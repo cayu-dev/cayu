@@ -77,6 +77,20 @@ not affect execution or approval.
   sandbox and a copy of the project. Pass `--environment default` to keep the
   application default, or `--environment NAME` to use a registered
   environment.
+- `BrokeredSandboxCodingEnvironmentFactory(egress="allowlist", egress_hosts=[...])`
+  asks Cayu Cloud for a sandbox that reaches only the listed HTTPS hosts
+  through Cloud's logging proxy, with no credential added
+  (`CAYU_CLOUD_SANDBOX_EGRESS=allowlist` with `CAYU_CLOUD_SANDBOX_EGRESS_HOSTS`
+  for `from_env`). The hosts are checked as Cloud does: 1 to 50 DNS names,
+  exact or `*.name`, no addresses. `SandboxBrokerClient.create` takes
+  `egress_hosts`, and `SandboxRecord.egress.hosts` reports them. Admission
+  reads guarantees version 2: `deny_by_default_network` is backed by the
+  record's `egress_deny_by_default` item, so `ExecutionRequirements.untrusted()`
+  is admitted on an allowlist sandbox as on a `none` one. Version 1 records
+  keep today's rule (`none` only), `public_web` never backs it, and no brokered
+  sandbox backs `brokered_egress`. Toolchain profiles still require
+  `egress="none"`. Cayu Cloud offers `allowlist` once an install turns it on;
+  until then the create is refused with `egress_mode_unsupported`.
 - `cayu.runners.LaunchedRunner` sends every command of a runner through your
   own launcher, such as `sudo -u sandbox` or bubblewrap: pass an argv prefix or
   a function from `ExecCommand` to `ExecCommand`. It wraps any runner, and

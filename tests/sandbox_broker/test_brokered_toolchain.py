@@ -221,6 +221,9 @@ def test_a_profile_needs_no_network_no_setup_and_a_neutral_type(tmp_path: Path) 
         _factory(broker, tmp_path, toolchain_profile=docker)
     with pytest.raises(ValueError, match="egress='none'"):
         _factory(broker, tmp_path, egress="public_web")
+    # An allowlist is still network, which a profile prohibits.
+    with pytest.raises(ValueError, match="egress='none'"):
+        _factory(broker, tmp_path, egress="allowlist", egress_hosts=["pypi.org"])
     with pytest.raises(ValueError, match="no setup_commands or workspace_setup_commands"):
         _factory(broker, tmp_path, setup_commands=["uv sync"])
     with pytest.raises(ValueError, match="no setup_commands or workspace_setup_commands"):

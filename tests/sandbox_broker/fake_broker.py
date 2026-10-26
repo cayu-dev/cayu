@@ -4,6 +4,10 @@ Each sandbox's ``/workspace`` is a host directory. Commands run there as real
 processes with a scrubbed environment, so Runtime code runs unchanged against
 the fake. Arguments naming ``/workspace`` are mapped to that directory, and the
 directory in a command's output back to ``/workspace``, as the guest's mount would.
+``guarantees_version = 2`` reports guarantees as Cloud does since ``allowlist`` egress:
+``egress_deny_by_default`` on ``none`` and ``allowlist`` sandboxes, never on ``public_web``.
+``egress_modes`` is what the install offers; ``allowlist`` hosts are validated and returned
+in canonical form as Cloud does.
 ``guest_paths`` maps further guest path prefixes (an image's ``/opt/...`` toolchain)
 to host directories the same way, and ``image_identities`` gives a catalog image
 the identity a broker reports for an image it built.
@@ -28,7 +32,7 @@ from urllib.parse import quote
 
 import httpx
 
-from cayu.sandbox_broker import SandboxBrokerClient, SandboxBrokerSettings
+from cayu.sandbox_broker import SandboxBrokerClient, SandboxBrokerSettings, validate_egress_hosts
 
 TOKEN = "cayu_sbx_test_token"
 APPLICATION = "compound"
@@ -39,6 +43,7 @@ GUARANTEES_V1 = (
     "unprivileged_commands",
     "egress_only_via_broker",
 )
+EGRESS_DENY_BY_DEFAULT = "egress_deny_by_default"
 ARCHIVE_LIMIT = 8 * 1024 * 1024
 STORAGE_URL = "https://storage.example.test"
 
@@ -93,6 +98,7 @@ class FakeSandbox:
     body: dict[str, Any]
     root: Path
     guarantees: tuple[str, ...]
+    guarantees_version: int = 1
     status: str = "provisioning"
     polls_until_ready: int = 1
     lease_expires_at: datetime | None = None
@@ -127,7 +133,7 @@ class FakeSandbox:
             "destroy_reason": self.destroy_reason,
             "staged_copies": self.staged_copies,
             "interactive_commands": self.interactive_commands,
-            "guarantees": {"version": 1, "items": list(self.guarantees)},
+            "guarantees": {"version": self.guarantees_version, "items": list(self.guarantees)},
             **({} if self.image_identity is None else {"image_identity": self.image_identity}),
         }
 
@@ -155,6 +161,9 @@ class FakeBroker:
         self.archive_limit = ARCHIVE_LIMIT
         self.archive_gets = 0
         self.guarantees = GUARANTEES_V1
+        # 2 reports Cloud's version 2 guarantees: the egress item on none and allowlist.
+        self.guarantees_version = 1
+        self.egress_modes = {"none", "public_web", "allowlist"}
         self.catalog = {"coding-python"}
         # What new sandboxes offer for staged copies; None offers none.
         self.staged_copies: dict[str, int] | None = None
@@ -334,6 +343,25 @@ class FakeBroker:
             return _error(status, code, detail)
         if body["image"] not in self.catalog:
             return _error(422, "image_unknown")
+        egress = body.get("egress")
+        if not isinstance(egress, dict) or egress.get("mode") not in {
+            "none",
+            "public_web",
+            "allowlist",
+        }:
+            return _error(400, "sandbox_invalid")
+        mode = egress["mode"]
+        if mode == "allowlist":
+            try:
+                hosts = validate_egress_hosts(egress.get("hosts"))
+            except (TypeError, ValueError):
+                return _error(400, "sandbox_invalid")
+            # The same hosts in another order are the same request.
+            body = {**body, "egress": {"mode": mode, "hosts": list(hosts)}}
+        elif set(egress) != {"mode"}:
+            return _error(400, "sandbox_invalid")
+        if mode not in self.egress_modes:
+            return _error(422, "egress_mode_unsupported")
         key = body["idempotency_key"]
         if key in self.by_key:
             existing = self.sandboxes[self.by_key[key]]
@@ -347,7 +375,12 @@ class FakeBroker:
             id=sandbox_id,
             body=body,
             root=root,
-            guarantees=self.guarantees,
+            guarantees=(
+                (*self.guarantees, EGRESS_DENY_BY_DEFAULT)
+                if self.guarantees_version >= 2 and mode != "public_web"
+                else self.guarantees
+            ),
+            guarantees_version=self.guarantees_version,
             staged_copies=self.staged_copies,
             interactive_commands=self.interactive_commands,
             image_identity=self.image_identities.get(body["image"]),

@@ -73,6 +73,7 @@ from cayu.sandbox_broker.client import (
     SandboxBrokerError,
     SandboxEgressMode,
     SandboxRecord,
+    validate_egress,
     validate_labels,
     validate_lease_seconds,
 )
@@ -89,6 +90,7 @@ from cayu.workspaces import LocalWorkspace, RunnerWorkspace, Workspace
 
 __all__ = [
     "BROKERED_SANDBOX_EGRESS_ENV",
+    "BROKERED_SANDBOX_EGRESS_HOSTS_ENV",
     "BROKERED_SANDBOX_IMAGE_ENV",
     "BROKERED_SANDBOX_LEASE_ENV",
     "BrokeredCodingBackendOptions",
@@ -99,8 +101,12 @@ __all__ = [
 
 #: Catalog image for coding sandboxes (default ``coding-python``).
 BROKERED_SANDBOX_IMAGE_ENV = "CAYU_CLOUD_SANDBOX_IMAGE"
-#: ``none`` or ``public_web``; required by ``from_env``, since there is no default network.
+#: ``none``, ``public_web`` or ``allowlist``; required by ``from_env``, since there is no
+#: default network.
 BROKERED_SANDBOX_EGRESS_ENV = "CAYU_CLOUD_SANDBOX_EGRESS"
+#: With ``allowlist`` egress, and only with it: the hosts the sandbox may reach, separated by
+#: commas or whitespace (``pypi.org,files.pythonhosted.org,*.githubusercontent.com``).
+BROKERED_SANDBOX_EGRESS_HOSTS_ENV = "CAYU_CLOUD_SANDBOX_EGRESS_HOSTS"
 #: Lease length in seconds, 60 to 3600 (default 900).
 BROKERED_SANDBOX_LEASE_ENV = "CAYU_CLOUD_SANDBOX_LEASE_SECONDS"
 
@@ -299,8 +305,16 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
 
     The network is the broker's: ``egress="none"`` gives the sandbox no
     outbound network, ``egress="public_web"`` the open internet through Cloud's
-    logging proxy. No credential ever enters the sandbox. The choice is
-    explicit; there is no default.
+    logging proxy, and ``egress="allowlist"`` with ``egress_hosts`` only the
+    HTTPS hosts listed (1 to 50 DNS names, each exact or ``*.name``), through
+    the same proxy. No credential ever enters the sandbox, and the proxy adds
+    none. The choice is explicit; there is no default.
+
+    ``none`` and ``allowlist`` sandboxes can be admitted for
+    ``ExecutionRequirements.untrusted()`` (``network_access="deny_by_default"``)
+    when their record carries the guarantee items behind it; ``public_web``
+    can't. No mode is ``network_access="brokered_egress"``, which needs
+    Runtime's own egress broker in the network path.
 
     Each session creates one sandbox under a fresh idempotency key and keeps
     its lease renewed at a third of ``lease_seconds``. The sandbox is destroyed
@@ -321,8 +335,9 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     ``toolchain_profile`` binds every sandbox to one neutral
     ``CodingToolchainProfile``, so ``run_check`` and ``run_command`` with that
     same profile work here as they do on Docker. It requires ``egress="none"``
-    (profiles prohibit the network) and no setup commands (profiles prohibit
-    installing packages at run time), and refuses a ``DockerCodingToolchainProfile``:
+    (profiles prohibit the network, an allowlist included) and no setup
+    commands (profiles prohibit installing packages at run time), and refuses
+    a ``DockerCodingToolchainProfile``:
     pass ``profile.coding_toolchain()``. Before allocation the profile's
     dependency inputs are verified in the source workspace. After allocation
     the factory requires the sandbox image to report the profile's
@@ -342,6 +357,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         broker: SandboxBrokerClient,
         source_workspace: LocalWorkspace,
         egress: SandboxEgressMode,
+        egress_hosts: Sequence[str] | None = None,
         image: str = DEFAULT_IMAGE,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         labels: Mapping[str, str] | None = None,
@@ -363,8 +379,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 "source_workspace must be a LocalWorkspace: durable storage outside the "
                 "sandbox whose protected paths can be excluded before traversal."
             )
-        if egress not in ("none", "public_web"):
-            raise ValueError("egress must be 'none' or 'public_web'.")
+        egress, owned_hosts = validate_egress(egress, egress_hosts)
         if type(image) is not str or not image.strip():
             raise ValueError("image must name a sandbox catalog entry.")
         if transfer_limits is None:
@@ -388,6 +403,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         self.broker = broker
         self.source_workspace = source_workspace
         self.egress: SandboxEgressMode = egress
+        #: The canonical hosts of an ``allowlist`` egress; ``None`` for the other modes.
+        self.egress_hosts: tuple[str, ...] | None = owned_hosts
         self.image = image
         self.lease_seconds = validate_lease_seconds(lease_seconds)
         self.labels = validate_labels(labels or {})
@@ -450,9 +467,25 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
 
         env = os.environ if environ is None else environ
         egress = env.get(BROKERED_SANDBOX_EGRESS_ENV, "").strip()
-        if egress not in ("none", "public_web"):
+        modes: dict[str, SandboxEgressMode] = {
+            "none": "none",
+            "public_web": "public_web",
+            "allowlist": "allowlist",
+        }
+        mode = modes.get(egress)
+        if mode is None:
             raise ValueError(
-                f"{BROKERED_SANDBOX_EGRESS_ENV} must be set to 'none' or 'public_web'."
+                f"{BROKERED_SANDBOX_EGRESS_ENV} must be set to 'none', 'public_web' or 'allowlist'."
+            )
+        hosts = _egress_hosts_from_env(env)
+        if mode == "allowlist" and hosts is None:
+            raise ValueError(
+                f"{BROKERED_SANDBOX_EGRESS_ENV}=allowlist needs {BROKERED_SANDBOX_EGRESS_HOSTS_ENV}."
+            )
+        if mode != "allowlist" and hosts is not None:
+            raise ValueError(
+                f"{BROKERED_SANDBOX_EGRESS_HOSTS_ENV} is only for "
+                f"{BROKERED_SANDBOX_EGRESS_ENV}=allowlist."
             )
         lease_text = env.get(BROKERED_SANDBOX_LEASE_ENV, "").strip()
         try:
@@ -462,7 +495,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         return cls(
             broker=SandboxBrokerClient.from_env(env),
             source_workspace=source_workspace,
-            egress="none" if egress == "none" else "public_web",
+            egress=mode,
+            egress_hosts=hosts,
             image=env.get(BROKERED_SANDBOX_IMAGE_ENV, "").strip() or DEFAULT_IMAGE,
             lease_seconds=lease_seconds,
             **options,
@@ -499,6 +533,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                         self.broker.settings.application_id,
                         self.image,
                         self.egress,
+                        # Only allowlist names hosts; the other modes keep their fingerprint.
+                        *(() if self.egress_hosts is None else self.egress_hosts),
                     )
                 ).encode()
             ).hexdigest()
@@ -636,6 +672,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             idempotency_key=idempotency_key,
             image=self.image,
             egress_mode=self.egress,
+            egress_hosts=self.egress_hosts,
             lease_seconds=self.lease_seconds,
             labels=labels,
         )
@@ -700,6 +737,11 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         )
 
 
+def _egress_hosts_from_env(env: Mapping[str, str]) -> tuple[str, ...] | None:
+    hosts = tuple(env.get(BROKERED_SANDBOX_EGRESS_HOSTS_ENV, "").replace(",", " ").split())
+    return hosts or None
+
+
 def _validated_commands(commands: Sequence[str], *, field_name: str) -> tuple[str, ...]:
     if isinstance(commands, str | bytes):
         raise TypeError(f"{field_name} must be a sequence of shell commands, not one string.")
@@ -727,6 +769,7 @@ def _brokered_toolchain_profile(
         )
     owned = owned_coding_toolchain_profile(profile)
     if egress != "none":
+        # An allowlist is still network: a profile's checks must not depend on any host.
         raise ValueError(
             "A toolchain profile prohibits the network, so a brokered sandbox with one needs "
             "egress='none'."
@@ -811,6 +854,9 @@ def _configuration_fingerprint(factory: BrokeredSandboxCodingEnvironmentFactory)
             None if factory.toolchain_profile is None else factory.toolchain_profile.fingerprint
         ),
     }
+    if factory.egress_hosts is not None:
+        # Only allowlist names hosts; the other modes keep their earlier fingerprint.
+        material["egress_hosts"] = list(factory.egress_hosts)
     return (
         "sha256:"
         + sha256(
@@ -824,8 +870,9 @@ class BrokeredCodingBackendOptions:
     """How the ``cayu-cloud`` coding backend asks Cayu Cloud's broker for sandboxes.
 
     Sandboxes always run with ``egress="none"``: toolchain profiles prohibit
-    the network. ``image`` names the catalog entry, or the image a broker
-    builds for the application (for example ``"release"``). ``broker`` reuses
+    the network, so an allowlist isn't offered here. ``image`` names the
+    catalog entry, or the image a broker builds for the application (for
+    example ``"release"``). ``broker`` reuses
     an existing client; otherwise one is made from the ``CAYU_CLOUD_*``
     variables and shared by every workspace the backend serves.
     """
@@ -850,7 +897,9 @@ class BrokeredCodingBackendOptions:
     def from_env(cls, environ: Mapping[str, str] | None = None) -> BrokeredCodingBackendOptions:
         """Read ``CAYU_CLOUD_SANDBOX_IMAGE`` and ``CAYU_CLOUD_SANDBOX_LEASE_SECONDS``.
 
-        ``CAYU_CLOUD_SANDBOX_EGRESS``, when set, must be ``none``.
+        ``CAYU_CLOUD_SANDBOX_EGRESS``, when set, must be ``none``, and
+        ``CAYU_CLOUD_SANDBOX_EGRESS_HOSTS`` must be unset: the toolchain prohibits
+        the network, an allowlist included.
         """
 
         env = os.environ if environ is None else environ
@@ -859,6 +908,11 @@ class BrokeredCodingBackendOptions:
             raise ValueError(
                 f"{BROKERED_SANDBOX_EGRESS_ENV}={egress} conflicts with the coding toolchain, "
                 "which prohibits the network; set it to 'none' or leave it unset."
+            )
+        if _egress_hosts_from_env(env) is not None:
+            raise ValueError(
+                f"{BROKERED_SANDBOX_EGRESS_HOSTS_ENV} conflicts with the coding toolchain, "
+                "which prohibits the network; leave it unset."
             )
         lease_text = env.get(BROKERED_SANDBOX_LEASE_ENV, "").strip()
         try:

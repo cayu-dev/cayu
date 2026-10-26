@@ -240,6 +240,10 @@ def test_cloud_backend_runs_the_neutral_profile_at_the_brokers_bar(tmp_path: Pat
     assert defaults.image == "release"
     with pytest.raises(ValueError, match="prohibits the network"):
         BrokeredCodingBackendOptions.from_env({"CAYU_CLOUD_SANDBOX_EGRESS": "public_web"})
+    with pytest.raises(ValueError, match="prohibits the network"):
+        BrokeredCodingBackendOptions.from_env({"CAYU_CLOUD_SANDBOX_EGRESS": "allowlist"})
+    with pytest.raises(ValueError, match="CAYU_CLOUD_SANDBOX_EGRESS_HOSTS"):
+        BrokeredCodingBackendOptions.from_env({"CAYU_CLOUD_SANDBOX_EGRESS_HOSTS": "pypi.org"})
     from_env = select_coding_backend(toolchain_profile=profile, environ=_CLOUD)
     assert from_env.metadata["sandbox_image"] == "coding-python"
 

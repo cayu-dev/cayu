@@ -120,28 +120,49 @@ def sandbox_capability_claims(
     capability is ``available`` only when the sandbox record carries the
     guarantee item that backs it, and ``unsupported`` when it doesn't.
 
-    The network is denied by default only with ``egress_mode="none"``.
+    ``deny_by_default_network`` follows the record's egress guarantee:
+
+    - from guarantees version 2 on, the ``egress_deny_by_default`` item (with
+      ``egress_only_via_broker``) backs it. Cloud sets that item on ``none``
+      sandboxes, which have no path out, and on ``allowlist`` sandboxes, which
+      reach only their listed hosts through Cloud's logging proxy with no
+      credential added;
+    - a version 1 record backs it only for ``egress_mode="none"``, with
+      ``egress_only_via_broker``, so an ``allowlist`` record without the
+      version 2 item fails closed.
+
     ``public_web`` reaches the open internet through a proxy that logs but
-    denies nothing, so it never backs ``deny_by_default_network``. Neither
-    mode backs ``brokered_egress``, which needs a Runtime policy broker in the
-    network path.
+    denies nothing, so it never backs ``deny_by_default_network``, whatever
+    its record says. Pre-create (``declared``) claims declare it for ``none``
+    and ``allowlist``; the record must then prove it. No mode backs
+    ``brokered_egress``, which needs a Runtime policy broker in the network
+    path.
     """
 
     items = set() if guarantees is None or guarantees.version < 1 else set(guarantees.items)
-    backing = {
-        "untrusted_code_isolation": "untrusted_code_isolation",
-        "host_filesystem_isolation": "untrusted_code_isolation",
-        "real_credential_non_possession": "no_provider_credentials",
-        "guest_privilege_containment": "unprivileged_commands",
-        "unprivileged_guest": "unprivileged_commands",
+    backing: dict[str, tuple[str, ...]] = {
+        "untrusted_code_isolation": ("untrusted_code_isolation",),
+        "host_filesystem_isolation": ("untrusted_code_isolation",),
+        "real_credential_non_possession": ("no_provider_credentials",),
+        "guest_privilege_containment": ("unprivileged_commands",),
+        "unprivileged_guest": ("unprivileged_commands",),
     }
-    if egress_mode == "none":
-        backing["deny_by_default_network"] = "egress_only_via_broker"
+    if egress_mode != "public_web":
+        if declared:
+            if egress_mode in ("none", "allowlist"):
+                backing["deny_by_default_network"] = ()
+        elif guarantees is not None and guarantees.version >= 2:
+            backing["deny_by_default_network"] = (
+                "egress_only_via_broker",
+                "egress_deny_by_default",
+            )
+        elif egress_mode == "none":
+            backing["deny_by_default_network"] = ("egress_only_via_broker",)
     claims: list[ExecutionCapabilityClaim] = []
-    for capability, item in backing.items():
+    for capability, required in backing.items():
         if declared:
             claims.append(ExecutionCapabilityClaim.declared(capability))
-        elif item in items:
+        elif items.issuperset(required):
             claims.append(ExecutionCapabilityClaim.available(capability))
         else:
             claims.append(
@@ -151,12 +172,22 @@ def sandbox_capability_claims(
                     remediation_code="select_guaranteed_sandbox",
                 )
             )
-    if egress_mode != "none":
+    if egress_mode == "public_web":
         claims.append(
             ExecutionCapabilityClaim.unsupported(
                 "deny_by_default_network",
                 reason_code="sandbox_egress_public_web",
                 remediation_code="select_no_egress",
+            )
+        )
+    elif "deny_by_default_network" not in backing:
+        # An allowlist (or a mode this Runtime doesn't know) on a record without
+        # the version 2 egress item: nothing proves the network is denied.
+        claims.append(
+            ExecutionCapabilityClaim.unsupported(
+                "deny_by_default_network",
+                reason_code="sandbox_guarantee_missing",
+                remediation_code="select_guaranteed_sandbox",
             )
         )
     claims.append(
@@ -1369,6 +1400,9 @@ def _fingerprint(runner: BrokeredSandboxRunner) -> str:
         else sandbox.guarantees.model_dump(mode="json"),
         "root": runner.default_cwd,
     }
+    if sandbox.egress.hosts is not None:
+        # Only allowlist records carry hosts; the others keep their earlier fingerprint.
+        identity["egress_hosts"] = list(sandbox.egress.hosts)
     if sandbox.image_identity is not None:
         # Records without an image identity keep their earlier fingerprint.
         identity["image_identity"] = sandbox.image_identity.model_dump(mode="json")
@@ -1486,9 +1520,10 @@ class _BrokeredAdmissionObserver(RunnerExecutionAdmissionObserver):
                 )
             )
         final = await self._observe()
-        if (final.id, final.image, final.guarantees, final.image_identity) != (
+        if (final.id, final.image, final.egress, final.guarantees, final.image_identity) != (
             initial.id,
             initial.image,
+            initial.egress,
             initial.guarantees,
             initial.image_identity,
         ):

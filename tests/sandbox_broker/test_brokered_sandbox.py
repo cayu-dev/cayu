@@ -18,7 +18,14 @@ import pytest
 from pydantic import SecretStr
 from tests.core.test_human_review import identity
 from tests.core.test_workspace_mutation_receipts import _SingleToolProvider
-from tests.sandbox_broker.fake_broker import API_URL, APPLICATION, TOKEN, FakeBroker
+from tests.sandbox_broker.fake_broker import (
+    API_URL,
+    APPLICATION,
+    EGRESS_DENY_BY_DEFAULT,
+    GUARANTEES_V1,
+    TOKEN,
+    FakeBroker,
+)
 
 from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
 from cayu.egress.sandbox_coding import SandboxWorkspaceTransferLimits
@@ -47,10 +54,13 @@ from cayu.sandbox_broker import (
     SandboxBrokerSettings,
     SandboxBrokerUnavailableError,
     SandboxCopyFailedError,
+    SandboxGuarantees,
     SandboxLeaseKeeper,
     SandboxLeaseLostError,
     SandboxNotFoundError,
     SandboxQuotaExceededError,
+    sandbox_capability_claims,
+    validate_egress_hosts,
 )
 from cayu.sandbox_broker import client as client_module
 from cayu.sandbox_broker import runner as runner_module
@@ -95,13 +105,18 @@ def _factory(
 
 
 async def _ready_runner(
-    broker: FakeBroker, *, egress: str = "none", **keeper_options
+    broker: FakeBroker,
+    *,
+    egress: str = "none",
+    egress_hosts: list[str] | None = None,
+    **keeper_options,
 ) -> BrokeredSandboxRunner:
     client = broker.client()
     created = await client.create(
         idempotency_key=f"k-{len(broker.sandboxes)}",
         image="coding-python",
         egress_mode=egress,
+        egress_hosts=egress_hosts,
         lease_seconds=60,
     )
     # The lease starts at ready, never during provisioning.
@@ -148,6 +163,185 @@ def test_factory_from_env_requires_an_explicit_egress_mode(tmp_path: Path) -> No
         BrokeredSandboxCodingEnvironmentFactory.from_env(
             source_workspace=source, environ={**_ENV, "CAYU_CLOUD_SANDBOX_EGRESS": "open"}
         )
+
+
+def test_factory_from_env_reads_an_allowlist_and_its_hosts(tmp_path: Path) -> None:
+    source = LocalWorkspace(tmp_path)
+    factory = BrokeredSandboxCodingEnvironmentFactory.from_env(
+        source_workspace=source,
+        environ={
+            **_ENV,
+            "CAYU_CLOUD_SANDBOX_EGRESS": "allowlist",
+            "CAYU_CLOUD_SANDBOX_EGRESS_HOSTS": " PyPI.org., files.pythonhosted.org\n"
+            "*.githubusercontent.com,pypi.org ",
+        },
+    )
+    assert factory.egress == "allowlist"
+    assert factory.egress_hosts == (
+        "*.githubusercontent.com",
+        "files.pythonhosted.org",
+        "pypi.org",
+    )
+    with pytest.raises(ValueError, match="CAYU_CLOUD_SANDBOX_EGRESS_HOSTS"):
+        BrokeredSandboxCodingEnvironmentFactory.from_env(
+            source_workspace=source, environ={**_ENV, "CAYU_CLOUD_SANDBOX_EGRESS": "allowlist"}
+        )
+    for mode in ("none", "public_web"):
+        with pytest.raises(ValueError, match="only for CAYU_CLOUD_SANDBOX_EGRESS=allowlist"):
+            BrokeredSandboxCodingEnvironmentFactory.from_env(
+                source_workspace=source,
+                environ={
+                    **_ENV,
+                    "CAYU_CLOUD_SANDBOX_EGRESS": mode,
+                    "CAYU_CLOUD_SANDBOX_EGRESS_HOSTS": "pypi.org",
+                },
+            )
+    with pytest.raises(ValueError, match="isn't a sandbox egress host"):
+        BrokeredSandboxCodingEnvironmentFactory.from_env(
+            source_workspace=source,
+            environ={
+                **_ENV,
+                "CAYU_CLOUD_SANDBOX_EGRESS": "allowlist",
+                "CAYU_CLOUD_SANDBOX_EGRESS_HOSTS": "pypi.org,10.0.0.1",
+            },
+        )
+
+
+def test_allowlist_hosts_follow_clouds_rules() -> None:
+    assert validate_egress_hosts(
+        ["B.example.com", "a.example.com.", "*.Example.com", "b.example.com"]
+    ) == (
+        "*.example.com",
+        "a.example.com",
+        "b.example.com",
+    )
+    assert len(validate_egress_hosts([f"h{index}.example.com" for index in range(50)])) == 50
+    refused = (
+        "10.0.0.1",
+        "8.8.8.8",
+        "::1",
+        "2001:db8::1",
+        "::ffff:1.2.3.4",
+        "*.1.2.3.4",
+        "pypi.org:443",
+        "https://pypi.org",
+        "pypi.org/simple",
+        "localhost",
+        "pypi",
+        "*.com",
+        "*.*.example.com",
+        "metadata.internal",
+        "printer.local",
+        "nothing.invalid",
+        "example.123",
+        "-bad.example.com",
+        "a..example.com",
+        "",
+        "*.",
+        "x" * 64 + ".example.com",
+    )
+    for host in refused:
+        with pytest.raises(ValueError, match="isn't a sandbox egress host"):
+            validate_egress_hosts([host])
+    for hosts in ([], [f"h{index}.example.com" for index in range(51)]):
+        with pytest.raises(ValueError, match="1 to 50 hosts"):
+            validate_egress_hosts(hosts)
+    with pytest.raises(TypeError, match="not one string"):
+        validate_egress_hosts("pypi.org")
+
+
+def test_the_client_sends_an_allowlist_in_the_contracts_shape(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        client = broker.client()
+        record = await client.create(
+            idempotency_key="allowlist",
+            image="coding-python",
+            egress_mode="allowlist",
+            egress_hosts=["PyPI.org", "*.githubusercontent.com", "pypi.org."],
+            lease_seconds=60,
+        )
+        assert record.egress.mode == "allowlist"
+        assert record.egress.hosts == ("*.githubusercontent.com", "pypi.org")
+        plain = await client.create(
+            idempotency_key="none", image="coding-python", egress_mode="none", lease_seconds=60
+        )
+        assert plain.egress.hosts is None
+        # Refused before anything is sent.
+        with pytest.raises(ValueError, match="needs the hosts"):
+            await client.create(
+                idempotency_key="x",
+                image="coding-python",
+                egress_mode="allowlist",
+                lease_seconds=60,
+            )
+        with pytest.raises(ValueError, match="only for egress 'allowlist'"):
+            await client.create(
+                idempotency_key="x",
+                image="coding-python",
+                egress_mode="public_web",
+                egress_hosts=["pypi.org"],
+                lease_seconds=60,
+            )
+        with pytest.raises(ValueError, match="'none', 'public_web' or 'allowlist'"):
+            await client.create(
+                idempotency_key="x", image="coding-python", egress_mode="open", lease_seconds=60
+            )
+        # An install that doesn't offer allowlist refuses it with the contract code.
+        broker.egress_modes = {"none", "public_web"}
+        with pytest.raises(SandboxBrokerRefusedError, match="egress_mode_unsupported"):
+            await client.create(
+                idempotency_key="unsupported",
+                image="coding-python",
+                egress_mode="allowlist",
+                egress_hosts=["pypi.org"],
+                lease_seconds=60,
+            )
+        await client.aclose()
+
+    asyncio.run(scenario())
+    posted = [
+        json.loads(request.content)["egress"]
+        for request in broker.requests
+        if request.method == "POST" and request.url.path.endswith("/sandboxes")
+    ]
+    assert posted == [
+        {"mode": "allowlist", "hosts": ["*.githubusercontent.com", "pypi.org"]},
+        {"mode": "none"},
+        {"mode": "allowlist", "hosts": ["pypi.org"]},
+    ]
+
+
+def test_a_factory_allocates_its_allowlist_and_fingerprints_its_hosts(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    factory = _factory(
+        broker, source, egress="allowlist", egress_hosts=["files.pythonhosted.org", "pypi.org"]
+    )
+    reordered = _factory(
+        broker, source, egress="allowlist", egress_hosts=["pypi.org", "files.pythonhosted.org"]
+    )
+    other = _factory(broker, source, egress="allowlist", egress_hosts=["pypi.org"])
+    assert factory.execution_profile_identity == reordered.execution_profile_identity
+    assert factory.execution_profile_identity != other.execution_profile_identity
+    with pytest.raises(ValueError, match="needs the hosts"):
+        _factory(broker, source, egress="allowlist")
+    with pytest.raises(ValueError, match="only for egress 'allowlist'"):
+        _factory(broker, source, egress="none", egress_hosts=["pypi.org"])
+
+    async def scenario():
+        result = await factory.create(_request())
+        assert result.metadata["sandbox_egress"] == "allowlist"
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    asyncio.run(scenario())
+    (sandbox,) = broker.sandboxes.values()
+    assert sandbox.body["egress"] == {
+        "mode": "allowlist",
+        "hosts": ["files.pythonhosted.org", "pypi.org"],
+    }
+    assert sandbox.status == "destroyed"
 
 
 # Allocation and use ----------------------------------------------------------
@@ -1224,6 +1418,78 @@ def test_untrusted_work_needs_every_guarantee_item_and_no_network(tmp_path: Path
             "guest_privilege_containment",
         }
         await weaker.close()
+
+    asyncio.run(scenario())
+
+
+def test_deny_by_default_follows_the_egress_guarantee_of_each_mode(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.guarantees_version = 2
+    untrusted = ExecutionRequirements.untrusted()
+    hosts = ["pypi.org", "*.githubusercontent.com"]
+
+    def decision(candidate, requirements=untrusted, *, stage="pre_exposure"):
+        return evaluate_execution_admission(
+            candidate=candidate.candidate,
+            requirements=requirements,
+            evidence=candidate.evidence,
+            stage=stage,
+        )
+
+    def network_claim(runner):
+        return runner.execution_admission_candidate().evidence.claim_for("deny_by_default_network")
+
+    async def scenario():
+        request = _request(execution_requirements=untrusted)
+        allowlist = _factory(broker, _project(tmp_path), egress="allowlist", egress_hosts=hosts)
+        pre_create = decision(allowlist.execution_admission_candidate(request), stage="pre_create")
+        assert pre_create.status == "admitted", pre_create.refusals
+        # A version 2 record backs deny-by-default with its egress item, on none and allowlist.
+        for egress, egress_hosts in (("allowlist", hosts), ("none", None)):
+            runner = await _ready_runner(broker, egress=egress, egress_hosts=egress_hosts)
+            assert runner.sandbox.guarantees.version == 2
+            assert EGRESS_DENY_BY_DEFAULT in runner.sandbox.guarantees.items
+            admitted = decision(runner.execution_admission_candidate())
+            assert admitted.status == "admitted", admitted.refusals
+            assert network_claim(runner).state == "available"
+            # No mode is Runtime's own brokered egress.
+            brokered = decision(
+                runner.execution_admission_candidate(),
+                ExecutionRequirements.untrusted(network_access="brokered_egress"),
+            )
+            assert {refusal.capability for refusal in brokered.refusals} == {"brokered_egress"}
+            await runner.close()
+        # public_web never carries the item, and is never deny-by-default even if a
+        # record claimed it.
+        runner = await _ready_runner(broker, egress="public_web")
+        assert EGRESS_DENY_BY_DEFAULT not in runner.sandbox.guarantees.items
+        refused = decision(runner.execution_admission_candidate())
+        assert {refusal.capability for refusal in refused.refusals} == {"deny_by_default_network"}
+        await runner.close()
+        broker.guarantees = (*GUARANTEES_V1, EGRESS_DENY_BY_DEFAULT)
+        runner = await _ready_runner(broker, egress="public_web")
+        assert network_claim(runner).reason_code == "sandbox_egress_public_web"
+        await runner.close()
+        # A version 2 record without the egress item fails closed, even for none.
+        for egress in ("allowlist", "none"):
+            claims = sandbox_capability_claims(
+                SandboxGuarantees(version=2, items=GUARANTEES_V1),
+                egress_mode=egress,
+                declared=False,
+            )
+            (claim,) = [item for item in claims if item.capability == "deny_by_default_network"]
+            assert (claim.state, claim.reason_code) == ("unsupported", "sandbox_guarantee_missing")
+        # A version 1 record keeps today's rule: none is deny-by-default, and an
+        # allowlist (an older Cloud API replica) fails closed.
+        broker.guarantees_version = 1
+        runner = await _ready_runner(broker, egress="none")
+        assert decision(runner.execution_admission_candidate()).status == "admitted"
+        await runner.close()
+        runner = await _ready_runner(broker, egress="allowlist", egress_hosts=hosts)
+        refused = decision(runner.execution_admission_candidate())
+        assert {refusal.capability for refusal in refused.refusals} == {"deny_by_default_network"}
+        assert network_claim(runner).reason_code == "sandbox_guarantee_missing"
+        await runner.close()
 
     asyncio.run(scenario())
 

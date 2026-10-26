@@ -167,15 +167,18 @@ from cayu.workspaces import LocalWorkspace
 factory = BrokeredSandboxCodingEnvironmentFactory(
     broker=SandboxBrokerClient.from_env(),
     source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
-    egress="none",  # or "public_web": the open internet through Cloud's logging proxy
+    egress="none",  # or "allowlist" with egress_hosts=[...], or "public_web"
 )
 ```
 
-Only `egress="none"` gives `deny_by_default_network`, so only a `none`
-sandbox can satisfy `ExecutionRequirements.untrusted()`. Catalog images
+`egress="none"` and `egress="allowlist"` (only the listed HTTPS hosts,
+through Cloud's logging proxy) give `deny_by_default_network` when the
+sandbox record carries the guarantee behind it (`egress_deny_by_default`
+from guarantees version 2), so either can satisfy
+`ExecutionRequirements.untrusted()`. `public_web` never does. Catalog images
 (`coding-python`, and `coding-agents` where offered) don't contain your
 project's dependencies; `workspace_setup_commands` can install them after
-copy-in, but that needs `public_web`. A coding app built with
+copy-in, with an allowlist naming the package index. A coding app built with
 `cayu new --preset coding` instead picks Docker locally and the broker on
 Cloud with `select_coding_backend`, using one toolchain profile on both. See
 [Coding in a sandbox brokered by Cayu Cloud](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md#coding-in-a-sandbox-brokered-by-cayu-cloud)

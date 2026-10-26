@@ -492,7 +492,14 @@ from cayu.workspaces import LocalWorkspace
 factory = BrokeredSandboxCodingEnvironmentFactory(
     broker=SandboxBrokerClient.from_env(),
     source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
-    egress="public_web",  # or "none"
+    egress="public_web",  # or "none", or "allowlist" with egress_hosts
+)
+# Only the hosts the work needs, through Cloud's logging proxy:
+factory = BrokeredSandboxCodingEnvironmentFactory(
+    broker=SandboxBrokerClient.from_env(),
+    source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
+    egress="allowlist",
+    egress_hosts=["pypi.org", "files.pythonhosted.org"],
 )
 # Or configure everything from the environment:
 factory = BrokeredSandboxCodingEnvironmentFactory.from_env(
@@ -505,7 +512,8 @@ factory = BrokeredSandboxCodingEnvironmentFactory.from_env(
 | `CAYU_CLOUD_API_URL` | Cloud API base URL. Must be HTTPS; plain HTTP works only for a loopback host. Cloud sets it. |
 | `CAYU_CLOUD_APPLICATION_ID` | The Agent whose `/sandboxes` routes to use. Cloud sets it. |
 | `CAYU_CLOUD_SANDBOX_TOKEN` | The Agent's sandbox credential (Cloud sets it), or an Organization API key with the `sandboxes` scope. |
-| `CAYU_CLOUD_SANDBOX_EGRESS` | `none` (no outbound network) or `public_web` (the open internet through Cloud's logging proxy). Required by `from_env`. |
+| `CAYU_CLOUD_SANDBOX_EGRESS` | `none` (no outbound network), `public_web` (the open internet through Cloud's logging proxy) or `allowlist` (only the hosts in `CAYU_CLOUD_SANDBOX_EGRESS_HOSTS`, through the same proxy). Required by `from_env`. |
+| `CAYU_CLOUD_SANDBOX_EGRESS_HOSTS` | With `allowlist`, and only with it: the hosts the sandbox may reach, separated by commas or spaces, for example `pypi.org,files.pythonhosted.org,*.githubusercontent.com`. |
 | `CAYU_CLOUD_SANDBOX_IMAGE` | Catalog image, default `coding-python`. `SandboxBrokerClient.list_images()` lists what the install offers. |
 | `CAYU_CLOUD_SANDBOX_LEASE_SECONDS` | Lease length, 60 to 3600, default 900. |
 | `CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS` | Timeout for one broker request, default 30. |
@@ -514,11 +522,34 @@ Every install's catalog has `coding-python` (Python with `uv`, `git` and
 ripgrep); an install may also offer `coding-agents`, which adds the Claude Code
 and Codex CLIs. Catalog images don't contain your project's dependencies.
 
+| Egress | What the sandbox reaches | `deny_by_default_network` |
+|---|---|---|
+| `none` | Nothing: no path out. | Yes, when the record carries the guarantee items behind it. |
+| `allowlist` | Port 443 of the listed hosts only, through Cloud's logging proxy, with no credential added. | Yes, when the record carries `egress_deny_by_default` (guarantees version 2). |
+| `public_web` | Any public HTTPS host, through Cloud's logging proxy, with no credential added. | Never. |
+
+An allowlist names 1 to 50 DNS hosts, each exact (`pypi.org`) or a wildcard
+for every name below one (`*.githubusercontent.com` covers
+`objects.githubusercontent.com`, not `githubusercontent.com`). The client
+checks them as Cloud does before sending anything: IP addresses, ports,
+schemes, paths, single-label names, special-use names (`.internal`, `.local`,
+`.invalid` and the like) and `*.` over a single label are refused, and the
+request carries them lowercased, deduplicated and sorted
+(`{"mode": "allowlist", "hosts": [...]}`). Cloud's proxy refuses any other
+host and any IP address, requires the TLS server name to be the host the
+tunnel was opened for, refuses encrypted ClientHellos and hosts that resolve
+to private addresses. It never decrypts, so it can't stop a listed host that
+serves several sites from serving another one, and anything the sandbox sends
+to a listed host is up to the hosts you list. List the fewest hosts that work,
+exact names where you can. An install that doesn't offer `allowlist` yet
+refuses it with `egress_mode_unsupported`.
+
 `setup_commands` run in the fresh sandbox before the workspace is copied in,
 so they can't see the project. `workspace_setup_commands` run in `/workspace`
 after copy-in and the Git baseline, for example `uv sync --frozen` to install
-the project's locked dependencies. That needs `egress="public_web"` to reach
-the package index. Anything they write under `/workspace` is copied back like
+the project's locked dependencies. That needs egress to the package index:
+`egress="allowlist"` naming it (for PyPI, `pypi.org` and
+`files.pythonhosted.org`), or `public_web`. Anything they write under `/workspace` is copied back like
 any other change, so put environments elsewhere
 (`UV_PROJECT_ENVIRONMENT=/tmp/venv`).
 
@@ -608,11 +639,17 @@ for a revoked credential, is final.
 Final admission uses the sandbox record's versioned `guarantees`. A capability
 such as `untrusted_code_isolation`, `real_credential_non_possession`,
 `guest_privilege_containment` or `deny_by_default_network` is available only
-when the guarantee item behind it is present. `deny_by_default_network` also
-needs `egress="none"`: `public_web` reaches the open internet through a proxy
-that logs but denies nothing. So a workload built with
-`ExecutionRequirements.untrusted()` is admitted only on a `none` sandbox that
-carries every item.
+when the guarantee item behind it is present. From guarantees version 2,
+`deny_by_default_network` needs the `egress_deny_by_default` item, which Cloud
+sets on `none` and `allowlist` sandboxes; a version 1 record backs it only for
+`egress="none"`, so an allowlist on an older Cloud fails closed. `public_web`
+never backs it, whatever the record says: it reaches the open internet through
+a proxy that logs but denies nothing. So a workload built with
+`ExecutionRequirements.untrusted()` (`network_access="deny_by_default"`) is
+admitted on a `none` or `allowlist` sandbox that carries every item, and never
+on `public_web`. No brokered sandbox satisfies
+`network_access="brokered_egress"`, which needs Runtime's own egress broker
+in the network path; an allowlist is enforced by Cloud's proxy instead.
 Required executables are probed live in the sandbox.
 
 Each part also works alone:
@@ -653,7 +690,7 @@ factory = BrokeredSandboxCodingEnvironmentFactory(
 ```
 
 A profile prohibits the network and installing packages at run time, so the
-factory requires `egress="none"` and refuses `setup_commands` and
+factory requires `egress="none"` (an allowlist is still network) and refuses `setup_commands` and
 `workspace_setup_commands`. It refuses a `DockerCodingToolchainProfile`; pass
 `profile.coding_toolchain()`. Before allocating, it checks the profile's
 dependency inputs in the source workspace. After allocating, and before
@@ -719,7 +756,9 @@ So agents should take their `ExecutionRequirements` from
 identity, architecture, restrictions, transfer limits, `cancel_timeout_s`) and
 `BrokeredCodingBackendOptions` (image, lease, transfer limits; built from the
 `CAYU_CLOUD_*` variables when omitted). Brokered sandboxes always run with
-`egress="none"`.
+`egress="none"`, since the toolchain profile prohibits the network; the
+backend refuses `CAYU_CLOUD_SANDBOX_EGRESS` set to anything else and
+`CAYU_CLOUD_SANDBOX_EGRESS_HOSTS`.
 
 `register_coding_environment` can be called once per workspace, for example
 for each clone a parallel worker edits; `RunRequest.environment_name` then

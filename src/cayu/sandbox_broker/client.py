@@ -41,6 +41,7 @@ __all__ = [
     "MAX_COMMAND_ENV_BYTES",
     "MAX_COMMAND_OUTPUT_BYTES",
     "MAX_COMMAND_STDIN_BYTES",
+    "MAX_EGRESS_HOSTS",
     "MAX_LEASE_SECONDS",
     "MAX_STDIO_CHUNK_BYTES",
     "MAX_WAIT_SECONDS",
@@ -58,6 +59,7 @@ __all__ = [
     "SandboxCommand",
     "SandboxCopy",
     "SandboxCopyFailedError",
+    "SandboxEgress",
     "SandboxEgressMode",
     "SandboxFailure",
     "SandboxGuarantees",
@@ -71,6 +73,8 @@ __all__ = [
     "SandboxStagedCopies",
     "SandboxStdinWrite",
     "SandboxStdoutChunk",
+    "validate_egress",
+    "validate_egress_hosts",
 ]
 
 #: Base URL of the Cloud API, for example ``https://cloud.cayu.dev``. Cloud injects it.
@@ -100,6 +104,8 @@ MAX_ARCHIVE_PATHS = 1_000
 MAX_ARCHIVE_EXCLUDES = 50
 #: The most one interactive stdin write carries, or one stdout read returns.
 MAX_STDIO_CHUNK_BYTES = 1024 * 1024
+#: The most hosts one ``allowlist`` egress names.
+MAX_EGRESS_HOSTS = 50
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 #: Worst-case growth of one output byte in the response JSON: a control byte
 #: becomes a six-byte ``\u00XX`` escape. The broker measures each stream's
@@ -114,6 +120,13 @@ _COMMAND_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _MAX_LABELS = 10
 _MAX_LABEL_VALUE = 200
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_MAX_EGRESS_HOST_LENGTH = 253
+_EGRESS_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_EGRESS_HOST_NAME = re.compile(rf"{_EGRESS_HOST_LABEL}(?:\.{_EGRESS_HOST_LABEL})*")
+# Special-use top-level names never name a public host, so an allowlist can't hold them.
+_SPECIAL_USE_LABELS = frozenset(
+    {"alt", "arpa", "home", "internal", "invalid", "local", "localhost", "onion", "test"}
+)
 _RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 #: The pause between attempts once a call retries a broker outage past its quick retries.
 _OUTAGE_RETRY_SECONDS = 1.0
@@ -140,7 +153,8 @@ _KNOWN_CODES = frozenset(
     }
 )
 
-SandboxEgressMode = Literal["none", "public_web"]
+SandboxEgressMode = Literal["none", "public_web", "allowlist"]
+_EGRESS_MODES = ("none", "public_web", "allowlist")
 SandboxStatus = Literal["provisioning", "ready", "destroying", "destroyed", "failed"]
 CommandStatus = Literal["running", "exited", "timed_out", "cancelled", "failed"]
 CopyStatus = Literal["awaiting_upload", "pending", "running", "done", "failed", "expired"]
@@ -243,9 +257,25 @@ class SandboxFailure(BaseModel):
 
 
 class SandboxEgress(BaseModel):
+    """A sandbox's egress as its record reports it.
+
+    ``hosts`` is set only for ``allowlist``: the hosts Cloud's proxy lets the
+    sandbox reach, in Cloud's canonical form (lowercased, deduplicated, sorted).
+    """
+
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     mode: str
+    hosts: tuple[str, ...] | None = None
+
+    @field_validator("hosts", mode="before")
+    @classmethod
+    def _hosts_or_none(cls, value: Any) -> Any:
+        # A shape this client doesn't understand reports no hosts rather than
+        # invalidating the record.
+        if isinstance(value, list | tuple) and all(type(item) is str for item in value):
+            return tuple(value)
+        return None
 
 
 class SandboxGuarantees(BaseModel):
@@ -530,6 +560,67 @@ def validate_labels(labels: Mapping[str, str]) -> dict[str, str]:
     return owned
 
 
+def _egress_host(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("Each sandbox egress host must be a string.")
+    pattern = value.strip().lower().removesuffix(".")
+    name = pattern.removeprefix("*.")
+    labels = name.split(".")
+    if (
+        not name
+        or len(pattern) > _MAX_EGRESS_HOST_LENGTH
+        # An IPv6 address fails the name pattern (it has colons) and an IPv4
+        # address the numeric last label below, so no address passes.
+        or _EGRESS_HOST_NAME.fullmatch(name) is None
+        # A public host has a registered name under a top-level domain: at least
+        # two labels, the last neither numeric (an address) nor special-use.
+        or len(labels) < 2
+        or labels[-1].isdigit()
+        or labels[-1] in _SPECIAL_USE_LABELS
+    ):
+        raise ValueError(
+            f"{value!r} isn't a sandbox egress host: name a public DNS host such as pypi.org, "
+            "or *.example.com for every name under example.com (no addresses, ports, schemes "
+            "or paths)."
+        )
+    return pattern
+
+
+def validate_egress_hosts(hosts: Sequence[str]) -> tuple[str, ...]:
+    """Check an ``allowlist`` egress's hosts as Cloud does, and return their canonical form.
+
+    1 to ``MAX_EGRESS_HOSTS`` DNS names, each exact (``pypi.org``) or a
+    wildcard for every name below one (``*.githubusercontent.com`` covers
+    ``objects.githubusercontent.com``, not ``githubusercontent.com``). IP
+    addresses, ports, schemes, paths, single-label names, special-use names
+    (``.internal``, ``.local``, ``.invalid`` and the like) and ``*.`` over a
+    single label are refused. The result is lowercased, without trailing dots,
+    deduplicated and sorted, which is how Cloud's record returns it.
+    """
+
+    if isinstance(hosts, str | bytes) or not isinstance(hosts, Sequence):
+        raise TypeError("Sandbox egress hosts must be a sequence of host names, not one string.")
+    if not 1 <= len(hosts) <= MAX_EGRESS_HOSTS:
+        raise ValueError(f"Sandbox egress hosts must name 1 to {MAX_EGRESS_HOSTS} hosts.")
+    return tuple(sorted({_egress_host(host) for host in hosts}))
+
+
+def validate_egress(
+    egress_mode: object, egress_hosts: Sequence[str] | None
+) -> tuple[SandboxEgressMode, tuple[str, ...] | None]:
+    """Check an egress mode and its hosts: ``allowlist`` needs hosts, the others take none."""
+
+    if egress_mode not in _EGRESS_MODES:
+        raise ValueError("Sandbox egress must be 'none', 'public_web' or 'allowlist'.")
+    if egress_mode == "allowlist":
+        if egress_hosts is None:
+            raise ValueError("Sandbox egress 'allowlist' needs the hosts it may reach.")
+        return "allowlist", validate_egress_hosts(egress_hosts)
+    if egress_hosts is not None:
+        raise ValueError("Sandbox egress hosts are only for egress 'allowlist'.")
+    return ("none" if egress_mode == "none" else "public_web"), None
+
+
 def validate_lease_seconds(lease_seconds: int) -> int:
     if (
         type(lease_seconds) is not int
@@ -657,7 +748,15 @@ class SandboxBrokerClient:
         egress_mode: SandboxEgressMode,
         lease_seconds: int,
         labels: Mapping[str, str] | None = None,
+        egress_hosts: Sequence[str] | None = None,
     ) -> SandboxRecord:
+        """Create a sandbox; ``egress_hosts`` names an ``allowlist`` egress's hosts.
+
+        The request's egress is ``{"mode": "none"}``, ``{"mode": "public_web"}``
+        or ``{"mode": "allowlist", "hosts": [...]}`` with the hosts in canonical
+        form (see ``validate_egress_hosts``).
+        """
+
         if (
             type(idempotency_key) is not str
             or not 1 <= len(idempotency_key) <= 200
@@ -666,12 +765,14 @@ class SandboxBrokerClient:
             raise ValueError("Sandbox idempotency_key must be 1 to 200 printable characters.")
         if type(image) is not str or not image.strip():
             raise ValueError("Sandbox image must name a catalog entry.")
-        if egress_mode not in ("none", "public_web"):
-            raise ValueError("Sandbox egress_mode must be 'none' or 'public_web'.")
+        mode, hosts = validate_egress(egress_mode, egress_hosts)
+        egress: dict[str, Any] = {"mode": mode}
+        if hosts is not None:
+            egress["hosts"] = list(hosts)
         payload = {
             "idempotency_key": idempotency_key,
             "image": image,
-            "egress": {"mode": egress_mode},
+            "egress": egress,
             "lease_seconds": validate_lease_seconds(lease_seconds),
             "labels": validate_labels(labels or {}),
         }
