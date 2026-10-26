@@ -175,6 +175,14 @@ not affect execution or approval.
   can't swap the launcher through `PATH` or `LD_PRELOAD`. `exec_system` stays
   on the wrapped runner, unlaunched. See
   [Send commands through your own launcher](build-a-runner.md#send-commands-through-your-own-launcher).
+- `cayu new NAME --with app-database` gives an application its own tables, for
+  every preset: SQLAlchemy 2 models in the `app` PostgreSQL schema beside Cayu's
+  `cayu_*` tables, and an Alembic setup that migrates only that schema (so it can't
+  alter or drop Cayu's tables), keeps its version table there, prefers
+  `CAYU_DATABASE_DIRECT_URL`, and never changes `search_path`. The application
+  connects on first use and never migrates itself. The generated project depends on
+  `sqlalchemy` and `alembic`; Cayu's own runtime dependencies don't change. See
+  `cayu guide applications#application-tables`.
 - A retry budget now bounds an event that the application retries by creating
   new tasks. Pass the same `TaskCreate(retry_key=...)`, such as the event's ID,
   for every task of that event. Tasks with one key share a budget of 3 tasks

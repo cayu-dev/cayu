@@ -151,18 +151,22 @@ def test_rendered_capability_owners_are_formatted(preset):
 
 
 @pytest.mark.parametrize(
-    ("preset", "execution"),
+    ("preset", "execution", "capabilities"),
     (
-        ("agent", None),
-        ("service", None),
-        ("long-running", None),
-        ("coding", None),
-        ("coding", "docker"),
+        ("agent", None, ()),
+        ("service", None, ()),
+        ("long-running", None, ()),
+        ("coding", None, ()),
+        ("coding", "docker", ()),
+        ("agent", None, ("app-database",)),
+        ("coding", "docker", ("app-database",)),
     ),
 )
-def test_rendered_projects_pass_default_ruff_checks(tmp_path, preset, execution):
+def test_rendered_projects_pass_default_ruff_checks(tmp_path, preset, execution, capabilities):
     # Generated projects add ruff without a [tool.ruff] section, so check with its defaults.
-    for relative, content in project_files("profile", preset=preset, execution=execution).items():
+    for relative, content in project_files(
+        "profile", preset=preset, execution=execution, with_capabilities=capabilities
+    ).items():
         if relative.endswith(".py"):
             path = tmp_path / relative
             path.parent.mkdir(parents=True, exist_ok=True)

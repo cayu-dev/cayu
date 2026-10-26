@@ -328,7 +328,9 @@ authorization, claims, and settlement) in the same database with
 
 - Keep application-owned durable records, such as orders, cases, ledgers, and
   sync cursors, in the configured database. Application tables may share it with
-  their own table prefix; Cayu reserves `cayu_` for its tables.
+  their own table prefix; Cayu reserves `cayu_` for its tables. For a maintained
+  layout with migrations, generate the project with `--with app-database` (see
+  [Application tables](#application-tables)).
 - `data/` locally and `/data` in a deployment hold files: artifacts, uploads, and
   fixtures. Do not open SQLite files there for durable application state. Cayu Cloud
   blocks such code at deploy time; acknowledge a rebuildable cache or index under
@@ -348,6 +350,40 @@ authorization, claims, and settlement) in the same database with
 - Deployments of applications with automatic memory must set
   `CAYU_MEMORY_EVIDENCE_KEY`; the local `data/memory-evidence.key` is git-ignored
   and never reaches a deployment.
+
+### Application tables
+
+`cayu new NAME --with app-database` gives the application tables of its own, for
+every preset. They live in the `app` PostgreSQL schema of the database Cayu uses;
+Cayu's `cayu_*` tables stay in the default schema. Cayu itself takes no SQLAlchemy
+or Alembic dependency: the generated project does.
+
+- `database/models.py` declares SQLAlchemy 2 models on `MetaData(schema="app")`;
+  `database/session.py` opens the connection from `CAYU_DATABASE_URL` on first use.
+  Nothing connects or migrates while the application starts, because Cayu Cloud
+  smoke-tests a release without database credentials. There is no SQLite fallback
+  for application tables.
+- `alembic.ini` and `migrations/` migrate the `app` schema only. The environment
+  prefers `CAYU_DATABASE_DIRECT_URL`, as `cayu storage migrate` does, creates the
+  schema when it's missing, keeps `alembic_version` in it, serialises concurrent runs
+  with its own advisory lock, and never changes `search_path`. Autogenerate reflects
+  only `app`, so it can't alter or drop Cayu's tables.
+- Add a table: define its model, run
+  `uv run alembic revision --autogenerate -m "describe the change"`, review the file
+  in `migrations/versions/`, then migrate.
+- Set up a new local database with
+  `uv run cayu storage migrate && uv run alembic upgrade head` (either order works);
+  after that, `uv run alembic upgrade head` applies the application's migrations.
+  Once Cayu's tables exist, `cayu storage migrate` asks for a backup flag; on a
+  disposable local database pass `--waive-backup`.
+- The schema is created only when it's missing, so a least-privilege role can use
+  an `app` schema provisioned for it. Don't name the role `app`: its default schema
+  would then be `app` and Cayu's tables would land there; the migration environment
+  refuses to run in that case.
+- `tests/test_app_database.py` runs without a database; with
+  `CAYU_TEST_POSTGRES_DSN` naming a server where it may create databases, it also
+  migrates a fresh database, runs both migrations in either order, and checks that
+  autogenerate finds nothing to change.
 
 `cayu check` reports `SCAFFOLD_PLAN_DRIFT` with field `storage` when the storage
 module constructs a fixed SQLite or Postgres store, or when

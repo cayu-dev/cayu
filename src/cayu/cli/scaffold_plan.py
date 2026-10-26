@@ -361,6 +361,30 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         ),
     ),
     CapabilitySpec(
+        name="app-database",
+        summary=(
+            "Application-owned tables in the `app` PostgreSQL schema beside Cayu's, "
+            "with SQLAlchemy models and Alembic migrations."
+        ),
+        status="selectable",
+        supported_presets=("agent", "service", "coding", "long-running"),
+        dependencies=("alembic>=1.13,<2", "sqlalchemy>=2,<3"),
+        environment=("CAYU_DATABASE_URL", "CAYU_DATABASE_DIRECT_URL"),
+        files=("database/", "migrations/", "alembic.ini"),
+        verification=("uv run --no-sync pytest -q tests/test_app_database.py",),
+        owned_files=(
+            "alembic.ini",
+            "database/CAPABILITY.md",
+            "database/__init__.py",
+            "database/models.py",
+            "database/session.py",
+            "migrations/env.py",
+            "migrations/script.py.mako",
+            "migrations/versions/0001_app_tables.py",
+            "tests/test_app_database.py",
+        ),
+    ),
+    CapabilitySpec(
         name="remote-git-delivery",
         summary="Approved host-side commit and push of an exact patch-ready result.",
         status="selectable",
@@ -699,8 +723,7 @@ def _plan_dependencies(plan: ApplicationPlan) -> tuple[str, ...]:
         ("execution", plan.execution),
     ):
         dependencies.update(_ADAPTER_BY_KEY[(kind, name)].dependencies)
-    for name in plan.capabilities:
-        dependencies.update(capability_spec(name).dependencies)
+    dependencies.update(capability_dependencies(plan))
     return tuple(sorted(dependencies))
 
 
@@ -737,6 +760,20 @@ def capability_dependents(plan: ApplicationPlan, name: str) -> tuple[str, ...]:
                 dependents.add(candidate)
                 changed = True
     return tuple(spec.name for spec in CAPABILITIES if spec.name in dependents)
+
+
+def capability_dependencies(plan: ApplicationPlan) -> tuple[str, ...]:
+    """The requirements the plan's capabilities add to the generated project."""
+
+    return tuple(
+        sorted(
+            {
+                dependency
+                for name in plan.capabilities
+                for dependency in capability_spec(name).dependencies
+            }
+        )
+    )
 
 
 def normalize_extension_declarations(

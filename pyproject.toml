@@ -59,6 +59,9 @@ dependencies = [
 claude-agent-sdk = ["claude-agent-sdk>=0.2.168,<0.3"]
 codex = ["openai-codex==0.163.0"]
 dev = [
+  # Runs the `cayu new --with app-database` project's own migration tests; the
+  # generated project depends on these, Cayu itself does not.
+  "alembic>=1.13,<2",
   # Exercises the bounded Brotli decoder in egress; not a runtime dependency.
   "brotli>=1.2,<2",
   "cryptography>=42",
@@ -78,6 +81,7 @@ dev = [
   "pytest-split>=0.11,<1",
   "pytest-xdist>=3.8,<4",
   "pydantic-settings>=2.7,<3",
+  "sqlalchemy>=2,<3",
   "pyjwt[crypto]>=2.15.0,<3",
   "ruff>=0.11",
   "sse-starlette>=2.0",

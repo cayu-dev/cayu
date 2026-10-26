@@ -42,8 +42,10 @@ from cayu.cli._guarded_tree_publication import (
 )
 from cayu.cli._identity import identity_markdown
 from cayu.cli._release_check import newer_release
+from cayu.cli.scaffold_app_database import APP_DATABASE, app_database_files
 from cayu.cli.scaffold_convention import (
     application_guidance,
+    capability_card,
     convention_files,
     local_database_path,
     scaffold_contract,
@@ -54,6 +56,7 @@ from cayu.cli.scaffold_plan import (
     PRESETS,
     ApplicationPlan,
     ScaffoldPlanError,
+    capability_dependencies,
     capability_dependents,
     capability_spec,
     normalize_application_plan,
@@ -2980,7 +2983,12 @@ def _rendered_project_files(
             "__AGENT_NAME__": resolved_agent_name,
             "__REVIEWER_NAME__": reviewer_name,
             "__CAYU_VERSION__": version,
-            "__RUNTIME_DEPENDENCIES__": json.dumps([f"cayu{runtime_extra}=={version}"]),
+            "__RUNTIME_DEPENDENCIES__": json.dumps(
+                [
+                    f"cayu{runtime_extra}=={version}",
+                    *capability_dependencies(plan),
+                ]
+            ),
             "__DEV_DEPENDENCIES__": json.dumps(dev_dependencies),
             "__UV_SOURCES__": uv_sources,
             "__SERVICE_FACTORY__": (
@@ -3053,6 +3061,10 @@ def _rendered_project_files(
             )
     files["README.md"] += application_guidance(plan)
     files["AGENTS.md"] += application_guidance(plan)
+    if APP_DATABASE in plan.capabilities:
+        files.update(app_database_files(files["configuration/settings.py"]))
+        # Only a project with the capability gets the card: it owns `database/`.
+        files["database/CAPABILITY.md"] = capability_card(plan, APP_DATABASE)
     if "evals" not in plan.capabilities:
         files.pop("evals/agent.py", None)
         for guidance_name in ("README.md", "AGENTS.md"):

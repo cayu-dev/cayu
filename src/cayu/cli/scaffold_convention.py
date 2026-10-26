@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 
+from cayu.cli.scaffold_app_database import APP_DATABASE, APP_DATABASE_TABLES
 from cayu.cli.scaffold_plan import (
     CAPABILITIES,
     ApplicationPlan,
@@ -1738,6 +1739,11 @@ arbitrary Python, start lifecycle work during import, or delete the scaffold
 contract to silence diagnostics. A custom layout is an explicit migration.
 """
 
+_APPLICATION_TABLES = """- Keep application-owned durable records, such as orders, cases, ledgers, and
+  sync cursors, in that configured database. Application tables may share it
+  with their own table prefix; Cayu reserves the `cayu_` prefix for its tables.
+"""
+
 _STORAGE_GUIDANCE = """
 
 ## Durable data
@@ -1748,10 +1754,7 @@ Cayu's session, task, and knowledge stores live in the configured database.
 `__LOCAL_DATABASE__`. Cayu CLI commands resolve `CAYU_DATABASE_URL` before
 `[tool.cayu.session_store]`, so they read the same database as the app.
 
-- Keep application-owned durable records, such as orders, cases, ledgers, and
-  sync cursors, in that configured database. Application tables may share it
-  with their own table prefix; Cayu reserves the `cayu_` prefix for its tables.
-- `data/` locally and `/data` in a deployment hold files: artifacts, uploads,
+__APPLICATION_TABLES__- `data/` locally and `/data` in a deployment hold files: artifacts, uploads,
   and fixtures. Do not open SQLite files there for durable application state; a
   deployment's `/data` may be a network filesystem.
 - Deployments set `CAYU_DATABASE_URL` to a migrated PostgreSQL database
@@ -2084,6 +2087,10 @@ def application_guidance(plan: ApplicationPlan) -> str:
             else "configuration/storage.py"
         ),
     ).replace("__LOCAL_DATABASE__", local_database_path(plan))
+    storage = storage.replace(
+        "__APPLICATION_TABLES__",
+        APP_DATABASE_TABLES if APP_DATABASE in plan.capabilities else _APPLICATION_TABLES,
+    )
     if "memory" in plan.capabilities:
         storage += _MEMORY_KEY_GUIDANCE
     if plan.preset == "agent" and plan.execution == "docker":
