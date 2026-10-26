@@ -772,6 +772,7 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(
                 "mutate": {"enabled": True, "unavailable_reason": None},
             }
             assert capabilities["evals_readiness"] == {
+                "session_additions": {"state": "ready", "reason_code": None},
                 "captured_evaluation": {
                     "state": "ready",
                     "reason_code": None,

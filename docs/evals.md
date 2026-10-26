@@ -3796,3 +3796,68 @@ systems can consume it in CI or adapt it to external eval platforms.
 Cayu should own the runtime-native view. External tools can own broader
 experiment management, hosted dashboards, human review queues, and organization
 level workflows.
+
+### Add a session to a suite
+
+Server contract 65 supports adding a finished session to an exact existing
+suite revision, or creating a new suite. Both authored and corpus destinations
+are supported. These operations require the existing full-access authorization;
+the three member-readable suite/run views do not grant write or source-link access.
+`evals_readiness.session_additions` reports whether the configured durable store
+supports atomic publication. SQLite and PostgreSQL require storage revision 130.
+
+`POST /api/evals/sessions/{session_id}/additions/preview` accepts `mode` (`case`
+or `score`), a `destination`, `case_id`, `case_name`, and optional assertions.
+An existing destination is `{ "kind": "existing", "selector": "…" }`; use the
+opaque suite identifier from the catalog. A new destination is
+`{ "kind": "new", "suite_id": "regressions", "name": "Regressions" }`.
+The server resolves the session and target, validates the exact destination, and
+returns a content-bound plan with the canonical case definition, source revision,
+destination case count, and execution coverage. An opaque source commitment also
+binds the resolved private source identity, so remapping a public session ID to
+identical evidence cannot reuse a reviewed plan. Preview does not publish data or
+start another agent execution.
+
+- `case` converts retained source input into one runnable case. Existing members,
+  assertions, trial policies, scenarios, judges and other corpus suites remain
+  unchanged. Publication creates a new immutable document revision. An identical
+  existing case is a no-op; the same case ID with different content is a conflict.
+  A new destination uses the current authored V3 format.
+- `score` scores retained evidence and records a one-case captured execution.
+  For an existing destination, it records an explicit association without changing
+  runnable membership. The destination history labels this placement separately
+  from the result's actual execution suite. Its baseline and comparison scope
+  remain those of that single-case execution. The underlying captured corpus
+  remains separately visible in the catalog. A new score-only destination is a
+  captured corpus.
+
+To publish, repeat the preview request at
+`POST /api/evals/sessions/{session_id}/additions`, add
+`expected_plan_revision` and `expected_source_revision`, and supply an
+`Idempotency-Key` header. The server revalidates the source and destination before
+atomically publishing the document/result, association, private source linkage,
+and operation receipt. A stale plan or changed request under the same key returns
+409. Repeating the exact committed request returns its original receipt, including
+after source deletion or a lost response. `GET /api/evals/additions/{operation_id}`
+recovers a receipt for its authenticated owner. Authentication and current role
+policy run before replay; tenant identity is operator provenance, not a new tenant
+isolation mechanism.
+
+Two different additions to the same immutable parent create two independently
+addressable child revisions. There is no mutable suite head or implicit merge.
+Scored history deduplicates repeated associations to the same immutable result.
+A run view can take `placement=<destination-selector>` to validate that association
+and return its destination breadcrumb while retaining the actual execution identity.
+
+Operational session links are separate from portable case provenance.
+`GET /api/evals/suite-views/{suite_key}/cases/{case_id}/source` resolves a case
+addition; supply `result_revision` for a scored attachment. It returns an available
+public session link only from a recorded server-owned association whose source
+still resolves to the same existing private session. Otherwise it returns an
+unavailable state. A server-published child revision preserves existing private
+associations for unchanged case IDs and revisions, including other suites in the
+same corpus, while each original operation receipt keeps its original destination.
+The child associations commit atomically with the child document and receipt.
+Copying or importing identical diagnostic source fields does not recreate an
+operational link. The existing capture preview, save, export,
+launch, reporting and authoring endpoints remain available.

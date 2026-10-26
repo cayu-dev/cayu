@@ -31,6 +31,7 @@ EvalsReadinessReasonCode = Literal[
     "eval_store_not_configured",
     "eval_target_not_configured",
     "captured_result_persistence_not_available",
+    "session_additions_not_available",
     "scenario_v2_not_available",
 ]
 
@@ -46,6 +47,7 @@ _UNSUPPORTED_EVALS_READINESS_REASONS = frozenset(
         "terminal_evidence_not_supported",
         "session_lineage_not_supported",
         "captured_result_persistence_not_available",
+        "session_additions_not_available",
         "scenario_v2_not_available",
     }
 )
@@ -207,6 +209,7 @@ class EvalsReadiness(_DiagnosticsModel):
     catalog_read: EvalsOperationReadiness
     catalog_write: EvalsOperationReadiness
     captured_result_persistence: EvalsOperationReadiness
+    session_additions: EvalsOperationReadiness
     scenario_conversion: EvalsOperationReadiness
     fresh_launch: EvalsOperationReadiness
     cancellation: EvalsOperationReadiness

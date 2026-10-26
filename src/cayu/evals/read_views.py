@@ -367,7 +367,16 @@ class EvalViewUsage(EvalViewModel):
     cost_unavailable_reason: Literal["aggregate_not_retained"] = "aggregate_not_retained"
 
 
+class EvalRunPlacement(EvalViewModel):
+    destination: EvalSuiteViewIdentity
+    operation_id: str
+    case_id: str
+    case_revision: str
+    execution_case_count: Literal[1] = 1
+
+
 class EvalRunViewMetadata(EvalViewModel):
+    placement: EvalRunPlacement | None = None
     id: str
     native_run_id: str | None
     authored_suite_revision: str | None

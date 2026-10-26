@@ -302,6 +302,7 @@ export const CONTRACT: ServerContract = {
         state: "ready",
         reason_code: null,
       },
+      session_additions: { state: "ready", reason_code: null },
       scenario_conversion: {
         state: "ready",
         reason_code: null,

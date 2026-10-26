@@ -294,7 +294,7 @@ def test_postgres_eval_store_requires_and_migrates_revision_seventy_four(
 
         validating = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(SchemaTooOld, match="requires >= 80"):
+            with pytest.raises(SchemaTooOld, match="requires >= 130"):
                 await validating.list_corpora()
         finally:
             await validating.close()
@@ -451,6 +451,8 @@ def test_postgres_eval_store_creates_revision_sixty_eight_schema(postgres_dsn) -
                 "cayu_eval_runs",
                 "cayu_eval_scenarios",
                 "cayu_eval_suites",
+                "cayu_eval_session_additions",
+                "cayu_eval_case_addition_sources",
             }
             await cur.execute(
                 "SELECT table_name, column_name, data_type FROM information_schema.columns "

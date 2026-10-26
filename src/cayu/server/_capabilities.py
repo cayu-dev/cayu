@@ -46,6 +46,7 @@ class ControlPlaneCapabilitySnapshot:
     tool_usage_supported: bool = False
     session_overview_supported: bool = False
     eval_suite_views_supported: bool = False
+    eval_session_additions_supported: bool = False
 
     @property
     def evaluation_promotion_supported(self) -> bool:
@@ -214,6 +215,7 @@ def inspect_control_plane_capabilities(
     tool_usage_supported: bool = False,
     session_overview_supported: bool = False,
     eval_suite_views_supported: bool = False,
+    eval_session_additions_supported: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
 
@@ -230,6 +232,7 @@ def inspect_control_plane_capabilities(
     )
     for field_name, value in (
         ("eval_suite_views_supported", eval_suite_views_supported),
+        ("eval_session_additions_supported", eval_session_additions_supported),
         ("browser_recordings_configured", browser_recordings_configured),
         ("dashboard_configured", dashboard_configured),
         ("tasks_configured", tasks_configured),
@@ -261,6 +264,7 @@ def inspect_control_plane_capabilities(
         raise ValueError("Configured Evals requires store, target, and project identity evidence.")
     return ControlPlaneCapabilitySnapshot(
         eval_suite_views_supported=eval_suite_views_supported,
+        eval_session_additions_supported=eval_session_additions_supported,
         browser_recordings_configured=browser_recordings_configured,
         task_index_supported=task_index_supported,
         task_creation_supported=task_creation_supported,
@@ -414,11 +418,22 @@ def _evals_readiness(snapshot: ControlPlaneCapabilitySnapshot) -> EvalsReadiness
             reason_code="captured_result_persistence_not_available",
         )
 
+    session_additions = (
+        captured_result_persistence.model_copy()
+        if captured_result_persistence.state != "ready"
+        else EvalsOperationReadiness(state="ready", reason_code=None)
+        if snapshot.eval_session_additions_supported
+        else EvalsOperationReadiness(
+            state="unsupported", reason_code="session_additions_not_available"
+        )
+    )
+
     return EvalsReadiness(
         captured_evaluation=captured_evaluation,
         catalog_read=catalog,
         catalog_write=catalog.model_copy(),
         captured_result_persistence=captured_result_persistence,
+        session_additions=session_additions,
         scenario_conversion=captured_evaluation.model_copy(),
         fresh_launch=fresh_launch,
         cancellation=stored_result_operation,

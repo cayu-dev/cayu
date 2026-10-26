@@ -795,6 +795,8 @@ def test_sqlite_eval_store_creates_revision_sixty_eight_schema(tmp_path) -> None
         "cayu_eval_runs",
         "cayu_eval_scenarios",
         "cayu_eval_suites",
+        "cayu_eval_session_additions",
+        "cayu_eval_case_addition_sources",
     }
     assert indexes == {
         "idx_cayu_eval_baseline_mutations_scope",
@@ -869,7 +871,7 @@ def test_sqlite_eval_store_requires_current_schema(
         schema_migrations.REVISIONS = revisions
         connection.close()
 
-    with pytest.raises(SchemaTooOld, match="requires >= 80"):
+    with pytest.raises(SchemaTooOld, match="requires >= 130"):
         SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
 
@@ -963,7 +965,7 @@ def test_sqlite_eval_store_requires_and_migrates_revision_seventy_four(
         finally:
             connection.close()
 
-        with pytest.raises(SchemaTooOld, match="requires >= 80"):
+        with pytest.raises(SchemaTooOld, match="requires >= 130"):
             SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
         migrated = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)

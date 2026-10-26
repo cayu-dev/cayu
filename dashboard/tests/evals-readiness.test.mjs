@@ -15,6 +15,7 @@ test("Evals readiness exposes every operation in a stable product order", () => 
       "catalog_read",
       "catalog_write",
       "captured_result_persistence",
+      "session_additions",
       "scenario_conversion",
       "fresh_launch",
       "cancellation",
@@ -68,6 +69,13 @@ test("Evals readiness copy distinguishes ready, deployment-gated, and unavailabl
       reason_code: "session_lineage_not_supported",
     }),
     "The session store cannot provide the session lineage required for captured evaluation.",
+  )
+  assert.equal(
+    evalsReadinessReasonText({
+      state: "unsupported",
+      reason_code: "session_additions_not_available",
+    }),
+    "The configured eval store cannot publish session additions atomically.",
   )
   assert.equal(
     evalsReadinessStateLabel({

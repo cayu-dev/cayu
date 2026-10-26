@@ -8279,6 +8279,40 @@
       "title": "EvalResultOutcomeDimensionsV1",
       "type": "object"
     },
+    "EvalRunPlacement": {
+      "additionalProperties": false,
+      "properties": {
+        "case_id": {
+          "title": "Case Id",
+          "type": "string"
+        },
+        "case_revision": {
+          "title": "Case Revision",
+          "type": "string"
+        },
+        "destination": {
+          "$ref": "#/components/schemas/EvalSuiteViewIdentity"
+        },
+        "execution_case_count": {
+          "const": 1,
+          "default": 1,
+          "title": "Execution Case Count",
+          "type": "integer"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "destination",
+        "operation_id",
+        "case_id",
+        "case_revision"
+      ],
+      "title": "EvalRunPlacement",
+      "type": "object"
+    },
     "EvalRunStatus": {
       "enum": [
         "queued",
@@ -8453,6 +8487,16 @@
         "origin": {
           "title": "Origin",
           "type": "string"
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/EvalRunPlacement"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "result_revision": {
           "anyOf": [
@@ -8672,6 +8716,16 @@
         "origin": {
           "title": "Origin",
           "type": "string"
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/EvalRunPlacement"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "result_revision": {
           "anyOf": [
@@ -10049,6 +10103,7 @@
                 "eval_store_not_configured",
                 "eval_target_not_configured",
                 "captured_result_persistence_not_available",
+                "session_additions_not_available",
                 "scenario_v2_not_available"
               ],
               "type": "string"
@@ -10106,6 +10161,9 @@
         },
         "scenario_conversion": {
           "$ref": "#/components/schemas/EvalsOperationReadiness"
+        },
+        "session_additions": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
         }
       },
       "required": [
@@ -10113,6 +10171,7 @@
         "catalog_read",
         "catalog_write",
         "captured_result_persistence",
+        "session_additions",
         "scenario_conversion",
         "fresh_launch",
         "cancellation",
@@ -11042,7 +11101,7 @@
     },
     "FilePart": {
       "additionalProperties": false,
-      "description": "User-supplied file input (image or document) for a multimodal request.\n\n`attachment` carries a JSON-safe `cayu.file_attachment.v1` payload\nreferencing a stored artifact \u2014 never file bytes. The runtime resolves the\nartifact from the active ArtifactStore immediately before each provider\nrequest, exactly like tool-result attachments.",
+      "description": "User-supplied file input (image or document) for a multimodal request.\n\n`attachment` carries a JSON-safe `cayu.file_attachment.v1` payload\nreferencing a stored artifact — never file bytes. The runtime resolves the\nartifact from the active ArtifactStore immediately before each provider\nrequest, exactly like tool-result attachments.",
       "properties": {
         "attachment": {
           "additionalProperties": true,
@@ -12651,7 +12710,7 @@
     },
     "Message": {
       "additionalProperties": false,
-      "description": "Frozen transcript message.\n\nMessages and their parts are immutable once constructed: attribute\nassignment is rejected, `content` is a tuple, and every part entering the\nmessage is copied so the message exclusively owns its JSON payloads. The\nfreeze is shallow, though \u2014 nested payload dicts stay mutable \u2014 so sharing\na validated instance is safe only while every holder treats payloads as\nread-only. Hot-path `copy_message` \"copies\" are no-ops under that\ncontract; `detach_message` produces a genuinely isolated copy for\nstorage/trust boundaries, and `copy.deepcopy` isolates as well.",
+      "description": "Frozen transcript message.\n\nMessages and their parts are immutable once constructed: attribute\nassignment is rejected, `content` is a tuple, and every part entering the\nmessage is copied so the message exclusively owns its JSON payloads. The\nfreeze is shallow, though — nested payload dicts stay mutable — so sharing\na validated instance is safe only while every holder treats payloads as\nread-only. Hot-path `copy_message` \"copies\" are no-ops under that\ncontract; `detach_message` produces a genuinely isolated copy for\nstorage/trust boundaries, and `copy.deepcopy` isolates as well.",
       "properties": {
         "content": {
           "default": [],
@@ -15868,7 +15927,7 @@
       "type": "object"
     },
     "ResolutionActorSource": {
-      "description": "How a ``ResolutionActor``'s identity claim was established.\n\n``HTTP_AUTH`` is produced only by the server layer from a verified\n``AuthContext``; ``REQUEST`` marks a caller-asserted identity (SDK or\nopen-access HTTP body); ``SYSTEM`` marks runtime-generated actors such as\ndeterministic approval expiry. Direct SDK callers are a trusted boundary\nand may construct system actors; HTTP bodies cannot \u2014 the server re-stamps\nopen-access bodies to ``REQUEST`` and rejects them entirely under auth.",
+      "description": "How a ``ResolutionActor``'s identity claim was established.\n\n``HTTP_AUTH`` is produced only by the server layer from a verified\n``AuthContext``; ``REQUEST`` marks a caller-asserted identity (SDK or\nopen-access HTTP body); ``SYSTEM`` marks runtime-generated actors such as\ndeterministic approval expiry. Direct SDK callers are a trusted boundary\nand may construct system actors; HTTP bodies cannot — the server re-stamps\nopen-access bodies to ``REQUEST`` and rejects them entirely under auth.",
       "enum": [
         "http_auth",
         "request",
@@ -16314,7 +16373,7 @@
     },
     "RunLimits": {
       "additionalProperties": false,
-      "description": "Optional hard limits for one session run or resume call.\n\nEvery limit is evaluated against the clock selected by ``scope``:\n\n- ``scope=\"run\"`` (the default): token, tool-call, and elapsed-time\n  limits all measure the current runtime invocation \u2014 usage deltas since\n  the original run entered and active time since the run started. Durable\n  approval and user-input continuations retain the baseline and exclude the\n  human wait interval. A fresh run or clean-boundary resume resets it.\n- ``scope=\"session\"``: token, tool-call, and elapsed-time limits all\n  measure the whole durable session \u2014 cumulative usage from the session\n  event stream and wall time since the session was created. A resumed\n  session that already meets a limit stops immediately.",
+      "description": "Optional hard limits for one session run or resume call.\n\nEvery limit is evaluated against the clock selected by ``scope``:\n\n- ``scope=\"run\"`` (the default): token, tool-call, and elapsed-time\n  limits all measure the current runtime invocation — usage deltas since\n  the original run entered and active time since the run started. Durable\n  approval and user-input continuations retain the baseline and exclude the\n  human wait interval. A fresh run or clean-boundary resume resets it.\n- ``scope=\"session\"``: token, tool-call, and elapsed-time limits all\n  measure the whole durable session — cumulative usage from the session\n  event stream and wall time since the session was created. A resumed\n  session that already meets a limit stops immediately.",
       "properties": {
         "finish_reserve_seconds": {
           "default": 30,
@@ -16590,7 +16649,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "64",
+          "default": "65",
           "title": "Contract Version",
           "type": "string"
         },
@@ -20174,7 +20233,7 @@
     },
     "ThinkingPart": {
       "additionalProperties": false,
-      "description": "Model reasoning/thinking content from a single reasoning block.\n\n`text` may be empty (the provider returned the reasoning in an omitted/redacted\nform). `provider_state` carries the opaque round-trip payload \u2014 the Anthropic\n`signature` or `redacted_thinking` data, or an OpenAI encrypted reasoning blob \u2014\nneeded to send the block back to the provider on a later turn. Built-in providers\ntag opaque reasoning state with its provider family, protocol, and protocol version;\nrequest adapters replay it only when all three match. Legacy untagged state remains\nreadable in the durable transcript but is not authoritative for opaque replay.",
+      "description": "Model reasoning/thinking content from a single reasoning block.\n\n`text` may be empty (the provider returned the reasoning in an omitted/redacted\nform). `provider_state` carries the opaque round-trip payload — the Anthropic\n`signature` or `redacted_thinking` data, or an OpenAI encrypted reasoning blob —\nneeded to send the block back to the provider on a later turn. Built-in providers\ntag opaque reasoning state with its provider family, protocol, and protocol version;\nrequest adapters replay it only when all three match. Legacy untagged state remains\nreadable in the durable transcript but is not authoritative for opaque replay.",
       "properties": {
         "provider_state": {
           "anyOf": [
@@ -22880,7 +22939,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "64",
+          "default": "65",
           "title": "Contract Version",
           "type": "string"
         }
@@ -23806,6 +23865,23 @@
               "minimum": 1024,
               "title": "Max Result Bytes",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "placement",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Placement"
             }
           }
         ],

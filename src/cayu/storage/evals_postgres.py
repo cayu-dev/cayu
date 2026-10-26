@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, LiteralString, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
+    from cayu.evals.session_additions import EvalAdditionRecord, PreparedEvalAddition
     from cayu.storage.retention import (
         EvalRetentionPolicy,
         RetentionAuditRecord,
@@ -162,7 +163,7 @@ from cayu.evals.suite_authoring import (
 from cayu.storage._eval_view_queries import latest_case_results_sql, view_index_sql
 from cayu.storage._postgres_base import _PostgresStoreBase
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 80
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 130
 
 logger = logging.getLogger(__name__)
 
@@ -480,6 +481,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         return await retention.eval_session_references(retention.PostgresEvalRetentionBackend(self))
 
     durable: ClassVar[bool] = True
+    session_additions: ClassVar[bool] = True
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
@@ -733,6 +735,84 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             query,
         )
 
+    async def _save_prepared_authored_suite_in_transaction(self, cur, validated, payload):
+        document_text = payload.decode("utf-8")
+        scenario_cases = authored_suite_scenario_cases(validated)
+        scenario_by_revision: dict[str, EvalScenarioDocumentV2] = {}
+        if scenario_cases:
+            await cur.execute(
+                "SELECT revision, document_json FROM cayu_eval_scenarios WHERE revision = ANY(%s)",
+                (list({reference.scenario_revision for _, reference in scenario_cases}),),
+            )
+            scenario_rows = await cur.fetchall()
+            scenario_by_revision = await asyncio.to_thread(
+                lambda: {
+                    str(revision): eval_scenario_from_json(scenario_json)
+                    for revision, scenario_json in scenario_rows
+                }
+            )
+        for case, reference in scenario_cases:
+            validate_authored_suite_scenario(
+                validated,
+                case,
+                scenario_by_revision.get(reference.scenario_revision),
+            )
+        created_at = await _database_now(cur)
+        entry = authored_suite_catalog_entry(
+            validated,
+            created_at=created_at,
+            document_bytes=len(payload),
+        )
+        await cur.execute(
+            """
+            INSERT INTO cayu_eval_authored_suites (
+                revision, suite_id, suite_revision, target_key, name,
+                description, case_count, assertion_count,
+                simple_input_count, scenario_count, trials,
+                timeout_seconds, document_json, document_bytes, created_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (revision) DO NOTHING
+            RETURNING revision
+            """,
+            (
+                entry.revision,
+                entry.id,
+                entry.suite_revision,
+                entry.target_key,
+                entry.name,
+                entry.description,
+                entry.case_count,
+                entry.assertion_count,
+                entry.simple_input_count,
+                entry.scenario_count,
+                entry.trials,
+                entry.timeout_seconds,
+                document_text,
+                entry.document_bytes,
+                entry.created_at,
+            ),
+        )
+        if await cur.fetchone() is None:
+            await cur.execute(
+                "SELECT document_json FROM cayu_eval_authored_suites WHERE revision = %s",
+                (validated.revision,),
+            )
+            existing = await cur.fetchone()
+            if existing is None or existing[0] != document_text:
+                raise EvalAuthoredSuiteConflict(
+                    f"Authored eval suite revision {validated.revision} has conflicting content."
+                )
+            loaded = await self._load_authored_suite_entry(
+                cur,
+                validated.revision,
+            )
+            assert loaded is not None
+            entry = loaded
+        return entry
+
     async def save_authored_suite(
         self,
         document: EvalSuiteDocument,
@@ -744,92 +824,13 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             document,
             redact_json=redact_json,
         )
-        document_text = payload.decode("utf-8")
-        scenario_cases = authored_suite_scenario_cases(validated)
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    scenario_by_revision: dict[str, EvalScenarioDocumentV2] = {}
-                    if scenario_cases:
-                        await cur.execute(
-                            "SELECT revision, document_json FROM cayu_eval_scenarios "
-                            "WHERE revision = ANY(%s)",
-                            (
-                                list(
-                                    {reference.scenario_revision for _, reference in scenario_cases}
-                                ),
-                            ),
-                        )
-                        scenario_rows = await cur.fetchall()
-                        scenario_by_revision = await asyncio.to_thread(
-                            lambda: {
-                                str(revision): eval_scenario_from_json(scenario_json)
-                                for revision, scenario_json in scenario_rows
-                            }
-                        )
-                    for case, reference in scenario_cases:
-                        validate_authored_suite_scenario(
-                            validated,
-                            case,
-                            scenario_by_revision.get(reference.scenario_revision),
-                        )
-                    created_at = await _database_now(cur)
-                    entry = authored_suite_catalog_entry(
-                        validated,
-                        created_at=created_at,
-                        document_bytes=len(payload),
+                    entry = await self._save_prepared_authored_suite_in_transaction(
+                        cur, validated, payload
                     )
-                    await cur.execute(
-                        """
-                        INSERT INTO cayu_eval_authored_suites (
-                            revision, suite_id, suite_revision, target_key, name,
-                            description, case_count, assertion_count,
-                            simple_input_count, scenario_count, trials,
-                            timeout_seconds, document_json, document_bytes, created_at
-                        ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s
-                        )
-                        ON CONFLICT (revision) DO NOTHING
-                        RETURNING revision
-                        """,
-                        (
-                            entry.revision,
-                            entry.id,
-                            entry.suite_revision,
-                            entry.target_key,
-                            entry.name,
-                            entry.description,
-                            entry.case_count,
-                            entry.assertion_count,
-                            entry.simple_input_count,
-                            entry.scenario_count,
-                            entry.trials,
-                            entry.timeout_seconds,
-                            document_text,
-                            entry.document_bytes,
-                            entry.created_at,
-                        ),
-                    )
-                    if await cur.fetchone() is None:
-                        await cur.execute(
-                            "SELECT document_json FROM cayu_eval_authored_suites "
-                            "WHERE revision = %s",
-                            (validated.revision,),
-                        )
-                        existing = await cur.fetchone()
-                        if existing is None or existing[0] != document_text:
-                            raise EvalAuthoredSuiteConflict(
-                                f"Authored eval suite revision {validated.revision} has "
-                                "conflicting content."
-                            )
-                        loaded = await self._load_authored_suite_entry(
-                            cur,
-                            validated.revision,
-                        )
-                        assert loaded is not None
-                        entry = loaded
                 await conn.commit()
                 return entry
             except BaseException:
@@ -2258,6 +2259,165 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                 raise RuntimeError("Immutable eval result disappeared during a read.")
             document = row[0]
         return await asyncio.to_thread(corpus_execution_result_from_json, document)
+
+    async def load_case_addition(
+        self, destination_selector: str, case_id: str
+    ) -> EvalAdditionRecord | None:
+        from cayu.evals.session_additions import EvalAdditionRecord
+
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT addition.record_json FROM cayu_eval_case_addition_sources AS member JOIN cayu_eval_session_additions AS addition ON addition.operation_id = member.operation_id AND addition.case_id = member.case_id AND addition.case_revision = member.case_revision WHERE member.destination_selector = %s AND member.case_id = %s AND addition.result_revision IS NULL",
+                (destination_selector, case_id),
+            )
+            row = await cur.fetchone()
+            return None if row is None else EvalAdditionRecord.model_validate_json(row[0])
+
+    async def load_result_addition(
+        self, result_revision: str, destination_selector: str
+    ) -> EvalAdditionRecord | None:
+        from cayu.evals.session_additions import EvalAdditionRecord
+
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT record_json FROM cayu_eval_session_additions WHERE result_revision = %s AND destination_selector = %s ORDER BY operation_id LIMIT 1",
+                (result_revision, destination_selector),
+            )
+            row = await cur.fetchone()
+            return None if row is None else EvalAdditionRecord.model_validate_json(row[0])
+
+    async def load_session_addition(self, operation_id: str) -> EvalAdditionRecord | None:
+        from cayu.evals.session_additions import EvalAdditionRecord
+
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT record_json FROM cayu_eval_session_additions WHERE operation_id = %s",
+                (operation_id,),
+            )
+            row = await cur.fetchone()
+            return None if row is None else EvalAdditionRecord.model_validate_json(row[0])
+
+    async def publish_session_addition(
+        self,
+        prepared: PreparedEvalAddition,
+        record: EvalAdditionRecord,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalAdditionRecord:
+        from cayu.evals._addition_publication import prepare_addition_documents, replay_addition
+        from cayu.evals.session_additions import EvalAdditionConflict, EvalAdditionRecord
+
+        documents = await asyncio.to_thread(
+            prepare_addition_documents, prepared, record, redact_json=redact_json
+        )
+        record = documents.record
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    # Unique insertion fences concurrent keys inside the same transaction.
+                    await cur.execute(
+                        "INSERT INTO cayu_eval_session_additions (operation_id, destination_selector, case_id, case_revision, result_revision, record_json, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (operation_id) DO NOTHING RETURNING operation_id",
+                        (
+                            record.receipt.operation_id,
+                            record.receipt.plan.destination.id,
+                            record.receipt.plan.case_id,
+                            record.receipt.plan.case_revision,
+                            record.receipt.plan.captured_result_revision,
+                            record.model_dump_json(),
+                            record.receipt.created_at,
+                        ),
+                    )
+                    if await cur.fetchone() is None:
+                        await cur.execute(
+                            "SELECT record_json FROM cayu_eval_session_additions WHERE operation_id = %s",
+                            (record.receipt.operation_id,),
+                        )
+                        row = await cur.fetchone()
+                        if row is None:
+                            raise EvalAdditionConflict("The operation receipt is unavailable.")
+                        replayed = replay_addition(
+                            EvalAdditionRecord.model_validate_json(row[0]), record
+                        )
+                        await conn.commit()
+                        return replayed
+                    parent = record.receipt.plan.parent
+                    if parent is not None:
+                        if parent.source == "authored":
+                            await cur.execute(
+                                "SELECT 1 FROM cayu_eval_authored_suites WHERE revision = %s AND target_key = %s",
+                                (parent.revision, parent.target_key),
+                            )
+                        else:
+                            await cur.execute(
+                                "SELECT 1 FROM cayu_eval_corpora WHERE revision = %s AND target_key = %s",
+                                (parent.revision, parent.target_key),
+                            )
+                        if await cur.fetchone() is None:
+                            raise EvalAdditionConflict(
+                                "The selected destination is no longer available."
+                            )
+                    now = record.receipt.created_at
+                    if documents.authored is not None:
+                        await self._save_prepared_authored_suite_in_transaction(
+                            cur, *documents.authored
+                        )
+                    if documents.corpus is not None:
+                        corpus, payload, inspection, suites, cases = documents.corpus
+                        await self._save_prepared_corpus_in_transaction(
+                            cur,
+                            corpus=corpus,
+                            document_text=payload.decode(),
+                            document_bytes=len(payload),
+                            inspection=inspection,
+                            suites=suites,
+                            cases=cases,
+                            created_at=now,
+                        )
+                    if documents.captured is not None:
+                        result, payload = documents.captured
+                        await self._save_result_in_transaction(
+                            cur,
+                            result=result,
+                            document_text=payload.decode(),
+                            document_bytes=len(payload),
+                            created_at=now,
+                            fresh_run_id=None,
+                        )
+                    if record.receipt.plan.mode == "case":
+                        destination = record.receipt.plan.destination.id
+                        for (
+                            parent_selector,
+                            child_selector,
+                            members,
+                        ) in documents.inherited_membership_scopes:
+                            await cur.execute(
+                                "SELECT case_id, case_revision, operation_id FROM cayu_eval_case_addition_sources WHERE destination_selector = %s",
+                                (parent_selector,),
+                            )
+                            for case_id, case_revision, operation_id in await cur.fetchall():
+                                if (case_id, case_revision) in members:
+                                    await cur.execute(
+                                        "INSERT INTO cayu_eval_case_addition_sources (destination_selector, case_id, case_revision, operation_id) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                        (child_selector, case_id, case_revision, operation_id),
+                                    )
+                        await cur.execute(
+                            "INSERT INTO cayu_eval_case_addition_sources (destination_selector, case_id, case_revision, operation_id) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            (
+                                destination,
+                                record.receipt.plan.case_id,
+                                record.receipt.plan.case_revision,
+                                record.receipt.operation_id,
+                            ),
+                        )
+                await conn.commit()
+                return record
+            except BaseException:
+                await conn.rollback()
+                raise
 
     async def save_captured_result(
         self,

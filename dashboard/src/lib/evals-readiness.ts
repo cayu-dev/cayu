@@ -7,6 +7,7 @@ export const EVALS_READINESS_OPERATIONS = [
   ["catalog_read", "Catalog"],
   ["catalog_write", "Import and save"],
   ["captured_result_persistence", "Captured results"],
+  ["session_additions", "Add session to suite"],
   ["scenario_conversion", "Production scenarios"],
   ["fresh_launch", "Current-app trials"],
   ["cancellation", "Cancellation"],
@@ -27,6 +28,8 @@ const REASON_TEXT: Record<EvalsReadinessReasonCode, string> = {
     "For mount_cayu, pass access=AuthenticatedAccess(...) and complete durable Evals wiring through evals=EvalsConfig(target=target, store=eval_store), where target is a CorpusTarget for the exact mounted CayuApp.",
   captured_result_persistence_not_available:
     "The configured eval store cannot persist captured results.",
+  session_additions_not_available:
+    "The configured eval store cannot publish session additions atomically.",
   scenario_v2_not_available: "Scenario-v2 conversion is unavailable in this deployment.",
 }
 

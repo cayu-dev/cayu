@@ -162,6 +162,10 @@ def test_openapi_contract_summary_matches_snapshot() -> None:
             "/api/evals/run-views/{run_key}",
         )
     )
+    assert any(
+        parameter["name"] == "placement"
+        for parameter in schema["paths"]["/api/evals/run-views/{run_key}"]["get"]["parameters"]
+    )
     expected = json.loads(_SNAPSHOT_PATH.read_text())
 
     assert _openapi_contract_summary(schema) == expected
@@ -373,6 +377,7 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
         "knowledge_review": {"enabled": False, "unavailable_reason": "not_configured"},
     }
     assert body["capabilities"]["evals_readiness"] == {
+        "session_additions": {"state": "gated", "reason_code": "eval_store_not_configured"},
         "captured_evaluation": {
             "state": "gated",
             "reason_code": "eval_target_not_configured",

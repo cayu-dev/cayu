@@ -5560,6 +5560,165 @@ export type EnvironmentsResponse = {
 };
 
 /**
+ * EvalAdditionCommitRequest
+ */
+export type EvalAdditionCommitRequest = {
+    /**
+     * Assertions
+     */
+    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec> | null;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Name
+     */
+    case_name: string;
+    /**
+     * Destination
+     */
+    destination: ({
+        kind: 'existing';
+    } & EvalExistingDestination) | ({
+        kind: 'new';
+    } & EvalNewDestination);
+    /**
+     * Expected Plan Revision
+     */
+    expected_plan_revision: string;
+    /**
+     * Expected Source Revision
+     */
+    expected_source_revision: string;
+    /**
+     * Mode
+     */
+    mode: 'case' | 'score';
+};
+
+/**
+ * EvalAdditionPlan
+ */
+export type EvalAdditionPlan = {
+    /**
+     * Captured Result Revision
+     */
+    captured_result_revision: string | null;
+    /**
+     * Case Definition
+     */
+    case_definition: {
+        [key: string]: JsonValue;
+    };
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Name
+     */
+    case_name: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    destination: EvalSuiteViewIdentity;
+    /**
+     * Destination Case Count
+     */
+    destination_case_count: number;
+    /**
+     * Execution Case Count
+     */
+    execution_case_count: 1 | null;
+    /**
+     * Membership Changed
+     */
+    membership_changed: boolean;
+    /**
+     * Mode
+     */
+    mode: 'case' | 'score';
+    parent: EvalSuiteViewIdentity | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Source Binding Revision
+     */
+    source_binding_revision: string;
+    /**
+     * Source Revision
+     */
+    source_revision: string;
+};
+
+/**
+ * EvalAdditionReceipt
+ */
+export type EvalAdditionReceipt = {
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    plan: EvalAdditionPlan;
+    /**
+     * Request Revision
+     */
+    request_revision: string;
+};
+
+/**
+ * EvalAdditionRequest
+ */
+export type EvalAdditionRequest = {
+    /**
+     * Assertions
+     */
+    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec> | null;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Name
+     */
+    case_name: string;
+    /**
+     * Destination
+     */
+    destination: ({
+        kind: 'existing';
+    } & EvalExistingDestination) | ({
+        kind: 'new';
+    } & EvalNewDestination);
+    /**
+     * Mode
+     */
+    mode: 'case' | 'score';
+};
+
+/**
+ * EvalAdditionSourceLink
+ */
+export type EvalAdditionSourceLink = {
+    /**
+     * Session Id
+     */
+    session_id: string | null;
+    /**
+     * State
+     */
+    state: 'available' | 'unavailable';
+};
+
+/**
  * EvalAssertionPresentationV1
  */
 export type EvalAssertionPresentationV1 = {
@@ -6670,6 +6829,20 @@ export type EvalExecutionTargetMaterialIdentityV1 = {
 };
 
 /**
+ * EvalExistingDestination
+ */
+export type EvalExistingDestination = {
+    /**
+     * Kind
+     */
+    kind?: 'existing';
+    /**
+     * Selector
+     */
+    selector: string;
+};
+
+/**
  * EvalJudgeCalibrationCriterionLabelV1
  *
  * One human score for an exact rubric criterion.
@@ -7279,6 +7452,24 @@ export type EvalMemorySourceReferenceV1 = {
 };
 
 /**
+ * EvalNewDestination
+ */
+export type EvalNewDestination = {
+    /**
+     * Kind
+     */
+    kind?: 'new';
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+};
+
+/**
  * EvalResultComparisonResponse
  *
  * Shared comparison projection with origin-neutral catalog identities.
@@ -7664,6 +7855,29 @@ export type EvalRunPage = {
 };
 
 /**
+ * EvalRunPlacement
+ */
+export type EvalRunPlacement = {
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    destination: EvalSuiteViewIdentity;
+    /**
+     * Execution Case Count
+     */
+    execution_case_count?: 1;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+};
+
+/**
  * EvalRunRecord
  */
 export type EvalRunRecord = {
@@ -7877,6 +8091,7 @@ export type EvalRunViewMetadata = {
      * Origin
      */
     origin: string;
+    placement?: EvalRunPlacement | null;
     /**
      * Result Revision
      */
@@ -7955,6 +8170,7 @@ export type EvalRunViewSummary = {
      * Origin
      */
     origin: string;
+    placement?: EvalRunPlacement | null;
     /**
      * Result Revision
      */
@@ -9742,7 +9958,7 @@ export type EvalsOperationReadiness = {
     /**
      * Reason Code
      */
-    reason_code: 'evaluation_promotion_not_configured' | 'terminal_evidence_not_supported' | 'session_lineage_not_supported' | 'eval_store_not_configured' | 'eval_target_not_configured' | 'captured_result_persistence_not_available' | 'scenario_v2_not_available' | null;
+    reason_code: 'evaluation_promotion_not_configured' | 'terminal_evidence_not_supported' | 'session_lineage_not_supported' | 'eval_store_not_configured' | 'eval_target_not_configured' | 'captured_result_persistence_not_available' | 'session_additions_not_available' | 'scenario_v2_not_available' | null;
     /**
      * State
      */
@@ -9764,6 +9980,7 @@ export type EvalsReadiness = {
     fresh_launch: EvalsOperationReadiness;
     reports: EvalsOperationReadiness;
     scenario_conversion: EvalsOperationReadiness;
+    session_additions: EvalsOperationReadiness;
 };
 
 /**
@@ -22403,6 +22620,50 @@ export type GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses = {
 
 export type GetEnvironmentApiEnvironmentsEnvironmentNameGetResponse = GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses[keyof GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses];
 
+export type GetSessionAdditionApiEvalsAdditionsOperationIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Operation Id
+         */
+        operation_id: string;
+    };
+    query?: never;
+    url: '/api/evals/additions/{operation_id}';
+};
+
+export type GetSessionAdditionApiEvalsAdditionsOperationIdGetErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetSessionAdditionApiEvalsAdditionsOperationIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalAdditionReceipt;
+};
+
+export type GetSessionAdditionApiEvalsAdditionsOperationIdGetResponse = GetSessionAdditionApiEvalsAdditionsOperationIdGetResponses[keyof GetSessionAdditionApiEvalsAdditionsOperationIdGetResponses];
+
 export type CompareEvalRunsApiEvalsComparisonsPostData = {
     /**
      * EvalComparisonRequest
@@ -23344,6 +23605,10 @@ export type GetRunViewApiEvalsRunViewsRunKeyGetData = {
          */
         compared_with?: string | null;
         /**
+         * Placement
+         */
+        placement?: string | null;
+        /**
          * Case Filter
          */
         case_filter?: 'regressed' | 'improved' | 'failing' | 'flaky' | null;
@@ -24152,6 +24417,100 @@ export type LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostResponses
 
 export type LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostResponse = LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostResponses[keyof LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostResponses];
 
+export type PublishSessionAdditionApiEvalsSessionsSessionIdAdditionsPostData = {
+    body: EvalAdditionCommitRequest;
+    headers: {
+        /**
+         * Idempotency-Key
+         */
+        'Idempotency-Key': string;
+    };
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/evals/sessions/{session_id}/additions';
+};
+
+export type PublishSessionAdditionApiEvalsSessionsSessionIdAdditionsPostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type PublishSessionAdditionApiEvalsSessionsSessionIdAdditionsPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: EvalAdditionReceipt;
+};
+
+export type PublishSessionAdditionApiEvalsSessionsSessionIdAdditionsPostResponse = PublishSessionAdditionApiEvalsSessionsSessionIdAdditionsPostResponses[keyof PublishSessionAdditionApiEvalsSessionsSessionIdAdditionsPostResponses];
+
+export type PreviewSessionAdditionApiEvalsSessionsSessionIdAdditionsPreviewPostData = {
+    body: EvalAdditionRequest;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/evals/sessions/{session_id}/additions/preview';
+};
+
+export type PreviewSessionAdditionApiEvalsSessionsSessionIdAdditionsPreviewPostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type PreviewSessionAdditionApiEvalsSessionsSessionIdAdditionsPreviewPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalAdditionPlan;
+};
+
+export type PreviewSessionAdditionApiEvalsSessionsSessionIdAdditionsPreviewPostResponse = PreviewSessionAdditionApiEvalsSessionsSessionIdAdditionsPreviewPostResponses[keyof PreviewSessionAdditionApiEvalsSessionsSessionIdAdditionsPreviewPostResponses];
+
 export type ExportCapturedEvaluationApiEvalsSessionsSessionIdEvaluationExportPostData = {
     body: CapturedEvaluationExportRequest;
     path: {
@@ -24452,6 +24811,59 @@ export type GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetResponses = {
 };
 
 export type GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetResponse = GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetResponses[keyof GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetResponses];
+
+export type GetAdditionSourceApiEvalsSuiteViewsSuiteKeyCasesCaseIdSourceGetData = {
+    body?: never;
+    path: {
+        /**
+         * Suite Key
+         */
+        suite_key: string;
+        /**
+         * Case Id
+         */
+        case_id: string;
+    };
+    query?: {
+        /**
+         * Result Revision
+         */
+        result_revision?: string | null;
+    };
+    url: '/api/evals/suite-views/{suite_key}/cases/{case_id}/source';
+};
+
+export type GetAdditionSourceApiEvalsSuiteViewsSuiteKeyCasesCaseIdSourceGetErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetAdditionSourceApiEvalsSuiteViewsSuiteKeyCasesCaseIdSourceGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalAdditionSourceLink;
+};
+
+export type GetAdditionSourceApiEvalsSuiteViewsSuiteKeyCasesCaseIdSourceGetResponse = GetAdditionSourceApiEvalsSuiteViewsSuiteKeyCasesCaseIdSourceGetResponses[keyof GetAdditionSourceApiEvalsSuiteViewsSuiteKeyCasesCaseIdSourceGetResponses];
 
 export type ListEvalAuthoredSuitesApiEvalsSuitesGetData = {
     body?: never;

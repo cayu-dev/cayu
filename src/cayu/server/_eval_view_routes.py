@@ -117,6 +117,7 @@ def register_eval_view_routes(
     async def get_run_view(
         run_key: str,
         compared_with: ViewCursor = None,
+        placement: ViewCursor = None,
         case_filter: EvalRunCaseFilter | None = None,
         cases_cursor: ViewCursor = None,
         cases_limit: ViewLimit = 50,
@@ -130,4 +131,13 @@ def register_eval_view_routes(
                 cases_cursor=cases_cursor,
                 cases_limit=cases_limit,
             )
+            if placement is not None:
+                identity = decode_suite_view(placement)
+                view_reader = reader()
+                await view_reader.suite_document(identity)
+                result = result.model_copy(
+                    update={
+                        "run": await view_reader.with_history_scope(result.run, identity),
+                    }
+                )
             return enforce_view_bytes(result, max_result_bytes)

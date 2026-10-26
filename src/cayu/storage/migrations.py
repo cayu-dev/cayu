@@ -554,6 +554,8 @@ REVISIONS: tuple[Revision, ...] = (
     # The size is filled for writers that omit it, so older binaries keep
     # working; session stores require this revision.
     Revision(revision=129, kind=RevisionKind.ADDITIVE, compatible_from=127),
+    # Atomic session additions retain exact replay and nonportable source provenance.
+    Revision(revision=130, kind=RevisionKind.ADDITIVE, compatible_from=127),
 )
 
 #: The revision an empty database is initialized to.

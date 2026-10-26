@@ -689,6 +689,28 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    130: (
+        """CREATE TABLE IF NOT EXISTS cayu_eval_session_additions (
+        operation_id TEXT PRIMARY KEY,
+        destination_selector TEXT NOT NULL,
+        case_id TEXT NOT NULL,
+        case_revision TEXT NOT NULL,
+        result_revision TEXT,
+        record_json TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+    )""",
+        """CREATE INDEX IF NOT EXISTS idx_cayu_eval_additions_destination
+        ON cayu_eval_session_additions(destination_selector, case_id, operation_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_cayu_eval_additions_result
+        ON cayu_eval_session_additions(result_revision, operation_id)""",
+        """CREATE TABLE IF NOT EXISTS cayu_eval_case_addition_sources (
+        destination_selector TEXT NOT NULL,
+        case_id TEXT NOT NULL,
+        case_revision TEXT NOT NULL,
+        operation_id TEXT NOT NULL REFERENCES cayu_eval_session_additions(operation_id),
+        PRIMARY KEY (destination_selector, case_id, case_revision)
+    )""",
+    ),
     129: (
         "ALTER TABLE cayu_transcript_messages ADD COLUMN IF NOT EXISTS message_bytes BIGINT",
         """

@@ -3135,6 +3135,7 @@ if TYPE_CHECKING:
         EvalViewIndexPage,
         EvalViewQuery,
     )
+    from cayu.evals.session_additions import EvalAdditionRecord, PreparedEvalAddition
     from cayu.storage.retention import (
         EvalRetentionPolicy,
         RetentionAuditRecord,
@@ -3148,6 +3149,44 @@ class EvalStore(ABC):
     """Bounded persistence for public eval corpora, run state, and safe results."""
 
     durable: ClassVar[bool] = False
+    session_additions: ClassVar[bool] = False
+
+    async def publish_session_addition(
+        self,
+        prepared: PreparedEvalAddition,
+        record: EvalAdditionRecord,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalAdditionRecord:
+        """Atomically publish trusted capture material, membership and exact replay receipt.
+
+        The prepared handoff is internal; portable source fields do not authorize it.
+        Custom stores opt in only when all publication/read methods are implemented.
+        """
+        raise NotImplementedError("Session additions are unavailable.")
+
+    async def load_case_addition(
+        self, destination_selector: str, case_id: str
+    ) -> EvalAdditionRecord | None:
+        """Resolve exact membership to its original private source publication.
+
+        Trusted child publications retain associations for unchanged case IDs and
+        revisions, including other suites in a changed corpus. The returned receipt
+        retains its original destination; lookup scope is owned by this association.
+        Portable imports and scored placements cannot mint membership associations.
+        """
+        raise NotImplementedError("Session additions are unavailable.")
+
+    async def load_result_addition(
+        self, result_revision: str, destination_selector: str
+    ) -> EvalAdditionRecord | None:
+        """Resolve one explicit bounded destination association; no inferred membership."""
+        raise NotImplementedError("Session additions are unavailable.")
+
+    async def load_session_addition(self, operation_id: str) -> EvalAdditionRecord | None:
+        """Load one private operation record, including exact expected request material."""
+        raise NotImplementedError("Session additions are unavailable.")
+
     captured_results: ClassVar[bool] = False
     scenarios: ClassVar[bool] = False
     scenario_execution: ClassVar[bool] = False
@@ -3724,6 +3763,7 @@ class InMemoryEvalStore(EvalStore):
     """Explicitly ephemeral EvalStore for tests and process-local SDK use."""
 
     durable: ClassVar[bool] = False
+    session_additions: ClassVar[bool] = True
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
@@ -3732,6 +3772,123 @@ class InMemoryEvalStore(EvalStore):
     judge_calibrations: ClassVar[bool] = True
 
     suite_views: ClassVar[bool] = True
+
+    async def load_case_addition(
+        self, destination_selector: str, case_id: str
+    ) -> EvalAdditionRecord | None:
+        from cayu.evals.session_additions import EvalAdditionRecord
+
+        async with self._lock:
+            association = self._case_addition_sources.get((destination_selector, case_id))
+            if association is None:
+                return None
+            case_revision, operation_id = association
+            record = EvalAdditionRecord.model_validate_json(self._session_additions[operation_id])
+            plan = record.receipt.plan
+            if (
+                plan.mode == "case"
+                and plan.case_id == case_id
+                and plan.case_revision == case_revision
+            ):
+                return record
+        return None
+
+    async def load_result_addition(
+        self, result_revision: str, destination_selector: str
+    ) -> EvalAdditionRecord | None:
+        from cayu.evals.session_additions import EvalAdditionRecord
+
+        async with self._lock:
+            for operation_id in sorted(self._session_additions):
+                record = EvalAdditionRecord.model_validate_json(
+                    self._session_additions[operation_id]
+                )
+                if (
+                    record.receipt.plan.captured_result_revision == result_revision
+                    and record.receipt.plan.destination.id == destination_selector
+                ):
+                    return record
+        return None
+
+    async def load_session_addition(self, operation_id: str) -> EvalAdditionRecord | None:
+        from cayu.evals.session_additions import EvalAdditionRecord
+
+        async with self._lock:
+            payload = self._session_additions.get(operation_id)
+            return None if payload is None else EvalAdditionRecord.model_validate_json(payload)
+
+    async def publish_session_addition(
+        self,
+        prepared: PreparedEvalAddition,
+        record: EvalAdditionRecord,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalAdditionRecord:
+        from cayu.evals._addition_publication import prepare_addition_documents, replay_addition
+        from cayu.evals.session_additions import EvalAdditionConflict, EvalAdditionRecord
+
+        documents = prepare_addition_documents(prepared, record, redact_json=redact_json)
+        record = documents.record
+        operation_id = record.receipt.operation_id
+        async with self._lock:
+            existing = self._session_additions.get(operation_id)
+            if existing is not None:
+                return replay_addition(EvalAdditionRecord.model_validate_json(existing), record)
+            parent = record.receipt.plan.parent
+            if parent is not None:
+                parents = (
+                    self._authored_suite_documents
+                    if parent.source == "authored"
+                    else self._corpus_documents
+                )
+                if parent.revision not in parents:
+                    raise EvalAdditionConflict("The selected destination is no longer available.")
+            # No await occurs after taking these snapshots. Restore every affected map
+            # on any failure, including a late receipt serialization/publication failure.
+            names = (
+                "_authored_suite_documents",
+                "_authored_suites",
+                "_corpus_documents",
+                "_corpora",
+                "_suites",
+                "_cases",
+                "_results",
+                "_session_additions",
+                "_case_addition_sources",
+            )
+            before = {name: getattr(self, name).copy() for name in names}
+            try:
+                now = record.receipt.created_at
+                if documents.authored is not None:
+                    self._save_prepared_authored_suite(*documents.authored)
+                if documents.corpus is not None:
+                    corpus, payload, _, suites, cases = documents.corpus
+                    self._save_prepared_corpus(corpus, payload, suites, cases, created_at=now)
+                if documents.captured is not None:
+                    self._save_result_document(*documents.captured, created_at=now)
+                self._session_additions[operation_id] = record.model_dump_json()
+                if record.receipt.plan.mode == "case":
+                    destination = record.receipt.plan.destination.id
+                    for (
+                        parent_selector,
+                        child_selector,
+                        members,
+                    ) in documents.inherited_membership_scopes:
+                        for case_id, case_revision in members:
+                            inherited = self._case_addition_sources.get((parent_selector, case_id))
+                            if inherited is not None and inherited[0] == case_revision:
+                                self._case_addition_sources.setdefault(
+                                    (child_selector, case_id), inherited
+                                )
+                    self._case_addition_sources.setdefault(
+                        (destination, record.receipt.plan.case_id),
+                        (record.receipt.plan.case_revision, operation_id),
+                    )
+            except BaseException:
+                for name, value in before.items():
+                    setattr(self, name, value)
+                raise
+            return record.model_copy(deep=True)
 
     async def list_view_index(self, query: EvalViewQuery) -> EvalViewIndexPage:
         from cayu.evals.read_views import (
@@ -3809,6 +3966,31 @@ class InMemoryEvalStore(EvalStore):
                                     created_at=record.created_at,
                                 )
                             )
+                from cayu.evals.session_additions import EvalAdditionRecord
+
+                present = {(item.source, item.revision) for item in items}
+                for payload in self._session_additions.values():
+                    addition = EvalAdditionRecord.model_validate_json(payload)
+                    plan = addition.receipt.plan
+                    state = (
+                        None
+                        if plan.captured_result_revision is None
+                        else self._results.get(plan.captured_result_revision)
+                    )
+                    if (
+                        plan.destination == scope
+                        and state is not None
+                        and ("result", state.record.revision) not in present
+                    ):
+                        items.append(
+                            EvalViewIndexEntry(
+                                source="result",
+                                revision=state.record.revision,
+                                created_at=state.record.created_at,
+                                target_key=state.record.target.target_key,
+                            )
+                        )
+                        present.add(("result", state.record.revision))
             items.sort(key=lambda item: item.key)
             if query.suite is not None:
                 items.sort(key=lambda item: item.created_at, reverse=True)
@@ -3934,6 +4116,8 @@ class InMemoryEvalStore(EvalStore):
         self._results: dict[str, _MemoryEvalResultState] = {}
         self._baselines: dict[tuple[str, str, str], EvalBaselineRecord] = {}
         self._baseline_mutations: dict[str, EvalBaselineMutationRecord] = {}
+        self._session_additions: dict[str, str] = {}
+        self._case_addition_sources: dict[tuple[str, str], tuple[str, str]] = {}
 
     def _now(self) -> datetime:
         return _aware_utc(self._clock(), "clock result")
@@ -4105,48 +4289,47 @@ class InMemoryEvalStore(EvalStore):
                 ]
             return _bounded_scenario_page(items, query)
 
+    def _save_prepared_authored_suite(self, validated, payload):
+        scenario_cases = authored_suite_scenario_cases(validated)
+        scenario_by_revision: dict[str, EvalScenarioDocumentV2] = {}
+        revisions = {reference.scenario_revision for _, reference in scenario_cases}
+        for revision in revisions:
+            scenario_payload = self._scenario_documents.get(revision)
+            if scenario_payload is not None:
+                scenario_by_revision[revision] = eval_scenario_from_json(
+                    scenario_payload.decode("utf-8")
+                )
+        for case, reference in scenario_cases:
+            validate_authored_suite_scenario(
+                validated,
+                case,
+                scenario_by_revision.get(reference.scenario_revision),
+            )
+        existing = self._authored_suite_documents.get(validated.revision)
+        if existing is not None:
+            if existing != payload:
+                raise EvalAuthoredSuiteConflict(
+                    f"Authored eval suite revision {validated.revision} has conflicting content."
+                )
+            return self._authored_suites[validated.revision].model_copy(deep=True)
+        entry = authored_suite_catalog_entry(
+            validated,
+            created_at=self._now(),
+            document_bytes=len(payload),
+        )
+        self._authored_suite_documents[validated.revision] = payload
+        self._authored_suites[validated.revision] = entry
+        return entry.model_copy(deep=True)
+
     async def save_authored_suite(
         self,
         document: EvalSuiteDocument,
         *,
         redact_json: Callable[[Any], Any],
     ) -> EvalAuthoredSuiteCatalogEntry:
-        validated, payload = _prepare_authored_suite_for_store(
-            document,
-            redact_json=redact_json,
-        )
+        validated, payload = _prepare_authored_suite_for_store(document, redact_json=redact_json)
         async with self._lock:
-            scenario_cases = authored_suite_scenario_cases(validated)
-            scenario_by_revision: dict[str, EvalScenarioDocumentV2] = {}
-            revisions = {reference.scenario_revision for _, reference in scenario_cases}
-            for revision in revisions:
-                scenario_payload = self._scenario_documents.get(revision)
-                if scenario_payload is not None:
-                    scenario_by_revision[revision] = eval_scenario_from_json(
-                        scenario_payload.decode("utf-8")
-                    )
-            for case, reference in scenario_cases:
-                validate_authored_suite_scenario(
-                    validated,
-                    case,
-                    scenario_by_revision.get(reference.scenario_revision),
-                )
-            existing = self._authored_suite_documents.get(validated.revision)
-            if existing is not None:
-                if existing != payload:
-                    raise EvalAuthoredSuiteConflict(
-                        f"Authored eval suite revision {validated.revision} has "
-                        "conflicting content."
-                    )
-                return self._authored_suites[validated.revision].model_copy(deep=True)
-            entry = authored_suite_catalog_entry(
-                validated,
-                created_at=self._now(),
-                document_bytes=len(payload),
-            )
-            self._authored_suite_documents[validated.revision] = payload
-            self._authored_suites[validated.revision] = entry
-            return entry.model_copy(deep=True)
+            return self._save_prepared_authored_suite(validated, payload)
 
     async def load_authored_suite(
         self,

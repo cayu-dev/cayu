@@ -45,7 +45,7 @@ def test_revision_129_is_additive_and_required_by_session_stores() -> None:
     revision = schema.revision(129)
     assert revision.kind is schema.RevisionKind.ADDITIVE
     assert revision.compatible_from == schema.revision(128).compatible_from
-    assert schema.LATEST_REVISION == 129
+    assert revision.revision <= schema.LATEST_REVISION
     assert sqlite._SQLITE_SESSION_MIN_REQUIRED_REVISION == 129
     assert postgres._POSTGRES_SESSION_MIN_REQUIRED_REVISION == 129
 

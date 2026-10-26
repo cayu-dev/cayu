@@ -16,6 +16,7 @@ from cayu.evals.read_views import (
     EvalCaseResultReference,
     EvalCaseView,
     EvalRunCaseFilter,
+    EvalRunPlacement,
     EvalRunViewDetail,
     EvalRunViewMetadata,
     EvalRunViewSnapshot,
@@ -332,8 +333,7 @@ class EvalViewReader:
             ),
         )
 
-    @staticmethod
-    def require_history_scope(run: EvalRunViewMetadata, identity: EvalSuiteViewIdentity) -> None:
+    async def with_history_scope(self, run: EvalRunViewMetadata, identity: EvalSuiteViewIdentity):
         matches = (
             run.suite == identity
             if identity.source == "corpus"
@@ -342,8 +342,35 @@ class EvalViewReader:
                 and run.authored_suite_revision == identity.revision
             )
         )
-        if not matches:
+        if matches:
+            return run
+        association = (
+            await self.store.load_result_addition(run.result_revision, identity.id)
+            if self.store.session_additions and run.result_revision is not None
+            else None
+        )
+        if association is None:
             raise HTTPException(status_code=409, detail="Eval history identity mismatch.")
+        plan = association.receipt.plan
+        if (
+            plan.mode != "score"
+            or plan.destination != identity
+            or plan.captured_result_revision != run.result_revision
+            or plan.execution_case_count != 1
+            or run.origin != "captured_session"
+            or run.suite.target_key != identity.target_key
+        ):
+            raise HTTPException(status_code=409, detail="Eval destination association is invalid.")
+        return run.model_copy(
+            update={
+                "placement": EvalRunPlacement(
+                    destination=identity,
+                    operation_id=association.receipt.operation_id,
+                    case_id=plan.case_id,
+                    case_revision=plan.case_revision,
+                )
+            }
+        )
 
     async def suite_summary(self, identity: EvalSuiteViewIdentity) -> EvalSuiteViewSummary:
         suite, cases = await self.suite_document(identity)
@@ -356,7 +383,7 @@ class EvalViewReader:
             last = (
                 await self.run_detail(run_view_id(item.source, item.revision), cases_limit=1)
             ).run
-            self.require_history_scope(last, identity)
+            last = await self.with_history_scope(last, identity)
         return EvalSuiteViewSummary(
             id=identity.id,
             identity=identity,
@@ -415,8 +442,7 @@ class EvalViewReader:
         runs = []
         for item in history.items:
             detail = await self.run_detail(run_view_id(item.source, item.revision), cases_limit=1)
-            self.require_history_scope(detail.run, identity)
-            runs.append(detail.run)
+            runs.append(await self.with_history_scope(detail.run, identity))
         page = case_page(
             [case_view(case) for case in definitions],
             scope=identity.id,
@@ -449,7 +475,7 @@ class EvalViewReader:
                 detail = await self.run_detail(
                     run_view_id(item.source, item.revision), cases_limit=1000
                 )
-                self.require_history_scope(detail.run, identity)
+                await self.with_history_scope(detail.run, identity)
                 outcome = next(
                     (
                         item.presentation

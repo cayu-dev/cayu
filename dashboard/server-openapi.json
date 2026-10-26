@@ -11360,6 +11360,492 @@
         "title": "EnvironmentsResponse",
         "type": "object"
       },
+      "EvalAdditionCommitRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "assertions": {
+            "anyOf": [
+              {
+                "items": {
+                  "discriminator": {
+                    "mapping": {
+                      "artifact": "#/components/schemas/ArtifactAssertionSpec",
+                      "child_status": "#/components/schemas/ChildStatusAssertionSpec",
+                      "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
+                      "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
+                      "max_estimated_cost": "#/components/schemas/MaxEstimatedCostAssertionSpec",
+                      "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
+                      "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
+                      "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                      "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
+                      "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                      "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                      "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
+                      "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                      "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionSpec",
+                      "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
+                      "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                      "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
+                      "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
+                      "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                      "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
+                    },
+                    "propertyName": "kind"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RootStatusAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ChildStatusAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/FinalOutputEqualsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/FinalOutputContainsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MaxModelStepsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/UsageRecordedAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MaxTotalTokensAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StructuredModelJudgeAssertionSpec"
+                    }
+                  ]
+                },
+                "maxItems": 1000,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assertions"
+          },
+          "case_id": {
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Case Name",
+            "type": "string"
+          },
+          "destination": {
+            "discriminator": {
+              "mapping": {
+                "existing": "#/components/schemas/EvalExistingDestination",
+                "new": "#/components/schemas/EvalNewDestination"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EvalExistingDestination"
+              },
+              {
+                "$ref": "#/components/schemas/EvalNewDestination"
+              }
+            ],
+            "title": "Destination"
+          },
+          "expected_plan_revision": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Plan Revision",
+            "type": "string"
+          },
+          "expected_source_revision": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Source Revision",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "case",
+              "score"
+            ],
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "destination",
+          "case_id",
+          "case_name",
+          "expected_plan_revision",
+          "expected_source_revision"
+        ],
+        "title": "EvalAdditionCommitRequest",
+        "type": "object"
+      },
+      "EvalAdditionPlan": {
+        "additionalProperties": false,
+        "properties": {
+          "captured_result_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Captured Result Revision"
+          },
+          "case_definition": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Case Definition",
+            "type": "object"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_name": {
+            "title": "Case Name",
+            "type": "string"
+          },
+          "case_revision": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "destination": {
+            "$ref": "#/components/schemas/EvalSuiteViewIdentity"
+          },
+          "destination_case_count": {
+            "minimum": 1.0,
+            "title": "Destination Case Count",
+            "type": "integer"
+          },
+          "execution_case_count": {
+            "anyOf": [
+              {
+                "const": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Case Count"
+          },
+          "membership_changed": {
+            "title": "Membership Changed",
+            "type": "boolean"
+          },
+          "mode": {
+            "enum": [
+              "case",
+              "score"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "parent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteViewIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Revision",
+            "type": "string"
+          },
+          "source_binding_revision": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Source Binding Revision",
+            "type": "string"
+          },
+          "source_revision": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Source Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "mode",
+          "source_revision",
+          "source_binding_revision",
+          "parent",
+          "destination",
+          "case_id",
+          "case_revision",
+          "case_name",
+          "case_definition",
+          "destination_case_count",
+          "membership_changed",
+          "execution_case_count",
+          "captured_result_revision"
+        ],
+        "title": "EvalAdditionPlan",
+        "type": "object"
+      },
+      "EvalAdditionReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "plan": {
+            "$ref": "#/components/schemas/EvalAdditionPlan"
+          },
+          "request_revision": {
+            "title": "Request Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "request_revision",
+          "plan",
+          "created_at"
+        ],
+        "title": "EvalAdditionReceipt",
+        "type": "object"
+      },
+      "EvalAdditionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "assertions": {
+            "anyOf": [
+              {
+                "items": {
+                  "discriminator": {
+                    "mapping": {
+                      "artifact": "#/components/schemas/ArtifactAssertionSpec",
+                      "child_status": "#/components/schemas/ChildStatusAssertionSpec",
+                      "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
+                      "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
+                      "max_estimated_cost": "#/components/schemas/MaxEstimatedCostAssertionSpec",
+                      "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
+                      "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
+                      "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                      "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
+                      "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                      "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                      "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
+                      "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                      "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionSpec",
+                      "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
+                      "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                      "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
+                      "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
+                      "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                      "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
+                    },
+                    "propertyName": "kind"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RootStatusAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ChildStatusAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/FinalOutputEqualsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/FinalOutputContainsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MaxModelStepsAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/UsageRecordedAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MaxTotalTokensAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StructuredModelJudgeAssertionSpec"
+                    }
+                  ]
+                },
+                "maxItems": 1000,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assertions"
+          },
+          "case_id": {
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Case Name",
+            "type": "string"
+          },
+          "destination": {
+            "discriminator": {
+              "mapping": {
+                "existing": "#/components/schemas/EvalExistingDestination",
+                "new": "#/components/schemas/EvalNewDestination"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EvalExistingDestination"
+              },
+              {
+                "$ref": "#/components/schemas/EvalNewDestination"
+              }
+            ],
+            "title": "Destination"
+          },
+          "mode": {
+            "enum": [
+              "case",
+              "score"
+            ],
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "destination",
+          "case_id",
+          "case_name"
+        ],
+        "title": "EvalAdditionRequest",
+        "type": "object"
+      },
+      "EvalAdditionSourceLink": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "state": {
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "state"
+        ],
+        "title": "EvalAdditionSourceLink",
+        "type": "object"
+      },
       "EvalAssertionPresentationV1": {
         "additionalProperties": false,
         "properties": {
@@ -13968,6 +14454,28 @@
         "title": "EvalExecutionTargetMaterialIdentityV1",
         "type": "object"
       },
+      "EvalExistingDestination": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "existing",
+            "default": "existing",
+            "title": "Kind",
+            "type": "string"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "EvalExistingDestination",
+        "type": "object"
+      },
       "EvalJudgeCalibrationCriterionLabelV1": {
         "additionalProperties": false,
         "description": "One human score for an exact rubric criterion.",
@@ -15062,6 +15570,34 @@
         "title": "EvalMemorySourceReferenceV1",
         "type": "object"
       },
+      "EvalNewDestination": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "new",
+            "default": "new",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "suite_id": {
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Suite Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "suite_id",
+          "name"
+        ],
+        "title": "EvalNewDestination",
+        "type": "object"
+      },
       "EvalResultComparisonResponse": {
         "additionalProperties": false,
         "description": "Shared comparison projection with origin-neutral catalog identities.",
@@ -15874,6 +16410,40 @@
         "title": "EvalRunPage",
         "type": "object"
       },
+      "EvalRunPlacement": {
+        "additionalProperties": false,
+        "properties": {
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "destination": {
+            "$ref": "#/components/schemas/EvalSuiteViewIdentity"
+          },
+          "execution_case_count": {
+            "const": 1,
+            "default": 1,
+            "title": "Execution Case Count",
+            "type": "integer"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "destination",
+          "operation_id",
+          "case_id",
+          "case_revision"
+        ],
+        "title": "EvalRunPlacement",
+        "type": "object"
+      },
       "EvalRunRecord": {
         "additionalProperties": false,
         "properties": {
@@ -16353,6 +16923,16 @@
             "title": "Origin",
             "type": "string"
           },
+          "placement": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunPlacement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "result_revision": {
             "anyOf": [
               {
@@ -16571,6 +17151,16 @@
           "origin": {
             "title": "Origin",
             "type": "string"
+          },
+          "placement": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunPlacement"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "result_revision": {
             "anyOf": [
@@ -20128,6 +20718,7 @@
                   "eval_store_not_configured",
                   "eval_target_not_configured",
                   "captured_result_persistence_not_available",
+                  "session_additions_not_available",
                   "scenario_v2_not_available"
                 ],
                 "type": "string"
@@ -20185,6 +20776,9 @@
           },
           "scenario_conversion": {
             "$ref": "#/components/schemas/EvalsOperationReadiness"
+          },
+          "session_additions": {
+            "$ref": "#/components/schemas/EvalsOperationReadiness"
           }
         },
         "required": [
@@ -20192,6 +20786,7 @@
           "catalog_read",
           "catalog_write",
           "captured_result_persistence",
+          "session_additions",
           "scenario_conversion",
           "fresh_launch",
           "cancellation",
@@ -35439,7 +36034,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "64",
+            "default": "65",
             "title": "Contract Version",
             "type": "string"
           },
@@ -42855,7 +43450,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "64",
+            "default": "65",
             "title": "Contract Version",
             "type": "string"
           }
@@ -44449,6 +45044,50 @@
         "summary": "Get Environment"
       }
     },
+    "/api/evals/additions/{operation_id}": {
+      "get": {
+        "operationId": "get_session_addition_api_evals_additions__operation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalAdditionReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Session Addition"
+      }
+    },
     "/api/evals/comparisons": {
       "post": {
         "operationId": "compare_eval_runs_api_evals_comparisons_post",
@@ -45611,6 +46250,23 @@
           },
           {
             "in": "query",
+            "name": "placement",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Placement"
+            }
+          },
+          {
+            "in": "query",
             "name": "case_filter",
             "required": false,
             "schema": {
@@ -46729,6 +47385,125 @@
         "summary": "Launch Eval Scenario"
       }
     },
+    "/api/evals/sessions/{session_id}/additions": {
+      "post": {
+        "operationId": "publish_session_addition_api_evals_sessions__session_id__additions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalAdditionCommitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalAdditionReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Publish Session Addition"
+      }
+    },
+    "/api/evals/sessions/{session_id}/additions/preview": {
+      "post": {
+        "operationId": "preview_session_addition_api_evals_sessions__session_id__additions_preview_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalAdditionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalAdditionPlan"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Preview Session Addition"
+      }
+    },
     "/api/evals/sessions/{session_id}/evaluation/export": {
       "post": {
         "operationId": "export_captured_evaluation_api_evals_sessions__session_id__evaluation_export_post",
@@ -47155,6 +47930,75 @@
           }
         },
         "summary": "Get Suite View"
+      }
+    },
+    "/api/evals/suite-views/{suite_key}/cases/{case_id}/source": {
+      "get": {
+        "operationId": "get_addition_source_api_evals_suite_views__suite_key__cases__case_id__source_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "suite_key",
+            "required": true,
+            "schema": {
+              "title": "Suite Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result_revision",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Result Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalAdditionSourceLink"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Addition Source"
       }
     },
     "/api/evals/suites": {

@@ -47,7 +47,10 @@ def view_index_sql(query: EvalViewQuery, *, postgres: bool) -> tuple[str, tuple[
         else:
             predicate = "target_key = ? AND corpus_revision = ? AND suite_id = ?"
             params.extend((query.target_key, scope.revision, scope.suite_id))
-        union = f"""SELECT 'run' AS source, run_id AS revision, NULL AS suite_id, created_at, target_key,
+        # UNION deduplicates by projected identity before the outer keyset sort.
+        # A linguistic default must not collapse distinct run IDs such as Zed/zed.
+        identity_collation = '"C"' if postgres else "BINARY"
+        union = f"""SELECT 'run' AS source, run_id COLLATE {identity_collation} AS revision, NULL AS suite_id, created_at, target_key,
                     'run:' || run_id || ':' AS sort_key FROM cayu_eval_runs WHERE {predicate}"""
         if scope.source == "corpus":
             union += """ UNION ALL
@@ -59,6 +62,18 @@ def view_index_sql(query: EvalViewQuery, *, postgres: bool) -> tuple[str, tuple[
                                   WHERE runs.result_revision = records.revision)
             """
             params.extend((query.target_key, scope.revision, scope.suite_id))
+        # An explicit atomic addition admits captured execution into destination
+        # history. UNION deduplicates the same immutable result across receipts.
+        union += """ UNION
+            SELECT 'result', records.revision, NULL, records.created_at, records.target_key,
+                   'result:' || records.revision || ':'
+            FROM cayu_eval_session_additions AS additions
+            JOIN cayu_eval_result_records AS records ON records.revision = additions.result_revision
+            WHERE additions.destination_selector = ? AND records.target_key = ?
+              AND NOT EXISTS (SELECT 1 FROM cayu_eval_runs AS runs
+                              WHERE runs.result_revision = records.revision)
+        """
+        params.extend((scope.id, scope.target_key))
 
     # Cursor validation uses Python lexical order, independent of DB locale.
     sort_key = 'sort_key COLLATE "C"' if postgres else "sort_key"

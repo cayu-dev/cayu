@@ -178,6 +178,7 @@ from cayu.server._corpus_routes import (
     register_corpus_management_routes,
 )
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
+from cayu.server._eval_addition_routes import register_eval_addition_routes
 from cayu.server._eval_view_routes import register_eval_view_routes
 from cayu.server._evaluation_promotion_routes import register_evaluation_promotion_routes
 from cayu.server._evaluation_result_routes import register_evaluation_result_routes
@@ -4591,6 +4592,8 @@ def create_router(
         session_lineage_supported=session_store.supports_session_lineage,
         session_supervision_events_supported=session_store.supports_supervision_events,
         eval_suite_views_supported=eval_runtime is not None and eval_runtime.store.suite_views,
+        eval_session_additions_supported=eval_runtime is not None
+        and eval_runtime.store.session_additions,
         evals_configured=eval_runtime is not None,
         eval_store_configured=(
             eval_runtime is not None
@@ -5015,7 +5018,7 @@ def create_router(
 
     if eval_registry is not None:
         captured_eval_store = None if eval_runtime is None else eval_runtime.store
-        _require_current_captured_candidate = register_captured_evaluation_routes(
+        _captured_source = register_captured_evaluation_routes(
             bounded_evals_router,
             bounded_captured_evaluation_router,
             cayu_app=cayu_app,
@@ -5023,6 +5026,13 @@ def create_router(
             captured_eval_store=captured_eval_store,
             resolve_public_session_id=_resolve_public_session_id,
             protected=protected,
+        )
+
+        register_eval_addition_routes(
+            bounded_captured_evaluation_router,
+            store=captured_eval_store,
+            source=_captured_source,
+            optional_auth_context=optional_auth_context,
         )
 
         register_evaluation_result_routes(
@@ -5050,7 +5060,7 @@ def create_router(
             cayu_app=cayu_app,
             eval_store=eval_store,
             active_eval_registry=active_eval_registry,
-            require_current_captured_candidate=_require_current_captured_candidate,
+            require_current_captured_candidate=_captured_source.require_current,
             protected=protected,
             optional_auth_context=optional_auth_context,
         )
