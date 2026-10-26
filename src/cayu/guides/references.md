@@ -81,14 +81,17 @@ class LookupTool(Tool):
         description="Look up one reviewed record.",
         input_schema={
             "type": "object",
-            "properties": {"query": {"type": "string"}},
+            "properties": {"query": {"type": "string", "maxLength": 8192}},
             "required": ["query"],
             "additionalProperties": False,
         },
         effect=ToolEffect.NONE,
+        max_terminal_payload_bytes=64 * 1024,
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        if len(args["query"]) > 8192:
+            return ToolResult(content="Input exceeds the 8192-character limit.", is_error=True)
         return ToolResult(
             content=f"Found {args['query']}",
             structured={"session_id": ctx.session_id},

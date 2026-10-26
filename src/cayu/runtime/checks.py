@@ -42,6 +42,7 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
     "TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED",
     "TOOL_APPROVAL_VALIDITY_RULE",
+    "TOOL_TERMINAL_PAYLOAD_UNBOUNDED",
 )
 # Every code `check_public_service_deployment` reports. `cayu serve` refuses to start a
 # production public service while any of them is reported.
@@ -427,6 +428,31 @@ def check_manifest(
                         verification_command=(
                             "cayu inspect --json && cayu check --fail-on warning --json"
                         ),
+                    )
+                )
+            if tool._terminal_payload_bound_undeclared:
+                diagnostics.append(
+                    ProjectDiagnostic(
+                        code="TOOL_TERMINAL_PAYLOAD_UNBOUNDED",
+                        severity=DiagnosticSeverity.WARNING,
+                        subject=f"tool:{agent.name}/{tool.name}",
+                        path=f"agents.{agent.name}.tools.{tool.name}.max_terminal_payload_bytes",
+                        message=(
+                            f"Tool '{tool.name}' declares no max_terminal_payload_bytes, so "
+                            "every deferred round that calls it takes all terminal publication "
+                            "capacity in the process and other sessions' tool rounds wait "
+                            "for it."
+                        ),
+                        hint=(
+                            "Declare ToolSpec(max_terminal_payload_bytes=...) as the largest "
+                            "result the tool returns, between 64 KiB and 1,984 KiB."
+                        ),
+                        tags=("authoring", "deploy"),
+                        parameters={"agent": agent.name, "tool": tool.name},
+                        documentation_anchor=(
+                            "cayu guide diagnostics#tool-terminal-payload-unbounded"
+                        ),
+                        verification_command="cayu check --fail-on warning --json",
                     )
                 )
             if (

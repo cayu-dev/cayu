@@ -31,16 +31,19 @@ class IssueRefund(Tool):
         description="Refund an order.",
         input_schema={
             "type": "object",
-            "properties": {"order_id": {"type": "string"}},
+            "properties": {"order_id": {"type": "string", "maxLength": 256}},
             "required": ["order_id"],
         },
         effect=ToolEffect.IDEMPOTENT,
+        max_terminal_payload_bytes=64 * 1024,
         execution_profile_identity=ExecutionProfileBehaviorIdentity(
             name="issue_refund", behavior_version="1", implementation_version="1"
         ),
     )
 
     async def run(self, ctx, args):
+        if len(args["order_id"]) > 256:
+            return ToolResult(content="Input exceeds the 256-character limit.", is_error=True)
         REFUNDS.append(args["order_id"])
         return ToolResult(content=f"Refunded {args['order_id']}.")
 

@@ -2011,3 +2011,34 @@ apply_slice_plan(plan)
         for path in state.rglob("*")
         if path.is_file()
     }
+
+
+@pytest.mark.parametrize("generator", ["slice", "first_tool"])
+def test_generated_echo_tool_enforces_its_terminal_payload_bound(generator):
+    import asyncio
+
+    from jsonschema import Draft202012Validator
+
+    from cayu.cli.generate import _first_tool_files, _slice_files
+    from cayu.tools._terminal_bounds import tool_result_payload_bytes
+
+    files = (
+        _slice_files(name="demo", tool_name="echo", effect="none")
+        if generator == "slice"
+        else _first_tool_files(agent_name="demo", tool_name="echo", effect="none")
+    )
+    namespace = {"__name__": "generated_echo"}
+    exec(files["tools/echo.py"], namespace)
+    tool = namespace["EchoTool"]()
+    validator = Draft202012Validator(tool.spec.input_schema)
+    for text in ("x" * 8192, "\x01" * 8192, "🌍" * 8192):
+        validator.validate({"input": text})
+        result = asyncio.run(tool.run(None, {"input": text}))
+        assert not result.is_error
+        assert result.content == f"echo: {text}"
+        assert tool_result_payload_bytes(result) <= tool.spec.max_terminal_payload_bytes
+    oversized = "x" * 70000
+    assert list(validator.iter_errors({"input": oversized}))
+    result = asyncio.run(tool.run(None, {"input": oversized}))
+    assert result.is_error
+    assert tool_result_payload_bytes(result) <= tool.spec.max_terminal_payload_bytes

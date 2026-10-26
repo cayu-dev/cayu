@@ -134,6 +134,23 @@ properties, required fields, and `additionalProperties` behavior in
 public `Tool.schema` property; Cayu treats that property as authoritative when
 the tool is registered.
 
+## tool-terminal-payload-unbounded
+
+`TOOL_TERMINAL_PAYLOAD_UNBOUNDED` means an application's own tool declares no
+`ToolSpec.max_terminal_payload_bytes`. Cayu reserves the declared size of each
+deferred tool round from terminal publication capacity shared by every session
+in the process. A round that calls a tool without a declaration takes all of
+that capacity alone, so those rounds run one at a time and other sessions'
+rounds wait for them; under concurrent load they can wait until the 600-second
+admission deadline fails them with `ToolRoundAdmissionTimeoutError`. Set
+`max_terminal_payload_bytes` to the largest result the tool returns, between
+64 KiB and 1,984 KiB. A result larger than the declaration fails as
+`invalid_tool_output` instead of being published, so keep the tool's own output
+caps inside it. Leave it undeclared only for a tool whose `run` awaits child
+sessions in the same invocation, which the exclusive lease always admits. Cayu
+also logs a warning when the tool is registered. Built-in tools and MCP tools
+are not reported.
+
 ## tool-input-schema-runtime-unsupported
 
 `TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED` means the registered schema is not a

@@ -82,7 +82,7 @@ class PayInvoiceTool(Tool):
         input_schema={
             "type": "object",
             "properties": {
-                "invoice_id": {"type": "string"},
+                "invoice_id": {"type": "string", "maxLength": 256},
                 "amount_cents": {"type": "integer", "minimum": 1},
             },
             "required": ["invoice_id", "amount_cents"],
@@ -90,6 +90,9 @@ class PayInvoiceTool(Tool):
         },
         # The payment service collapses repeats on the idempotency key below.
         effect=ToolEffect.IDEMPOTENT,
+        # The largest result this tool returns, so its rounds share terminal
+        # publication capacity with other sessions instead of taking all of it.
+        max_terminal_payload_bytes=64 * 1024,
         execution_profile_identity=ExecutionProfileBehaviorIdentity(
             name="__PROJECT_NAME__.pay_invoice",
             behavior_version="1",
@@ -105,6 +108,12 @@ class PayInvoiceTool(Tool):
         if ctx.idempotency_key is None:
             return ToolResult(
                 content="No idempotency key; refusing to pay.", is_error=True
+            )
+        # Reject oversized IDs before the side effect, leaving ample room for
+        # JSON escaping in the declared receipt bound.
+        if len(args["invoice_id"]) > 256:
+            return ToolResult(
+                content="Invoice ID exceeds the 256-character limit.", is_error=True
             )
         receipt = await self.payments.pay(
             invoice_id=args["invoice_id"],

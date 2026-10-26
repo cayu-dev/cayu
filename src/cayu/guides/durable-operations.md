@@ -195,6 +195,7 @@ class RecordProposal(Tool):
         input_schema=proposal_input_schema(),
         parallel_safe=False,
         effect=ToolEffect.IDEMPOTENT,
+        max_terminal_payload_bytes=64 * 1024,
     )
 
     def __init__(self, proposal_store: ProposalStore) -> None:
@@ -267,6 +268,7 @@ class ApplyChange(Tool):
         parallel_safe=False,
         # Replays collapse through the stable domain action_id contract below.
         effect=ToolEffect.IDEMPOTENT,
+        max_terminal_payload_bytes=64 * 1024,
     )
 
     def __init__(self, proposal_store: ProposalStore, system: FakeSystem) -> None:
@@ -318,6 +320,7 @@ class VerifyChange(Tool):
             "additionalProperties": False,
         },
         effect=ToolEffect.NONE,
+        max_terminal_payload_bytes=64 * 1024,
     )
 
     def __init__(self, system: FakeSystem) -> None:

@@ -27,7 +27,10 @@ from cayu.tools import (
     ToolPolicyResult,
     WriteFileTool,
 )
+from cayu.tools.subagents import SubagentSpec, SubagentTool
 from cayu.workspaces import LocalWorkspace
+
+_BOUND = 64 * 1024
 
 
 class _ExternalTool(Tool):
@@ -35,6 +38,7 @@ class _ExternalTool(Tool):
         name="send",
         effect=ToolEffect.EXTERNAL,
         input_schema={"type": "object", "additionalProperties": False},
+        max_terminal_payload_bytes=_BOUND,
     )
 
     async def run(self, ctx, args):
@@ -48,6 +52,7 @@ class _ConfiguredTool(Tool):
                 name=name,
                 effect=effect,
                 input_schema={"type": "object", "additionalProperties": False},
+                max_terminal_payload_bytes=_BOUND,
             )
         )
         self._content = content
@@ -57,7 +62,7 @@ class _ConfiguredTool(Tool):
 
 
 class _UnconstrainedTool(Tool):
-    spec = ToolSpec(name="lookup", effect=ToolEffect.NONE)
+    spec = ToolSpec(name="lookup", effect=ToolEffect.NONE, max_terminal_payload_bytes=_BOUND)
 
     async def run(self, ctx, args):
         return ToolResult(content="found")
@@ -68,10 +73,22 @@ class _RemoteSchemaTool(Tool):
         name="fetch",
         effect=ToolEffect.NONE,
         input_schema={"$ref": "https://schemas.example/fetch.json"},
+        max_terminal_payload_bytes=_BOUND,
     )
 
     async def run(self, ctx, args):
         return ToolResult(content="fetched")
+
+
+class _UnboundedTool(Tool):
+    spec = ToolSpec(
+        name="report",
+        effect=ToolEffect.NONE,
+        input_schema={"type": "object", "additionalProperties": False},
+    )
+
+    async def run(self, ctx, args):
+        return ToolResult(content="reported")
 
 
 class _PermissiveApprovalPolicy(AlwaysRequireApprovalToolPolicy):
@@ -114,6 +131,7 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
         "TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED",
         "TOOL_APPROVAL_VALIDITY_RULE",
+        "TOOL_TERMINAL_PAYLOAD_UNBOUNDED",
     )
     assert len(BUILTIN_DIAGNOSTIC_CODES) == len(set(BUILTIN_DIAGNOSTIC_CODES))
 
@@ -391,6 +409,51 @@ def test_unconstrained_tool_schema_is_an_actionable_authoring_warning() -> None:
     )
 
 
+def test_tool_without_terminal_payload_bound_is_a_deploy_visible_warning() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+    app.register_agent(
+        AgentSpec(name="reviewer", model="test-model"),
+        tools=[
+            _UnboundedTool(),
+            _ConfiguredTool("bounded", effect=ToolEffect.NONE, content="ok"),
+            ExecCommandTool(),
+            WriteFileTool(),
+            # A foreground child keeps its exclusive lease on purpose.
+            SubagentTool(app, agents={"child": SubagentSpec(agent_name="child")}),
+        ],
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
+    )
+    manifest = app.describe()
+    assert {
+        tool.name for tool in manifest.agents[0].tools if tool._terminal_payload_bound_undeclared
+    } == {"report"}
+
+    report = check_manifest(manifest)
+
+    findings = [
+        item for item in report.diagnostics if item.code == "TOOL_TERMINAL_PAYLOAD_UNBOUNDED"
+    ]
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.severity == "warning"
+    assert finding.subject == "tool:reviewer/report"
+    assert finding.path == "agents.reviewer.tools.report.max_terminal_payload_bytes"
+    assert finding.tags == ("authoring", "deploy")
+    assert finding.parameters == {"agent": "reviewer", "tool": "report"}
+    assert "takes all terminal publication capacity" in finding.message
+    assert "ToolSpec(max_terminal_payload_bytes=...)" in finding.hint
+    assert finding.documentation_anchor == (
+        "cayu guide diagnostics#tool-terminal-payload-unbounded"
+    )
+    assert finding in check_manifest(manifest, deploy_only=True).diagnostics
+    # A manifest read back from JSON cannot tell, so it reports nothing.
+    reloaded = type(manifest).model_validate_json(manifest.model_dump_json())
+    assert "TOOL_TERMINAL_PAYLOAD_UNBOUNDED" not in {
+        item.code for item in check_manifest(reloaded).diagnostics
+    }
+
+
 def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     empty_codes = {
         item.code for item in check_manifest(CayuApp(enable_logging=False).describe()).diagnostics
@@ -483,6 +546,10 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     unconstrained_codes = {
         item.code for item in check_manifest(unconstrained.describe()).diagnostics
     }
+
+    unbounded = CayuApp(enable_logging=False)
+    unbounded.register_agent(AgentSpec(name="unbounded", model="model"), tools=[_UnboundedTool()])
+    unbounded_codes = {item.code for item in check_manifest(unbounded.describe()).diagnostics}
     public_service_codes = {
         item.code
         for item in check_manifest(
@@ -539,6 +606,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | structurally_incomplete_codes
         | unfinished_codes
         | unconstrained_codes
+        | unbounded_codes
         | public_service_codes
         | nondurable_task_service_codes
         | project_control_plane_codes
@@ -683,3 +751,55 @@ def test_explicit_allow_is_not_published_in_the_manifest() -> None:
     # A manifest loaded from JSON keeps the conservative default.
     reloaded = AppManifest.model_validate_json(serialized)
     assert reloaded.agents[0].tools[0]._policy_allows_explicitly is False
+
+
+@pytest.mark.parametrize("bound", [None, 64 * 1024])
+def test_process_isolated_application_tool_reports_missing_bound(
+    bound, caplog, monkeypatch
+) -> None:
+    import logging
+
+    from cayu.runtime import ExecutionProfileBehaviorIdentity
+    from cayu.tools import (
+        ProcessIsolatedTool,
+        ProcessIsolatedToolFactoryRef,
+        ProcessIsolatedToolLimits,
+    )
+
+    # This checks registration diagnostics without launching a child process.
+    monkeypatch.setattr(
+        "cayu.runtime._isolated_tool_process._complete_process_tree_supervision_available",
+        lambda: True,
+    )
+    identity = ExecutionProfileBehaviorIdentity(
+        name="isolated-report", behavior_version="1", implementation_version="1"
+    )
+    tool = ProcessIsolatedTool(
+        ToolSpec(
+            name="isolated_report",
+            max_terminal_payload_bytes=bound,
+            execution_profile_identity=identity,
+        ),
+        factory=ProcessIsolatedToolFactoryRef(
+            module="cayu.testing.isolated_tools",
+            qualname="build_deterministic_isolated_tool",
+            identity=identity,
+        ),
+        limits=ProcessIsolatedToolLimits(deadline_seconds=1),
+    )
+    app = CayuApp(enable_logging=False)
+    with caplog.at_level(logging.WARNING, logger="cayu._application_agent_registry"):
+        app.register_agent(AgentSpec(name="worker", model="test-model"), tools=[tool])
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "declares no max_terminal_payload_bytes" in record.getMessage()
+    ]
+    findings = [
+        item
+        for item in check_manifest(app.describe()).diagnostics
+        if item.code == "TOOL_TERMINAL_PAYLOAD_UNBOUNDED"
+    ]
+    assert len(warnings) == len(findings) == (1 if bound is None else 0)
+    if findings:
+        assert findings[0].parameters == {"agent": "worker", "tool": "isolated_report"}

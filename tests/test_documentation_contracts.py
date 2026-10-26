@@ -494,3 +494,23 @@ def test_server_auth_tenant_isolation_boundary_is_documented() -> None:
     assert "run_to_completion" not in recipe
     assert "return await cayu_app.session_store.query_events" not in recipe
     assert "product_runs.require_owned" not in recipe
+
+
+def test_isolated_search_example_bounds_output_before_dispatch() -> None:
+    import re
+
+    from cayu.tools._terminal_bounds import tool_result_payload_bytes
+
+    guide = (_REPO_ROOT / "docs" / "process-isolated-tools.md").read_text(encoding="utf-8")
+    snippet = next(
+        block
+        for block in re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
+        if "class SearchHandler" in block
+    )
+    namespace = {}
+    exec(compile(snippet, "process-isolated-tools", "exec"), namespace)
+    handler = namespace["SearchHandler"]({"endpoint": "https://example.test"})
+    assert handler.run(None, {"query": "x" * 70000}).is_error
+    result = handler.run(None, {"query": "\x01" * 8192})
+    assert not result.is_error
+    assert tool_result_payload_bytes(result) <= 256 * 1024

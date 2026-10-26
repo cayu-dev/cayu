@@ -48,7 +48,10 @@ _TEST_TERMINAL_CLAIM_LEASE_SECONDS = 5.0
 
 class _RestartRecordingTool(_RecordingTool):
     spec = _RecordingTool.spec.model_copy(
-        update={"execution_profile_identity": _identity("restart-record")}
+        update={
+            "execution_profile_identity": _identity("restart-record"),
+            "max_terminal_payload_bytes": 64 * 1024,
+        }
     )
 
 

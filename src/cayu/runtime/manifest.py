@@ -34,6 +34,7 @@ from cayu.context.footprints import (
 )
 from cayu.environments.admission import ExecutionRequirements
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools._terminal_bounds import application_tool_declares_no_bound
 from cayu.tools.catalogue import ToolExecutionContract
 from cayu.tools.policy import (
     AllowAllToolPolicy,
@@ -269,6 +270,10 @@ class ToolManifest(_ManifestModel):
     # registered policy names this tool in an explicit allowlist. A manifest
     # loaded from JSON keeps the conservative default.
     _policy_allows_explicitly: bool = PrivateAttr(default=False)
+    # In-process fact for checks, like the one above: an application's own tool
+    # declares no terminal payload bound. A manifest loaded from JSON cannot
+    # tell and reports nothing.
+    _terminal_payload_bound_undeclared: bool = PrivateAttr(default=False)
 
     @field_validator("adapter_identity", mode="before")
     @classmethod
@@ -630,9 +635,16 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         for tool in agent.tools
         if tool._policy_allows_explicitly
     }
+    unbounded = {
+        (agent.name, tool.name)
+        for agent in agents
+        for tool in agent.tools
+        if tool._terminal_payload_bound_undeclared
+    }
     for agent in manifest.agents:
         for tool in agent.tools:
             tool._policy_allows_explicitly = (agent.name, tool.name) in explicit
+            tool._terminal_payload_bound_undeclared = (agent.name, tool.name) in unbounded
     return manifest
 
 
@@ -819,6 +831,9 @@ def _describe_tool(
         implementation_provenance=_provenance(tool.tool, project_root),
     )
     manifest._policy_allows_explicitly = _policy_allows_explicitly(tool_policy, tool_name)
+    manifest._terminal_payload_bound_undeclared = application_tool_declares_no_bound(
+        tool.tool, execution_contract.max_terminal_payload_bytes
+    )
     return manifest
 
 

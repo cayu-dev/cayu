@@ -129,3 +129,46 @@ def test_every_preset_points_waiting_and_spending_jobs_to_the_guide(
     agents = project_files("probe", preset=preset)["AGENTS.md"]
     assert "uv run --no-sync cayu guide long-running" in agents
     assert "`cayu guide long-running#timers`" in agents
+
+
+def test_payment_tool_rejects_oversized_invoice_before_paying(tmp_path: Path) -> None:
+    assert main(["new", "invoices", "--preset", "long-running", "--dir", str(tmp_path)]) == 0
+    checked = _run(
+        tmp_path / "invoices",
+        "-c",
+        """
+import asyncio
+from jsonschema import Draft202012Validator
+from cayu import ToolContext
+from cayu.tools._terminal_bounds import tool_result_payload_bytes
+from integrations.payments import LocalPaymentService
+from tools.payments import PayInvoiceTool
+
+async def check():
+    payments = LocalPaymentService()
+    tool = PayInvoiceTool(payments)
+    validator = Draft202012Validator(tool.spec.input_schema)
+    oversized = {"invoice_id": "x" * 70000, "amount_cents": 1}
+    assert list(validator.iter_errors(oversized))
+    result = await tool.run(
+        ToolContext(session_id="payment", idempotency_key="oversized"), oversized
+    )
+    assert result.is_error
+    assert payments.payments == {}
+    assert tool_result_payload_bytes(result) <= tool.spec.max_terminal_payload_bytes
+    for index, invoice_id in enumerate(("x" * 256, "\\x01" * 256, "🌍" * 256)):
+        arguments = {"invoice_id": invoice_id, "amount_cents": 1}
+        validator.validate(arguments)
+        key = f"payment-{index}"
+        result = await tool.run(
+            ToolContext(session_id="payment", idempotency_key=key), arguments
+        )
+        assert not result.is_error
+        assert result.structured == {"payment_id": payments.payments[key].payment_id}
+        assert tool_result_payload_bytes(result) <= tool.spec.max_terminal_payload_bytes
+    assert len(payments.payments) == 3
+
+asyncio.run(check())
+""",
+    )
+    assert checked.returncode == 0, checked.stdout + checked.stderr

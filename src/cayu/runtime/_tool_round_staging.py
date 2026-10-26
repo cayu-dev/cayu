@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -64,6 +64,7 @@ from cayu.sessions.store import SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _shared_artifact_results as shared_artifact_results
 from cayu.tools import _web_access_results as web_access_results
+from cayu.tools._terminal_bounds import application_tool_declares_no_bound
 from cayu.tools.base import ToolResult, _bound_policy_denial_result, _bound_policy_denial_text
 from cayu.tools.catalogue import ToolExecutionContract
 from cayu.tools.exposure import ResolvedToolExposureAuthority, copy_resolved_tool_exposure_authority
@@ -164,6 +165,27 @@ _TOOL_TERMINAL_RUNTIME_PAYLOAD_HEADROOM_BYTES = 64 * 1024
 _TOOL_ROUND_LINEAGE_MAX_DEPTH = 256
 
 
+class _TerminalPayloadLimits(Mapping[str, int | None]):
+    """Each call's reserved terminal bytes, or None, and the tools that declare none."""
+
+    __slots__ = ("_limits", "undeclared_tool_names")
+
+    def __init__(
+        self, limits: Mapping[str, int | None], *, undeclared_tool_names: Iterable[str] = ()
+    ) -> None:
+        self._limits = dict(limits)
+        self.undeclared_tool_names = tuple(undeclared_tool_names)
+
+    def __getitem__(self, tool_call_id: str) -> int | None:
+        return self._limits[tool_call_id]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._limits)
+
+    def __len__(self) -> int:
+        return len(self._limits)
+
+
 class _ToolRoundPublicationCoordinator:
     """Serialize actual secret discovery with private terminal staging."""
 
@@ -209,6 +231,11 @@ class _ToolRoundPublicationCoordinator:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._terminal_payload_limits = (
             {} if terminal_payload_limits is None else dict(terminal_payload_limits)
+        )
+        self._undeclared_tool_names = (
+            terminal_payload_limits.undeclared_tool_names
+            if isinstance(terminal_payload_limits, _TerminalPayloadLimits)
+            else ()
         )
         if any(
             type(tool_call_id) is not str
@@ -266,6 +293,7 @@ class _ToolRoundPublicationCoordinator:
                 session_id=self._session_id,
                 tool_round_id=self._tool_round_identity.tool_round_id,
                 maximum_bytes=self._capacity_maximum_bytes,
+                unbounded_tool_names=self._undeclared_tool_names,
             )
         else:
             await self._publication_governor._reserve_invocation_round(
@@ -274,6 +302,7 @@ class _ToolRoundPublicationCoordinator:
                 maximum_bytes=self._capacity_maximum_bytes,
                 invocation=session.invocation,
                 lineage=await self._session_lineage(session),
+                unbounded_tool_names=self._undeclared_tool_names,
             )
         self._capacity_reserved = True
 
@@ -1352,11 +1381,13 @@ async def _tool_terminal_payload_limits(
     publication_governor: ToolTerminalPublicationGovernor,
     runtime_hooks: Iterable[runtime_records.RegisteredRuntimeHook] = (),
     approved_arguments: Mapping[str, dict[str, Any]] | None = None,
-) -> dict[str, int | None]:
+) -> _TerminalPayloadLimits:
     """Resolve frozen registration-time terminal bounds for round admission.
 
     A call a person approved with changed arguments also publishes them and
-    begins its result with the runtime notice, so both are reserved.
+    begins its result with the runtime notice, so both are reserved. The
+    result also names the registered tools that declare no bound, which an
+    admission wait reports.
     """
 
     has_argument_modifying_hook = any(
@@ -1367,6 +1398,7 @@ async def _tool_terminal_payload_limits(
         for registered_hook in (*runtime_hooks, *registered_agent.runtime_hooks)
     )
     limits: dict[str, int | None] = {}
+    undeclared: list[str] = []
     for tool_call in tool_calls:
         registered_tool = registered_agent.executable_tool(tool_call.name)
         if registered_tool is None:
@@ -1376,6 +1408,8 @@ async def _tool_terminal_payload_limits(
         result_limit = contract.max_terminal_payload_bytes
         if result_limit is None:
             limits[tool_call.id] = None
+            if application_tool_declares_no_bound(registered_tool.tool, result_limit):
+                undeclared.append(registered_tool.name)
             continue
         if registered_tool.publish_arguments and has_argument_modifying_hook:
             limits[tool_call.id] = None
@@ -1394,4 +1428,4 @@ async def _tool_terminal_payload_limits(
         if approved is not None:
             argument_bytes += APPROVED_ARGUMENTS_NOTICE_MAX_BYTES
         limits[tool_call.id] = result_limit + argument_bytes
-    return limits
+    return _TerminalPayloadLimits(limits, undeclared_tool_names=undeclared)

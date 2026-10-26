@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import replace
 from itertools import islice
@@ -50,8 +51,13 @@ from cayu.runtime.tool_effects import ToolEffectReconciliationRegistration
 from cayu.sessions.child_context import ChildSessionContextContributor
 from cayu.sessions.fork_overlays import FORK_CONTROLLER_AGENT_SEPARATOR, fork_controller_agent_name
 from cayu.sessions.store import SessionStore
+from cayu.tools._terminal_bounds import (
+    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+    MIN_TOOL_TERMINAL_PAYLOAD_BYTES,
+    application_tool_declares_no_bound,
+)
 from cayu.tools.base import Tool, ToolEffect
-from cayu.tools.catalogue import build_tool_catalog_snapshot
+from cayu.tools.catalogue import ToolExecutionContract, build_tool_catalog_snapshot
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_ONLY_PROFILE_ID,
     SearchToolsTool,
@@ -71,6 +77,8 @@ from cayu.tools.exposure import (
 from cayu.tools.policy import AllowAllToolPolicy, ToolPolicy
 from cayu.tools.targeted_projection import TargetedToolMode, copy_targeted_tool_mode
 from cayu.vaults.redaction import SecretRedactor
+
+logger = logging.getLogger(__name__)
 
 
 def _session_store_survives_restart(store: SessionStore) -> bool:
@@ -116,6 +124,7 @@ class ApplicationAgentRegistry:
         self._mcp_manifest_policy = mcp_manifest_policy
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
         self._agent_thinking_sources: dict[str, CayuConfigSource] = {}
+        self._unbounded_tools_reported: set[str] = set()
         self._mcp_refresh_owner = object()
         self._mcp_publication_lock = asyncio.Lock()
         self._refreshable_mcp_toolsets: dict[int, McpToolset] = {}
@@ -571,7 +580,31 @@ class ApplicationAgentRegistry:
             self._refreshable_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
         for toolset in newly_claimed_static:
             self._static_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
+        for registered_tool in tools_by_name.values():
+            self._report_unbounded_tool(registered_tool)
         return spec
+
+    def _report_unbounded_tool(self, registered_tool: runtime_records.RegisteredTool) -> None:
+        """Warn once per tool name about a tool that declares no terminal bound."""
+
+        if registered_tool.name in self._unbounded_tools_reported:
+            return
+        bound = ToolExecutionContract.model_validate(
+            registered_tool.execution_contract
+        ).max_terminal_payload_bytes
+        if not application_tool_declares_no_bound(registered_tool.tool, bound):
+            return
+        self._unbounded_tools_reported.add(registered_tool.name)
+        logger.warning(
+            "Tool %s declares no max_terminal_payload_bytes. Every deferred round that "
+            "calls it takes all terminal publication capacity in this process, so those "
+            "rounds run one at a time and other sessions' tool rounds wait for them. "
+            "Declare ToolSpec(max_terminal_payload_bytes=...) as the largest result the "
+            "tool returns, between %d and %d bytes.",
+            registered_tool.name,
+            MIN_TOOL_TERMINAL_PAYLOAD_BYTES,
+            MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+        )
 
     async def refresh_mcp_toolset(
         self,

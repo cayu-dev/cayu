@@ -1200,3 +1200,74 @@ def test_external_agents_guide_is_indexed_and_its_extras_are_listed(capsys) -> N
     for topic in ("authoring#cayu-map", "references#external-agents"):
         assert main(["guide", topic]) == 0
         assert "cayu guide external-agents" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "body", ["x" * 40000, "\x01" * 40000, "🌍" * 40000], ids=["ascii", "escaped", "unicode"]
+)
+def test_handbook_guide_bounds_and_redacts_full_search_records(capsys, body):
+    from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
+    from cayu.tools._terminal_bounds import tool_result_payload_bytes
+    from cayu.vaults import SecretRedactor
+
+    # This secret crosses the preview boundary and needs redaction before JSON
+    # serialization, which would otherwise escape its quotes and backslash.
+    secret = 'CANARY"\\' + "s" * 10000
+    store = InMemoryKnowledgeStore(
+        [KnowledgeEntry(id="large", namespace="handbook", text="shipping " + secret + body)],
+        access_scope=KnowledgeAccessScope.for_namespace("handbook"),
+    )
+    assert main(["guide", "durable-service-tools"]) == 0
+    guide = capsys.readouterr().out
+    namespace = {"store": store}
+    for snippet in re.findall(r"```python\n(.*?)```", guide, re.DOTALL):
+        exec(compile(snippet, "durable-service-tools", "exec"), namespace)
+    reader = namespace["HandbookReader"](store)
+    context = ToolContext(
+        session_id="guide-test", invocation_secret_redactor=lambda: SecretRedactor([secret])
+    )
+    result = asyncio.run(reader.run(context, {}))
+    assert not result.is_error
+    assert result.structured == {"truncated": True}
+    assert "CANARY" not in result.content
+    assert "[REDACTED_SECRET]" in result.content
+    assert "...[truncated]" in result.content
+    assert tool_result_payload_bytes(result) <= reader.spec.max_terminal_payload_bytes
+
+
+@pytest.mark.parametrize(
+    ("topic", "class_name", "field", "limit", "effects"),
+    [
+        ("long-running", "PayInvoice", "invoice_id", 256, "PAID"),
+        ("restart-tests", "IssueRefund", "order_id", 256, "REFUNDS"),
+        ("references", "LookupTool", "query", 8192, None),
+    ],
+)
+def test_guide_echo_tools_enforce_bounds_before_effects(
+    capsys, topic, class_name, field, limit, effects
+):
+    from jsonschema import Draft202012Validator
+
+    from cayu.tools._terminal_bounds import tool_result_payload_bytes
+
+    assert main(["guide", topic]) == 0
+    guide = capsys.readouterr().out
+    snippet = next(
+        block
+        for block in re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
+        if f"class {class_name}" in block
+    )
+    namespace = {}
+    exec(compile(snippet, topic, "exec"), namespace)
+    tool = namespace[class_name]()
+    context = ToolContext(session_id="guide-test", idempotency_key="bounded")
+    oversized = {field: "x" * 70000}
+    assert list(Draft202012Validator(tool.spec.input_schema).iter_errors(oversized))
+    result = asyncio.run(tool.run(context, oversized))
+    assert result.is_error
+    if effects:
+        assert not namespace[effects]
+    for text in ("x" * limit, "\x01" * limit, "🌍" * limit):
+        result = asyncio.run(tool.run(context, {field: text}))
+        assert not result.is_error
+        assert tool_result_payload_bytes(result) <= tool.spec.max_terminal_payload_bytes

@@ -84,6 +84,27 @@ def spec_with_terminal_payload_bound(spec: ToolSpec, value: object, *, default: 
     return spec.model_copy(update={"max_terminal_payload_bytes": bound})
 
 
+def application_tool_declares_no_bound(
+    tool: object, max_terminal_payload_bytes: int | None
+) -> bool:
+    """Whether to tell an application that its tool declares no terminal bound.
+
+    Application implementations and process-isolated application specs are
+    reported. Cayu's own tools declare a bound, except ``subagent`` with a
+    foreground child, whose exclusive lease is deliberate, and MCP tools,
+    which have no declaration to set.
+    """
+
+    if max_terminal_payload_bytes is not None:
+        return False
+    from cayu.tools.isolated import ProcessIsolatedTool
+
+    if isinstance(tool, ProcessIsolatedTool):
+        return True
+    module = type(tool).__module__
+    return not (module == "cayu" or module.startswith("cayu."))
+
+
 def json_payload_bytes(value: Any) -> int:
     """Return the compact UTF-8 JSON size Cayu measures for durable payloads."""
 

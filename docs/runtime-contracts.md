@@ -3367,6 +3367,29 @@ Every built-in tool declares a bound and keeps its results inside it, except
 sets one, so its rounds take the exclusive lease; see
 [Built-in terminal payload bounds](#built-in-terminal-payload-bounds).
 
+An undeclared tool costs every session in the process: while a round that calls
+it holds the exclusive lease, no other session's deferred round is admitted,
+and it is admitted only when no other round holds capacity. When an application
+registers a tool implemented outside Cayu that declares no bound, Cayu logs a
+warning, once per tool name, and `cayu check` reports
+`TOOL_TERMINAL_PAYLOAD_UNBOUNDED` for each agent that registers it. Cayu's own
+tools are not reported: `subagent` with a foreground child takes the lease on
+purpose, and MCP tools have no declaration to set, so a round calling an MCP
+tool is exclusive too.
+
+The exclusive lease is not about size. Cayu stores no event larger than the
+2 MiB durable event limit, so an undeclared tool's terminal payload is no
+larger than that, and a larger result already becomes a bounded failure or an
+artifact projection before it is staged. Cayu still does not reserve a bounded
+default for an undeclared tool, because the lease also decides nested
+admission. A tool's `run` may await child rounds in its invocation family, as
+`subagent` does with a foreground child. Under an exclusive lease such a child
+round is always admitted. Under a bounded lease it is refused whenever another
+family holds the capacity it needs, since waiting could deadlock two families
+that each await their own child. Cayu cannot tell from a `ToolSpec` whether a
+tool awaits child rounds, so an undeclared tool keeps the exclusive lease, and
+a tool that declares a bound accepts that its child rounds may be refused.
+
 Related rounds use the same capacity family, identified from their durable
 invocation root after validating the current session incarnation and run epoch.
 An inline subagent therefore does not wait behind its parent's exclusive lease.
@@ -3388,13 +3411,24 @@ drained. Caller-supplied parent metadata does not establish this grouping.
 
 Because nested rounds can enter ahead of unrelated waiters, a family whose
 nested work keeps overlapping can hold capacity for as long as it stays busy. A
-round therefore waits a bounded time for its lease: Cayu logs a warning naming the
-round after 60 seconds, and after 600 seconds the round fails with
+round therefore waits a bounded time for its lease: Cayu logs a warning naming
+the round after 60 seconds, and after 600 seconds the round fails with
 `ToolRoundAdmissionTimeoutError` before any of its tools run. The session's
 `session.failed` event then carries content-free counts of the families that
-held the lease. Closing an interrupted or cancelled round that staged no
-terminal takes no lease, so a round cancelled while waiting for admission
-closes at once instead of queuing again behind the same holders.
+held the lease. `waiting_round_unbounded_tools` names only the waiting round's
+own application tools without bounds, with advice to declare
+`ToolSpec.max_terminal_payload_bytes`. Other tenants may own the holder
+sessions and tools, so neither their session IDs nor their active tool names
+appear in this durable error. The 60-second warning and the timeout warning
+add `exclusive_holder_sessions` and `exclusive_holder_unbounded_tools` only in
+the operator log. The latter lists application tools without bounds in the
+holders' rounds (`none` when the lease is exclusive for another reason, such
+as size). Each list names at most four sessions or eight tools and counts the
+rest. Only session IDs and registered tool names appear, never arguments or
+results.
+Closing an interrupted or cancelled round that staged no terminal takes no
+lease, so a round cancelled while waiting for admission closes at once instead
+of queuing again behind the same holders.
 
 A tool that exceeds its declaration receives one bounded authoritative
 `invalid_tool_output` failure; Cayu does not truncate a successful result or
@@ -4370,6 +4404,7 @@ remember_spec = ToolSpec(
         "properties": {"text": {"type": "string"}},
         "required": ["text"],
     },
+    max_terminal_payload_bytes=256 * 1024,
     execution_profile_identity=remember_identity,
 )
 ```
@@ -12875,8 +12910,11 @@ Tools marked "never cut" return attested evidence or text a person supplied.
 Their results are naturally within the default, and the default for those
 without a natural limit is the largest result Cayu can store, so a result that
 would exceed it gets the same bounded runtime failure as any result too large
-to store. An application's own tools, MCP tools and process-isolated tools
-declare their bounds themselves.
+to store. An application's own tools and process-isolated tools declare their
+bounds themselves; Cayu warns at registration and `cayu check` reports each one
+that does not (see
+[Tool terminal publication capacity](#tool-terminal-publication-capacity)). MCP
+tools have no bound to declare yet, so their rounds take the exclusive lease.
 
 ### Workspace search progression
 

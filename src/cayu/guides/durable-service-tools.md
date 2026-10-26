@@ -87,6 +87,7 @@ required dependency before registering the tool or issuing a provider request:
 import json
 from cayu.storage import KnowledgeQuery, KnowledgeStore
 from cayu import Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.vaults import SecretRedactor
 
 class HandbookReader(Tool):
     spec = ToolSpec(
@@ -94,6 +95,7 @@ class HandbookReader(Tool):
         description="Search the authorized handbook.",
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         effect=ToolEffect.NONE,
+        max_terminal_payload_bytes=64 * 1024,
         execution_profile_identity=reader_identity,
     )
 
@@ -105,12 +107,25 @@ class HandbookReader(Tool):
 
     async def run(self, ctx, args):
         found = await self.store.search(KnowledgeQuery(text="shipping", namespace="handbook"))
-        payload = found.model_dump(mode="json")
-        return ToolResult(content=json.dumps(payload), structured=payload)
+        redactor = (ctx.invocation_secret_redactor() if ctx.invocation_secret_redactor
+                    else SecretRedactor())
+        # Redact complete values before serialization or truncation.
+        payload = redactor.redact_json({
+            "hits": [{"id": hit.entry.id, "text": hit.entry.text} for hit in found.hits],
+            "truncated": found.truncated,
+        })
+        preview, truncated = redactor.redact_text_bounded_with_marker(
+            json.dumps(payload, ensure_ascii=False), max_bytes=8 * 1024,
+            truncation_marker="...[truncated]",
+        )
+        return ToolResult(content=preview, structured={"truncated": truncated})
 
 ```
 
-Register `HandbookReader(the_supplied_scoped_store)` on your agent.
+Register `HandbookReader(the_supplied_scoped_store)` on your agent. The result
+contains an 8 KiB display preview, not the complete search record; its structured
+flag reports truncation. This leaves room for JSON escaping inside the 64 KiB
+terminal bound. A query's `max_bytes` bounds previews, not full `hit.entry` data.
 
 Use the actual supplied service. Do not construct an empty replacement store or
 silently return empty evidence when a required resource is missing. A namespace

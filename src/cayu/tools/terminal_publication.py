@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from math import isfinite
 from threading import Lock
@@ -23,6 +23,9 @@ TOOL_TERMINAL_PUBLICATION_MAX_OFFLOADS = 4
 TOOL_TERMINAL_STAGED_CAPACITY_BYTES = 128 * 1024 * 1024
 TOOL_ROUND_ADMISSION_TIMEOUT_SECONDS = 600.0
 TOOL_ROUND_ADMISSION_NOTICE_SECONDS = 60.0
+# A capacity wait names at most this many sessions and tool names per list.
+_MAX_NAMED_HOLDER_SESSIONS = 4
+_MAX_NAMED_TOOLS = 8
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +79,9 @@ class _RoundReservation:
     weight: int
     exclusive: bool
     group: tuple[str, ...]
+    # Names of the round's registered tools that declare no terminal payload
+    # bound. They explain a wait and take no part in the reservation itself.
+    unbounded_tool_names: tuple[str, ...] = field(default=(), compare=False)
 
 
 def _require_positive_seconds(value: float, name: str) -> None:
@@ -152,13 +158,16 @@ class ToolTerminalPublicationGovernor:
         session_id: str,
         tool_round_id: str,
         maximum_bytes: int | None,
+        unbounded_tool_names: tuple[str, ...] = (),
     ) -> None:
         """Reserve a deferred round before any of its tool effects execute.
 
         Declared rounds share the fixed byte budget. A declared round larger
         than the domain, or a round containing an unbounded tool, receives the
         standard exclusive oversize lease so partial sibling stages can never
-        deadlock behind unrelated rounds.
+        deadlock behind unrelated rounds. ``unbounded_tool_names`` names the
+        round's tools that declare no bound, so a round waiting behind this
+        one can say why.
         """
 
         await self._reserve_round(
@@ -166,6 +175,7 @@ class ToolTerminalPublicationGovernor:
             tool_round_id=tool_round_id,
             maximum_bytes=maximum_bytes,
             group=("round", session_id, tool_round_id),
+            unbounded_tool_names=unbounded_tool_names,
         )
 
     async def _reserve_invocation_round(
@@ -176,6 +186,7 @@ class ToolTerminalPublicationGovernor:
         maximum_bytes: int | None,
         invocation: SessionInvocation,
         lineage: tuple[str, ...] | None = None,
+        unbounded_tool_names: tuple[str, ...] = (),
     ) -> None:
         """Reserve using provenance resolved by the runtime's session owner.
 
@@ -203,6 +214,7 @@ class ToolTerminalPublicationGovernor:
             maximum_bytes=maximum_bytes,
             group=("invocation", invocation.root_invocation_id, invocation.root_session_id),
             lineage=None if lineage is None else frozenset(lineage),
+            unbounded_tool_names=unbounded_tool_names,
         )
 
     def _group_usage(self) -> dict[tuple[str, ...], tuple[int, bool]]:
@@ -230,9 +242,14 @@ class ToolTerminalPublicationGovernor:
         maximum_bytes: int | None,
         group: tuple[str, ...],
         lineage: frozenset[str] | None = None,
+        unbounded_tool_names: tuple[str, ...] = (),
     ) -> None:
         if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes <= 0):
             raise ValueError("maximum_bytes must be a positive integer or None.")
+        if type(unbounded_tool_names) is not tuple or any(
+            type(name) is not str or not name for name in unbounded_tool_names
+        ):
+            raise ValueError("unbounded_tool_names must be a tuple of tool names.")
         key = (session_id, tool_round_id)
         exclusive = maximum_bytes is None or maximum_bytes > self.staged_capacity_bytes
         weight = self.staged_capacity_bytes if maximum_bytes is None else maximum_bytes
@@ -241,6 +258,7 @@ class ToolTerminalPublicationGovernor:
             weight=weight,
             exclusive=exclusive,
             group=group,
+            unbounded_tool_names=tuple(sorted(set(unbounded_tool_names))),
         )
         token = object()
         loop = asyncio.get_running_loop()
@@ -326,10 +344,21 @@ class ToolTerminalPublicationGovernor:
                         return
                     now = loop.time()
                     if deadline is not None and now >= deadline:
+                        # The error reaches this session's durable events, so
+                        # only the operator log names the sessions holding the
+                        # lease; they may belong to another tenant.
+                        logger.warning(
+                            "Tool round failed waiting for terminal publication capacity: "
+                            "session_id=%s tool_round_id=%s waited_s=%.0f %s",
+                            session_id,
+                            tool_round_id,
+                            now - started_at,
+                            self._capacity_holders(requested, groups, name_holders=True),
+                        )
                         raise ToolRoundAdmissionTimeoutError(
                             f"Tool round waited {now - started_at:.0f}s for terminal "
                             "publication capacity before running any tool; "
-                            f"{self._capacity_holders(others)}"
+                            f"{self._capacity_holders(requested, groups, name_holders=False)}"
                         )
                     if notice_at is not None and now >= notice_at:
                         notice_at = None
@@ -339,7 +368,7 @@ class ToolTerminalPublicationGovernor:
                             session_id,
                             tool_round_id,
                             now - started_at,
-                            self._capacity_holders(others),
+                            self._capacity_holders(requested, groups, name_holders=True),
                         )
                     wake_at = min(
                         (moment for moment in (deadline, notice_at) if moment is not None),
@@ -355,15 +384,55 @@ class ToolTerminalPublicationGovernor:
                 self._condition.notify_all()
                 raise
 
-    def _capacity_holders(self, others: list[tuple[int, bool]]) -> str:
-        """Describe, without content, what holds the lease a round waits for."""
+    def _capacity_holders(
+        self,
+        waiting: _RoundReservation,
+        usage: Mapping[tuple[str, ...], tuple[int, bool]],
+        *,
+        name_holders: bool,
+    ) -> str:
+        """Describe, without content, what holds the lease a round waits for.
 
-        return (
+        Beside the counts it names the tools, the exclusive holders' and the
+        waiting round's, that declare no bound, because such a tool is the
+        usual reason a lease is exclusive. Registered tool names belong to the
+        application. Holder session IDs and tool names are included only when
+        ``name_holders`` is set, for the operator log.
+        """
+
+        others = [value for group, value in usage.items() if group != waiting.group]
+        description = (
             f"other_reservation_groups={len(others)} "
             f"exclusive_groups={sum(is_exclusive for _, is_exclusive in others)} "
             f"reserved_round_bytes={self._reserved_round_bytes} "
             f"round_waiters={len(self._round_waiters)}"
         )
+        holders = [
+            (holder_session_id, reservation)
+            for (holder_session_id, _), reservation in self._round_reservations.items()
+            if reservation.group != waiting.group and usage[reservation.group][1]
+        ]
+        holder_tools = {name for _, item in holders for name in item.unbounded_tool_names}
+        if holders and name_holders:
+            description += (
+                " exclusive_holder_sessions="
+                f"{_bounded_names({session for session, _ in holders}, _MAX_NAMED_HOLDER_SESSIONS)}"
+            )
+            description += (
+                f" exclusive_holder_unbounded_tools={_bounded_names(holder_tools) or 'none'}"
+            )
+        if waiting.unbounded_tool_names:
+            description += (
+                f" waiting_round_unbounded_tools={_bounded_names(waiting.unbounded_tool_names)}"
+            )
+        if (name_holders and holder_tools) or waiting.unbounded_tool_names:
+            description += (
+                ". A round that calls a tool without ToolSpec.max_terminal_payload_bytes "
+                "takes all terminal publication capacity in the process, so such rounds run "
+                "one at a time across every session; declare the largest result each named "
+                "tool returns."
+            )
+        return description
 
     def release_round(self, *, session_id: str, tool_round_id: str) -> None:
         """Release one process-local round lease after its stages drain."""
@@ -664,6 +733,14 @@ class ToolTerminalPublicationGovernor:
                     self._active_bytes -= weight
                 self._active_offloads -= int(oversized)
                 self._condition.notify_all()
+
+
+def _bounded_names(names: set[str] | tuple[str, ...], limit: int = _MAX_NAMED_TOOLS) -> str:
+    ordered = sorted(set(names))
+    listed = ",".join(ordered[:limit])
+    if len(ordered) > limit:
+        listed += f",+{len(ordered) - limit}_more"
+    return listed
 
 
 def utc_now() -> datetime:

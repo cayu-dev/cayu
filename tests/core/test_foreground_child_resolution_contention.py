@@ -35,7 +35,10 @@ from cayu.tools.user_input import UserInputTool
 
 class _ContendedTool(_RecordingTool):
     spec = _RecordingTool.spec.model_copy(
-        update={"execution_profile_identity": _identity("contention-record")}
+        update={
+            "execution_profile_identity": _identity("contention-record"),
+            "max_terminal_payload_bytes": 64 * 1024,
+        }
     )
 
 

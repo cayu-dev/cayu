@@ -101,6 +101,24 @@ to keep it offline.
   on that SDK's internals.
 - `ExternalCleanupIncomplete` is exported from `cayu.external_agents`, so code can
   catch it without importing a private module.
+- Registering an application tool that declares no
+  `ToolSpec.max_terminal_payload_bytes` logs a warning, once per tool name, and
+  `cayu check` reports `TOOL_TERMINAL_PAYLOAD_UNBOUNDED` for it. Each round that
+  calls such a tool takes all terminal publication capacity in the process, so
+  those rounds run one at a time and every other session's tool rounds wait for
+  them. Application-owned process-isolated tools are reported too. Built-in
+  tools and MCP tools are not reported. Tools from `cayu generate` and the
+  long-running scaffold now declare 64 KiB. Generated echo tools accept at most
+  8,192 input characters so their escaped output stays within that bound. The
+  payment scaffold rejects invoice IDs over 256 characters before paying.
+- A tool round that waits for terminal publication capacity now says why:
+  `ToolRoundAdmissionTimeoutError` names the waiting round's own application
+  tools without bounds and the fix. Holders' session IDs and active tool names
+  may belong to another tenant, so they appear only in the process log: the
+  60-second warning and a warning logged when the round fails.
+  An undeclared tool still takes the exclusive lease, because it may await child
+  rounds that only that lease always admits; see
+  [Tool terminal publication capacity](runtime-contracts.md#tool-terminal-publication-capacity).
 - New read-only tools `ListSessionsTool` (`list_sessions`) and `ReadSessionTool`
   (`read_session`) let a model page through earlier sessions and read bounded,
   secret-redacted transcript windows. Each requires a `SessionReadAccess` policy

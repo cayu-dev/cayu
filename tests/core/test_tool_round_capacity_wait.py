@@ -142,12 +142,17 @@ def test_cancelled_round_waiting_for_capacity_closes_without_waiting_again():
     asyncio.run(scenario())
 
 
-def test_round_waiting_past_admission_deadline_fails_before_any_tool_runs():
+def test_round_waiting_past_admission_deadline_fails_before_any_tool_runs(caplog):
+    holder = "tenant-b-session"
+
     async def scenario():
         store = InMemorySessionStore()
         governor = ToolTerminalPublicationGovernor(round_admission_timeout_s=0.2)
         await governor.reserve_round(
-            session_id="other", tool_round_id="other-round", maximum_bytes=None
+            session_id=holder,
+            tool_round_id="holder-round",
+            maximum_bytes=None,
+            unbounded_tool_names=("legacy_export",),
         )
         calls: list[str] = []
         app = _app(store, governor, calls)
@@ -159,15 +164,34 @@ def test_round_waiting_past_admission_deadline_fails_before_any_tool_runs():
         failure = persisted[-1]
         assert failure.type is EventType.SESSION_FAILED
         assert failure.payload["error_type"] == "ToolRoundAdmissionTimeoutError"
-        assert "terminal publication capacity" in failure.payload["error"]
-        assert "exclusive_groups=1" in failure.payload["error"]
+        error = failure.payload["error"]
+        assert "terminal publication capacity" in error
+        assert "exclusive_groups=1" in error
+        # The failure names only this session's tools. Other tenants' active
+        # tool names and session IDs belong only in operator logs.
+        assert "exclusive_holder_unbounded_tools" not in error
+        assert "waiting_round_unbounded_tools=first_tool,second_tool." in error
+        assert "declare the largest result each named tool returns." in error
+        assert "exclusive_holder_sessions" not in error
+        assert all(holder not in event.model_dump_json() for event in persisted)
+        assert all("legacy_export" not in event.model_dump_json() for event in persisted)
         assert (await store.load("root")).status is SessionStatus.FAILED
         assert calls == []
         snapshot = governor.snapshot()
         assert snapshot.round_reservation_waiters == 0
         assert snapshot.active_round_reservations == 1
 
-    asyncio.run(scenario())
+    with caplog.at_level(logging.WARNING, logger="cayu.tools.terminal_publication"):
+        asyncio.run(scenario())
+    (logged,) = [
+        record
+        for record in caplog.records
+        if "failed waiting for terminal publication capacity" in record.getMessage()
+    ]
+    assert logged.levelno == logging.WARNING
+    assert f"exclusive_holder_sessions={holder} " in logged.getMessage()
+    assert "session_id=root " in logged.getMessage()
+    assert "exclusive_holder_unbounded_tools=legacy_export " in logged.getMessage()
 
 
 def test_related_rounds_of_unknown_lineage_cannot_hold_a_waiter_forever(caplog):
@@ -353,3 +377,167 @@ def test_round_admitted_before_its_deadline_keeps_waiting_normally():
 def test_round_admission_timing_must_be_positive_finite_seconds(options):
     with pytest.raises(ValueError, match="positive finite number of seconds"):
         ToolTerminalPublicationGovernor(**options)
+
+
+def test_capacity_wait_names_holders_and_unbounded_tools_within_bounds(caplog):
+    async def scenario():
+        governor = ToolTerminalPublicationGovernor(
+            round_admission_timeout_s=0.2, round_admission_notice_s=0.05
+        )
+        family = _family("parent")
+        tools = tuple(f"tool_{index:02}" for index in range(10))
+        for index in range(6):
+            await governor._reserve_invocation_round(
+                session_id=f"family-{index}",
+                tool_round_id=f"family-round-{index}",
+                maximum_bytes=None,
+                invocation=family,
+                unbounded_tool_names=tools[index : index + 5],
+            )
+        with pytest.raises(ToolRoundAdmissionTimeoutError) as raised:
+            await governor.reserve_round(
+                session_id="root",
+                tool_round_id="root-round",
+                maximum_bytes=1024,
+            )
+        message = str(raised.value)
+        assert message.endswith("round_waiters=1")
+        assert "exclusive_holder_unbounded_tools" not in message
+        assert all(tool not in message for tool in tools)
+        assert "family-" not in message
+        assert "waiting_round_unbounded_tools" not in message
+        for index in range(6):
+            governor.release_round(
+                session_id=f"family-{index}", tool_round_id=f"family-round-{index}"
+            )
+
+    with caplog.at_level(logging.WARNING, logger="cayu.tools.terminal_publication"):
+        asyncio.run(scenario())
+    notice, failed = [record.getMessage() for record in caplog.records]
+    assert notice.startswith("Tool round is still waiting")
+    assert failed.startswith("Tool round failed waiting")
+    for logged in (notice, failed):
+        assert "session_id=root tool_round_id=root-round" in logged
+        assert (
+            "exclusive_holder_sessions=family-0,family-1,family-2,family-3,+2_more "
+            "exclusive_holder_unbounded_tools="
+            "tool_00,tool_01,tool_02,tool_03,tool_04,tool_05,tool_06,tool_07,+2_more."
+        ) in logged
+
+
+def test_capacity_wait_without_unbounded_tools_reports_only_the_lease():
+    async def scenario():
+        governor = ToolTerminalPublicationGovernor(round_admission_timeout_s=0.1)
+        # A declared round larger than capacity is exclusive for its size alone.
+        await governor.reserve_round(
+            session_id="oversized",
+            tool_round_id="oversized-round",
+            maximum_bytes=governor.staged_capacity_bytes + 1,
+        )
+        with pytest.raises(ToolRoundAdmissionTimeoutError) as raised:
+            await governor.reserve_round(
+                session_id="root", tool_round_id="root-round", maximum_bytes=1024
+            )
+        message = str(raised.value)
+        assert message.endswith("round_waiters=1")
+        assert "oversized" not in message
+        governor.release_round(session_id="oversized", tool_round_id="oversized-round")
+
+        # Declared rounds that merely fill capacity hold no exclusive lease.
+        await governor.reserve_round(
+            session_id="full",
+            tool_round_id="full-round",
+            maximum_bytes=governor.staged_capacity_bytes,
+        )
+        with pytest.raises(ToolRoundAdmissionTimeoutError) as raised:
+            await governor.reserve_round(
+                session_id="root",
+                tool_round_id="root-round",
+                maximum_bytes=None,
+                unbounded_tool_names=("report", "report"),
+            )
+        message = str(raised.value)
+        assert "exclusive_holder" not in message
+        assert "exclusive_groups=0" in message
+        assert "waiting_round_unbounded_tools=report." in message
+
+    asyncio.run(scenario())
+
+
+def test_unbounded_tool_names_explain_a_reservation_without_changing_it():
+    async def scenario():
+        governor = ToolTerminalPublicationGovernor()
+        await governor.reserve_round(
+            session_id="root",
+            tool_round_id="root-round",
+            maximum_bytes=None,
+            unbounded_tool_names=("report",),
+        )
+        # A retry of the same round is the same reservation whatever it names.
+        await governor.reserve_round(
+            session_id="root", tool_round_id="root-round", maximum_bytes=None
+        )
+        assert governor.snapshot().active_round_reservations == 1
+        for names in (["report"], ("",), (7,)):
+            with pytest.raises(ValueError, match="unbounded_tool_names"):
+                await governor.reserve_round(
+                    session_id="other",
+                    tool_round_id="other-round",
+                    maximum_bytes=None,
+                    unbounded_tool_names=names,
+                )
+        assert governor.snapshot().round_reservation_waiters == 0
+
+    asyncio.run(scenario())
+
+
+def test_capacity_advice_excludes_mcp_and_foreground_subagents():
+    from tests.core.test_mcp import _fake_toolset
+
+    from cayu.mcp.tools import McpToolAdapter
+    from cayu.runtime._runtime_records import ToolCallRequest
+    from cayu.runtime._tool_round_staging import _tool_terminal_payload_limits
+    from cayu.tools.subagents import SubagentSpec, SubagentTool
+
+    async def scenario():
+        app = CayuApp(enable_logging=False)
+        toolset = _fake_toolset()
+        app.register_agent(
+            AgentSpec(name="worker", model="test-model"),
+            tools=[SubagentTool(app, agents={"child": SubagentSpec(agent_name="child")})],
+            mcp_toolsets=[toolset],
+        )
+        registered = app._get_registered_agent("worker")
+        tools = [
+            tool
+            for tool in registered.tools.values()
+            if isinstance(tool.tool, (McpToolAdapter, SubagentTool))
+        ]
+        assert len(tools) == 2
+        governor = ToolTerminalPublicationGovernor(round_admission_timeout_s=0.01)
+        calls = [
+            ToolCallRequest(id=str(index), name=tool.name, arguments={})
+            for index, tool in enumerate(tools)
+        ]
+        limits = await _tool_terminal_payload_limits(
+            registered, calls, publication_governor=governor
+        )
+        assert all(limits[call.id] is None for call in calls)
+        assert limits.undeclared_tool_names == ()
+        await governor.reserve_round(
+            session_id="holder",
+            tool_round_id="held",
+            maximum_bytes=None,
+            unbounded_tool_names=limits.undeclared_tool_names,
+        )
+        with pytest.raises(ToolRoundAdmissionTimeoutError) as raised:
+            await governor.reserve_round(
+                session_id="waiter", tool_round_id="waiting", maximum_bytes=1024
+            )
+        assert "exclusive_groups=1" in str(raised.value)
+        assert "declare the largest result" not in str(raised.value)
+        assert "ToolSpec.max_terminal_payload_bytes" not in str(raised.value)
+        governor.release_round(session_id="holder", tool_round_id="held")
+        await toolset.close()
+
+    asyncio.run(scenario())

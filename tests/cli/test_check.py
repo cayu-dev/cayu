@@ -418,7 +418,12 @@ def build_app():
         "EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
         "EVALS_PROJECT_STORE_NOT_CONFIGURED",
         "EXTERNAL_TOOL_UNGUARDED",
+        "TOOL_TERMINAL_PAYLOAD_UNBOUNDED",
     ]
+    unbounded_finding = report["diagnostics"][-1]
+    assert unbounded_finding["severity"] == "warning"
+    assert unbounded_finding["path"] == "agents.sender.tools.send.max_terminal_payload_bytes"
+    assert unbounded_finding["documentation_anchor"].endswith("#tool-terminal-payload-unbounded")
     provider_finding = report["diagnostics"][0]
     assert provider_finding["path"] == "agents.sender.configured_provider"
     assert provider_finding["parameters"] == {"agent": "sender", "provider": "missing"}

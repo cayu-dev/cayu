@@ -95,6 +95,8 @@ def test_maintained_wrapper_preserves_exact_base_coverage(kind):
                     name=name,
                     effect=ToolEffect.EXTERNAL,
                     input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+                    # Bounded like the built-in tools these stand in for.
+                    max_terminal_payload_bytes=256 * 1024,
                 )
             )
             for name in ("write_file", "run_command")

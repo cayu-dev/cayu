@@ -51,6 +51,8 @@ class SearchHandler:
         context: ProcessIsolatedToolContext,
         arguments: dict[str, Any],
     ) -> ToolResult:
+        if len(arguments["query"]) > 8192:
+            return ToolResult(content="Query exceeds the 8192-character limit.", is_error=True)
         # Call the trusted, possibly non-cooperative dependency here.
         return ToolResult(content=f"searched {arguments['query']}")
 
@@ -79,11 +81,12 @@ search = ProcessIsolatedTool(
         description="Run the application search adapter.",
         input_schema={
             "type": "object",
-            "properties": {"query": {"type": "string"}},
+            "properties": {"query": {"type": "string", "maxLength": 8192}},
             "required": ["query"],
             "additionalProperties": False,
         },
         effect=ToolEffect.NONE,
+        max_terminal_payload_bytes=256 * 1024,
         execution_profile_identity=ExecutionProfileBehaviorIdentity(
             name="my-app:isolated-search",
             behavior_version="1",

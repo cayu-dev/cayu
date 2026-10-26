@@ -15,19 +15,19 @@ from cayu.tools import AlwaysRequireApprovalToolPolicy
 
 PAID = {}  # Stands in for the payment provider, keyed by idempotency key.
 
-
 class PayInvoice(Tool):
     spec = ToolSpec(
         name="pay_invoice", description="Pay one invoice.", effect=ToolEffect.IDEMPOTENT,
-        input_schema={"type": "object", "properties": {"invoice_id": {"type": "string"}}},
+        input_schema={"type": "object", "properties": {"invoice_id": {"type": "string", "maxLength": 256}}},
         execution_profile_identity=ExecutionProfileBehaviorIdentity(
             name="pay_invoice", behavior_version="1", implementation_version="1"),
-    )
+        max_terminal_payload_bytes=64 * 1024)
 
     async def run(self, ctx, args):
+        if len(args["invoice_id"]) > 256:
+            return ToolResult(content="Input exceeds the 256-character limit.", is_error=True)
         PAID.setdefault(ctx.idempotency_key, args["invoice_id"])  # A repeat pays nothing.
         return ToolResult(content=f"Paid {args['invoice_id']}.")
-
 
 approval_policy = AlwaysRequireApprovalToolPolicy(
     tools=["pay_invoice"], expires_in_seconds=72 * 3600)

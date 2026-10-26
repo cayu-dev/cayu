@@ -1858,10 +1858,13 @@ class {tool_class}(Tool):
         description="Process one explicit input for the {name} agent.",
         input_schema={{
             "type": "object",
-            "properties": {{"input": {{"type": "string"}}}},
+            "properties": {{"input": {{"type": "string", "maxLength": 8192}}}},
             "required": ["input"],
             "additionalProperties": False,
         }},
+        # The largest result this tool returns, so its rounds share terminal
+        # publication capacity with other sessions instead of taking all of it.
+        max_terminal_payload_bytes=64 * 1024,
         # Every custom tool declares its behavior so paused sessions can resume.
         # Bump behavior_version whenever this tool's behavior changes.
         execution_profile_identity=ExecutionProfileBehaviorIdentity(
@@ -1872,6 +1875,11 @@ class {tool_class}(Tool):
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        # Even JSON escaping every character leaves room within the 64 KiB bound.
+        if len(args["input"]) > 8192:
+            return ToolResult(
+                content="Input exceeds the 8192-character limit.", is_error=True
+            )
         return ToolResult(content=f"{tool_name}: {{args['input']}}")
 '''
     test = f'''from __future__ import annotations
@@ -2033,10 +2041,13 @@ class {tool_class}(Tool):
         description="Process one explicit input for the {agent_name} agent.",
         input_schema={{
             "type": "object",
-            "properties": {{"input": {{"type": "string"}}}},
+            "properties": {{"input": {{"type": "string", "maxLength": 8192}}}},
             "required": ["input"],
             "additionalProperties": False,
         }},
+        # The largest result this tool returns, so its rounds share terminal
+        # publication capacity with other sessions instead of taking all of it.
+        max_terminal_payload_bytes=64 * 1024,
         # Every custom tool declares its behavior so paused sessions can resume.
         # Bump behavior_version whenever this tool's behavior changes.
         execution_profile_identity=ExecutionProfileBehaviorIdentity(
@@ -2047,6 +2058,11 @@ class {tool_class}(Tool):
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        # Even JSON escaping every character leaves room within the 64 KiB bound.
+        if len(args["input"]) > 8192:
+            return ToolResult(
+                content="Input exceeds the 8192-character limit.", is_error=True
+            )
         return ToolResult(content=f"{tool_name}: {{args['input']}}")
 '''
     test = f'''from __future__ import annotations
