@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import multiprocessing
@@ -969,7 +970,10 @@ def build_app():
             owner.kill()
             owner.wait(timeout=2)
         if worker_pid is not None and _linux_process_running(worker_pid):
-            os.kill(worker_pid, signal.SIGKILL)
+            # The worker is meant to exit on its own; it may do so between the
+            # check and the kill.
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(worker_pid, signal.SIGKILL)
 
 
 def test_child_lifetime_guard_covers_interpreter_shutdown(tmp_path: Path) -> None:
