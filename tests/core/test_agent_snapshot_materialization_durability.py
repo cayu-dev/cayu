@@ -378,6 +378,20 @@ def test_missing_copy_object_store_is_not_recovery_destination_missing(materiali
         materialization.materialize()
 
 
+def _observed(path: Path) -> tuple[object, ...]:
+    # Everything recovery could change. Not st_atime: reading the file updates it,
+    # so it differs whenever the read lands in the next second.
+    info = path.lstat()
+    return (
+        info.st_mode,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        path.read_bytes(),
+    )
+
+
 @pytest.mark.parametrize("mutation", ("content", "executable", "receipt", "extra", "symlink"))
 def test_recovery_refuses_mutated_state_without_repair(materialization, mutation):
     result = materialization.materialize()
@@ -397,10 +411,10 @@ def test_recovery_refuses_mutated_state_without_repair(materialization, mutation
     else:
         target.unlink()
         target.symlink_to(materialization.destination / "nested/deeper/check.py")
-    before = (target.lstat(), target.read_bytes())
+    before = _observed(target)
     with pytest.raises(AgentBundleError):
         materialization.recover("completed", result)
-    assert (target.lstat(), target.read_bytes()) == before
+    assert _observed(target) == before
 
 
 def test_recovery_preserves_permitted_modes_receipt_bytes_and_empty_directories(materialization):
