@@ -786,6 +786,43 @@ def test_large_trees_move_in_several_archives(tmp_path: Path, monkeypatch) -> No
     asyncio.run(scenario())
 
 
+def _env_of_exactly(items: int, total: int) -> dict[str, str]:
+    """``items`` variables whose ``NAME=value`` strings add up to ``total`` UTF-8 bytes."""
+
+    names = [f"V{index:03d}" for index in range(items)]
+    env = dict.fromkeys(names, "")
+    remaining = total - sum(len(name) + 1 for name in names)
+    for name in names:
+        size = min(remaining, 131_071 - len(name) - 1)
+        env[name] = "x" * size
+        remaining -= size
+    assert remaining == 0
+    return env
+
+
+@pytest.mark.parametrize(
+    ("env", "refusal"),
+    [
+        # Cayu Cloud's broker accepts 1,000 variables and 256 KiB, counting each
+        # variable as its NAME=value UTF-8 bytes with no terminator.
+        ({f"V{index}": "" for index in range(1_000)}, None),
+        ({f"V{index}": "" for index in range(1_001)}, "at most 1000 variables"),
+        (_env_of_exactly(1_000, 256 * 1024), None),
+        (_env_of_exactly(3, 256 * 1024), None),
+        (_env_of_exactly(3, 256 * 1024 + 1), "env exceeds 262144 bytes"),
+        # One NAME=value is held to Linux's per-string limit, in UTF-8 bytes.
+        ({"A": "é" * 65_534 + "x"}, None),
+        ({"A": "é" * 65_535}, "131071 bytes each"),
+    ],
+)
+def test_command_env_matches_the_brokers_limits(env: dict[str, str], refusal: str | None) -> None:
+    if refusal is None:
+        client_module.validate_command_shape(["true"], env, None)
+    else:
+        with pytest.raises(ValueError, match=refusal):
+            client_module.validate_command_shape(["true"], env, None)
+
+
 def test_copy_back_enforces_the_limits_before_buffering(tmp_path: Path, monkeypatch) -> None:
     limit = 64 * 1024
     monkeypatch.setattr(runner_module, "MAX_ARCHIVE_BYTES", limit)
@@ -1171,9 +1208,12 @@ def test_commands_run_asynchronously_in_the_workspace(tmp_path: Path) -> None:
             await runner.exec(ExecCommand.process("echo", "x" * 131_072))
         with pytest.raises(ValueError, match="argv exceeds"):
             await runner.exec(ExecCommand.process("echo", *(["x" * 100_000] * 3)))
+        with pytest.raises(ValueError, match="env exceeds"):
+            await runner.exec(
+                ExecCommand.process("true"),
+                env={"A": "x" * 131_069, "B": "x" * 131_069, "C": "x"},
+            )
         assert len(broker.started) == started
-        with pytest.raises(ValueError, match="env"):
-            await runner.exec(ExecCommand.process("true"), env={"BIG": "x" * (64 * 1024)})
         with pytest.raises(ValueError, match="outside the runner root"):
             await runner.exec(ExecCommand.process("true"), cwd="/etc")
         # A sandbox at its command limit is retried; the command had not started.

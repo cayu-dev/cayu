@@ -135,7 +135,7 @@ immutable Release image:
   `cayu worker NAME`. Cloud runs at most one worker table per Agent and restarts
   the task if it exits.
 - Each `[[schedules]]` entry starts a separate short task at the times its
-  `expression` names. An Agent declares at most 20 schedules, each with a unique
+  `expression` names. An Agent declares at most 100 schedules, each with a unique
   `name` of lowercase letters, digits and interior hyphens (at most 63
   characters).
 

@@ -61,8 +61,8 @@ _SAFE_ENV_TEMPLATES = frozenset({".env.example", ".env.sample", ".env.template"}
 # Cayu Cloud's limit on one compressed source upload; keep it identical to Cloud.
 # docs/cayu-cloud.md#what-a-deploy-uploads states it and the exclusions above.
 SOURCE_BUNDLE_MAX_BYTES = 250 * 1024 * 1024
-# Schedules one manifest declares (Cloud accepts more; this CLI has always stopped here).
-SCHEDULES_LIMIT = 20
+# Cayu Cloud's limit on the schedules one Agent declares; keep it identical to Cloud.
+SCHEDULES_LIMIT = 100
 
 
 def is_application_slug(value: str) -> bool:

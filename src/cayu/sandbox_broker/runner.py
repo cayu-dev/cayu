@@ -236,10 +236,11 @@ class BrokeredSandboxRunner(Runner):
     which the broker never runs twice. A command cancelled by its caller is
     cancelled in the sandbox; only if the broker can't confirm it stopped is
     the runner's exec path closed for good. Bounds that can't be met (stdin
-    over 1 MiB, argv over 256 KiB, env over 64 KiB) are refused, and output
-    is captured up to 2 MiB per stream as the broker encodes it in JSON
-    (fewer raw bytes when the output is full of control characters or
-    non-ASCII text). Each argv argument is limited to 131,071 bytes.
+    over 1 MiB, argv over 256 KiB, env over 1,000 variables or 256 KiB) are
+    refused, and output is captured up to 2 MiB per stream as the broker
+    encodes it in JSON (fewer raw bytes when the output is full of control characters or
+    non-ASCII text). Each argv argument and each env ``NAME=value`` is limited
+    to 131,071 bytes.
 
     ``close`` stops lease renewal and destroys the sandbox. If the destroy call
     fails, the sandbox is no longer renewed and the broker destroys it when its

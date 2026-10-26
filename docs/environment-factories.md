@@ -704,8 +704,10 @@ Each command starts under a fresh command id and is polled until it finishes:
   runner asks for up to six times the caller's limit and cuts the result back
   to the raw bytes the caller asked for.
 - stdin over 1 MiB, any argv argument over 131,071 bytes (Linux's per-argument
-  limit), argv over 256 KiB in all, and env over 64 KiB are refused before
-  anything is sent.
+  limit), argv over 256 KiB in all, and env over 1,000 variables, 256 KiB in
+  all or 131,071 bytes for one `NAME=value` are refused before anything is
+  sent. Like the broker, the client counts each variable as the UTF-8 bytes of
+  `NAME=value`.
 
 A broker answer without a contract code (from authentication, a proxy or the
 ingress) is retried only for 408, 429 and 5xx. Any other 4xx, such as a 401

@@ -97,8 +97,11 @@ MAX_COMMAND_ARGV_ITEMS = 1_024
 MAX_COMMAND_ARGV_BYTES = 256 * 1024
 #: Linux's per-argument limit (MAX_ARG_STRLEN - 1); larger programs go through stdin.
 MAX_COMMAND_ARGUMENT_BYTES = 131_071
-MAX_COMMAND_ENV_ITEMS = 50
-MAX_COMMAND_ENV_BYTES = 64 * 1024
+#: Cayu Cloud's limits on a command's added environment; keep them identical to Cloud.
+#: Each ``NAME=value`` counts its UTF-8 bytes (no terminator) and is also held to
+#: ``MAX_COMMAND_ARGUMENT_BYTES``, as Linux holds each environment string.
+MAX_COMMAND_ENV_ITEMS = 1_000
+MAX_COMMAND_ENV_BYTES = 256 * 1024
 MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_ARCHIVE_PATHS = 1_000
 MAX_ARCHIVE_EXCLUDES = 50
@@ -653,8 +656,13 @@ def validate_command_shape(
     variables = dict(env or {})
     if len(variables) > MAX_COMMAND_ENV_ITEMS:
         raise ValueError(f"Sandbox command env allows at most {MAX_COMMAND_ENV_ITEMS} variables.")
-    env_bytes = sum(len(key.encode()) + len(value.encode()) + 2 for key, value in variables.items())
-    if env_bytes > MAX_COMMAND_ENV_BYTES:
+    env_sizes = [len(f"{key}={value}".encode()) for key, value in variables.items()]
+    if any(size > MAX_COMMAND_ARGUMENT_BYTES for size in env_sizes):
+        raise ValueError(
+            f"Sandbox command env variables (NAME=value) are limited to "
+            f"{MAX_COMMAND_ARGUMENT_BYTES} bytes each."
+        )
+    if sum(env_sizes) > MAX_COMMAND_ENV_BYTES:
         raise ValueError(f"Sandbox command env exceeds {MAX_COMMAND_ENV_BYTES} bytes.")
     if stdin is not None and len(stdin.encode("utf-8")) > MAX_COMMAND_STDIN_BYTES:
         raise ValueError(f"Sandbox command stdin exceeds {MAX_COMMAND_STDIN_BYTES} bytes.")

@@ -423,7 +423,14 @@ class FakeBroker:
         sizes = [len(item.encode()) for item in body["argv"]]
         if max(sizes) > 131_071 or sum(sizes) > 256 * 1024:
             return _error(422, "sandbox_invalid")
-        if CLOUD_ENVIRONMENT_NAMES & set(body.get("env") or {}):
+        added_env = body.get("env") or {}
+        env_sizes = [len(f"{name}={value}".encode()) for name, value in added_env.items()]
+        if (
+            len(env_sizes) > 1_000
+            or sum(env_sizes) > 256 * 1024
+            or max(env_sizes, default=0) > 131_071
+            or CLOUD_ENVIRONMENT_NAMES & set(added_env)
+        ):
             return _error(422, "sandbox_invalid")
         if body.get("interactive") and ("stdin" in body or "output_limit_bytes" in body):
             return _error(422, "sandbox_invalid")

@@ -159,6 +159,12 @@ showed this, because the in-memory store makes its own key.
 
 ### Changes
 
+- Runtime now matches the limits Cayu Cloud raised. A brokered sandbox command
+  may add up to 1,000 environment variables and 256 KiB of environment in all
+  (was 50 and 64 KiB), counted like the broker as the UTF-8 bytes of each
+  `NAME=value`; one `NAME=value` over 131,071 bytes is refused before it is
+  sent, as Cloud refuses it. `cayu cloud` accepts up to 100 `[[schedules]]` per
+  Agent (was 20).
 - When a sandbox disappears mid-session, the admission refusal that ends the
   session now says so. A closed or poisoned runner whose execution resource is
   gone is refused with `reason_code="runner_lost"` instead of `runner_closed` or

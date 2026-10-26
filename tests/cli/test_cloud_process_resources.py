@@ -190,6 +190,26 @@ def test_web_port_and_idle_timeout_require_integers(field, value):
         CloudProjectManifest.loads(_BASE + web)
 
 
+def _schedules(count: int) -> str:
+    return "".join(
+        f'[[schedules]]\nname = "tick-{index}"\ncommand = "tick"\nexpression = "rate(1 hour)"\n'
+        for index in range(count)
+    )
+
+
+def test_an_agent_declares_as_many_schedules_as_cayu_cloud_accepts():
+    # Cayu Cloud accepts 100 schedules per Agent (cayu-cloud MAX_SCHEDULES).
+    manifest = CloudProjectManifest.loads(_BASE + _schedules(100))
+    payload = manifest.deployment_payload(
+        repository="https://github.com/example/agent", revision="a" * 40
+    )
+    assert len(payload["manifest"]["runtime"]["schedules"]) == 100
+    with pytest.raises(CloudApiError) as raised:
+        CloudProjectManifest.loads(_BASE + _schedules(101))
+    assert raised.value.category == "manifest_invalid"
+    assert str(raised.value) == "A manifest declares at most 100 schedules."
+
+
 @pytest.mark.parametrize(
     ("schedules", "label"),
     [
