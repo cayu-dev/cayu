@@ -396,6 +396,7 @@ def create_server(
         side_effect_recovery_task: asyncio.Task[None] | None = None
         incomplete_session_recovery_task: asyncio.Task[None] | None = None
         attention_repair_task: asyncio.Task[None] | None = None
+        event_watcher_task: asyncio.Task[None] | None = None
         storage_growth_task: asyncio.Task[None] | None = None
         try:
             # aclose() owns stopping it, within the shutdown deadline.
@@ -411,6 +412,7 @@ def create_server(
                 app, side_effect_health
             )
             attention_repair_task = _start_human_attention_repair(app)
+            event_watcher_task = _start_registered_event_watchers(app)
             storage_growth_task = _start_storage_growth_report(app)
             yield
         finally:
@@ -418,6 +420,7 @@ def create_server(
                 try:
                     # Stop the server's own loops before the app seals, so
                     # neither starts new work against a closing application.
+                    await _cancel_background_task(event_watcher_task)
                     await _cancel_background_task(storage_growth_task)
                     await _cancel_background_task(incomplete_session_recovery_task)
                     await _cancel_background_task(attention_repair_task)
@@ -1449,6 +1452,19 @@ def _start_human_attention_repair(app: CayuApp) -> asyncio.Task[None] | None:
     return asyncio.create_task(handoff.run(), name="cayu-human-attention-repair")
 
 
+def _start_registered_event_watchers(app: CayuApp) -> asyncio.Task[None] | None:
+    """Run the watchers the application registered for this server's lifetime."""
+
+    if not app.event_watchers:
+        return None
+    from cayu.observability.watchers import serve_event_watchers
+
+    # Cancellation stops the loop; app.aclose() settles a delivery it left running.
+    return asyncio.create_task(
+        serve_event_watchers(app, asyncio.Event()), name="cayu-event-watchers"
+    )
+
+
 def _compose_interruption_drain_lifespan(
     server: Any,
     app: CayuApp,
@@ -1472,6 +1488,7 @@ def _compose_interruption_drain_lifespan(
         async with existing_lifespan(server_app) as state:
             side_effect_recovery_task: asyncio.Task[None] | None = None
             attention_repair_task: asyncio.Task[None] | None = None
+            event_watcher_task: asyncio.Task[None] | None = None
             try:
                 # aclose() owns stopping it, within the shutdown deadline.
                 await app.start_model_policy()
@@ -1487,6 +1504,7 @@ def _compose_interruption_drain_lifespan(
                     app, side_effect_health
                 )
                 attention_repair_task = _start_human_attention_repair(app)
+                event_watcher_task = _start_registered_event_watchers(app)
                 async with cloud_inventory_lifespan(
                     app,
                     project_root=(
@@ -1499,6 +1517,7 @@ def _compose_interruption_drain_lifespan(
             finally:
                 try:
                     try:
+                        await _cancel_background_task(event_watcher_task)
                         await _cancel_background_task(attention_repair_task)
                         await _cancel_background_task(side_effect_recovery_task)
                     finally:

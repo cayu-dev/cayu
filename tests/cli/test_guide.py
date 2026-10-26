@@ -919,9 +919,9 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
 
     assert main(["guide", "long-running"]) == 0
     guide = capsys.readouterr().out
-    assert len(guide.splitlines()) <= 238
+    assert len(guide.splitlines()) <= 290
     snippets = re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
-    assert len(snippets) == 6
+    assert len(snippets) == 8
     namespace: dict[str, Any] = {}
     for snippet in snippets:
         exec(compile(snippet, "long-running", "exec"), namespace)
@@ -1017,6 +1017,44 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
 
     asyncio.run(paused_worker("pay_invoice", {"invoice_id": "INV-10"}))
     asyncio.run(paused_worker("ask_user", {"question": "Amount?"}))
+
+    # Approval without a model turn, and the watcher that reacts to its denial.
+    async def proposal_and_watcher() -> str:
+        from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest
+        from cayu.evals.testing import ScriptedModelProvider
+        from cayu.sessions.memory import InMemorySessionStore
+
+        app = namespace["build_app"](
+            provider=ScriptedModelProvider([]),
+            session_store=InMemorySessionStore(),
+            task_store=None,
+        )
+        app.register_event_watcher(namespace["approval_outcomes"])
+        stop = asyncio.Event()
+        watching = asyncio.create_task(namespace["run_watchers"](app, stop))
+        outcome = await namespace["propose_payment"](app, "INV-9")
+        assert outcome.status == "pending_approval"
+        async for _event in app.resolve_tool_approval(
+            ToolApprovalRequest(
+                session_id=outcome.session_id,
+                approval_id=outcome.approval_id,
+                tool_round_id=outcome.tool_round_id,
+                tool_call_id=outcome.tool_call_id,
+                decision=ToolApprovalDecision.DENY,
+            )
+        ):
+            pass
+        async with asyncio.timeout(10):
+            while outcome.session_id not in namespace["OUTCOMES"]:
+                await asyncio.sleep(0.05)
+        stop.set()
+        await asyncio.wait_for(watching, 5)
+        await app.aclose()
+        return outcome.session_id
+
+    session_id = asyncio.run(proposal_and_watcher())
+    assert namespace["OUTCOMES"] == {session_id: "tool.call.approval_denied"}
+    assert "INV-9" not in namespace["PAID"].values()
 
     # Worker time limit: the guide's retrying worker ends a hung job and fails it.
     async def hung_worker() -> None:

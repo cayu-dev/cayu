@@ -131,6 +131,9 @@ from cayu.approvals.business import (
     business_approval_routing_metadata as business_approval_routing_metadata,
 )
 from cayu.approvals.business import resolve_business_approval as resolve_business_approval
+from cayu.approvals.proposals import ToolCallProposalOutcome as ToolCallProposalOutcome
+from cayu.approvals.proposals import ToolCallProposalStatus as ToolCallProposalStatus
+from cayu.approvals.proposals import tool_call_proposal_request as tool_call_proposal_request
 from cayu.approvals.review import HumanReviewCall as HumanReviewCall
 from cayu.approvals.review import HumanReviewConflict as HumanReviewConflict
 from cayu.approvals.review import HumanReviewContext as HumanReviewContext

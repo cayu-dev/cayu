@@ -1641,7 +1641,43 @@ _OWNERSHIP_FILES: dict[str, str] = {
     "operations/__init__.py": '"""Durable task, worker, approval, completion, and recovery behavior."""\n',
     "operations/tasks.py": '"""Task declaration, dispatch, and durable task-state boundaries."""\n',
     "operations/workers.py": '"""Explicit worker construction and lifecycle entry points."""\n',
-    "operations/watchers.py": '"""Durable event watcher construction and delivery policy."""\n',
+    "operations/watchers.py": (
+        '"""Durable event watcher construction and delivery policy.\n'
+        "\n"
+        "Example: react when a person approves or denies a tool call. In app.py pass\n"
+        "CayuApp(event_watcher_store=build_watcher_store()) and call\n"
+        "app.register_event_watcher(APPROVAL_OUTCOMES); `cayu serve` runs registered\n"
+        "watchers. See `uv run --no-sync cayu guide long-running`.\n"
+        '"""\n'
+        "\n"
+        "# from pathlib import Path\n"
+        "#\n"
+        "# from cayu.events import EventType\n"
+        "# from cayu.observability import EventWatcher\n"
+        "# from cayu.sessions import EventQuery\n"
+        "# from cayu.storage import SQLiteEventWatcherStore\n"
+        "#\n"
+        "#\n"
+        "# def build_watcher_store():\n"
+        "#     # Keep cursors in the app's SQLite database so a restart does not redeliver\n"
+        "#     # old events. With CAYU_DATABASE_URL set, use PostgresEventWatcherStore.\n"
+        "#     root = Path(__file__).resolve().parents[1]\n"
+        '#     return SQLiteEventWatcherStore(root / "__LOCAL_DATABASE__")\n'
+        "#\n"
+        "#\n"
+        "# def record_approval_outcome(context):\n"
+        "#     event = context.record.event  # Delivered at least once: make this idempotent.\n"
+        '#     print(event.session_id, event.type.value, event.payload.get("reason"))\n'
+        "#\n"
+        "#\n"
+        "# APPROVAL_OUTCOMES = EventWatcher(\n"
+        '#     name="approval-outcomes",\n'
+        "#     query=EventQuery(\n"
+        "#         event_types=(EventType.TOOL_CALL_APPROVED, EventType.TOOL_CALL_APPROVAL_DENIED)\n"
+        "#     ),\n"
+        "#     handler=record_approval_outcome,\n"
+        "# )\n"
+    ),
     "operations/approvals.py": '"""Human input, approval requests, and settlement boundaries."""\n',
     "operations/completion.py": '"""Completion verification and result resolution boundaries."""\n',
     "operations/recovery.py": '"""Application-owned recovery and reconciliation entry points."""\n',
@@ -1906,6 +1942,9 @@ def convention_files(
     files = dict(_OWNERSHIP_FILES)
     files.update(
         {
+            "operations/watchers.py": _OWNERSHIP_FILES["operations/watchers.py"].replace(
+                "__LOCAL_DATABASE__", local_database_path(plan)
+            ),
             "app.py": app,
             "configuration/__init__.py": _CONFIGURATION_INIT_PY,
             "configuration/settings.py": settings,

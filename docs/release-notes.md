@@ -265,6 +265,25 @@ showed this, because the in-memory store makes its own key.
   connects on first use and never migrates itself. The generated project depends on
   `sqlalchemy` and `alembic`; Cayu's own runtime dependencies don't change. See
   `cayu guide applications#application-tables`.
+- Workflow code can ask a person to approve an exact tool call without a model
+  turn: `await app.propose_tool_call(agent_name, tool_name, arguments, ...)`.
+  The call goes through the agent's tool policy and guards like a model-raised
+  call and pauses as an ordinary approval, so the Pending page,
+  `resolve_tool_approval`, task attachment and restart recovery all work
+  unchanged; approval runs the tool and a denial is recorded. No provider is
+  needed and the two control steps are priced at zero. It returns a
+  `ToolCallProposalOutcome`; `ToolCallProposalOutcome.from_events(...)` reads
+  the state later, and `cayu.approvals.tool_call_proposal_request(...)` builds
+  the `RunRequest` to run yourself. The provider name `cayu-tool-proposal` is
+  now reserved.
+- `app.register_event_watcher(watcher)` declares an event watcher, and servers
+  from `create_server` and `mount_control_plane`, including `cayu serve`, run
+  registered watchers while they serve.
+  `cayu.observability.serve_event_watchers(app, stop)` runs them from a worker.
+  `cayu guide long-running` shows a watcher that reacts to approved and denied
+  calls, and the scaffold's `operations/watchers.py` has the same example
+  commented out, with a `SQLiteEventWatcherStore` in the project's SQLite
+  database so a restart does not redeliver old events.
 - A retry budget now bounds an event that the application retries by creating
   new tasks. Pass the same `TaskCreate(retry_key=...)`, such as the event's ID,
   for every task of that event. Tasks with one key share a budget of 3 tasks

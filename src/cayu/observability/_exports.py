@@ -24,6 +24,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "RuntimeHookPhase": ("cayu.observability.hooks", "RuntimeHookPhase"),
     "TRACE_LEVEL": ("cayu.observability.logging", "TRACE_LEVEL"),
     "ToolCallHookContext": ("cayu.observability.hooks", "ToolCallHookContext"),
+    "serve_event_watchers": ("cayu.observability.watchers", "serve_event_watchers"),
     "ModelStepPreparationTiming": ("cayu.observability.timing", "ModelStepPreparationTiming"),
     "RuntimePhaseTiming": ("cayu.observability.timing", "RuntimePhaseTiming"),
     "RuntimeTimingConfig": ("cayu.observability.timing", "RuntimeTimingConfig"),
@@ -66,4 +67,5 @@ PUBLIC_NAMES = [
     "RuntimeHookPhase",
     "TRACE_LEVEL",
     "ToolCallHookContext",
+    "serve_event_watchers",
 ]

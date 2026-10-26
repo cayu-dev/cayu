@@ -40,6 +40,58 @@ Pending page resolves it; resolving after the expiry denies the call.
 a crash, so pass it to your provider. Deep guides: `cayu guide durable-operations`
 and `cayu guide tool-effects`.
 
+## Approval without a model turn
+
+```python
+async def propose_payment(app, invoice_id):
+    """Workflow code that already knows the exact call asks a person to approve it."""
+    return await app.propose_tool_call(  # .status is "pending_approval" until decided.
+        "invoices", "pay_invoice", {"invoice_id": invoice_id}, session_id=f"pay-{invoice_id}")
+```
+
+No model is called, so the text can't drift. The agent's tool policy decides
+as for a model-raised call (guards apply, including to an approver's edits),
+and the pause is an ordinary approval: the Pending page or
+`app.resolve_tool_approval(...)` settles it, a restarted worker resumes it, and
+`ToolCallProposalOutcome.from_events(...)` reads where it stands. Pass
+`task_id`, `task_worker_id` and `task_lease_expires_at` to attach a task, or
+run `cayu.approvals.tool_call_proposal_request(...)` yourself. The arguments
+are stored with the session, so keep secrets out of them.
+
+## React to approval outcomes
+
+```python
+from cayu.events import EventType
+from cayu.observability import EventWatcher, serve_event_watchers
+from cayu.sessions import EventQuery
+
+OUTCOMES = {}  # Stands in for your records.
+decided = (EventType.TOOL_CALL_APPROVED, EventType.TOOL_CALL_APPROVAL_DENIED)
+
+
+def record_outcome(context):
+    event = context.record.event
+    OUTCOMES[event.session_id] = event.type.value  # Keyed, so a redelivery is harmless.
+
+
+approval_outcomes = EventWatcher(
+    name="approval-outcomes", query=EventQuery(event_types=decided), handler=record_outcome)
+
+
+async def run_watchers(app, stop):  # A [tool.cayu.workers] entrypoint.
+    await serve_event_watchers(app, stop)
+```
+
+Call `app.register_event_watcher(approval_outcomes)` in the factory. `cayu
+serve` runs registered watchers while it serves, so a denial on the Pending
+page reaches the handler there; `run_watchers` runs them in a worker. Delivery
+is ordered, at least once, retried up to `max_attempts` and leased by watcher
+name. Give the app a durable cursor with
+`CayuApp(event_watcher_store=SQLiteEventWatcherStore(path))` (from `cayu.storage`)
+on the same SQLite file as its other stores, or `PostgresEventWatcherStore` in a
+deployment. The default store is in memory, so a restart delivers every old
+matching event again; the example keeps it only because its test app is too.
+
 ## Waiting for an outside reply
 
 ```python

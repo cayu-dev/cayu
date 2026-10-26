@@ -31,3 +31,4 @@ from cayu.observability.watchers import EventWatcherRunResult as EventWatcherRun
 from cayu.observability.watchers import EventWatcherState as EventWatcherState
 from cayu.observability.watchers import EventWatcherStore as EventWatcherStore
 from cayu.observability.watchers import InMemoryEventWatcherStore as InMemoryEventWatcherStore
+from cayu.observability.watchers import serve_event_watchers as serve_event_watchers

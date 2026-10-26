@@ -13,6 +13,10 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._tool_call_proposals import (
+    TOOL_CALL_PROPOSAL_PROVIDER_NAME,
+    ToolCallProposalProvider,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 
@@ -22,12 +26,22 @@ class ApplicationProviderRegistry:
     Registration snapshots provider identity, usage dialect and routing patterns.
     The live provider remains available for execution. Callers supply provenance
     captured at their public registration boundary.
+
+    The runtime-owned tool-call proposal provider is always resolvable by its
+    reserved name, so every process can continue a proposal session. It is not
+    a declaration: it is never listed, routed to or selected as the default.
     """
 
     def __init__(self, *, secret_redactor: SecretRedactor) -> None:
         self._secret_redactor = secret_redactor
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._default_name: str | None = None
+        proposal_provider = ToolCallProposalProvider()
+        self._tool_call_proposal_provider = runtime_records.RegisteredProvider(
+            name=TOOL_CALL_PROPOSAL_PROVIDER_NAME,
+            provider=proposal_provider,
+            usage_dialect=proposal_provider.usage_dialect,
+        )
 
     @property
     def registrations(self) -> Mapping[str, runtime_records.RegisteredProvider]:
@@ -53,6 +67,8 @@ class ApplicationProviderRegistry:
         stored_model_patterns = _validate_provider_model_patterns(model_patterns)
         provider_name = require_clean_nonblank(provider.name, "provider.name")
         usage_dialect = copy_usage_dialect(provider.usage_dialect, "provider.usage_dialect")
+        if provider_name == TOOL_CALL_PROPOSAL_PROVIDER_NAME:
+            raise ValueError(f"Provider name is runtime-owned: {provider_name}")
         if provider_name in self._providers:
             raise ValueError(f"Provider already registered: {provider_name}")
 
@@ -86,6 +102,8 @@ class ApplicationProviderRegistry:
             provider_name = self._default_name
         if provider_name is None:
             raise RuntimeError("No model provider registered.")
+        if provider_name == TOOL_CALL_PROPOSAL_PROVIDER_NAME:
+            return self._tool_call_proposal_provider
         try:
             return self._providers[provider_name]
         except KeyError as exc:

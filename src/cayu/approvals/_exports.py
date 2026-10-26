@@ -186,6 +186,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "ToolAuthorizationGrantUseDecision",
     ),
     "ToolCallGrantMatcher": ("cayu.approvals.authorization_grants", "ToolCallGrantMatcher"),
+    "ToolCallProposalOutcome": ("cayu.approvals.proposals", "ToolCallProposalOutcome"),
+    "ToolCallProposalStatus": ("cayu.approvals.proposals", "ToolCallProposalStatus"),
     "ToolPolicyEvidence": ("cayu.approvals.tools", "ToolPolicyEvidence"),
     "UserInputRecoveryRequest": ("cayu.approvals.user_input", "UserInputRecoveryRequest"),
     "UserInputResponse": ("cayu.approvals.user_input", "UserInputResponse"),
@@ -196,6 +198,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "business_approval_routing_metadata",
     ),
     "resolve_business_approval": ("cayu.approvals.business", "resolve_business_approval"),
+    "tool_call_proposal_request": ("cayu.approvals.proposals", "tool_call_proposal_request"),
     "tool_authorization_grant_id": (
         "cayu.approvals.authorization_grants",
         "tool_authorization_grant_id",
@@ -278,6 +281,8 @@ PUBLIC_NAMES = [
     "ToolAuthorizationGrantUseCursor",
     "ToolAuthorizationGrantUseDecision",
     "ToolCallGrantMatcher",
+    "ToolCallProposalOutcome",
+    "ToolCallProposalStatus",
     "ToolPolicyEvidence",
     "UserInputRecoveryRequest",
     "UserInputResponse",
@@ -285,6 +290,7 @@ PUBLIC_NAMES = [
     "business_approval_routing",
     "business_approval_routing_metadata",
     "resolve_business_approval",
+    "tool_call_proposal_request",
     "tool_authorization_grant_id",
     "tool_authorization_grant_sample_bucket",
 ]

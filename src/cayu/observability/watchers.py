@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
+import logging
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -25,6 +27,9 @@ from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.sessions.event_queries import EventOrder, EventQuery, copy_event_query
 from cayu.sessions.records import EventRecord
 from cayu.vaults import SecretRedactor
+
+if TYPE_CHECKING:
+    from cayu.applications import CayuApp
 
 EVENT_WATCHER_QUERY_PAGE_LIMIT = 5000
 
@@ -863,3 +868,89 @@ def _clean_error(value: str) -> str:
         encoded[:4096].decode("utf-8", errors="ignore").strip()
         or "Event watcher diagnostic truncated."
     )
+
+
+_WATCHER_LOOP_LOGGER = logging.getLogger("cayu.observability.watchers")
+_PROGRESS_STATUSES = frozenset(
+    {EventWatcherDeliveryStatus.SUCCEEDED, EventWatcherDeliveryStatus.DEAD_LETTERED}
+)
+
+
+async def serve_event_watchers(
+    app: CayuApp,
+    stop: asyncio.Event,
+    *,
+    watchers: Iterable[EventWatcher] | None = None,
+    poll_interval_seconds: float = 1.0,
+    limit: int = 100,
+) -> None:
+    """Run event watchers until ``stop`` is set or the application shuts down.
+
+    Without ``watchers`` it runs the application's registered watchers, read
+    again on every pass. A pass gives each watcher its own
+    ``app.run_event_watchers([watcher], limit=limit)`` call, so a backlogged
+    watcher cannot use up the budget of the ones after it. A watcher whose call
+    failed, lost its lease or met an active lease rests for
+    ``poll_interval_seconds`` before its next attempt, so a failing handler is
+    retried at that pace until its ``max_attempts`` while the others keep going.
+    After a pass that settled nothing the loop waits ``poll_interval_seconds``.
+    Watcher and store errors are logged and retried, not raised. The signature
+    fits a ``[tool.cayu.workers]`` entrypoint: ``functools.partial`` or a
+    two-line ``async def run(app, stop)`` wrapper. Servers built with
+    ``create_server`` or ``mount_control_plane`` already run registered watchers.
+    """
+    from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
+
+    if not isinstance(stop, asyncio.Event):
+        raise TypeError("stop must be an asyncio.Event.")
+    interval = require_positive_timedelta_seconds(poll_interval_seconds, "poll_interval_seconds")
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be an integer greater than or equal to 1.")
+    fixed = None if watchers is None else tuple(watchers)
+    # Delivery accepts exactly EventWatcher; refuse anything else up front.
+    if fixed is not None and any(type(watcher) is not EventWatcher for watcher in fixed):
+        raise TypeError("watchers must contain EventWatcher instances.")
+    loop = asyncio.get_running_loop()
+    resting_until: dict[str, float] = {}
+    while not stop.is_set():
+        selected = app.event_watchers if fixed is None else fixed
+        progressed = False
+        for watcher in selected:
+            if stop.is_set():
+                return
+            if resting_until.get(watcher.name, 0.0) > loop.time():
+                continue
+            try:
+                [result] = await app.run_event_watchers([watcher], limit=limit)
+            except ApplicationAdmissionsSealed:
+                return
+            except Exception as exc:
+                # The type alone: an arbitrary store message may carry secrets.
+                _WATCHER_LOOP_LOGGER.warning(
+                    "Event watcher %s pass failed: %s", watcher.name, type(exc).__name__
+                )
+                resting_until[watcher.name] = loop.time() + interval
+                continue
+            failed = result.error is not None or result.blocked_by_active_lease
+            if result.error is not None:
+                _WATCHER_LOOP_LOGGER.warning(
+                    "Event watcher %s did not run: %s", result.watcher_name, result.error
+                )
+            for delivery in result.deliveries:
+                if delivery.status in _PROGRESS_STATUSES:
+                    progressed = True
+                    continue
+                failed = True
+                if delivery.error is not None:
+                    _WATCHER_LOOP_LOGGER.warning(
+                        "Event watcher %s delivery %s: %s",
+                        result.watcher_name,
+                        delivery.status.value,
+                        delivery.error,
+                    )
+            if failed:
+                resting_until[watcher.name] = loop.time() + interval
+        if progressed:
+            continue
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=interval)

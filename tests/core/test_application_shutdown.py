@@ -36,6 +36,7 @@ GATED_ENTRANCES = frozenset(
         "execute_producer_output",
         "execute_recovery",
         "fork_session",
+        "propose_tool_call",
         "reconcile_tool_effect",
         "recover_collaboration_wait",
         "recover_incomplete_session",

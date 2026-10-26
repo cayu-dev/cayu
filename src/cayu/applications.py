@@ -28,6 +28,7 @@ from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import _registration_site, _validate_runtime_hooks
 from cayu._application_session_deletion import delete_app_session, export_app_session_closure
 from cayu._application_task_types import ApplicationTaskTypes
+from cayu._application_workflow_entrances import WorkflowEntrances
 from cayu._event_schema import private_event_linkage_value
 from cayu._task_wait import collect_failures, combine_drain_results, wait_until_idle
 from cayu._validation import (
@@ -340,8 +341,6 @@ from cayu.observability.timing import (
     ToolRoundTiming,
 )
 from cayu.observability.watchers import (
-    EventWatcher,
-    EventWatcherRunResult,
     EventWatcherStore,
     InMemoryEventWatcherStore,
     _clock_or_utc_now,
@@ -396,7 +395,7 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_linkage_sequence,
 )
-from cayu.runtime._event_watcher_delivery import EventWatcherSupervisor, dispatch_event_watchers
+from cayu.runtime._event_watcher_delivery import EventWatcherSupervisor
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._execution_profile_classification import ExecutionProfileClassifier
 from cayu.runtime._execution_profile_comparison import (
@@ -951,7 +950,7 @@ def _retrieve_idle_release_outcome(task: asyncio.Task[None]) -> None:
         task.exception()
 
 
-class CayuApp:
+class CayuApp(WorkflowEntrances):
     """Application runtime for registered specialists, providers, and session state."""
 
     def __init__(
@@ -8643,24 +8642,6 @@ class CayuApp:
         )
         del causal_budget_id
         return await operation
-
-    @_admitted_entrance
-    async def run_event_watchers(
-        self,
-        watchers: Iterable[EventWatcher],
-        *,
-        limit: int = 100,
-    ) -> list[EventWatcherRunResult]:
-        """Deliver ordered durable events under renewable, fenced watcher leases."""
-        return await dispatch_event_watchers(
-            watchers,
-            limit=limit,
-            get_session_store=lambda: self.session_store,
-            get_watcher_store=lambda: self.event_watcher_store,
-            supervisor=self._event_watcher_supervisor,
-            redactor=self._secret_redactor,
-            project_record=self._project_persisted_event_record_for_exposure,
-        )
 
     @_tracked_entrance
     async def get_session_cost(

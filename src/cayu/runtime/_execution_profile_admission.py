@@ -2188,6 +2188,8 @@ def _cayu_provider_material_extractors() -> dict[
     from cayu.providers.chat_completions import _execution_profile_material as extract_2
     from cayu.providers.openai import OpenAIProvider
     from cayu.providers.openai import _execution_profile_material as extract_1
+    from cayu.runtime._tool_call_proposals import ToolCallProposalProvider
+    from cayu.runtime._tool_call_proposals import _execution_profile_material as extract_5
 
     return {
         ScriptedModelProvider: ("scripted-model-provider", 1, extract_0),
@@ -2195,6 +2197,7 @@ def _cayu_provider_material_extractors() -> dict[
         ChatCompletionsProvider: ("chat-completions", 3, extract_2),
         AnthropicProvider: ("anthropic-messages", 2, extract_3),
         BedrockProvider: ("bedrock-converse-stream", 2, extract_4),
+        ToolCallProposalProvider: ("tool-call-proposal", 1, extract_5),
     }
 
 
