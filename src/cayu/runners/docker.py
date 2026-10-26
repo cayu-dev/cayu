@@ -11,6 +11,7 @@ import re
 import secrets
 import shlex
 import shutil
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -114,6 +115,9 @@ DOCKER_COMMAND_STATE_DIR = "/tmp/cayu-docker-commands"
 # back to removing the container.
 _STRICT_CLEANUP_POLICIES = frozenset({"sandbox", "command_or_sandbox"})
 _DOCKER_LIFECYCLE_DIAGNOSTIC_MAX_BYTES = 300
+DOCKER_PROCESS_LOCAL_OWNER_LABEL = "io.cayu.process-local-owner"
+# Bounds the one blocking `docker rm -f` an interpreter-exit hook may run.
+_DOCKER_EXIT_REMOVE_TIMEOUT_S = 15.0
 _DOCKER_CONTAINER_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DOCKER_IMAGE_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DOCKER_EGRESS_CUTOVER_FENCE_SCRIPT = r"""
@@ -2487,6 +2491,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
         allocation_identity: str | None = None,
         _execution_environment_authority: ExecutionEnvironmentAuthority | None = None,
+        _process_local_owner: str | None = None,
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
@@ -2541,6 +2546,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             or re.fullmatch(r"sha256:[0-9a-f]{64}", allocation_identity) is None
         ):
             raise ValueError("allocation_identity must be a lowercase SHA-256 identity.")
+        if _process_local_owner is not None and (
+            type(_process_local_owner) is not str
+            or re.fullmatch(r"v1:[0-9a-z:-]{1,240}", _process_local_owner) is None
+        ):
+            raise ValueError("_process_local_owner must be a process-local owner token.")
         strict_mode = image_identity is not None
         owned_image_identity = (
             None
@@ -2700,6 +2710,13 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             run_argv += ["--name", name]
             if allocation_identity is not None:
                 run_argv += ["--label", f"io.cayu.allocation-identity={allocation_identity}"]
+            if _process_local_owner is not None:
+                # Only allocations whose records end with this process carry it;
+                # see cayu.environments.process_ownership.
+                run_argv += [
+                    "--label",
+                    f"{DOCKER_PROCESS_LOCAL_OWNER_LABEL}={_process_local_owner}",
+                ]
             if network is not None:
                 run_argv += ["--network", require_clean_nonblank(network, "network")]
             for host_entry in extra_hosts:
@@ -4143,6 +4160,50 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         await self._settle_terminal_lifecycle(
             lambda: self._close_owned(action), action=action, timeout_s=self.cancel_timeout_s
         )
+
+    @classmethod
+    def _close_all_at_interpreter_exit(cls, entries: Sequence[tuple[Runner, str | None]]) -> int:
+        """Remove owned containers with one bounded ``docker rm -f`` per daemon.
+
+        Only removals count: an unsettled ``remove`` (``close()`` with
+        ``close_action="remove"``, or ``kill()``), or ``None`` when the
+        configured close action removes. A ``stop`` or ``none`` runner keeps
+        its container, as its owner asked, and only an exact owned container ID
+        is ever removed, never a name.
+        """
+
+        groups: dict[tuple[str, tuple[str, ...]], list[DockerRunner]] = {}
+        for runner, action in entries:
+            if (
+                not isinstance(runner, DockerRunner)
+                or (runner.close_action if action is None else action) != "remove"
+                or runner._container_removed
+                or runner.container_id is None
+            ):
+                continue
+            key = (runner.docker_path, tuple(runner.docker_cli_env_allowlist))
+            groups.setdefault(key, []).append(runner)
+        removed = 0
+        for (docker_path, allowlist), runners in groups.items():
+            container_ids = list(dict.fromkeys(cast("str", r.container_id) for r in runners))
+            try:
+                result = subprocess.run(
+                    [docker_path, "rm", "-f", *container_ids],
+                    env=docker_cli_env(allowlist),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=_DOCKER_EXIT_REMOVE_TIMEOUT_S,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if result.returncode != 0:
+                continue
+            for runner in runners:
+                runner._container_removed = True
+            removed += len(container_ids)
+        return removed
 
     async def _close_owned(self, action: DockerCloseAction) -> None:
         if action == "remove":

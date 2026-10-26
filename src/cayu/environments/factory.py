@@ -27,6 +27,7 @@ from cayu.environments.admission import (
     ExecutionRequirements,
 )
 from cayu.environments.base import Environment, copy_environment
+from cayu.environments.process_ownership import is_process_local_owner_token
 from cayu.runners.base import RunnerWorkloadAuthority
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
@@ -581,6 +582,14 @@ class EnvironmentFactoryRequest:
     #: provision a compatible execution identity (for example the same exact
     #: image version) and must not reconnect to it. Empty otherwise.
     replacement_predecessor: dict[str, Any] = field(default_factory=dict)
+    #: Owner token of the current process when the session store does not
+    #: outlive it (for example the in-memory store), for creation and reconnect
+    #: alike; ``None`` for durable stores, and when this process cannot
+    #: establish its boot, PID namespace and start time. A factory may record it
+    #: on any resource it creates so a later process can remove the resource
+    #: once :func:`cayu.environments.process_local_owner_exited` reports the
+    #: owner gone. See ``cayu.environments.process_ownership``.
+    process_local_owner: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.operation, EnvironmentFactoryOperation):
@@ -641,6 +650,10 @@ class EnvironmentFactoryRequest:
             "replacement_predecessor",
             copy_durable_metadata(self.replacement_predecessor, "replacement_predecessor"),
         )
+        if self.process_local_owner is not None and not is_process_local_owner_token(
+            self.process_local_owner
+        ):
+            raise ValueError("process_local_owner must be a process-local owner token.")
         if self.replacement_predecessor and (
             self.operation is not EnvironmentFactoryOperation.CREATE or self.reconnect_metadata
         ):
@@ -934,6 +947,7 @@ def copy_environment_factory_request(
         execution_requirements=request.execution_requirements,
         interaction_id=request.interaction_id,
         replacement_predecessor=request.replacement_predecessor,
+        process_local_owner=request.process_local_owner,
     )
 
 

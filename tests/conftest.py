@@ -18,6 +18,7 @@ from scripts.ci_shard_plan import (
 
 from cayu.cli import _release_check as release_check
 from cayu.releases import RELEASE_ID_ENV, RELEASE_SNAPSHOT_ROOT_ENV
+from tests.exit_cleanup_isolation import isolated_interpreter_exit_cleanup
 from tests.sqlite_resources import SQLiteResourceScope
 
 
@@ -26,6 +27,13 @@ def _no_ambient_release(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep a Release stated by the surrounding environment out of every test."""
     monkeypatch.delenv(RELEASE_ID_ENV, raising=False)
     monkeypatch.delenv(RELEASE_SNAPSHOT_ROOT_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_interpreter_exit_cleanup() -> Iterator[None]:
+    """Keep runners a test leaves registered away from the real exit hooks."""
+    with isolated_interpreter_exit_cleanup():
+        yield
 
 
 @pytest.fixture(autouse=True)

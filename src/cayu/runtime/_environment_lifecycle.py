@@ -126,6 +126,7 @@ from cayu.environments.lifecycle import (
     _set_environment_lifecycle_progress_reporter,
     environment_lifecycle_progress_from_event,
 )
+from cayu.environments.process_ownership import current_process_local_owner
 from cayu.events import (
     Event,
     EventType,
@@ -139,6 +140,7 @@ from cayu.execution_profiles import (
     event_with_execution_profile_authority,
     event_with_execution_profile_fingerprint_authority,
 )
+from cayu.runners._exit_cleanup import release_held_runners_at_exit
 from cayu.runners.base import Runner, RunnerExecutionAdmissionObserver
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -290,6 +292,14 @@ _ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_BATCH_SIZE = 5000
 _ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_LIMIT = (
     len(EnvironmentLifecycleOperation) * MAX_ENVIRONMENT_PROGRESS_EVENTS
 )
+
+
+def _session_store_survives_restart(store: SessionStore) -> bool:
+    # Imported here: the application registry imports runtime modules.
+    from cayu._application_agent_registry import _session_store_survives_restart as survives
+    from cayu.runtime._checkpoint_store import public_session_store
+
+    return survives(public_session_store(store))
 
 
 def _transition_evidence_fields(
@@ -888,6 +898,54 @@ class EnvironmentLifecycle:
         self._final_workspace_observation_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS
         )
+        self._exit_hook: Callable[[], list[Runner]] | None = None
+        self._process_local_store = False
+        if not _session_store_survives_restart(session_store):
+            self.declare_process_local_session_store()
+
+    def declare_process_local_session_store(self) -> None:
+        """Treat allocation records as ending with this process.
+
+        For a session store that does not outlive the process, no later process
+        can resume its sessions or reconnect to what they allocated. Two things
+        follow, and this enables both (idempotently):
+
+        - Factory requests, for creation and reconnect alike, carry
+          ``process_local_owner``, so a factory can tag what it creates and a
+          later process can reap it once this one is gone
+          (``reap_orphaned_docker_coding_containers`` for Docker coding).
+        - At normal interpreter exit, each factory runner still held (a session
+          whose release failed, or that never released because the app was not
+          closed) has its own close action applied synchronously; for Docker
+          coding that is ``docker rm -f`` of the exact container. Environments
+          the application registered directly are never touched.
+        """
+
+        self._process_local_store = True
+        if self._exit_hook is not None:
+            return
+        # The hook holds the owner table, not this lifecycle: an app dropped
+        # without aclose() still has its held allocations released at exit.
+        setups = self._active_environment_setups
+
+        def held_runners() -> list[Runner]:
+            runners: list[Runner] = []
+            for owner in list(setups.values()):
+                registered = owner.registered_environment
+                if not registered.factory_backed:
+                    continue
+                for environment in (
+                    registered.environment,
+                    getattr(registered.unclaimed_factory_result, "environment", None),
+                    getattr(registered.retained_factory_result, "environment", None),
+                ):
+                    runner = getattr(environment, "runner", None)
+                    if isinstance(runner, Runner):
+                        runners.append(runner)
+            return runners
+
+        self._exit_hook = held_runners
+        release_held_runners_at_exit(self, held_runners)
 
     async def _emit_transition(
         self,
@@ -3397,6 +3455,10 @@ class EnvironmentLifecycle:
                     )
                     if effective_operation is EnvironmentFactoryOperation.CREATE
                     else {}
+                ),
+                # Read per request, so a forked child names itself.
+                process_local_owner=(
+                    current_process_local_owner() if self._process_local_store else None
                 ),
             )
             admission_candidate = (

@@ -16,6 +16,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "select_coding_backend": ("cayu.environments.coding_backends", "select_coding_backend"),
     "DockerCodingBackendOptions": ("cayu.environments.docker_coding", "DockerCodingBackendOptions"),
     "verify_local_docker_image": ("cayu.environments.docker_coding", "verify_local_docker_image"),
+    "reap_orphaned_docker_coding_containers": (
+        "cayu.environments.docker_coding",
+        "reap_orphaned_docker_coding_containers",
+    ),
+    "process_local_owner_exited": (
+        "cayu.environments.process_ownership",
+        "process_local_owner_exited",
+    ),
     "LocalWorkspaceEnvironmentFactory": (
         "cayu.environments.local_workspace",
         "LocalWorkspaceEnvironmentFactory",
@@ -427,6 +435,8 @@ PUBLIC_NAMES = [
     "select_coding_backend",
     "DockerCodingBackendOptions",
     "verify_local_docker_image",
+    "reap_orphaned_docker_coding_containers",
+    "process_local_owner_exited",
     "LocalWorkspaceEnvironmentFactory",
     "workspace_root_from_metadata",
     "require_allowed_workspace_root",

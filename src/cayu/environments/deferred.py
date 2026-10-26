@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 from cayu._validation import require_clean_nonblank
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, Runner
+from cayu.runners._exit_cleanup import close_runners_at_exit
 from cayu.runners.base import (
     RunnerBinaryStreamCapability,
     RunnerExecutionAdmissionObserver,
@@ -537,6 +538,19 @@ class DeferredRunner(Runner):
             stdout=stdout,
             stdout_limit_bytes=stdout_limit_bytes,
             output_limit_bytes=output_limit_bytes,
+        )
+
+    @classmethod
+    def _close_all_at_interpreter_exit(cls, entries: Sequence[tuple[Runner, str | None]]) -> int:
+        """Release at interpreter exit through the materialized runners' own hooks.
+
+        A deferred runner that never materialized owns nothing yet.
+        """
+
+        return close_runners_at_exit(
+            (live, action)
+            for runner, action in entries
+            if isinstance(runner, cls) and (live := runner._live()) is not None
         )
 
     async def close(self) -> None:

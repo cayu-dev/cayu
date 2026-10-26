@@ -935,6 +935,14 @@ def runtime_checkpoint_session_store(
     )
 
 
+def public_session_store(store: SessionStore) -> SessionStore:
+    """Return the application's own store behind the runtime-only adapter."""
+
+    if isinstance(store, _RuntimeCheckpointSessionStore):
+        return store._store
+    return store
+
+
 async def load_runtime_session_checkpoint_snapshot(
     store: SessionStore,
     session_id: str,

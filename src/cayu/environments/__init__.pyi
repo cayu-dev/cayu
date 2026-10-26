@@ -149,6 +149,9 @@ from cayu.environments.docker_coding import (
 from cayu.environments.docker_coding import (
     DockerWorkspaceTransferLimits as DockerWorkspaceTransferLimits,
 )
+from cayu.environments.docker_coding import (
+    reap_orphaned_docker_coding_containers as reap_orphaned_docker_coding_containers,
+)
 from cayu.environments.docker_coding import verify_local_docker_image as verify_local_docker_image
 from cayu.environments.docker_toolchains import (
     DOCKER_CODING_COMMAND_AUTHORITY_SCHEMA as DOCKER_CODING_COMMAND_AUTHORITY_SCHEMA,
@@ -272,6 +275,9 @@ from cayu.environments.local_workspace import (
 )
 from cayu.environments.local_workspace import (
     workspace_root_from_metadata as workspace_root_from_metadata,
+)
+from cayu.environments.process_ownership import (
+    process_local_owner_exited as process_local_owner_exited,
 )
 from cayu.environments.snapshot_lifecycle import ExecutionSnapshots as ExecutionSnapshots
 from cayu.environments.snapshot_lifecycle import (

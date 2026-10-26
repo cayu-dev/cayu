@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, TypeAlias
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.runners._admission_probes import EXECUTABLE_AVAILABILITY_SCRIPT
+from cayu.runners._exit_cleanup import close_runners_at_exit
 from cayu.runners._subprocess import copy_runner_env, validate_runner_env_remove
 from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -263,6 +264,20 @@ class LaunchedRunner(Runner):
         self._close_exec("runner finalization has started")
         await self._runner.close()
         self._closed = True
+
+    @classmethod
+    def _close_all_at_interpreter_exit(cls, entries: Sequence[tuple[Runner, str | None]]) -> int:
+        """Release at interpreter exit through the wrapped runners' own hooks.
+
+        ``close()`` closes the wrapped runner, whose unsettled removal its own
+        adapter already finishes at exit; this covers a launched runner that an
+        exit hook was handed directly, for example a factory allocation an app
+        with a process-local store still holds.
+        """
+
+        return close_runners_at_exit(
+            (runner._runner, action) for runner, action in entries if isinstance(runner, cls)
+        )
 
     async def await_pending_command_settlement(self) -> bool:
         """Delegate to the wrapped runner's waiter only when it is cancellation-safe."""

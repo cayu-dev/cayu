@@ -1134,6 +1134,59 @@ callable, falling back to your cold start when it returns `None`.
   from `cayu.environments`) when a spare cannot serve the consumer's
   requirements at all, as opposed to a transient failure.
 
+### Containers that outlive their process
+
+A session's container is removed when its binding finalizes, and
+`await app.aclose()` retries any release that failed. When a process ends
+without closing its app, Cayu decides what to remove from allocation
+ownership, never from container labels alone, because the container of a
+session that can still be resumed or recovered holds that session's workspace:
+
+- A removal that started but never settled (the runner's close deadline passed,
+  or the event loop stopped while `docker rm` was running) is finished at normal
+  interpreter exit with one bounded `docker rm -f` of the exact container IDs
+  (one call per Docker daemon). The runtime only asks for that removal after
+  workspace copy-back, so this is always safe. The seam is provider-neutral:
+  any `Runner` class can override the `_close_all_at_interpreter_exit(entries)`
+  classmethod to finish its own removals synchronously.
+- An application whose session store does not outlive the process (the
+  in-memory store, or SQLite `:memory:`) keeps its allocation records only in
+  memory, so no later process can reconnect to what its sessions allocated. At
+  normal interpreter exit it applies each held factory runner's close action
+  (for Docker coding, `docker rm -f`), covering a release that failed or never
+  ran, even when the app object was dropped first. Environments the
+  application registered directly are never touched.
+- A durable store keeps the records, and its sessions may still be resumed. A
+  container whose session is terminal but whose release is still pending is
+  released by `CayuApp.recover_incomplete_sessions` (or `cayu recovery`)
+  through those records; a container whose session is still recoverable (for
+  example one killed mid-tool, with an effect to reconcile) is kept.
+- A killed process runs no exit hook. For a process-local store, every
+  factory request, creation and reconnect alike, carries
+  `EnvironmentFactoryRequest.process_local_owner`, a token naming the kernel
+  boot, the PID namespace, the PID and that process's start time
+  (`v1:<boot>:<pid namespace>:<pid>:<start>`). A process that cannot read all
+  of them (for example on a platform other than Linux or macOS) gets no token.
+  The Docker coding factory records the token on the container as the
+  `io.cayu.process-local-owner` label, for eager and deferred containers alike,
+  including a deferred container first created after a session resumed.
+  `await cayu.environments.reap_orphaned_docker_coding_containers()` removes
+  only `cayu-coding-` containers with that label whose owner
+  `process_local_owner_exited` proves gone: same boot and PID namespace as the
+  caller, and the PID no longer runs or now belongs to a process with another
+  start time. It fails closed: a live owner, another boot, host or PID
+  namespace (such as a process in a host-network container sharing the
+  daemon), an unreadable start time or a missing label keeps the container.
+  Containers of durable stores never carry the label, and neither does a
+  claimed warm spare, because Docker labels are fixed when a container is
+  created. Pass `label=` to restrict it further, for example to one test run.
+  Call it at startup or from a test session fixture; other factories can record
+  and check the same token.
+
+Signals still need handling by the application: Python's default `SIGTERM`
+action ends the process without running exit hooks, so a long-running SDK
+process should translate `SIGTERM` into closing its app.
+
 ## Execution admission for custom integrations
 
 Applications attach provider-neutral workload requirements to the agent, not

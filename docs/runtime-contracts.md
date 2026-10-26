@@ -3045,6 +3045,23 @@ A historical unacknowledged container without that identity is not adopted or
 deleted on the strength of its reusable name alone. An empty lookup cannot
 rule out a late create and therefore cannot establish `REAPED`.
 
+When the session store does not outlive the process (the in-memory store, or
+SQLite `:memory:`), these records end with the process.
+`EnvironmentFactoryRequest.process_local_owner` (on creation and reconnect
+requests alike) then carries a token naming
+the kernel boot, PID namespace, PID and process start time (it is `None` for
+durable stores, and when the process cannot establish all four), which a
+factory may record on the resource. Docker coding writes it to the
+`io.cayu.process-local-owner` label, and
+`reap_orphaned_docker_coding_containers` removes a container only when
+`process_local_owner_exited` proves that owner ran in the caller's boot and PID
+namespace and has exited; anything it cannot prove keeps the container. The same
+applications release still-held factory runners at normal interpreter exit.
+Independently of the store, a runner whose removal started but never settled
+finishes it synchronously at normal interpreter exit through
+`Runner._close_all_at_interpreter_exit`. Neither path touches an allocation that a
+durable store can still resume or recover.
+
 Factory cleanup has a ten-second attempt deadline. A failure or ambiguous
 outcome retains the durable intent and returns `pending_allocation_cleanup`;
 calling `recover_incomplete_session` again is the bounded public retry path.

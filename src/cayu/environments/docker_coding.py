@@ -85,6 +85,7 @@ from cayu.environments.factory import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
 )
+from cayu.environments.process_ownership import process_local_owner_exited
 from cayu.environments.warm_spares import WarmSparePool, WarmSpareRequirementsUnsatisfied
 from cayu.immutable_inputs import (
     DockerImmutableInputMount,
@@ -96,7 +97,13 @@ from cayu.immutable_inputs import (
 )
 from cayu.runners._cleanup import validate_cancel_timeout
 from cayu.runners.base import ExecCommand, Runner
-from cayu.runners.docker import DockerRunner, _require_docker, validate_docker_seccomp_profile
+from cayu.runners.docker import (
+    DOCKER_PROCESS_LOCAL_OWNER_LABEL,
+    DockerRunner,
+    _require_docker,
+    _run_docker,
+    validate_docker_seccomp_profile,
+)
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 from cayu.runtime._binding_cleanup import (
     BindingFinalizeFailure,
@@ -1677,15 +1684,20 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                             "str",
                             allocation.intent.provider_metadata.get("container_name"),
                         )
+                        # Records that end with this process name their owner on
+                        # the container, so a later process can reap it.
+                        owner = request.process_local_owner
                         runner = await self._create_or_recover_runner(
                             container_name,
                             immutable_mounts=immutable_mounts,
                             requirements=effective_requirements,
                             allocation_identity=_docker_allocation_identity(allocation),
+                            **({} if owner is None else {"process_local_owner": owner}),
                         )
                     else:
                         raise RuntimeError("Docker coding allocation is not dispatchable.")
                 else:
+                    owner = request.process_local_owner
                     runner = await self._create_or_recover_runner(
                         _docker_coding_container_name(
                             request,
@@ -1694,6 +1706,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                         ),
                         immutable_mounts=immutable_mounts,
                         requirements=effective_requirements,
+                        **({} if owner is None else {"process_local_owner": owner}),
                     )
             else:
                 container_id = cast("str", request.reconnect_metadata.get("container_id"))
@@ -1846,6 +1859,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         immutable_mounts: tuple[DockerImmutableInputMount, ...],
         requirements: ExecutionRequirements,
         allocation_identity: str | None = None,
+        process_local_owner: str | None = None,
     ) -> DockerRunner:
         existing_id = await DockerRunner.resolve_container_id(
             container_name,
@@ -1887,6 +1901,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 immutable_input_mounts=immutable_mounts,
                 allocation_identity=allocation_identity,
                 _execution_environment_authority=(self._execution_environment_authority),
+                _process_local_owner=process_local_owner,
             )
         except Exception:
             recovered_id = await DockerRunner.resolve_container_id(
@@ -2146,12 +2161,17 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             elif allocation.acknowledged_reconnect_metadata != reconnect_metadata:
                 raise RuntimeError("Recovered deferred Docker allocation changed its identity.")
 
+        # Creation and reconnect alike: a reconnect that materializes a new
+        # container must carry the owner of records that end with this process.
+        owner = request.process_local_owner
+
         async def materialize(mode):
             return await self._materialize_deferred(
                 request,
                 container_name=container_name,
                 effective_requirements=effective_requirements,
                 mode=mode,
+                process_local_owner=owner,
             )
 
         async def dispose_unmaterialized() -> None:
@@ -2225,6 +2245,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         container_name: str,
         effective_requirements: ExecutionRequirements,
         mode: str,
+        process_local_owner: str | None = None,
     ) -> tuple[DockerRunner, DockerCodingWorkspaceBinding]:
         """Create a fresh container (``use``) or adopt the existing one (``recover``).
 
@@ -2261,10 +2282,17 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                     runner = None if spare is None else spare.runner
                 pooled = runner is not None
                 if runner is None:
+                    # A claimed warm spare cannot gain the owner label: Docker
+                    # labels are fixed at creation, so it is never reaped.
                     runner = await self._create_or_recover_runner(
                         container_name,
                         immutable_mounts=(),
                         requirements=effective_requirements,
+                        **(
+                            {}
+                            if process_local_owner is None
+                            else {"process_local_owner": process_local_owner}
+                        ),
                     )
             try:
                 container_id = runner.container_id
@@ -3244,6 +3272,88 @@ def verify_local_docker_image(
             "immutable ID; rebuild it or update the recorded identity."
         )
     return docker
+
+
+_ORPHAN_REAP_DOCKER_TIMEOUT_S = 30
+
+
+async def reap_orphaned_docker_coding_containers(
+    *,
+    docker_path: str | None = None,
+    label: str | None = None,
+) -> tuple[str, ...]:
+    """Remove Docker coding containers whose process-local owner has exited.
+
+    Returns the IDs of the removed containers. A container is removed only when
+    all of these hold:
+
+    - Its name starts with ``cayu-coding-`` and it carries the
+      ``io.cayu.process-local-owner`` label. The Docker coding factory sets
+      that label only on a container it creates for an allocation whose
+      records end with the creating process: the application's session store
+      does not outlive the process (the in-memory store, or SQLite
+      ``:memory:``). No other process can resume, reconnect to or recover such
+      an allocation.
+    - :func:`cayu.environments.process_local_owner_exited` proves the owner
+      gone: it ran under this kernel boot and in this PID namespace, and its
+      process no longer runs (or its PID now belongs to a process with another
+      start time). A live owner, another boot, host or PID namespace, an
+      unreadable start time or a malformed label keeps the container.
+
+    Containers of durable stores never carry the owner label, so this never
+    touches them: their sessions may still be resumed or recovered, and
+    ``CayuApp.recover_incomplete_sessions`` releases them through their
+    allocation records. Warm spares are reaped by their own pool. ``label``
+    (``key`` or ``key=value``) further restricts the candidates, for example to
+    one test run's namespace.
+    """
+
+    docker = _require_docker(docker_path)
+    filters = [
+        "--filter",
+        "name=cayu-coding-",
+        "--filter",
+        f"label={DOCKER_PROCESS_LOCAL_OWNER_LABEL}",
+    ]
+    if label is not None:
+        filters += ["--filter", f"label={require_durable_clean_nonblank(label, 'label')}"]
+    listed = await _run_docker(
+        docker,
+        [
+            "ps",
+            "-a",
+            "--no-trunc",
+            *filters,
+            "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Label " + f'"{DOCKER_PROCESS_LOCAL_OWNER_LABEL}"' + "}}",
+        ],
+        timeout_s=_ORPHAN_REAP_DOCKER_TIMEOUT_S,
+    )
+    if listed.exit_code != 0 or listed.timed_out:
+        raise RuntimeError("Docker could not list Docker coding containers.")
+    orphans: list[str] = []
+    for line in listed.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3:
+            continue
+        container_id, name, owner = fields
+        if (
+            _CONTAINER_ID.fullmatch(container_id)
+            and name.startswith("cayu-coding-")
+            and not name.startswith(_SPARE_NAME_PREFIX)
+            and process_local_owner_exited(owner)
+        ):
+            orphans.append(container_id)
+    removed: list[str] = []
+    for container_id in orphans:
+        result = await _run_docker(
+            docker,
+            ["rm", "-f", container_id],
+            timeout_s=_ORPHAN_REAP_DOCKER_TIMEOUT_S,
+        )
+        if result.exit_code == 0 and not result.timed_out:
+            removed.append(container_id)
+    return tuple(removed)
 
 
 def docker_coding_backend(context: Any) -> Any:

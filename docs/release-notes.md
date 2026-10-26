@@ -159,6 +159,26 @@ showed this, because the in-memory store makes its own key.
 
 ### Changes
 
+- Docker coding containers no longer outlive a process that exits without
+  `await app.aclose()` when Cayu had already decided to release them, or when
+  nothing could ever reconnect to them. At normal interpreter exit, a container
+  whose removal started but never settled (the close deadline passed, or the
+  event loop stopped mid-removal) is removed with one bounded `docker rm -f`,
+  and an app whose session store does not outlive the process (the in-memory
+  store or SQLite `:memory:`) also removes the containers its sessions still
+  hold, such as after a failed release. Containers of durable stores whose
+  sessions can still be resumed or recovered are left for
+  `recover_incomplete_sessions`, as before. Containers created for a
+  process-local store now carry an `io.cayu.process-local-owner` label, and
+  `cayu.environments.reap_orphaned_docker_coding_containers()` removes those
+  whose owner process has provably exited (for example one killed by a signal).
+  The label names the kernel boot, PID namespace, PID and process start time,
+  and anything the reaper cannot prove, such as an owner in another PID
+  namespace sharing the daemon, keeps the container; it never touches
+  containers of durable stores. Wrapped `LaunchedRunner` and deferred runners
+  take part in the exit cleanup too. Factories can read the same owner token
+  from `EnvironmentFactoryRequest.process_local_owner` and check it with
+  `cayu.environments.process_local_owner_exited()`.
 - Runtime now matches the limits Cayu Cloud raised. A brokered sandbox command
   may add up to 1,000 environment variables and 256 KiB of environment in all
   (was 50 and 64 KiB), counted like the broker as the UTF-8 bytes of each

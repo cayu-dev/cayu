@@ -6,7 +6,7 @@ import secrets
 import threading
 import traceback
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import wraps
 from typing import (
@@ -67,6 +67,10 @@ from cayu.runners._diagnostics import (
     safe_runner_failure_fields,
     trusted_runner_error_type_name,
     trusted_runner_exception_type_name,
+)
+from cayu.runners._exit_cleanup import (
+    forget_unsettled_terminal_lifecycle,
+    track_unsettled_terminal_lifecycle,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
@@ -1352,6 +1356,22 @@ class Runner(ABC):
 
         self._closed = True
 
+    @classmethod
+    def _close_all_at_interpreter_exit(cls, entries: Sequence[tuple[Runner, str | None]]) -> int:
+        """Synchronously release these runners' sandboxes during interpreter exit.
+
+        Cayu calls this from an ``atexit`` hook, after the event loop stopped,
+        once per runner type. Each entry pairs a runner with the action of a
+        ``close()`` or ``kill()`` that started but never settled, or with
+        ``None`` to apply the configured close action to an allocation nothing
+        can reconnect to. Return how many sandboxes were released. Adapters
+        that can do it with bounded blocking calls override this; it must never
+        raise. The default releases nothing.
+        """
+
+        del entries
+        return 0
+
     async def await_pending_command_settlement(self) -> bool:
         """Wait for command cleanup deferred beyond an ``exec`` result.
 
@@ -1730,6 +1750,8 @@ class Runner(ABC):
             self._terminal_lifecycle_task = task
             self._terminal_failure_progress = progress
             self._terminal_lifecycle_action = action
+            # Until it settles, interpreter exit finishes it when the adapter can.
+            track_unsettled_terminal_lifecycle(self, action)
             _PENDING_RUNNER_CLEANUPS.add(task)
             task.add_done_callback(self._record_terminal_lifecycle)
         owned_progress = getattr(self, "_terminal_failure_progress", None)
@@ -1772,6 +1794,7 @@ class Runner(ABC):
             failure = error
         if failure is None:
             self._closed = True
+            forget_unsettled_terminal_lifecycle(self)
         else:
             self._poison_exec()
         # Failed, definitely settled cleanup can be retried; an in-flight
