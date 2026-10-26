@@ -1378,6 +1378,18 @@ def _require_selected_baseline(
     )
 
 
+def _raise_unsupported_database(exc: CloudApiError) -> None:
+    """Explain an HTTP 422 from a Cloud that predates `[database] migrate`."""
+
+    if ("body.manifest.database", "extra_forbidden") in exc.rejected_fields:
+        raise CloudCommandError(
+            "database_migration_unsupported",
+            "This Cayu Cloud doesn't run application migrations, so it rejected [database] "
+            "migrate in cayu-cloud.toml; nothing was deployed. Deploy to a Cayu Cloud that "
+            "runs them, or remove [database] and migrate the application's tables yourself.",
+        ) from exc
+
+
 def _raise_rejected_candidate(exc: CloudApiError) -> None:
     """Explain an HTTP 422 that names the candidate statement; any other passes through."""
 
@@ -1694,6 +1706,8 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             "runtime": initialized.runtime,
             "sign_in": initialized.sign_in,
         }
+        if initialized.database_migrate is not None:
+            result["database"] = {"migrate": initialized.database_migrate}
         if initialized.serve is not None:
             result["serve"] = initialized.serve
         from cayu.cli._cloud_deploy_check import init_deploy_check_notice, run_cloud_deploy_check
@@ -2015,6 +2029,7 @@ def _deploy(
             idempotency_key=source_key,
         )
     except CloudApiError as exc:
+        _raise_unsupported_database(exc)
         if staging:
             _raise_candidate_refusal(exc)
             if exc.status_code == 422:

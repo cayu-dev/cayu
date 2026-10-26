@@ -105,6 +105,11 @@ for a worker, which has no pages. Otherwise it writes `mode = "own"`: a project 
 `server_auth.py` keeps its own sign-in. See
 [Sign-in and home page](#sign-in-and-home-page).
 
+For a project generated with `cayu new --with app-database`, init also writes
+`[database]` with `migrate = "alembic upgrade head"` and reports it as
+`result.database.migrate`. See
+[Application database migration](#application-database-migration).
+
 ## Archive an Agent
 
 Archive retires an Agent you no longer use and keeps its Releases, configuration, data and
@@ -1082,3 +1087,32 @@ Developer dashboard access are its own, and for any other auth target; see
 [Initialize an Agent project](#initialize-an-agent-project). It writes no `home`,
 because init cannot know a page of the project's own. Add `home` yourself when the
 Agent serves one.
+
+## Application database migration
+
+An Agent that keeps its own tables beside Cayu's, such as a project generated with
+`cayu new --with app-database`, declares the command that migrates them:
+
+```toml
+[database]
+migrate = "alembic upgrade head"
+```
+
+- `[database]` is optional. Without it nothing changes: Cloud migrates only Cayu's own
+  storage, and the deployment request is the same as before.
+- `migrate` is required in `[database]`. It is a command, run from the project root
+  without a shell, of at most 2048 characters. It reads the database from
+  `CAYU_DATABASE_URL`, or from `CAYU_DATABASE_DIRECT_URL` when that is set.
+  Other keys in `[database]` are rejected like those in `[web]`. It requires
+  `schema_version = 2`, and `cayu cloud deploy` checks it before uploading and fails
+  with `manifest_invalid`.
+- The command is sent in the deployment request, so a custom `--manifest` path can
+  declare it.
+- A Cayu Cloud that doesn't run application migrations rejects the declaration.
+  `cayu cloud deploy` then exits `2` with category `database_migration_unsupported`,
+  and nothing is deployed. Deploy to a Cayu Cloud that runs them, or remove `[database]`
+  and migrate the application's tables yourself.
+
+`cayu cloud init` writes `migrate = "alembic upgrade head"` for a project generated with
+`--with app-database` (`app-database` in `[tool.cayu.scaffold].capabilities`), and
+reports it as `result.database.migrate`.

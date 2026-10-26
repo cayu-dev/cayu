@@ -28,6 +28,7 @@ from cayu._operator_credentials import (
 )
 from cayu.cli._cloud_api import CloudApiError
 from cayu.cli._serve_readiness import ServeSetupPlan, plan_serve_setup
+from cayu.cli.scaffold_app_database import APP_DATABASE
 
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _APPLICATION = re.compile(r"[a-z0-9][a-z0-9-]{6,61}[a-z0-9]\Z")
@@ -197,6 +198,31 @@ class CloudSignIn:
     public_paths: tuple[str, ...] = ()
 
 
+# The command `cayu new --with app-database` projects migrate their own tables with.
+APP_DATABASE_MIGRATE = "alembic upgrade head"
+_DATABASE_MIGRATE_ERROR = (
+    "[database] migrate must be the command that migrates the application's own tables, "
+    'such as "alembic upgrade head": a non-blank string of at most 2048 characters.'
+)
+
+
+@dataclass(frozen=True)
+class CloudDatabase:
+    """`[database]`: the command Cayu Cloud runs on deploy to migrate the application's tables."""
+
+    migrate: str
+
+
+def _migrate_command(value: object) -> str:
+    if type(value) is not str or not value.strip() or len(value) > 2048 or "\x00" in value:
+        raise CloudApiError("manifest_invalid", _DATABASE_MIGRATE_ERROR)
+    return value
+
+
+def _database(table: dict[str, object] | None) -> CloudDatabase | None:
+    return None if table is None else CloudDatabase(migrate=_migrate_command(table.get("migrate")))
+
+
 def _same_host_path(value: object, *, label: str) -> str:
     # Cloud redirects to `home` and matches `public_paths` against request paths, so
     # each must stay on the Agent's host and mean the same path to every parser.
@@ -276,6 +302,7 @@ class CloudProjectManifest:
     local_files: tuple[CloudLocalFile, ...] = ()
     home: str | None = None
     sign_in: CloudSignIn = CloudSignIn()
+    database: CloudDatabase | None = None
 
     @classmethod
     def load(cls, path: Path) -> CloudProjectManifest:
@@ -314,6 +341,7 @@ class CloudProjectManifest:
             "storage",
             "home",
             "sign_in",
+            "database",
         }
         schema_version = payload.get("schema_version")
         if set(payload) - allowed or schema_version not in {1, 2}:
@@ -333,6 +361,11 @@ class CloudProjectManifest:
                 "manifest_invalid",
                 "home and [sign_in] require cayu-cloud.toml schema_version 2.",
             )
+        if schema_version == 1 and "database" in payload:
+            raise CloudApiError(
+                "manifest_invalid",
+                "[database] requires cayu-cloud.toml schema_version 2.",
+            )
         application = payload.get("application")
         if type(application) is not str:
             raise CloudApiError(
@@ -347,6 +380,9 @@ class CloudProjectManifest:
             sign_in = payload.get("sign_in")
             if sign_in is not None and not isinstance(sign_in, dict):
                 raise TypeError("sign_in must be a table")
+            database = payload.get("database")
+            if database is not None and not isinstance(database, dict):
+                raise TypeError("database must be a table")
             if web is not None and not isinstance(web, dict):
                 raise TypeError("web must be a table")
             if worker is not None and not isinstance(worker, dict):
@@ -365,6 +401,7 @@ class CloudProjectManifest:
                 ("web", web, CloudWebProcess),
                 ("worker", worker, CloudProcess),
                 ("sign_in", sign_in, CloudSignIn),
+                ("database", database, CloudDatabase),
                 *(
                     (
                         f'schedule "{item["name"]}"'
@@ -438,6 +475,7 @@ class CloudProjectManifest:
                 local_files=_local_files(payload.get("storage")),
                 home=_home(payload.get("home")),
                 sign_in=_sign_in(sign_in),
+                database=_database(database),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CloudApiError(
@@ -539,6 +577,8 @@ class CloudProjectManifest:
             _local_file(entry.path, entry.reason)
         _home(self.home)
         _checked_sign_in(self.sign_in.mode, list(self.sign_in.public_paths) or None)
+        if self.database is not None:
+            _migrate_command(self.database.migrate)
 
     def deployment_payload(self, *, repository: str, revision: str) -> dict[str, object]:
         return {
@@ -556,6 +596,12 @@ class CloudProjectManifest:
                 "timeout_seconds": self.timeout_seconds,
                 "environment": self.environment,
                 "compatibility": self.compatibility,
+                # Sent only when declared, so a Cloud that predates it accepts other Agents.
+                **(
+                    {}
+                    if self.database is None
+                    else {"database": {"migrate": self.database.migrate}}
+                ),
             },
             "policy_version": self.policy_version,
         }
@@ -637,6 +683,7 @@ class InitializedCloudProject:
     serve: dict[str, object] | None = None
     command: str | None = None
     sign_in: str = "cloud"
+    database_migrate: str | None = None
 
 
 def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudProject:
@@ -695,6 +742,13 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         runtime = "worker"
         command = "python -m " + application.replace("-", "_")
     sign_in = "cloud" if serve_setup is None else _init_sign_in_mode(serve_setup)
+    scaffold = cayu.get("scaffold", {})
+    capabilities = scaffold.get("capabilities") if isinstance(scaffold, dict) else None
+    database_migrate = (
+        APP_DATABASE_MIGRATE
+        if isinstance(capabilities, list) and APP_DATABASE in capabilities
+        else None
+    )
     content = _render_initial_manifest(
         application=application,
         name=name or application,
@@ -702,6 +756,7 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         command=command,
         runtime=runtime,
         sign_in=sign_in,
+        database_migrate=database_migrate,
     )
     CloudProjectManifest.loads(content)
     if writes_auth_module:
@@ -741,6 +796,7 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         else _serve_setup_report(serve_setup, created_auth_module=writes_auth_module),
         command=command,
         sign_in=sign_in,
+        database_migrate=database_migrate,
     )
 
 
@@ -908,6 +964,7 @@ def _render_initial_manifest(
     command: str,
     runtime: str,
     sign_in: str,
+    database_migrate: str | None,
 ) -> str:
     values = [
         "schema_version = 2",
@@ -931,6 +988,8 @@ def _render_initial_manifest(
     # No `home`: init cannot know a page of the project's own. A worker has no pages,
     # so Cloud sign-in costs it nothing.
     values.extend(("[sign_in]", f"mode = {json.dumps(sign_in)}", ""))
+    if database_migrate is not None:
+        values.extend(("[database]", f"migrate = {json.dumps(database_migrate)}", ""))
     return "\n".join(values)
 
 

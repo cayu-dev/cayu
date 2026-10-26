@@ -124,6 +124,13 @@ not affect execution or approval.
 
 ### Changes
 
+- `cayu-cloud.toml` can declare the command that migrates an Agent's own tables,
+  `[database] migrate = "alembic upgrade head"`, so Cayu Cloud can run it on deploy.
+  `cayu cloud deploy` sends it only when declared, and names a Cayu Cloud that
+  doesn't run application migrations (`database_migration_unsupported`) instead of
+  deploying without them. `cayu cloud init` writes it for projects generated with
+  `--with app-database`. See [Application database
+  migration](cayu-cloud.md#application-database-migration).
 - A tool call uses about 15% less runtime CPU with the SQLite store and about
   20% less with the in-memory store. Copying a validated event no longer
   copies its validation stamp or validates a changed payload twice, event
