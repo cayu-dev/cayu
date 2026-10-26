@@ -343,7 +343,11 @@ def test_release_artifact_job_enforces_tagged_note_immutability() -> None:
 
     checkout = package.index("uses: actions/checkout@")
     setup = package.index("uses: astral-sh/setup-uv@")
-    assert "fetch-depth: 0" in package[checkout:setup]
+    # Tag publishing verifies immutable release state from full history.
+    assert (
+        "fetch-depth: ${{ startsWith(github.ref, 'refs/tags/v') && '0' || '1' }}"
+        in package[checkout:setup]
+    )
     assert "python3 scripts/run_ci.py --lane package" in package
     assert "uv run --no-project" in package_manifest
     assert "--offline" in package_manifest
@@ -363,8 +367,8 @@ def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> No
 
     assert "needs: verification-scope" in sqlite
     assert "needs.verification-scope.outputs.sqlite_cancellation == 'true'" in sqlite
-    assert "needs: verification-scope" in package
-    assert "needs.verification-scope.outputs.release_artifacts == 'true'" in package
+    # The archives build beside the scope; the contracts consuming them wait for it.
+    assert "needs:" not in package
     assert "needs: verification-scope" in dashboard
     assert "needs.verification-scope.outputs.dashboard == 'true'" in dashboard
 
@@ -375,9 +379,11 @@ def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> No
     sidecar_verifier_command = "bash scripts/verify_release_sidecar_artifacts.sh"
     assert package_manifest.count(sidecar_verifier_command) == 1
     checks = _job_block(workflow, "package")
-    assert "needs: package-build" in checks
+    assert "needs: [verification-scope, package-build]" in checks
+    assert "needs.verification-scope.outputs.release_artifacts == 'true'" in checks
     assert (
-        "group: [core, server, campaign, dashboard, authoring, coding, docker, service]" in checks
+        "group: [core, layout, server, campaign, dashboard, authoring, coding, docker, service]"
+        in checks
     )
     assert "matrix.group == 'core'" in checks
     assert '["self-hosted","linux","arm64","gcp-ci"]' in checks
@@ -424,14 +430,14 @@ def test_ci_triggers_skip_main_pushes_and_cover_draft_transitions() -> None:
 def test_draft_prs_skip_every_independent_worker_before_allocation() -> None:
     workflow = _CI_WORKFLOW.read_text()
     draft_guard = "    if: github.event_name != 'pull_request' || !github.event.pull_request.draft"
-    for name in ("verification-scope", "static", "python-tests"):
+    for name in ("verification-scope", "static", "python-tests", "package-build"):
         block = _job_block(workflow, name)
         assert draft_guard in block
         start = block.index("runs-on:") if "runs-on:" in block else block.index("uses:")
         assert block.index(draft_guard) < start
-    for name in ("sqlite-cancellation", "package-build", "dashboard"):
+    for name in ("sqlite-cancellation", "dashboard"):
         assert "needs: verification-scope" in _job_block(workflow, name)
-    assert "needs: package-build" in _job_block(workflow, "package")
+    assert "needs: [verification-scope, package-build]" in _job_block(workflow, "package")
 
 
 def test_manual_tag_validation_cannot_publish() -> None:

@@ -110,6 +110,7 @@ class VerificationScope:
 
 _PACKAGE_VERIFICATION_GROUPS = (
     "core",
+    "layout",
     "server",
     "campaign",
     "dashboard",
