@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import tarfile
 from pathlib import Path
@@ -80,3 +81,16 @@ def test_empty_input_is_rejected(source: Path) -> None:
     (source / "uv.lock").write_bytes(b"")
     with pytest.raises(project.CloudSourceInputsError, match="not a usable file"):
         project.resolve_project(str(source), manifest_path=None, revision=None)
+
+
+def test_a_source_over_clouds_upload_limit_is_refused_before_upload(
+    source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (source / "data.bin").write_bytes(os.urandom(8192))  # random bytes do not compress
+    monkeypatch.setattr(project, "SOURCE_BUNDLE_MAX_BYTES", 1024)
+
+    with pytest.raises(project.CloudApiError) as raised:
+        project.resolve_project(str(source), manifest_path=None, revision=None)
+
+    assert raised.value.category == "source_too_large"
+    assert "add large data, models or build output to .gitignore" in str(raised.value)

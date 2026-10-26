@@ -48,7 +48,7 @@ _GUIDES = {
     ),
     "evals-production": (
         "evals-production.md",
-        "Production sessions, scenarios, tools, process behavior, and memory.",
+        "Production sessions, scenarios, tools, memory, and Compass objectives.",
     ),
     "external-agents": (
         "external-agents.md",
@@ -310,10 +310,18 @@ def run_guide(args: argparse.Namespace) -> int:
 
 def _guide_section(content: str, anchor: str) -> str | None:
     lines = content.splitlines(keepends=True)
+    # A `#` comment inside a fenced code block, such as a TOML example, is not a heading.
+    in_fence = [False] * len(lines)
+    fenced = False
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        else:
+            in_fence[index] = fenced
     match_index: int | None = None
     match_level = 0
     for index, line in enumerate(lines):
-        heading = re.fullmatch(r"(#{1,6})\s+(.+?)\s*\n?", line)
+        heading = None if in_fence[index] else re.fullmatch(r"(#{1,6})\s+(.+?)\s*\n?", line)
         if heading is None or _heading_anchor(heading.group(2)) != anchor:
             continue
         match_index = index
@@ -323,7 +331,7 @@ def _guide_section(content: str, anchor: str) -> str | None:
         return None
     end = len(lines)
     for index in range(match_index + 1, len(lines)):
-        heading = re.match(r"(#{1,6})\s+", lines[index])
+        heading = None if in_fence[index] else re.match(r"(#{1,6})\s+", lines[index])
         if heading is not None and len(heading.group(1)) <= match_level:
             end = index
             break

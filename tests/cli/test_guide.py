@@ -141,6 +141,32 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "Causal contribution" in production
 
 
+def test_objectives_guide_examples_parse_as_cloud_compass_reads_them(capsys) -> None:
+    import tomllib
+
+    from cayu.evals import ProjectImprovementConfigV1, project_objectives_from_toml
+
+    assert main(["guide", "evals-production#objectives-for-compass"]) == 0
+    section = capsys.readouterr().out
+    assert section.startswith("## Objectives for Compass")
+    declaration, objectives = re.findall(r"```toml\n(.*?)```", section, re.DOTALL)
+
+    improvement = tomllib.loads(declaration)["tool"]["cayu"]["improvement"]
+    config = ProjectImprovementConfigV1.model_validate(improvement)
+    assert config.objectives == "cayu-objectives.toml"
+    # Compass parses the objectives text with the runtime's own parser.
+    parsed = project_objectives_from_toml(objectives)
+    assert [entry.suite_id for entry in parsed.correctness_floor] == ["agent-output"]
+    assert parsed.sampled_review_rate_bps == 500
+    assert parsed.mutable_surfaces.body_paths == ("prompts",)
+    # Every commented-out optional part parses too once uncommented.
+    uncommented = re.sub(r"^# (?=\[|[a-z_]+ = )", "", objectives, flags=re.MULTILINE)
+    full = project_objectives_from_toml(uncommented)
+    assert full.mandatory_controls[0].tool_name == "issue_refund"
+    assert full.targets.seconds_per_verified_completion == 90
+    assert full.mutable_surfaces.model_per_step is True
+
+
 def test_guide_accepts_emitted_section_anchors(capsys) -> None:
     assert main(["guide", "diagnostics#app-no-agents"]) == 0
     section = capsys.readouterr().out

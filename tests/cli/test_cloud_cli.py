@@ -71,6 +71,7 @@ def test_cloud_help_exposes_first_party_customer_commands(
     help_text = " ".join(capsys.readouterr().out.split())
     for command in (
         "applications",
+        "compass",
         "context",
         "deploy",
         "deployment",
@@ -503,6 +504,102 @@ mail-agent = "mail_agent.cli:main"
     assert manifest.entrypoint == "mail-agent"
     assert manifest.worker == cloud_project.CloudProcess(command="mail-agent")
     assert manifest.version == "0.4.0"
+
+
+def test_cloud_init_generates_a_worker_next_to_web_for_a_declared_worker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "cayu-scout"
+version = "0.1.0"
+dependencies = ["cayu[server]>=0.14"]
+
+[tool.cayu]
+factory = "app:build_app"
+
+[tool.cayu.serve]
+auth = "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"
+
+[tool.cayu.workers]
+scout = "operations.scout_runs:run_scout_worker"
+""".strip()
+        + "\n"
+    )
+
+    assert main(["cloud", "init", str(tmp_path)]) == 0
+
+    result = json.loads(capsys.readouterr().out)["result"]
+    manifest = cloud_project.CloudProjectManifest.load(tmp_path / "cayu-cloud.toml")
+    assert result["runtime"] == "web"
+    assert result["worker"] == {"command": "cayu worker scout"}
+    assert result["notes"] == [
+        "Added [worker] with `cayu worker scout` next to [web], so the Agent runs its "
+        "declared worker."
+    ]
+    assert manifest.entrypoint == "cayu serve --host 0.0.0.0 --port 8000"
+    assert manifest.web is not None
+    assert manifest.web.command == "cayu serve --host 0.0.0.0 --port 8000"
+    assert manifest.worker == cloud_project.CloudProcess(command="cayu worker scout")
+
+
+@pytest.mark.parametrize("factory", [True, False])
+def test_cloud_init_generates_the_first_of_several_workers_and_names_the_rest(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    factory: bool,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "cayu-scout"\n'
+        'version = "0.1.0"\n'
+        'dependencies = ["cayu[server]>=0.14"]\n\n'
+        "[tool.cayu]\n"
+        + ('factory = "app:build_app"\n\n' if factory else "\n")
+        + "[tool.cayu.serve]\n"
+        'auth = "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"\n\n'
+        "[tool.cayu.workers]\n"
+        'scout = "operations.scout:run"\n'
+        'digest = "operations.digest:run"\n'
+        '"nightly report" = "operations.report:run"\n'
+    )
+
+    assert main(["cloud", "init", str(tmp_path)]) == 0
+
+    result = json.loads(capsys.readouterr().out)["result"]
+    manifest = cloud_project.CloudProjectManifest.load(tmp_path / "cayu-cloud.toml")
+    assert manifest.worker == cloud_project.CloudProcess(command="cayu worker scout")
+    assert result["notes"][-1] == (
+        "Cayu Cloud runs one worker process per Agent, so [worker] runs `scout`, the first "
+        "declared worker, and leaves out `digest`, `nightly report`. Combine them into one "
+        "worker entrypoint, or run the ones that work on a timetable as [[schedules]]."
+    )
+    # `[tool.cayu.serve]` alone also declares the web process.
+    assert result["runtime"] == "web"
+    assert manifest.web is not None
+
+
+def test_cloud_init_quotes_a_worker_name_for_the_command(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "mail-agent"\nversion = "0.1.0"\n\n'
+        '[tool.cayu.workers]\n"mail sync" = "mail.sync:run"\n'
+    )
+
+    assert main(["cloud", "init", str(tmp_path)]) == 0
+
+    result = json.loads(capsys.readouterr().out)["result"]
+    manifest = cloud_project.CloudProjectManifest.load(tmp_path / "cayu-cloud.toml")
+    assert result["runtime"] == "worker"
+    assert "notes" not in result
+    assert "worker" not in result
+    assert manifest.web is None
+    assert manifest.entrypoint == "cayu worker 'mail sync'"
+    assert manifest.worker == cloud_project.CloudProcess(command="cayu worker 'mail sync'")
 
 
 def test_cloud_init_refuses_to_replace_existing_manifest_without_force(

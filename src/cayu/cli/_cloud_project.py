@@ -9,6 +9,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import stat
 import subprocess
 import tarfile
@@ -57,6 +58,11 @@ _EXCLUDED_DIRECTORIES = frozenset(
     }
 )
 _SAFE_ENV_TEMPLATES = frozenset({".env.example", ".env.sample", ".env.template"})
+# Cayu Cloud's limit on one compressed source upload; keep it identical to Cloud.
+# docs/cayu-cloud.md#what-a-deploy-uploads states it and the exclusions above.
+SOURCE_BUNDLE_MAX_BYTES = 250 * 1024 * 1024
+# Schedules one manifest declares (Cloud accepts more; this CLI has always stopped here).
+SCHEDULES_LIMIT = 20
 
 
 def is_application_slug(value: str) -> bool:
@@ -121,6 +127,40 @@ class CloudWebProcess(CloudProcess):
     ready_start_period_seconds: int = _READY_START_PERIOD_SECONDS
 
 
+# Cayu Cloud's limit on a schedule's input, as compact JSON once escaped; keep it identical.
+SCHEDULE_INPUT_MAX_BYTES = 4096
+
+
+def schedule_input_json(value: object) -> str:
+    """``value`` as the compact JSON a scheduled run reads from ``CAYU_SCHEDULE_INPUT``.
+
+    Cayu Cloud's own rule: a table, array, string, number or boolean, keys sorted, at most
+    ``SCHEDULE_INPUT_MAX_BYTES`` once written as a JSON string (quotes and backslashes take
+    two bytes, other non-ASCII characters six).
+    """
+
+    not_json = CloudApiError(
+        "manifest_invalid",
+        "A schedule input must be JSON: a table, array, string, number or boolean.",
+    )
+    if value is None:
+        raise not_json
+    try:
+        text = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+    except (TypeError, ValueError):
+        raise not_json from None
+    # Cloud passes it inside the platform's own JSON (a task override), escaped.
+    if len(json.dumps(text)) - 2 > SCHEDULE_INPUT_MAX_BYTES:
+        raise CloudApiError(
+            "manifest_invalid",
+            f"A schedule input must be at most {SCHEDULE_INPUT_MAX_BYTES} bytes of compact JSON "
+            "once escaped: quotes and backslashes take two bytes, non-ASCII characters six.",
+        )
+    return text
+
+
 @dataclass(frozen=True)
 class CloudSchedule:
     name: str
@@ -128,6 +168,8 @@ class CloudSchedule:
     expression: str
     cpu_millis: int | None = None
     memory_mb: int | None = None
+    # Each run's `CAYU_SCHEDULE_INPUT` (compact JSON); None: the schedule declares none.
+    input: object = field(default=None, hash=False)
 
 
 @dataclass(frozen=True)
@@ -468,6 +510,7 @@ class CloudProjectManifest:
                         command=str(item["command"]),
                         expression=str(item["expression"]),
                         **_process_resources(item),
+                        input=item.get("input"),
                     )
                     for item in schedules
                 ),
@@ -557,8 +600,10 @@ class CloudProjectManifest:
                 "manifest_invalid",
                 "Runtime web idle_timeout_seconds is invalid.",
             )
-        if len(self.schedules) > 20:
-            raise CloudApiError("manifest_invalid", "Too many runtime schedules.")
+        if len(self.schedules) > SCHEDULES_LIMIT:
+            raise CloudApiError(
+                "manifest_invalid", f"A manifest declares at most {SCHEDULES_LIMIT} schedules."
+            )
         for schedule in self.schedules:
             _process_resources({"cpu_millis": schedule.cpu_millis, "memory_mb": schedule.memory_mb})
             if (
@@ -569,6 +614,8 @@ class CloudProjectManifest:
                 or len(schedule.expression) > 256
             ):
                 raise CloudApiError("manifest_invalid", "Runtime schedule is invalid.")
+            if schedule.input is not None:
+                schedule_input_json(schedule.input)
         if len(set(item.name for item in self.schedules)) != len(self.schedules):
             raise CloudApiError("manifest_invalid", "Runtime schedule names must be unique.")
         if len(self.local_files) > _LOCAL_FILES_LIMIT:
@@ -619,6 +666,8 @@ class CloudProjectManifest:
                     **_process_resources(
                         {"cpu_millis": item.cpu_millis, "memory_mb": item.memory_mb}
                     ),
+                    # Omitted without one, so the manifest (and its digest) stays as before.
+                    **({} if item.input is None else {"input": item.input}),
                 }
                 for item in self.schedules
             ],
@@ -683,6 +732,8 @@ class InitializedCloudProject:
     serve: dict[str, object] | None = None
     command: str | None = None
     sign_in: str = "cloud"
+    worker_command: str | None = None
+    notes: tuple[str, ...] = ()
     database_migrate: str | None = None
 
 
@@ -724,23 +775,41 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
     cayu = tool.get("cayu", {}) if isinstance(tool, dict) else {}
     cayu = cayu if isinstance(cayu, dict) else {}
     workers = cayu.get("workers", {})
+    worker_names = [str(name) for name in workers] if isinstance(workers, dict) else []
     scripts = project.get("scripts", {})
     serve_setup: ServeSetupPlan | None = None
     writes_auth_module = False
+    web_command: str | None = None
+    worker_command: str | None = None
+    notes: list[str] = []
     if "serve" in cayu or isinstance(cayu.get("factory"), str):
-        runtime = "web"
-        command = "cayu serve --host 0.0.0.0 --port 8000"
+        web_command = "cayu serve --host 0.0.0.0 --port 8000"
         serve_setup = _plan_init_serve_setup(pyproject_path)
         writes_auth_module = _auth_module_needs_writing(root, serve_setup)
-    elif isinstance(workers, dict) and len(workers) == 1:
-        runtime = "worker"
-        command = f"cayu worker {next(iter(workers))}"
-    elif isinstance(scripts, dict) and len(scripts) == 1:
-        runtime = "worker"
-        command = str(next(iter(scripts)))
-    else:
-        runtime = "worker"
-        command = "python -m " + application.replace("-", "_")
+    if worker_names:
+        # Without a worker process, the runs a web process queues for a declared
+        # worker are never executed. Cloud runs one worker table per Agent.
+        worker_command = shlex.join(("cayu", "worker", worker_names[0]))
+        if web_command is not None:
+            notes.append(
+                f"Added [worker] with `{worker_command}` next to [web], so the Agent runs "
+                "its declared worker."
+            )
+        if len(worker_names) > 1:
+            left_out = ", ".join(f"`{name}`" for name in worker_names[1:])
+            notes.append(
+                "Cayu Cloud runs one worker process per Agent, so [worker] runs "
+                f"`{worker_names[0]}`, the first declared worker, and leaves out {left_out}. "
+                "Combine them into one worker entrypoint, or run the ones that work on a "
+                "timetable as [[schedules]]."
+            )
+    elif web_command is None and isinstance(scripts, dict) and len(scripts) == 1:
+        worker_command = str(next(iter(scripts)))
+    elif web_command is None:
+        worker_command = "python -m " + application.replace("-", "_")
+    runtime = "web" if web_command is not None else "worker"
+    command = web_command if web_command is not None else worker_command
+    assert command is not None
     sign_in = "cloud" if serve_setup is None else _init_sign_in_mode(serve_setup)
     scaffold = cayu.get("scaffold", {})
     capabilities = scaffold.get("capabilities") if isinstance(scaffold, dict) else None
@@ -753,8 +822,8 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         application=application,
         name=name or application,
         version=version,
-        command=command,
-        runtime=runtime,
+        web_command=web_command,
+        worker_command=worker_command,
         sign_in=sign_in,
         database_migrate=database_migrate,
     )
@@ -796,6 +865,8 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         else _serve_setup_report(serve_setup, created_auth_module=writes_auth_module),
         command=command,
         sign_in=sign_in,
+        worker_command=worker_command,
+        notes=tuple(notes),
         database_migrate=database_migrate,
     )
 
@@ -961,17 +1032,18 @@ def _render_initial_manifest(
     application: str,
     name: str,
     version: str,
-    command: str,
-    runtime: str,
+    web_command: str | None,
+    worker_command: str | None,
     sign_in: str,
     database_migrate: str | None,
 ) -> str:
+    entrypoint = web_command if web_command is not None else worker_command
     values = [
         "schema_version = 2",
         f"application = {json.dumps(application)}",
         f"name = {json.dumps(name)}",
         f"version = {json.dumps(version)}",
-        f"entrypoint = {json.dumps(command)}",
+        f"entrypoint = {json.dumps(entrypoint)}",
         'capabilities = ["model.generate"]',
         "cpu_millis = 1000",
         "memory_mb = 2048",
@@ -981,10 +1053,10 @@ def _render_initial_manifest(
         'policy_version = "cayu-egress-v1"',
         "",
     ]
-    if runtime == "web":
-        values.extend(("[web]", f"command = {json.dumps(command)}", "port = 8000", ""))
-    else:
-        values.extend(("[worker]", f"command = {json.dumps(command)}", ""))
+    if web_command is not None:
+        values.extend(("[web]", f"command = {json.dumps(web_command)}", "port = 8000", ""))
+    if worker_command is not None:
+        values.extend(("[worker]", f"command = {json.dumps(worker_command)}", ""))
     # No `home`: init cannot know a page of the project's own. A worker has no pages,
     # so Cloud sign-in costs it nothing.
     values.extend(("[sign_in]", f"mode = {json.dumps(sign_in)}", ""))
@@ -1227,6 +1299,13 @@ def _archive_project(root: Path, *, required_file: Path) -> bytes:
                     f"Local deployment source contains an unsupported file: {relative.as_posix()}",
                 )
     bundle = buffer.getvalue()
+    if len(bundle) > SOURCE_BUNDLE_MAX_BYTES:
+        raise CloudApiError(
+            "source_too_large",
+            f"The compressed source is {len(bundle) / 1024 / 1024:.1f} MiB; Cayu Cloud accepts "
+            f"at most {SOURCE_BUNDLE_MAX_BYTES // 1024 // 1024} MiB. Git decides what is "
+            "uploaded: add large data, models or build output to .gitignore.",
+        )
     _validate_python_build_inputs(root, bundle)
     return bundle
 

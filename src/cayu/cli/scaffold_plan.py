@@ -344,7 +344,12 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         supported_presets=("agent", "service", "coding", "long-running"),
         files=("evals/",),
         verification=("uv run --no-sync cayu eval run",),
-        owned_files=("evals/__init__.py", "evals/agent.py", "evals/CAPABILITY.md"),
+        owned_files=(
+            "evals/__init__.py",
+            "evals/agent.py",
+            "cayu-objectives.toml",
+            "evals/CAPABILITY.md",
+        ),
     ),
     CapabilitySpec(
         name="observability",

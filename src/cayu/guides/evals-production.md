@@ -112,6 +112,88 @@ Session-scoped memory aliases are diagnostic labels, not stable case identity
 across fresh runs. Results retain bounded source/lifecycle evidence and safe
 immutable references, never raw private memory identity or content.
 
+## Objectives for Compass
+
+Compass on Cayu Cloud watches how an Agent runs and proposes changes, and it
+judges every finding by the objectives the Agent's Release declares. Cloud
+refuses to enroll an Agent whose Release declares none (`no_objectives`).
+Declare them in `pyproject.toml`, next to the evals that check a change:
+
+```toml
+[tool.cayu.improvement]
+objectives = "cayu-objectives.toml"
+eval_targets = ["evals.agent:build_eval"]
+```
+
+`objectives` is a project-relative path; keep it outside anything a change may
+edit. Name at least one of `eval_targets` (the `module:attribute` form of
+`[tool.cayu].eval_target`), `corpora` (portable corpus files) or
+`benchmark_packages`; the missions Compass makes ready evaluate on
+`eval_targets`. `evaluator_only_paths` lists material a candidate must never
+see, such as reference answers.
+
+A minimal objectives file, with the optional parts commented out:
+
+```toml
+schema_version = 1
+
+# Required. The share of decisions granted autonomy that a person still
+# reviews, in basis points from 0 to 10000 (500 = 5%).
+sampled_review_rate_bps = 500
+
+# Required, at least one. Suites whose compared results must not regress,
+# each named once by the id its eval or corpus gives it.
+[[correctness_floor]]
+suite_id = "agent-output"
+# metrics = ["status", "score", "reliability"]  # the default: all three
+
+# Tools, or one approval gate on a tool, that are never removed or granted
+# autonomy. Without approval_gate an entry covers every gate on the tool.
+# [[mandatory_controls]]
+# tool_name = "issue_refund"
+# approval_gate = "refund-over-limit"
+
+# Goals per verified completion. Recorded, not enforced.
+# [targets]
+# cost_per_verified_completion = { amount = "0.25", currency = "USD" }
+# seconds_per_verified_completion = 90
+# human_attention_requests_per_verified_completion = "0.2"
+
+# What a change may touch. Nothing is mutable unless it is listed here.
+[mutable_surfaces]
+body_paths = ["prompts"]
+# execution_profile = true  # may change the execution profile
+# model_per_step = true     # may change the model each step uses
+
+# Who approves each kind of change. Schema version 1 accepts only "person",
+# which is the default, so the table can be left out.
+# [approval_rules]
+# body_paths = "person"
+# execution_profile = "person"
+# model_per_step = "person"
+# autonomy_grant = "person"
+```
+
+Body paths must exist and must not overlap the protected paths:
+`pyproject.toml`, the objectives file, the declared corpora, benchmark packages
+and evaluator-only paths, and each eval target's module. `cayu new` writes this
+file and table for presets with evals. Check the declaration before deploying:
+
+```console
+cayu objectives validate
+cayu cloud deploy .
+cayu cloud compass enroll my-agent --agent my-agent
+cayu cloud compass verify my-agent --wait
+cayu cloud compass findings list my-agent
+```
+
+`--agent` names a Cayu agent inside the Agent that Compass watches, and the
+Agent must register it. Repeat it to watch several; each `enroll` sets the
+whole list, so an agent left out is no longer watched. `cayu cloud compass
+--help` lists the rest: `show`, `disable`, `pass`, `job`, `missions`, and
+`findings show|accept|dismiss`. The full schema and the Python API are in the
+repository's `docs/evals.md`.
+
 ## Compare and automate
 
 Captured, fresh simple, and scenario results share the same result, baseline,

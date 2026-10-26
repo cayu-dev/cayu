@@ -26,8 +26,11 @@ cayu cloud service status --application my-agent
 - `deployment logs|status|timeline|wait|promote|discard|retry` and `rollback` for immutable
   releases, including [candidate releases](#candidate-releases);
 - `runtimes list|status` for retained runtime artifacts;
-- `service credentials|destroy|logs|restart|sleep|status|wake` for Agent infrastructure;
-- `env list|set|unset` for Agent-owned configuration; and
+- `service credentials|destroy|logs|pause|restart|resume|sleep|status|wake` for Agent
+  infrastructure, and `schedule run` to run a schedule now;
+- `env list|set|unset` for Agent-owned configuration;
+- `compass agents|show|enroll|disable|verify|pass|job|missions|findings` for
+  [Compass](#compass); and
 - `evidence list|show|verify` for local content-free command records.
 
 `deployment timeline` shows the release pipeline milestones and whether a failed
@@ -58,7 +61,16 @@ failed.
 
 `cayu cloud init` writes `cayu-cloud.toml`. For a project with a `[tool.cayu]`
 factory it writes a web process that runs `cayu serve --host 0.0.0.0 --port 8000`.
-Outside `--dev`, that command needs the `server` extra of `cayu` and a
+For a project that declares `[tool.cayu.workers]` it also writes a `[worker]` that runs
+`cayu worker NAME`, next to `[web]` when there is one; without it, runs the web process
+queues for the worker would never execute. Cayu Cloud runs one worker process per Agent,
+so with several workers init writes the first one declared and names the others in
+`result.notes`; combine them into one worker entrypoint, or run the ones that work on a
+timetable as [`[[schedules]]`](#schedules). A project with neither
+gets a worker that runs its only console script, or `python -m PACKAGE`.
+`result.worker.command` reports a worker written next to `[web]`.
+
+Outside `--dev`, the `cayu serve` command needs the `server` extra of `cayu` and a
 `[tool.cayu.serve].auth` target, so init checks `pyproject.toml` first:
 
 - If the `cayu` requirement in `[project].dependencies` lacks the `server` extra,
@@ -109,6 +121,153 @@ For a project generated with `cayu new --with app-database`, init also writes
 `[database]` with `migrate = "alembic upgrade head"` and reports it as
 `result.database.migrate`. See
 [Application database migration](#application-database-migration).
+
+## Agent processes on Cayu Cloud
+
+This section is what an Agent's code can count on once it runs on Cayu Cloud. A
+`cayu-cloud.toml` declares up to three kinds of process, all built from one
+immutable Release image:
+
+- `[web]` runs one long-lived task serving `port`, reached at the Agent's own
+  address. Cloud probes it for readiness (`[web] ready_path`, below) and may
+  let it sleep when idle and wake it on the next request.
+- `[worker]` runs one long-lived task with no inbound traffic, for example
+  `cayu worker NAME`. Cloud runs at most one worker table per Agent and restarts
+  the task if it exits.
+- Each `[[schedules]]` entry starts a separate short task at the times its
+  `expression` names. An Agent declares at most 20 schedules, each with a unique
+  `name` of lowercase letters, digits and interior hyphens (at most 63
+  characters).
+
+`entrypoint` is used only when the manifest declares none of these. Web, worker
+and schedules share the Release image, the Agent's environment variables
+(`cayu cloud env`), and `/data`. When Cloud provisions the Agent's PostgreSQL
+database, every process gets it as `CAYU_DATABASE_URL` together with
+`CAYU_REQUIRE_POSTGRES=1`, so Cayu's SQLite stores refuse to open; keep durable
+state in that database.
+
+Cloud runs each `command` without a shell. It splits the string the way a POSIX
+shell splits words (quotes group, nothing is expanded) and starts the program
+directly, so pipes, `&&`, redirects and `$VARIABLE` don't work. Wrap such a
+command in `sh -c '...'`; the image has the BusyBox `sh`, not `bash`.
+
+### Schedules
+
+`expression` uses Amazon EventBridge Scheduler's syntax and is evaluated in UTC:
+
+- `rate(VALUE UNIT)` with a unit of `minute`, `hour` or `day` for a value of 1
+  and `minutes`, `hours` or `days` otherwise, such as `rate(15 minutes)` or
+  `rate(1 day)`;
+- `cron(MINUTES HOURS DAY-OF-MONTH MONTH DAY-OF-WEEK YEAR)` with six fields,
+  where one of day-of-month and day-of-week is `?`, such as
+  `cron(0 14 ? * MON-FRI *)` for 14:00 UTC on weekdays. Numbered days of the week
+  run from 1 (Sunday) to 7 (Saturday).
+
+A run starts at its time, without a flexible window, and runs don't wait for
+each other: a run that outlasts its interval overlaps the next one. On an
+install that runs Agents on Kubernetes, an expression must keep its exact
+meaning as a five-field UTC cron: a minute rate that divides an hour, an hour
+rate that divides a day, `rate(1 day)`, or a `cron()` without `L`, `W`, `#`, a
+year limit, or a stepped day of the week. Each run's output is in
+`cayu cloud service logs`.
+
+A schedule can carry a JSON `input`, a table, array, string, number or boolean
+of at most 4096 bytes as compact JSON once escaped (quotes and backslashes take
+two bytes, other non-ASCII characters six). Each run gets it as
+`CAYU_SCHEDULE_INPUT`, compact JSON with sorted keys, beside
+`CAYU_SCHEDULE_NAME`; scheduled tasks have no standard input, so the command
+reads the variable. The input shows in the schedule and its tasks, so it must
+never hold a secret. A schedule without `input` sends the same manifest as
+before, and `cayu cloud deploy` checks the input before uploading:
+
+```toml
+[[schedules]]
+name = "scout"
+command = "python -m scout.run"  # reads CAYU_SCHEDULE_INPUT
+expression = "rate(6 hours)"
+input = { prompt = "Look for new pricing pages", limit = 20 }
+```
+
+`cayu cloud schedule run NAME --application AGENT` starts one run of a deployed
+schedule now, as its expression would, and prints the run Cloud started (its
+output is in the logs); `--input JSON` gives that run its own input instead of
+the schedule's. A Release that declares no such schedule is refused with `code`
+`schedule_not_found`.
+
+`cayu cloud service pause --application AGENT` scales the worker to zero and
+stops the schedules starting runs; runs already started finish, and the web
+process keeps serving, so people can still open the Agent and decide what waits
+on them. A pause outlasts deploys, rollbacks, environment changes and restarts
+until `cayu cloud service resume`; `service destroy` clears it. Both are
+idempotent and print the service, whose `paused` and `paused_at` (also in
+`service status`) say where it stands. `schedule run` works while the Agent is
+paused. These need a Cayu Cloud release that supports them; an older one
+answers `service_pause_unsupported` or `schedule_run_unsupported`, and refuses a
+manifest with `input`.
+
+### The runtime image
+
+Cloud builds each Release on the official `python:3.13-alpine` image, so the
+Agent runs Python 3.13 on Alpine Linux with musl libc. The build copies the
+uploaded source to `/app`, adds `git` and `ripgrep`, and runs
+`uv sync --frozen --no-dev` from `uv.lock`; the project's virtual environment is
+first on `PATH`. Development dependencies are not installed, and there is no
+`gh`, `bash` or C compiler. Every dependency needs a pure Python or `musllinux`
+wheel; one that ships only glibc (`manylinux`) wheels and must compile fails the
+build. Call web APIs such as GitHub's REST API instead of command-line tools the
+image lacks.
+
+### Files under /data
+
+`/data` is a persistent directory of the Agent's own on a network file system,
+mounted read-write in the web process, the worker and every schedule run, which
+all see the same files. It survives deploys, rollbacks, restarts, sleep and
+`service destroy`; no other Agent can mount it. Production backs it up daily and
+keeps each backup 35 days; ask Cayu support for a restore. It is for files: Cloud
+refuses a Release that keeps durable database state in local files there unless
+you acknowledge them (see [Local file acknowledgements](#local-file-acknowledgements)),
+and `cayu cloud service status` reports what it finds under `/data` as
+`storage_audit`.
+
+### What a deploy uploads
+
+`cayu cloud deploy .` uploads the project the way Git sees it: tracked files
+plus untracked files `.gitignore` doesn't exclude, so `.gitignore` decides what
+ships. Outside a Git repository it uploads every file. Either way it never
+uploads `.git`, `.hg`, `.svn`, `.venv`, `venv`, `__pycache__`, `.mypy_cache`,
+`.pytest_cache`, `.ruff_cache`, `build`, `dist` or `node_modules` directories,
+`.DS_Store`, `*.pyc` and `*.pyo` files, `.env`, or any other `.env.*` file except
+`.env.example`, `.env.sample` and `.env.template`. Secrets belong in
+`cayu cloud env set NAME --secret`, never in the source.
+
+The compressed upload may be at most 250 MiB; the CLI refuses a larger one with
+`source_too_large` before uploading anything. `pyproject.toml` and `uv.lock` must
+be at the root of the upload, and Git must not ignore an untracked `uv.lock`.
+Files listed in `[tool.cayu.improvement] evaluator_only_paths` are uploaded for
+evaluation but kept out of the image the Agent runs.
+
+### The release smoke test
+
+Before a Release can serve, Cloud starts each distinct process command (the
+web, the worker and every schedule, or the `entrypoint` when there are none) in
+an isolated sandbox with no network access and no credentials. A command passes
+if it is still running after 2 seconds, or has exited with status 0 by then.
+So a process that exits with an error at startup because it can't reach the
+network, its database or a secret fails the Release at the `smoke_test` stage; a
+schedule that finishes quickly and exits 0 passes. The same sandbox also proves
+that the image can't reach the network directly or read cloud credentials.
+After promotion, the web process must also pass its readiness probe.
+
+### Approvals in Cayu Cloud
+
+Cayu Cloud Home lists what an Agent is waiting on a person for (approvals,
+questions and recoveries), read from the Agent's own inbox, which `cayu serve`
+serves from Cayu 0.14.0. Cloud reads it through the web process, so an Agent
+without a running `[web]`, such as a worker-only Agent, shows nothing there.
+Deciding from Cloud needs `[sign_in] mode = "cloud"`, so the Agent knows who
+decided; Cloud can't decide for an Agent on its own sign-in
+(`agent_sign_in_required`), so people decide in the Agent itself. A sleeping
+Agent is read only while one of its sessions waits for a person.
 
 ## Archive an Agent
 
@@ -1031,6 +1190,70 @@ with `manifest_invalid` before upload, for both local and repository sources. Mo
 the manifest to the root as a regular file and deploy without `--manifest`. Custom
 manifests with no acknowledgements (including an empty `local_files` array) remain
 supported.
+
+## Compass
+
+Compass watches how an Agent runs and where people step in, and proposes
+findings: an agent change a Compound mission can make, or an autonomy grant. A
+person accepts or dismisses each one; Compass changes nothing on the Agent by
+itself. It judges every finding by the objectives the Agent's Release declares
+under `[tool.cayu.improvement]`, so declare them first (`cayu guide
+evals-production#objectives-for-compass`, checked with `cayu objectives
+validate`). Cloud refuses an Agent whose Release declares none with
+`no_objectives`.
+
+```console
+cayu cloud compass enroll my-agent --agent my-agent
+cayu cloud compass verify my-agent --wait
+cayu cloud compass show my-agent
+cayu cloud compass pass my-agent --wait
+cayu cloud compass findings list my-agent --status proposed
+cayu cloud compass findings accept my-agent FINDING --note "Worth trying"
+cayu cloud compass findings dismiss my-agent FINDING --note "Expected behavior"
+cayu cloud compass missions my-agent
+cayu cloud compass disable my-agent
+```
+
+The commands call Cloud's `/v1/compass/agents/...` routes with your `cayu cloud
+login` (or the selected context's API key), and Cloud answers only for your
+Organization's Agents. They need a developer or organization administrator; a
+member is refused with `code` `developer_required`. They mirror Cloud's operator
+`compass` commands, except that waits take `--poll-seconds` and
+`--wait-seconds` like the rest of `cayu cloud`.
+
+- **Enrolling.** `--agent` names a Cayu agent inside the Agent that Compass
+  watches; the Agent must register it, or it won't start with Compass's fork
+  controller. Repeat it to watch several (1 to 16). Each `enroll` sets the whole
+  enrollment: options left out take Cloud's defaults (12 forks, no model runs,
+  5 runs per finding, a 14-day window, $20 per mission and $100 a month), and an
+  agent left out is no longer watched. `--allow-model-runs` needs
+  `--fork-budget-usd`. `--release` picks the Release whose objectives judge
+  findings (the selected one by default), and `--api-path /cayu/api` is for an
+  Agent that mounts Cayu with `mount_cayu` instead of running `cayu serve`.
+- **Several agents and older Cloud releases.** `enroll` always sends the agents
+  as `agents`. A Cloud release from before several agents refuses that field, so
+  with one `--agent` the command sends it again as `agent` under the same
+  idempotency key, and with several it fails saying that Cloud watches one agent
+  per Agent. Once an Agent watches several agents, Cloud refuses a single
+  `agent` with `agents_required`.
+- **Idempotency.** `enroll`, `verify`, `pass`, `findings accept` and
+  `findings dismiss` take `--idempotency-key`. Without one the command chooses a
+  key and prints it as `idempotency_key`, on an error too, so a write whose
+  answer was lost (`compass_outcome_unknown`) can be repeated with it.
+- **Jobs.** `verify` and `pass` print the first job Compass queued, with one per
+  watched agent in `jobs`; `--agent` queues only that agent's. With `--wait`
+  they wait until every job succeeds or fails, retrying brief API outages, and
+  exit `2` with `wait_timeout` and a `compass job` command once
+  `--wait-seconds` pass. `findings list --agent NAME` lists one agent's
+  findings.
+- **Missions.** `missions` lists the Compound missions Compass made ready and
+  why Cloud starts none now, if it doesn't. Cloud starts them on its own, and
+  each waits for a person to approve its plan before it spends anything.
+
+A refusal exits `2` with Cloud's `code` and message, for example
+`no_objectives`, `invalid_settings`, `not_enrolled`, `fork_controller_conflict`,
+`enrollment_incomplete` (repeat the same enroll, or disable), `agents_required`,
+`agent_not_watched`, `compass_disabled` or `compass_unavailable`.
 
 ## Tools and knowledge registration
 

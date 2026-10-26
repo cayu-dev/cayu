@@ -18,7 +18,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO, cast
+from typing import Any, TextIO, cast
 
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
@@ -788,6 +788,29 @@ pythonpath = ["."]
 [tool.uv]
 cache-dir = ".cayu/uv-cache"
 __UV_SOURCES__"""
+
+_OBJECTIVES_PATH = "cayu-objectives.toml"
+_IMPROVEMENT_TOML = f"""[tool.cayu.improvement]
+objectives = "{_OBJECTIVES_PATH}"
+eval_targets = ["evals.agent:build_eval"]
+"""
+_OBJECTIVES_TOML = """# What Compass on Cayu Cloud judges proposed changes by, named by
+# [tool.cayu.improvement] in pyproject.toml. Every field is explained by
+# `uv run --no-sync cayu guide evals-production#objectives-for-compass`.
+# Check it with `uv run --no-sync cayu objectives validate`.
+schema_version = 1
+
+# The share of decisions granted autonomy that a person still reviews (500 = 5%).
+sampled_review_rate_bps = 500
+
+# The suite in evals/agent.py whose results must not regress.
+[[correctness_floor]]
+suite_id = "__SUITE_ID__"
+
+# What a proposed change may edit. A person approves every change.
+[mutable_surfaces]
+body_paths = ["prompts"]
+"""
 
 _SERVE_AUTH = f"""# `cayu serve` requires {OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE}
 # (HTTP Basic auth) and refuses to start without them. `cayu serve --dev` stays
@@ -2828,7 +2851,19 @@ def project_file_paths(plan: ApplicationPlan) -> frozenset[str]:
     )
 
 
-def _rendered_project_files(
+def _rendered_project_files(name: str, **options: Any) -> dict[str, str]:
+    files = _rendered_preset_files(name, **options)
+    if "evals/agent.py" in files:
+        # Compass judges proposed changes by these objectives; the floor names the
+        # suite the preset's own eval defines.
+        suite = re.search(r'EvalSuite\(\s*id="([^"]+)"', files["evals/agent.py"])
+        if suite is None:
+            raise ValueError("evals/agent.py defines no EvalSuite id for the objectives file.")
+        files[_OBJECTIVES_PATH] = _OBJECTIVES_TOML.replace("__SUITE_ID__", suite.group(1))
+    return files
+
+
+def _rendered_preset_files(
     name: str,
     *,
     agent_name: str | None = None,
@@ -3004,7 +3039,9 @@ def _rendered_project_files(
                 "" if plan.preset == "service" else _SERVE_DEPLOYMENT_AGENTS
             ),
             "__EVAL_TARGET__": (
-                'eval_target = "evals.agent:build_eval"\n' if "evals" in plan.capabilities else ""
+                'eval_target = "evals.agent:build_eval"\n\n' + _IMPROVEMENT_TOML
+                if "evals" in plan.capabilities
+                else ""
             ),
             # Local tooling default; CAYU_DATABASE_URL overrides it for the CLI and app.
             "__SESSION_STORE__": f'backend = "sqlite"\npath = "{local_database_path(plan)}"',

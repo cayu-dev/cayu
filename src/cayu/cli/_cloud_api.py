@@ -57,6 +57,37 @@ _SAFE_API_ERROR_DETAILS = {
 # Cloud's documented refusals of a candidate release, whose own message names the releases.
 CANDIDATE_REFUSAL_CODES = frozenset({"candidate_baseline_changed", "candidate_expired"})
 
+# Cloud's documented refusals whose code and own message the CLI reports, filtered like a
+# conflict's reason, since the message says what to fix: Compass's (`cayu cloud compass`)
+# and a schedule run's (`cayu cloud schedule run`).
+_REPORTED_API_REFUSALS = frozenset(
+    {
+        (403, "compass_disabled"),
+        (403, "developer_required"),
+        (404, "agent_not_watched"),
+        (404, "not_enrolled"),
+        (404, "release_not_found"),
+        (404, "schedule_not_found"),
+        (409, "agent_inactive"),
+        (409, "agent_not_enrollable"),
+        (409, "agents_required"),
+        (409, "disabled"),
+        (409, "enrollment_incomplete"),
+        (409, "fork_controller_conflict"),
+        (409, "idempotency_key_reused"),
+        (409, "no_schedule"),
+        (409, "no_selected_release"),
+        (409, "release_source_unreadable"),
+        (422, "invalid_settings"),
+        (422, "no_objectives"),
+        (422, "release_too_large"),
+        (503, "agent_domain_unknown"),
+        (503, "compass_unavailable"),
+        (503, "release_source_unavailable"),
+        (504, "compass_outcome_unknown"),
+    }
+)
+
 # Cloud's stable rejection codes are short lowercase identifiers.
 _CLOUD_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _CONFLICT_DETAIL_LIMIT = 512
@@ -361,8 +392,10 @@ def _safe_api_error_code(
     if structured is None:
         return None
     code = structured[0]
-    documented = (status_code, code) in _SAFE_API_ERROR_DETAILS or (
-        status_code == 409 and code in CANDIDATE_REFUSAL_CODES
+    documented = (
+        (status_code, code) in _SAFE_API_ERROR_DETAILS
+        or (status_code, code) in _REPORTED_API_REFUSALS
+        or (status_code == 409 and code in CANDIDATE_REFUSAL_CODES)
     )
     return code if documented else None
 
@@ -396,7 +429,10 @@ def _safe_api_error_detail(
             )
             return "Agent resources exceed supported sizes. Valid manifest pairs: " + options + "."
     allowlisted = _SAFE_API_ERROR_DETAILS.get((status_code, code))
-    if allowlisted is None and status_code == 409 and _CLOUD_ERROR_CODE.fullmatch(code):
+    if allowlisted is None and (
+        (status_code, code) in _REPORTED_API_REFUSALS
+        or (status_code == 409 and _CLOUD_ERROR_CODE.fullmatch(code))
+    ):
         return safe_text(detail.get("message"), _CONFLICT_DETAIL_LIMIT)
     return allowlisted
 

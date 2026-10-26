@@ -3253,3 +3253,35 @@ def test_a_real_run_into_an_existing_scaffold_reports_a_non_empty_target(
     assert payload["error"]["code"] == "TARGET_NOT_EMPTY"
     # The identical request still settles as an authenticated retry.
     assert main(["new", "existing", "--dir", str(tmp_path), "--json"]) == 0
+
+
+@pytest.mark.parametrize(
+    ("preset", "suite_id"),
+    [("agent", "agent-output"), ("service", "agent-output"), ("long-running", "invoice-payment")],
+)
+def test_presets_with_evals_declare_valid_compass_objectives(
+    tmp_path: Path, preset: str, suite_id: str
+) -> None:
+    from cayu.cli.scaffold import project_files
+    from cayu.evals import load_project_improvement, validate_project_improvement
+
+    files = project_files("objectives-agent", preset=preset)
+    for relative, content in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(content, encoding="utf-8")
+
+    declaration = load_project_improvement(tmp_path)
+
+    assert declaration.config.objectives == "cayu-objectives.toml"
+    assert declaration.config.eval_targets == ("evals.agent:build_eval",)
+    assert [entry.suite_id for entry in declaration.objectives.correctness_floor] == [suite_id]
+    assert validate_project_improvement(declaration) == ()
+
+
+def test_a_project_without_evals_gets_no_objectives() -> None:
+    from cayu.cli.scaffold import project_files
+
+    files = project_files("objectives-agent", without_capabilities=("evals",))
+
+    assert "cayu-objectives.toml" not in files
+    assert "improvement" not in tomllib.loads(files["pyproject.toml"])["tool"]["cayu"]

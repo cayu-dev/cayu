@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Never
+from urllib.parse import quote
 
 from cayu.cli._cloud_api import (
     CANDIDATE_REFUSAL_CODES,
@@ -31,6 +32,7 @@ from cayu.cli._cloud_auth import (
     WorkOSDeviceAuthClient,
     fresh_cloud_credentials,
 )
+from cayu.cli._cloud_compass import CompassWriteError, add_compass_parser, compass_command
 from cayu.cli._cloud_diagnostics import CloudDeploymentFailure as _CloudDeploymentFailure
 from cayu.cli._cloud_diagnostics import parse_build_failure, safe_text
 from cayu.cli._cloud_evidence import EvidenceRecorder
@@ -41,6 +43,7 @@ from cayu.cli._cloud_project import (
     initialize_project,
     is_application_slug,
     resolve_project,
+    schedule_input_json,
 )
 
 _DEPLOYMENT_FAILURES = {"cancelled", "destroyed", "failed"}
@@ -715,7 +718,7 @@ def _cloud_failure(exc: Exception) -> int:
         error.update(exc.details)
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
-    if isinstance(exc, _CloudDeployCheckError):
+    if isinstance(exc, (_CloudDeployCheckError, CompassWriteError)):
         error.update(exc.details)
     if isinstance(
         exc,
@@ -993,7 +996,12 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         ),
         "destroy": "Remove the Agent services and schedules but retain its releases.",
         "logs": "Read recent infrastructure logs from the Agent service.",
+        "pause": (
+            "Scale the Agent worker to zero and stop its schedules starting runs; the web "
+            "process keeps serving. Deploys and restarts keep the Agent paused until resume."
+        ),
         "restart": "Restart the Agent service on its selected immutable release.",
+        "resume": "Start the paused Agent worker again and let its schedules run.",
         "sleep": "Scale only the Agent web service to zero.",
         "status": "Show the Agent web, worker, schedule, and endpoint state.",
         "wake": "Start only the Agent web service.",
@@ -1038,6 +1046,32 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     environment_unset.add_argument("name")
     environment_unset.add_argument("--application", required=True)
+
+    schedule = commands.add_parser(
+        "schedule",
+        help="Run an Agent schedule now.",
+        description="Operate the Agent's [[schedules]] outside their expressions.",
+    )
+    schedule_commands = schedule.add_subparsers(dest="schedule_command", required=True)
+    schedule_run = schedule_commands.add_parser(
+        "run",
+        description=(
+            "Start one run of a deployed schedule now, as its expression would, also while "
+            "the Agent is paused. Its output is in `service logs`."
+        ),
+    )
+    schedule_run.add_argument("name", help="The schedule's name in cayu-cloud.toml.")
+    schedule_run.add_argument("--application", required=True)
+    schedule_run.add_argument(
+        "--input",
+        type=_schedule_input,
+        help=(
+            "JSON the run reads from CAYU_SCHEDULE_INPUT instead of the schedule's own input "
+            "(at most 4096 bytes compact; never a secret)."
+        ),
+    )
+
+    add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
 
     evidence = commands.add_parser(
         "evidence",
@@ -1710,6 +1744,10 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             result["database"] = {"migrate": initialized.database_migrate}
         if initialized.serve is not None:
             result["serve"] = initialized.serve
+        if initialized.runtime == "web" and initialized.worker_command is not None:
+            result["worker"] = {"command": initialized.worker_command}
+        if initialized.notes:
+            result["notes"] = list(initialized.notes)
         from cayu.cli._cloud_deploy_check import init_deploy_check_notice, run_cloud_deploy_check
 
         check = run_cloud_deploy_check(
@@ -1814,6 +1852,16 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         return _service(arguments, client=client)
     if arguments.command == "env":
         return _environment(arguments, client=client)
+    if arguments.command == "schedule":
+        return _schedule(arguments, client=client)
+    if arguments.command == "compass":
+        return compass_command(
+            arguments,
+            client=client,
+            is_transient=_transient_api_error,
+            transient_limit=_SERVICE_POLL_TRANSIENT_LIMIT,
+            validate_wait=_validate_wait,
+        )
     raise CloudCommandError(
         "command_unavailable",
         f"`cayu cloud {arguments.command}` is not available.",
@@ -3105,6 +3153,12 @@ def _service(
         result = client.request("POST", f"{path}/restart")
     elif action in {"sleep", "wake"}:
         result = client.request("POST", f"{path}/{action}")
+    elif action in {"pause", "resume"}:
+        result = _unsupported_when_missing(
+            lambda: client.request("POST", f"{path}/{action}"),
+            "service_pause_unsupported",
+            "This Cayu Cloud can't pause Agents yet.",
+        )
     elif action == "logs":
         result = client.request("GET", f"{path}/logs")
     elif action == "credentials":
@@ -3127,6 +3181,49 @@ def _service(
                 result = client.request("GET", path)
                 result_status = _service_status(result)
     return {"operation": f"service.{action}", "result": result}
+
+
+def _unsupported_when_missing(
+    request: Callable[[], dict[str, Any]], category: str, message: str
+) -> dict[str, Any]:
+    """Answer ``request``, naming a route the selected Cloud doesn't serve yet.
+
+    The Agent was just resolved, so a 404 without one of Cloud's codes, or a 405, means the
+    route itself is missing.
+    """
+
+    try:
+        return request()
+    except CloudApiError as exc:
+        if exc.status_code == 405 or (exc.status_code == 404 and exc.code is None):
+            raise CloudCommandError(category, message) from None
+        raise
+
+
+def _schedule(arguments: argparse.Namespace, *, client: CloudApiClient) -> dict[str, Any]:
+    application_id = _application_id(client, arguments.application)
+    name = quote(arguments.name, safe="")
+    payload = None if arguments.input is None else {"input": arguments.input}
+    result = _unsupported_when_missing(
+        lambda: client.request(
+            "POST", f"/v1/applications/{application_id}/schedules/{name}/run", payload=payload
+        ),
+        "schedule_run_unsupported",
+        "This Cayu Cloud can't run a schedule on demand yet.",
+    )
+    return {"operation": "schedule.run", "result": result}
+
+
+def _schedule_input(value: str) -> object:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"must be JSON: {exc.msg}") from None
+    try:
+        schedule_input_json(parsed)
+    except CloudApiError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return parsed
 
 
 def _operator_credentials(client: CloudApiClient, *, application_id: str) -> dict[str, Any]:
