@@ -130,3 +130,16 @@ test("members may read native tool usage but never gain tool mutations", () => {
     false,
   )
 })
+
+test("members read registered tool labels without gaining tool mutation authority", () => {
+  const read = { kind: "surface", surface: "tool_display" }
+  assert.equal(applyViewerAccess(available, read, member).enabled, true)
+  assert.equal(
+    applyViewerAccess({ enabled: false, unavailable_reason: "unsupported" }, read, member).enabled,
+    false,
+  )
+  assert.equal(
+    applyViewerAccess(available, { ...read, operation: "mutate" }, member).enabled,
+    false,
+  )
+})

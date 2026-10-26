@@ -2,7 +2,7 @@
  * Pure helpers that turn runtime records into what the pages show. Nothing here knows
  * about a particular app: titles, summaries, labels and structured output are generic.
  */
-import type { SessionState, ToolDisplay, TranscriptMessage } from "../api/types.ts"
+import type { AgentsPage, SessionState, ToolDisplay, TranscriptMessage } from "../api/types.ts"
 
 export const STATE_LABEL: Record<SessionState, string> = {
   running: "Running",
@@ -75,6 +75,8 @@ export type Block =
 
 type Part = { [key: string]: unknown }
 const str = (v: unknown) => (typeof v === "string" ? v : "")
+const redacted = (value: string) =>
+  value.includes("[REDACTED_SECRET]") || value.includes("[PRIVATE_EVENT_AUTHORITY]")
 
 function resultText(part: Part): string {
   const content = part.content
@@ -104,15 +106,7 @@ export function buildBlocks(
       part.tool_round_id,
     ]
     if (typeof fields[0] !== "string" || !fields[0].trim()) return null
-    if (
-      fields.some(
-        (field) =>
-          typeof field !== "string" ||
-          !field.trim() ||
-          field.includes("[REDACTED_SECRET]") ||
-          field.includes("[PRIVATE_EVENT_AUTHORITY]"),
-      )
-    )
+    if (fields.some((field) => typeof field !== "string" || !field.trim() || redacted(field)))
       return null
     return JSON.stringify(fields)
   }
@@ -221,6 +215,33 @@ export function buildBlocks(
  */
 export type ToolDisplays = Record<string, ToolDisplay | undefined>
 
+/** Current declarations for the session's specialist, never a global tool-name lookup. */
+export function sessionToolDisplays(
+  inventory: AgentsPage | undefined,
+  agentName: string | undefined,
+): ToolDisplays {
+  if (!agentName || redacted(agentName)) return {}
+  const agents = inventory?.agents.filter((agent) => agent.name === agentName) ?? []
+  if (agents.length !== 1) return {}
+  const declarations = new Map<string, ToolDisplay | undefined>()
+  for (const tool of agents[0]!.tools) {
+    // Public redaction can collapse distinct registered names. Neither the first
+    // nor the last declaration establishes which one the transcript called.
+    declarations.set(
+      tool.name,
+      declarations.has(tool.name) || !tool.name || redacted(tool.name)
+        ? undefined
+        : (tool.display ?? undefined),
+    )
+  }
+  return Object.fromEntries(declarations)
+}
+
+/** Only declared own keys count: names such as `constructor` are valid tool names. */
+export function toolDisplay(name: string, displays: ToolDisplays): ToolDisplay | undefined {
+  return Object.hasOwn(displays, name) ? displays[name] : undefined
+}
+
 const lowerFirst = (s: string) => s.charAt(0).toLowerCase() + s.slice(1)
 const upperFirst = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 
@@ -236,7 +257,9 @@ function phrase(name: string, n: number, display: ToolDisplay | undefined): stri
 export function workSummary(tools: ToolUse[], displays: ToolDisplays = {}): string {
   const counts = new Map<string, number>()
   for (const t of tools) counts.set(t.name, (counts.get(t.name) ?? 0) + 1)
-  return upperFirst([...counts].map(([name, n]) => phrase(name, n, displays[name])).join(", "))
+  return upperFirst(
+    [...counts].map(([name, n]) => phrase(name, n, toolDisplay(name, displays))).join(", "),
+  )
 }
 
 /** One step in an expanded line: "Read src/app.py", or the tool name when it has no label. */
@@ -244,7 +267,7 @@ export function stepLabel(
   tool: ToolUse,
   displays: ToolDisplays = {},
 ): { verb: string; target: string } {
-  const display = displays[tool.name]
+  const display = toolDisplay(tool.name, displays)
   return {
     verb: display ? upperFirst(display.verb) : tool.name,
     target: tool.argumentsUnavailable ? "" : argPreview(tool.args),

@@ -200,7 +200,10 @@ cursor-paged calls. Unavailable reads do not become zero counts. Exact call link
 carry the retained session incarnation into Trace. The old Agents page is removed.
 `/api/agents` supplies optional registered `display` labels, advertised by the
 read-only `tool_display` capability. Built-ins declare labels; custom, MCP and
-hosted tools retain the name fallback when none is declared.
+hosted tools retain the name fallback when none is declared. Session collapsed work,
+expanded steps and completed Trace tool spans share the session specialist's declared
+labels. Unavailable labels or ambiguous public names keep the tool-name fallback;
+labels do not change call identity or links between Conversation and Trace.
 
 Knowledge page port: `/knowledge` uses runtime kept-entry reads and revision-fenced
 retirement. Reviews reuse Inbox decisions and source evidence; kept usage and

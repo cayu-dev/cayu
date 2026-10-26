@@ -4,6 +4,7 @@ import { SessionPage } from "./session-page"
 
 export function SessionEntry() {
   const { sessionId } = useParams({ strict: false })
+  const toolDisplay = useDashboardCapability({ kind: "surface", surface: "tool_display" })
   const workflow = useDashboardCapability({ kind: "surface", surface: "workflow" })
   const taskReplay = useDashboardCapability({ kind: "surface", surface: "task_creation" })
   const structured = useDashboardCapability({
@@ -30,6 +31,7 @@ export function SessionEntry() {
         workflowEnabled={workflow.enabled}
         taskReplayEnabled={taskReplay.enabled}
         structuredOutputEnabled={structured.enabled}
+        toolDisplayEnabled={toolDisplay.enabled}
         interruptionEnabled={interruption.enabled}
         providerResolutionEnabled={provider.enabled}
         recoveryEnabled={recovery.enabled}

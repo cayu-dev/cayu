@@ -40,7 +40,6 @@ import {
 import { validateSessionHistorySearch } from "@/lib/session-history-search"
 import { prepareSessionTaskReplay, type TaskReplayAcceptance } from "@/lib/session-task-replay"
 import { cn } from "@/lib/utils"
-import type { ToolWithDisplay } from "../../api/types"
 import {
   useInbox,
   useOverview,
@@ -58,6 +57,7 @@ import {
   isActive,
   isWaiting,
   sessionDisplayTitle,
+  sessionToolDisplays,
 } from "../../app/session-model"
 import { useSessionMutation } from "../../app/session-mutation"
 import { useSessionProgress } from "../../app/session-progress"
@@ -85,6 +85,7 @@ import { TraceView } from "./trace-view"
 
 export function SessionPage({
   structuredOutputEnabled = true,
+  toolDisplayEnabled = true,
   artifactsEnabled = true,
   interruptionEnabled = false,
   providerResolutionEnabled = false,
@@ -93,6 +94,7 @@ export function SessionPage({
   workflowEnabled = true,
 }: {
   structuredOutputEnabled?: boolean
+  toolDisplayEnabled?: boolean
   artifactsEnabled?: boolean
   interruptionEnabled?: boolean
   providerResolutionEnabled?: boolean
@@ -172,12 +174,11 @@ export function SessionPage({
   }
   const setPanel = (tab: PanelTab | undefined) => setSearch({ panel: tab })
   const openTrace = (span?: string) => setSearch({ view: "trace", span, log: undefined })
-  const displays = useMemo(() => {
-    const agent = specialists.data?.agents.find((a) => a.name === detail.data?.agent_name)
-    return Object.fromEntries(
-      (agent?.tools ?? []).map((t) => [t.name, (t as ToolWithDisplay).display ?? undefined]),
-    )
-  }, [specialists.data, detail.data])
+  const displays = useMemo(
+    () =>
+      toolDisplayEnabled ? sessionToolDisplays(specialists.data, detail.data?.agent_name) : {},
+    [specialists.data, detail.data?.agent_name, toolDisplayEnabled],
+  )
   const blocks = useMemo(
     () =>
       buildBlocks(

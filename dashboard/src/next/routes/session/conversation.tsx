@@ -95,7 +95,15 @@ function ToolRow({
         onClick={() => setOpen(!open)}
         className="group flex w-full items-center gap-1.5 rounded-md py-0.5 text-left text-sm text-muted-foreground hover:text-foreground"
       >
-        <span className={cn("shrink-0", !named && "font-mono text-[13px]")}>{verb}</span>
+        <span
+          className={cn(
+            "min-w-0 break-words [overflow-wrap:anywhere]",
+            target && "max-w-[60%] shrink-0",
+            !named && "font-mono text-[13px]",
+          )}
+        >
+          {verb}
+        </span>
         {target && <span className="min-w-0 truncate font-mono text-[13px]">{target}</span>}
         {tool.running && (
           <span className={cn("shrink-0 text-xs", PENDING[pending].tone)}>

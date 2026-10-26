@@ -18,7 +18,7 @@ import type { SessionDetail, SessionEvent, SessionState } from "../../api/types"
 import type { SessionRow } from "../../app/queries"
 import { useEvents, useSessionState } from "../../app/queries"
 import { useApi, useNow, useServices } from "../../app/services"
-import { argPreview, isActive, type ToolDisplays } from "../../app/session-model"
+import { argPreview, isActive, type ToolDisplays, toolDisplay } from "../../app/session-model"
 import { useTraceHistory } from "../../app/trace-history"
 import {
   buildTrace,
@@ -118,7 +118,7 @@ function spanLabel(s: Span, displays: ToolDisplays): { name: string; detail: str
       (e) => e.type === "tool.call.completed" || e.type === "tool.call.failed",
     )
     const args = payload(done ?? s.events[0] ?? ({} as SessionEvent)).arguments
-    const display = displays[s.name]
+    const display = toolDisplay(s.name, displays)
     return { name: display ? display.verb : s.name, detail: args ? argPreview(args) : "" }
   }
   return { name: s.name, detail: s.detail }
@@ -604,7 +604,13 @@ function Waterfall({
               ) : (
                 <span className="w-[18px] shrink-0" />
               )}
-              <span className={cn("shrink-0", span.status === "error" && "text-destructive")}>
+              <span
+                className={cn(
+                  "min-w-0 max-w-[60%] shrink-0 truncate",
+                  span.status === "error" && "text-destructive",
+                )}
+                title={name}
+              >
                 {name}
               </span>
               {detail && (
@@ -860,11 +866,12 @@ function SpanDetail({
     )
     const first = span.events[0]
     const name = first ? toolOf(first) : null
+    const display = name ? toolDisplay(name, displays) : undefined
     const p = payload(done ?? first ?? ({} as SessionEvent))
     facts.push(
       <Fact key="tool" k="Tool">
         <span className="font-mono text-xs">{name ?? span.detail ?? "–"}</span>
-        {name && displays[name] ? ` (${displays[name]?.verb})` : ""}
+        {display ? ` (${display.verb})` : ""}
       </Fact>,
     )
     if (p.effect)
@@ -944,7 +951,9 @@ function SpanDetail({
     <div className="space-y-4 p-4">
       <div className="space-y-1">
         <p className="text-xs font-medium text-muted-foreground">{KIND_LABEL[span.kind]}</p>
-        <p className="font-medium break-words">{spanLabel(span, displays).name}</p>
+        <p className="font-medium break-words [overflow-wrap:anywhere]">
+          {spanLabel(span, displays).name}
+        </p>
         <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
           <span className={cn("font-medium", STATUS_TEXT[span.status])}>
             {STATUS_LABEL[span.status]}

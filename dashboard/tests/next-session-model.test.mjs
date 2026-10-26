@@ -6,6 +6,7 @@ import {
   constantColumns,
   formatDuration,
   relativeTime,
+  sessionToolDisplays,
   stepLabel,
   workSummary,
 } from "../src/next/app/session-model.ts"
@@ -351,4 +352,66 @@ test("hiding thinking preserves exact native part positions and all other eviden
   )
   assert.equal(blocks[1].key, "m5.1")
   assert.equal(blocks[1].part.type, "file")
+})
+
+test("undeclared JavaScript property names keep tool-name fallback", () => {
+  for (const name of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+    assert.equal(workSummary([{ name }, { name }], {}), `Used ${name} 2 times`)
+    assert.deepEqual(stepLabel({ name, args: {} }, {}), { verb: name, target: "" })
+  }
+})
+
+test("labels retain explicit plural, noun-free verbs, singular and first-use order", () => {
+  const labels = {
+    remember: { verb: "Proposed", noun: "memory", plural: "memories" },
+    search: { verb: "Searched" },
+    run: { verb: "Ran", noun: "command" },
+  }
+  assert.equal(
+    workSummary(
+      ["remember", "search", "remember", "run", "search", "run"].map((name) => ({ name })),
+      labels,
+    ),
+    "Proposed 2 memories, searched 2 times, ran 2 commands",
+  )
+  assert.equal(workSummary([{ name: "remember" }], labels), "Proposed a memory")
+  assert.equal(workSummary([{ name: "read_file" }], labels), "Used read_file")
+  assert.equal(workSummary([{ name: "search" }], labels), "Searched")
+  assert.equal(workSummary([], labels), "")
+  for (const name of ["constructor", "toString", "__proto__"]) {
+    const displays = Object.fromEntries([
+      [name, { verb: "Inspected", noun: "entry", plural: "entries" }],
+    ])
+    assert.equal(workSummary([{ name }, { name }], displays), "Inspected 2 entries")
+    assert.deepEqual(stepLabel({ name, args: { path: "<img src=x>" } }, displays), {
+      verb: "Inspected",
+      target: "<img src=x>",
+    })
+  }
+})
+
+test("session declaration selection requires one visible owner and one own tool", () => {
+  const tool = { name: "inspect", display: { verb: "Read", noun: "entry" } }
+  const other = { name: "other", tools: [{ ...tool, display: { verb: "Borrowed" } }] }
+  const selected = { name: "selected", tools: [tool] }
+  const label = (agents, owner = "selected") =>
+    workSummary([{ name: "inspect" }], sessionToolDisplays({ agents }, owner))
+  assert.equal(label([other, selected]), "Read an entry")
+  for (const agents of [
+    [],
+    [other],
+    [selected, selected],
+    [{ ...selected, tools: [tool, tool] }],
+    [{ ...selected, tools: [tool, { ...tool, display: null }, tool] }],
+  ]) {
+    assert.equal(label(agents), "Used inspect")
+  }
+  assert.deepEqual(sessionToolDisplays(undefined, "selected"), {})
+  assert.deepEqual(sessionToolDisplays({ agents: [selected] }, undefined), {})
+  for (const marker of ["[REDACTED_SECRET]", "[PRIVATE_EVENT_AUTHORITY]"]) {
+    assert.equal(
+      label([{ ...selected, name: `owner-${marker}` }], `owner-${marker}`),
+      "Used inspect",
+    )
+  }
 })
