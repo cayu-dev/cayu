@@ -190,3 +190,13 @@ while pinned to the tail. Event-log invalidation respects
 position while explicit history/filter reads remain available. Focused trace
 reads bind to the loaded session incarnation; conflicts require reloading the
 session. Tool links use absolute message and part positions, never provider IDs.
+
+## Specialists and Tools production port
+
+Specialists uses the prototype cards with expandable configuration and bounded
+per-specialist recent work; `/agents?q=` redirects to `/specialists?q=`. Tools
+retains declaration variants and uses the real public-name usage aggregates and
+cursor-paged calls. Unavailable reads do not become zero counts. Exact call links
+carry the retained session incarnation into Trace. The old Agents page is removed.
+Built-in display-label runtime work remains separate; tool names remain the
+fallback until labels are supplied by the runtime.

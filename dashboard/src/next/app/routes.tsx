@@ -115,8 +115,18 @@ export function createDashboardRouter(history?: RouterHistory) {
       }),
       component: EvalRunPage,
     }),
-    page("/specialists", SpecialistsPage),
-    page("/tools", ToolsPage),
+    createRoute({
+      getParentRoute: () => root,
+      path: "/specialists",
+      validateSearch: (s: Record<string, unknown>) => ({ q: str(s.q) }),
+      component: SpecialistsPage,
+    }),
+    createRoute({
+      getParentRoute: () => root,
+      path: "/tools",
+      validateSearch: (s: Record<string, unknown>) => ({ q: str(s.q) }),
+      component: ToolsPage,
+    }),
     page("/knowledge", KnowledgePage),
     ...(
       [

@@ -596,6 +596,7 @@ export function SessionPage({
             }
             retryInterruptionBusy={stop.isPending || interruptMutation.busy}
             subagents={relations.rows}
+            expectedInstanceId={search.session_instance_id}
             spanId={search.span}
             log={search.log === "1"}
             onSelect={(span) => {

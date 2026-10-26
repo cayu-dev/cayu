@@ -19,6 +19,7 @@ import {
   Search,
   Settings2,
   Sun,
+  Wrench,
   X,
 } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
@@ -196,7 +197,8 @@ const sections = [
   {
     label: "Agent",
     items: [
-      { to: "/agents", label: "Specialists", icon: Bot },
+      { to: "/specialists", label: "Specialists", icon: Bot },
+      { to: "/tools", label: "Tools", icon: Wrench },
       {
         to: "/knowledge",
         label: "Knowledge",

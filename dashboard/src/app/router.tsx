@@ -21,7 +21,11 @@ import { validateWorkflowSearch } from "../lib/workflow-search"
 import { PageBody, ShellContext, TopBar } from "../next/routes/common"
 import { Layout } from "./layout"
 
-const AgentsPage = lazyRouteComponent(() => import("../routes/agents"), "AgentsPage")
+const SpecialistsPage = lazyRouteComponent(
+  () => import("../next/routes/specialists-entry"),
+  "SpecialistsEntry",
+)
+const ToolsPage = lazyRouteComponent(() => import("../next/routes/tools-entry"), "ToolsEntry")
 const ArtifactsPage = lazyRouteComponent(() => import("../routes/artifacts"), "ArtifactsPage")
 const DashboardPage = lazyRouteComponent(() => import("../next/routes/home-page"), "HomePage")
 const EnvironmentsPage = lazyRouteComponent(
@@ -158,10 +162,30 @@ export function createDashboardRouter(history?: RouterHistory) {
     ),
   })
 
+  const specialistSearch = (search: Record<string, unknown>) => ({
+    q: typeof search.q === "string" ? search.q : undefined,
+  })
   const agentsRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/agents",
-    component: AgentsPage,
+    validateSearch: specialistSearch,
+    beforeLoad: ({ search }) => {
+      throw redirect({ to: "/specialists", search, replace: true })
+    },
+  })
+  const specialistsRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
+    getParentRoute: () => rootRoute,
+    path: "/specialists",
+    validateSearch: specialistSearch,
+    component: SpecialistsPage,
+  })
+  const toolsRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
+    getParentRoute: () => rootRoute,
+    path: "/tools",
+    validateSearch: specialistSearch,
+    component: ToolsPage,
   })
 
   const environmentsRoute = createRoute({
@@ -249,6 +273,8 @@ export function createDashboardRouter(history?: RouterHistory) {
     pendingActionsRoute,
     oldPendingRoute,
     agentsRoute,
+    specialistsRoute,
+    toolsRoute,
     environmentsRoute,
     artifactsRoute,
     workflowRoute,

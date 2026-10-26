@@ -117,3 +117,16 @@ test("members read Inbox query counts without mutation authority", () => {
     false,
   )
 })
+
+test("members may read native tool usage but never gain tool mutations", () => {
+  const read = { kind: "surface", surface: "tool_usage" }
+  assert.equal(applyViewerAccess(available, read, member).enabled, true)
+  assert.equal(
+    applyViewerAccess({ enabled: false, unavailable_reason: "unsupported" }, read, member).enabled,
+    false,
+  )
+  assert.equal(
+    applyViewerAccess(available, { ...read, operation: "mutate" }, member).enabled,
+    false,
+  )
+})

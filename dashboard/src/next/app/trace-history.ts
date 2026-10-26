@@ -5,7 +5,11 @@ import { useApi } from "./services"
 import { mergeTracePages } from "./trace-runtime"
 
 /** Historical pages keep a fixed cutoff; live deltas use a separate forward cursor. */
-export function useTraceHistory(sessionId: string, enabled: boolean) {
+export function useTraceHistory(sessionId: string, enabled: boolean, expectedInstanceId?: string) {
+  const identity = JSON.stringify([sessionId, expectedInstanceId])
+  const queryKey = expectedInstanceId
+    ? ["trace", sessionId, expectedInstanceId]
+    : ["trace", sessionId]
   const api = useApi()
   const client = useQueryClient()
   const current = useRef<{
@@ -15,16 +19,16 @@ export function useTraceHistory(sessionId: string, enabled: boolean) {
     through: number
     more: boolean
     live: number
-  }>({ id: sessionId, after: 0, through: 0, more: false, live: 0 })
-  if (current.current.id !== sessionId)
-    current.current = { id: sessionId, after: 0, through: 0, more: false, live: 0 }
+  }>({ id: identity, after: 0, through: 0, more: false, live: 0 })
+  if (current.current.id !== identity)
+    current.current = { id: identity, after: 0, through: 0, more: false, live: 0 }
   const [loadingMore, setLoadingMore] = useState(false)
   const [pageError, setPageError] = useState<unknown>(null)
   const olderAbort = useRef<AbortController | null>(null)
   // biome-ignore lint/correctness/useExhaustiveDependencies: changing session must abort its historical read.
-  useEffect(() => () => olderAbort.current?.abort(), [sessionId])
+  useEffect(() => () => olderAbort.current?.abort(), [identity])
   const query = useQuery({
-    queryKey: ["trace", sessionId],
+    queryKey,
     enabled,
     queryFn: async ({ signal }) => {
       if (!api.trace) throw new Error("This server does not provide exact session traces.")
@@ -34,7 +38,7 @@ export function useTraceHistory(sessionId: string, enabled: boolean) {
         {
           after_sequence: owner.page ? owner.live : 0,
           limit: 1000,
-          session_instance_id: owner.page?.session_instance_id,
+          session_instance_id: owner.page?.session_instance_id ?? expectedInstanceId,
         },
         signal,
       )
@@ -94,7 +98,7 @@ export function useTraceHistory(sessionId: string, enabled: boolean) {
       owner.page = mergeTracePages(owner.page, incoming)
       owner.after = incoming.next_sequence
       owner.more = incoming.has_more
-      client.setQueryData(["trace", sessionId], { page: owner.page, hasMore: owner.more })
+      client.setQueryData(queryKey, { page: owner.page, hasMore: owner.more })
     } catch (error) {
       if (!controller.signal.aborted) setPageError(error)
     } finally {

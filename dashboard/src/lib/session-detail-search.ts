@@ -9,6 +9,7 @@ export type SessionDetailSearch = SessionHistorySearch &
   Omit<WorkflowSearch, "agent_name" | "environment_name"> & {
     workflow_agent_name?: string
     workflow_environment_name?: string
+    session_instance_id?: string
     panel?: string
     view?: string
     workflow?: "1"
@@ -28,6 +29,7 @@ export function validateSessionDetailSearch(search: Record<string, unknown>): Se
   return {
     ...history,
     ...workflowSearchPatch(workflowSearchFromSession(search)),
+    session_instance_id: text(search.session_instance_id),
     panel: ["overview", "usage", "artifacts", "browser"].includes(panel ?? "") ? panel : undefined,
     view:
       search.view === "conversation"

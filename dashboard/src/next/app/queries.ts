@@ -43,7 +43,7 @@ export function useApp() {
 
 export function useSpecialists() {
   const api = useApi()
-  return useQuery({ queryKey: ["specialists"], queryFn: () => api.specialists() })
+  return useQuery({ queryKey: ["specialists"], queryFn: ({ signal }) => api.specialists(signal) })
 }
 
 /** The session list joined with each session's overview. */
@@ -249,9 +249,15 @@ export function useSessionState(id: string, enabled: boolean) {
   return useQuery({ queryKey: ["state", id], queryFn: () => api.state(id), enabled })
 }
 
-export function useToolUsage() {
+export function useToolUsage(enabled = true) {
   const api = useApi()
-  return useQuery({ queryKey: ["tool-usage"], queryFn: () => api.toolUsage() })
+  return useQuery({
+    queryKey: ["tool-usage"],
+    enabled,
+    queryFn: ({ signal }) => api.toolUsage(signal),
+    refetchInterval: TASK_POLL_MS,
+    retry: false,
+  })
 }
 
 export function useKnowledge() {

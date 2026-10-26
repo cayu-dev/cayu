@@ -1480,6 +1480,7 @@ async def _exercise_dashboard(
 ) -> None:
     await _exercise_operational_scope(page, base_url)
     await _exercise_dashboard_inbox(page, base_url)
+    await _exercise_specialists_tools(page, base_url)
     await _exercise_run_agent_inventory(page, base_url)
     await _exercise_mutation_recovery(page, base_url)
     await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
@@ -1512,6 +1513,19 @@ async def _exercise_dashboard(
         task_store,
         expected_query_aborts,
     )
+
+
+async def _exercise_specialists_tools(page: Page, base_url: str) -> None:
+    await page.goto(f"{base_url}/cayu/agents?q={AGENT_NAME}")
+    await expect(page).to_have_url(re.compile(r"/cayu/specialists\?q="))
+    await page.get_by_role("button", name=f"Inspect {AGENT_NAME}", exact=True).click()
+    await expect(page.get_by_text("Provider options", exact=True)).to_be_visible()
+    await expect(page.get_by_text("System prompt", exact=True)).to_be_visible()
+    await page.goto(f"{base_url}/cayu/tools")
+    await page.get_by_role("button", name="Inspect dashboard_contract_tool", exact=True).click()
+    await expect(page.get_by_text("Input schema", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Recent calls", exact=True)).to_be_visible()
+    await expect(page.locator("main header")).to_have_count(1)
 
 
 async def _exercise_captured_evaluation(
@@ -3704,6 +3718,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         observed_requests.clear()
         await page.goto(f"{base_url}/cayu/agents", wait_until="networkidle")
         await expect(page.get_by_role("heading", name="Specialists", exact=True)).to_be_visible()
+        await page.get_by_role("button", name=f"Inspect {AGENT_NAME}", exact=True).click()
         await expect(page.get_by_text("Tasks are unavailable.", exact=False)).to_be_visible()
         require(
             not any(request.startswith("GET /api/tasks") for request in observed_requests),

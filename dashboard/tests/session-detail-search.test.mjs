@@ -88,3 +88,19 @@ test("legacy event links open the log, while explicit subsequent views remain au
   assert.equal(conversation.view, "conversation")
   assert.equal(validateSessionDetailSearch({ event_id: "event", view: "trace" }).log, undefined)
 })
+
+test("tool call links retain the exact session incarnation with their event filter", () => {
+  const search = validateSessionDetailSearch({
+    view: "trace",
+    log: "1",
+    event_id: "event",
+    session_instance_id: "retained-instance",
+  })
+  assert.equal(search.session_instance_id, "retained-instance")
+  assert.equal(search.event_id, "event")
+  assert.equal(search.event, "event")
+  assert.equal(
+    validateSessionDetailSearch({ session_instance_id: true }).session_instance_id,
+    undefined,
+  )
+})

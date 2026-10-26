@@ -861,11 +861,11 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
           if (e.type === "tool.call.started") u.calls++
           if (e.type === "tool.approval.requested") {
             u.calls++
-            u.approvals.waiting++
+            u.approvals.waiting = (u.approvals.waiting ?? 0) + 1
             u.recent.push({ session_id: s.session.id, at, status: "waiting" })
           }
           if (e.type === "tool.approval.resolved") {
-            u.approvals.waiting = Math.max(0, u.approvals.waiting - 1)
+            u.approvals.waiting = Math.max(0, (u.approvals.waiting ?? 0) - 1)
             if ((e.payload as { decision?: string }).decision === "approve") u.approvals.approved++
             else u.approvals.denied++
           }

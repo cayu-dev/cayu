@@ -110,17 +110,17 @@ export type ToolSource =
 export type ToolApproval = "never" | "always" | "sometimes" | "blocked" | "unknown"
 export type ToolWithDisplay = import("@/lib/generated/server-api").ApiToolSummary & {
   display?: ToolDisplay | null
-  /** Proposed (backend item 11): where the tool comes from, and whether it asks a person first. */
+  /** Native source classification and approval policy. */
   source?: ToolSource | null
   approval?: ToolApproval | null
 }
 
-/** Proposed (backend item 11): how each tool has been used, from the runtime's usage reporting. */
+/** Retained public-name tool usage from the runtime. */
 export type ToolUsage = {
   tool: string
   calls: number
   failed: number
-  approvals: { approved: number; denied: number; waiting: number }
+  approvals: { approved: number; denied: number; waiting?: number }
   last_used_at: string | null
   recent: { session_id: string; at: string; status: "ok" | "error" | "waiting" }[]
 }
@@ -211,7 +211,7 @@ export type AppInfo = { name: string; runtime_version: string }
 
 export type Api = {
   app(): Promise<AppInfo>
-  specialists(): Promise<AgentsPage>
+  specialists(signal?: AbortSignal): Promise<AgentsPage>
   sessions(query?: SessionListQuery, signal?: AbortSignal): Promise<SessionsPage>
   session(id: string): Promise<SessionDetail>
   overviews(ids: string[]): Promise<SessionOverview[]>
@@ -290,8 +290,13 @@ export type Api = {
     sessionId: string,
     options?: MutationExecutionOptions,
   ): Promise<{ session_id: string; snapshot?: MutationTransportSnapshot }>
-  /** Proposed (backend item 11). */
-  toolUsage(): Promise<ToolUsage[]>
+  /** Native retained per-tool usage, shared by public tool name. */
+  toolUsage(signal?: AbortSignal): Promise<ToolUsage[]>
+  toolCalls?(
+    name: string,
+    cursor?: string,
+    signal?: AbortSignal,
+  ): Promise<import("@/lib/generated/server-api").ToolCallsResponse>
   /** Proposed (backend item 12): `GET /api/knowledge`, active entries. */
   knowledge(): Promise<KnowledgeEntry[]>
   /** Proposed (backend item 12): retire an active entry. */

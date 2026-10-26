@@ -18,7 +18,7 @@ import {
   pauseTask,
   resumeTask,
 } from "@/lib/api"
-import type { InboxSettleResponse } from "@/lib/generated/server-api"
+import type { InboxSettleResponse, ToolUsageResponse } from "@/lib/generated/server-api"
 import {
   executeInterruptMutation,
   executeRecoverToolApprovalMutation,
@@ -48,7 +48,7 @@ const query = (params: Record<string, string | number | null | undefined>) => {
 
 export const realApi: Api = {
   app: fetchDashboardIdentity,
-  specialists: () => fetchAgents(),
+  specialists: (signal) => fetchAgents(signal),
   sessions: (q, signal) => fetchSessionsPage({ include: ["overview"], ...q }, signal),
   session: (id) => fetchSession(id),
   async overviews(ids) {
@@ -199,8 +199,20 @@ export const realApi: Api = {
     )
     return { session_id: snapshot.sessionId, snapshot }
   },
-  // Proposed reads: until backend items 11 and 12 land there is nothing to show.
-  toolUsage: async () => [],
+  async toolUsage(signal) {
+    const result = await json<ToolUsageResponse>("/tools/usage", { signal })
+    return result.tools.map((tool) => ({
+      tool: tool.name,
+      calls: tool.calls,
+      failed: tool.failures,
+      approvals: { approved: tool.approved, denied: tool.rejected },
+      last_used_at: tool.last_used_at,
+      recent: [],
+    }))
+  },
+  toolCalls: (name, cursor, signal) =>
+    json(`/tools/calls${query({ name, cursor, limit: 20 })}`, { signal }),
+  // The Knowledge page adapter is delivered separately.
   knowledge: async () => [],
   async removeKnowledge() {
     throw new Error("Removing knowledge needs the runtime's knowledge API (backend item 12).")

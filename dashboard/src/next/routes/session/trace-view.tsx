@@ -159,6 +159,7 @@ function RuntimeTraceView(props: TraceViewProps) {
 
 function TraceViewContent({
   session,
+  expectedInstanceId,
   state,
   displays,
   subagents,
@@ -189,6 +190,7 @@ function TraceViewContent({
   retryEnabled: boolean
   workflowOpen?: boolean
   session: SessionDetail
+  expectedInstanceId?: string
   state: SessionState | undefined
   displays: ToolDisplays
   subagents: SessionRow[]
@@ -213,7 +215,7 @@ function TraceViewContent({
   const now = useNow()
   const api = useApi()
   const { prototype } = useServices()
-  const runtime = useTraceHistory(session.id, traceEnabled)
+  const runtime = useTraceHistory(session.id, traceEnabled, expectedInstanceId)
   const focusSequence = spanId?.match(
     /^(?:interaction|model|round|tool|exec|wait|knowledge):(\d+)$/,
   )?.[1]
@@ -310,6 +312,24 @@ function TraceViewContent({
     return map
   }, [trace])
   const selectedEvent = eventId ? all.find((e) => e.id === eventId) : undefined
+
+  if (!prototype && traceEnabled && expectedInstanceId && runtime.error)
+    return (
+      <div className="p-4">
+        <ErrorState error={runtime.error} />
+        <p className="mt-2 text-sm">
+          {runtime.error instanceof ApiClientError && runtime.error.status === 409
+            ? "This call no longer belongs to the retained session. Open the Tools page to refresh recent calls."
+            : "The call's session could not be verified."}
+        </p>
+      </div>
+    )
+  if (!prototype && traceEnabled && expectedInstanceId && !runtime.data)
+    return (
+      <p role="status" className="p-4">
+        Checking the call's session…
+      </p>
+    )
 
   if (!prototype && !traceEnabled)
     return (

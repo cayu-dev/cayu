@@ -48,10 +48,10 @@ regenerate their client and upgrade their supported contract version together.
 ## Dashboard navigation and member access
 
 The dashboard sidebar groups Home, Inbox, Sessions and Tasks, with Evals and
-Usage under Improve and Specialists, Knowledge, Environments, Artifacts and
+Usage under Improve and Specialists, Tools, Knowledge, Environments, Artifacts and
 System under Agent. Items depend on the server capabilities and viewer access.
 Existing URLs remain valid: `/pending-actions` redirects to Inbox at `/inbox`,
-`/run` opens Home with the shared Start form, and Specialists uses `/agents`. Search sessions from the sidebar; `Ctrl+K` or
+`/run` opens Home with the shared Start form, and Specialists uses `/specialists`; `/agents?q=...` redirects there with its search intact. Tools at `/tools` retains each specialist declaration, including differing schemas or policies with the same public name. Search sessions from the sidebar; `Ctrl+K` or
 `Cmd+K` focuses search, and Enter opens the session index with its `q` filter.
 The Sessions page uses `GET /api/sessions?include=overview`, displays authored titles
 and completion summaries, and preserves the existing filter links. Eval trials and
@@ -348,8 +348,9 @@ The app registers **specialists**: the Specialists page lists them, and sessions
 tasks and New Run identify the specialist they use. A **subagent** remains a child
 session started with `SubagentTool`.
 
-Python names (`CayuApp`, `register_agent`, `AgentSpec`), API fields, `/agents`
-routes and existing authentication configuration remain unchanged. In particular,
+Python names (`CayuApp`, `register_agent`, `AgentSpec`), API fields, the `/api/agents`
+read and existing authentication configuration remain unchanged. The old dashboard
+`/agents` URL redirects to `/specialists`, preserving its search. In particular,
 `CAYU_OPERATOR_USERNAME`, `CAYU_OPERATOR_PASSWORD` and
 `cayu.server.environment_auth:OPERATOR_BASIC_AUTH` still configure the Developer
 dashboard login. This naming change does not remove authentication outside Cloud.
@@ -669,3 +670,25 @@ operation does not promise idempotent acknowledgement replay: after a lost
 response, inspect canonical state; repeating the old revision can return 409.
 Members cannot retire entries. Retirement does not replace Keep or Drop for
 pending proposals.
+
+### Inspecting specialists and tools
+
+Specialist cards open their model/provider configuration, system-prompt presence,
+metadata, provider options and thinking settings. Recent sessions are bounded
+per-specialist reads, with links to the full filtered Session and Tasks lists.
+Prompt contents are not exposed by this inventory read. Members can inspect
+these pages; starting a session still requires full access and runtime support.
+
+Tools retains declaration variants and reads usage from the control plane. Counts
+are retained-history aggregates by public tool name, shared across declarations
+with that name, rather than per-specialist attribution. Unknown or unavailable
+usage is shown explicitly rather than as zero. Expand a tool for its full schema,
+source, approval policy and cursor-paged recent calls. Calls link to their exact
+Trace event with a session incarnation; a replaced session cannot silently
+substitute a different call.
+
+Specialist activity and tool usage refresh while the page is visible. Recent tool
+calls refresh a bounded latest window; explicitly loaded older calls retain their
+snapshot instead of being replayed by each background refresh. Start from latest
+calls to read one continuous fresh cursor chain when newer calls may fall between
+the latest window and loaded history.
