@@ -306,6 +306,11 @@ async def test_same_name_acquisition_is_exclusive_before_provider_ack(
 @pytest.mark.anyio
 @pytest.mark.parametrize("constructor_rollback", [False, True])
 async def test_dispatched_removal_retains_owner_past_deadline(monkeypatch, constructor_rollback):
+    # The rollback registry is process-wide. Settle rollback an earlier test left
+    # behind on a loaded worker, then clear what it recorded, so the exact counts
+    # and removals below are this test's own.
+    reset_fake_module()
+    assert await MicrosandboxRunner.drain_failed_creations(timeout_s=30) == 0
     reset_fake_module()
     accepted = asyncio.Event()
     release = asyncio.Event()
