@@ -327,14 +327,14 @@ async def _check_every_path_stays_in_the_callers_organization(store: SessionStor
                 _ctx(world.caller),
                 {"session_id": await _alias(store, world.caller, f"{world.prefix}-missing")},
             )
+            genuine = _CODEC.encode(
+                world.own[0].id, field_name="session_ref", session_id=world.caller
+            )
+            # The tag's last base64 character carries 4 bits, so it is already
+            # "A" one time in 16; swap in a different canonical final character.
             forged = await read_tool.run(
                 _ctx(world.caller),
-                {
-                    "session_id": _CODEC.encode(
-                        world.own[0].id, field_name="session_ref", session_id=world.caller
-                    )[:-1]
-                    + "A"
-                },
+                {"session_id": genuine[:-1] + ("E" if genuine.endswith("A") else "A")},
             )
             other_caller = await read_tool.run(
                 _ctx(world.caller),
