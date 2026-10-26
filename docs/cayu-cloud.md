@@ -929,6 +929,20 @@ If submission loses its response, the CLI reports `deployment_id` and
 --idempotency-key KEY`. Agent process health failures, on either smoke provider, and
 other nonretryable failures require repairing the source.
 
+## Sandboxes for an Agent's tools
+
+Where the install runs a sandbox broker, Cloud gives the Agent's processes
+`CAYU_CLOUD_API_URL`, `CAYU_CLOUD_APPLICATION_ID` and `CAYU_CLOUD_SANDBOX_TOKEN`.
+The Agent has no cloud-provider permission of its own, so its tools run code in
+a sandbox Cloud allocates, leases and destroys for it:
+`BrokeredSandboxCodingEnvironmentFactory` in `cayu.sandbox_broker`
+([coding in a sandbox brokered by Cayu Cloud](environment-factories.md#coding-in-a-sandbox-brokered-by-cayu-cloud)).
+A project made with `cayu new --preset coding` selects it automatically when
+those variables are set, and Docker when they aren't
+([choosing a coding backend](environment-factories.md#choosing-a-coding-backend)).
+Set `CAYU_CODING_BACKEND=cayu-cloud` on the Agent to make a missing sandbox
+credential fail at startup instead.
+
 ## Fixed process resources
 
 `cpu_millis` and `memory_mb` at the top of `cayu-cloud.toml` apply to all Agent

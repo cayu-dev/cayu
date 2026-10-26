@@ -18,6 +18,7 @@ from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tasks.memory import InMemoryTaskStore
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository
 from tests.qualification.repository_maintenance_toolchain import maintenance_toolchain
@@ -79,9 +80,7 @@ def test_reserved_deadline_controls_generated_workflow(
         assert spec is not None and spec.loader is not None
         harness = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(harness)
-        monkeypatch.setattr(
-            operations, "_configured_docker_authority", lambda _root: (profile, "/usr/bin/docker")
-        )
+        admit_fixture_image(monkeypatch, operations, toolchain_profile=profile)
         runners = []
         harness._install_fake_docker_factory(monkeypatch, target=target, created_runners=runners)
         provider = WaitingProvider()

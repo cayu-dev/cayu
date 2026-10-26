@@ -12,11 +12,15 @@ own `docker run` wrapper or allowlisting proxy; Cayu has both parts.
   hosts you allowlist. It still shares the host kernel (the Docker Desktop VM on
   a laptop), so a kernel or Docker escape reaches that host. Use it for code
   whose risk you accept on that machine.
-- **Production, or code you treat as hostile:** `SandboxCodingEnvironmentFactory`
-  with `LambdaMicroVMEgressAdapter` (its default `metadata_isolation="required"`).
-  Each session gets its own Lambda MicroVM, and it is the composition that
-  satisfies `ExecutionRequirements.untrusted()`. See
+- **Self-hosted production on AWS, or code you treat as hostile:**
+  `SandboxCodingEnvironmentFactory` with `LambdaMicroVMEgressAdapter` (its
+  default `metadata_isolation="required"`). Each session gets its own Lambda
+  MicroVM, and it is the composition that satisfies
+  `ExecutionRequirements.untrusted()`. It needs your own AWS permissions. See
   [Coding in a cloud sandbox](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md#coding-in-a-cloud-sandbox).
+- **An Agent deployed on Cayu Cloud:** `BrokeredSandboxCodingEnvironmentFactory`
+  (below). The Agent holds no cloud permission, so it can't use the self-hosted
+  path; Cloud allocates, leases and destroys the sandbox for it.
 
 Docker never satisfies `ExecutionRequirements.untrusted()`, hardened or not. Do
 not drop that requirement to make admission pass for hostile workloads.
@@ -148,6 +152,34 @@ the environment then reports `guest_privilege_containment` and
 `unprivileged_guest` as available, `deny_by_default_network` and
 `brokered_egress` from the egress adapter, and `untrusted_code_isolation` as
 unsupported because of the shared kernel.
+
+## On Cayu Cloud
+
+Cloud gives an Agent's processes `CAYU_CLOUD_API_URL`,
+`CAYU_CLOUD_APPLICATION_ID` and `CAYU_CLOUD_SANDBOX_TOKEN` where the install
+runs a sandbox broker. `BrokeredSandboxCodingEnvironmentFactory` (in
+`cayu.sandbox_broker`) uses them to get one sandbox per session:
+
+```python
+from cayu.sandbox_broker import BrokeredSandboxCodingEnvironmentFactory, SandboxBrokerClient
+from cayu.workspaces import LocalWorkspace
+
+factory = BrokeredSandboxCodingEnvironmentFactory(
+    broker=SandboxBrokerClient.from_env(),
+    source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
+    egress="none",  # or "public_web": the open internet through Cloud's logging proxy
+)
+```
+
+Only `egress="none"` gives `deny_by_default_network`, so only a `none`
+sandbox can satisfy `ExecutionRequirements.untrusted()`. Catalog images
+(`coding-python`, and `coding-agents` where offered) don't contain your
+project's dependencies; `workspace_setup_commands` can install them after
+copy-in, but that needs `public_web`. A coding app built with
+`cayu new --preset coding` instead picks Docker locally and the broker on
+Cloud with `select_coding_backend`, using one toolchain profile on both. See
+[Coding in a sandbox brokered by Cayu Cloud](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md#coding-in-a-sandbox-brokered-by-cayu-cloud)
+for leases, copy limits and toolchain profiles in brokered sandboxes.
 
 ## Use the parts on their own
 

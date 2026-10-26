@@ -5,6 +5,7 @@ has no import dependency on this module or the Runtime test suite.
 """
 
 import ast
+import json
 from pathlib import Path
 
 from cayu.cli.scaffold import project_files
@@ -609,27 +610,17 @@ async def run_verified_github_delivery(
         "COPY pyproject.toml uv.lock ./\n"
         f"COPY {_PROBE_INPUT} /opt/cayu-acceptance/range_probe.py\n",
     )
-    files["build_coding_image.py"] = _replace_once(
-        files["build_coding_image.py"],
-        '    "docker-coding-build.json": 16 * 1024,\n',
-        f'    "docker-coding-build.json": 16 * 1024,\n    "{_PROBE_INPUT}": 16 * 1024,\n',
-    )
+    # The probe program is one more image input, declared once in the build config.
+    build_configuration = json.loads(files["docker-coding-build.json"])
+    build_configuration["extra_build_inputs"] = [{"path": _PROBE_INPUT, "max_bytes": 16 * 1024}]
+    files["docker-coding-build.json"] = json.dumps(build_configuration, indent=2) + "\n"
     for name in ("build_coding_image.py", "docker-coding-image.json"):
         files[name] = _replace_once(
             files[name],
             '"profile_id": "maintenance-app-python"',
             '"profile_id": "repository-maintenance-python"',
         )
-        files[name] = _replace_once(
-            files[name],
-            '"profile_revision": "2"',
-            '"profile_revision": "1"',
-        )
-    source = _replace_once(
-        files["operations/coding.py"],
-        '    "docker-coding-build.json",\n',
-        f'    "docker-coding-build.json",\n    "{_PROBE_INPUT}",\n',
-    )
+    source = files["operations/coding.py"]
     source = _replace_once(
         source,
         "from environments.coding import workspace_candidate\n",
@@ -666,19 +657,29 @@ async def run_verified_github_delivery(
     )
     source = _replace_once(
         source,
-        "        command_policy=command_policy,\n        toolchain_profile=toolchain_profile,\n",
-        "        command_policy=command_policy,\n        toolchain_profile=toolchain_profile,\n"
-        "        max_model_output_bytes=256,\n",
+        "        ),\n        toolchain_profile=toolchain_profile,\n    )\n",
+        "        ),\n        toolchain_profile=toolchain_profile,\n"
+        "        max_model_output_bytes=256,\n    )\n",
+    )
+    source = _replace_once(
+        source,
+        """    checks = named_checks_from_toolchain(
+        toolchain_profile,
+        identities=_CHECK_IDENTITIES,
+        identity_prefix="maintenance-app.docker_check",
+    )
+""",
+        """    checks = maintenance_checks()
+    for check in checks:
+        authority = toolchain_profile.command_authority(check.name)
+        if authority is None or authority.command_argv() != tuple(check.command.argv):
+            raise RuntimeError("Maintenance check escapes admitted toolchain authority")
+""",
     )
     source = _replace_once(
         source,
         '_PYTHON_TOOLCHAIN_PROFILE_ID = "maintenance-app-python"',
         '_PYTHON_TOOLCHAIN_PROFILE_ID = "repository-maintenance-python"',
-    )
-    source = _replace_once(
-        source,
-        '_PYTHON_TOOLCHAIN_PROFILE_REVISION = "2"',
-        '_PYTHON_TOOLCHAIN_PROFILE_REVISION = "1"',
     )
     source = _replace_once(
         source,
@@ -702,23 +703,13 @@ def _path_rules(*, required):
     return tuple(rules)
 """,
             "_python_toolchain_profile": """
-def _python_toolchain_profile(image_identity, *, profile_id=None, profile_revision=None,
-                              platform_architecture="amd64", dependency_inputs=(),
-                              trusted_build_context_sha256=None):
-    # Build metadata has already been validated by _read_docker_toolchain_profile.
+def _python_toolchain_profile(receipt):
+    # Build metadata has already been validated by read_coding_image_receipt.
     # Workspace dependencies belong to the target corpus, not the application.
-    return maintenance_toolchain(image_identity=image_identity,
-                                 architecture=platform_architecture,
-                                 build_context_sha256=trusted_build_context_sha256)
-""",
-            "_named_checks": """
-def _named_checks(profile):
-    checks = maintenance_checks()
-    for check in checks:
-        authority = profile.command_authority(check.name)
-        if authority is None or authority.command_argv() != tuple(check.command.argv):
-            raise RuntimeError("Maintenance check escapes admitted toolchain authority")
-    return checks
+    return maintenance_toolchain(image_identity=receipt.image_identity,
+                                 architecture=receipt.platform_architecture,
+                                 build_context_sha256=receipt.trusted_build_context_sha256,
+                                 ).coding_toolchain()
 """,
         },
     )
@@ -770,7 +761,8 @@ def _named_checks(profile):
         return await verify_maintenance_result(
             request=request, reference=publication.result_reference,
             repository=CodingProductArtifactRepository(self.artifact_store),
-            toolchain=self.toolchain_profile, workspace=self.source_workspace,
+            toolchain=self.toolchain_profile, image_fingerprint=self.image_fingerprint,
+            workspace=self.source_workspace,
             public_authority_alias_codec=self.app.session_store.public_authority_alias_codec,
         )
 

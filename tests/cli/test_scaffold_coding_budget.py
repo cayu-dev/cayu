@@ -4,6 +4,7 @@ import importlib
 from decimal import Decimal
 
 import pytest
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository
 
@@ -12,7 +13,6 @@ from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMe
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.cli.project import project_context
 from cayu.cli.scaffold import project_files
-from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tasks.memory import InMemoryTaskStore
@@ -58,14 +58,7 @@ def test_coding_constructors_forward_budget_owners(tmp_path, monkeypatch, execut
         operations = importlib.import_module("operations.coding")
         module = importlib.import_module("app")
         if execution == "docker":
-            profile = operations._python_toolchain_profile(
-                DockerImageIdentity(reference="fixture@sha256:" + "a" * 64)
-            )
-            monkeypatch.setattr(
-                operations,
-                "_configured_docker_authority",
-                lambda _root: (profile, "/usr/bin/docker"),
-            )
+            admit_fixture_image(monkeypatch, operations)
         policy, ledger = denial_policy(), InMemoryBudgetLedger()
         constructed = getattr(module, entrance)(
             provider=RecordingOneShotProvider(),

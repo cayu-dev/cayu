@@ -12,13 +12,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import pytest
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.qualification.repository_maintenance_delivery_case import build_journey_http
 from worker_harness import _write_json_atomic
 
 from cayu.budgets.base import BudgetPolicy
 from cayu.cli.project import project_context
-from cayu.environments.docker_toolchains import DockerCodingToolchainProfile
+from cayu.environments.coding_toolchains import CodingToolchainProfile
 from cayu.evals.testing import ScriptedModelProvider
+from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
@@ -28,11 +31,18 @@ from cayu.tasks.worker import run_task_worker
 async def run_maintenance_approval(config):
     with project_context(Path(config["project"])):
         operations = importlib.import_module("operations.coding")
-        profile = DockerCodingToolchainProfile.model_validate_json(config["toolchain_json"])
+        profile = CodingToolchainProfile.model_validate_json(config["toolchain_json"])
         provider = ScriptedModelProvider([])
-        with patch.object(
-            operations, "_configured_docker_authority", lambda root: (profile, "/usr/bin/docker")
-        ):
+        with pytest.MonkeyPatch.context() as fixture_image:
+            admit_fixture_image(
+                fixture_image,
+                operations,
+                toolchain_profile=profile,
+                image_identity=DockerImageIdentity.model_validate_json(
+                    config["image_identity_json"]
+                ),
+                platform_architecture=config["platform_architecture"],
+            )
             application = importlib.import_module("app").build_coding_product_application(
                 provider=provider,
                 workspace_root=Path(config["source"]),

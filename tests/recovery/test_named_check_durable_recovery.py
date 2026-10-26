@@ -107,7 +107,7 @@ def build_app(root: Path, patch):
     async def admitted(*args, **kwargs):
         return None
 
-    patch.setattr(named_checks, "ensure_docker_coding_toolchain_runner_admission", admitted)
+    patch.setattr(named_checks, "ensure_coding_toolchain_runner_admission", admitted)
 
     async def collect_admission():
         return runner.execution_admission_candidate()

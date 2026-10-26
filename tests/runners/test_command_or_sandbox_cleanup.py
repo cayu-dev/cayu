@@ -843,10 +843,8 @@ def test_receipt_backed_coding_commands_remove_the_container_on_timeout(
     async def admitted(*args, **kwargs):
         return None
 
-    monkeypatch.setattr(
-        structured_commands, "ensure_docker_coding_toolchain_runner_admission", admitted
-    )
-    monkeypatch.setattr(named_checks, "ensure_docker_coding_toolchain_runner_admission", admitted)
+    monkeypatch.setattr(structured_commands, "ensure_coding_toolchain_runner_admission", admitted)
+    monkeypatch.setattr(named_checks, "ensure_coding_toolchain_runner_admission", admitted)
     docker = _GuestDocker()
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", docker)
     authority = DockerCodingCommandAuthority(

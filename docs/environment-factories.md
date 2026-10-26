@@ -468,10 +468,10 @@ default). Tools must use the proxy and CA the adapter sets (`HTTPS_PROXY`,
 other non-HTTPS protocols are not available. See
 [Virtual egress](virtual-egress.md#credentialless-open-internet-for-isolated-sandboxes).
 
-Not yet available on the cloud factory: Docker toolchain profiles
-(`DockerCodingToolchainProfile` is Docker-typed and refused elsewhere),
-immutable inputs, a guest git baseline (Docker's `git_baseline`), and a
-network-free sandbox.
+Not yet available on this factory: toolchain profiles (it has no
+network-free mode, which every profile requires; the brokered factory below
+takes one), immutable inputs, a guest git baseline (Docker's `git_baseline`),
+and a network-free sandbox.
 
 ### Coding in a sandbox brokered by Cayu Cloud
 
@@ -506,9 +506,21 @@ factory = BrokeredSandboxCodingEnvironmentFactory.from_env(
 | `CAYU_CLOUD_APPLICATION_ID` | The Agent whose `/sandboxes` routes to use. Cloud sets it. |
 | `CAYU_CLOUD_SANDBOX_TOKEN` | The Agent's sandbox credential (Cloud sets it), or an Organization API key with the `sandboxes` scope. |
 | `CAYU_CLOUD_SANDBOX_EGRESS` | `none` (no outbound network) or `public_web` (the open internet through Cloud's logging proxy). Required by `from_env`. |
-| `CAYU_CLOUD_SANDBOX_IMAGE` | Catalog image, default `coding-python`. |
+| `CAYU_CLOUD_SANDBOX_IMAGE` | Catalog image, default `coding-python`. `SandboxBrokerClient.list_images()` lists what the install offers. |
 | `CAYU_CLOUD_SANDBOX_LEASE_SECONDS` | Lease length, 60 to 3600, default 900. |
 | `CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS` | Timeout for one broker request, default 30. |
+
+Every install's catalog has `coding-python` (Python with `uv`, `git` and
+ripgrep); an install may also offer `coding-agents`, which adds the Claude Code
+and Codex CLIs. Catalog images don't contain your project's dependencies.
+
+`setup_commands` run in the fresh sandbox before the workspace is copied in,
+so they can't see the project. `workspace_setup_commands` run in `/workspace`
+after copy-in and the Git baseline, for example `uv sync --frozen` to install
+the project's locked dependencies. That needs `egress="public_web"` to reach
+the package index. Anything they write under `/workspace` is copied back like
+any other change, so put environments elsewhere
+(`UV_PROJECT_ENVIRONMENT=/tmp/venv`).
 
 Each session creates one sandbox. Its lease starts when the sandbox is ready,
 and the factory renews it at a third of the lease length. The factory waits up
@@ -621,6 +633,108 @@ Each part also works alone:
   broker's archive routes.
 
 None of them imports a provider SDK or reads a cloud credential.
+
+#### Toolchain profiles in a brokered sandbox
+
+`toolchain_profile=` binds every sandbox to one neutral
+`CodingToolchainProfile` (see
+[Docker coding toolchains](docker-coding-toolchains.md#one-profile-on-docker-and-cayu-cloud)),
+so `run_check` and `run_command` built from that same profile work in the
+sandbox as they do on Docker:
+
+```python
+factory = BrokeredSandboxCodingEnvironmentFactory(
+    broker=SandboxBrokerClient.from_env(),
+    source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
+    egress="none",
+    image="release",
+    toolchain_profile=profile,  # a CodingToolchainProfile
+)
+```
+
+A profile prohibits the network and installing packages at run time, so the
+factory requires `egress="none"` and refuses `setup_commands` and
+`workspace_setup_commands`. It refuses a `DockerCodingToolchainProfile`; pass
+`profile.coding_toolchain()`. Before allocating, it checks the profile's
+dependency inputs in the source workspace. After allocating, and before
+anything is copied in, it:
+
+- requires the sandbox image to report the profile's
+  `trusted_build_context_sha256`, when the profile sets one (the sandbox
+  record's `image_identity`; older brokers report none, and such a profile is
+  then refused with `toolchain_image_unverified`);
+- checks that the read-only support paths exist (it can't prove they are
+  read-only, so it doesn't claim it);
+- runs the profile's admission probes and probes its executables live.
+
+The runner's evidence then carries the profile's fingerprint, which the
+command tools require. Binding by build inputs rather than image digest lets
+one profile describe the image built locally and the one Cloud builds from the
+same `Dockerfile.coding`. Until the install builds that image for the Agent,
+a catalog image without the project's dependencies fails
+admission with a code naming what is missing.
+
+### Choosing a coding backend
+
+`cayu.environments.coding_backends` picks where one toolchain profile runs,
+so the same app uses Docker on a laptop and Cayu Cloud's broker when deployed,
+with the same agents, tools and prompts:
+
+```python
+from cayu.environments import (
+    DockerCodingBackendOptions,
+    register_coding_environment,
+    select_coding_backend,
+)
+
+backend = select_coding_backend(
+    toolchain_profile=profile,
+    options={
+        "docker": DockerCodingBackendOptions(image_identity=image, platform_architecture="arm64"),
+    },
+)
+register_coding_environment(
+    app, name="coding", backend=backend, source_workspace=workspace, default=True
+)
+agent_requirements = backend.execution_requirements(real_secret_visibility="non_possession")
+```
+
+Selection, in order:
+
+1. `required=` or `CAYU_CODING_BACKEND` names the backend a deployment
+   requires. It must be registered and usable, so a missing Cloud credential
+   fails at startup instead of falling back to Docker.
+2. Otherwise `cayu-cloud` when `CAYU_CLOUD_API_URL`,
+   `CAYU_CLOUD_APPLICATION_ID` and `CAYU_CLOUD_SANDBOX_TOKEN` are all set,
+   `docker` otherwise. A sandbox token without the other two is an error
+   naming what's missing; the API URL and application id alone are not, since
+   Cloud's agent registry and the `cayu cloud` CLI use them too.
+3. Any other backend is selected by name only.
+
+Each backend supplies the execution requirements its agents need: Docker's
+evidence is `live_verified`, the broker's capability claims are `available`.
+So agents should take their `ExecutionRequirements` from
+`backend.execution_requirements(...)` rather than hard-coding Docker's bar.
+`options` are keyed by backend name: `DockerCodingBackendOptions` (image
+identity, architecture, restrictions, transfer limits, `cancel_timeout_s`) and
+`BrokeredCodingBackendOptions` (image, lease, transfer limits; built from the
+`CAYU_CLOUD_*` variables when omitted). Brokered sandboxes always run with
+`egress="none"`.
+
+`register_coding_environment` can be called once per workspace, for example
+for each clone a parallel worker edits; `RunRequest.environment_name` then
+picks the workspace. `named_checks_from_toolchain(profile)` and
+`ExactNamedCheckCommandPolicy(checks)` build `RunCheckTool`'s checks and its
+defense-in-depth policy from the profile.
+
+`CodingBackendRegistry` holds the builders. `default_coding_backends()` returns
+a new registry with `docker` and `cayu-cloud`; another provider registers its
+own builder on that registry and passes `registry=` to `select_coding_backend`.
+No registry is global. The individual factories stay public, so an app that
+always runs on one backend can construct it directly.
+
+A session started on one backend isn't resumed on another: the factories have
+different execution-profile identities, so the runtime refuses the resume.
 
 ### Per-child workspaces for subagents
 

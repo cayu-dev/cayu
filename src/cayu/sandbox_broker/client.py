@@ -270,6 +270,35 @@ class SandboxStagedCopies(BaseModel):
     sandbox_max_bytes: int
 
 
+class SandboxImageIdentity(BaseModel):
+    """The identity of the image a sandbox started from, when the broker reports one.
+
+    A broker that builds an application's own coding image reports what it was
+    built from, so a toolchain profile can be bound to the same build inputs
+    locally and on Cloud. ``trusted_build_context_sha256`` is the digest of the
+    reviewed build inputs; it doesn't depend on the architecture, unlike
+    ``content_digest``. Older brokers report nothing.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    name: str | None = None
+    content_digest: str | None = None
+    trusted_build_context_sha256: str | None = None
+    platform_architecture: str | None = None
+
+    @property
+    def fingerprint(self) -> str:
+        return (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    self.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+
+
 class SandboxRecord(BaseModel):
     """The broker's sandbox record. ``provider`` is informational only."""
 
@@ -294,6 +323,21 @@ class SandboxRecord(BaseModel):
     #: doesn't say so refuses them, so its absence means it doesn't.
     interactive_commands: bool = False
     guarantees: SandboxGuarantees | None = None
+    image_identity: SandboxImageIdentity | None = None
+
+    @field_validator("image_identity", mode="before")
+    @classmethod
+    def _image_identity_or_none(cls, value: Any) -> Any:
+        # A shape this client doesn't understand reports no identity rather
+        # than invalidating the record.
+        if isinstance(value, SandboxImageIdentity):
+            return value
+        if not isinstance(value, Mapping):
+            return None
+        try:
+            return SandboxImageIdentity.model_validate(dict(value))
+        except ValidationError:
+            return None
 
     @field_validator("interactive_commands", mode="before")
     @classmethod

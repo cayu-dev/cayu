@@ -154,6 +154,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "MaterializeSharedArtifactTool",
     ),
     "NamedCheck": ("cayu.tools.named_checks", "NamedCheck"),
+    "ExactNamedCheckCommandPolicy": ("cayu.tools.named_checks", "ExactNamedCheckCommandPolicy"),
+    "named_checks_from_toolchain": ("cayu.tools.named_checks", "named_checks_from_toolchain"),
     "OwnTreeSessionAccess": ("cayu.tools.session_reads", "OwnTreeSessionAccess"),
     "PUBLISH_WORKSPACE_ARTIFACT_TOOL_NAME": (
         "cayu.tools.shared_artifacts",
@@ -537,6 +539,8 @@ PUBLIC_NAMES = [
     "MatchingSessionAccess",
     "MaterializeSharedArtifactTool",
     "NamedCheck",
+    "ExactNamedCheckCommandPolicy",
+    "named_checks_from_toolchain",
     "OwnTreeSessionAccess",
     "PUBLISH_WORKSPACE_ARTIFACT_TOOL_NAME",
     "ParallelAIWebAdapter",

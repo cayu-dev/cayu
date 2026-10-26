@@ -1,6 +1,21 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "CLOUD_CODING_BACKEND": ("cayu.environments.coding_backends", "CLOUD_CODING_BACKEND"),
+    "CLOUD_SANDBOX_VARIABLES": ("cayu.environments.coding_backends", "CLOUD_SANDBOX_VARIABLES"),
+    "CODING_BACKEND_ENV": ("cayu.environments.coding_backends", "CODING_BACKEND_ENV"),
+    "DOCKER_CODING_BACKEND": ("cayu.environments.coding_backends", "DOCKER_CODING_BACKEND"),
+    "CodingBackend": ("cayu.environments.coding_backends", "CodingBackend"),
+    "CodingBackendContext": ("cayu.environments.coding_backends", "CodingBackendContext"),
+    "CodingBackendRegistry": ("cayu.environments.coding_backends", "CodingBackendRegistry"),
+    "default_coding_backends": ("cayu.environments.coding_backends", "default_coding_backends"),
+    "register_coding_environment": (
+        "cayu.environments.coding_backends",
+        "register_coding_environment",
+    ),
+    "select_coding_backend": ("cayu.environments.coding_backends", "select_coding_backend"),
+    "DockerCodingBackendOptions": ("cayu.environments.docker_coding", "DockerCodingBackendOptions"),
+    "verify_local_docker_image": ("cayu.environments.docker_coding", "verify_local_docker_image"),
     "LocalWorkspaceEnvironmentFactory": (
         "cayu.environments.local_workspace",
         "LocalWorkspaceEnvironmentFactory",
@@ -90,6 +105,59 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_WORKSPACE_INSTRUCTION_PATHS": (
         "cayu.environments.base",
         "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
+    ),
+    "CODING_COMMAND_AUTHORITY_SCHEMA": (
+        "cayu.environments.coding_toolchains",
+        "CODING_COMMAND_AUTHORITY_SCHEMA",
+    ),
+    "CODING_TOOLCHAIN_PROFILE_SCHEMA": (
+        "cayu.environments.coding_toolchains",
+        "CODING_TOOLCHAIN_PROFILE_SCHEMA",
+    ),
+    "CodingAdmissionProbe": ("cayu.environments.coding_toolchains", "CodingAdmissionProbe"),
+    "CodingCommandAuthority": ("cayu.environments.coding_toolchains", "CodingCommandAuthority"),
+    "CodingDependencyInput": ("cayu.environments.coding_toolchains", "CodingDependencyInput"),
+    "CodingFixedEnvironmentVariable": (
+        "cayu.environments.coding_toolchains",
+        "CodingFixedEnvironmentVariable",
+    ),
+    "CodingToolchainError": ("cayu.environments.coding_toolchains", "CodingToolchainError"),
+    "CodingToolchainProfile": ("cayu.environments.coding_toolchains", "CodingToolchainProfile"),
+    "CodingToolchainEvidencePolicy": (
+        "cayu.environments.coding_toolchains",
+        "CodingToolchainEvidencePolicy",
+    ),
+    "coding_toolchain_evidence_policy": (
+        "cayu.environments.coding_toolchains",
+        "coding_toolchain_evidence_policy",
+    ),
+    "coding_toolchain_runner_admission_failure": (
+        "cayu.environments.coding_toolchains",
+        "coding_toolchain_runner_admission_failure",
+    ),
+    "ensure_coding_toolchain_runner_admission": (
+        "cayu.environments.coding_toolchains",
+        "ensure_coding_toolchain_runner_admission",
+    ),
+    "register_coding_toolchain_evidence_policy": (
+        "cayu.environments.coding_toolchains",
+        "register_coding_toolchain_evidence_policy",
+    ),
+    "run_coding_toolchain_admission_probes": (
+        "cayu.environments.coding_toolchains",
+        "run_coding_toolchain_admission_probes",
+    ),
+    "owned_coding_toolchain_profile": (
+        "cayu.environments.coding_toolchains",
+        "owned_coding_toolchain_profile",
+    ),
+    "verify_coding_toolchain_dependencies": (
+        "cayu.environments.coding_toolchains",
+        "verify_coding_toolchain_dependencies",
+    ),
+    "verify_local_coding_toolchain_dependencies": (
+        "cayu.environments.coding_toolchains",
+        "verify_local_coding_toolchain_dependencies",
     ),
     "DOCKER_CODING_COMMAND_AUTHORITY_SCHEMA": (
         "cayu.environments.docker_toolchains",
@@ -345,6 +413,18 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "CLOUD_CODING_BACKEND",
+    "CLOUD_SANDBOX_VARIABLES",
+    "CODING_BACKEND_ENV",
+    "DOCKER_CODING_BACKEND",
+    "CodingBackend",
+    "CodingBackendContext",
+    "CodingBackendRegistry",
+    "default_coding_backends",
+    "register_coding_environment",
+    "select_coding_backend",
+    "DockerCodingBackendOptions",
+    "verify_local_docker_image",
     "LocalWorkspaceEnvironmentFactory",
     "workspace_root_from_metadata",
     "require_allowed_workspace_root",
@@ -378,6 +458,23 @@ PUBLIC_NAMES = [
     "DEFAULT_SYNC_STAGING_MAX_CONCURRENCY",
     "DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES",
     "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
+    "CODING_COMMAND_AUTHORITY_SCHEMA",
+    "CODING_TOOLCHAIN_PROFILE_SCHEMA",
+    "CodingAdmissionProbe",
+    "CodingCommandAuthority",
+    "CodingDependencyInput",
+    "CodingFixedEnvironmentVariable",
+    "CodingToolchainError",
+    "CodingToolchainProfile",
+    "CodingToolchainEvidencePolicy",
+    "coding_toolchain_evidence_policy",
+    "coding_toolchain_runner_admission_failure",
+    "ensure_coding_toolchain_runner_admission",
+    "register_coding_toolchain_evidence_policy",
+    "run_coding_toolchain_admission_probes",
+    "owned_coding_toolchain_profile",
+    "verify_coding_toolchain_dependencies",
+    "verify_local_coding_toolchain_dependencies",
     "DOCKER_CODING_COMMAND_AUTHORITY_SCHEMA",
     "DOCKER_CODING_PROTECTED_DIRECTORY_NAMES",
     "DOCKER_CODING_TOOLCHAIN_PROFILE_SCHEMA",

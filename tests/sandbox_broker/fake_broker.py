@@ -4,6 +4,9 @@ Each sandbox's ``/workspace`` is a host directory. Commands run there as real
 processes with a scrubbed environment, so Runtime code runs unchanged against
 the fake. Arguments naming ``/workspace`` are mapped to that directory, and the
 directory in a command's output back to ``/workspace``, as the guest's mount would.
+``guest_paths`` maps further guest path prefixes (an image's ``/opt/...`` toolchain)
+to host directories the same way, and ``image_identities`` gives a catalog image
+the identity a broker reports for an image it built.
 """
 
 from __future__ import annotations
@@ -100,6 +103,7 @@ class FakeSandbox:
     copies: dict[str, dict[str, Any]] = field(default_factory=dict)
     staged_copies: dict[str, int] | None = None
     interactive_commands: bool = True
+    image_identity: dict[str, Any] | None = None
 
     def record(self) -> dict[str, Any]:
         return {
@@ -124,6 +128,7 @@ class FakeSandbox:
             "staged_copies": self.staged_copies,
             "interactive_commands": self.interactive_commands,
             "guarantees": {"version": 1, "items": list(self.guarantees)},
+            **({} if self.image_identity is None else {"image_identity": self.image_identity}),
         }
 
 
@@ -160,6 +165,10 @@ class FakeBroker:
         self.storage_requests: list[httpx.Request] = []
         # Stdio requests whose answer is lost after the broker applied them.
         self.drop_stdio_responses = 0
+        # Guest path prefixes mapped to host directories, beyond /workspace.
+        self.guest_paths: dict[str, Path] = {}
+        # The image identity reported for sandboxes of each image name.
+        self.image_identities: dict[str, dict[str, Any]] = {}
 
     def client(self, **settings: Any) -> SandboxBrokerClient:
         return SandboxBrokerClient(
@@ -341,6 +350,7 @@ class FakeBroker:
             guarantees=self.guarantees,
             staged_copies=self.staged_copies,
             interactive_commands=self.interactive_commands,
+            image_identity=self.image_identities.get(body["image"]),
         )
         self.sandboxes[sandbox_id] = sandbox
         self.by_key[key] = sandbox_id
@@ -368,12 +378,7 @@ class FakeBroker:
             self.busy_responses -= 1
             return _error(409, "sandbox_busy")
         self.started.append(body["argv"])
-        argv = [
-            str(sandbox.root) + item.removeprefix("/workspace")
-            if item == "/workspace" or item.startswith("/workspace/")
-            else item
-            for item in body["argv"]
-        ]
+        argv = [self._host_path(sandbox, item) for item in body["argv"]]
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(sandbox.root)}
         env.update(body.get("env") or {})
         command = FakeCommand(body=body, root=sandbox.root)
@@ -391,6 +396,13 @@ class FakeBroker:
         )
         sandbox.commands[body["command_id"]] = command
         return httpx.Response(202, json=command.view())
+
+    def _host_path(self, sandbox: FakeSandbox, value: str) -> str:
+        prefixes = {"/workspace": sandbox.root, **self.guest_paths}
+        for prefix in sorted(prefixes, key=len, reverse=True):
+            if value == prefix or value.startswith(prefix + "/"):
+                return str(prefixes[prefix]) + value.removeprefix(prefix)
+        return value
 
     async def _relay(self, command: FakeCommand) -> None:
         """Hold an interactive command's stdout until it is read; it exits after its output."""

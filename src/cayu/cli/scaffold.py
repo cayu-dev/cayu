@@ -690,21 +690,24 @@ def test_agent_runs_through_the_runtime() -> None:
             ModelStreamEvent.completed({"finish_reason": "stop"}),
         ]
     )
-    app = build_app(
-        provider=provider,
-        session_store=InMemorySessionStore(),
-        task_store=InMemoryTaskStore(),
-    )
 
-    outcome = asyncio.run(
-        run_to_completion(
-            app,
-            RunRequest(
-                agent_name="__AGENT_NAME__",
-                messages=[Message.text("user", "Handle this request")],
-            ),
-        )
-    )
+    async def run_once():
+        # Closing the app releases what its sessions allocated, such as a
+        # sandbox container, even when a test fails.
+        async with build_app(
+            provider=provider,
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        ) as app:
+            return await run_to_completion(
+                app,
+                RunRequest(
+                    agent_name="__AGENT_NAME__",
+                    messages=[Message.text("user", "Handle this request")],
+                ),
+            )
+
+    outcome = asyncio.run(run_once())
 
     assert outcome.ok
     assert outcome.final_text == "Agent result."
@@ -2979,18 +2982,15 @@ def _rendered_project_files(
     files.update(convention_files(plan, render=render))
     if "knowledge" in plan.capabilities:
         for relative in ("tests/test_agent.py", "evals/agent.py"):
-            files[relative] = (
-                files[relative]
-                .replace(
+            files[relative] = re.sub(
+                r"^( +)task_store=InMemoryTaskStore\(\),\n",
+                r"\1task_store=InMemoryTaskStore(),\n\1knowledge_store=InMemoryKnowledgeStore(),\n",
+                files[relative].replace(
                     "from cayu.sessions import InMemorySessionStore\n",
                     "from cayu.sessions import InMemorySessionStore\n"
                     "from cayu.storage import InMemoryKnowledgeStore\n",
-                )
-                .replace(
-                    "        task_store=InMemoryTaskStore(),\n",
-                    "        task_store=InMemoryTaskStore(),\n"
-                    "        knowledge_store=InMemoryKnowledgeStore(),\n",
-                )
+                ),
+                flags=re.MULTILINE,
             )
     files["pyproject.toml"] += scaffold_contract(plan)
     if "tasks" not in plan.capabilities:
@@ -3247,6 +3247,7 @@ def _publish_new_project(
     target: Path,
     files: dict[str, str],
     plan: ApplicationPlan,
+    target_not_empty: bool = False,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     _require_safe_scaffold_parent(target.parent)
@@ -3270,7 +3271,14 @@ def _publish_new_project(
         )
     except BaseException as error:
         if isinstance(error, GuardedTreePublicationError):
-            if error.code == "destination_not_empty":
+            if error.code == "destination_not_empty" or (
+                # A directory that held anything before this run and that its
+                # publication receipt can't authorize (another request, or a
+                # tree with links such as a uv cache) is simply not empty.
+                target_not_empty
+                and error.code
+                in {"publication_request_conflict", "unsafe_tree_entry", "unsupported_tree_entry"}
+            ):
                 raise _ScaffoldTargetNotEmpty from None
             raise _translated_scaffold_publication_error(error) from error
         raise
@@ -3469,7 +3477,8 @@ def run_new(args: argparse.Namespace) -> int:
             message=f"{target} already exists and is not a directory",
             as_json=args.json,
         )
-    if args.dry_run and target.exists() and any(target.iterdir()):
+    target_not_empty = target.exists() and any(target.iterdir())
+    if args.dry_run and target_not_empty:
         return _new_error(
             code="TARGET_NOT_EMPTY",
             message=f"{target} already exists and is not empty",
@@ -3529,6 +3538,7 @@ def run_new(args: argparse.Namespace) -> int:
             target=target,
             files=files,
             plan=plan,
+            target_not_empty=target_not_empty,
         )
     except _ScaffoldCodingPreflightError as exc:
         return _new_error(

@@ -8,6 +8,7 @@ import hashlib
 import io
 import logging
 import posixpath
+import re
 import secrets
 import tarfile
 import tempfile
@@ -96,6 +97,7 @@ _POLL_RECOVERY_GRACE_SECONDS = 120.0
 _CANCEL_SETTLE_SECONDS = 30.0
 _DEFAULT_TIMEOUT_SECONDS = 300
 _ADMISSION_PROBE_TIMEOUT_SECONDS = 10
+_SHA256_IDENTITY = re.compile(r"sha256:[0-9a-f]{64}\Z")
 # Leave room in each archive for tar headers, long-name records and padding.
 _ARCHIVE_MEMBER_OVERHEAD = 4 * 1024
 _ARCHIVE_END_BYTES = 1024
@@ -200,6 +202,12 @@ class BrokeredSandboxRunner(Runner):
     ``close`` stops lease renewal and destroys the sandbox. If the destroy call
     fails, the sandbox is no longer renewed and the broker destroys it when its
     lease lapses; ``close`` can be retried.
+
+    ``toolchain_profile_fingerprint`` and ``toolchain_executables`` bind the
+    runner to one coding toolchain profile: its admission evidence then names
+    that profile and carries live probes of those executables, which
+    ``refresh_execution_admission`` renews in this exact sandbox. Command
+    tools holding the same profile admit the runner through that evidence.
     """
 
     isolation = BROKERED_SANDBOX_CANDIDATE
@@ -214,6 +222,8 @@ class BrokeredSandboxRunner(Runner):
         lease_keeper: SandboxLeaseKeeper | None = None,
         destroy_on_close: bool = True,
         poll_wait_seconds: int = MAX_WAIT_SECONDS,
+        toolchain_profile_fingerprint: str | None = None,
+        toolchain_executables: Sequence[str] = (),
     ) -> None:
         if not isinstance(client, SandboxBrokerClient):
             raise TypeError("BrokeredSandboxRunner requires a SandboxBrokerClient.")
@@ -227,11 +237,25 @@ class BrokeredSandboxRunner(Runner):
             raise TypeError("destroy_on_close must be a bool.")
         if type(poll_wait_seconds) is not int or not 0 <= poll_wait_seconds <= MAX_WAIT_SECONDS:
             raise ValueError(f"poll_wait_seconds must be from 0 to {MAX_WAIT_SECONDS}.")
+        if toolchain_profile_fingerprint is not None and (
+            type(toolchain_profile_fingerprint) is not str
+            or _SHA256_IDENTITY.fullmatch(toolchain_profile_fingerprint) is None
+        ):
+            raise ValueError("toolchain_profile_fingerprint must be a lowercase SHA-256 identity.")
+        executables = tuple(toolchain_executables)
+        if executables and toolchain_profile_fingerprint is None:
+            raise ValueError("toolchain_executables require toolchain_profile_fingerprint.")
+        if any(type(item) is not str or not item for item in executables):
+            raise ValueError("toolchain_executables must be nonempty strings.")
         self._client = client
         self.sandbox = sandbox
         self.lease_keeper = lease_keeper
         self.destroy_on_close = destroy_on_close
         self.poll_wait_seconds = poll_wait_seconds
+        self.toolchain_profile_fingerprint = toolchain_profile_fingerprint
+        self.toolchain_executables = tuple(sorted(set(executables)))
+        self._toolchain_evidence: tuple[ExecutionExecutableEvidence, ...] = ()
+        self._toolchain_refresh_lock = asyncio.Lock()
         self._destroyed = False
 
     @property
@@ -440,7 +464,29 @@ class BrokeredSandboxRunner(Runner):
     # Admission --------------------------------------------------------------
 
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
-        return _admission_candidate(self, ())
+        return _admission_candidate(self, self._toolchain_evidence)
+
+    async def refresh_execution_admission(self) -> None:
+        """Probe the bound toolchain's executables again in this exact sandbox."""
+
+        if not self.toolchain_executables:
+            return
+        from cayu.environments.admission import ExecutionRequirements
+
+        async with self._toolchain_refresh_lock:
+            observer = _BrokeredAdmissionObserver(
+                self,
+                ExecutionRequirements.trusted(required_executables=self.toolchain_executables),
+            )
+            candidate = await observer.collect()
+            tool_requirements = candidate.evidence.tool_requirements
+            self._toolchain_evidence = (
+                () if tool_requirements is None else tool_requirements.executables
+            )
+
+    async def collect_execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
+        await self.refresh_execution_admission()
+        return self.execution_admission_candidate()
 
     def execution_admission_observer(self, requirements):
         if not requirements.executable_names():
@@ -1312,23 +1358,24 @@ def _bounded_text(text: str, limit: int) -> tuple[str, bool]:
 def _fingerprint(runner: BrokeredSandboxRunner) -> str:
     settings = runner.broker.settings
     sandbox = runner.sandbox
+    identity: dict[str, Any] = {
+        "api_url": settings.api_url,
+        "application_id": settings.application_id,
+        "sandbox_id": sandbox.id,
+        "image": sandbox.image,
+        "egress": sandbox.egress.mode,
+        "guarantees": None
+        if sandbox.guarantees is None
+        else sandbox.guarantees.model_dump(mode="json"),
+        "root": runner.default_cwd,
+    }
+    if sandbox.image_identity is not None:
+        # Records without an image identity keep their earlier fingerprint.
+        identity["image_identity"] = sandbox.image_identity.model_dump(mode="json")
     return (
         "sha256:"
         + sha256(
-            canonical_durable_json_bytes(
-                {
-                    "api_url": settings.api_url,
-                    "application_id": settings.application_id,
-                    "sandbox_id": sandbox.id,
-                    "image": sandbox.image,
-                    "egress": sandbox.egress.mode,
-                    "guarantees": None
-                    if sandbox.guarantees is None
-                    else sandbox.guarantees.model_dump(mode="json"),
-                    "root": runner.default_cwd,
-                },
-                "brokered_sandbox_execution_identity",
-            )
+            canonical_durable_json_bytes(identity, "brokered_sandbox_execution_identity")
         ).hexdigest()
     )
 
@@ -1339,6 +1386,9 @@ def _admission_candidate(
 ) -> ExecutionAdmissionCandidate:
     fingerprint = _fingerprint(runner)
     sandbox = runner.sandbox
+    image_fingerprint = (
+        None if sandbox.image_identity is None else sandbox.image_identity.fingerprint
+    )
     return ExecutionAdmissionCandidate(
         candidate=BROKERED_SANDBOX_CANDIDATE,
         evidence=ExecutionCapabilityEvidence(
@@ -1347,8 +1397,11 @@ def _admission_candidate(
                 sandbox.guarantees, egress_mode=sandbox.egress.mode, declared=False
             ),
             environment_fingerprint=fingerprint,
+            image_fingerprint=image_fingerprint,
+            toolchain_profile_fingerprint=runner.toolchain_profile_fingerprint,
             tool_requirements=ExecutionToolRequirementEvidence(
                 environment_fingerprint=fingerprint,
+                image_fingerprint=image_fingerprint,
                 executables=executables,
             ),
         ),
@@ -1433,10 +1486,11 @@ class _BrokeredAdmissionObserver(RunnerExecutionAdmissionObserver):
                 )
             )
         final = await self._observe()
-        if (final.id, final.image, final.guarantees) != (
+        if (final.id, final.image, final.guarantees, final.image_identity) != (
             initial.id,
             initial.image,
             initial.guarantees,
+            initial.image_identity,
         ):
             raise SandboxLeaseLostError("Brokered sandbox identity changed during admission.")
         candidate = _admission_candidate(self.runner, tuple(claims))

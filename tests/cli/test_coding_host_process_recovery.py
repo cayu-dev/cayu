@@ -55,7 +55,7 @@ async def main():
         from operations import coding as composition
         from cayu.guides.coding_host import extend_generated_application
         from cayu.coding_products import CodingSettlementPolicy
-        from cayu.runners.docker_workload import DockerImageIdentity
+        from tests.coding_scaffold_fixtures import generated_docker_toolchain_profile
         workspace_options = dict(
             excluded_directory_names=composition._SOURCE_EXCLUDED_DIRECTORY_NAMES,
             excluded_path_patterns=composition._SOURCE_EXCLUDED_PATH_PATTERNS,
@@ -117,8 +117,7 @@ async def main():
     if generated:
         application = CodingProductApplication(
             app, source_workspace=workspace, artifact_store=repository.store,
-            toolchain_profile=composition._python_toolchain_profile(
-                DockerImageIdentity(reference="fixture@sha256:" + "a" * 64)),
+            toolchain_profile=generated_docker_toolchain_profile(composition),
             agent_name="coder", project_root=source,
         )
         wrapped = extend_generated_application(application, business=business,

@@ -15,6 +15,7 @@ from cayu.sessions.memory import InMemorySessionStore
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tasks.memory import InMemoryTaskStore
 from tests.cli.test_scaffold_coding_budget import denial_policy
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository
 from tests.qualification.repository_maintenance_toolchain import maintenance_toolchain
@@ -42,9 +43,7 @@ def test_generated_product_budget_denies_before_provider_dispatch(project, tmp_p
         assert spec is not None and spec.loader is not None
         harness = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(harness)
-        monkeypatch.setattr(
-            operations, "_configured_docker_authority", lambda _root: (profile, "/usr/bin/docker")
-        )
+        admit_fixture_image(monkeypatch, operations, toolchain_profile=profile)
         runners = []
         harness._install_fake_docker_factory(monkeypatch, target=target, created_runners=runners)
         provider = RecordingOneShotProvider()

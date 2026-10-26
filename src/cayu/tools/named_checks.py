@@ -15,11 +15,15 @@ from cayu._validation import (
     require_durable_text,
 )
 from cayu.artifacts.base import ArtifactMetadata, ArtifactScope
+from cayu.environments.coding_toolchains import (
+    CodingToolchainError,
+    CodingToolchainProfile,
+    ensure_coding_toolchain_runner_admission,
+    owned_coding_toolchain_profile,
+    verify_coding_toolchain_dependencies,
+)
 from cayu.environments.docker_toolchains import (
-    DockerCodingToolchainError,
     DockerCodingToolchainProfile,
-    ensure_docker_coding_toolchain_runner_admission,
-    verify_docker_coding_toolchain_dependencies,
 )
 from cayu.runners.base import (
     ExecCommand,
@@ -57,6 +61,9 @@ from cayu.tools.commands import (
     MAX_OUTPUT_LIMIT_BYTES,
     MAX_TIMEOUT_SECONDS,
     CommandPolicy,
+    CommandPolicyDecision,
+    CommandPolicyResult,
+    CommandRequest,
     ExecCommandTool,
     _command_output_encoding,
     _command_output_label,
@@ -214,14 +221,8 @@ class _RunCheckRecoveryCommandTool(RunCommandTool):
                 args = {"selector": check}
         return super()._resolve_arguments(args)
 
-    def __init__(
-        self, *, toolchain_profile: DockerCodingToolchainProfile, owner: RunCheckTool
-    ) -> None:
-        if type(toolchain_profile) is not DockerCodingToolchainProfile:
-            raise TypeError("toolchain_profile must be an exact DockerCodingToolchainProfile.")
-        self._profile = DockerCodingToolchainProfile.model_validate(
-            toolchain_profile.model_dump(mode="python", by_alias=True)
-        )
+    def __init__(self, *, toolchain_profile: CodingToolchainProfile, owner: RunCheckTool) -> None:
+        self._profile = owned_coding_toolchain_profile(toolchain_profile)
         self._authorities = {item.selector: item for item in self._profile.named_check_authorities}
         # Journaled and recovered results fit the owning run_check's bound.
         self.spec = self.spec.model_copy(
@@ -298,7 +299,7 @@ class RunCheckTool(Tool, DurableToolRecovery):
         checks: Iterable[NamedCheck],
         command_policy: CommandPolicy,
         max_model_output_bytes: int = DEFAULT_CHECK_MODEL_OUTPUT_BYTES,
-        toolchain_profile: DockerCodingToolchainProfile | None = None,
+        toolchain_profile: CodingToolchainProfile | None = None,
         workspace_observation_limits: WorkspaceRevisionObservationLimits | None = None,
         max_terminal_payload_bytes: int | None = None,
     ) -> None:
@@ -326,19 +327,8 @@ class RunCheckTool(Tool, DurableToolRecovery):
         if owned_model_limit < len(_OUTPUT_TRUNCATION_MARKER.encode("utf-8")):
             raise ValueError("max_model_output_bytes is too small for the truncation marker.")
         ordered_checks = tuple(sorted(owned_checks, key=lambda item: item.name))
-        if (
-            toolchain_profile is not None
-            and type(toolchain_profile) is not DockerCodingToolchainProfile
-        ):
-            raise TypeError(
-                "toolchain_profile must be an exact DockerCodingToolchainProfile or None."
-            )
         owned_toolchain = (
-            None
-            if toolchain_profile is None
-            else DockerCodingToolchainProfile.model_validate(
-                toolchain_profile.model_dump(mode="python", by_alias=True)
-            )
+            None if toolchain_profile is None else owned_coding_toolchain_profile(toolchain_profile)
         )
         if owned_toolchain is not None:
             for check in ordered_checks:
@@ -463,12 +453,10 @@ class RunCheckTool(Tool, DurableToolRecovery):
         return self._command_policy
 
     @property
-    def toolchain_profile(self) -> DockerCodingToolchainProfile | None:
+    def toolchain_profile(self) -> CodingToolchainProfile | None:
         if self._toolchain_profile is None:
             return None
-        return DockerCodingToolchainProfile.model_validate(
-            self._toolchain_profile.model_dump(mode="python", by_alias=True)
-        )
+        return owned_coding_toolchain_profile(self._toolchain_profile)
 
     def _execution_profile_material(self) -> dict[str, object]:
         """Return complete built-in behavior inputs; policy is profiled separately."""
@@ -483,6 +471,8 @@ class RunCheckTool(Tool, DurableToolRecovery):
         }
         if self._toolchain_profile is not None:
             material["toolchain_profile_fingerprint"] = self._toolchain_profile.fingerprint
+            if type(self._toolchain_profile) is not DockerCodingToolchainProfile:
+                material["toolchain_admission"] = "cayu.coding_toolchain_evidence_policy.v1"
         return material
 
     @bounded_terminal_result
@@ -503,16 +493,16 @@ class RunCheckTool(Tool, DurableToolRecovery):
         dependency_sensitive = False
 
         if self._toolchain_profile is not None:
-            runner_failure = await ensure_docker_coding_toolchain_runner_admission(
-                ctx.runner,
-                profile=self._toolchain_profile,
+            runner_failure = await ensure_coding_toolchain_runner_admission(
+                ctx.runner, profile=self._toolchain_profile
             )
             if runner_failure is not None:
                 return self._complete_result(
                     check,
                     ToolResult(
                         content=(
-                            f"Check {check.name!r} requires the exact admitted Docker toolchain."
+                            f"Check {check.name!r} requires the exact admitted "
+                            f"{_toolchain_label(self._toolchain_profile)}."
                         ),
                         structured={
                             **_base_error_evidence(check, status="toolchain_unavailable"),
@@ -544,20 +534,19 @@ class RunCheckTool(Tool, DurableToolRecovery):
             dependency_sensitive = authority.dependency_sensitive
             if dependency_sensitive:
                 try:
-                    await verify_docker_coding_toolchain_dependencies(
+                    await verify_coding_toolchain_dependencies(
                         self._toolchain_profile,
                         ctx.workspace,
                     )
-                except DockerCodingToolchainError as exc:
+                except CodingToolchainError as exc:
                     return self._complete_result(
                         check,
                         _toolchain_dependency_failure_result(check, exc),
                         started_ns=started_ns,
                     )
 
-            runner_failure = await ensure_docker_coding_toolchain_runner_admission(
-                ctx.runner,
-                profile=self._toolchain_profile,
+            runner_failure = await ensure_coding_toolchain_runner_admission(
+                ctx.runner, profile=self._toolchain_profile
             )
             if runner_failure is not None:
                 return self._complete_result(
@@ -631,9 +620,8 @@ class RunCheckTool(Tool, DurableToolRecovery):
                     started_ns=started_ns,
                 )
 
-            runner_failure = await ensure_docker_coding_toolchain_runner_admission(
-                ctx.runner,
-                profile=self._toolchain_profile,
+            runner_failure = await ensure_coding_toolchain_runner_admission(
+                ctx.runner, profile=self._toolchain_profile
             )
             if runner_failure is not None:
                 result = self._complete_result(
@@ -738,11 +726,11 @@ class RunCheckTool(Tool, DurableToolRecovery):
                 in {"complete", "runner_quiescent"}
             ):
                 try:
-                    await verify_docker_coding_toolchain_dependencies(
+                    await verify_coding_toolchain_dependencies(
                         self._toolchain_profile,
                         workspace,
                     )
-                except DockerCodingToolchainError as exc:
+                except CodingToolchainError as exc:
                     projected = _toolchain_dependency_failure_result(
                         check,
                         exc,
@@ -1254,9 +1242,13 @@ def _base_error_evidence(check: NamedCheck, *, status: str) -> dict[str, object]
     }
 
 
+def _toolchain_label(profile: CodingToolchainProfile) -> str:
+    return "Docker toolchain" if type(profile) is DockerCodingToolchainProfile else "toolchain"
+
+
 def _toolchain_dependency_failure_result(
     check: NamedCheck,
-    exc: DockerCodingToolchainError,
+    exc: CodingToolchainError,
     *,
     result: ToolResult | None = None,
 ) -> ToolResult:
@@ -1335,3 +1327,116 @@ def _malformed_execution_result(check: NamedCheck) -> ToolResult:
         },
         is_error=True,
     )
+
+
+def named_checks_from_toolchain(
+    profile: CodingToolchainProfile,
+    *,
+    identities: Mapping[str, ExecutionProfileBehaviorIdentity] | None = None,
+    identity_prefix: str = "cayu.named_check",
+) -> tuple[NamedCheck, ...]:
+    """Declare one ``NamedCheck`` per named-check authority of a toolchain profile.
+
+    Each check runs its authority's exact argv with its timeout and output
+    bound, so it passes ``RunCheckTool``'s match against the profile. A check
+    takes its identity from ``identities`` by name; one without an entry gets
+    ``<identity_prefix>.<name>`` versioned by the authority's fingerprint, so
+    changing the authority changes the identity.
+    """
+
+    owned = owned_coding_toolchain_profile(profile)
+    supplied = {} if identities is None else dict(identities)
+    checks: list[NamedCheck] = []
+    for authority in owned.named_check_authorities:
+        identity = supplied.get(authority.selector) or ExecutionProfileBehaviorIdentity(
+            name=f"{identity_prefix}.{authority.selector}",
+            behavior_version="1",
+            implementation_version=authority.fingerprint,
+        )
+        checks.append(
+            NamedCheck(
+                name=authority.selector,
+                description=authority.description,
+                command=ExecCommand.process(*authority.command_argv()),
+                timeout_s=authority.timeout_seconds,
+                max_output_bytes=authority.max_output_bytes,
+                execution_profile_identity=identity,
+            )
+        )
+    unknown = sorted(set(supplied) - {check.name for check in checks})
+    if unknown:
+        raise ValueError(
+            "identities name checks the toolchain profile doesn't declare: " + ", ".join(unknown)
+        )
+    if not checks:
+        raise ValueError("The toolchain profile declares no named-check authorities.")
+    return tuple(checks)
+
+
+class ExactNamedCheckCommandPolicy(CommandPolicy):
+    """Allow exactly the declared checks' process argv and timeouts, nothing else.
+
+    The defense-in-depth policy ``RunCheckTool`` requires: a request passes
+    only as one declared check's argv and timeout, run in ``workspace_path``
+    with no working-directory override, environment or stdin.
+    """
+
+    def __init__(
+        self,
+        checks: Iterable[NamedCheck],
+        *,
+        workspace_path: str = "/workspace",
+        execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+    ) -> None:
+        owned_checks = tuple(checks)
+        if not owned_checks or any(type(check) is not NamedCheck for check in owned_checks):
+            raise TypeError("checks must be one or more exact NamedCheck declarations.")
+        path = require_durable_clean_nonblank(workspace_path, "workspace_path")
+        if not path.startswith("/"):
+            raise ValueError("workspace_path must be an absolute guest path.")
+        allowed = sorted(
+            {(tuple(check.command.argv or ()), check.timeout_s) for check in owned_checks}
+        )
+        self._allowed = frozenset(allowed)
+        self._workspace_path = path
+        if execution_profile_identity is None:
+            material = {
+                "workspace_path": path,
+                "allowed": [[list(argv), timeout] for argv, timeout in allowed],
+            }
+            execution_profile_identity = ExecutionProfileBehaviorIdentity(
+                name="cayu.exact_named_check_command_policy",
+                behavior_version="1",
+                implementation_version="sha256:"
+                + sha256(
+                    canonical_durable_json_bytes(material, "exact_named_check_policy")
+                ).hexdigest(),
+            )
+        owned_identity = copy_execution_profile_behavior_identity(execution_profile_identity)
+        if owned_identity is None:
+            raise TypeError(
+                "execution_profile_identity must be an ExecutionProfileBehaviorIdentity."
+            )
+        self._identity = owned_identity
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return self._identity
+
+    async def evaluate(self, ctx: ToolContext, request: CommandRequest) -> CommandPolicyResult:
+        del ctx
+        command = request.command
+        exact = (
+            command.kind == "process"
+            and command.shell is None
+            and command.argv is not None
+            and (tuple(command.argv), request.timeout_s) in self._allowed
+            and request.cwd is None
+            and request.canonical_cwd == self._workspace_path
+            and request.env is None
+            and request.stdin is None
+        )
+        return CommandPolicyResult(
+            decision=CommandPolicyDecision.ALLOW if exact else CommandPolicyDecision.DENY,
+            reason=None if exact else "Command is not an exact declared named check.",
+        )

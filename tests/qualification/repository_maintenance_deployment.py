@@ -169,7 +169,8 @@ def bind_maintenance_deployment(app, *, agent_name):
         app,
         source_workspace=factory.source_workspace,
         artifact_store=factory.configured_artifact_store,
-        toolchain_profile=factory.toolchain_profile,
+        toolchain_profile=factory.coding_toolchain_profile,
+        image_fingerprint=factory.toolchain_profile.image_identity.fingerprint,
         agent_name=agent_name,
         project_root=factory.source_workspace.root,
     )

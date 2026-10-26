@@ -153,6 +153,7 @@ async def _fixture(
         "reference": publication.result_reference,
         "repository": repository,
         "toolchain": toolchain,
+        "image_fingerprint": toolchain.image_identity.fingerprint,
         "workspace": workspace,
     }, source
 

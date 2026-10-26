@@ -27,6 +27,7 @@ from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.qualification.repository_maintenance_delivery_case import build_journey_http
 from tests.qualification.repository_maintenance_toolchain import maintenance_toolchain
 from tests.qualification.test_repository_maintenance_application import scripted_journey_budget
@@ -51,9 +52,7 @@ async def run(root, action, old_pid):
             architecture="amd64",
             build_context_sha256="sha256:" + "b" * 64,
         )
-        patches.setattr(
-            operations, "_configured_docker_authority", lambda _: (profile, "/usr/bin/docker")
-        )
+        admit_fixture_image(patches, operations, toolchain_profile=profile)
         spec = importlib.util.spec_from_file_location(
             "local_composition", project / "tests/test_coding_composition.py"
         )

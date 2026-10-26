@@ -160,8 +160,9 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
     (project / "docker-coding-build.json").write_text(
         json.dumps(
             {
-                "schema_version": "1",
+                "schema_version": "2",
                 "image_reference": image,
+                "profile_revision": "1",
                 "base_image": _BASE_IMAGE,
                 "uv_version": _UV_VERSION,
                 "debian_snapshot": _DEBIAN_SNAPSHOT,
@@ -170,6 +171,8 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
                 "ripgrep_package": _RIPGREP_PACKAGE,
                 "cayu_wheel": f".cayu/{wheel.name}",
                 "cayu_wheel_sha256": wheel_digest,
+                "extra_build_inputs": [],
+                "extra_probe_executables": [],
             },
             indent=2,
             sort_keys=True,

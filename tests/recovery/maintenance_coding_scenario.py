@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.qualification.repository_maintenance_delivery_case import build_journey_http
 from worker_harness import _wait_for_task_lease_expiry, _write_json_atomic
 
@@ -78,9 +79,7 @@ async def run_maintenance_coding(config):
     with project_context(project), pytest.MonkeyPatch.context() as patch:
         operations = importlib.import_module("operations.coding")
         profile = DockerCodingToolchainProfile.model_validate_json(config["toolchain_json"])
-        patch.setattr(
-            operations, "_configured_docker_authority", lambda root: (profile, "/usr/bin/docker")
-        )
+        admit_fixture_image(patch, operations, toolchain_profile=profile)
         spec = importlib.util.spec_from_file_location(
             "maintenance_coding_fixture", project / "tests/test_coding_composition.py"
         )
@@ -102,7 +101,7 @@ async def run_maintenance_coding(config):
                 container_id="b" * 64,
                 configuration_fingerprint=factory._configuration_fingerprint,
                 image_fingerprint=factory.image_identity.fingerprint,
-                toolchain_profile_fingerprint=factory.toolchain_profile.fingerprint,
+                toolchain_profile_fingerprint=factory._evidence_toolchain_fingerprint,
             )
             local_identity = {
                 "session_id": request.session_id,

@@ -16,6 +16,7 @@ from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.workspaces.local import LocalWorkspace
 from tests.cli.test_scaffold_coding_budget import denial_policy
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository
 from tests.qualification.repository_maintenance_toolchain import maintenance_toolchain
@@ -33,9 +34,7 @@ def consumer(project, tmp_path, monkeypatch, request):
     )
     with project_context(project):
         operations = importlib.import_module("operations.coding")
-        monkeypatch.setattr(
-            operations, "_configured_docker_authority", lambda _root: (profile, "/usr/bin/docker")
-        )
+        admit_fixture_image(monkeypatch, operations, toolchain_profile=profile)
         provider = RecordingOneShotProvider()
         task_store = (
             SQLiteTaskStore(tmp_path / "worker-tasks.sqlite")

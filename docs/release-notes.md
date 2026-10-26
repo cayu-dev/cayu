@@ -213,6 +213,48 @@ to keep it offline.
   `access_scope=` or construct the store with one, and a `KnowledgeQuery` with
   only filters points to `list_entries(KnowledgeListQuery(...))` and the
   `list_knowledge` tool.
+- One coding toolchain now runs on Docker locally and in a sandbox brokered by
+  Cayu Cloud. `CodingToolchainProfile` is the backend-neutral part of
+  `DockerCodingToolchainProfile`, which now extends it; a Docker profile's
+  fields, dump and fingerprint are unchanged. `RunCommandTool`,
+  `StructuredCommandToolPolicy` and `RunCheckTool` accept either profile type
+  (exactly those two classes). `DockerCodingEnvironmentFactory` takes a neutral
+  profile with `image_identity`, and `BrokeredSandboxCodingEnvironmentFactory`
+  takes one with `toolchain_profile=` (requires `egress="none"`). Until Cayu
+  Cloud builds an Agent's own coding image, a catalog image without the
+  project's dependencies fails admission with `toolchain_image_unverified`.
+- `select_coding_backend` picks the `docker` or `cayu-cloud` coding backend:
+  the one `CAYU_CODING_BACKEND` (or `required=`) names, otherwise Cayu Cloud when
+  all three `CAYU_CLOUD_*` sandbox variables are set and Docker otherwise.
+  Other backends register on a `CodingBackendRegistry`. `register_coding_environment`
+  registers one workspace's environment, once per clone if needed, and
+  `named_checks_from_toolchain` and `ExactNamedCheckCommandPolicy` build
+  `RunCheckTool`'s checks and policy from a profile.
+- New `cayu new --preset coding` projects use those parts: the generated
+  composition selects its backend, so the same project deploys to Cayu Cloud
+  without code changes; `register_workspace_environment` registers another clone
+  in a few lines; `docker-coding-build.json` v2 lists extra build inputs and
+  probe executables instead of two hard-coded lists; the project's top-level
+  `data/` (runtime files) stays out of the sandbox copy, while nested
+  directories such as `tests/data/` are copied as usual; and generated tests
+  close the app. Existing
+  generated projects keep their shape.
+- The coding image's Dockerfile and `resolve_pins` now add the
+  `debian-security` and `-updates` snapshot lines, so `Dockerfile.coding`
+  builds again when the base image carries security updates.
+- A Docker coding toolchain failure now publishes a stable `code` with
+  `path_count` and `paths_fingerprint` in its failure event, and profile
+  validation errors name the selector or probe. A git-ignored source path that
+  publication would omit is now caught when the sandbox is bound, before the
+  first model call, as well as at finalization.
+- `cayu new` reports `TARGET_NOT_EMPTY` for a non-empty target it can't take
+  over on a real run too, not only with `--dry-run`.
+- `BrokeredSandboxCodingEnvironmentFactory(workspace_setup_commands=...)` runs
+  commands in `/workspace` after copy-in, for example to install locked
+  dependencies; `setup_commands` still run before copy-in. The sandbox record's
+  optional `image_identity` names what a broker-built image was built from.
+- `DockerCodingBackendOptions(cancel_timeout_s=...)` passes the cleanup
+  deadline to every factory the Docker backend builds.
 
 ## v0.14.0
 

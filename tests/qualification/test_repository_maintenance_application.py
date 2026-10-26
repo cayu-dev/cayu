@@ -35,6 +35,7 @@ from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tasks.memory import InMemoryTaskStore
 from tests.cli.test_scaffold_coding_budget import denial_policy
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_application import maintenance_project_files
 from tests.qualification.repository_maintenance_case import (
@@ -149,25 +150,34 @@ def test_generated_image_readback_constructs_target_specific_profile(project):
         builder = importlib.import_module("build_coding_image")
         operations = importlib.import_module("operations.coding")
         snapshot = builder._trusted_build_context_snapshot()
+        configuration = json.loads(snapshot["docker-coding-build.json"])
+        limits = builder._build_context_input_limits(snapshot["docker-coding-build.json"])
         metadata = json.loads((project / "docker-coding-image.json").read_text())
         # Synthetic image metadata tests parsing only, not Docker admission.
         metadata.update(
             content_digest="sha256:" + "a" * 64,
+            profile_revision=configuration["profile_revision"],
             platform_architecture="amd64",
-            dependency_inputs=builder._trusted_build_context_inputs(snapshot),
+            dependency_inputs=[
+                {
+                    **entry,
+                    "max_bytes": min(limits[entry["path"]], builder._DEPENDENCY_INPUT_MAX_BYTES),
+                }
+                for entry in builder._trusted_build_context_inputs(snapshot)
+            ],
             trusted_build_context_sha256=builder._trusted_build_context_sha256(snapshot),
         )
         (project / "docker-coding-image.json").write_text(json.dumps(metadata))
-        profile = operations._read_docker_toolchain_profile()
+        profile = operations._python_toolchain_profile(operations.read_coding_image_receipt())
         assert profile.profile_id == metadata["profile_id"]
         assert profile.revision == metadata["profile_revision"]
         assert (
-            tuple(check.name for check in operations._named_checks(profile))
+            tuple(authority.selector for authority in profile.named_check_authorities)
             == operations._CHECK_NAMES
         )
         assert operations._COMMAND_SELECTOR_NAMES == ("python-version",)
         assert tuple(item.path for item in profile.dependency_inputs) == ("pyproject.toml",)
-        assert {check.name for check in operations._named_checks(profile)} == {
+        assert {authority.selector for authority in profile.named_check_authorities} == {
             "format",
             "independent-range-probe",
             "lint",
@@ -183,8 +193,8 @@ def test_generated_image_readback_constructs_target_specific_profile(project):
             if item["path"] != "environments/range_probe.py"
         ]
         (project / "docker-coding-image.json").write_text(json.dumps(metadata))
-        with pytest.raises(RuntimeError, match="toolchain identity"):
-            operations._read_docker_toolchain_profile()
+        with pytest.raises(RuntimeError, match="exactly the build inputs"):
+            operations.read_coding_image_receipt()
 
 
 @pytest.mark.parametrize("wrong_base", [False, True])
@@ -228,9 +238,7 @@ def test_public_factory_constructs_and_prepares_the_bounded_workflow(
         domain = importlib.import_module("domain.coding_product")
         # Only replace unavailable Docker inspection. No claim of admitted image
         # or execution; real factory construction and Runtime preparation remain.
-        monkeypatch.setattr(
-            operations, "_configured_docker_authority", lambda root: (profile, "/usr/bin/docker")
-        )
+        admit_fixture_image(monkeypatch, operations, toolchain_profile=profile)
         provider = RecordingOneShotProvider()
         application = app_module.build_coding_product_application(
             provider=provider,
@@ -564,9 +572,7 @@ def test_public_workflow_seals_verifies_and_replays(
         assert spec is not None and spec.loader is not None
         harness = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(harness)
-        monkeypatch.setattr(
-            operations, "_configured_docker_authority", lambda root: (profile, "/usr/bin/docker")
-        )
+        admit_fixture_image(monkeypatch, operations, toolchain_profile=profile)
         original_exec = harness._LocalDockerRunner.exec
         observed_tests = []
 

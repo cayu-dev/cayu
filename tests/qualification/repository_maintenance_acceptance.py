@@ -12,7 +12,7 @@ from cayu.coding_products import (
     CodingProductRequest,
     coding_product_completion_decision,
 )
-from cayu.environments.docker_toolchains import DockerCodingToolchainProfile
+from cayu.environments.coding_toolchains import CodingToolchainProfile
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.tasks.contracts import CompletionResultReference, CompletionVerdict, WorkEvidenceReference
 from cayu.workspaces.base import Workspace
@@ -105,13 +105,14 @@ async def verify_maintenance_result(
     request: CodingProductRequest,
     reference: CompletionResultReference,
     repository: CodingProductArtifactRepository,
-    toolchain: DockerCodingToolchainProfile,
+    toolchain: CodingToolchainProfile,
+    image_fingerprint: str,
     workspace: Workspace,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
 ) -> MaintenanceAcceptance:
     """Verify retained output and current exact source without executing code.
 
-    Request, reference, toolchain and workspace must come from the application's
+    Request, reference, toolchain, image fingerprint and workspace must come from the application's
     tenant-qualified lookup, not directly from a product-route request body.
     A returned record does not authorize a later write or bypass fresh delivery
     approval/revision checks.
@@ -136,7 +137,7 @@ async def verify_maintenance_result(
         or request.source.git_baseline.head_revision != SEED_BASE_REVISION
         or request.runtime.toolchain_profile_fingerprint != toolchain.fingerprint
         or request.runtime.dependency_identity != toolchain.dependency_identity
-        or request.runtime.image_fingerprint != toolchain.image_identity.fingerprint
+        or request.runtime.image_fingerprint != image_fingerprint
     ):
         raise MaintenanceAcceptanceRejected()
     checks = {check.check: check for check in candidate.checks}

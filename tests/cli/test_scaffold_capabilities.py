@@ -11,6 +11,7 @@ from functools import wraps
 from pathlib import Path
 
 import pytest
+from tests.coding_scaffold_fixtures import admit_fixture_image
 
 from cayu import EventType, Message, RunRequest, run_to_completion
 from cayu.approvals import PendingToolApprovalEventView, ToolApprovalDecision, ToolApprovalRequest
@@ -238,12 +239,11 @@ def test_coding_docker_capability_matrix(tmp_path, monkeypatch, database, exclud
     with project_context(project):
         coding = importlib.import_module("operations.coding")
         monkeypatch.setattr(coding, "_verify_coding_dependencies", lambda root: None)
-        monkeypatch.setattr(
+        admit_fixture_image(
+            monkeypatch,
             coding,
-            "_configured_docker_authority",
-            lambda root: (
-                DockerImageIdentity(reference="test:profile", content_digest="sha256:" + "a" * 64),
-                "/usr/bin/docker",
+            image_identity=DockerImageIdentity(
+                reference="test:profile", content_digest="sha256:" + "a" * 64
             ),
         )
         app = importlib.import_module("app").build_app()

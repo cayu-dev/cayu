@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import replace
 
 import pytest
+from tests.coding_scaffold_fixtures import generated_docker_toolchain_profile
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 
 from cayu.agents import AgentSpec
@@ -21,7 +22,6 @@ from cayu.coding_products import (
     CodingProductState,
 )
 from cayu.environments.base import Environment, EnvironmentSpec
-from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.workspaces.local import LocalWorkspace
@@ -68,9 +68,7 @@ def test_generated_workflow_recovers_settled_publication(tmp_path, monkeypatch):
         workflow = importlib.import_module("workflows.coding_product")
         domain = importlib.import_module("domain.coding_product")
         composition = importlib.import_module("operations.coding")
-        profile = composition._python_toolchain_profile(
-            DockerImageIdentity(reference="fixture@sha256:" + "a" * 64)
-        )
+        profile = generated_docker_toolchain_profile(composition)
         workspace = LocalWorkspace(
             source,
             workspace_id="coding-source-workspace",

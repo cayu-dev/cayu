@@ -355,7 +355,7 @@ def test_run_check_persists_and_reconciles_durable_dispatch_evidence(
     async def admitted(_runner, **_kwargs):
         return None
 
-    monkeypatch.setattr(named_checks, "ensure_docker_coding_toolchain_runner_admission", admitted)
+    monkeypatch.setattr(named_checks, "ensure_coding_toolchain_runner_admission", admitted)
     records: dict[str, dict[str, object]] = {}
 
     async def load_operation(storage_key: str):
@@ -476,7 +476,7 @@ def test_toolchain_run_check_journals_and_recovers_a_result_within_its_bound(
     async def admitted(_runner, **_kwargs):
         return None
 
-    monkeypatch.setattr(named_checks, "ensure_docker_coding_toolchain_runner_admission", admitted)
+    monkeypatch.setattr(named_checks, "ensure_coding_toolchain_runner_admission", admitted)
     records: dict[str, dict[str, object]] = {}
 
     async def load_operation(storage_key: str):
@@ -604,7 +604,7 @@ def test_toolchain_run_check_recovers_its_output_under_unchanged_limits(
     async def admitted(_runner, **_kwargs):
         return None
 
-    monkeypatch.setattr(named_checks, "ensure_docker_coding_toolchain_runner_admission", admitted)
+    monkeypatch.setattr(named_checks, "ensure_coding_toolchain_runner_admission", admitted)
     records: dict[str, dict[str, object]] = {}
 
     async def load_operation(storage_key: str):
@@ -760,7 +760,7 @@ def test_run_check_rejects_a_pass_that_changes_toolchain_dependencies(
 
     monkeypatch.setattr(
         named_checks,
-        "ensure_docker_coding_toolchain_runner_admission",
+        "ensure_coding_toolchain_runner_admission",
         admitted,
     )
     tool = RunCheckTool(

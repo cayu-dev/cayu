@@ -31,6 +31,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.workflows.base import WorkflowSpec
 from cayu.workflows.workflow import WorkflowBase, step
 from tests.cli.test_scaffold_coding_budget import denial_policy
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.evals.test_workflow_eval_target import _register_app
 from tests.qualification.repository_maintenance_case import SEED_FILES, materialize_seed_repository
@@ -1085,9 +1086,7 @@ def test_generated_profile_is_not_authority_for_source_path_or_seed_bytes(
         root_module = importlib.import_module("app")
         requests = importlib.import_module("operations.maintenance_requests")
         task_type = importlib.import_module("domain.coding_product").CodingProductTask
-        monkeypatch.setattr(
-            operations, "_configured_docker_authority", lambda root: (profile, "/usr/bin/docker")
-        )
+        admit_fixture_image(monkeypatch, operations, toolchain_profile=profile)
         applications = []
 
         async def scenario():

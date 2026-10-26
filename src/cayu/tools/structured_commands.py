@@ -1,4 +1,4 @@
-"""Closed selector-plus-argv command execution for admitted Docker toolchains."""
+"""Closed selector-plus-argv command execution for admitted coding toolchains."""
 
 from __future__ import annotations
 
@@ -13,12 +13,16 @@ from cayu._command_diagnostics import CommandDenialCode, CommandValidationError
 from cayu._validation import canonical_durable_json_bytes, copy_json_value
 from cayu.artifacts.base import ArtifactMetadata, ArtifactScope
 from cayu.environments.admission import ExecutionAdmissionCandidate
+from cayu.environments.coding_toolchains import (
+    CodingCommandAuthority,
+    CodingToolchainError,
+    CodingToolchainProfile,
+    ensure_coding_toolchain_runner_admission,
+    owned_coding_toolchain_profile,
+    verify_coding_toolchain_dependencies,
+)
 from cayu.environments.docker_toolchains import (
-    DockerCodingCommandAuthority,
-    DockerCodingToolchainError,
     DockerCodingToolchainProfile,
-    ensure_docker_coding_toolchain_runner_admission,
-    verify_docker_coding_toolchain_dependencies,
 )
 from cayu.runners.base import (
     ExecCommand,
@@ -215,8 +219,8 @@ class _AdmittedStructuredCommandPolicy(CommandPolicy):
 
     def __init__(
         self,
-        profile: DockerCodingToolchainProfile,
-        authority: DockerCodingCommandAuthority,
+        profile: CodingToolchainProfile,
+        authority: CodingCommandAuthority,
     ) -> None:
         self._profile = profile
         self._authority = authority
@@ -271,7 +275,7 @@ class _AdmittedStructuredCommandPolicy(CommandPolicy):
 class _AdmittedStructuredCommandCataloguePolicy(CommandPolicy):
     """Identity-bearing exact policy for every selector in one profile."""
 
-    def __init__(self, profile: DockerCodingToolchainProfile) -> None:
+    def __init__(self, profile: CodingToolchainProfile) -> None:
         self._policies = tuple(
             _AdmittedStructuredCommandPolicy(profile, authority)
             for authority in profile.structured_command_authorities
@@ -304,16 +308,13 @@ class StructuredCommandToolPolicy(ToolPolicy):
     def __init__(
         self,
         *,
-        toolchain_profile: DockerCodingToolchainProfile,
+        toolchain_profile: CodingToolchainProfile,
         base_policy: ToolPolicy | None = None,
     ) -> None:
-        if type(toolchain_profile) is not DockerCodingToolchainProfile:
-            raise TypeError("toolchain_profile must be an exact DockerCodingToolchainProfile.")
+        owned_profile = owned_coding_toolchain_profile(toolchain_profile)
         if base_policy is not None and not isinstance(base_policy, ToolPolicy):
             raise TypeError("base_policy must implement ToolPolicy or be None.")
-        self._profile = DockerCodingToolchainProfile.model_validate(
-            toolchain_profile.model_dump(mode="python", by_alias=True)
-        )
+        self._profile = owned_profile
         self._authorities = {
             item.selector: item for item in self._profile.structured_command_authorities
         }
@@ -330,6 +331,7 @@ class StructuredCommandToolPolicy(ToolPolicy):
                 "base_policy_identity": (
                     None if base_identity is None else base_identity.model_dump(mode="json")
                 ),
+                **_neutral_admission_material(self._profile),
             }
             self._identity = ExecutionProfileBehaviorIdentity(
                 name="cayu.structured_command_tool_policy",
@@ -351,6 +353,7 @@ class StructuredCommandToolPolicy(ToolPolicy):
             "schema": STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA,
             "profile_fingerprint": self._profile.fingerprint,
             "identity": self._identity.model_dump(mode="json"),
+            **_neutral_admission_material(self._profile),
         }
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
@@ -415,9 +418,9 @@ class StructuredCommandToolPolicy(ToolPolicy):
 
 
 def _resolve_structured_command_request(
-    authorities: Mapping[str, DockerCodingCommandAuthority],
+    authorities: Mapping[str, CodingCommandAuthority],
     args: dict,
-) -> tuple[DockerCodingCommandAuthority, tuple[str, ...], str, int, str]:
+) -> tuple[CodingCommandAuthority, tuple[str, ...], str, int, str]:
     if type(args) is not dict:
         raise CommandValidationError(CommandDenialCode.ARGUMENT_SHAPE)
     allowed = {"selector", "args", "workingDirectory", "timeoutSeconds", "outputMode"}
@@ -503,19 +506,15 @@ class RunCommandTool(Tool):
     def __init__(
         self,
         *,
-        toolchain_profile: DockerCodingToolchainProfile,
+        toolchain_profile: CodingToolchainProfile,
         max_terminal_payload_bytes: int | None = None,
     ) -> None:
-        if type(toolchain_profile) is not DockerCodingToolchainProfile:
-            raise TypeError("toolchain_profile must be an exact DockerCodingToolchainProfile.")
+        owned_profile = owned_coding_toolchain_profile(toolchain_profile)
         # The profile's own publication ceiling is at most 200,000 bytes, so the
         # default bound only applies when an application sets a smaller one.
         terminal_bound = tool_terminal_payload_bound(
             max_terminal_payload_bytes,
             default=DEFAULT_RECORD_TOOL_TERMINAL_PAYLOAD_BYTES,
-        )
-        owned_profile = DockerCodingToolchainProfile.model_validate(
-            toolchain_profile.model_dump(mode="python", by_alias=True)
         )
         authorities = owned_profile.structured_command_authorities
         if not authorities:
@@ -609,10 +608,8 @@ class RunCommandTool(Tool):
         self._command_policy = _AdmittedStructuredCommandCataloguePolicy(owned_profile)
 
     @property
-    def toolchain_profile(self) -> DockerCodingToolchainProfile:
-        return DockerCodingToolchainProfile.model_validate(
-            self._profile.model_dump(mode="python", by_alias=True)
-        )
+    def toolchain_profile(self) -> CodingToolchainProfile:
+        return owned_coding_toolchain_profile(self._profile)
 
     @property
     def _result_publication_ceiling(self) -> int:
@@ -629,7 +626,7 @@ class RunCommandTool(Tool):
         return min(ceiling, bound - TERMINAL_PAYLOAD_FIT_MARGIN_BYTES)
 
     @property
-    def selectors(self) -> tuple[DockerCodingCommandAuthority, ...]:
+    def selectors(self) -> tuple[CodingCommandAuthority, ...]:
         return self._profile.structured_command_authorities
 
     @property
@@ -649,6 +646,7 @@ class RunCommandTool(Tool):
             "selector_fingerprints": [
                 authority.fingerprint for authority in self._profile.structured_command_authorities
             ],
+            **_neutral_admission_material(self._profile),
         }
 
     @bounded_terminal_result
@@ -658,16 +656,15 @@ class RunCommandTool(Tool):
             authority, arguments, working_directory, timeout_seconds, output_mode = (
                 self._resolve_arguments(args)
             )
-        runner_failure = await ensure_docker_coding_toolchain_runner_admission(
-            ctx.runner,
-            profile=self._profile,
+        runner_failure = await ensure_coding_toolchain_runner_admission(
+            ctx.runner, profile=self._profile
         )
         if runner_failure is not None:
             return self._error_result(
                 authority,
                 status="unavailable",
                 error=runner_failure,
-                content="Structured commands require the exact admitted Docker toolchain.",
+                content=_admission_refusal_content(self._profile),
             )
         if ctx.workspace is None:
             return self._error_result(
@@ -678,11 +675,11 @@ class RunCommandTool(Tool):
             )
         if authority.dependency_sensitive:
             try:
-                await verify_docker_coding_toolchain_dependencies(
+                await verify_coding_toolchain_dependencies(
                     self._profile,
                     ctx.workspace,
                 )
-            except DockerCodingToolchainError as exc:
+            except CodingToolchainError as exc:
                 return self._error_result(
                     authority,
                     status=(
@@ -711,9 +708,8 @@ class RunCommandTool(Tool):
                 ),
             )
         pre_capture_timing = _timing_evidence(pre_capture_started_at, datetime.now(UTC))
-        runner_failure = await ensure_docker_coding_toolchain_runner_admission(
-            ctx.runner,
-            profile=self._profile,
+        runner_failure = await ensure_coding_toolchain_runner_admission(
+            ctx.runner, profile=self._profile
         )
         if runner_failure is not None:
             return self._error_result(
@@ -752,9 +748,8 @@ class RunCommandTool(Tool):
                 error="durable_command_journal_unavailable",
                 content="Structured command durable dispatch evidence was unavailable.",
             )
-        runner_failure = await ensure_docker_coding_toolchain_runner_admission(
-            ctx.runner,
-            profile=self._profile,
+        runner_failure = await ensure_coding_toolchain_runner_admission(
+            ctx.runner, profile=self._profile
         )
         if runner_failure is not None:
             result = self._error_result(
@@ -1031,14 +1026,14 @@ class RunCommandTool(Tool):
     def _resolve_arguments(
         self,
         args: dict,
-    ) -> tuple[DockerCodingCommandAuthority, tuple[str, ...], str, int, str]:
+    ) -> tuple[CodingCommandAuthority, tuple[str, ...], str, int, str]:
         return _resolve_structured_command_request(self._authorities, args)
 
     async def _project_result(
         self,
         ctx: ToolContext,
         *,
-        authority: DockerCodingCommandAuthority,
+        authority: CodingCommandAuthority,
         arguments: tuple[str, ...],
         working_directory: str,
         timeout_seconds: int,
@@ -1312,7 +1307,7 @@ class RunCommandTool(Tool):
 
     def _error_result(
         self,
-        authority: DockerCodingCommandAuthority,
+        authority: CodingCommandAuthority,
         *,
         status: str,
         error: str,
@@ -1343,6 +1338,20 @@ class RunCommandTool(Tool):
         )
 
 
+def _admission_refusal_content(profile: CodingToolchainProfile) -> str:
+    if type(profile) is DockerCodingToolchainProfile:
+        return "Structured commands require the exact admitted Docker toolchain."
+    return "Structured commands require the exact admitted toolchain."
+
+
+def _neutral_admission_material(profile: CodingToolchainProfile) -> dict[str, object]:
+    """Identity material for a neutral profile's admission; Docker's stays unchanged."""
+
+    if type(profile) is DockerCodingToolchainProfile:
+        return {}
+    return {"toolchain_admission": "cayu.coding_toolchain_evidence_policy.v1"}
+
+
 def _relative_working_directory(canonical: str | None, *, workspace_path: str) -> str:
     if canonical == workspace_path:
         return "."
@@ -1362,7 +1371,7 @@ def _argv_digest(argv: tuple[str, ...]) -> str:
     )
 
 
-def _environment_identity(authority: DockerCodingCommandAuthority) -> str:
+def _environment_identity(authority: CodingCommandAuthority) -> str:
     return (
         "sha256:"
         + sha256(
@@ -1374,7 +1383,7 @@ def _environment_identity(authority: DockerCodingCommandAuthority) -> str:
     )
 
 
-def _mutation_scope_identity(authority: DockerCodingCommandAuthority) -> str:
+def _mutation_scope_identity(authority: CodingCommandAuthority) -> str:
     return (
         "sha256:"
         + sha256(
@@ -1600,8 +1609,8 @@ def _optional_command_identity_sha256(value: str | None) -> str | None:
 async def _start_command_journal(
     ctx: ToolContext,
     *,
-    profile: DockerCodingToolchainProfile,
-    authority: DockerCodingCommandAuthority,
+    profile: CodingToolchainProfile,
+    authority: CodingCommandAuthority,
     command_argv: tuple[str, ...],
     working_directory: str,
     timeout_seconds: int,
@@ -2054,7 +2063,7 @@ async def _recover_runner_terminal_command_result(
     raw_result: object,
     timing: object,
     tool: RunCommandTool,
-    authority: DockerCodingCommandAuthority,
+    authority: CodingCommandAuthority,
     arguments: tuple[str, ...],
     working_directory: str,
     timeout_seconds: int,
@@ -2192,8 +2201,8 @@ async def _recover_runner_terminal_command_result(
 def _recover_terminal_command_result(
     record: dict[str, Any],
     *,
-    authority: DockerCodingCommandAuthority,
-    profile: DockerCodingToolchainProfile,
+    authority: CodingCommandAuthority,
+    profile: CodingToolchainProfile,
     maximum: int,
 ) -> DurableToolRecoveryEvidence:
     raw_result = record.get("terminal_result")
@@ -2294,7 +2303,7 @@ def _command_recovery_refusal(error: str) -> DurableToolRecoveryEvidence:
 
 
 def _command_mutation_evidence(
-    authority: DockerCodingCommandAuthority,
+    authority: CodingCommandAuthority,
     *,
     before: _WorkspaceCommandManifest,
     after: _WorkspaceCommandManifest | None,
@@ -2475,7 +2484,7 @@ def _tool_result_publication_bytes(result: ToolResult) -> int:
 def _bound_command_result_publication(
     result: ToolResult,
     *,
-    authority: DockerCodingCommandAuthority,
+    authority: CodingCommandAuthority,
     stdout: str,
     stderr: str,
     maximum: int,
@@ -2577,7 +2586,7 @@ def _bound_command_result_publication(
 
 
 def _minimal_publication_ceiling_result(
-    authority: DockerCodingCommandAuthority,
+    authority: CodingCommandAuthority,
     *,
     maximum: int,
 ) -> ToolResult:
@@ -2607,7 +2616,7 @@ def _minimal_publication_ceiling_result(
 async def _store_output_artifact(
     ctx: ToolContext,
     *,
-    authority: DockerCodingCommandAuthority,
+    authority: CodingCommandAuthority,
     content: bytes,
     content_sha256: str,
 ) -> tuple[str, dict[str, object] | None]:

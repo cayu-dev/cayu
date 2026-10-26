@@ -42,6 +42,14 @@ commands a separate sandbox.
   untrusted execution too.
   Docker does not satisfy `ExecutionRequirements.untrusted()`; do not remove that
   requirement just to make admission pass for hostile workloads.
+- **An Agent deployed on Cayu Cloud:** the Agent holds no cloud permission, so
+  it can't compose `LambdaMicroVMEgressAdapter` itself. Cloud's sandbox broker
+  allocates the sandbox instead:
+  [`BrokeredSandboxCodingEnvironmentFactory`](environment-factories.md#coding-in-a-sandbox-brokered-by-cayu-cloud).
+  With `egress="none"` and every guarantee in the sandbox record, it satisfies
+  `ExecutionRequirements.untrusted()`. `select_coding_backend`
+  ([choosing a coding backend](environment-factories.md#choosing-a-coding-backend))
+  runs one toolchain profile on Docker locally and on the broker when deployed.
 - **Restrict network access:** the Docker coding factory disables networking.
   When tools need selected destinations, install `cayu[egress]` for Docker or
   `cayu[aws,egress]` for Lambda MicroVM, then compose

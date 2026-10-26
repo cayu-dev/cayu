@@ -590,17 +590,24 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     workflow_source = (project / "workflows" / "coding_product.py").read_text(encoding="utf-8")
     remote_git_source = (project / "integrations" / "remote_git.py").read_text(encoding="utf-8")
     github_source = (project / "integrations" / "github.py").read_text(encoding="utf-8")
-    assert "DockerCodingEnvironmentFactory" in composition_source
+    # The generated composition assembles library parts instead of copying them.
+    assert "select_coding_backend(" in composition_source
+    assert "register_coding_environment(" in composition_source
+    assert "DockerCodingBackendOptions(" in composition_source
     assert "DockerWorkspaceTransferLimits" in composition_source
     assert "RunCheckTool" in composition_source
     assert "RunCommandTool" in composition_source
     assert "StructuredCommandToolPolicy" in composition_source
-    assert "DockerCodingToolchainProfile" in composition_source
-    assert "NamedCheck" in composition_source
-    assert "_ExactCheckCommandPolicy" in composition_source
+    assert "CodingToolchainProfile(" in composition_source
+    assert "DockerCodingToolchainProfile" not in composition_source
+    assert "named_checks_from_toolchain(" in composition_source
+    assert "ExactNamedCheckCommandPolicy(" in composition_source
+    assert "class _ExactCheckCommandPolicy" not in composition_source
+    assert "def register_workspace_environment(" in composition_source
     assert '"docker-coding-image.json",' in composition_source
-    assert "does not match the current schema version 3" in composition_source
-    assert "_PYTHON_TOOLCHAIN_DEPENDENCY_PATHS" in composition_source
+    assert "does not match the current schema version 4" in composition_source
+    assert "_BASE_DEPENDENCY_PATHS" in composition_source
+    assert '    "data",\n' in composition_source
     assert "values=list(check_names)" in composition_source
     assert "values=list(command_selectors)" in composition_source
     assert 'code_trust="untrusted"' not in composition_source
@@ -611,7 +618,11 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert "PRIMARY_EXECUTION_PROFILE_IDENTITY" in primary_source
     assert "ARG CAYU_BASE_IMAGE" in dockerfile
     assert "ARG CAYU_DEBIAN_SNAPSHOT" in dockerfile
-    assert "snapshot.debian.org/archive/debian" in dockerfile
+    assert "snapshot.debian.org/archive/debian/%s %s main" in dockerfile
+    # The base image's packages can come from the security archive (perl-base, for
+    # example), so apt must see it or the pinned packages' dependencies can't install.
+    assert "snapshot.debian.org/archive/debian-security/%s %s-security main" in dockerfile
+    assert "snapshot.debian.org/archive/debian/%s %s-updates main" in dockerfile
     assert "uv sync --frozen --extra dev --no-install-project" in dockerfile
     assert "from=cayu-wheel" in dockerfile
     assert "pip install" in dockerfile
@@ -633,6 +644,10 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert "GitHubPullRequestConnector" in github_source
     assert json.loads((project / "docker-coding-image.json").read_text())["content_digest"] is None
     build_configuration = json.loads((project / "docker-coding-build.json").read_text())
+    assert build_configuration["schema_version"] == "2"
+    assert build_configuration["profile_revision"] == "1"
+    assert build_configuration["extra_build_inputs"] == []
+    assert build_configuration["extra_probe_executables"] == []
     assert build_configuration["cayu_wheel"] is None
     assert build_configuration["cayu_wheel_sha256"] is None
     assert build_configuration["debian_snapshot"] is None
@@ -680,15 +695,23 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         spec.loader.exec_module(module)
         globals_ = module.build_coding_app.__globals__
         monkeypatch.setitem(globals_, "_verify_coding_dependencies", lambda root: None)
+        receipt = globals_["CodingImageReceipt"](
+            image_identity=DockerImageIdentity(
+                reference="docker-coder:test",
+                content_digest=image_id,
+            ),
+            profile_revision="1",
+            platform_architecture="amd64",
+            dependency_inputs=(),
+            trusted_build_context_sha256="sha256:" + ("c" * 64),
+        )
+        select_backend = globals_["_coding_backend"]
+        monkeypatch.setitem(globals_, "read_coding_image_receipt", lambda: receipt)
         monkeypatch.setitem(
             globals_,
-            "_configured_docker_authority",
-            lambda root: (
-                DockerImageIdentity(
-                    reference="docker-coder:test",
-                    content_digest=image_id,
-                ),
-                "/usr/bin/docker",
+            "_coding_backend",
+            lambda profile, receipt: select_backend(
+                profile, receipt, environ={}, verify_local_image=False
             ),
         )
         app = module.build_app(
@@ -886,9 +909,15 @@ def test_generated_docker_builder_uses_one_immutable_input_snapshot(
     assert captured_build_contexts == [
         {
             path: builder._read_project_input(path, max_bytes=limit)
-            for path, limit in builder._BUILD_CONTEXT_INPUT_LIMITS.items()
+            for path, limit in builder._BASE_BUILD_CONTEXT_INPUT_LIMITS.items()
         }
     ]
+    assert recorded["schema_version"] == "4"
+    assert recorded["profile_revision"] == build_configuration["profile_revision"]
+    assert {item["path"]: item["max_bytes"] for item in recorded["dependency_inputs"]} == {
+        path: min(limit, builder._DEPENDENCY_INPUT_MAX_BYTES)
+        for path, limit in builder._BASE_BUILD_CONTEXT_INPUT_LIMITS.items()
+    }
     configured_self_test = real_subprocess_run(
         [
             sys.executable,
@@ -953,6 +982,11 @@ def test_generated_docker_builder_resolves_only_null_pins(
             return "bookworm"
         if arguments[0] == "run":
             assert "madison ripgrep" in arguments[-1]
+            # The probe resolves against the same three archives as Dockerfile.coding.
+            assert "/archive/debian/" in arguments[-1]
+            assert " bookworm-updates main" in arguments[-1]
+            assert "/archive/debian-security/" in arguments[-1]
+            assert " bookworm-security main" in arguments[-1]
             return "   ripgrep | 13.0.0-4+b2 | https://snapshot.debian.org bookworm/main\n"
         return ""
 
@@ -3059,3 +3093,60 @@ def test_scaffold_from_a_release_install_keeps_the_pypi_pin(
     assert document["project"]["optional-dependencies"]["dev"] == ["pytest"]
     assert document["tool"]["uv"] == {"cache-dir": ".cayu/uv-cache"}
     assert "Cayu source:" not in receipt
+
+
+def test_generated_agent_test_closes_the_app_it_builds(tmp_path: Path) -> None:
+    # Closing the app releases what its sessions allocated, such as a Docker
+    # sandbox container, so repeated test runs don't leave containers behind.
+    assert main(["new", "closes", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "closes"
+    source = (project / "tests" / "test_agent.py").read_text(encoding="utf-8")
+    assert "async with build_app(" in source
+    assert "            knowledge_store=InMemoryKnowledgeStore(),\n" in source
+    formatted = subprocess.run(
+        [sys.executable, "-m", "ruff", "format", "--isolated", "--check", "-"],
+        input=source,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert formatted.returncode == 0, formatted.stdout + formatted.stderr
+
+    spec = importlib.util.spec_from_file_location(
+        "closes_test_agent", project / "tests/test_agent.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    built: list[CayuApp] = []
+    with project_context(project):
+        spec.loader.exec_module(module)
+        build_app = module.build_app
+
+        def recording_build_app(**options):
+            app = build_app(**options)
+            built.append(app)
+            return app
+
+        module.build_app = recording_build_app
+        module.test_agent_runs_through_the_runtime()
+
+    assert len(built) == 1
+    assert built[0].lifecycle_state == "closed"
+
+
+def test_a_real_run_into_an_existing_scaffold_reports_a_non_empty_target(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["new", "existing", "--dir", str(tmp_path), "--json"]) == 0
+    capsys.readouterr()
+
+    # A different request into the published project used to fail with an
+    # internal publication-receipt error; it is simply a non-empty target.
+    result = main(["new", "existing", "--dir", str(tmp_path), "--provider", "anthropic", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert payload["error"]["code"] == "TARGET_NOT_EMPTY"
+    # The identical request still settles as an authenticated retry.
+    assert main(["new", "existing", "--dir", str(tmp_path), "--json"]) == 0

@@ -7893,6 +7893,12 @@ def exception_failure_payload(
     except BaseException:
         return fallback
     try:
+        toolchain_error = _toolchain_failure_payload(error)
+    except BaseException:
+        toolchain_error = None
+    if toolchain_error is not None:
+        payload["toolchain_error"] = toolchain_error
+    try:
         cleanup_payload = binding_cleanup_payload(
             error,
             redactor=resolved_redactor,
@@ -7912,6 +7918,30 @@ def exception_failure_payload(
         portable,
         redactor=resolved_redactor,
     )
+
+
+def _toolchain_failure_payload(error: BaseException) -> dict[str, object] | None:
+    """Return a toolchain refusal's stable code, path count and path fingerprint.
+
+    Only Cayu's own toolchain error types qualify. Their paths stay private;
+    the fingerprint lets an operator match a refusal against a known path set.
+    """
+
+    from cayu.environments.coding_toolchains import CodingToolchainError
+    from cayu.environments.docker_toolchains import DockerCodingToolchainError
+
+    roots = iter_exception_tree(error) if isinstance(error, BaseExceptionGroup) else (error,)
+    for root in roots:
+        # A wrapper raised from the refusal keeps it as its direct cause.
+        candidate: BaseException | None = root
+        for _ in range(4):
+            if candidate is None:
+                break
+            if type(candidate) in (CodingToolchainError, DockerCodingToolchainError):
+                assert isinstance(candidate, CodingToolchainError)
+                return candidate.diagnostic()
+            candidate = candidate.__cause__
+    return None
 
 
 def _attach_environment_factory_release_payload(

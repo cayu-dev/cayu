@@ -907,8 +907,8 @@ def _verify_coding_dependencies(root: Path) -> None:
         )
 
 
-def configured_workspace_root(override: str | os.PathLike[str] | None = None) -> Path:
-    """Resolve and validate the trusted local Git workspace for this composition."""
+def configured_source_root(override: str | os.PathLike[str] | None = None) -> Path:
+    """Resolve the configured source directory without the host Git checks."""
 
     candidate = workspace_candidate(_PROJECT_ROOT, override)
     try:
@@ -919,6 +919,13 @@ def configured_workspace_root(override: str | os.PathLike[str] | None = None) ->
         raise RuntimeError(f"coding workspace is not a directory: {root}")
     if root == Path(root.anchor):
         raise RuntimeError("coding workspace cannot be a filesystem root")
+    return root
+
+
+def configured_workspace_root(override: str | os.PathLike[str] | None = None) -> Path:
+    """Resolve and validate the trusted local Git workspace for this composition."""
+
+    root = configured_source_root(override)
     _verify_coding_dependencies(root)
     return root
 
@@ -1986,7 +1993,7 @@ from cayu.coding_products import (
     admit_or_recover_coding_product_request,
     register_coding_product_contract,
 )
-from cayu.environments import DockerCodingToolchainProfile
+from cayu.environments import CodingToolchainProfile, DockerCodingToolchainProfile
 from cayu.workspaces import Workspace
 
 from domain.coding_product import CodingProductTask
@@ -2015,10 +2022,22 @@ class CodingProductApplication:
         *,
         source_workspace: Workspace,
         artifact_store: ArtifactStore,
-        toolchain_profile: DockerCodingToolchainProfile,
+        toolchain_profile: CodingToolchainProfile,
         agent_name: str,
         project_root: str | Path,
+        image_fingerprint: str | None = None,
     ) -> None:
+        if image_fingerprint is None and isinstance(
+            toolchain_profile, DockerCodingToolchainProfile
+        ):
+            image_fingerprint = toolchain_profile.image_identity.fingerprint
+        if image_fingerprint is None:
+            # Product receipts bind one exact trusted-repository Docker image.
+            raise RuntimeError(
+                "The coding-product front door runs on the docker coding backend; "
+                "use build_app() for agents in a Cloud-brokered sandbox."
+            )
+        self.image_fingerprint = image_fingerprint
         self.app = app
         self.source_workspace = source_workspace
         self.artifact_store = artifact_store
@@ -2105,7 +2124,7 @@ class CodingProductApplication:
             toolchain_profile_id=self.toolchain_profile.profile_id,
             toolchain_profile_revision=self.toolchain_profile.revision,
             toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
-            image_fingerprint=self.toolchain_profile.image_identity.fingerprint,
+            image_fingerprint=self.image_fingerprint,
             dependency_identity=self.toolchain_profile.dependency_identity,
             execution_profile_fingerprint=execution_profile,
             tool_manifest_fingerprint=_fingerprint("coding-tools-v1", tool_manifest),
@@ -2479,6 +2498,7 @@ def build_coding_product_application(
         source_workspace=composition.source_workspace,
         artifact_store=composition.artifact_store,
         toolchain_profile=composition.toolchain_profile,
+        image_fingerprint=composition.image_fingerprint,
         agent_name=AGENT.name,
         project_root=composition.project_root,
     )
@@ -2505,6 +2525,12 @@ RUN test -n "${CAYU_UV_VERSION}" \
     && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s %s main\n' \
         "${CAYU_DEBIAN_SNAPSHOT}" "${CAYU_DEBIAN_SUITE}" \
         > /etc/apt/sources.list \
+    && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s %s-updates main\n' \
+        "${CAYU_DEBIAN_SNAPSHOT}" "${CAYU_DEBIAN_SUITE}" \
+        >> /etc/apt/sources.list \
+    && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/%s %s-security main\n' \
+        "${CAYU_DEBIAN_SNAPSHOT}" "${CAYU_DEBIAN_SUITE}" \
+        >> /etc/apt/sources.list \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         "git=${CAYU_GIT_PACKAGE}" \
@@ -2545,8 +2571,9 @@ dist
 
 
 _DOCKER_BUILD_CONFIG = """{
-  "schema_version": "1",
+  "schema_version": "2",
   "image_reference": "__PROJECT_NAME__-cayu-coding:local",
+  "profile_revision": "1",
   "base_image": null,
   "uv_version": null,
   "debian_snapshot": null,
@@ -2554,17 +2581,19 @@ _DOCKER_BUILD_CONFIG = """{
   "git_package": null,
   "ripgrep_package": null,
   "cayu_wheel": null,
-  "cayu_wheel_sha256": null
+  "cayu_wheel_sha256": null,
+  "extra_build_inputs": [],
+  "extra_probe_executables": []
 }
 """
 
 
 _DOCKER_IMAGE_CONFIG = """{
-  "schema_version": "3",
+  "schema_version": "4",
   "reference": "__PROJECT_NAME__-cayu-coding:local",
   "content_digest": null,
   "profile_id": "__PROJECT_NAME__-python",
-  "profile_revision": "2",
+  "profile_revision": null,
   "platform_architecture": null,
   "dependency_inputs": null,
   "trusted_build_context_sha256": null
@@ -2577,6 +2606,11 @@ _DOCKER_BUILD_IMAGE_PY = r'''"""Trusted operator entrypoint for the generated co
 First run: ``python build_coding_image.py --resolve-pins`` fills any null pins in
 docker-coding-build.json with current values, without building. Review them, then
 run ``python build_coding_image.py`` to build and record the immutable image.
+
+docker-coding-build.json also declares ``extra_build_inputs`` (more files the
+Dockerfile copies, each with a byte limit) and ``extra_probe_executables`` (more
+executables the built image must contain), and the toolchain ``profile_revision``.
+Declare them there once; the image receipt records them and the app reads them.
 """
 
 from __future__ import annotations
@@ -2585,6 +2619,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -2606,14 +2641,20 @@ _RESOLVE_HINT = (
     "run `uv run --no-sync python build_coding_image.py --resolve-pins`, review "
     "docker-coding-build.json, then build again"
 )
-_BUILD_CONTEXT_INPUT_LIMITS = {
+_BUILD_CONFIG_MAX_BYTES = 16 * 1024
+_BASE_BUILD_CONTEXT_INPUT_LIMITS = {
     ".dockerignore": 1024 * 1024,
     "Dockerfile.coding": 1024 * 1024,
-    "docker-coding-build.json": 16 * 1024,
+    "docker-coding-build.json": _BUILD_CONFIG_MAX_BYTES,
     "pyproject.toml": 1024 * 1024,
     "uv.lock": 64 * 1024 * 1024,
 }
+_EXTRA_INPUT_MAX_BYTES = 16 * 1024 * 1024
+# The most a runtime dependency check reads of one input.
+_DEPENDENCY_INPUT_MAX_BYTES = 16 * 1024 * 1024
 _WHEEL_MAX_BYTES = 64 * 1024 * 1024
+_PROFILE_REVISION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}\Z")
+_EXECUTABLE = re.compile(r"/[A-Za-z0-9._+/-]+\Z")
 
 
 def _read_project_input(relative_path: str, *, max_bytes: int) -> bytes:
@@ -2664,17 +2705,71 @@ def _read_project_input(relative_path: str, *, max_bytes: int) -> bytes:
     return content
 
 
+def _build_context_input_limits(raw_build_configuration: bytes) -> dict[str, int]:
+    """The base inputs plus the extra_build_inputs docker-coding-build.json declares."""
+
+    try:
+        value = json.loads(raw_build_configuration)
+    except (UnicodeDecodeError, ValueError):
+        raise RuntimeError("docker-coding-build.json is invalid JSON") from None
+    if type(value) is not dict or value.get("schema_version") != "2":
+        raise RuntimeError("docker-coding-build.json does not match schema version 2")
+    limits = dict(_BASE_BUILD_CONTEXT_INPUT_LIMITS)
+    for item in _validated_extra_inputs(value.get("extra_build_inputs")):
+        limits[item["path"]] = item["max_bytes"]
+    return dict(sorted(limits.items()))
+
+
 def _trusted_build_context_snapshot() -> dict[str, bytes]:
+    raw = _read_project_input(
+        "docker-coding-build.json", max_bytes=_BUILD_CONFIG_MAX_BYTES
+    )
     return {
-        path: _read_project_input(path, max_bytes=limit)
-        for path, limit in _BUILD_CONTEXT_INPUT_LIMITS.items()
+        path: (
+            raw
+            if path == "docker-coding-build.json"
+            else _read_project_input(path, max_bytes=limit)
+        )
+        for path, limit in _build_context_input_limits(raw).items()
     }
 
 
-def _configuration(raw: bytes) -> dict[str, str]:
+def _validated_extra_inputs(value: object) -> list[dict]:
+    if type(value) is not list or len(value) > 32:
+        raise RuntimeError("extra_build_inputs must be a list of at most 32 inputs")
+    paths = set()
+    for item in value:
+        if (
+            type(item) is not dict
+            or set(item) != {"path", "max_bytes"}
+            or type(item["path"]) is not str
+            or type(item["max_bytes"]) is not int
+            or not 1 <= item["max_bytes"] <= _EXTRA_INPUT_MAX_BYTES
+        ):
+            raise RuntimeError(
+                "extra_build_inputs entries must be {path, max_bytes} with max_bytes "
+                f"from 1 to {_EXTRA_INPUT_MAX_BYTES}"
+            )
+        relative = PurePosixPath(item["path"])
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or ".." in relative.parts
+            or str(relative) != item["path"]
+            or relative.parts[0] in {".cayu", ".git", ".runtime"}
+            or any(character.isspace() for character in item["path"])
+        ):
+            raise RuntimeError(f"extra build input {item['path']!r} is not a project path")
+        if item["path"] in _BASE_BUILD_CONTEXT_INPUT_LIMITS or item["path"] in paths:
+            raise RuntimeError(f"extra build input {item['path']!r} is declared twice")
+        paths.add(item["path"])
+    return value
+
+
+def _configuration(raw: bytes) -> dict:
     if type(raw) is not bytes:
         raise TypeError("docker-coding-build.json content must be bytes")
-    if len(raw) > 16 * 1024:
+    if len(raw) > _BUILD_CONFIG_MAX_BYTES:
         raise RuntimeError("docker-coding-build.json exceeds 16384 bytes")
     try:
         value = json.loads(raw)
@@ -2683,6 +2778,7 @@ def _configuration(raw: bytes) -> dict[str, str]:
     expected = {
         "schema_version",
         "image_reference",
+        "profile_revision",
         "base_image",
         "uv_version",
         "debian_snapshot",
@@ -2691,13 +2787,33 @@ def _configuration(raw: bytes) -> dict[str, str]:
         "ripgrep_package",
         "cayu_wheel",
         "cayu_wheel_sha256",
+        "extra_build_inputs",
+        "extra_probe_executables",
     }
     if (
         type(value) is not dict
         or set(value) != expected
-        or value.get("schema_version") != "1"
+        or value.get("schema_version") != "2"
     ):
-        raise RuntimeError("docker-coding-build.json does not match schema version 1")
+        raise RuntimeError("docker-coding-build.json does not match schema version 2")
+    revision = value.get("profile_revision")
+    if type(revision) is not str or not _PROFILE_REVISION.fullmatch(revision):
+        raise RuntimeError("profile_revision must be a portable version identifier")
+    _validated_extra_inputs(value.get("extra_build_inputs"))
+    executables = value.get("extra_probe_executables")
+    if (
+        type(executables) is not list
+        or len(executables) > 32
+        or any(
+            type(item) is not str
+            or not _EXECUTABLE.fullmatch(item)
+            or ".." in PurePosixPath(item).parts
+            for item in executables
+        )
+    ):
+        raise RuntimeError(
+            "extra_probe_executables must list at most 32 absolute executable paths"
+        )
     for key in (
         "base_image",
         "uv_version",
@@ -2822,8 +2938,9 @@ def _read_built_image_id(path: Path) -> str:
 
 
 def _require_project_inputs_unchanged(snapshot: dict[str, bytes]) -> None:
+    limits = _build_context_input_limits(snapshot["docker-coding-build.json"])
     for path, expected in snapshot.items():
-        limit = _BUILD_CONTEXT_INPUT_LIMITS.get(path, _WHEEL_MAX_BYTES)
+        limit = limits.get(path, _WHEEL_MAX_BYTES)
         try:
             current = _read_project_input(path, max_bytes=limit)
         except RuntimeError:
@@ -2894,6 +3011,7 @@ def resolve_pins() -> int:
         if configuration.get(key) is None
     ]
     if wanted:
+        archive = "https://snapshot.debian.org/archive"
         listing = _docker_output(
             docker,
             "run",
@@ -2902,8 +3020,14 @@ def resolve_pins() -> int:
             "sh",
             "-c",
             "rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources"
-            " && printf 'deb [check-valid-until=no] "
-            f"https://snapshot.debian.org/archive/debian/{snapshot} {suite} main\\n'"
+            # Match Dockerfile.coding: the base image's installed packages may
+            # come from the security or updates archive, so pick versions that
+            # resolve against all three.
+            " && printf '"
+            f"deb [check-valid-until=no] {archive}/debian/{snapshot} {suite} main\\n"
+            f"deb [check-valid-until=no] {archive}/debian/{snapshot} {suite}-updates main\\n"
+            f"deb [check-valid-until=no] {archive}/debian-security/{snapshot} "
+            f"{suite}-security main\\n'"
             " > /etc/apt/sources.list && apt-get update -qq >/dev/null"
             f" && apt-cache madison {' '.join(wanted)}",
         )
@@ -3040,16 +3164,22 @@ def main() -> int:
                 "-c",
                 "test -x /opt/cayu-project/.venv/bin/ruff "
                 "&& test -x /opt/cayu-project/.venv/bin/pytest "
-                "&& command -v git >/dev/null "
+                + "".join(
+                    f"&& test -x {shlex.quote(executable)} "
+                    for executable in configuration["extra_probe_executables"]
+                )
+                + "&& command -v git >/dev/null "
                 "&& command -v python3 >/dev/null "
                 "&& command -v rg >/dev/null "
                 "&& command -v rm >/dev/null "
                 "&& command -v sh >/dev/null "
                 "&& command -v sleep >/dev/null "
                 "&& /opt/cayu-project/.venv/bin/python -c "
-                "'from cayu.environments import DockerCodingEnvironmentFactory, "
-                "DockerCodingToolchainProfile; "
-                "from cayu.tools import RunCheckTool, RunCommandTool'",
+                "'from cayu.environments import CodingToolchainProfile, "
+                "DockerCodingEnvironmentFactory, register_coding_environment, "
+                "select_coding_backend; "
+                "from cayu.tools import ExactNamedCheckCommandPolicy, RunCheckTool, "
+                "RunCommandTool'",
             ],
             cwd=_ROOT,
             stdin=subprocess.DEVNULL,
@@ -3084,21 +3214,30 @@ def main() -> int:
         raise RuntimeError(
             "Docker coding image tag changed before immutable image settlement"
         )
+    limits = _build_context_input_limits(
+        build_context_snapshot["docker-coding-build.json"]
+    )
     _IMAGE_CONFIG.write_text(
         json.dumps(
             {
-                "schema_version": "3",
+                "schema_version": "4",
                 "reference": configuration["image_reference"],
                 "content_digest": image_id,
                 "profile_id": "__PROJECT_NAME__-python",
-                "profile_revision": "2",
+                "profile_revision": configuration["profile_revision"],
                 "platform_architecture": architecture,
                 # The reviewed wheel is a protected build input, not a runtime
                 # workspace dependency. Its path and digest remain pinned in
                 # docker-coding-build.json and the complete context fingerprint.
-                "dependency_inputs": _trusted_build_context_inputs(
-                    build_context_snapshot
-                ),
+                "dependency_inputs": [
+                    {
+                        **entry,
+                        "max_bytes": min(
+                            limits[entry["path"]], _DEPENDENCY_INPUT_MAX_BYTES
+                        ),
+                    }
+                    for entry in _trusted_build_context_inputs(build_context_snapshot)
+                ],
                 "trusted_build_context_sha256": _trusted_build_context_sha256(
                     trusted_input_snapshot
                 ),
@@ -3122,10 +3261,13 @@ if __name__ == "__main__":
 
 _DOCKER_COMPOSITION_BUILD = r'''
 _DOCKER_IMAGE_CONFIGURATION = _PROJECT_ROOT / "docker-coding-image.json"
-_DOCKER_IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_DOCKER_BUILD_CONFIGURATION = _PROJECT_ROOT / "docker-coding-build.json"
+_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _PYTHON_TOOLCHAIN_PROFILE_ID = "__PROJECT_NAME__-python"
-_PYTHON_TOOLCHAIN_PROFILE_REVISION = "2"
-_PYTHON_TOOLCHAIN_DEPENDENCY_PATHS = (
+# The build inputs every image records. docker-coding-build.json adds any
+# extra_build_inputs (for example a target repository's lock file); the image
+# receipt must then record exactly this set plus those.
+_BASE_DEPENDENCY_PATHS = (
     ".dockerignore",
     "Dockerfile.coding",
     "docker-coding-build.json",
@@ -3174,10 +3316,15 @@ _SOURCE_EXCLUDED_FILE_PATTERNS = (
     # and must never enter model-facing source or generic publication.
     "docker-coding-image.json",
 )
-_SOURCE_EXCLUDED_PATH_PATTERNS = tuple(
-    pattern
-    for file_pattern in _SOURCE_EXCLUDED_FILE_PATTERNS
-    for pattern in (file_pattern, f"**/{file_pattern}")
+_SOURCE_EXCLUDED_PATH_PATTERNS = (
+    # The project's own Git-ignored runtime files (artifacts, uploads, clones).
+    # Only the top-level directory: a nested tests/data/ is ordinary source.
+    "data",
+    *(
+        pattern
+        for file_pattern in _SOURCE_EXCLUDED_FILE_PATTERNS
+        for pattern in (file_pattern, f"**/{file_pattern}")
+    ),
 )
 _CHECK_EXECUTABLE_ROOT = "/opt/cayu-project/.venv/bin"
 _CHECK_NAMES = ("format", "lint", "test")
@@ -3198,21 +3345,37 @@ _CHECK_TEST_IDENTITY = ExecutionProfileBehaviorIdentity(
     behavior_version="1",
     implementation_version="2",
 )
+_CHECK_IDENTITIES = {
+    "format": _CHECK_FORMAT_IDENTITY,
+    "lint": _CHECK_LINT_IDENTITY,
+    "test": _CHECK_TEST_IDENTITY,
+}
 _CHECK_COMMAND_POLICY_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="__PROJECT_NAME__.docker_check.command_policy",
     behavior_version="1",
     implementation_version="2",
 )
-_DOCKER_ENVIRONMENT_IDENTITY = ExecutionProfileBehaviorIdentity(
-    name="__PROJECT_NAME__.docker_coding.environment",
-    behavior_version="9",
+_CODING_ENVIRONMENT_IDENTITY = ExecutionProfileBehaviorIdentity(
+    name="__PROJECT_NAME__.coding.environment",
+    behavior_version="1",
     implementation_version="1-__CODING_PROFILE__",
 )
 _DOCKER_BINDING_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="__PROJECT_NAME__.docker_coding.binding",
-    behavior_version="9",
+    behavior_version="10",
     implementation_version="1",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CodingImageReceipt:
+    """The immutable coding image build_coding_image.py recorded, and what it was built from."""
+
+    image_identity: DockerImageIdentity
+    profile_revision: str
+    platform_architecture: Literal["amd64", "arm64"]
+    dependency_inputs: tuple[CodingDependencyInput, ...]
+    trusted_build_context_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -3222,29 +3385,142 @@ class CodingComposition:
     app: CayuApp
     source_workspace: LocalWorkspace
     artifact_store: ArtifactStore
-    toolchain_profile: DockerCodingToolchainProfile
+    toolchain_profile: CodingToolchainProfile
+    backend: CodingBackend
     project_root: Path
+    # The exact Docker image on the docker backend; None elsewhere.
+    image_fingerprint: str | None
 
 
-def _python_toolchain_profile(
-    image_identity: DockerImageIdentity,
-    *,
-    profile_id: str = _PYTHON_TOOLCHAIN_PROFILE_ID,
-    profile_revision: str = _PYTHON_TOOLCHAIN_PROFILE_REVISION,
-    platform_architecture: Literal["amd64", "arm64"] = "amd64",
-    dependency_inputs: tuple[DockerCodingDependencyInput, ...] = (),
-    trusted_build_context_sha256: str | None = None,
-) -> DockerCodingToolchainProfile:
-    """Return the explicit built-in profile shared by checks and commands."""
+def _read_bounded_json(path: Path, *, label: str) -> tuple[bytes, object]:
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        raise RuntimeError(f"{label} is unavailable") from None
+    if len(raw) > 16 * 1024:
+        raise RuntimeError(f"{label} exceeds 16384 bytes")
+    try:
+        return raw, json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        raise RuntimeError(f"{label} is invalid JSON") from None
 
-    return DockerCodingToolchainProfile(
-        profile_id=profile_id,
-        revision=profile_revision,
-        image_identity=image_identity,
+
+def _required_dependency_paths(build_configuration: object) -> tuple[str, ...]:
+    if (
+        type(build_configuration) is not dict
+        or build_configuration.get("schema_version") != "2"
+    ):
+        raise RuntimeError("docker-coding-build.json does not match schema version 2")
+    extra = build_configuration.get("extra_build_inputs")
+    if type(extra) is not list or any(
+        type(item) is not dict or type(item.get("path")) is not str for item in extra
+    ):
+        raise RuntimeError("docker-coding-build.json has invalid extra_build_inputs")
+    return tuple(sorted({*_BASE_DEPENDENCY_PATHS, *(item["path"] for item in extra)}))
+
+
+def read_coding_image_receipt() -> CodingImageReceipt:
+    """Read docker-coding-image.json and require it to match docker-coding-build.json."""
+
+    _, value = _read_bounded_json(
+        _DOCKER_IMAGE_CONFIGURATION, label="docker-coding-image.json"
+    )
+    required_fields = {
+        "schema_version",
+        "reference",
+        "content_digest",
+        "profile_id",
+        "profile_revision",
+        "platform_architecture",
+        "dependency_inputs",
+        "trusted_build_context_sha256",
+    }
+    if (
+        type(value) is not dict
+        or value.get("schema_version") != "4"
+        or set(value) != required_fields
+    ):
+        raise RuntimeError(
+            "docker-coding-image.json does not match the current schema version 4"
+        )
+    reference = value.get("reference")
+    digest = value.get("content_digest")
+    if type(reference) is not str or not reference.strip():
+        raise RuntimeError("docker-coding-image.json requires an image reference")
+    if digest is None:
+        raise RuntimeError(
+            "docker-coding-image.json has no immutable image ID; run "
+            "build_coding_image.py --resolve-pins (first time, then review the pins) "
+            "and build_coding_image.py"
+        )
+    if type(digest) is not str or _DIGEST_PATTERN.fullmatch(digest) is None:
+        raise RuntimeError(
+            "docker-coding-image.json contains an invalid immutable image ID"
+        )
+    build_raw, build_configuration = _read_bounded_json(
+        _DOCKER_BUILD_CONFIGURATION, label="docker-coding-build.json"
+    )
+    required_paths = _required_dependency_paths(build_configuration)
+    assert type(build_configuration) is dict
+    profile_revision = value.get("profile_revision")
+    platform_architecture = value.get("platform_architecture")
+    raw_dependencies = value.get("dependency_inputs")
+    build_context_sha256 = value.get("trusted_build_context_sha256")
+    if (
+        value.get("profile_id") != _PYTHON_TOOLCHAIN_PROFILE_ID
+        or type(profile_revision) is not str
+        or profile_revision != build_configuration.get("profile_revision")
+        or platform_architecture not in {"amd64", "arm64"}
+        or type(raw_dependencies) is not list
+        or type(build_context_sha256) is not str
+        or _DIGEST_PATTERN.fullmatch(build_context_sha256) is None
+    ):
+        raise RuntimeError(
+            "docker-coding-image.json contains invalid toolchain identity; rebuild the "
+            "image after changing docker-coding-build.json"
+        )
+    try:
+        dependency_inputs = tuple(
+            CodingDependencyInput.model_validate(item) for item in raw_dependencies
+        )
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "docker-coding-image.json contains invalid toolchain profile data"
+        ) from None
+    if tuple(item.path for item in dependency_inputs) != required_paths:
+        raise RuntimeError(
+            "docker-coding-image.json does not record exactly the build inputs "
+            "docker-coding-build.json declares; rebuild the image"
+        )
+    recorded_build = next(
+        item for item in dependency_inputs if item.path == "docker-coding-build.json"
+    )
+    if recorded_build.content_sha256 != "sha256:" + sha256(build_raw).hexdigest():
+        raise RuntimeError(
+            "docker-coding-build.json changed after the image was built; rebuild the image"
+        )
+    return CodingImageReceipt(
+        image_identity=DockerImageIdentity(reference=reference, content_digest=digest),
+        profile_revision=profile_revision,
         platform_architecture=platform_architecture,
+        dependency_inputs=dependency_inputs,
+        trusted_build_context_sha256=build_context_sha256,
+    )
+
+
+def _python_toolchain_profile(receipt: CodingImageReceipt) -> CodingToolchainProfile:
+    """Return the editable, backend-neutral profile shared by checks and commands.
+
+    Add a selector or check here; the same profile runs on Docker and in a
+    Cloud-brokered sandbox. Keep command authorities sorted by selector.
+    """
+
+    return CodingToolchainProfile(
+        profile_id=_PYTHON_TOOLCHAIN_PROFILE_ID,
+        revision=receipt.profile_revision,
         read_only_support_paths=("/opt/cayu-project",),
         command_authorities=(
-            DockerCodingCommandAuthority(
+            CodingCommandAuthority(
                 selector="focused-test",
                 revision="1",
                 description="Run one focused generated Python test target.",
@@ -3261,7 +3537,7 @@ def _python_toolchain_profile(
                 max_output_bytes=100_000,
                 allowed_exit_codes=(0, 1, 2, 3, 4, 5),
             ),
-            DockerCodingCommandAuthority(
+            CodingCommandAuthority(
                 selector="format",
                 revision="1",
                 description="Verify Python formatting without mutating files.",
@@ -3272,7 +3548,7 @@ def _python_toolchain_profile(
                 timeout_seconds=120,
                 max_output_bytes=50_000,
             ),
-            DockerCodingCommandAuthority(
+            CodingCommandAuthority(
                 selector="lint",
                 revision="1",
                 description="Run deterministic Python static lint validation.",
@@ -3283,7 +3559,7 @@ def _python_toolchain_profile(
                 timeout_seconds=120,
                 max_output_bytes=50_000,
             ),
-            DockerCodingCommandAuthority(
+            CodingCommandAuthority(
                 selector="lint-file",
                 revision="1",
                 description="Lint bounded selected Python source paths.",
@@ -3311,7 +3587,7 @@ def _python_toolchain_profile(
                 max_output_bytes=50_000,
                 allowed_exit_codes=(0, 1, 2),
             ),
-            DockerCodingCommandAuthority(
+            CodingCommandAuthority(
                 selector="python-version",
                 revision="1",
                 description="Report the admitted Python interpreter version.",
@@ -3322,10 +3598,10 @@ def _python_toolchain_profile(
                 timeout_seconds=10,
                 max_output_bytes=4096,
             ),
-            DockerCodingCommandAuthority(
+            CodingCommandAuthority(
                 selector="test",
                 revision="1",
-                description="Run the application-owned project check target in Docker.",
+                description="Run the application-owned project check target.",
                 exposure="named_check",
                 executable=f"{_CHECK_EXECUTABLE_ROOT}/pytest",
                 fixed_arguments=(
@@ -3339,29 +3615,10 @@ def _python_toolchain_profile(
                 max_output_bytes=100_000,
             ),
         ),
-        dependency_inputs=dependency_inputs,
-        trusted_build_context_sha256=trusted_build_context_sha256,
+        dependency_inputs=receipt.dependency_inputs,
+        trusted_build_context_sha256=receipt.trusted_build_context_sha256,
         admission_probes=(
-            DockerCodingAdmissionProbe(
-                probe_id="platform",
-                argv=(
-                    f"{_CHECK_EXECUTABLE_ROOT}/python",
-                    "-c",
-                    (
-                        "import platform; "
-                        "machine={'x86_64':'amd64','aarch64':'arm64'}.get("
-                        "platform.machine().lower(),platform.machine().lower()); "
-                        "print(platform.system().lower()+'/'+machine)"
-                    ),
-                ),
-                stdout_sha256="sha256:"
-                + sha256(
-                    f"linux/{platform_architecture}\n".encode("ascii")
-                ).hexdigest(),
-                timeout_seconds=10,
-                max_output_bytes=4096,
-            ),
-            DockerCodingAdmissionProbe(
+            CodingAdmissionProbe(
                 probe_id="python-version",
                 argv=(f"{_CHECK_EXECUTABLE_ROOT}/python", "--version"),
                 timeout_seconds=10,
@@ -3371,203 +3628,69 @@ def _python_toolchain_profile(
     )
 
 
-def _named_checks(profile: DockerCodingToolchainProfile) -> tuple[NamedCheck, ...]:
-    """Return the complete editable finite check declaration."""
+def _docker_platform_probe(
+    platform_architecture: Literal["amd64", "arm64"],
+) -> CodingAdmissionProbe:
+    """Docker-only: the locally built image must report the architecture it recorded."""
 
-    identities = {
-        "format": _CHECK_FORMAT_IDENTITY,
-        "lint": _CHECK_LINT_IDENTITY,
-        "test": _CHECK_TEST_IDENTITY,
-    }
-    checks = []
-    for authority in profile.named_check_authorities:
-        name = authority.selector
-        identity = identities.get(name)
-        if identity is None:
-            identity = ExecutionProfileBehaviorIdentity(
-                name=f"__PROJECT_NAME__.docker_check.{name}",
-                behavior_version="1",
-                implementation_version=authority.fingerprint,
-            )
-        checks.append(
-            NamedCheck(
-                name=name,
-                description=authority.description,
-                command=ExecCommand.process(*authority.command_argv()),
-                timeout_s=authority.timeout_seconds,
-                max_output_bytes=authority.max_output_bytes,
-                execution_profile_identity=identity,
-            )
-        )
-    if not checks:
-        raise RuntimeError("Toolchain profile exposes no named check authorities")
-    return tuple(checks)
-
-
-class _ExactCheckCommandPolicy(CommandPolicy):
-    """Allow only the exact process declarations owned by this application."""
-
-    def __init__(self, checks: tuple[NamedCheck, ...]) -> None:
-        self._allowed = frozenset(
-            (tuple(check.command.argv or ()), check.timeout_s) for check in checks
-        )
-
-    @property
-    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
-        return _CHECK_COMMAND_POLICY_IDENTITY
-
-    async def evaluate(
-        self,
-        ctx,
-        request: CommandRequest,
-    ) -> CommandPolicyResult:
-        del ctx
-        command = request.command
-        exact = (
-            command.kind == "process"
-            and command.shell is None
-            and command.argv is not None
-            and (tuple(command.argv), request.timeout_s) in self._allowed
-            and request.cwd is None
-            and request.canonical_cwd == "/workspace"
-            and request.env is None
-            and request.stdin is None
-        )
-        return CommandPolicyResult(
-            decision=(
-                CommandPolicyDecision.ALLOW if exact else CommandPolicyDecision.DENY
+    return CodingAdmissionProbe(
+        probe_id="platform",
+        argv=(
+            f"{_CHECK_EXECUTABLE_ROOT}/python",
+            "-c",
+            (
+                "import platform; "
+                "machine={'x86_64':'amd64','aarch64':'arm64'}.get("
+                "platform.machine().lower(),platform.machine().lower()); "
+                "print(platform.system().lower()+'/'+machine)"
             ),
-            reason=None if exact else "Command is not an exact declared named check.",
-        )
-
-
-def _read_docker_toolchain_profile() -> DockerCodingToolchainProfile:
-    try:
-        raw = _DOCKER_IMAGE_CONFIGURATION.read_bytes()
-    except OSError:
-        raise RuntimeError("docker-coding-image.json is unavailable") from None
-    if len(raw) > 16 * 1024:
-        raise RuntimeError("docker-coding-image.json exceeds 16384 bytes")
-    try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, ValueError):
-        raise RuntimeError("docker-coding-image.json is invalid JSON") from None
-    required_fields = {
-        "schema_version",
-        "reference",
-        "content_digest",
-        "profile_id",
-        "profile_revision",
-        "platform_architecture",
-        "dependency_inputs",
-        "trusted_build_context_sha256",
-    }
-    if (
-        type(value) is not dict
-        or value.get("schema_version") != "3"
-        or set(value) != required_fields
-    ):
-        raise RuntimeError(
-            "docker-coding-image.json does not match the current schema version 3"
-        )
-    reference = value.get("reference")
-    digest = value.get("content_digest")
-    if type(reference) is not str or not reference.strip():
-        raise RuntimeError("docker-coding-image.json requires an image reference")
-    if digest is None:
-        raise RuntimeError(
-            "docker-coding-image.json has no immutable image ID; run "
-            "build_coding_image.py --resolve-pins (first time, then review the pins) "
-            "and build_coding_image.py"
-        )
-    if type(digest) is not str or _DOCKER_IMAGE_ID_PATTERN.fullmatch(digest) is None:
-        raise RuntimeError(
-            "docker-coding-image.json contains an invalid immutable image ID"
-        )
-    image_identity = DockerImageIdentity(reference=reference, content_digest=digest)
-    profile_id = value.get("profile_id")
-    profile_revision = value.get("profile_revision")
-    platform_architecture = value.get("platform_architecture")
-    raw_dependencies = value.get("dependency_inputs")
-    build_context_sha256 = value.get("trusted_build_context_sha256")
-    if (
-        profile_id != _PYTHON_TOOLCHAIN_PROFILE_ID
-        or profile_revision != _PYTHON_TOOLCHAIN_PROFILE_REVISION
-        or platform_architecture not in {"amd64", "arm64"}
-        or type(raw_dependencies) is not list
-        or len(raw_dependencies) != len(_PYTHON_TOOLCHAIN_DEPENDENCY_PATHS)
-        or (
-            type(build_context_sha256) is not str
-            or _DOCKER_IMAGE_ID_PATTERN.fullmatch(build_context_sha256) is None
-        )
-    ):
-        raise RuntimeError(
-            "docker-coding-image.json contains invalid toolchain identity"
-        )
-    try:
-        dependency_inputs = tuple(
-            DockerCodingDependencyInput.model_validate(item)
-            for item in raw_dependencies
-        )
-        if tuple(item.path for item in dependency_inputs) != (
-            _PYTHON_TOOLCHAIN_DEPENDENCY_PATHS
-        ):
-            raise ValueError("Built-in dependency authority is incomplete.")
-        return _python_toolchain_profile(
-            image_identity,
-            profile_id=profile_id,
-            profile_revision=profile_revision,
-            platform_architecture=platform_architecture,
-            dependency_inputs=dependency_inputs,
-            trusted_build_context_sha256=build_context_sha256,
-        )
-    except (TypeError, ValueError):
-        raise RuntimeError(
-            "docker-coding-image.json contains invalid toolchain profile data"
-        ) from None
-
-
-def _configured_docker_authority(
-    root: Path,
-) -> tuple[DockerCodingToolchainProfile, str]:
-    """Validate bounded non-secret Docker/image authority before provider work."""
-
-    profile = _read_docker_toolchain_profile()
-    identity = profile.image_identity
-    docker = shutil.which("docker")
-    if docker is None:
-        raise RuntimeError(
-            "Docker CLI is unavailable for the Docker coding composition"
-        )
-    info = _execute_dependency_probe(
-        [docker, "info", "--format", "{{.ServerVersion}}"],
-        cwd=root,
-        reject_output_overflow=True,
+        ),
+        stdout_sha256="sha256:"
+        + sha256(f"linux/{platform_architecture}\n".encode("ascii")).hexdigest(),
+        timeout_seconds=10,
+        max_output_bytes=4096,
     )
-    if not info.output.strip():
-        raise RuntimeError("Docker daemon semantic probe failed")
-    inspection = _execute_dependency_probe(
-        [docker, "image", "inspect", "--format", "{{.Id}}", identity.reference],
-        cwd=root,
-        reject_output_overflow=True,
+
+
+def _coding_backend(
+    toolchain_profile: CodingToolchainProfile,
+    receipt: CodingImageReceipt,
+    *,
+    environ: Mapping[str, str] | None = None,
+    verify_local_image: bool = True,
+) -> CodingBackend:
+    """Docker locally; Cayu Cloud's broker when CAYU_CLOUD_* are set (or CAYU_CODING_BACKEND)."""
+
+    return select_coding_backend(
+        toolchain_profile=toolchain_profile,
+        options={
+            DOCKER_CODING_BACKEND: DockerCodingBackendOptions(
+                image_identity=receipt.image_identity,
+                platform_architecture=receipt.platform_architecture,
+                extra_admission_probes=(
+                    _docker_platform_probe(receipt.platform_architecture),
+                ),
+                transfer_limits=DockerWorkspaceTransferLimits(
+                    max_files=10_000,
+                    max_file_bytes=8 * 1024 * 1024,
+                    max_total_bytes=64 * 1024 * 1024,
+                    max_archive_bytes=128 * 1024 * 1024,
+                ),
+                verify_local_image=verify_local_image,
+            ),
+        },
+        environ=environ,
     )
-    observed = inspection.output.decode("ascii", errors="ignore").strip()
-    if observed != identity.content_digest:
-        raise RuntimeError(
-            "Docker coding image does not match its recorded immutable ID"
-        )
-    return profile, docker
 
 
-def _check_required_executables(checks: tuple[NamedCheck, ...]) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            {
-                executable
-                for check in checks
-                for executable in check.required_executables
-            }
-        )
+def _source_workspace(
+    root: Path, *, workspace_id: str = "coding-source-workspace"
+) -> LocalWorkspace:
+    return LocalWorkspace(
+        root,
+        workspace_id=workspace_id,
+        excluded_directory_names=_SOURCE_EXCLUDED_DIRECTORY_NAMES,
+        excluded_path_patterns=_SOURCE_EXCLUDED_PATH_PATTERNS,
     )
 
 
@@ -3586,29 +3709,23 @@ def build_coding_composition(
     budget_policy: BudgetPolicy | None = None,
     budget_ledger: BudgetLedger | None = None,
 ) -> CodingComposition:
-    """Build one fresh process-scoped trusted-repository Docker composition."""
+    """Build one fresh process-scoped trusted-repository coding composition."""
 
     if not __CODING_ARTIFACTS_ENABLED__ and artifact_store is not None:
         raise ValueError("artifact_store requires the artifacts capability")
     LocalWorkspace.require_path_operations_supported()
-    root = configured_workspace_root(workspace_root)
-    configured_toolchain, docker_path = _configured_docker_authority(root)
-    toolchain_profile = (
-        _python_toolchain_profile(configured_toolchain)
-        if type(configured_toolchain) is DockerImageIdentity
-        else configured_toolchain
+    receipt = read_coding_image_receipt()
+    toolchain_profile = _python_toolchain_profile(receipt)
+    backend = _coding_backend(toolchain_profile, receipt)
+    # Docker reads the host checkout with host git and rg. Other backends build
+    # their own Git baseline in the sandbox, and a source uploaded to Cayu Cloud
+    # has no .git, so they only need the source directory.
+    root = (
+        configured_workspace_root(workspace_root)
+        if backend.name == DOCKER_CODING_BACKEND
+        else configured_source_root(workspace_root)
     )
-    if type(toolchain_profile) is not DockerCodingToolchainProfile:
-        raise RuntimeError(
-            "Docker coding authority returned an invalid toolchain profile"
-        )
-    image_identity = toolchain_profile.image_identity
-    source_workspace = LocalWorkspace(
-        root,
-        workspace_id="coding-source-workspace",
-        excluded_directory_names=_SOURCE_EXCLUDED_DIRECTORY_NAMES,
-        excluded_path_patterns=_SOURCE_EXCLUDED_PATH_PATTERNS,
-    )
+    source_workspace = _source_workspace(root)
     scope = _knowledge_scope()
     stores = build_coding_stores(
         _STATE_ROOT,
@@ -3646,7 +3763,11 @@ def build_coding_composition(
         ),
         store_profile=stores.store_profile,
     )
-    checks = _named_checks(toolchain_profile)
+    checks = named_checks_from_toolchain(
+        toolchain_profile,
+        identities=_CHECK_IDENTITIES,
+        identity_prefix="__PROJECT_NAME__.docker_check",
+    )
     check_names = tuple(check.name for check in checks)
     command_selectors = tuple(
         authority.selector
@@ -3656,33 +3777,16 @@ def build_coding_composition(
         raise RuntimeError(
             "Toolchain profile exposes no structured command authorities"
         )
-    check_required_executables = _check_required_executables(checks)
-    if not set(check_required_executables).issubset(
-        toolchain_profile.required_executables
-    ):
-        raise RuntimeError(
-            "Named checks escape the selected toolchain executable authority"
-        )
-    required_executables = toolchain_profile.required_executables
-    command_policy = _ExactCheckCommandPolicy(checks)
     check_tool = RunCheckTool(
         checks=checks,
-        command_policy=command_policy,
+        command_policy=ExactNamedCheckCommandPolicy(
+            checks,
+            workspace_path=toolchain_profile.workspace_path,
+            execution_profile_identity=_CHECK_COMMAND_POLICY_IDENTITY,
+        ),
         toolchain_profile=toolchain_profile,
     )
     command_tool = RunCommandTool(toolchain_profile=toolchain_profile)
-    factory = DockerCodingEnvironmentFactory(
-        source_workspace=source_workspace,
-        toolchain_profile=toolchain_profile,
-        artifact_store=selected_artifact_store,
-        transfer_limits=DockerWorkspaceTransferLimits(
-            max_files=10_000,
-            max_file_bytes=8 * 1024 * 1024,
-            max_total_bytes=64 * 1024 * 1024,
-            max_archive_bytes=128 * 1024 * 1024,
-        ),
-        docker_path=docker_path,
-    )
 
     runtime = build_runtime_options()
     app = CayuApp(
@@ -3698,28 +3802,24 @@ def build_coding_composition(
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)
-    environment_metadata = {
-        "execution_kind": "trusted_repository_docker",
-        "network": "none",
-        "image_fingerprint": image_identity.fingerprint,
-        **toolchain_profile.evidence(),
-        "factory_profile_identity": factory.execution_profile_identity.model_dump(
-            mode="json"
-        ),
-        "binding_profile_identity": _DOCKER_BINDING_IDENTITY.model_dump(mode="json"),
-        "store_profile_identity": (
-            None if store_identity is None else store_identity.model_dump(mode="json")
-        ),
-    }
-    app.register_environment_factory(
-        EnvironmentSpec(
-            name="coding",
-            metadata=environment_metadata,
-            execution_profile_identity=_DOCKER_ENVIRONMENT_IDENTITY,
-        ),
-        factory,
+    register_coding_environment(
+        app,
+        name="coding",
+        backend=backend,
+        source_workspace=source_workspace,
         artifact_store=selected_artifact_store,
         default=True,
+        execution_profile_identity=_CODING_ENVIRONMENT_IDENTITY,
+        metadata={
+            "binding_profile_identity": _DOCKER_BINDING_IDENTITY.model_dump(
+                mode="json"
+            ),
+            "store_profile_identity": (
+                None
+                if store_identity is None
+                else store_identity.model_dump(mode="json")
+            ),
+        },
     )
     tools = [
         ListFilesTool(),
@@ -3799,15 +3899,14 @@ def build_coding_composition(
                 ),
             ),
         ),
-        execution_requirements=ExecutionRequirements.trusted(
+        # The backend sets the evidence its sandboxes can prove: live on Docker,
+        # broker-reported guarantees on Cayu Cloud. Both are trusted-code only.
+        execution_requirements=backend.execution_requirements(
             real_secret_visibility="non_possession",
-            network_access="deny_by_default",
             guest_privilege="contained",
             host_filesystem="isolated",
             cancellation="confirmed",
             cleanup="confirmed",
-            minimum_evidence="live_verified",
-            required_executables=required_executables,
         ),
         provider_override=provider,
     )
@@ -3816,7 +3915,40 @@ def build_coding_composition(
         source_workspace=source_workspace,
         artifact_store=selected_artifact_store,
         toolchain_profile=toolchain_profile,
+        backend=backend,
         project_root=root,
+        image_fingerprint=(
+            receipt.image_identity.fingerprint
+            if backend.name == DOCKER_CODING_BACKEND
+            else None
+        ),
+    )
+
+
+def register_workspace_environment(
+    composition: CodingComposition,
+    *,
+    name: str,
+    workspace_root: str | os.PathLike[str],
+) -> None:
+    """Add another workspace (for example one clone per parallel worker) as ``name``.
+
+    It runs on the composition's backend with the same toolchain; pick it with
+    ``RunRequest(environment_name=name)``. Register before the first run.
+    """
+
+    root = (
+        configured_workspace_root(workspace_root)
+        if composition.backend.name == DOCKER_CODING_BACKEND
+        else configured_source_root(workspace_root)
+    )
+    register_coding_environment(
+        composition.app,
+        name=name,
+        backend=composition.backend,
+        source_workspace=_source_workspace(root, workspace_id=f"coding-source-{name}"),
+        artifact_store=composition.artifact_store,
+        execution_profile_identity=_CODING_ENVIRONMENT_IDENTITY,
     )
 
 
@@ -3913,6 +4045,30 @@ required checks remain independent from diagnostic commands. When configured, th
 tool-free. Tool exposure, parameter policy, exact command policy, environment
 admission, and execution-profile adoption are independent enforced gates.
 
+### Where the toolchain runs
+
+`operations/coding.py` declares one backend-neutral `CodingToolchainProfile`
+(`_python_toolchain_profile`) and lets `select_coding_backend` choose where it
+runs. Locally that is Docker, with the image `build_coding_image.py` recorded.
+On Cayu Cloud, where the Agent's process has `CAYU_CLOUD_API_URL`,
+`CAYU_CLOUD_APPLICATION_ID` and `CAYU_CLOUD_SANDBOX_TOKEN`, it is a sandbox from
+Cloud's broker with no network. Only some of the three variables is an error.
+Set `CAYU_CODING_BACKEND=docker` or `cayu-cloud` to require one backend, so a
+missing credential fails at startup instead of falling back. The agents keep the
+same `run_check` checks and `run_command` selectors on both; only the evidence
+each backend can prove differs (live on Docker, broker-reported guarantees on
+Cloud). A Cloud sandbox must start from an image built from this project's
+`Dockerfile.coding` inputs: the sandbox image has to report the same
+`trusted_build_context_sha256`, otherwise the session fails admission with
+`toolchain_image_unverified` (catalog images don't carry the project's
+dependencies). `CAYU_CLOUD_SANDBOX_IMAGE` names the image. The coding-product
+front door records an exact Docker image and runs on the Docker backend only.
+
+To let parallel workers edit separate clones, register one environment per
+clone with `register_workspace_environment(composition, name="slot-1",
+workspace_root=...)` before the first run and pick it with
+`RunRequest(environment_name="slot-1")`.
+
 Docker is the P1 bounded path for code the operator already trusts. It is
 not hostile-repository isolation. Runtime networking is disabled, the root
 filesystem is read-only, the guest is non-root, all capabilities are dropped,
@@ -3933,7 +4089,14 @@ plus `debian_suite` freeze transitive apt inputs rather than consulting the
 moving Debian index.
 The optional `cayu_wheel` and `cayu_wheel_sha256` pair can select a reviewed
 project-relative wheel (for example under protected `.cayu/`) for release or CI
-proof; leave both null to use the Cayu artifact in the frozen lock. Review
+proof; leave both null to use the Cayu artifact in the frozen lock.
+`profile_revision` is the toolchain profile's revision; the image receipt copies
+it. To bake more inputs into the image (for example a target repository's
+`pyproject.toml` and `uv.lock`), list each once in `extra_build_inputs` as
+`{"path": ..., "max_bytes": ...}`, copy it in `Dockerfile.coding`, and list any
+executables the image must then contain in `extra_probe_executables`. The
+builder snapshots exactly those inputs, the receipt records them, and the app
+requires the receipt to match `docker-coding-build.json`. Review
 `Dockerfile.coding`, then run:
 
 ```bash
@@ -3973,9 +4136,13 @@ The host Git repository remains authoritative. Each session gets one unique
 ephemeral `/workspace`; `.git`, `.cayu`, `.runtime`, credentials, sockets,
 devices, and unrelated host files never enter through generic transfer. The
 guest receives a constrained fresh Git baseline. Configured generated-output and
-sensitive-file exclusions are enforced before traversal and direct access. A
-new ignored path outside that explicit projection blocks source admission or
-terminal publication instead of disappearing from the retained diff.
+sensitive-file exclusions are enforced before traversal and direct access;
+the top-level `data/`, which holds runtime files, is excluded too (a nested
+`tests/data/` is ordinary source). A Git-ignored path outside
+that explicit projection fails the session when the workspace is bound (before
+the first model call), or blocks terminal publication when the session created
+it, instead of disappearing from the retained diff; the error gives the number
+of such paths and their fingerprint.
 The bounded host-index observer covers the complete admitted source envelope;
 Git submodules are rejected because this flat projection cannot preserve
 gitlink semantics. Regular-file Git modes (`100644` and `100755`) are preserved
@@ -3995,8 +4162,8 @@ require rerunning a check; uncertainty is reported, never silently replayed.
 
 Advance the paired identity whenever behavior changes: named-check declarations
 and argv require their `_CHECK_*_IDENTITY`; exact command authorization requires
-`_CHECK_COMMAND_POLICY_IDENTITY`; Docker restrictions/factory wiring require
-`_DOCKER_ENVIRONMENT_IDENTITY`; transfer limits or binding policy require
+`_CHECK_COMMAND_POLICY_IDENTITY`; backend selection or factory wiring require
+`_CODING_ENVIRONMENT_IDENTITY`; transfer limits or binding policy require
 `_DOCKER_BINDING_IDENTITY`; and primary prompt/metadata changes require
 `PRIMARY_EXECUTION_PROFILE_IDENTITY`. Rebuild and record a new immutable image
 after Dockerfile, lock, toolchain, or check-executable changes.
@@ -4015,7 +4182,10 @@ stable caller IDs for recovery and preserve the distinction between
 `patch_ready_for_delivery` and any later commit, push, pull request, CI, or merge
 effect.
 
-Keep Docker execution explicit and trusted-only. Preserve finite named checks and
+Keep the toolchain profile backend-neutral: tools and both backends share
+`_python_toolchain_profile`, and Docker-only settings stay in
+`DockerCodingBackendOptions`. Keep execution explicit and trusted-only on every
+backend. Preserve finite named checks and
 structured selectors, the exact-command policy, dependency identities, network
 denial, no raw credentials, immutable image
 verification, non-root/read-only/capability/resource controls, protected source
@@ -4057,6 +4227,9 @@ from typing import Any, Literal
 from operations import coding as composition
 import pytest
 import build_coding_image
+from agents.agent import AGENT
+from agents.registration import _agent_for_provider_override
+from agents.reviewer import REVIEWER, REVIEWER_EXECUTION_PROFILE_IDENTITY
 from app import build_app, build_coding_product_application
 from domain.coding_product import CodingProductTask
 
@@ -4222,11 +4395,30 @@ def test_source_git_authority_rejects_gitlinks(tmp_path: Path) -> None:
         composition.observe_clean_coding_product_git_baseline(repository)
 
 
+_TEST_RECEIPT = composition.CodingImageReceipt(
+    image_identity=DockerImageIdentity(
+        reference="generated-coding:test",
+        content_digest=_IMAGE_ID,
+    ),
+    profile_revision="test-1",
+    platform_architecture="amd64",
+    dependency_inputs=(),
+    trusted_build_context_sha256="sha256:" + ("c" * 64),
+)
+_BUILTIN_TOOLCHAIN_PROFILE = composition._python_toolchain_profile
+_SELECT_CODING_BACKEND = composition._coding_backend
+_CLOUD_ENVIRONMENT = {
+    "CAYU_CLOUD_API_URL": "https://cloud.example.test",
+    "CAYU_CLOUD_APPLICATION_ID": "generated-app",
+    "CAYU_CLOUD_SANDBOX_TOKEN": "cayu_sbx_generated_test_token",
+}
+
+
 def _custom_toolchain_profile(
-    image: DockerImageIdentity,
-) -> composition.DockerCodingToolchainProfile:
-    builtin = composition._python_toolchain_profile(image)
-    repository_version = composition.DockerCodingCommandAuthority(
+    receipt: composition.CodingImageReceipt,
+) -> composition.CodingToolchainProfile:
+    builtin = _BUILTIN_TOOLCHAIN_PROFILE(receipt)
+    repository_version = composition.CodingCommandAuthority(
         selector="repository-version",
         revision="1",
         description="Report the admitted repository client version.",
@@ -4243,7 +4435,7 @@ def _custom_toolchain_profile(
             key=lambda authority: authority.selector,
         )
     )
-    return composition.DockerCodingToolchainProfile.model_validate(
+    return composition.CodingToolchainProfile.model_validate(
         {
             **builtin.model_dump(mode="python", by_alias=True),
             "profile_id": "generated-custom-toolchain",
@@ -4257,21 +4449,20 @@ def _admit_test_image(
     monkeypatch: pytest.MonkeyPatch,
     *,
     custom_profile: bool = False,
+    environ: dict[str, str] | None = None,
 ) -> None:
-    image = DockerImageIdentity(
-        reference="generated-coding:test",
-        content_digest=_IMAGE_ID,
-    )
-    authority = (
-        _custom_toolchain_profile(image)
-        if custom_profile
-        else image
-    )
+    """Use a recorded test image without asking a Docker daemon about it."""
+
+    monkeypatch.setattr(composition, "read_coding_image_receipt", lambda: _TEST_RECEIPT)
     monkeypatch.setattr(
         composition,
-        "_configured_docker_authority",
-        lambda root: (authority, "/usr/bin/docker"),
+        "_coding_backend",
+        lambda profile, receipt: _SELECT_CODING_BACKEND(
+            profile, receipt, environ=environ or {}, verify_local_image=False
+        ),
     )
+    if custom_profile:
+        monkeypatch.setattr(composition, "_python_toolchain_profile", _custom_toolchain_profile)
     monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
 
 
@@ -4357,45 +4548,138 @@ def test_image_build_requires_reviewed_pinned_inputs() -> None:
         )
 
 
-def test_image_receipt_requires_current_complete_builtin_authority(
+def test_image_receipt_requires_the_build_inputs_its_build_config_declares(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    build = json.loads(composition._DOCKER_BUILD_CONFIGURATION.read_text(encoding="utf-8"))
+    build["extra_build_inputs"] = [{"path": "targets/app/uv.lock", "max_bytes": 4096}]
+    build_raw = json.dumps(build).encode("utf-8")
+    build_path = tmp_path / "docker-coding-build.json"
+    build_path.write_bytes(build_raw)
     receipt_path = tmp_path / "docker-coding-image.json"
+    paths = sorted({*composition._BASE_DEPENDENCY_PATHS, "targets/app/uv.lock"})
     receipt = {
-        "schema_version": "3",
+        "schema_version": "4",
         "reference": "generated-coding:test",
         "content_digest": _IMAGE_ID,
         "profile_id": composition._PYTHON_TOOLCHAIN_PROFILE_ID,
-        "profile_revision": composition._PYTHON_TOOLCHAIN_PROFILE_REVISION,
+        "profile_revision": build["profile_revision"],
         "platform_architecture": "amd64",
         "dependency_inputs": [
-            {"path": path, "content_sha256": "sha256:" + ("b" * 64)}
-            for path in composition._PYTHON_TOOLCHAIN_DEPENDENCY_PATHS
+            {
+                "path": path,
+                "content_sha256": (
+                    "sha256:" + hashlib.sha256(build_raw).hexdigest()
+                    if path == "docker-coding-build.json"
+                    else "sha256:" + ("b" * 64)
+                ),
+                "max_bytes": 4096,
+            }
+            for path in paths
         ],
         "trusted_build_context_sha256": "sha256:" + ("c" * 64),
     }
     monkeypatch.setattr(composition, "_DOCKER_IMAGE_CONFIGURATION", receipt_path)
+    monkeypatch.setattr(composition, "_DOCKER_BUILD_CONFIGURATION", build_path)
 
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
-    profile = composition._read_docker_toolchain_profile()
-    assert tuple(item.path for item in profile.dependency_inputs) == (
-        composition._PYTHON_TOOLCHAIN_DEPENDENCY_PATHS
-    )
+    recorded = composition.read_coding_image_receipt()
+    profile = composition._python_toolchain_profile(recorded)
+    assert [item.path for item in profile.dependency_inputs] == paths
+    assert profile.revision == build["profile_revision"]
+    assert profile.platform_architecture is None
+
+    receipt_path.write_text(json.dumps({**receipt, "schema_version": "3"}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="current schema version 4"):
+        composition.read_coding_image_receipt()
 
     receipt_path.write_text(
-        json.dumps({**receipt, "schema_version": "2"}),
+        json.dumps({**receipt, "dependency_inputs": receipt["dependency_inputs"][:-1]}),
         encoding="utf-8",
     )
-    with pytest.raises(RuntimeError, match="current schema version 3"):
-        composition._read_docker_toolchain_profile()
+    with pytest.raises(RuntimeError, match="exactly the build inputs"):
+        composition.read_coding_image_receipt()
 
-    receipt_path.write_text(
-        json.dumps({**receipt, "dependency_inputs": []}),
-        encoding="utf-8",
-    )
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    build_path.write_bytes(build_raw + b"\n")
+    with pytest.raises(RuntimeError, match="changed after the image was built"):
+        composition.read_coding_image_receipt()
+    build_path.write_bytes(json.dumps({**build, "profile_revision": "9"}).encode("utf-8"))
     with pytest.raises(RuntimeError, match="invalid toolchain identity"):
-        composition._read_docker_toolchain_profile()
+        composition.read_coding_image_receipt()
+
+
+def test_cloud_variables_select_the_brokered_backend_with_the_same_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _admit_test_image(monkeypatch, environ=_CLOUD_ENVIRONMENT)
+
+    def host_git_forbidden(root: Path) -> None:
+        raise AssertionError("the brokered composition must not need host git or rg")
+
+    monkeypatch.setattr(composition, "_verify_coding_dependencies", host_git_forbidden)
+    # A source uploaded to Cayu Cloud has no .git directory.
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "pyproject.toml").write_text("[project]\nname = 'uploaded'\n", encoding="utf-8")
+    app = build_app(
+        provider=ScriptedModelProvider([]),
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+        workspace_root=source,
+    )
+
+    registered = app._environment_registry.registrations["coding"]
+    factory = registered.factory
+    assert type(factory).__name__ == "BrokeredSandboxCodingEnvironmentFactory"
+    assert factory.egress == "none"
+    assert registered.spec.metadata["coding_backend"] == "cayu-cloud"
+    primary = app._agents["__AGENT_NAME__"]
+    # The broker reports its sandbox guarantees as available; executables stay live.
+    assert primary.execution_requirements.minimum_evidence == "available"
+    assert primary.execution_requirements.code_trust == "trusted"
+    run_command = primary.tools["run_command"].tool
+    assert run_command.toolchain_profile == factory.toolchain_profile
+    with pytest.raises(RuntimeError, match="docker coding backend"):
+        build_coding_product_application(
+            provider=ScriptedModelProvider([]),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+            workspace_root=source,
+        )
+
+
+def test_more_workspaces_register_on_the_same_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _admit_test_image(monkeypatch)
+    provider = ScriptedModelProvider([])
+    composition_state = composition.build_coding_composition(
+        primary_agent=_agent_for_provider_override(AGENT, provider),
+        reviewer_agent=_agent_for_provider_override(REVIEWER, provider),
+        reviewer_execution_profile_identity=REVIEWER_EXECUTION_PROFILE_IDENTITY,
+        configured_provider=lambda: provider,
+        provider=provider,
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+        workspace_root=_repository(tmp_path / "primary"),
+    )
+    clone = _repository(tmp_path / "clone")
+    composition.register_workspace_environment(
+        composition_state, name="slot-1", workspace_root=clone
+    )
+
+    registrations = composition_state.app._environment_registry.registrations
+    assert set(registrations) == {"coding", "slot-1"}
+    slot = registrations["slot-1"]
+    assert isinstance(slot.factory, DockerCodingEnvironmentFactory)
+    assert slot.factory.source_workspace.root == clone.resolve()
+    assert slot.factory.coding_toolchain_profile == composition_state.toolchain_profile
+    assert "data" in slot.factory.source_workspace.excluded_path_patterns
+    assert "data" not in slot.factory.source_workspace.excluded_directory_names
 
 
 def test_exact_check_policy_denies_changed_argv(
@@ -4441,10 +4725,11 @@ def test_docker_diagnostics_fail_before_provider_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
+    monkeypatch.setattr(composition, "read_coding_image_receipt", lambda: _TEST_RECEIPT)
     monkeypatch.setattr(
         composition,
-        "_configured_docker_authority",
-        lambda root: (_ for _ in ()).throw(
+        "_coding_backend",
+        lambda profile, receipt: (_ for _ in ()).throw(
             RuntimeError("Docker daemon is unavailable")
         ),
     )
@@ -5077,12 +5362,24 @@ def test_reduced_docker_profile_matches_the_declared_capabilities(
     subprocess.run(["git", "init", "-q", str(workspace)], check=True)
     monkeypatch.setattr(composition, "_STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
-    monkeypatch.setattr(composition, "_configured_docker_authority", lambda root: (
-        DockerImageIdentity(
+    receipt = composition.CodingImageReceipt(
+        image_identity=DockerImageIdentity(
             reference="generated:test", content_digest="sha256:" + "a" * 64,
         ),
-        "/usr/bin/docker",
-    ))
+        profile_revision="test-1",
+        platform_architecture="amd64",
+        dependency_inputs=(),
+        trusted_build_context_sha256="sha256:" + "c" * 64,
+    )
+    select = composition._coding_backend
+    monkeypatch.setattr(composition, "read_coding_image_receipt", lambda: receipt)
+    monkeypatch.setattr(
+        composition,
+        "_coding_backend",
+        lambda profile, receipt: select(
+            profile, receipt, environ={}, verify_local_image=False
+        ),
+    )
     app = build_app(
         session_store=InMemorySessionStore(),
         task_store=InMemoryTaskStore() if __CODING_TASKS_ENABLED__ else None,
@@ -5244,8 +5541,8 @@ async def _run_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "baseline",
         cwd=workspace,
     )
-    ordinary_data = workspace / "data"
-    ordinary_data.mkdir()
+    ordinary_data = workspace / "tests" / "data"
+    ordinary_data.mkdir(parents=True)
     ordinary_data_file = ordinary_data / "project.txt"
     ordinary_data_file.write_text(
         "ordinary project gitdir guidance remains model-visible\n",
@@ -5381,8 +5678,8 @@ async def _run_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert "pyproject.toml" in results["list_files"][0]["content"]
     assert ".git" not in results["list_files"][0]["content"]
     assert ".cayu" not in results["list_files"][0]["content"]
-    assert "data/project.txt" in results["list_files"][0]["content"]
-    assert "data/project.txt" in results["search_text"][0]["content"]
+    assert "tests/data/project.txt" in results["list_files"][0]["content"]
+    assert "tests/data/project.txt" in results["search_text"][0]["content"]
     assert "linked-worktree/.GiT" not in results["search_text"][0]["content"]
     assert "private-project.txt" not in results["search_text"][0]["content"]
     assert "private.txt" not in results["search_text"][0]["content"]
@@ -6070,6 +6367,7 @@ def _docker_composition_source(source: str) -> str:
         "import os\n",
         (
             "import json\nimport os\nimport re\n"
+            "from collections.abc import Mapping\n"
             "from dataclasses import dataclass\n"
             "from typing import Literal\n"
         ),
@@ -6077,23 +6375,32 @@ def _docker_composition_source(source: str) -> str:
     )
     source = source.replace(
         "from cayu.environments import Environment, EnvironmentSpec\n",
-        "from cayu.environments import EnvironmentSpec\n",
+        "",
         1,
     )
     source = source.replace(
         "from cayu.runners import LocalRunner\n",
         (
             "from cayu.tools import (\n"
-            "    CommandPolicy, CommandPolicyDecision, CommandPolicyResult, CommandRequest,\n"
-            "    NamedCheck, RunCheckTool, RunCommandTool, StructuredCommandToolPolicy,\n"
+            "    ExactNamedCheckCommandPolicy,\n"
+            "    RunCheckTool,\n"
+            "    RunCommandTool,\n"
+            "    StructuredCommandToolPolicy,\n"
+            "    named_checks_from_toolchain,\n"
             ")\n"
             "from cayu.environments import (\n"
-            "    DockerCodingAdmissionProbe, DockerCodingCommandAuthority,\n"
-            "    DockerCodingDependencyInput, DockerCodingEnvironmentFactory,\n"
-            "    DockerCodingToolchainProfile, DockerWorkspaceTransferLimits,\n"
-            "    ExecutionRequirements,\n"
+            "    DOCKER_CODING_BACKEND,\n"
+            "    CodingAdmissionProbe,\n"
+            "    CodingBackend,\n"
+            "    CodingCommandAuthority,\n"
+            "    CodingDependencyInput,\n"
+            "    CodingToolchainProfile,\n"
+            "    DockerCodingBackendOptions,\n"
+            "    DockerWorkspaceTransferLimits,\n"
+            "    register_coding_environment,\n"
+            "    select_coding_backend,\n"
             ")\n"
-            "from cayu.runners import DockerImageIdentity, ExecCommand\n"
+            "from cayu.runners import DockerImageIdentity\n"
         ),
         1,
     )

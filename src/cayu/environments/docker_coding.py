@@ -58,6 +58,12 @@ from cayu.environments.bindings import (
     WorkspaceSnapshot,
     _should_sync_back,
 )
+from cayu.environments.coding_toolchains import (
+    CodingAdmissionProbe,
+    CodingToolchainProfile,
+    _fingerprint,
+    owned_coding_toolchain_profile,
+)
 from cayu.environments.deferred import DeferredMaterialization, EnvironmentMaterializationError
 from cayu.environments.docker_toolchains import (
     DockerCodingToolchainError,
@@ -512,6 +518,11 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                     runner, tree_bytes=tree_bytes, tree_files=tree_files
                 )
                 git_baseline = await ephemeral_git_baseline(runner)
+                if self.sync_back != "never":
+                    # Fail before the first model call, not after the session's
+                    # work: copy-in already holds every source path Git ignores.
+                    # Finalization checks again for paths the session creates.
+                    await _require_no_publishable_ignored_paths(bound)
             transformed_baseline_paths = frozenset()
             if copied is not None:
                 transformed = await _git_paths_with_transformed_bytes(
@@ -908,6 +919,15 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     inside an app's tool call have one, so their timeout or cancellation always
     removes the container.
 
+    ``toolchain_profile`` is a ``DockerCodingToolchainProfile``, or a neutral
+    ``CodingToolchainProfile`` together with ``image_identity`` (and
+    ``platform_architecture`` unless the profile names one, optional
+    ``restrictions`` and Docker-only ``extra_admission_probes``). With a neutral
+    profile the factory builds the Docker profile itself with
+    ``DockerCodingToolchainProfile.from_toolchain`` and verifies it exactly as a
+    Docker-typed one, while its runners report the neutral profile's fingerprint
+    so that tools holding that same neutral profile admit them.
+
     ``cancel_timeout_s`` bounds how long one command cleanup or container
     removal waits for Docker, as ``DockerRunner(cancel_timeout_s=...)`` does;
     ``None`` keeps the runner default of five seconds. When it expires the
@@ -929,7 +949,11 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self,
         *,
         source_workspace: LocalWorkspace,
-        toolchain_profile: DockerCodingToolchainProfile,
+        toolchain_profile: CodingToolchainProfile,
+        image_identity: DockerImageIdentity | None = None,
+        platform_architecture: Literal["amd64", "arm64"] | None = None,
+        restrictions: DockerWorkloadRestrictions | None = None,
+        extra_admission_probes: Sequence[CodingAdmissionProbe] = (),
         artifact_store: ArtifactStore | None = None,
         transfer_limits: DockerWorkspaceTransferLimits | None = None,
         runtime: str | None = None,
@@ -970,8 +994,31 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 "attached and mounted when an allocation is created, before a deferred "
                 "container exists. Use deferred=False for factories with immutable inputs."
             )
-        if type(toolchain_profile) is not DockerCodingToolchainProfile:
-            raise TypeError("toolchain_profile must be an exact DockerCodingToolchainProfile.")
+        owned_profile = owned_coding_toolchain_profile(toolchain_profile)
+        if type(owned_profile) is DockerCodingToolchainProfile:
+            if (
+                image_identity is not None
+                or platform_architecture is not None
+                or restrictions is not None
+                or extra_admission_probes
+            ):
+                raise ValueError(
+                    "A DockerCodingToolchainProfile already fixes its image, architecture, "
+                    "restrictions and probes; pass them only with a neutral CodingToolchainProfile."
+                )
+            docker_profile = owned_profile
+        else:
+            if image_identity is None:
+                raise ValueError(
+                    "A neutral CodingToolchainProfile needs image_identity to run on Docker."
+                )
+            docker_profile = DockerCodingToolchainProfile.from_toolchain(
+                owned_profile,
+                image_identity=image_identity,
+                platform_architecture=platform_architecture,
+                restrictions=restrictions,
+                extra_admission_probes=tuple(extra_admission_probes),
+            )
         # Reuse the concrete environment's validation before any allocation.
         validated = Environment(
             EnvironmentSpec(name="coding"),
@@ -987,9 +1034,11 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         ):
             raise TypeError("transfer_limits must be DockerWorkspaceTransferLimits or None.")
         self.source_workspace = source_workspace
-        self.toolchain_profile = DockerCodingToolchainProfile.model_validate(
-            toolchain_profile.model_dump(mode="python", by_alias=True)
-        )
+        #: The Docker profile this factory verifies, built here from a neutral profile.
+        self.toolchain_profile = docker_profile
+        #: The profile tools must hold to admit this factory's runners.
+        self.coding_toolchain_profile = owned_profile
+        self._evidence_toolchain_fingerprint = owned_profile.fingerprint
         self.restrictions = self.toolchain_profile.restrictions
         self.image_identity = self.toolchain_profile.image_identity
         self.git_baseline = git_baseline
@@ -1037,6 +1086,9 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             runtime=self.runtime,
             seccomp_sha256=self._seccomp_sha256,
             toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            evidence_toolchain_profile_fingerprint=(
+                None if owned_profile is docker_profile else self._evidence_toolchain_fingerprint
+            ),
             source_excluded_directory_names=self.source_workspace.excluded_directory_names,
             source_excluded_path_patterns=self.source_workspace.excluded_path_patterns,
             immutable_input_projection_fingerprints=tuple(
@@ -1353,7 +1405,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 container_id=container_id,
                 configuration_fingerprint=self._configuration_fingerprint,
                 image_fingerprint=self.image_identity.fingerprint,
-                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+                toolchain_profile_fingerprint=self._evidence_toolchain_fingerprint,
                 allocation_id=intent.allocation_id,
             )
             await allocation.acknowledge(acknowledged)
@@ -1661,7 +1713,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 container_id=exact_container_id,
                 configuration_fingerprint=self._configuration_fingerprint,
                 image_fingerprint=self.image_identity.fingerprint,
-                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+                toolchain_profile_fingerprint=self._evidence_toolchain_fingerprint,
                 allocation_id=allocation_id,
             )
             if allocation is not None:
@@ -1761,7 +1813,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 workload_restrictions=self.restrictions,
                 required_executables=requirements.executable_names(),
                 executable_probes=requirements.executable_probes(),
-                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+                toolchain_profile_fingerprint=self._evidence_toolchain_fingerprint,
                 immutable_input_mounts=immutable_mounts,
                 allocation_identity=allocation_identity,
                 _execution_environment_authority=(self._execution_environment_authority),
@@ -1803,7 +1855,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             docker_path=self.docker_path,
             required_executables=requirements.executable_names(),
             executable_probes=requirements.executable_probes(),
-            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            toolchain_profile_fingerprint=self._evidence_toolchain_fingerprint,
             immutable_input_mounts=immutable_mounts,
             cancellation_cleanup=self.command_cleanup,
             timeout_cleanup=self.command_cleanup,
@@ -1909,7 +1961,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             "container_name": require_durable_clean_nonblank(container_name, "container_name"),
             "configuration_fingerprint": self._configuration_fingerprint,
             "image_fingerprint": self.image_identity.fingerprint,
-            "toolchain_profile_fingerprint": self.toolchain_profile.fingerprint,
+            "toolchain_profile_fingerprint": self._evidence_toolchain_fingerprint,
         }
         if allocation_id is not None:
             identity["allocation_id"] = require_durable_clean_nonblank(
@@ -1962,7 +2014,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             final_candidate.candidate != "docker"
             or final_evidence.environment_fingerprint is None
             or final_evidence.image_fingerprint != self.image_identity.fingerprint
-            or final_evidence.toolchain_profile_fingerprint != self.toolchain_profile.fingerprint
+            or final_evidence.toolchain_profile_fingerprint != self._evidence_toolchain_fingerprint
             or final_evidence.tool_requirements is None
             or tuple(claim.executable for claim in final_evidence.tool_requirements.executables)
             != effective_requirements.executable_names()
@@ -2186,7 +2238,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             container_id=container_id,
             configuration_fingerprint=self._configuration_fingerprint,
             image_fingerprint=self.image_identity.fingerprint,
-            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            toolchain_profile_fingerprint=self._evidence_toolchain_fingerprint,
             allocation_id=request.reconnect_metadata.get("allocation_id"),
         )
         if request.reconnect_metadata != expected:
@@ -2245,7 +2297,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             subject="docker",
             environment_fingerprint=environment_fingerprint,
             image_fingerprint=image_fingerprint,
-            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            toolchain_profile_fingerprint=self._evidence_toolchain_fingerprint,
             claims=(
                 ExecutionCapabilityClaim.declared("real_credential_non_possession"),
                 ExecutionCapabilityClaim.declared("deny_by_default_network"),
@@ -2667,8 +2719,17 @@ async def _require_no_publishable_ignored_paths(bound: BoundWorkspace) -> None:
         )
     )
     if publishable_ignored_paths:
+        # Count and fingerprint only: the paths are repository content.
+        fingerprint = _fingerprint(
+            {"paths": sorted(publishable_ignored_paths)}, "ignored_source_paths"
+        )
+        count = len(publishable_ignored_paths)
         raise RuntimeError(
-            "Docker coding refused publication because Git would omit a source path."
+            "Docker coding refused publication because Git would omit a source path: "
+            f"{count} Git-ignored {'path is' if count == 1 else 'paths are'} outside the "
+            f"workspace's source exclusions (paths fingerprint {fingerprint}). Exclude "
+            "them from the source workspace (excluded_directory_names or "
+            "excluded_path_patterns) or stop ignoring them."
         )
 
 
@@ -2712,6 +2773,7 @@ def _docker_coding_configuration_fingerprint(
     source_excluded_path_patterns: tuple[str, ...],
     immutable_input_projection_fingerprints: tuple[str, ...],
     immutable_input_runtime_compatibility_fingerprint: str | None,
+    evidence_toolchain_profile_fingerprint: str | None = None,
     git_baseline: bool = True,
     deferred: bool = False,
     command_cleanup: Literal["command_or_sandbox", "sandbox"] = "sandbox",
@@ -2747,6 +2809,10 @@ def _docker_coding_configuration_fingerprint(
     if deferred:
         # Eager fingerprints stay byte-for-byte unchanged.
         material["materialization"] = "deferred"
+    if evidence_toolchain_profile_fingerprint is not None:
+        # A factory built from a neutral profile reports that profile to tools;
+        # factories given a Docker profile keep their fingerprints unchanged.
+        material["evidence_toolchain_profile_fingerprint"] = evidence_toolchain_profile_fingerprint
     if command_cleanup != "sandbox":
         # Container removal is the behaviour every earlier fingerprint
         # described, so it keeps them byte-for-byte unchanged. Keeping the
@@ -3036,3 +3102,132 @@ class _DockerWarmSpareBackend:
             timeout=15,
             check=False,
         )
+
+
+@dataclass(frozen=True)
+class DockerCodingBackendOptions:
+    """How the ``docker`` coding backend runs a neutral toolchain profile.
+
+    ``image_identity`` is the exact image built for the profile.
+    ``platform_architecture`` is needed unless the profile names one;
+    ``restrictions`` and ``extra_admission_probes`` are Docker-only additions.
+    With ``verify_local_image`` (the default) the backend checks, when it is
+    built, that the local daemon holds exactly that image, so a stale or
+    missing image fails at startup rather than in the first session.
+    ``cancel_timeout_s`` is passed to every factory the backend builds.
+    """
+
+    image_identity: DockerImageIdentity
+    platform_architecture: Literal["amd64", "arm64"] | None = None
+    restrictions: DockerWorkloadRestrictions | None = None
+    extra_admission_probes: tuple[CodingAdmissionProbe, ...] = ()
+    transfer_limits: DockerWorkspaceTransferLimits | None = None
+    docker_path: str | None = None
+    verify_local_image: bool = True
+    cancel_timeout_s: float | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.image_identity) is not DockerImageIdentity:
+            raise TypeError("image_identity must be a DockerImageIdentity.")
+        if type(self.verify_local_image) is not bool:
+            raise TypeError("verify_local_image must be a bool.")
+        if self.cancel_timeout_s is not None:
+            validate_cancel_timeout(self.cancel_timeout_s)
+        object.__setattr__(self, "extra_admission_probes", tuple(self.extra_admission_probes))
+
+
+def verify_local_docker_image(
+    image_identity: DockerImageIdentity,
+    *,
+    docker_path: str | None = None,
+    timeout_s: float = 30.0,
+) -> str:
+    """Require the local daemon to hold exactly ``image_identity``; return the docker CLI."""
+
+    docker = _require_docker(docker_path)
+    try:
+        inspected = subprocess.run(
+            [docker, "image", "inspect", "--format", "{{.Id}}", image_identity.reference],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError("The Docker daemon could not be asked about the coding image.") from None
+    observed = inspected.stdout.decode("ascii", errors="ignore").strip()
+    if inspected.returncode != 0:
+        raise RuntimeError(
+            f"The Docker coding image {image_identity.reference} is not available locally; "
+            "build it first."
+        )
+    if image_identity.content_digest is not None and observed != image_identity.content_digest:
+        raise RuntimeError(
+            f"The Docker coding image {image_identity.reference} does not match its recorded "
+            "immutable ID; rebuild it or update the recorded identity."
+        )
+    return docker
+
+
+def docker_coding_backend(context: Any) -> Any:
+    """Build the ``docker`` coding backend from a ``CodingBackendContext``."""
+
+    from cayu.environments.coding_backends import (
+        DOCKER_CODING_BACKEND,
+        CodingBackend,
+        CodingBackendContext,
+    )
+
+    if type(context) is not CodingBackendContext:
+        raise TypeError("context must be a CodingBackendContext.")
+    options = context.options
+    if type(options) is not DockerCodingBackendOptions:
+        raise ValueError(
+            "The docker coding backend needs DockerCodingBackendOptions(image_identity=...) "
+            "under options['docker']."
+        )
+    profile = context.toolchain_profile
+    # Validate the combination once, before any workspace is registered.
+    docker_profile = DockerCodingToolchainProfile.from_toolchain(
+        profile,
+        image_identity=options.image_identity,
+        platform_architecture=options.platform_architecture,
+        restrictions=options.restrictions,
+        extra_admission_probes=options.extra_admission_probes,
+    )
+    docker_path = (
+        verify_local_docker_image(options.image_identity, docker_path=options.docker_path)
+        if options.verify_local_image
+        else options.docker_path
+    )
+
+    def build_factory(
+        source_workspace: LocalWorkspace,
+        *,
+        artifact_store: ArtifactStore | None = None,
+    ) -> DockerCodingEnvironmentFactory:
+        return DockerCodingEnvironmentFactory(
+            source_workspace=source_workspace,
+            toolchain_profile=profile,
+            image_identity=options.image_identity,
+            platform_architecture=options.platform_architecture,
+            restrictions=options.restrictions,
+            extra_admission_probes=options.extra_admission_probes,
+            artifact_store=artifact_store,
+            transfer_limits=options.transfer_limits,
+            docker_path=docker_path,
+            cancel_timeout_s=options.cancel_timeout_s,
+        )
+
+    return CodingBackend(
+        name=DOCKER_CODING_BACKEND,
+        candidate="docker",
+        toolchain_profile=profile,
+        build_factory=build_factory,
+        metadata={
+            "execution_kind": "trusted_repository_docker",
+            "image_fingerprint": options.image_identity.fingerprint,
+            "toolchain_image_content_digest": options.image_identity.content_digest,
+            "toolchain_platform": f"linux/{docker_profile.platform_architecture}",
+        },
+    )

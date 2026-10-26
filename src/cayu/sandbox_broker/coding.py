@@ -23,9 +23,11 @@ import logging
 import os
 import secrets
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Literal
 
+from cayu._validation import canonical_durable_json_bytes
 from cayu.egress.sandbox_coding import SandboxWorkspaceTransferLimits
 from cayu.environments import (
     Environment,
@@ -56,10 +58,19 @@ from cayu.environments.bindings import (
     SyncTargetWorkspaceProvisioner,
     WorkspaceSnapshot,
 )
+from cayu.environments.coding_toolchains import (
+    CodingToolchainError,
+    CodingToolchainProfile,
+    owned_coding_toolchain_profile,
+    run_coding_toolchain_admission_probes,
+    verify_local_coding_toolchain_dependencies,
+)
 from cayu.runners import ExecCommand
 from cayu.runners.base import Runner
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sandbox_broker.client import (
     SandboxBrokerClient,
+    SandboxBrokerError,
     SandboxEgressMode,
     SandboxRecord,
     validate_labels,
@@ -80,8 +91,10 @@ __all__ = [
     "BROKERED_SANDBOX_EGRESS_ENV",
     "BROKERED_SANDBOX_IMAGE_ENV",
     "BROKERED_SANDBOX_LEASE_ENV",
+    "BrokeredCodingBackendOptions",
     "BrokeredSandboxCodingBinding",
     "BrokeredSandboxCodingEnvironmentFactory",
+    "brokered_coding_backend",
 ]
 
 #: Catalog image for coding sandboxes (default ``coding-python``).
@@ -100,6 +113,7 @@ _PROTECTED_DIRECTORY_NAMES = (".cayu", ".git", ".runtime")
 _FACTORY_LABEL_KEYS = frozenset({"cayu.environment", "cayu.session"})
 _MAX_USER_LABELS = 10 - len(_FACTORY_LABEL_KEYS)
 _SETUP_COMMAND_TIMEOUT_SECONDS = 600
+_TOOLCHAIN_WORKSPACE = "/workspace"
 
 
 class BrokeredSandboxCodingBinding(SyncBinding):
@@ -119,11 +133,20 @@ class BrokeredSandboxCodingBinding(SyncBinding):
     destroys it when the lease lapses if no retry comes.
     """
 
-    def __init__(self, *, git_baseline: bool = True, **options: Any) -> None:
+    def __init__(
+        self,
+        *,
+        git_baseline: bool = True,
+        workspace_setup_commands: Sequence[str] = (),
+        **options: Any,
+    ) -> None:
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
         super().__init__(**options)
         self._git_baseline = git_baseline
+        self._workspace_setup_commands = _validated_commands(
+            workspace_setup_commands, field_name="workspace_setup_commands"
+        )
 
     async def bind(
         self,
@@ -150,7 +173,7 @@ class BrokeredSandboxCodingBinding(SyncBinding):
             environment_name=environment_name,
             metadata=metadata,
         )
-        if not self._git_baseline:
+        if not self._git_baseline and not self._workspace_setup_commands:
             return bound
         try:
             target = bound.workspace
@@ -158,10 +181,25 @@ class BrokeredSandboxCodingBinding(SyncBinding):
                 bound.runner, BrokeredSandboxRunner
             ):
                 raise RuntimeError("Brokered coding binding lost its sandbox target.")
-            tree_bytes, tree_files = sync_bound_tree_size(bound.metadata)
-            await initialize_ephemeral_git_baseline(
-                bound.runner, cwd=target.runner_cwd, tree_bytes=tree_bytes, tree_files=tree_files
-            )
+            if self._git_baseline:
+                tree_bytes, tree_files = sync_bound_tree_size(bound.metadata)
+                await initialize_ephemeral_git_baseline(
+                    bound.runner,
+                    cwd=target.runner_cwd,
+                    tree_bytes=tree_bytes,
+                    tree_files=tree_files,
+                )
+            for command in self._workspace_setup_commands:
+                result = await bound.runner.exec(
+                    ExecCommand.bash(command),
+                    cwd=target.runner_cwd,
+                    timeout_s=_SETUP_COMMAND_TIMEOUT_SECONDS,
+                )
+                if result.exit_code != 0 or result.timed_out or result.cancelled:
+                    raise RuntimeError(
+                        "Brokered sandbox workspace setup command failed with exit code "
+                        f"{result.exit_code}."
+                    )
         except BaseException:
             self.abandon(bound)
             raise
@@ -272,6 +310,26 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     session gets a new sandbox, copied in from the source workspace; completion
     recovery after a crash is refused, so it never runs against an empty
     replacement.
+
+    ``setup_commands`` run in the fresh sandbox before the workspace is copied
+    in. ``workspace_setup_commands`` run after copy-in (and after the Git
+    baseline) in ``/workspace``, for example to install the project's locked
+    dependencies; anything they write under ``/workspace`` is published back
+    like any other change, so write environments elsewhere (for example
+    ``UV_PROJECT_ENVIRONMENT=/tmp/venv``).
+
+    ``toolchain_profile`` binds every sandbox to one neutral
+    ``CodingToolchainProfile``, so ``run_check`` and ``run_command`` with that
+    same profile work here as they do on Docker. It requires ``egress="none"``
+    (profiles prohibit the network) and no setup commands (profiles prohibit
+    installing packages at run time), and refuses a ``DockerCodingToolchainProfile``:
+    pass ``profile.coding_toolchain()``. Before allocation the profile's
+    dependency inputs are verified in the source workspace. After allocation
+    the factory requires the sandbox image to report the profile's
+    ``trusted_build_context_sha256`` when the profile sets one, checks the
+    read-only support paths exist (it can't prove they are read-only), runs the
+    profile's admission probes and probes its executables live. The runner's
+    evidence then names the profile, which the tools require.
     """
 
     @property
@@ -295,6 +353,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         ready_timeout_s: float = DEFAULT_READY_TIMEOUT_SECONDS,
         renew_every_s: float | None = None,
         git_baseline: bool = True,
+        workspace_setup_commands: Sequence[str] = (),
+        toolchain_profile: CodingToolchainProfile | None = None,
     ) -> None:
         if not isinstance(broker, SandboxBrokerClient):
             raise TypeError("broker must be a SandboxBrokerClient.")
@@ -315,6 +375,16 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             raise ValueError("ready_timeout_s must be positive.")
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
+        owned_setup = _validated_commands(setup_commands, field_name="setup_commands")
+        owned_workspace_setup = _validated_commands(
+            workspace_setup_commands, field_name="workspace_setup_commands"
+        )
+        owned_profile = _brokered_toolchain_profile(
+            toolchain_profile,
+            egress=egress,
+            setup_commands=owned_setup,
+            workspace_setup_commands=owned_workspace_setup,
+        )
         self.broker = broker
         self.source_workspace = source_workspace
         self.egress: SandboxEgressMode = egress
@@ -331,7 +401,9 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 f"The factory adds {len(_FACTORY_LABEL_KEYS)} labels of its own, so it accepts "
                 f"at most {_MAX_USER_LABELS}."
             )
-        self.setup_commands = tuple(setup_commands)
+        self.setup_commands = owned_setup
+        self.workspace_setup_commands = owned_workspace_setup
+        self.toolchain_profile = owned_profile
         self.transfer_limits = transfer_limits
         self.sync_back = sync_back
         self.staging_capacity = staging_capacity
@@ -354,6 +426,17 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             excluded_directory_names=self._excluded,
             excluded_path_patterns=self._excluded_patterns,
         )
+        self._profile_identity = ExecutionProfileBehaviorIdentity(
+            name="cayu.brokered_sandbox_coding_environment",
+            behavior_version="1",
+            implementation_version=_configuration_fingerprint(self),
+        )
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        """Identity of what every session's sandbox is built from; it never reconnects."""
+
+        return self._profile_identity
 
     @classmethod
     def from_env(
@@ -426,6 +509,9 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 subject=BROKERED_SANDBOX_CANDIDATE,
                 claims=sandbox_capability_claims(None, egress_mode=self.egress, declared=True),
                 environment_fingerprint=fingerprint,
+                toolchain_profile_fingerprint=(
+                    None if self.toolchain_profile is None else self.toolchain_profile.fingerprint
+                ),
                 tool_requirements=ExecutionToolRequirementEvidence(
                     environment_fingerprint=fingerprint,
                     executables=tuple(
@@ -452,6 +538,10 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         # A RECONNECT without metadata is a follow-up turn: it gets a fresh
         # sandbox, which binding fills from the source. Completion recovery
         # against that sandbox is refused by the binding.
+        profile = self.toolchain_profile
+        if profile is not None:
+            # Like Docker: a stale source fails before any sandbox is allocated.
+            verify_local_coding_toolchain_dependencies(profile, self.source_workspace.root)
         sandbox = await self._allocate(request)
         keeper: SandboxLeaseKeeper | None = None
         runner: BrokeredSandboxRunner | None = None
@@ -462,8 +552,16 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 lease_seconds=self.lease_seconds,
                 renew_every_s=self.renew_every_s,
             ).start()
-            runner = BrokeredSandboxRunner(self.broker, sandbox, lease_keeper=keeper)
+            runner = BrokeredSandboxRunner(
+                self.broker,
+                sandbox,
+                lease_keeper=keeper,
+                toolchain_profile_fingerprint=None if profile is None else profile.fingerprint,
+                toolchain_executables=() if profile is None else profile.required_executables,
+            )
             self._require_transfer_capacity(sandbox)
+            if profile is not None:
+                await _admit_toolchain(runner, profile)
             for command in self.setup_commands:
                 result = await runner.exec(
                     ExecCommand.bash(command), timeout_s=_SETUP_COMMAND_TIMEOUT_SECONDS
@@ -489,13 +587,18 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             del action
             await owned_runner.close()
 
+        metadata: dict[str, Any] = {
+            "sandbox_id": sandbox.id,
+            "sandbox_image": sandbox.image,
+            "sandbox_egress": sandbox.egress.mode,
+        }
+        if sandbox.image_identity is not None:
+            metadata["sandbox_image_fingerprint"] = sandbox.image_identity.fingerprint
+        if profile is not None:
+            metadata.update(profile.evidence())
         return EnvironmentFactoryResult(
             environment=environment,
-            metadata={
-                "sandbox_id": sandbox.id,
-                "sandbox_image": sandbox.image,
-                "sandbox_egress": sandbox.egress.mode,
-            },
+            metadata=metadata,
             release=release,
         )
 
@@ -593,4 +696,231 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             preserve_git_modes=True,
             staging_capacity=self.staging_capacity,
             git_baseline=self.git_baseline,
+            workspace_setup_commands=self.workspace_setup_commands,
         )
+
+
+def _validated_commands(commands: Sequence[str], *, field_name: str) -> tuple[str, ...]:
+    if isinstance(commands, str | bytes):
+        raise TypeError(f"{field_name} must be a sequence of shell commands, not one string.")
+    owned = tuple(commands)
+    if any(type(command) is not str or not command.strip() for command in owned):
+        raise ValueError(f"{field_name} entries must be nonblank shell commands.")
+    return owned
+
+
+def _brokered_toolchain_profile(
+    profile: object,
+    *,
+    egress: str,
+    setup_commands: tuple[str, ...],
+    workspace_setup_commands: tuple[str, ...],
+) -> CodingToolchainProfile | None:
+    if profile is None:
+        return None
+    from cayu.environments.docker_toolchains import DockerCodingToolchainProfile
+
+    if type(profile) is DockerCodingToolchainProfile:
+        raise TypeError(
+            "A brokered sandbox can't verify a Docker image; pass the neutral profile "
+            "(profile.coding_toolchain()) instead of a DockerCodingToolchainProfile."
+        )
+    owned = owned_coding_toolchain_profile(profile)
+    if egress != "none":
+        raise ValueError(
+            "A toolchain profile prohibits the network, so a brokered sandbox with one needs "
+            "egress='none'."
+        )
+    if setup_commands or workspace_setup_commands:
+        raise ValueError(
+            "A toolchain profile prohibits installing packages at run time, so a brokered "
+            "sandbox with one takes no setup_commands or workspace_setup_commands; build "
+            "the dependencies into the sandbox image instead."
+        )
+    if owned.workspace_path != _TOOLCHAIN_WORKSPACE:
+        raise ValueError(
+            f"A brokered sandbox's workspace is {_TOOLCHAIN_WORKSPACE}; the toolchain "
+            f"profile names {owned.workspace_path}."
+        )
+    return owned
+
+
+async def _admit_toolchain(runner: BrokeredSandboxRunner, profile: CodingToolchainProfile) -> None:
+    """Bind one allocated sandbox to the profile before anything is copied in."""
+
+    expected_context = profile.trusted_build_context_sha256
+    identity = runner.sandbox.image_identity
+    if expected_context is not None and (
+        identity is None or identity.trusted_build_context_sha256 != expected_context
+    ):
+        raise CodingToolchainError(
+            "toolchain_image_unverified",
+            "The brokered sandbox image does not report the trusted build context this "
+            "toolchain profile was built from. Catalog images don't carry an application's "
+            "dependencies; use an image the broker built from the same coding image inputs "
+            "(for example the Release's own image).",
+        )
+    await run_coding_toolchain_admission_probes(runner, profile)
+    try:
+        await runner.refresh_execution_admission()
+    except SandboxBrokerError:
+        raise CodingToolchainError(
+            "toolchain_executables_unverified",
+            "The brokered sandbox's toolchain executables could not be probed.",
+        ) from None
+    evidence = runner.execution_admission_candidate().evidence.tool_requirements
+    unavailable = tuple(
+        executable
+        for executable in profile.required_executables
+        if evidence is None
+        or (claim := evidence.executable_for(executable)) is None
+        or claim.state != "live_verified"
+    )
+    if unavailable:
+        raise CodingToolchainError(
+            "toolchain_executables_unavailable",
+            f"{len(unavailable)} of the toolchain profile's {len(profile.required_executables)} "
+            "executables are missing in the brokered sandbox image.",
+            paths=unavailable,
+        )
+
+
+def _configuration_fingerprint(factory: BrokeredSandboxCodingEnvironmentFactory) -> str:
+    limits = factory.transfer_limits
+    material = {
+        "schema": "cayu.brokered_sandbox_coding_environment.v1",
+        "image": factory.image,
+        "egress": factory.egress,
+        "sync_back": factory.sync_back,
+        "git_baseline": factory.git_baseline,
+        "transfer_limits": {
+            "max_files": limits.max_files,
+            "max_file_bytes": limits.max_file_bytes,
+            "max_total_bytes": limits.max_total_bytes,
+            "max_archive_bytes": limits.max_archive_bytes,
+        },
+        "excluded_directory_names": list(factory._excluded),
+        "excluded_path_patterns": list(factory._excluded_patterns),
+        "setup_commands_sha256": sha256(
+            "\0".join(factory.setup_commands).encode("utf-8")
+        ).hexdigest(),
+        "workspace_setup_commands_sha256": sha256(
+            "\0".join(factory.workspace_setup_commands).encode("utf-8")
+        ).hexdigest(),
+        "toolchain_profile_fingerprint": (
+            None if factory.toolchain_profile is None else factory.toolchain_profile.fingerprint
+        ),
+    }
+    return (
+        "sha256:"
+        + sha256(
+            canonical_durable_json_bytes(material, "brokered_sandbox_coding_configuration")
+        ).hexdigest()
+    )
+
+
+@dataclass(frozen=True)
+class BrokeredCodingBackendOptions:
+    """How the ``cayu-cloud`` coding backend asks Cayu Cloud's broker for sandboxes.
+
+    Sandboxes always run with ``egress="none"``: toolchain profiles prohibit
+    the network. ``image`` names the catalog entry, or the image a broker
+    builds for the application (for example ``"release"``). ``broker`` reuses
+    an existing client; otherwise one is made from the ``CAYU_CLOUD_*``
+    variables and shared by every workspace the backend serves.
+    """
+
+    image: str = DEFAULT_IMAGE
+    lease_seconds: int = DEFAULT_LEASE_SECONDS
+    transfer_limits: SandboxWorkspaceTransferLimits | None = None
+    broker: SandboxBrokerClient | None = None
+    labels: Mapping[str, str] | None = None
+    git_baseline: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.image) is not str or not self.image.strip():
+            raise ValueError("image must name a sandbox catalog entry.")
+        validate_lease_seconds(self.lease_seconds)
+        if self.broker is not None and not isinstance(self.broker, SandboxBrokerClient):
+            raise TypeError("broker must be a SandboxBrokerClient or None.")
+        if type(self.git_baseline) is not bool:
+            raise TypeError("git_baseline must be a bool.")
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> BrokeredCodingBackendOptions:
+        """Read ``CAYU_CLOUD_SANDBOX_IMAGE`` and ``CAYU_CLOUD_SANDBOX_LEASE_SECONDS``.
+
+        ``CAYU_CLOUD_SANDBOX_EGRESS``, when set, must be ``none``.
+        """
+
+        env = os.environ if environ is None else environ
+        egress = env.get(BROKERED_SANDBOX_EGRESS_ENV, "").strip()
+        if egress not in ("", "none"):
+            raise ValueError(
+                f"{BROKERED_SANDBOX_EGRESS_ENV}={egress} conflicts with the coding toolchain, "
+                "which prohibits the network; set it to 'none' or leave it unset."
+            )
+        lease_text = env.get(BROKERED_SANDBOX_LEASE_ENV, "").strip()
+        try:
+            lease_seconds = int(lease_text) if lease_text else DEFAULT_LEASE_SECONDS
+        except ValueError:
+            raise ValueError(f"{BROKERED_SANDBOX_LEASE_ENV} must be an integer.") from None
+        return cls(
+            image=env.get(BROKERED_SANDBOX_IMAGE_ENV, "").strip() or DEFAULT_IMAGE,
+            lease_seconds=lease_seconds,
+        )
+
+
+def brokered_coding_backend(context: Any) -> Any:
+    """Build the ``cayu-cloud`` coding backend from a ``CodingBackendContext``."""
+
+    from cayu.environments.coding_backends import (
+        CLOUD_CODING_BACKEND,
+        CodingBackend,
+        CodingBackendContext,
+    )
+
+    if type(context) is not CodingBackendContext:
+        raise TypeError("context must be a CodingBackendContext.")
+    options = context.options
+    if options is None:
+        options = BrokeredCodingBackendOptions.from_env(context.environ)
+    if type(options) is not BrokeredCodingBackendOptions:
+        raise TypeError("options['cayu-cloud'] must be BrokeredCodingBackendOptions or omitted.")
+    profile = context.toolchain_profile
+    # Refuse a profile the broker can't host before any workspace is registered.
+    _brokered_toolchain_profile(
+        profile, egress="none", setup_commands=(), workspace_setup_commands=()
+    )
+    # One client for every workspace of this process: it holds the broker's connections.
+    broker = options.broker or SandboxBrokerClient.from_env(context.environ)
+
+    def build_factory(
+        source_workspace: LocalWorkspace,
+        *,
+        artifact_store: Any = None,
+    ) -> BrokeredSandboxCodingEnvironmentFactory:
+        # The artifact store is registered with the app; sandboxes never hold it.
+        del artifact_store
+        return BrokeredSandboxCodingEnvironmentFactory(
+            broker=broker,
+            source_workspace=source_workspace,
+            egress="none",
+            image=options.image,
+            lease_seconds=options.lease_seconds,
+            labels=options.labels,
+            transfer_limits=options.transfer_limits,
+            git_baseline=options.git_baseline,
+            toolchain_profile=profile,
+        )
+
+    return CodingBackend(
+        name=CLOUD_CODING_BACKEND,
+        candidate=BROKERED_SANDBOX_CANDIDATE,
+        toolchain_profile=profile,
+        build_factory=build_factory,
+        metadata={
+            "execution_kind": "trusted_repository_brokered_sandbox",
+            "sandbox_image": options.image,
+        },
+    )

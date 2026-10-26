@@ -14,6 +14,7 @@ from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.tasks_postgres import PostgresTaskStore
 from tests.cli.test_scaffold_coding_budget import denial_policy
+from tests.coding_scaffold_fixtures import admit_fixture_image
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository
 from tests.qualification.repository_maintenance_toolchain import maintenance_toolchain
@@ -41,9 +42,7 @@ def deployment(project, tmp_path, monkeypatch):
         root = importlib.import_module("app")
         module = importlib.import_module("operations.maintenance_deployment")
         provider = RecordingOneShotProvider()
-        monkeypatch.setattr(
-            operations, "_configured_docker_authority", lambda _root: (profile, "/usr/bin/docker")
-        )
+        admit_fixture_image(monkeypatch, operations, toolchain_profile=profile)
         monkeypatch.setattr(root, "configured_provider", lambda: provider)
         yield module, source, provider
 
@@ -154,7 +153,7 @@ def test_worker_binding_reuses_the_registered_graph_without_reconstruction(deplo
     assert bound.application.app.get_provider() is provider and not provider.requests
     assert bound.application.source_workspace is original.source_workspace
     assert bound.application.artifact_store is original.artifact_store
-    assert bound.application.toolchain_profile is factory.toolchain_profile
+    assert bound.application.toolchain_profile is factory.coding_toolchain_profile
     assert bound.application.toolchain_profile == original.toolchain_profile
     assert bound.application.project_root == original.project_root
     assert bound.application.agent_name == original.agent_name
@@ -181,7 +180,7 @@ def test_worker_binding_rejects_unsupported_graph(deployment, monkeypatch, inval
 
         factory = DockerCodingEnvironmentFactory(
             source_workspace=original.source_workspace,
-            toolchain_profile=original.toolchain_profile,
+            toolchain_profile=original.app.get_environment_factory().toolchain_profile,
         )
         monkeypatch.setattr(original.app, "get_environment_factory", lambda: factory)
     elif invalid == "store":

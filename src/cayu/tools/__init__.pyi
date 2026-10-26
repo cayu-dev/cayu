@@ -188,8 +188,10 @@ from cayu.tools.knowledge import ReadKnowledgeTool as ReadKnowledgeTool
 from cayu.tools.knowledge import RememberKnowledgePolicy as RememberKnowledgePolicy
 from cayu.tools.knowledge import RememberKnowledgeTool as RememberKnowledgeTool
 from cayu.tools.knowledge import SearchKnowledgeTool as SearchKnowledgeTool
+from cayu.tools.named_checks import ExactNamedCheckCommandPolicy as ExactNamedCheckCommandPolicy
 from cayu.tools.named_checks import NamedCheck as NamedCheck
 from cayu.tools.named_checks import RunCheckTool as RunCheckTool
+from cayu.tools.named_checks import named_checks_from_toolchain as named_checks_from_toolchain
 from cayu.tools.outcomes import ToolCallSummary as ToolCallSummary
 from cayu.tools.parallel import ParallelAIWebAdapter as ParallelAIWebAdapter
 from cayu.tools.patches import ApplyPatchTool as ApplyPatchTool

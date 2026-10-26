@@ -18,6 +18,7 @@ def exercise_approval_restart(application, reservations, identity, *, root, remo
     )
     module_path = importlib.import_module("app").__file__
     assert module_path is not None
+    docker_profile = application.app.get_environment_factory().toolchain_profile
     values = {
         "project": str(Path(module_path).parent),
         "source": str(application.project_root),
@@ -26,6 +27,8 @@ def exercise_approval_restart(application, reservations, identity, *, root, remo
         "tenant": identity.intent.tenant,
         "identity": identity.model_dump(mode="json"),
         "toolchain_json": application.toolchain_profile.model_dump_json(),
+        "image_identity_json": docker_profile.image_identity.model_dump_json(),
+        "platform_architecture": docker_profile.platform_architecture,
         "budget_json": application.app.budget_policy.model_dump_json(),
         "budget_path": str(root / "journey-budget.sqlite"),
         "git_host": {

@@ -226,6 +226,62 @@ application's task/source reservation still requires its own supported settlemen
 using the resulting cleanup evidence; session interruption alone is insufficient.
 
 
+## One profile on Docker and Cayu Cloud
+
+Only the image, runtime user and container restrictions of a
+`DockerCodingToolchainProfile` are about Docker. The rest is
+`CodingToolchainProfile` (in `cayu.environments`), which
+`DockerCodingToolchainProfile` extends: executables, command authorities,
+named checks, fixed environment, dependency inputs, admission probes and the
+prohibited capabilities. `CodingCommandAuthority`, `CodingDependencyInput`,
+`CodingAdmissionProbe` and `CodingFixedEnvironmentVariable` are the same
+classes as their `DockerCoding*` names, with the same schemas, so selector
+fingerprints in existing receipts don't change.
+
+`RunCommandTool`, `StructuredCommandToolPolicy` and `RunCheckTool` take either
+profile type. They accept exactly those two classes, never another subclass,
+and validate their own copy, so a subclass can't change what the model may run.
+With a Docker-typed profile they behave as before. With a neutral profile they
+admit any runner whose evidence names that profile and meets its backend's
+evidence policy:
+
+- `docker`: everything `live_verified`, as for a Docker-typed profile;
+- `cayu-cloud`: executables probed live, capabilities `available`, and the
+  network denied (`egress="none"`).
+
+They only ever evaluate `ExecutionRequirements.trusted(...)`, so this doesn't
+change what an agent's own admission requires: Docker still doesn't satisfy
+`ExecutionRequirements.untrusted()`.
+
+`DockerCodingEnvironmentFactory` takes a neutral profile together with
+`image_identity` (and `platform_architecture` unless the profile names one):
+
+```python
+factory = DockerCodingEnvironmentFactory(
+    source_workspace=LocalWorkspace(workspace_root),
+    toolchain_profile=profile,  # a CodingToolchainProfile
+    image_identity=DockerImageIdentity(reference=tag, content_digest=image_id),
+    platform_architecture="arm64",
+)
+```
+
+It builds the Docker profile with `DockerCodingToolchainProfile.from_toolchain`
+and verifies it exactly as a Docker-typed one. `extra_admission_probes` adds
+Docker-only checks, such as one that the image reports this architecture,
+without tying the neutral profile to a machine. Its runners report the
+neutral profile's fingerprint, so tools holding that same profile admit them.
+`DockerCodingToolchainProfile.coding_toolchain()` goes the other way.
+
+The same neutral profile runs in a sandbox brokered by Cayu Cloud
+([toolchain profiles in a brokered sandbox](environment-factories.md#toolchain-profiles-in-a-brokered-sandbox)),
+and `select_coding_backend` picks between the two
+([choosing a coding backend](environment-factories.md#choosing-a-coding-backend)).
+`cayu new --preset coding` generates that call.
+
+Toolchain failures carry a stable `code`, and, where paths are involved, only
+`path_count` and `paths_fingerprint`; validation errors name the selector or
+probe that is wrong.
+
 ## Writable home and tool caches
 
 Runtime-created Docker coding containers receive a private, disposable home at
