@@ -281,6 +281,41 @@ def test_egress_re_exports_are_the_private_objects() -> None:
     assert extension_egress.ExposedProxy is proxy_exposure.ExposedProxy
 
 
+def test_setup_commands_take_the_request_timeout_and_report_masked_output() -> None:
+    from cayu.egress.adapter import EgressBinding, VirtualEgressRunnerRequest
+
+    calls: list[dict[str, object]] = []
+
+    class _SetupRunner:
+        async def exec_system(self, command: ExecCommand, **options: object) -> ExecResult:
+            calls.append(options)
+            return ExecResult(
+                stdout="resolving\n",
+                stderr="401 for token presented-secret-value\nnetwork unreachable\n",
+                exit_code=7,
+            )
+
+    request = VirtualEgressRunnerRequest(
+        name="sandbox-1",
+        runner_kind="acme",
+        image="image",
+        binding=EgressBinding(),
+        env_overlay={"API_TOKEN": "presented-secret-value"},
+        ca_cert_host_path="/tmp/ca.pem",
+        guest_ca_path="/etc/cayu/ca.pem",
+        setup_commands=("pip install private-package",),
+        egress_destinations=(),
+        setup_command_timeout_s=42,
+    )
+    with pytest.raises(RuntimeError) as failed:
+        asyncio.run(extension_egress.run_setup_commands(_SetupRunner(), request))  # type: ignore[arg-type]
+    message = str(failed.value)
+    assert calls == [{"timeout_s": 42}]
+    assert message.startswith("acme setup command failed (exit code 7); stderr: ")
+    assert "network unreachable" in message and "stdout: resolving" in message
+    assert "presented-secret-value" not in message
+
+
 def test_public_capability_evidence_builder_matches_the_adapter_builder() -> None:
     from cayu.egress.adapter import _virtual_egress_execution_capability_evidence
 

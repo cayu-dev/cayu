@@ -68,9 +68,14 @@ MAX_PATCH_REPLACEMENTS_PER_EDIT = 1_000
 MAX_PATCH_REPLACEMENTS = MAX_PATCH_EDITS * MAX_PATCH_REPLACEMENTS_PER_EDIT
 MAX_PATCH_PATH_BYTES = 4_096
 MAX_PATCH_INPUT_BYTES = 2 * 1024 * 1024
-MAX_PATCH_FILE_BYTES = 4 * 1024 * 1024
-MAX_PATCH_SOURCE_BYTES = 8 * 1024 * 1024
-MAX_PATCH_OUTPUT_BYTES = 8 * 1024 * 1024
+# Defaults and the largest values ApplyPatchTool accepts. Patched files are
+# held in memory and the workspace's own read limit still applies.
+DEFAULT_PATCH_FILE_BYTES = 4 * 1024 * 1024
+MAX_PATCH_FILE_BYTES = 64 * 1024 * 1024
+DEFAULT_PATCH_SOURCE_BYTES = 8 * 1024 * 1024
+MAX_PATCH_SOURCE_BYTES = 128 * 1024 * 1024
+DEFAULT_PATCH_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_PATCH_OUTPUT_BYTES = 128 * 1024 * 1024
 MAX_PATCH_RETAINED_DIFF_BYTES = 2 * 1024 * 1024
 DEFAULT_PATCH_DIFF_PREVIEW_BYTES = 64 * 1024
 MAX_PATCH_DIFF_PREVIEW_BYTES = 200 * 1024
@@ -318,9 +323,9 @@ class ApplyPatchTool(Tool):
         *,
         max_operations: int = MAX_PATCH_OPERATIONS,
         max_input_bytes: int = MAX_PATCH_INPUT_BYTES,
-        max_file_bytes: int = MAX_PATCH_FILE_BYTES,
-        max_source_bytes: int = MAX_PATCH_SOURCE_BYTES,
-        max_output_bytes: int = MAX_PATCH_OUTPUT_BYTES,
+        max_file_bytes: int = DEFAULT_PATCH_FILE_BYTES,
+        max_source_bytes: int = DEFAULT_PATCH_SOURCE_BYTES,
+        max_output_bytes: int = DEFAULT_PATCH_OUTPUT_BYTES,
         max_retained_diff_bytes: int = MAX_PATCH_RETAINED_DIFF_BYTES,
         max_diff_preview_bytes: int = DEFAULT_PATCH_DIFF_PREVIEW_BYTES,
         max_file_diff_preview_bytes: int = DEFAULT_PATCH_FILE_DIFF_PREVIEW_BYTES,

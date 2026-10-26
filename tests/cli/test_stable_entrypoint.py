@@ -416,7 +416,9 @@ def test_entrypoint_counts_only_the_exhausted_steps_retry_backoff(capsys) -> Non
             ]
         raise ModelProviderError("busy", provider="scripted", status_code=503, retryable=True)
 
-    retry_policy = RetryPolicy(max_attempts=3, initial_delay_s=0.1, jitter_s=0.0)
+    retry_policy = RetryPolicy(
+        max_attempts=3, initial_delay_s=0.1, jitter_s=0.0, max_retry_elapsed_s=None
+    )
 
     def factory() -> CayuApp:
         app = CayuApp(config=CayuConfig(run=RunDefaults(retry_policy=retry_policy)))
@@ -438,7 +440,9 @@ def test_entrypoint_reports_exhausted_provider_retries(capsys, status, exhausted
             lambda request: httpx.Response(status, json={"detail": "Try again later."})
         )
     )
-    retry_policy = RetryPolicy(max_attempts=3, initial_delay_s=0.1, jitter_s=0.0)
+    retry_policy = RetryPolicy(
+        max_attempts=3, initial_delay_s=0.1, jitter_s=0.0, max_retry_elapsed_s=None
+    )
 
     def factory() -> CayuApp:
         app = CayuApp(config=CayuConfig(run=RunDefaults(retry_policy=retry_policy)))

@@ -24,6 +24,9 @@ keep 0.2.170.
 `cayu new` may ask PyPI for the latest release; set `CAYU_NO_VERSION_CHECK=1`
 to keep it offline.
 
+Several runtime limits have new defaults (see the breaking changes below), and
+sessions created before this release may not resume after the upgrade.
+
 The Knowledge page now combines proposal review with scoped kept entries, recorded
 attribution and usage, and full-access revision-fenced Remove. Ejected dashboard
 owners should replace the former `src/routes/knowledge.tsx` route with the new
@@ -50,6 +53,74 @@ not affect execution or approval.
 - A `read_file` `image_region` of one pixel or less, such as `[0, 0, 1, 1]` or
   `[0, 0, 0, 0]`, now counts as left out, so on an image it reads the whole
   image. 0.14.0 returned a one-pixel crop or failed.
+- The default `max_steps` is 1,000 (was 64) for SDK runs, HTTP runs, resumes,
+  subagents and product services. Task-backed runs still have no default cap.
+  Pass `max_steps=64` to keep the old bound; `RunLimits` is the budget tool.
+- The absolute model-stream deadline (600 seconds) now counts from the model's
+  last output instead of from dispatch, so a stream that is still producing
+  output is no longer cut off and its session no longer fenced. It still ends a
+  stream that sends only keep-alives or stalls. A stream that trickles output
+  forever is bounded only by `execution_deadline`, `RunLimits` or the task
+  worker's `execution_timeout_s`.
+- A tool that declares no `ToolSpec.max_terminal_payload_bytes` (every MCP
+  tool, application tools without a declaration, and `subagent` with a
+  foreground child) no longer takes the whole staged-terminal pool and runs its
+  round alone across every session in the process. Each such call reserves the
+  largest terminal the 2 MiB event limit allows (1,984 KiB plus 64 KiB of
+  runtime headroom) and shares the pool. Only a round or invocation family
+  larger than the pool is still admitted exclusively. A foreground subagent's
+  child round, which used to be guaranteed admission by its parent's exclusive
+  lease, is now refused only when the pool can't fit it beside other sessions'
+  reservations. The pool is 512 MiB (was 128 MiB); set
+  `ToolExecutionConfig(tool_terminal_staged_capacity_bytes=...)`.
+- `DockerCodingEnvironmentFactory` and `DockerCodingBackendOptions` default
+  `cancel_timeout_s` to 30 seconds (was 5), so a slow `docker rm -f` on a loaded
+  host no longer fails a session that finished its work. A `DockerRunner` built
+  directly keeps 5 seconds.
+- Docker and sandbox coding transfer limits default to 100,000 files, 256 MiB
+  per file, 4 GiB in total and an 8 GiB archive (were 10,000, 8 MiB, 64 MiB and
+  128 MiB), and `SyncBinding` defaults to 100,000 files, 4 GiB and an 8 GiB
+  archive. The generated Docker coding scaffold uses the library defaults
+  instead of writing the old numbers. A tree that a `SyncBinding` copies back
+  is still limited by its completion record, which saves every path and
+  revision in a checkpoint marker of at most 4 MiB, roughly 20,000 files with
+  typical paths. Such a tree is now refused when it binds instead of failing
+  when the session completes.
+- The process-wide `SyncBinding` staging domain allows 16 transfers and 4 GiB
+  (was 4 and 512 MiB). It covers both the on-disk archive spool and the file
+  buffers held in memory while files are copied.
+- MCP calls time out after 300 seconds by default (were 30 seconds over stdio
+  and 120 seconds over HTTP). `GitChangesTool` waits 120 seconds for git (was a
+  fixed 30) and accepts `timeout_seconds=`.
+- `RetryPolicy` now has a 300-second time budget for rate-limit and overload
+  failures (HTTP 429, 503 and 529, or a rate-limit message) by default, and
+  `max_delay_s` defaults to 60 seconds (was 30), which also caps a provider's
+  `Retry-After`. The first such retry uses ordinary backoff; each later one
+  waits its share of the time left, spread over the attempts left and growing
+  by `backoff_multiplier`, and retries stop when the budget is spent. With the
+  defaults the four retries of a sustained rate limit wait about 1, 43, 60 and
+  60 seconds instead of 7.5 to 9.5 seconds in all. `max_attempts` still bounds
+  the attempts, a zero `initial_delay_s` never waits, and
+  `RetryPolicy(max_retry_elapsed_s=None, max_delay_s=30.0)` restores the old
+  behavior. The budget applies to agent model steps and automatic compaction.
+- Lambda MicroVM endpoint calls time out after 120 seconds (was 30) and a
+  sandbox has 180 seconds to become ready (was 60). Suspend and terminate waits
+  use the new `lifecycle_timeout_s` (120 seconds) instead of the request
+  timeout. All three are typed options on `LambdaMicroVMEgressAdapter`;
+  `runner_options` still works, and setting an option in both places raises
+  `ValueError`.
+- Egress: a session broker runs 64 concurrent upstream requests (was 16; the
+  maximum is 512, was 64), an upstream operation may take 3,600 seconds (was
+  600), and the Docker egress proxy accepts 64 connections (was 16; maximum 512,
+  was 64). A request over the broker's capacity is still refused with 503.
+- A brokered command without a timeout asks for the sandbox's remaining
+  lifetime less 60 seconds, by the Agent's clock, instead of all of it. When
+  the broker still refuses a timeout past the remaining lifetime it names, the
+  command is retried once with the broker's number. This fixes sessions failing
+  at setup with `422 sandbox_invalid`.
+- `BrokeredSandboxCodingEnvironmentFactory` without explicit `transfer_limits`
+  allows each file up to the sandbox's staged-copy `max_bytes` less 64 KiB
+  when the sandbox offers staged copies (was one 8 MiB archive less 64 KiB).
 
 ### Changes
 
@@ -316,6 +387,50 @@ not affect execution or approval.
   optional `image_identity` names what a broker-built image was built from.
 - `DockerCodingBackendOptions(cancel_timeout_s=...)` passes the cleanup
   deadline to every factory the Docker backend builds.
+- A session whose binding finalization fails only after its workspace output
+  was copied back, for example on a slow container close, now reports
+  `workspace_output_committed: true` on `session.failed` and on the task error,
+  and `binding_finalize_error` carries the same flag. The session still ends
+  `failed`.
+- `ToolExecutionConfig(tool_round_admission_timeout_seconds=...)` sets how long a
+  tool round waits for terminal publication capacity (600 seconds by default;
+  `None` waits). `ToolSpec.max_terminal_payload_bytes` accepts any positive
+  value; below 64 KiB the runtime reserves and enforces 64 KiB.
+- Built-in tool maximums: `exec_command` output per stream follows the tool's
+  terminal bound (1 MiB by default, was 200,000; the 50 KB default stays); the
+  command timeout ceiling is 12 hours (was 1 hour), with the default still 1
+  hour, raised through `ExecCommandTool(max_timeout_seconds=...)` or
+  `ProcessCommandPolicy(max_timeout_s=...)`; `write_file` and `edit_file`
+  `max_bytes` up to 64 MiB (was 4 MiB); `ApplyPatchTool` up to 64 MiB per file
+  and 128 MiB per patch; `RunCheckTool` model output up to the terminal bound
+  (was 50,000); `SharedArtifactPolicy.max_bytes` up to 1 GiB (was 64 MiB).
+  Defaults are unchanged.
+- The provider stream capacity error names the limit and
+  `ProviderStreamDeadlines(max_concurrent_streams=...)`, whose default is now
+  1,000 (was 100). A stream over the limit still fails at once.
+- `SyncBinding` reserves staging capacity for the file sizes it measures
+  (`LocalWorkspace` and `RunnerWorkspace` measure) instead of its declared
+  limits, so raising the limits no longer fails a small tree with "transfer peak
+  exceeds staged byte capacity". The limits remain ceilings, and a file that
+  grows after it was measured fails the transfer.
+- `run_command` and `run_check` capture the workspace manifest within the new
+  `RunnerWorkspace(manifest_limits=WorkspaceManifestLimits(...))`, which the
+  Docker and sandbox coding factories set from their transfer limits, instead
+  of a fixed 10,000 paths, 8 MiB per file and 64 MiB. The path count is capped
+  at 40,000 by the command journal. `DockerCodingEnvironmentFactory` also takes
+  `staging_capacity=`, and its `warm_spares` is no longer capped at 8.
+- Brokered sandboxes take `staged_copies="auto" | "never" | "always"`. `auto`,
+  the default, chooses as before and now falls back to split archives when a
+  staged copy-in fails while the sandbox is still usable.
+- Setup commands take `setup_command_timeout_s=` on
+  `VirtualEgressEnvironmentFactory`, `SandboxCodingEnvironmentFactory` and
+  `BrokeredSandboxCodingEnvironmentFactory` (300 seconds by default, 600 on
+  brokered sandboxes, as before), and a failed or timed-out setup command's
+  error ends with a masked tail of its stderr and stdout.
+- Egress factories take `max_active_upstream_operations=`,
+  `upstream_total_timeout_s=` and `upstream_max_response_bytes=` (256 MiB by
+  default, because responses are held in memory to scrub credentials), and
+  `DockerEgressAdapter` takes `proxy_max_connections=`.
 - `cayu serve` now logs one warning at startup when a SQLite or PostgreSQL
   session store holds at least 1 GiB or a terminal session older than 30 days
   and no session retention apply is recorded in the last 7 days. Retention

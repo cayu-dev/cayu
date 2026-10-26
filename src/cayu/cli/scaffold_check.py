@@ -1658,6 +1658,7 @@ def _stdlib_declaration_is_inert(
                 "max_unknown_attempts",
                 "initial_delay_s",
                 "max_delay_s",
+                "max_retry_elapsed_s",
                 "backoff_multiplier",
                 "jitter_s",
                 "retry_on_status_codes",

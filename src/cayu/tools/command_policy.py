@@ -8,6 +8,7 @@ from cayu._validation import require_clean_nonblank
 from cayu.runners.base import is_same_or_child
 from cayu.tools.base import ToolContext
 from cayu.tools.commands import (
+    DEFAULT_MAX_TIMEOUT_SECONDS,
     MAX_TIMEOUT_SECONDS,
     CommandPolicy,
     CommandPolicyDecision,
@@ -56,7 +57,7 @@ class ProcessCommandPolicy(CommandPolicy):
         max_env_value_bytes: int = DEFAULT_MAX_ENV_VALUE_BYTES,
         allow_stdin: bool = False,
         max_stdin_bytes: int = DEFAULT_MAX_STDIN_BYTES,
-        max_timeout_s: int = MAX_TIMEOUT_SECONDS,
+        max_timeout_s: int = DEFAULT_MAX_TIMEOUT_SECONDS,
         shell_decision: CommandPolicyDecision = CommandPolicyDecision.DENY,
     ) -> None:
         self._allowed_executables = _validated_strings(

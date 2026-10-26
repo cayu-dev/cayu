@@ -52,7 +52,10 @@ _REQUEST_HEAD_TIMEOUT_S = 10.0
 _REQUEST_BODY_TIMEOUT_S = 300.0
 _TLS_HANDSHAKE_TIMEOUT_S = 10.0
 _SOCKET_POLL_INTERVAL_S = 0.1
-_MAX_PROXY_WORKERS = 64
+# Connections one proxy serves at once; each holds a worker thread while open.
+# One more is refused. Package managers and browsers open many in parallel.
+DEFAULT_EGRESS_PROXY_MAX_CONNECTIONS = 64
+MAX_EGRESS_PROXY_MAX_CONNECTIONS = 512
 _MAX_CERTIFICATE_CACHE_ENTRIES = 128
 _CERTIFICATE_CACHE_TTL_S = 15 * 60.0
 _CERTIFICATE_GENERATION_WAIT_S = 5.0
@@ -290,6 +293,16 @@ def _validated_connect_target(target: str) -> tuple[str, int]:
     return normalize_egress_hostname(host, field_name="CONNECT target"), port
 
 
+def validate_egress_proxy_max_connections(value: object, name: str) -> int:
+    """Return a valid proxy connection-slot count."""
+
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer.")
+    if not 1 <= value <= MAX_EGRESS_PROXY_MAX_CONNECTIONS:
+        raise ValueError(f"{name} must be between 1 and {MAX_EGRESS_PROXY_MAX_CONNECTIONS}.")
+    return value
+
+
 class TransparentEgressProxyServer:
     """A threaded HTTP CONNECT proxy that terminates TLS and calls the broker.
 
@@ -308,14 +321,11 @@ class TransparentEgressProxyServer:
         authority: SessionCertificateAuthority | None = None,
         host: str | Sequence[str] = "127.0.0.1",
         port: int = 0,
-        max_workers: int = 16,
+        max_workers: int = DEFAULT_EGRESS_PROXY_MAX_CONNECTIONS,
         transport_auth_token: bytes | None = None,
         owns_authority: bool = True,
     ) -> None:
-        if type(max_workers) is not int:
-            raise TypeError("max_workers must be an integer.")
-        if not 1 <= max_workers <= _MAX_PROXY_WORKERS:
-            raise ValueError(f"max_workers must be between 1 and {_MAX_PROXY_WORKERS}.")
+        max_workers = validate_egress_proxy_max_connections(max_workers, "max_workers")
         listen_hosts = (host,) if isinstance(host, str) else tuple(host)
         if not listen_hosts or any(not item.strip() for item in listen_hosts):
             raise ValueError("Egress proxy listen hosts must be nonblank.")
@@ -1007,7 +1017,7 @@ class DualStackLoopbackEgressProxyServer(TransparentEgressProxyServer):
         authority: SessionCertificateAuthority | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
-        max_workers: int = 16,
+        max_workers: int = DEFAULT_EGRESS_PROXY_MAX_CONNECTIONS,
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError("Dual-stack loopback proxy host must be '127.0.0.1'.")

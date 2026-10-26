@@ -73,10 +73,14 @@ CAYU_EGRESS_ERROR_HEADER = "X-Cayu-Egress-Error"
 DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 256 * 1024 * 1024
 DEFAULT_EGRESS_BROWSER_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 2 * 1024 * 1024 * 1024
-DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS = 16
-MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS = 64
+# Concurrent upstream requests per session broker. One more is refused with
+# 503 ``upstream_capacity_exhausted``; package managers and browsers open many
+# connections at once. Buffered memory is bounded separately by the budget below.
+DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS = 64
+MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS = 512
 _MAX_ACTIVE_CREDENTIAL_RESOLUTIONS = 16
-DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S = 600.0
+# Total time one upstream request may take, including a streamed response body.
+DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S = 3600.0
 MAX_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S = 3600.0
 # Every in-flight buffered response draws on one broker-wide budget, so many
 # concurrent large downloads fail clearly instead of exhausting host memory.
@@ -1387,6 +1391,17 @@ class HttpxUpstream:
         )
 
 
+def _bounded_upstream_operations(value: int) -> int:
+    if type(value) is not int:
+        raise TypeError("max_active_upstream_operations must be an integer.")
+    if not 1 <= value <= MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS:
+        raise ValueError(
+            "max_active_upstream_operations must be between 1 and "
+            f"{MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS}."
+        )
+    return value
+
+
 def _bounded_timeout(value: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError("timeout_s must be a finite positive number.")
@@ -1489,13 +1504,9 @@ class TransparentEgressBroker:
     ) -> None:
         if resolver is not None:
             validate_secret_resolver(resolver, "resolver")
-        if type(max_active_upstream_operations) is not int:
-            raise TypeError("max_active_upstream_operations must be an integer.")
-        if not 1 <= max_active_upstream_operations <= MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS:
-            raise ValueError(
-                "max_active_upstream_operations must be between 1 and "
-                f"{MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS}."
-            )
+        max_active_upstream_operations = _bounded_upstream_operations(
+            max_active_upstream_operations
+        )
         self._registry = registry
         self._resolver = resolver
         self._policies = dict(policies)

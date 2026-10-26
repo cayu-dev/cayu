@@ -40,6 +40,7 @@ from cayu.tools.base import (
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyRequest
 from cayu.tools.structured_commands import RunCommandTool, StructuredCommandToolPolicy
 from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces import WorkspaceManifestLimits
 from cayu.workspaces.local import LocalWorkspace
 
 
@@ -1592,6 +1593,64 @@ def test_incomplete_post_command_manifest_is_explicitly_partial(
     assert mutation["scope_admitted"] is False
     assert mutation["after_manifest_fingerprint"] is None
     assert result.is_error is True
+
+
+class _DeclaredManifestLimitsWorkspace(LocalWorkspace):
+    manifest_limits = WorkspaceManifestLimits(
+        max_paths=100,
+        max_file_bytes=64,
+        max_total_bytes=1024,
+    )
+
+
+def test_command_manifest_follows_the_workspace_manifest_limits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "uv.lock").write_bytes(b"locked\n")
+    workspace = _DeclaredManifestLimitsWorkspace(tmp_path, workspace_id="workspace")
+    profile = _profile()
+    # The built-in fallback would refuse the 9-byte file; the workspace's
+    # declared limits (its environment's transfer limits) allow it.
+    monkeypatch.setattr(structured_commands, "_COMMAND_MANIFEST_MAX_FILE_BYTES", 8)
+    runner = _MutatingAdmittedRunner(
+        profile,
+        root=tmp_path,
+        mutation_path="tests/generated.txt",
+        content=b"x" * 9,
+    )
+
+    result = _run(
+        RunCommandTool(toolchain_profile=profile),
+        runner,
+        workspace,
+        {"selector": "focused-test", "args": ["tests/test_unit.py"]},
+    )
+
+    assert result.structured["workspace_mutation_evidence"]["complete"] is True
+    # The journal keeps the before manifest, which caps the path count.
+    huge = WorkspaceManifestLimits(
+        max_paths=100_000,
+        max_file_bytes=256 * 1024 * 1024,
+        max_total_bytes=4 * 1024 * 1024 * 1024,
+    )
+    handle = InvocationWorkspaceHandle(
+        _DeclaredManifestLimitsWorkspace(tmp_path, workspace_id="workspace"),
+        redactor_snapshot_provider=lambda: None,
+        capture_observer=lambda _bytes: None,
+    )
+    assert handle.manifest_limits == _DeclaredManifestLimitsWorkspace.manifest_limits
+    monkeypatch.setattr(_DeclaredManifestLimitsWorkspace, "manifest_limits", huge)
+    assert structured_commands._command_manifest_limits(handle) == (
+        40_000,
+        256 * 1024 * 1024,
+        4 * 1024 * 1024 * 1024,
+    )
+    assert structured_commands._command_manifest_limits(LocalWorkspace(tmp_path)) == (
+        10_000,
+        8,
+        64 * 1024 * 1024,
+    )
 
 
 def test_structured_command_rejects_shell_and_path_escape_before_dispatch(

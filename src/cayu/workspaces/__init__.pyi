@@ -21,6 +21,7 @@ from cayu.workspaces.base import WorkspaceGitMode as WorkspaceGitMode
 from cayu.workspaces.base import WorkspaceGitModeMismatchError as WorkspaceGitModeMismatchError
 from cayu.workspaces.base import WorkspaceGitModeMutator as WorkspaceGitModeMutator
 from cayu.workspaces.base import WorkspaceListResult as WorkspaceListResult
+from cayu.workspaces.base import WorkspaceManifestLimits as WorkspaceManifestLimits
 from cayu.workspaces.base import WorkspaceMoveAmbiguousError as WorkspaceMoveAmbiguousError
 from cayu.workspaces.base import WorkspaceMoveFidelity as WorkspaceMoveFidelity
 from cayu.workspaces.base import WorkspaceMoveResult as WorkspaceMoveResult

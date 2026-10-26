@@ -188,9 +188,9 @@ def test_named_check_is_public_immutable_and_snapshots_process_argv() -> None:
         ({"description": ""}, ValueError, "cannot be blank"),
         ({"command": ExecCommand.bash("pytest -q")}, ValueError, "process-form"),
         ({"timeout_s": 0}, ValueError, "greater than zero"),
-        ({"timeout_s": 3_601}, ValueError, "at most 3600"),
+        ({"timeout_s": 12 * 3_600 + 1}, ValueError, "at most 43200"),
         ({"max_output_bytes": 0}, ValueError, "greater than zero"),
-        ({"max_output_bytes": 200_001}, ValueError, "at most 200000"),
+        ({"max_output_bytes": 2_031_617}, ValueError, "at most 2031616"),
         ({"execution_profile_identity": None}, TypeError, "ExecutionProfileBehaviorIdentity"),
     ],
 )
@@ -954,6 +954,24 @@ def test_run_check_distinguishes_unavailable_failed_and_malformed_runners() -> N
     assert unavailable_result.is_error is True
     assert failed_result.is_error is True
     assert malformed_result.is_error is True
+
+
+def test_run_check_model_output_maximum_follows_the_terminal_bound() -> None:
+    def tool(model_bytes: int, bound: int | None = None) -> RunCheckTool:
+        return RunCheckTool(
+            checks=[_check()],
+            command_policy=_policy(),
+            max_model_output_bytes=model_bytes,
+            max_terminal_payload_bytes=bound,
+        )
+
+    assert tool(512 * 1024)._max_model_output_bytes == 512 * 1024
+    assert tool(1024 * 1024)._max_model_output_bytes == 1024 * 1024
+    with pytest.raises(ValueError, match="at most 1048576"):
+        tool(1024 * 1024 + 1)
+    assert tool(256 * 1024, bound=256 * 1024)._max_model_output_bytes == 256 * 1024
+    with pytest.raises(ValueError, match="at most 262144"):
+        tool(256 * 1024 + 1, bound=256 * 1024)
 
 
 def test_run_check_bounds_model_output_and_retains_captured_log_as_artifact(tmp_path) -> None:

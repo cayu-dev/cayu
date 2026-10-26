@@ -77,16 +77,22 @@ from cayu.egress import (
 )
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+    DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS,
     VirtualEgressAllocationPreparation,
     VirtualEgressAllocationReap,
     _await_bounded_cleanup_task,
+    validate_setup_command_timeout,
 )
 from cayu.egress.authority import _copy_egress_authority_identity
 from cayu.egress.broker import (
     DEFAULT_EGRESS_BROWSER_MAX_RESPONSE_BYTES,
+    DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS,
     DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+    DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S,
     EgressResponseBufferBudget,
     _bounded_response_bytes,
+    _bounded_timeout,
+    _bounded_upstream_operations,
 )
 from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.egress.destinations import normalize_egress_hostname, validate_approved_destinations
@@ -116,6 +122,7 @@ from cayu.environments.bindings import (
     NoWorkspaceBinding,
     WorkspaceBinding,
     WorkspaceSnapshot,
+    _binding_copies_back,
     _EnvironmentLifecycleBindAttempt,
     copy_workspace_snapshot,
 )
@@ -177,6 +184,7 @@ from cayu.runtime._binding_cleanup import (
     BindingFinalizeFailure,
     binding_finalize_explicit_cancellation,
     binding_finalize_fatal_signal,
+    binding_finalize_workspace_output_committed,
     record_binding_finalize_failures,
 )
 from cayu.runtime.execution_identity import (
@@ -540,6 +548,19 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     server subprocess or the host HTTP client), never injected into the runner,
     so they sit at the ``trusted_tool`` boundary and are outside this factory.
 
+    Each session's broker takes these limits. ``max_active_upstream_operations``
+    (default 64, at most 512) bounds its concurrent upstream requests; one more
+    is answered with 503 ``upstream_capacity_exhausted``.
+    ``upstream_max_response_bytes`` (default 256 MiB, at most 2 GiB) bounds one
+    buffered response, which the broker holds in memory to scrub credentials, so
+    ``response_buffer_budget`` must hold at least one. ``upstream_total_timeout_s``
+    (default 3,600 s, at most 3,600 s) bounds one upstream request including its
+    response body.
+
+    Each of ``setup_commands`` may run for ``setup_command_timeout_s`` (default
+    300 s); a failure names the command's exit code or timeout and ends with
+    a masked tail of its output.
+
     See ``cayu guide untrusted-code`` for the hardened Docker composition.
     """
 
@@ -554,6 +575,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         resolver: SecretResolver | None = None,
         image: str = DEFAULT_SANDBOX_IMAGE,
         setup_commands: Sequence[str] = (),
+        setup_command_timeout_s: int = DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS,
         adapter: SandboxEgressAdapter | None = None,
         adapter_registry: EgressAdapterRegistry | None = None,
         runner_kind: str | None = None,
@@ -569,6 +591,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         require_test_mode_credentials: bool = True,
         browser_max_response_bytes: int | None = None,
         response_buffer_budget: EgressResponseBufferBudget | None = None,
+        max_active_upstream_operations: int = DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS,
+        upstream_max_response_bytes: int = DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+        upstream_total_timeout_s: float = DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
         egress_authority_generation: int = 1,
         egress_authority_source: str | None = None,
@@ -661,6 +686,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         )
         self._image = image
         self._setup_commands = tuple(setup_commands)
+        self._setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
         self._adapter = adapter
         self._adapter_registry = adapter_registry
         self._runner_kind = selected_runner_kind
@@ -724,6 +750,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             if browser_max_response_bytes is None
             else _bounded_response_bytes(browser_max_response_bytes)
         )
+        self._max_active_upstream_operations = _bounded_upstream_operations(
+            max_active_upstream_operations
+        )
+        self._upstream_max_response_bytes = _bounded_response_bytes(upstream_max_response_bytes)
+        self._upstream_total_timeout_s = _bounded_timeout(upstream_total_timeout_s)
         # Every broker this factory creates (one per session authority) draws on
         # one budget, so concurrent sandboxes share a single memory bound.
         if response_buffer_budget is None:
@@ -731,7 +762,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         elif not isinstance(response_buffer_budget, EgressResponseBufferBudget):
             raise TypeError("response_buffer_budget must be an EgressResponseBufferBudget.")
         largest_response = max(
-            DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+            self._upstream_max_response_bytes,
             DEFAULT_EGRESS_BROWSER_MAX_RESPONSE_BYTES
             if self._browser_max_response_bytes is None
             else self._browser_max_response_bytes,
@@ -914,6 +945,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             require_test_mode_credentials=self._require_test_mode,
             browser_max_response_bytes=self._browser_max_response_bytes,
             response_buffer_budget=self._response_buffer_budget,
+            max_active_upstream_operations=self._max_active_upstream_operations,
+            upstream_max_response_bytes=self._upstream_max_response_bytes,
+            upstream_total_timeout_s=self._upstream_total_timeout_s,
         )
         revoker = _EgressAuthorityRevoker(grants=grants, broker=broker)
         target_credential_env = {grant.env_name: grant.presented_value for grant in grants}
@@ -1334,6 +1368,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             require_test_mode_credentials=self._require_test_mode,
             browser_max_response_bytes=self._browser_max_response_bytes,
             response_buffer_budget=self._response_buffer_budget,
+            max_active_upstream_operations=self._max_active_upstream_operations,
+            upstream_max_response_bytes=self._upstream_max_response_bytes,
+            upstream_total_timeout_s=self._upstream_total_timeout_s,
         )
         authority_revoker = _EgressAuthorityRevoker(
             grants=grants,
@@ -1384,6 +1421,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 ca_cert_host_path=ca_host,
                 guest_ca_path=guest_ca_path,
                 setup_commands=self._setup_commands,
+                setup_command_timeout_s=self._setup_command_timeout_s,
                 egress_destinations=_ordered_destinations(
                     grants,
                     self._approved_destinations,
@@ -5339,6 +5377,14 @@ class _EgressTeardownBinding(WorkspaceBinding):
                 finalization_state.inner_retired = True
             except BaseException as exc:
                 cleanup_error = exc
+        # Without an inner error the inner pass finished, now or in an earlier
+        # attempt, so only teardown or diagnostics failed. Its output committed
+        # only if that pass copied back for this outcome.
+        workspace_output_committed = (
+            _binding_copies_back(self._inner, outcome)
+            if inner_error is None
+            else binding_finalize_workspace_output_committed(inner_error)
+        )
         failures: list[BindingFinalizeFailure] = []
         if revoke_cancelled:
             failures.append(
@@ -5386,6 +5432,7 @@ class _EgressTeardownBinding(WorkspaceBinding):
                 finalization_error,
                 tuple(failures),
                 supplemental_redactor=self._finalize_redactor,
+                workspace_output_committed=workspace_output_committed,
             )
             raise finalization_error from diagnostic_fatal
         if failures:
@@ -5400,6 +5447,7 @@ class _EgressTeardownBinding(WorkspaceBinding):
                 finalization_error,
                 tuple(failures),
                 supplemental_redactor=self._finalize_redactor,
+                workspace_output_committed=workspace_output_committed,
             )
             if len(failures) == 1:
                 raise finalization_error

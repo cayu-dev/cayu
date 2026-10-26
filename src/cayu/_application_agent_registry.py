@@ -54,7 +54,6 @@ from cayu.sessions.fork_overlays import FORK_CONTROLLER_AGENT_SEPARATOR, fork_co
 from cayu.sessions.store import SessionStore
 from cayu.tools._terminal_bounds import (
     MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
-    MIN_TOOL_TERMINAL_PAYLOAD_BYTES,
     application_tool_declares_no_bound,
 )
 from cayu.tools.base import Tool, ToolEffect
@@ -600,13 +599,13 @@ class ApplicationAgentRegistry:
             return
         self._unbounded_tools_reported.add(registered_tool.name)
         logger.warning(
-            "Tool %s declares no max_terminal_payload_bytes. Every deferred round that "
-            "calls it takes all terminal publication capacity in this process, so those "
-            "rounds run one at a time and other sessions' tool rounds wait for them. "
-            "Declare ToolSpec(max_terminal_payload_bytes=...) as the largest result the "
-            "tool returns, between %d and %d bytes.",
+            "Tool %s declares no max_terminal_payload_bytes, so every call reserves the "
+            "largest terminal result Cayu can store (%d bytes) from the terminal "
+            "publication capacity shared by every session in this process. Declare "
+            "ToolSpec(max_terminal_payload_bytes=...) as the largest result the tool "
+            "returns, at most %d bytes.",
             registered_tool.name,
-            MIN_TOOL_TERMINAL_PAYLOAD_BYTES,
+            MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
             MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
         )
 

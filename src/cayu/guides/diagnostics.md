@@ -147,17 +147,18 @@ the tool is registered.
 `TOOL_TERMINAL_PAYLOAD_UNBOUNDED` means an application's own tool declares no
 `ToolSpec.max_terminal_payload_bytes`. Cayu reserves the declared size of each
 deferred tool round from terminal publication capacity shared by every session
-in the process. A round that calls a tool without a declaration takes all of
-that capacity alone, so those rounds run one at a time and other sessions'
-rounds wait for them; under concurrent load they can wait until the 600-second
-admission deadline fails them with `ToolRoundAdmissionTimeoutError`. Set
-`max_terminal_payload_bytes` to the largest result the tool returns, between
-64 KiB and 1,984 KiB. A result larger than the declaration fails as
+in the process (`ToolExecutionConfig.tool_terminal_staged_capacity_bytes`,
+512 MiB by default). Each call to a tool without a declaration reserves the
+largest terminal result Cayu can store, 1,984 KiB, so fewer rounds fit at once
+and, under heavy concurrent load, rounds wait for capacity and can reach the
+admission deadline (`ToolExecutionConfig.tool_round_admission_timeout_seconds`,
+600 seconds by default), which fails them with
+`ToolRoundAdmissionTimeoutError`. Set `max_terminal_payload_bytes` to the
+largest result the tool returns, at most 1,984 KiB; a smaller bound than 64 KiB
+reserves 64 KiB. A result larger than the declaration fails as
 `invalid_tool_output` instead of being published, so keep the tool's own output
-caps inside it. Leave it undeclared only for a tool whose `run` awaits child
-sessions in the same invocation, which the exclusive lease always admits. Cayu
-also logs a warning when the tool is registered. Built-in tools and MCP tools
-are not reported.
+caps inside it. Cayu also logs a warning when the tool is registered. Built-in
+tools and MCP tools are not reported.
 
 ## tool-input-schema-runtime-unsupported
 

@@ -23,7 +23,12 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from cayu.artifacts import ArtifactStore
-from cayu.egress.adapter import SandboxEgressAdapter
+from cayu.egress.adapter import DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS, SandboxEgressAdapter
+from cayu.egress.broker import (
+    DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS,
+    DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+    DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S,
+)
 from cayu.egress.destinations import ApprovedEgressDestination
 from cayu.egress.policy import EgressPolicy
 from cayu.egress.runtime import (
@@ -35,6 +40,10 @@ from cayu.egress.runtime import (
 )
 from cayu.environments._sync_staging import SyncBindingStagingCapacity
 from cayu.environments.bindings import (
+    MAX_WORKSPACE_TRANSFER_ARCHIVE_BYTES,
+    MAX_WORKSPACE_TRANSFER_FILE_BYTES,
+    MAX_WORKSPACE_TRANSFER_FILES,
+    MAX_WORKSPACE_TRANSFER_TOTAL_BYTES,
     SyncBinding,
     SyncBindingContext,
     SyncTargetWorkspacePlan,
@@ -42,7 +51,7 @@ from cayu.environments.bindings import (
 from cayu.knowledge.base import KnowledgeStore
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.vaults import SecretResolver
-from cayu.workspaces import LocalWorkspace, RunnerWorkspace
+from cayu.workspaces import LocalWorkspace, RunnerWorkspace, WorkspaceManifestLimits
 
 __all__ = ["SandboxCodingEnvironmentFactory", "SandboxWorkspaceTransferLimits"]
 
@@ -51,18 +60,40 @@ _PROTECTED_DIRECTORY_NAMES = (".cayu", ".git", ".runtime")
 
 
 class SandboxWorkspaceTransferLimits(BaseModel):
-    """Finite copy-in and copy-back limits for one coding sandbox."""
+    """Finite copy-in and copy-back limits for one coding sandbox.
+
+    Transfers spool to disk and reserve staging capacity from the files they
+    measure, so these are ceilings, not reservations. A single file is held in
+    memory while it is copied, which the staging capacity bounds.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    max_files: int = Field(default=10_000, ge=1, le=100_000)
-    max_file_bytes: int = Field(default=8 * 1024 * 1024, ge=1, le=64 * 1024 * 1024)
-    max_total_bytes: int = Field(default=64 * 1024 * 1024, ge=1, le=1024 * 1024 * 1024)
-    max_archive_bytes: int = Field(
-        default=128 * 1024 * 1024,
-        ge=1024,
-        le=2 * 1024 * 1024 * 1024,
+    max_files: int = Field(default=100_000, ge=1, le=MAX_WORKSPACE_TRANSFER_FILES)
+    max_file_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1,
+        le=MAX_WORKSPACE_TRANSFER_FILE_BYTES,
     )
+    max_total_bytes: int = Field(
+        default=4 * 1024 * 1024 * 1024,
+        ge=1,
+        le=MAX_WORKSPACE_TRANSFER_TOTAL_BYTES,
+    )
+    max_archive_bytes: int = Field(
+        default=8 * 1024 * 1024 * 1024,
+        ge=1024,
+        le=MAX_WORKSPACE_TRANSFER_ARCHIVE_BYTES,
+    )
+
+    def manifest_limits(self) -> WorkspaceManifestLimits:
+        """The bounds a command's workspace manifest is captured within."""
+
+        return WorkspaceManifestLimits(
+            max_paths=self.max_files,
+            max_file_bytes=self.max_file_bytes,
+            max_total_bytes=self.max_total_bytes,
+        )
 
 
 class SandboxCodingEnvironmentFactory(VirtualEgressEnvironmentFactory):
@@ -105,6 +136,13 @@ class SandboxCodingEnvironmentFactory(VirtualEgressEnvironmentFactory):
     One source workspace belongs to one active session at a time; a concurrent
     session over the same source is refused rather than sharing a writable
     sandbox.
+
+    Each of ``setup_commands`` may run for ``setup_command_timeout_s`` (default
+    300 s); provider timeouts are configured on the adapter.
+
+    ``max_active_upstream_operations``, ``upstream_max_response_bytes`` and
+    ``upstream_total_timeout_s`` set the egress broker's limits, as on
+    ``VirtualEgressEnvironmentFactory``.
     """
 
     def __init__(
@@ -120,6 +158,7 @@ class SandboxCodingEnvironmentFactory(VirtualEgressEnvironmentFactory):
         open_internet_policy: str | None = None,
         resolver: SecretResolver | None = None,
         setup_commands: Sequence[str] = (),
+        setup_command_timeout_s: int = DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS,
         transfer_limits: SandboxWorkspaceTransferLimits | None = None,
         sync_back: Literal["always", "on_success", "never"] = "on_success",
         sandbox_excluded_directory_names: Sequence[str] = (),
@@ -129,6 +168,9 @@ class SandboxCodingEnvironmentFactory(VirtualEgressEnvironmentFactory):
         knowledge_access_scope_factory: VirtualEgressKnowledgeAccessScopeFactory | None = None,
         event_emitter: EventEmitter | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+        max_active_upstream_operations: int = DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS,
+        upstream_max_response_bytes: int = DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+        upstream_total_timeout_s: float = DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S,
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError(
@@ -175,6 +217,7 @@ class SandboxCodingEnvironmentFactory(VirtualEgressEnvironmentFactory):
                     workspace_id=f"sandbox-coding:{context.session_id}",
                     excluded_directory_names=excluded,
                     excluded_path_patterns=excluded_patterns,
+                    manifest_limits=transfer_limits.manifest_limits(),
                 )
             )
 
@@ -189,6 +232,7 @@ class SandboxCodingEnvironmentFactory(VirtualEgressEnvironmentFactory):
             resolver=resolver,
             image=image,
             setup_commands=setup_commands,
+            setup_command_timeout_s=setup_command_timeout_s,
             adapter=adapter,
             inner_binding=SyncBinding(
                 target_workspace_plan_factory=target_plan,
@@ -211,4 +255,7 @@ class SandboxCodingEnvironmentFactory(VirtualEgressEnvironmentFactory):
             knowledge_access_scope_factory=knowledge_access_scope_factory,
             event_emitter=event_emitter,
             execution_profile_identity=execution_profile_identity,
+            max_active_upstream_operations=max_active_upstream_operations,
+            upstream_max_response_bytes=upstream_max_response_bytes,
+            upstream_total_timeout_s=upstream_total_timeout_s,
         )

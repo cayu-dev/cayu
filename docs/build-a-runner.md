@@ -512,7 +512,7 @@ For runners that pair with a remote virtual-egress adapter (see
 | `prepare_exposed_proxy_binding` | Starts a session proxy listener, exposes it through a `ProxyExposure`, and returns an `EgressBinding`. Teardown revokes grants before releasing the exposure and listener; failed preparation rolls back the same way. |
 | `ProxyExposure`, `ExposedProxy` | The exposure protocol and its result (`credentialless_isolated` must be asserted for credentialless routes). |
 | `ProxyServerFactory`, `DEFAULT_PROXY_SERVER_FACTORY` | Injectable proxy listener constructor. |
-| `run_setup_commands`, `DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS` | Runs the request's setup commands through `Runner.exec_system`. |
+| `run_setup_commands`, `DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS` | Runs the request's setup commands through `Runner.exec_system`, each bounded by `request.setup_command_timeout_s` (the factory's `setup_command_timeout_s`, default 300 s). A failure ends with a masked tail of the command's output. |
 | `run_enforcement_preflight` | In-guest probe proving brokered reachability and direct-egress denial; returns the observation time. |
 | `virtual_egress_execution_capability_evidence` | Builds `ExecutionCapabilityEvidence` for an enforced virtual-egress runner with strictly typed inputs. |
 

@@ -34,6 +34,7 @@ from cayu.workspaces import (
     RunnerWorkspace,
     TarStreamWriter,
     TarWriter,
+    WorkspaceManifestLimits,
 )
 from cayu.workspaces._tar import tar_archive_size_bound
 
@@ -1224,6 +1225,76 @@ def test_runner_workspace_list_returns_sorted_prefix_at_payload_limit(
     assert result.paths == tuple(sorted(expected)[: len(result.paths)])
     assert result.total_count == len(expected)
     assert result.truncated is True
+
+
+def test_runner_workspace_listing_payload_scales_with_manifest_limits(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_workspace_module, "RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES", 1024)
+    # About 70-byte paths: 20 of them overflow the 1 KiB default listing.
+    directory = tmp_path / ("d" * 20)
+    directory.mkdir()
+    expected = []
+    for index in range(20):
+        path = directory / f"{index:02d}-{'f' * 40}.txt"
+        path.write_bytes(b"x" * index)
+        expected.append(path.relative_to(tmp_path).as_posix())
+    limits = WorkspaceManifestLimits(max_paths=20, max_file_bytes=64, max_total_bytes=1024)
+    workspace = RunnerWorkspace(
+        LocalRunner(tmp_path, inherit_env=False),
+        workspace_id="runner",
+        python_executable=sys.executable,
+        manifest_limits=limits,
+    )
+
+    # Every allowed path fits the listing and the content manifest.
+    listing = asyncio.run(workspace.list("**/*.txt", limit=20))
+    manifest = asyncio.run(
+        workspace.capture_content_manifest(max_paths=20, max_file_bytes=64, max_total_bytes=1024)
+    )
+
+    assert asyncio.run(_workspace(tmp_path).list("**/*.txt", limit=20)).truncated is True
+    assert workspace.manifest_limits == limits
+    assert listing.paths == tuple(sorted(expected))
+    assert listing.truncated is False
+    assert [entry[0] for entry in manifest.entries] == sorted(expected)
+    invalid_limits: Any = (20, 64, 1024)
+    with pytest.raises(TypeError, match="manifest_limits"):
+        RunnerWorkspace(LocalRunner(tmp_path), manifest_limits=invalid_limits)
+    with pytest.raises(ValueError, match="max_paths"):
+        WorkspaceManifestLimits(max_paths=0, max_file_bytes=1, max_total_bytes=1)
+
+
+class _CountingExecRunner(LocalRunner):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.exec_calls = 0
+
+    async def exec(self, *args: Any, **kwargs: Any) -> ExecResult:
+        self.exec_calls += 1
+        return await super().exec(*args, **kwargs)
+
+
+def test_runner_workspace_measures_transfer_sizes_in_batches(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_workspace_module, "_RUNNER_WORKSPACE_MEASURE_BATCH_BYTES", 16)
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "a.txt").write_bytes(b"a" * 3)
+    (tmp_path / "nested" / "b.txt").write_bytes(b"b" * 10)
+    (tmp_path / "empty.txt").write_bytes(b"")
+    runner = _CountingExecRunner(tmp_path, inherit_env=False)
+    workspace = RunnerWorkspace(runner, workspace_id="runner", python_executable=sys.executable)
+
+    sizes = asyncio.run(workspace._observe_transfer_sizes(("a.txt", "empty.txt", "nested/b.txt")))
+
+    assert sizes == (13, 10)
+    # One guest command per batch of paths.
+    assert runner.exec_calls == 2
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(workspace._observe_transfer_sizes(("missing.txt",)))
 
 
 def test_runner_workspace_rejects_path_and_pattern_escape(tmp_path) -> None:

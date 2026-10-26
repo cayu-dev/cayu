@@ -113,8 +113,9 @@ def test_transport_clients_preserve_legacy_defaults_with_shared_byte_limits() ->
 
     assert stdio_limits.max_message_bytes == DEFAULT_MCP_MAX_MESSAGE_BYTES == 16 * 1024 * 1024
     assert stdio_limits.max_response_bytes == DEFAULT_MCP_MAX_RESPONSE_BYTES == 64 * 1024 * 1024
-    assert (stdio_limits.idle_timeout_s, stdio_limits.total_call_timeout_s) == (30.0, 30.0)
-    assert (http_limits.idle_timeout_s, http_limits.total_call_timeout_s) == (120.0, 120.0)
+    assert (stdio_limits.idle_timeout_s, stdio_limits.total_call_timeout_s) == (300.0, 300.0)
+    assert (http_limits.idle_timeout_s, http_limits.total_call_timeout_s) == (300.0, 300.0)
+    assert McpTransportLimits().total_call_timeout_s == 300.0
 
 
 def test_stdio_rejects_conflicting_legacy_and_limits_configuration() -> None:

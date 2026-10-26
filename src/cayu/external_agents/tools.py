@@ -130,7 +130,7 @@ class ExternalPermissionTool(Tool):
                 description="Authorize one external harness built-in tool call.",
                 input_schema={"type": "object"},
                 effect=ToolEffect.NONE,
-                # The receipt is a fixed few bytes; this is the smallest bound Cayu accepts.
+                # The receipt is a fixed few bytes; this is the smallest bound Cayu reserves.
                 max_terminal_payload_bytes=MIN_TOOL_TERMINAL_PAYLOAD_BYTES,
             )
         )

@@ -28,6 +28,8 @@ from hashlib import sha256
 from typing import Any, Literal
 
 from cayu._validation import canonical_durable_json_bytes
+from cayu.egress._remote_adapter import setup_command_failure_message
+from cayu.egress.adapter import validate_setup_command_timeout
 from cayu.egress.sandbox_coding import SandboxWorkspaceTransferLimits
 from cayu.environments import (
     Environment,
@@ -84,7 +86,9 @@ from cayu.sandbox_broker.runner import (
     STAGED_FILE_OVERHEAD_BYTES,
     BrokeredSandboxRunner,
     BrokeredSandboxWorkspace,
+    StagedCopiesMode,
     sandbox_capability_claims,
+    validate_staged_copies_mode,
 )
 from cayu.workspaces import LocalWorkspace, RunnerWorkspace, Workspace
 
@@ -115,10 +119,11 @@ DEFAULT_IMAGE = "coding-python"
 DEFAULT_LEASE_SECONDS = 900
 # Cloud fails a sandbox still provisioning after five minutes.
 DEFAULT_READY_TIMEOUT_SECONDS = 330.0
+#: How long each setup command may run, unless the factory sets otherwise.
+DEFAULT_BROKERED_SETUP_COMMAND_TIMEOUT_SECONDS = 600
 _PROTECTED_DIRECTORY_NAMES = (".cayu", ".git", ".runtime")
 _FACTORY_LABEL_KEYS = frozenset({"cayu.environment", "cayu.session"})
 _MAX_USER_LABELS = 10 - len(_FACTORY_LABEL_KEYS)
-_SETUP_COMMAND_TIMEOUT_SECONDS = 600
 _TOOLCHAIN_WORKSPACE = "/workspace"
 
 
@@ -144,10 +149,12 @@ class BrokeredSandboxCodingBinding(SyncBinding):
         *,
         git_baseline: bool = True,
         workspace_setup_commands: Sequence[str] = (),
+        setup_command_timeout_s: int = DEFAULT_BROKERED_SETUP_COMMAND_TIMEOUT_SECONDS,
         **options: Any,
     ) -> None:
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
+        self._setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
         super().__init__(**options)
         self._git_baseline = git_baseline
         self._workspace_setup_commands = _validated_commands(
@@ -199,12 +206,15 @@ class BrokeredSandboxCodingBinding(SyncBinding):
                 result = await bound.runner.exec(
                     ExecCommand.bash(command),
                     cwd=target.runner_cwd,
-                    timeout_s=_SETUP_COMMAND_TIMEOUT_SECONDS,
+                    timeout_s=self._setup_command_timeout_s,
                 )
                 if result.exit_code != 0 or result.timed_out or result.cancelled:
                     raise RuntimeError(
-                        "Brokered sandbox workspace setup command failed with exit code "
-                        f"{result.exit_code}."
+                        setup_command_failure_message(
+                            "Brokered sandbox workspace setup command",
+                            result,
+                            timeout_s=self._setup_command_timeout_s,
+                        )
                     )
         except BaseException:
             self.abandon(bound)
@@ -330,7 +340,16 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     baseline) in ``/workspace``, for example to install the project's locked
     dependencies; anything they write under ``/workspace`` is published back
     like any other change, so write environments elsewhere (for example
-    ``UV_PROJECT_ENVIRONMENT=/tmp/venv``).
+    ``UV_PROJECT_ENVIRONMENT=/tmp/venv``). Each setup command may run for
+    ``setup_command_timeout_s`` (default 600 s); a failure ends with a
+    masked tail of the command's output.
+
+    ``staged_copies`` chooses when the workspace moves through the sandbox's
+    staged copies (see ``BrokeredSandboxWorkspace``): ``"auto"`` (the default)
+    where needed, falling back to split archives when a staged copy-in fails;
+    ``"never"``; or ``"always"``, which refuses a sandbox without them. Without
+    ``transfer_limits`` the largest file follows each sandbox: what its staged
+    copies carry where it offers them, otherwise one broker archive.
 
     ``toolchain_profile`` binds every sandbox to one neutral
     ``CodingToolchainProfile``, so ``run_check`` and ``run_command`` with that
@@ -371,6 +390,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         git_baseline: bool = True,
         workspace_setup_commands: Sequence[str] = (),
         toolchain_profile: CodingToolchainProfile | None = None,
+        setup_command_timeout_s: int = DEFAULT_BROKERED_SETUP_COMMAND_TIMEOUT_SECONDS,
+        staged_copies: StagedCopiesMode = "auto",
     ) -> None:
         if not isinstance(broker, SandboxBrokerClient):
             raise TypeError("broker must be a SandboxBrokerClient.")
@@ -382,10 +403,23 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         egress, owned_hosts = validate_egress(egress, egress_hosts)
         if type(image) is not str or not image.strip():
             raise ValueError("image must name a sandbox catalog entry.")
+        owned_staged_copies = validate_staged_copies_mode(staged_copies)
+        # Without explicit limits, the largest file follows what each sandbox
+        # can carry: its staged copies where it offers them, else one archive.
+        self._max_file_bytes_follow_sandbox = transfer_limits is None
         if transfer_limits is None:
             transfer_limits = SandboxWorkspaceTransferLimits(max_file_bytes=MAX_TRANSFER_FILE_BYTES)
         elif type(transfer_limits) is not SandboxWorkspaceTransferLimits:
             raise TypeError("transfer_limits must be SandboxWorkspaceTransferLimits.")
+        elif (
+            owned_staged_copies == "never"
+            and transfer_limits.max_file_bytes > MAX_TRANSFER_FILE_BYTES
+        ):
+            raise ValueError(
+                f"transfer_limits.max_file_bytes={transfer_limits.max_file_bytes} needs staged "
+                f"copies, which staged_copies='never' turns off; one broker archive carries "
+                f"files of at most {MAX_TRANSFER_FILE_BYTES} bytes."
+            )
         if type(ready_timeout_s) not in {int, float} or ready_timeout_s <= 0:
             raise ValueError("ready_timeout_s must be positive.")
         if type(git_baseline) is not bool:
@@ -427,6 +461,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         self.ready_timeout_s = float(ready_timeout_s)
         self.renew_every_s = renew_every_s
         self.git_baseline = git_baseline
+        self.setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
+        self.staged_copies: StagedCopiesMode = owned_staged_copies
         names = {
             name.casefold(): name
             for name in (
@@ -600,17 +636,21 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 await _admit_toolchain(runner, profile)
             for command in self.setup_commands:
                 result = await runner.exec(
-                    ExecCommand.bash(command), timeout_s=_SETUP_COMMAND_TIMEOUT_SECONDS
+                    ExecCommand.bash(command), timeout_s=self.setup_command_timeout_s
                 )
                 if result.exit_code != 0 or result.timed_out:
                     raise RuntimeError(
-                        f"Brokered sandbox setup command failed with exit code {result.exit_code}."
+                        setup_command_failure_message(
+                            "Brokered sandbox setup command",
+                            result,
+                            timeout_s=self.setup_command_timeout_s,
+                        )
                     )
             environment = Environment(
                 EnvironmentSpec(name=request.environment_name),
                 workspace=self._protected_source,
                 runner=runner,
-                binding=self._binding(),
+                binding=self._binding(sandbox),
             )
         except BaseException as original:
             await self._discard(sandbox, keeper, runner, original)
@@ -643,12 +683,17 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
 
         One archive carries a file of up to ``MAX_TRANSFER_FILE_BYTES``; a larger
         one moves only as a staged copy, which the install must offer and size.
+        With ``staged_copies="always"`` the sandbox must offer staged copies.
         """
 
-        limits = self.transfer_limits
-        if limits.max_file_bytes <= MAX_TRANSFER_FILE_BYTES:
-            return
         staged = sandbox.staged_copies
+        if self.staged_copies == "always" and staged is None:
+            raise RuntimeError(
+                "staged_copies='always', but this sandbox broker offers no staged copies."
+            )
+        limits = self.transfer_limits
+        if self._max_file_bytes_follow_sandbox or limits.max_file_bytes <= MAX_TRANSFER_FILE_BYTES:
+            return
         needed = limits.max_file_bytes + STAGED_FILE_OVERHEAD_BYTES
         if staged is None or staged.max_bytes < needed:
             raise RuntimeError(
@@ -702,10 +747,28 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 "the broker destroys it when its lease lapses."
             )
 
-    def _binding(self) -> BrokeredSandboxCodingBinding:
+    def _max_file_bytes(self, sandbox: SandboxRecord) -> int:
+        """The largest file one session moves through this sandbox."""
+
+        limits = self.transfer_limits
+        staged = sandbox.staged_copies
+        if (
+            not self._max_file_bytes_follow_sandbox
+            or staged is None
+            or self.staged_copies == "never"
+        ):
+            return limits.max_file_bytes
+        # A file moves alone as one staged copy, beside its tar framing.
+        return max(
+            limits.max_file_bytes,
+            min(staged.max_bytes - STAGED_FILE_OVERHEAD_BYTES, limits.max_total_bytes),
+        )
+
+    def _binding(self, sandbox: SandboxRecord) -> BrokeredSandboxCodingBinding:
         limits = self.transfer_limits
         excluded = self._excluded
         excluded_patterns = self._excluded_patterns
+        staged_copies = self.staged_copies
 
         def target_plan(context: SyncBindingContext) -> SyncTargetWorkspacePlan:
             runner = context.runner
@@ -714,6 +777,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             return SyncTargetWorkspacePlan(
                 workspace=BrokeredSandboxWorkspace(
                     runner,
+                    staged_copies=staged_copies,
                     workspace_id=f"brokered-sandbox:{context.session_id}",
                     excluded_directory_names=excluded,
                     excluded_path_patterns=excluded_patterns,
@@ -723,7 +787,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         return BrokeredSandboxCodingBinding(
             target_workspace_plan_factory=target_plan,
             max_files=limits.max_files,
-            max_file_bytes=limits.max_file_bytes,
+            max_file_bytes=self._max_file_bytes(sandbox),
             max_total_bytes=limits.max_total_bytes,
             max_archive_bytes=limits.max_archive_bytes,
             clean_target="always",
@@ -734,6 +798,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             staging_capacity=self.staging_capacity,
             git_baseline=self.git_baseline,
             workspace_setup_commands=self.workspace_setup_commands,
+            setup_command_timeout_s=self.setup_command_timeout_s,
         )
 
 
@@ -836,9 +901,13 @@ def _configuration_fingerprint(factory: BrokeredSandboxCodingEnvironmentFactory)
         "egress": factory.egress,
         "sync_back": factory.sync_back,
         "git_baseline": factory.git_baseline,
+        "staged_copies": factory.staged_copies,
         "transfer_limits": {
             "max_files": limits.max_files,
-            "max_file_bytes": limits.max_file_bytes,
+            # Without explicit limits it follows each sandbox's staged copies.
+            "max_file_bytes": (
+                "sandbox" if factory._max_file_bytes_follow_sandbox else limits.max_file_bytes
+            ),
             "max_total_bytes": limits.max_total_bytes,
             "max_archive_bytes": limits.max_archive_bytes,
         },
@@ -883,6 +952,7 @@ class BrokeredCodingBackendOptions:
     broker: SandboxBrokerClient | None = None
     labels: Mapping[str, str] | None = None
     git_baseline: bool = True
+    staged_copies: StagedCopiesMode = "auto"
 
     def __post_init__(self) -> None:
         if type(self.image) is not str or not self.image.strip():
@@ -892,6 +962,7 @@ class BrokeredCodingBackendOptions:
             raise TypeError("broker must be a SandboxBrokerClient or None.")
         if type(self.git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
+        validate_staged_copies_mode(self.staged_copies)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> BrokeredCodingBackendOptions:
@@ -966,6 +1037,7 @@ def brokered_coding_backend(context: Any) -> Any:
             transfer_limits=options.transfer_limits,
             git_baseline=options.git_baseline,
             toolchain_profile=profile,
+            staged_copies=options.staged_copies,
         )
 
     return CodingBackend(

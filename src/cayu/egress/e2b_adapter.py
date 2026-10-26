@@ -39,7 +39,6 @@ from cayu.egress.proxy_server import SessionCertificateAuthority
 from cayu.environments.admission import ExecutionCapabilityEvidence
 from cayu.extensions.egress import (
     DEFAULT_PROXY_SERVER_FACTORY,
-    DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS,
     ProxyExposure,
     ProxyServerFactory,
     prepare_exposed_proxy_binding,
@@ -272,7 +271,7 @@ class E2BEgressAdapter(SandboxEgressAdapter):
         handoff_timeout_s = (
             DEFAULT_E2B_HANDOFF_TIMEOUT_SECONDS
             + ((1 + bool(request.setup_commands)) * self._preflight_timeout_s)
-            + (len(request.setup_commands) * DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS)
+            + (len(request.setup_commands) * request.setup_command_timeout_s)
         )
         try:
             if allow_create:

@@ -382,6 +382,7 @@ class LiveModelAttempt:
         memory_evidence_reference: MemoryEvidenceReference | None,
         child_session_notification_binding: ChildSessionNotificationStageBinding | None,
         prepared_model_completion_dispatch: ModelCompletionDispatch | None,
+        retry_elapsed_s: Callable[[], float] | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         input_coverage = context_input_coverage(
             model_request.messages, transcript_cursor=transcript_cursor_before_request
@@ -1393,6 +1394,7 @@ class LiveModelAttempt:
                             and provider_error.status_code is None
                             and provider_error.retryable is None
                         ),
+                        elapsed_s=None if retry_elapsed_s is None else retry_elapsed_s(),
                     )
 
                     if provider_operation_state is not None:

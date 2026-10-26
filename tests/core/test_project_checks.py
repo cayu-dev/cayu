@@ -442,7 +442,7 @@ def test_tool_without_terminal_payload_bound_is_a_deploy_visible_warning() -> No
     assert finding.path == "agents.reviewer.tools.report.max_terminal_payload_bytes"
     assert finding.tags == ("authoring", "deploy")
     assert finding.parameters == {"agent": "reviewer", "tool": "report"}
-    assert "takes all terminal publication capacity" in finding.message
+    assert "every call reserves the largest terminal result" in finding.message
     assert "ToolSpec(max_terminal_payload_bytes=...)" in finding.hint
     assert finding.documentation_anchor == (
         "cayu guide diagnostics#tool-terminal-payload-unbounded"

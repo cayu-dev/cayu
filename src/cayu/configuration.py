@@ -25,8 +25,12 @@ from cayu.sessions.cleanup import (
     RecoveryCleanupPolicy,
     copy_recovery_cleanup_policy,
 )
+from cayu.tools.terminal_publication import (
+    TOOL_ROUND_ADMISSION_TIMEOUT_SECONDS,
+    TOOL_TERMINAL_STAGED_CAPACITY_BYTES,
+)
 
-DEFAULT_MAX_STEPS = 64
+DEFAULT_MAX_STEPS = 1000
 # Keep step allowances exact across durable JSON and JavaScript API clients.
 MAX_STEPS = 2**53 - 1
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
@@ -113,17 +117,27 @@ class ToolExecutionConfig(BaseModel):
         default=DEFAULT_MAX_PARALLEL_TOOL_CALLS,
         ge=1,
     )
+    # Terminal results staged by deferred tool rounds, shared by every session
+    # in the application. A round reserves its tools' declared result bounds
+    # before any tool runs and waits while the reservation does not fit.
+    tool_terminal_staged_capacity_bytes: StrictInt = Field(
+        default=TOOL_TERMINAL_STAGED_CAPACITY_BYTES,
+        ge=1,
+    )
+    # How long such a round waits for that capacity before failing without
+    # running a tool. None waits until capacity is released.
+    tool_round_admission_timeout_seconds: float | None = TOOL_ROUND_ADMISSION_TIMEOUT_SECONDS
 
-    @field_validator("tool_timeout_seconds", mode="before")
+    @field_validator("tool_timeout_seconds", "tool_round_admission_timeout_seconds", mode="before")
     @classmethod
-    def validate_tool_timeout_seconds(cls, value: Any) -> float | None:
+    def validate_tool_timeout_seconds(cls, value: Any, info: Any) -> float | None:
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ValueError("tool_timeout_seconds must be a number.")
+            raise ValueError(f"{info.field_name} must be a number.")
         resolved = float(value)
         if not isfinite(resolved) or resolved <= 0:
-            raise ValueError("tool_timeout_seconds must be a finite positive number.")
+            raise ValueError(f"{info.field_name} must be a finite positive number.")
         return resolved
 
 
@@ -197,6 +211,32 @@ class CayuConfig(BaseModel):
         return OperationsConfig.model_validate(
             {field_name: getattr(value, field_name) for field_name in value.model_fields_set}
         )
+
+
+# The type that owns each configurable field, by its path in CayuConfig.
+CAYU_CONFIG_FIELD_OWNERS = {
+    "evals.max_concurrency": "cayu.configuration.EvalConfig",
+    "run.max_steps": "cayu.configuration.RunDefaults",
+    "run.limits": "cayu.runtime.stop_policy.RunLimits",
+    "run.retry_policy": "cayu.providers.retry_policy.RetryPolicy",
+    "run.thinking": "cayu.context.thinking.ThinkingConfig",
+    "tool_execution.max_file_attachment_bytes": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.max_total_file_attachment_bytes": ("cayu.configuration.ToolExecutionConfig"),
+    "tool_execution.max_file_attachments_per_request": ("cayu.configuration.ToolExecutionConfig"),
+    "tool_execution.image_max_frame_bytes": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.image_max_total_bytes": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.image_max_frames": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.tool_timeout_seconds": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.max_parallel_tool_calls": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.tool_terminal_staged_capacity_bytes": (
+        "cayu.configuration.ToolExecutionConfig"
+    ),
+    "tool_execution.tool_round_admission_timeout_seconds": (
+        "cayu.configuration.ToolExecutionConfig"
+    ),
+    "operations.max_environment_lifecycle_owners": "cayu.configuration.OperationsConfig",
+    "operations.recovery_cleanup_policy": ("cayu.sessions.cleanup.RecoveryCleanupPolicy"),
+}
 
 
 def copy_cayu_config(config: CayuConfig | None) -> CayuConfig:

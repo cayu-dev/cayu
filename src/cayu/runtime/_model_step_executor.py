@@ -1745,6 +1745,12 @@ class ModelStepExecutor:
         ):
             raise ValueError("Initial model attempt belongs to a different logical step.")
         attempt = 1
+        # The rate-limit retry budget counts from the step's first attempt.
+        retry_window_started_at = asyncio.get_running_loop().time()
+
+        def retry_elapsed_s() -> float:
+            return max(0.0, asyncio.get_running_loop().time() - retry_window_started_at)
+
         prior_retry_failure: ModelAttemptFailed | None = None
         prompt_contribution_manifest = (
             await self._load_prompt_contribution_manifest(session.id)
@@ -1959,6 +1965,7 @@ class ModelStepExecutor:
                     attempt=attempt,
                     max_attempts=retry_policy.max_attempts,
                     retry_policy=retry_policy,
+                    retry_elapsed_s=retry_elapsed_s,
                     model_attempt_identity=model_attempt_identity,
                     transcript_cursor_before_request=transcript_cursor_before_request,
                     record_model_completion=record_model_completion,
@@ -2068,6 +2075,7 @@ class ModelStepExecutor:
                         retry_after_s=retry_after_s,
                         unknown_provider_error=unknown_provider_error,
                         suppression=_attempt_retry_suppression(exc),
+                        elapsed_s=retry_elapsed_s(),
                     )
                 elif (
                     decision.attempt != attempt

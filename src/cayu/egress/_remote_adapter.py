@@ -5,8 +5,10 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
 from cayu._exception_groups import add_exception_note_safely
+from cayu.egress._docker_diagnostics import docker_stderr_tail
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+    DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS,
     EgressBinding,
     VirtualEgressRunnerRequest,
     _await_bounded_cleanup_task,
@@ -19,13 +21,16 @@ from cayu.egress.errors import UnsupportedEgressCapabilityError, UnsupportedEgre
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ExposedProxy, HttpProxyEndpoint, ProxyExposure
 from cayu.egress.proxy_server import SessionCertificateAuthority, TransparentEgressProxyServer
-from cayu.runners.base import ExecCommand, Runner
+from cayu.runners.base import ExecCommand, ExecResult, Runner
+from cayu.vaults import SecretRedactor
 
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
 #: Binding env key carrying a per-session proxy transport token to a trusted
 #: guest relay. The first-party Lambda sidecar strips it from agent commands.
 PROXY_TRANSPORT_TOKEN_ENV = "CAYU_EGRESS_PROXY_TRANSPORT_TOKEN"
-DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS = 300
+#: The default bound on each setup command; the factory's
+#: ``setup_command_timeout_s`` reaches adapters on the runner request.
+DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS = DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS
 _METADATA_ISOLATION_UNSUPPORTED_EXIT_CODE = 42
 
 ProxyServerFactory = Callable[..., TransparentEgressProxyServer]
@@ -259,18 +264,49 @@ async def run_enforcement_preflight(
 
 
 async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest) -> None:
-    """Run each setup command through ``Runner.exec_system``; fail on the first error."""
+    """Run each setup command through ``Runner.exec_system``; fail on the first error.
+
+    Each command is bounded by ``request.setup_command_timeout_s``. The error
+    ends with the last lines of the command's output, with the environment
+    overlay's values redacted and credential shapes masked.
+    """
 
     for command in request.setup_commands:
         result = await runner.exec_system(
             ExecCommand.bash(command),
-            timeout_s=DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS,
+            timeout_s=request.setup_command_timeout_s,
         )
         if result.exit_code != 0 or result.timed_out:
             raise RuntimeError(
-                f"{request.runner_kind} setup command failed "
-                f"(exit_code={result.exit_code}, timed_out={result.timed_out})."
+                setup_command_failure_message(
+                    f"{request.runner_kind} setup command",
+                    result,
+                    timeout_s=request.setup_command_timeout_s,
+                    redactor=SecretRedactor(
+                        [value for value in request.env_overlay.values() if value]
+                    ),
+                )
             )
+
+
+def setup_command_failure_message(
+    label: str,
+    result: ExecResult,
+    *,
+    timeout_s: int,
+    redactor: SecretRedactor | None = None,
+) -> str:
+    """Say why a setup command failed, ending with a bounded, masked tail of its output."""
+
+    if result.timed_out:
+        reason = f"timed out after {timeout_s} seconds"
+    elif result.cancelled:
+        reason = "was cancelled"
+    else:
+        reason = f"exit code {result.exit_code}"
+    stderr = docker_stderr_tail(result.stderr, redactor=redactor)
+    stdout = docker_stderr_tail(result.stdout, redactor=redactor)
+    return f"{label} failed ({reason}); stderr: {stderr}; stdout: {stdout}"
 
 
 def _preflight_script(

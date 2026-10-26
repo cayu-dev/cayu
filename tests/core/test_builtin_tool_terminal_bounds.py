@@ -150,7 +150,8 @@ def test_applications_set_a_builtin_bound_at_construction(name: str) -> None:
 @pytest.mark.parametrize(
     ("value", "error"),
     [
-        (MIN_TOOL_TERMINAL_PAYLOAD_BYTES - 1, ValueError),
+        (0, ValueError),
+        (-1, ValueError),
         (MAX_TOOL_TERMINAL_PAYLOAD_BYTES + 1, ValueError),
         (True, TypeError),
         (128 * KIB + 0.5, TypeError),
@@ -159,6 +160,33 @@ def test_applications_set_a_builtin_bound_at_construction(name: str) -> None:
 def test_builtin_bounds_outside_what_cayu_can_store_are_refused(value, error) -> None:
     with pytest.raises(error, match="max_terminal_payload_bytes"):
         ExecCommandTool(max_terminal_payload_bytes=value)
+
+
+@pytest.mark.parametrize("value", [1, 4 * KIB, MIN_TOOL_TERMINAL_PAYLOAD_BYTES - 1])
+def test_builtin_bounds_below_the_minimum_are_rounded_up(value) -> None:
+    tool = ExecCommandTool(max_terminal_payload_bytes=value)
+
+    assert tool.spec.max_terminal_payload_bytes == MIN_TOOL_TERMINAL_PAYLOAD_BYTES
+
+
+def test_an_application_bound_below_the_minimum_reserves_and_enforces_the_minimum() -> None:
+    from cayu.agents import AgentSpec
+    from cayu.tools.catalogue import ToolExecutionContract
+
+    class _Receipt(Tool):
+        spec = ToolSpec(name="receipt", max_terminal_payload_bytes=512)
+
+        async def run(self, ctx, args):
+            return ToolResult(content="ok")
+
+    assert _Receipt.spec.max_terminal_payload_bytes == 512
+    app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+    app.register_agent(AgentSpec(name="worker", model="test-model"), tools=[_Receipt()])
+    registered = app._get_registered_agent("worker").executable_tool("receipt")
+
+    assert registered is not None
+    contract = ToolExecutionContract.model_validate(registered.execution_contract)
+    assert contract.max_terminal_payload_bytes == MIN_TOOL_TERMINAL_PAYLOAD_BYTES
 
 
 def test_a_bound_declared_on_an_explicit_spec_is_kept() -> None:
@@ -449,9 +477,24 @@ def test_exec_command_cuts_encoded_output_as_a_marked_preview(tmp_path) -> None:
     assert TERMINAL_PAYLOAD_TRUNCATION_FIELD not in result.structured
 
 
+def test_built_in_spec_with_a_bound_below_the_minimum_is_rounded_up(tmp_path) -> None:
+    spec = ExecCommandTool.spec.model_copy(update={"max_terminal_payload_bytes": 512})
+    tool = ExecCommandTool(spec=spec)
+
+    assert tool.spec.max_terminal_payload_bytes == 64 * KIB
+    result = asyncio.run(
+        tool.run(
+            ToolContext(session_id="s", runner=LocalRunner(tmp_path)),
+            {"kind": "process", "argv": [sys.executable, "-c", "print('ok')"]},
+        )
+    )
+    assert result.is_error is False
+    assert result.structured["stdout"] == "ok\n"
+
+
 def test_exec_command_keeps_the_start_and_end_of_long_text_output(tmp_path) -> None:
     ctx = ToolContext(session_id="s", runner=LocalRunner(tmp_path))
-    tool = ExecCommandTool(max_terminal_payload_bytes=64 * KIB)
+    tool = ExecCommandTool(max_terminal_payload_bytes=256 * KIB)
     script = "print('first'); print('\"' * 150000); print('last')"
 
     result = asyncio.run(
@@ -465,7 +508,7 @@ def test_exec_command_keeps_the_start_and_end_of_long_text_output(tmp_path) -> N
         )
     )
 
-    assert tool_result_payload_bytes(result) <= 64 * KIB
+    assert tool_result_payload_bytes(result) <= 256 * KIB
     assert result.structured["stdout_encoding"] == "text"
     assert result.structured["stdout_truncated"] is True
     assert result.structured["stdout"].startswith("first\n")
@@ -622,7 +665,7 @@ def test_subagent_with_a_foreground_child_declares_no_bound_unless_asked() -> No
 
 def test_claims_that_built_ins_declare_a_bound_name_the_foreground_subagent() -> None:
     # Because of the case above, a claim that every built-in declares a bound
-    # must name foreground subagents, whose rounds still take the exclusive lease.
+    # must name foreground subagents, which declare none.
     contracts = Path(__file__).resolve().parents[2] / "docs" / "runtime-contracts.md"
     texts = {
         "runtime-contracts.md": " ".join(contracts.read_text(encoding="utf-8").split()),

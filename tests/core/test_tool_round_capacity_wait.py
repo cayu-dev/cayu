@@ -26,7 +26,7 @@ from cayu.tools.terminal_publication import (
 
 class _ExternalTool(Tool):
     def __init__(self, name: str, calls: list[str]) -> None:
-        # No declared terminal bound, so the round needs the exclusive lease.
+        # No declared terminal bound, so each call reserves the event-limit ceiling.
         self.spec = ToolSpec(
             name=name,
             description="Record one external dispatch.",
@@ -171,7 +171,7 @@ def test_round_waiting_past_admission_deadline_fails_before_any_tool_runs(caplog
         # tool names and session IDs belong only in operator logs.
         assert "exclusive_holder_unbounded_tools" not in error
         assert "waiting_round_unbounded_tools=first_tool,second_tool." in error
-        assert "declare the largest result each named tool returns." in error
+        assert "declare the largest result each named tool returns" in error
         assert "exclusive_holder_sessions" not in error
         assert all(holder not in event.model_dump_json() for event in persisted)
         assert all("legacy_export" not in event.model_dump_json() for event in persisted)

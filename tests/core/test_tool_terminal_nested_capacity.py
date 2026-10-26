@@ -6,6 +6,7 @@ import pytest
 from tests.runtime.runtime_provider_support import FakeProvider
 from tests.runtime.runtime_session_support import collect_events
 
+from cayu._validation import DURABLE_EVENT_LIMITS
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.events import EventType
@@ -86,7 +87,8 @@ def test_inline_child_capacity_uses_durable_family_without_releasing_parent(
             max_terminal_payload_bytes=100_000 if bounded else None,
         )
         if not bounded:
-            # Exercise the exclusive lease an undeclared tool takes.
+            # An undeclared tool reserves the event-limit ceiling, which is
+            # larger than this domain.
             delegate.spec = delegate.spec.model_copy(update={"max_terminal_payload_bytes": None})
         if mode == "capacity-rejected":
             await governor.reserve_round(
@@ -115,10 +117,10 @@ def test_inline_child_capacity_uses_durable_family_without_releasing_parent(
             else:
                 await asyncio.wait_for(entered.wait(), timeout=20)
                 assert governor.snapshot().active_round_reservations == 2
-                if mode.startswith("bounded-family"):
-                    assert governor.snapshot().reserved_round_bytes > 256_000
-                else:
-                    assert governor.snapshot().reserved_round_bytes == 256_000
+                # Either way the family outgrows this small domain, so it is
+                # admitted exclusively.
+                assert governor.snapshot().reserved_round_bytes > 256_000
+                assert governor.snapshot().active_exclusive_rounds == 2
                 competing = asyncio.create_task(
                     governor.reserve_round(
                         session_id="unrelated",
@@ -474,7 +476,7 @@ def test_sibling_children_queue_behind_an_unrelated_round_once_their_parent_fini
         order = []
 
         class ProbeTool(Tool):
-            # Unbounded terminal, so each sibling round needs the exclusive lease.
+            # Unbounded terminal, so each sibling round fills the domain below.
             spec = ToolSpec(
                 name="probe",
                 description="Run one long probe.",
@@ -531,7 +533,11 @@ def test_sibling_children_queue_behind_an_unrelated_round_once_their_parent_fini
         app = CayuApp(
             session_store=store, task_store=tasks, dispatcher=dispatcher, enable_logging=False
         )
-        governor = ToolTerminalPublicationGovernor(round_admission_timeout_s=None)
+        # One undeclared call reserves the whole domain, so rounds take turns.
+        governor = ToolTerminalPublicationGovernor(
+            staged_capacity_bytes=DURABLE_EVENT_LIMITS.max_bytes,
+            round_admission_timeout_s=None,
+        )
         app._tool_round_executor.invocation.terminals.governor = governor
         delegate = SubagentTool(
             app,

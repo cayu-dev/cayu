@@ -262,6 +262,12 @@ def test_terminal_docker_cleanup_drain_matches_exact_physical_census(
             ):
                 assert "session.failed" in event_types
                 assert "environment.binding.finalize_failed" in event_types
+                if mode in ("close_failure", "copyback_failure"):
+                    failure = next(event for event in events if str(event.type) == "session.failed")
+                    # Only a close after a finished copy-back keeps the output.
+                    assert failure.payload["workspace_output_committed"] is (
+                        mode == "close_failure"
+                    ), dict(failure.payload)
                 assert await app.drain_environment_cleanups(timeout_s=0.2) is False
                 assert exists(container_id)
                 checkpoint = await store.load_checkpoint(session_id)

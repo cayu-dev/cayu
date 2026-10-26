@@ -156,6 +156,10 @@ class FakeBroker:
         # Responses without a contract code, as authentication, a proxy or the ingress send.
         self.bare_statuses: list[int] = []
         self.cancel_confirms = True
+        # How far the broker's clock runs ahead of the Agent's, and how many
+        # command timeouts it refused for passing the remaining lifetime.
+        self.clock_ahead_seconds = 0.0
+        self.lifetime_refusals = 0
         # Seconds a start takes to register, so a cancel can overtake it.
         self.start_delay = 0.0
         self.archive_limit = ARCHIVE_LIMIT
@@ -167,6 +171,8 @@ class FakeBroker:
         self.catalog = {"coding-python"}
         # What new sandboxes offer for staged copies; None offers none.
         self.staged_copies: dict[str, int] | None = None
+        # Staged copy-ins that fail after extracting part of their archive.
+        self.fail_copy_ins = 0
         # Whether new sandboxes run interactive commands; Cloud before them refuses the field.
         self.interactive_commands = True
         # Staged objects by key, and every request the storage received.
@@ -397,6 +403,20 @@ class FakeBroker:
             if existing.body != body:
                 return _error(409, "command_id_conflict")
             return httpx.Response(200, json=existing.view())
+        if sandbox.max_expires_at is not None:
+            # Cloud checks a new command's timeout against its own clock.
+            now = datetime.now(UTC) + timedelta(seconds=self.clock_ahead_seconds)
+            remaining = max(1, int((sandbox.max_expires_at - now).total_seconds()))
+            if body["timeout_seconds"] > remaining:
+                self.lifetime_refusals += 1
+                return _error(
+                    422,
+                    "sandbox_invalid",
+                    message=(
+                        "timeout_seconds must be at most the sandbox's remaining lifetime "
+                        f"({remaining} seconds)."
+                    ),
+                )
         if "interactive" in body and not sandbox.interactive_commands:
             # A broker without interactive commands rejects the unknown field.
             return _error(422, "sandbox_invalid")
@@ -606,6 +626,14 @@ class FakeBroker:
             return
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
             members = archive.getmembers()
+            if self.fail_copy_ins:
+                # Fail part-way, leaving the first member extracted.
+                self.fail_copy_ins -= 1
+                archive.extractall(
+                    sandbox.root / copy.get("path", "."), members=members[:1], filter="data"
+                )
+                copy.update(status="failed", error={"code": "copy_failed", "message": ""})
+                return
             archive.extractall(sandbox.root / copy.get("path", "."), filter="data")
         copy.update(status="done", files=len(members))
 
@@ -682,7 +710,10 @@ def _json_capped(raw: bytes, limit: int) -> tuple[str, bool]:
     return text[:low], True
 
 
-def _error(status: int, code: str, detail: dict[str, Any] | None = None) -> httpx.Response:
+def _error(
+    status: int, code: str, detail: dict[str, Any] | None = None, *, message: str | None = None
+) -> httpx.Response:
     return httpx.Response(
-        status, json={"error": {"code": code, "message": code, "detail": detail or {}}}
+        status,
+        json={"error": {"code": code, "message": message or code, "detail": detail or {}}},
     )

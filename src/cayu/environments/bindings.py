@@ -28,6 +28,7 @@ from cayu._exception_groups import (
 )
 from cayu._task_wait import await_shielded_task_outcome, unexpected_child_cancellation_error
 from cayu._validation import (
+    _json_string_body_size,
     copy_durable_json_object,
     copy_durable_metadata,
     copy_json_value,
@@ -138,6 +139,50 @@ class _SyncSourceRevision:
     git_mode: WorkspaceGitMode | None = None
 
 
+# Completion finalization saves a bind's paths and revisions in one checkpoint
+# marker of at most 4 MiB (sessions/_completion_finalization.py), inside a
+# checkpoint of at most 250,000 JSON nodes. These leave room for the marker's
+# envelope and the rest of the checkpoint.
+_COMPLETION_MARKER_STATE_MAX_BYTES = 3 * 1024 * 1024 + 512 * 1024
+_COMPLETION_MARKER_STATE_MAX_NODES = 200_000
+
+
+def _require_completion_marker_capacity(
+    source_paths: tuple[str, ...],
+    target_baseline_paths: tuple[str, ...],
+    source_revisions: tuple[_SyncSourceRevision, ...],
+) -> None:
+    """Refuse at bind a tree whose completion finalization record cannot be saved.
+
+    Otherwise the session would do all its work and then fail when it
+    completes, before copy-back.
+    """
+
+    # Compact JSON: a listed path is one node and its quotes and comma; a
+    # revision is an object of three fields, seven nodes and 42 bytes of keys
+    # and punctuation beside its values.
+    nodes = len(source_paths) + len(target_baseline_paths) + 7 * len(source_revisions)
+    size = (
+        sum(_json_string_body_size(path) + 3 for path in source_paths)
+        + sum(_json_string_body_size(path) + 3 for path in target_baseline_paths)
+        + sum(
+            _json_string_body_size(item.path)
+            + _json_string_body_size(item.revision)
+            + _json_string_body_size(item.git_mode or "")
+            + 42
+            for item in source_revisions
+        )
+    )
+    if nodes > _COMPLETION_MARKER_STATE_MAX_NODES or size > _COMPLETION_MARKER_STATE_MAX_BYTES:
+        raise RuntimeError(
+            f"SyncBinding cannot finalize this tree of {len(source_paths)} files: completion "
+            f"finalization saves its paths and revisions in one record of about {size} bytes "
+            f"and {nodes} nodes, above {_COMPLETION_MARKER_STATE_MAX_BYTES} bytes or "
+            f"{_COMPLETION_MARKER_STATE_MAX_NODES} nodes. Bind a smaller tree, for example "
+            "by excluding generated or vendored directories."
+        )
+
+
 @dataclass(frozen=True)
 class _SyncBindingState:
     source_paths: tuple[str, ...]
@@ -152,10 +197,23 @@ class _SyncBindingState:
 
 
 @dataclass(frozen=True, slots=True)
+class _SyncTransferSizes:
+    """Measured logical bytes of the files one transfer will stage."""
+
+    total_bytes: int
+    largest_file_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class _SyncSourceObservation:
     revisions: tuple[_SyncSourceRevision, ...]
     content_sha256: str
     logical_bytes: int
+    largest_file_bytes: int = 0
+
+    @property
+    def sizes(self) -> _SyncTransferSizes:
+        return _SyncTransferSizes(self.logical_bytes, self.largest_file_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,8 +263,17 @@ class _BoundedSyncArchiveWriter:
         self._destination.flush()
 
 
-DEFAULT_SYNC_MAX_TOTAL_BYTES = 64 * 1024 * 1024
-DEFAULT_SYNC_MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
+DEFAULT_SYNC_MAX_FILES = 100_000
+DEFAULT_SYNC_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+DEFAULT_SYNC_MAX_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024
+# Ceilings for the coding factories' transfer limits. Listings and command
+# manifests carry every path through one command's output, which bounds the
+# file count; the byte ceilings only stop a typo from naming an unbounded
+# transfer, because each transfer must still fit its staging capacity.
+MAX_WORKSPACE_TRANSFER_FILES = 100_000
+MAX_WORKSPACE_TRANSFER_FILE_BYTES = 64 * 1024 * 1024 * 1024
+MAX_WORKSPACE_TRANSFER_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
+MAX_WORKSPACE_TRANSFER_ARCHIVE_BYTES = 128 * 1024 * 1024 * 1024
 _SYNC_GIT_MODE_TAR_OWNER = "cayu.git-mode.v1"
 
 
@@ -1406,7 +1473,7 @@ class SyncBinding(WorkspaceBinding):
         target_workspace_factory: Callable[[SyncBindingContext], object] | None = None,
         path: str | None = None,
         pattern: str = "**/*",
-        max_files: int = 10_000,
+        max_files: int = DEFAULT_SYNC_MAX_FILES,
         max_file_bytes: int | None = None,
         max_total_bytes: int | None = DEFAULT_SYNC_MAX_TOTAL_BYTES,
         max_archive_bytes: int | None = DEFAULT_SYNC_MAX_ARCHIVE_BYTES,
@@ -1814,6 +1881,11 @@ class SyncBinding(WorkspaceBinding):
                     ),
                     bytes_total=self.max_total_bytes,
                 )
+                observed_sizes = (
+                    source_observation.sizes
+                    if source_observation is not None
+                    else await _observe_sync_transfer_sizes(workspace, source_paths)
+                )
                 _require_sync_copy_staging_capacity(
                     source=workspace,
                     target=target,
@@ -1823,6 +1895,7 @@ class SyncBinding(WorkspaceBinding):
                     max_archive_bytes=self.max_archive_bytes,
                     staging_capacity=self.staging_capacity,
                     requires_source_observation=source_observation is not None,
+                    observed=observed_sizes,
                 )
                 cleaned_paths: tuple[str, ...] = ()
                 if self.clean_target == "always":
@@ -1878,6 +1951,7 @@ class SyncBinding(WorkspaceBinding):
                         source=workspace,
                         target=target,
                     ),
+                    observed=observed_sizes,
                 )
                 await _report_sync_lifecycle(
                     EnvironmentLifecyclePhase.TRANSFER,
@@ -1933,6 +2007,10 @@ class SyncBinding(WorkspaceBinding):
                     "cleaned_target_files": len(cleaned_paths),
                 },
             }
+            if _should_sync_back(self.sync_back, "completed"):
+                _require_completion_marker_capacity(
+                    source_paths, target_baseline_paths, source_revisions
+                )
             bound = BoundWorkspace(
                 workspace=target,
                 source_workspace=workspace,
@@ -2156,6 +2234,7 @@ class SyncBinding(WorkspaceBinding):
                     staging_capacity=self.staging_capacity,
                     source_observation=None,
                     archive_policy=None,
+                    observed=await _observe_sync_transfer_sizes(bound.workspace, copy_back_paths),
                 )
                 for path in deleted_paths:
                     await _await_sync_mutation(
@@ -2233,27 +2312,46 @@ class SyncBinding(WorkspaceBinding):
                     bytes_completed=0,
                     bytes_total=self.max_total_bytes,
                 )
-                archive_reservation = _sync_archive_reservation_bound(
-                    copy_back_paths,
-                    max_file_bytes=max_file_bytes,
-                    max_total_bytes=max_total_bytes,
-                    max_archive_bytes=self.max_archive_bytes,
-                )
-                if archive_reservation is None:
-                    raise AssertionError("Revision-aware SyncBinding requires finite staging.")
-                staging_capacity._record_archive_build()
-                archive = await _pack_workspace_tar(
+                observed = await _observe_sync_transfer_sizes(target, copy_back_paths)
+                source_stream = target.bounded_tar_stream_reader()
+                plan = _sync_copy_plan(
                     source=target,
-                    source_stream=target.bounded_tar_stream_reader(),
+                    source_stream=source_stream,
+                    target=source,
+                    # Members are written one at a time from the private spool.
+                    target_stream=None,
                     paths=copy_back_paths,
                     max_file_bytes=max_file_bytes,
                     max_total_bytes=max_total_bytes,
                     max_archive_bytes=self.max_archive_bytes,
-                    archive_reservation=archive_reservation,
+                    requires_source_observation=True,
                     staging_capacity=staging_capacity,
+                    observed=observed,
+                    # Covers the source revision checks below, which read
+                    # host files up to the declared per-file limit.
                     minimum_transient_bytes=max_file_bytes,
-                    preserve_git_modes=self.preserve_git_modes,
                 )
+                if plan is None:
+                    raise AssertionError("Revision-aware SyncBinding requires finite staging.")
+                staging_capacity._record_archive_build()
+                try:
+                    archive = await _pack_workspace_tar(
+                        source=target,
+                        source_stream=source_stream,
+                        paths=copy_back_paths,
+                        max_file_bytes=plan.max_file_bytes,
+                        max_total_bytes=plan.max_total_bytes,
+                        max_archive_bytes=self.max_archive_bytes,
+                        archive_reservation=plan.archive_reservation,
+                        staging_capacity=staging_capacity,
+                        minimum_transient_bytes=plan.consumer_transient_bytes,
+                        preserve_git_modes=self.preserve_git_modes,
+                    )
+                except RuntimeError as error:
+                    limit_note = _sync_plan_limit_note(plan, observed)
+                    if limit_note is not None:
+                        error.add_note(limit_note)
+                    raise
                 copied_bytes = archive.logical_bytes
                 await _report_sync_lifecycle(
                     EnvironmentLifecyclePhase.ARCHIVE_PREPARATION,
@@ -3117,6 +3215,7 @@ async def _capture_sync_source_revisions(
         revisions=tuple(revisions),
         content_sha256=hashlib.sha256(encoded).hexdigest(),
         logical_bytes=observed_bytes,
+        largest_file_bytes=max((entry[2] for entry in manifest), default=0),
     )
 
 
@@ -3191,8 +3290,13 @@ async def _copy_paths(
     staging_capacity: SyncBindingStagingCapacity,
     source_observation: _SyncSourceObservation | None,
     archive_policy: _SyncArchivePolicy | None,
+    observed: _SyncTransferSizes | None = None,
 ) -> int:
-    """Copy files through one capacity-owned, private, immutable tar spool."""
+    """Copy files through one capacity-owned, private, immutable tar spool.
+
+    ``observed`` sizes size the staging reservation; the declared limits stay
+    its ceiling.
+    """
 
     if not paths:
         return 0
@@ -3219,13 +3323,20 @@ async def _copy_paths(
             preserve_git_modes=preserve_git_modes,
             staging_capacity=staging_capacity,
         )
-    archive_reservation = _sync_archive_reservation_bound(
-        paths,
+    plan = _sync_copy_plan(
+        source=source,
+        source_stream=source_stream,
+        target=target,
+        target_stream=target_stream,
+        paths=paths,
         max_file_bytes=max_file_bytes,
         max_total_bytes=max_total_bytes,
         max_archive_bytes=max_archive_bytes,
+        requires_source_observation=source_observation is not None,
+        staging_capacity=staging_capacity,
+        observed=observed,
     )
-    if archive_reservation is None:
+    if plan is None:
         return await _copy_paths_per_file(
             source=source,
             target=target,
@@ -3235,30 +3346,32 @@ async def _copy_paths(
             preserve_git_modes=preserve_git_modes,
             staging_capacity=staging_capacity,
         )
-    minimum_transient_bytes = _sync_transfer_transient_reservation_bound(
-        target=target,
-        target_stream=target_stream,
-        paths=paths,
-        max_file_bytes=max_file_bytes,
-        max_total_bytes=max_total_bytes,
-        max_archive_bytes=max_archive_bytes,
-        archive_reservation=archive_reservation,
-        requires_source_observation=source_observation is not None,
-    )
+    # The copy runs within the planned limits, so the reservation, the spool
+    # and every read stay inside what was measured or what capacity holds.
+    max_file_bytes = plan.max_file_bytes
+    max_total_bytes = plan.max_total_bytes
+    archive_reservation = plan.archive_reservation
+    minimum_transient_bytes = plan.consumer_transient_bytes
+    limit_note = _sync_plan_limit_note(plan, observed)
 
     async def build_archive() -> _SealedTarArchive:
-        archive = await _pack_workspace_tar(
-            source=source,
-            source_stream=source_stream,
-            paths=paths,
-            max_file_bytes=max_file_bytes,
-            max_total_bytes=max_total_bytes,
-            max_archive_bytes=max_archive_bytes,
-            archive_reservation=archive_reservation,
-            staging_capacity=staging_capacity,
-            minimum_transient_bytes=minimum_transient_bytes,
-            preserve_git_modes=preserve_git_modes,
-        )
+        try:
+            archive = await _pack_workspace_tar(
+                source=source,
+                source_stream=source_stream,
+                paths=paths,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=max_total_bytes,
+                max_archive_bytes=max_archive_bytes,
+                archive_reservation=archive_reservation,
+                staging_capacity=staging_capacity,
+                minimum_transient_bytes=minimum_transient_bytes,
+                preserve_git_modes=preserve_git_modes,
+            )
+        except RuntimeError as error:
+            if limit_note is not None:
+                error.add_note(limit_note)
+            raise
         if source_observation is not None:
             try:
                 await _verify_sync_source_revisions(
@@ -3569,9 +3682,16 @@ async def _pack_workspace_tar(
             del tar_data
         else:
             copied_bytes = 0
-            staged_logical_limit = (
-                None if max_archive_bytes is None else max_archive_bytes - archive_overhead_bytes
-            )
+            # The spool holds at most the admitted reservation, which can be
+            # below the declared archive limit.
+            staged_logical_limit = archive_reservation - archive_overhead_bytes
+            staged_limit_label = f"the staged archive reservation of {archive_reservation} bytes"
+            if (
+                max_archive_bytes is not None
+                and max_archive_bytes - archive_overhead_bytes <= staged_logical_limit
+            ):
+                staged_logical_limit = max_archive_bytes - archive_overhead_bytes
+                staged_limit_label = f"max_archive_bytes={max_archive_bytes}"
             with tarfile.open(fileobj=active_spool, mode="w|") as tar:
                 for path in paths:
                     result = await _read_sync_file_result(
@@ -3581,11 +3701,7 @@ async def _pack_workspace_tar(
                         max_total_bytes=max_total_bytes,
                         copied_bytes=copied_bytes,
                         max_staged_bytes=staged_logical_limit,
-                        staged_limit_label=(
-                            None
-                            if max_archive_bytes is None
-                            else f"max_archive_bytes={max_archive_bytes}"
-                        ),
+                        staged_limit_label=staged_limit_label,
                     )
                     copied_bytes += len(result.content)
                     info = tarfile.TarInfo(name=path)
@@ -3846,6 +3962,143 @@ def _sync_archive_builder_transient_reservation_bound(
     )
 
 
+def _sync_measured_limits(
+    *,
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    observed: _SyncTransferSizes | None,
+) -> tuple[int | None, int | None]:
+    """Narrow the declared per-file and total limits to measured sizes.
+
+    Without a declared per-file limit, reads keep the workspace's own read
+    limit, so only the total is narrowed and it bounds each file.
+    """
+
+    if observed is None:
+        return max_file_bytes, max_total_bytes
+    # Reads and tar readers need positive bounds, even for a tree of empty files.
+    return (
+        None
+        if max_file_bytes is None
+        else min(max_file_bytes, max(1, observed.largest_file_bytes)),
+        max(1, observed.total_bytes)
+        if max_total_bytes is None
+        else min(max_total_bytes, max(1, observed.total_bytes)),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _SyncCopyPlan:
+    """The limits one staged copy runs within and the bytes it reserves."""
+
+    max_file_bytes: int | None
+    max_total_bytes: int | None
+    archive_reservation: int
+    consumer_transient_bytes: int
+    builder_transient_bytes: int
+    # The limits were cut to fit the staging capacity, not measured.
+    capacity_bounded: bool
+
+    @property
+    def required_bytes(self) -> int:
+        return self.archive_reservation + max(
+            self.consumer_transient_bytes, self.builder_transient_bytes
+        )
+
+
+def _sync_copy_plan(
+    *,
+    source: Workspace,
+    source_stream: BoundedTarStreamReader | None,
+    target: Workspace,
+    target_stream: TarStreamWriter | None,
+    paths: tuple[str, ...],
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
+    requires_source_observation: bool,
+    staging_capacity: SyncBindingStagingCapacity,
+    observed: _SyncTransferSizes | None,
+    minimum_transient_bytes: int = 0,
+) -> _SyncCopyPlan | None:
+    """Plan one staged copy's limits and reservation; ``None`` means no finite bound.
+
+    Measured sizes narrow the declared limits, which stay the ceiling. An
+    unmeasured transfer whose declared ceiling exceeds the staging capacity
+    copies at most what the capacity holds instead, so a small tree waits
+    for capacity rather than failing. Either way the copy enforces the
+    planned limits, so the spool and every read stay inside the reservation.
+    """
+
+    max_file_bytes, max_total_bytes = _sync_measured_limits(
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        observed=observed,
+    )
+
+    def plan(
+        file_bytes: int | None, total_bytes: int | None, *, capacity_bounded: bool
+    ) -> _SyncCopyPlan | None:
+        archive_reservation = _sync_archive_reservation_bound(
+            paths,
+            max_file_bytes=file_bytes,
+            max_total_bytes=total_bytes,
+            max_archive_bytes=max_archive_bytes,
+        )
+        if archive_reservation is None:
+            return None
+        return _SyncCopyPlan(
+            max_file_bytes=file_bytes,
+            max_total_bytes=total_bytes,
+            archive_reservation=archive_reservation,
+            consumer_transient_bytes=max(
+                minimum_transient_bytes,
+                _sync_transfer_transient_reservation_bound(
+                    target=target,
+                    target_stream=target_stream,
+                    paths=paths,
+                    max_file_bytes=file_bytes,
+                    max_total_bytes=total_bytes,
+                    max_archive_bytes=max_archive_bytes,
+                    archive_reservation=archive_reservation,
+                    requires_source_observation=requires_source_observation,
+                ),
+            ),
+            builder_transient_bytes=_sync_archive_builder_transient_reservation_bound(
+                source=source,
+                source_stream=source_stream,
+                paths=paths,
+                max_file_bytes=file_bytes,
+                max_total_bytes=total_bytes,
+                max_archive_bytes=max_archive_bytes,
+                archive_reservation=archive_reservation,
+            ),
+            capacity_bounded=capacity_bounded,
+        )
+
+    planned = plan(max_file_bytes, max_total_bytes, capacity_bounded=False)
+    capacity = staging_capacity.max_staged_bytes
+    if planned is None or observed is not None or planned.required_bytes <= capacity:
+        return planned
+    # The archive holds the logical bytes plus tar overhead, and at most one
+    # more copy of either, or the fixed minimum, is held beside it.
+    overhead = tar_archive_size_bound(0, paths)
+    fitted_total = min(
+        (capacity - 2 * overhead) // 2,
+        capacity - overhead - minimum_transient_bytes,
+    )
+    if max_total_bytes is not None:
+        fitted_total = min(fitted_total, max_total_bytes)
+    if fitted_total <= 0:
+        return planned
+    fitted = plan(
+        None if max_file_bytes is None else max(1, min(max_file_bytes, fitted_total)),
+        fitted_total,
+        capacity_bounded=True,
+    )
+    return planned if fitted is None or fitted.required_bytes > capacity else fitted
+
+
 def _require_sync_copy_staging_capacity(
     *,
     source: Workspace,
@@ -3856,6 +4109,7 @@ def _require_sync_copy_staging_capacity(
     max_archive_bytes: int | None,
     staging_capacity: SyncBindingStagingCapacity,
     requires_source_observation: bool,
+    observed: _SyncTransferSizes | None = None,
 ) -> None:
     if not paths:
         return
@@ -3868,42 +4122,69 @@ def _require_sync_copy_staging_capacity(
     )
     if not source_supports_bulk and not target_supports_bulk and not requires_staging:
         return
-    archive_reservation = _sync_archive_reservation_bound(
-        paths,
-        max_file_bytes=max_file_bytes,
-        max_total_bytes=max_total_bytes,
-        max_archive_bytes=max_archive_bytes,
-    )
-    if archive_reservation is None:
-        return
-    consumer_transient_bytes = _sync_transfer_transient_reservation_bound(
+    plan = _sync_copy_plan(
+        source=source,
+        source_stream=source_stream,
         target=target,
         target_stream=target_stream,
         paths=paths,
         max_file_bytes=max_file_bytes,
         max_total_bytes=max_total_bytes,
         max_archive_bytes=max_archive_bytes,
-        archive_reservation=archive_reservation,
         requires_source_observation=requires_source_observation,
+        staging_capacity=staging_capacity,
+        observed=observed,
     )
-    builder_transient_bytes = _sync_archive_builder_transient_reservation_bound(
-        source=source,
-        source_stream=source_stream,
-        paths=paths,
-        max_file_bytes=max_file_bytes,
-        max_total_bytes=max_total_bytes,
-        max_archive_bytes=max_archive_bytes,
-        archive_reservation=archive_reservation,
-    )
-    required = archive_reservation + max(
-        consumer_transient_bytes,
-        builder_transient_bytes,
-    )
-    if required > staging_capacity.max_staged_bytes:
+    if plan is not None and plan.required_bytes > staging_capacity.max_staged_bytes:
         raise SyncBindingStagingCapacityError(
             "SyncBinding transfer peak exceeds staged byte capacity: "
-            f"required={required}, capacity={staging_capacity.max_staged_bytes}."
+            f"required={plan.required_bytes}, capacity={staging_capacity.max_staged_bytes}."
         )
+
+
+def _sync_plan_limit_note(plan: _SyncCopyPlan, observed: _SyncTransferSizes | None) -> str | None:
+    """Explain a limit error whose limit is the plan's, not the configured one."""
+
+    if plan.capacity_bounded:
+        return (
+            "SyncBinding could not measure these files, so it copied at most what its "
+            "staging capacity holds; a limit smaller than the configured one is that bound."
+        )
+    if observed is not None:
+        return (
+            "SyncBinding stages files within the sizes it measured before the transfer; "
+            "a limit smaller than the configured one means a file changed after it was "
+            "measured."
+        )
+    return None
+
+
+async def _observe_sync_transfer_sizes(
+    workspace: Workspace,
+    paths: tuple[str, ...],
+) -> _SyncTransferSizes | None:
+    """Measure the files a transfer will stage, when the workspace can.
+
+    Measurement only sizes the staging reservation, so a workspace that
+    cannot measure, or a measurement that fails, leaves the declared limits
+    in charge; the transfer itself still enforces every limit.
+    """
+
+    observe = getattr(workspace, "_observe_transfer_sizes", None)
+    if not paths or not callable(observe):
+        return None
+    try:
+        observed = await observe(paths)
+    except Exception:
+        return None
+    if (
+        type(observed) is not tuple
+        or len(observed) != 2
+        or any(type(value) is not int or value < 0 for value in observed)
+        or observed[1] > observed[0]
+    ):
+        return None
+    return _SyncTransferSizes(total_bytes=observed[0], largest_file_bytes=observed[1])
 
 
 def _validate_sync_tar_stream(
@@ -4274,6 +4555,16 @@ def _should_sync_back(policy: SyncBackPolicy, outcome: str | None) -> bool:
     if policy == "always":
         return True
     return outcome == "completed"
+
+
+def _binding_copies_back(binding: WorkspaceBinding, outcome: str | None) -> bool:
+    """Whether ``binding``'s finalize publishes workspace output for ``outcome``.
+
+    Only a ``SyncBinding`` that syncs back for this outcome does; for any other
+    binding Cayu does not claim that output was published.
+    """
+
+    return isinstance(binding, SyncBinding) and _should_sync_back(binding.sync_back, outcome)
 
 
 def _sync_back_paths(

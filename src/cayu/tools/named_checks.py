@@ -37,6 +37,7 @@ from cayu.runtime.execution_identity import (
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 from cayu.tools._terminal_bounds import (
     DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
     bounded_terminal_result,
     json_payload_bytes,
     spec_with_terminal_payload_bound,
@@ -98,7 +99,9 @@ DEFAULT_CHECK_MODEL_OUTPUT_BYTES = 16_000
 # the command identities a journaled toolchain result gains.
 _RUN_CHECK_COMPLETION_BYTES = 1024
 _RUN_CHECK_JOURNAL_FIELD_BYTES = 4096
-MAX_CHECK_MODEL_OUTPUT_BYTES = 50_000
+# RunCheckTool accepts max_model_output_bytes up to its own
+# max_terminal_payload_bytes; this is the largest any bound can be.
+MAX_CHECK_MODEL_OUTPUT_BYTES = MAX_TOOL_TERMINAL_PAYLOAD_BYTES
 MAX_NAMED_CHECKS = 128
 MAX_NAMED_CHECK_NAME_BYTES = 128
 MAX_NAMED_CHECK_DESCRIPTION_BYTES = 4 * 1024
@@ -321,10 +324,18 @@ class RunCheckTool(Tool, DurableToolRecovery):
             raise ValueError("checks must not contain duplicate names.")
         if not isinstance(command_policy, CommandPolicy):
             raise TypeError("command_policy must implement CommandPolicy.")
+        bounded_spec = spec_with_terminal_payload_bound(
+            type(self).spec,
+            max_terminal_payload_bytes,
+            default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+        )
+        # The model previews follow the result bound they are fitted into.
+        terminal_bound = bounded_spec.max_terminal_payload_bytes
+        assert terminal_bound is not None
         owned_model_limit = _bounded_positive_int(
             max_model_output_bytes,
             field_name="max_model_output_bytes",
-            maximum=MAX_CHECK_MODEL_OUTPUT_BYTES,
+            maximum=terminal_bound,
         )
         if owned_model_limit < len(_OUTPUT_TRUNCATION_MARKER.encode("utf-8")):
             raise ValueError("max_model_output_bytes is too small for the truncation marker.")
@@ -366,12 +377,8 @@ class RunCheckTool(Tool, DurableToolRecovery):
             )
         )
         super().__init__(
-            spec_with_terminal_payload_bound(
-                type(self).spec.model_copy(
-                    update={"input_schema": schema, "execution_requirements": requirements}
-                ),
-                max_terminal_payload_bytes,
-                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+            bounded_spec.model_copy(
+                update={"input_schema": schema, "execution_requirements": requirements}
             )
         )
         self._checks = ordered_checks

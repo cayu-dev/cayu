@@ -1624,8 +1624,9 @@ _OWNERSHIP_FILES: dict[str, str] = {
         '"""Provider and operation retry policy extension seam.\n'
         "\n"
         "A run retries a model call that fails with a rate limit, an overload, or another\n"
-        "retryable provider error. The default RetryPolicy() gives up after 5 attempts\n"
-        "and 7.5 to 9.5 seconds of backoff. To wait out longer outages or usage\n"
+        "retryable provider error. The default RetryPolicy() gives up after 5 attempts;\n"
+        "rate limits and overloads are spread over up to 300 seconds, other failures\n"
+        "over 7.5 to 9.5 seconds of backoff. To wait out longer outages or usage\n"
         "limits, define a RetryPolicy here and pass it to\n"
         "CayuConfig(run=RunDefaults(retry_policy=...)) in configuration/runtime.py for\n"
         "every run, or to RunRequest(retry_policy=...) for one run. See\n"

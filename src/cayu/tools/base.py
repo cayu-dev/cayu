@@ -82,6 +82,22 @@ MAX_TOOL_EXECUTION_REQUIREMENTS = 32
 MAX_TOOL_EXECUTION_ALTERNATIVES = 16
 MAX_TOOL_EXECUTABLE_PROBE_ARGUMENTS = 8
 MAX_TOOL_EXECUTABLE_PROBE_EXIT_CODES = 16
+# The runtime enforces and reserves at least this many bytes for a declared
+# terminal payload bound, so its own bounded failure and notice results fit.
+MIN_ENFORCED_TERMINAL_PAYLOAD_BYTES = 64 * 1024
+
+
+def enforced_terminal_payload_bound(value: int | None) -> int | None:
+    """The bound the runtime enforces for a declared ``max_terminal_payload_bytes``.
+
+    A declaration smaller than ``MIN_ENFORCED_TERMINAL_PAYLOAD_BYTES`` is
+    rounded up to it, because the runtime's contract-failure result must fit
+    inside the bound it reports.
+    """
+
+    if value is None:
+        return None
+    return max(value, MIN_ENFORCED_TERMINAL_PAYLOAD_BYTES)
 
 
 def _copy_bounded_iterable(
@@ -370,7 +386,7 @@ class _ToolSpecInput(BaseModel):
     workspace_mutation: StrictBool = False
     max_terminal_payload_bytes: StrictInt | None = Field(
         default=None,
-        ge=64 * 1024,
+        ge=1,
         le=MAX_DURABLE_JSON_INTEGER,
     )
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
@@ -437,7 +453,7 @@ class ToolSpec(BaseModel):
     workspace_mutation: StrictBool = False
     max_terminal_payload_bytes: StrictInt | None = Field(
         default=None,
-        ge=64 * 1024,
+        ge=1,
         le=MAX_DURABLE_JSON_INTEGER,
     )
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None

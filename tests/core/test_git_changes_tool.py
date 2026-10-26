@@ -111,6 +111,37 @@ def test_git_changes_status_is_structured_and_pageable(tmp_path: Path) -> None:
     assert renamed["original_path"] == "rename-me.txt"
 
 
+@pytest.mark.parametrize("mode", ["status", "summary", "diff"])
+def test_git_changes_timeout_is_a_constructor_option(tmp_path: Path, mode: str) -> None:
+    _repository(tmp_path)
+    (tmp_path / "tracked.txt").write_text("after\n")
+    timeouts: list[int] = []
+
+    class RecordingRunner(LocalRunner):
+        async def exec(self, command, **kwargs):
+            timeouts.append(kwargs["timeout_s"])
+            return await super().exec(command, **kwargs)
+
+    ctx = ToolContext(session_id="session", runner=RecordingRunner(tmp_path))
+
+    default = asyncio.run(GitChangesTool().run(ctx, {"mode": mode}))
+    assert default.is_error is False
+    assert timeouts and set(timeouts) == {git_module.GIT_CHANGES_TIMEOUT_SECONDS} == {120}
+    timeouts.clear()
+
+    configured = GitChangesTool(timeout_seconds=7)
+    assert asyncio.run(configured.run(ctx, {"mode": mode})).is_error is False
+    assert timeouts and set(timeouts) == {7}
+    assert configured._execution_profile_material()["timeout_seconds"] == 7
+    assert "timeout_seconds" not in GitChangesTool()._execution_profile_material()
+
+
+@pytest.mark.parametrize("value", [0, True, 1.5, 12 * 3_600 + 1])
+def test_git_changes_refuses_an_invalid_timeout(value) -> None:
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        GitChangesTool(timeout_seconds=value)
+
+
 def test_git_changes_summary_and_diff_are_bounded(tmp_path: Path) -> None:
     _repository(tmp_path)
     (tmp_path / "tracked.txt").write_text(
@@ -505,7 +536,9 @@ def test_git_changes_rejects_nonportable_projected_filter_names(
                 stderr="",
             )
 
-    result = asyncio.run(git_module._configured_filter_names(ConfigRunner(), cwd="/workspace"))
+    result = asyncio.run(
+        git_module._configured_filter_names(ConfigRunner(), cwd="/workspace", timeout_s=120)
+    )
 
     assert isinstance(result, ToolResult)
     assert result.structured == {"error": "git_filter_name_unsupported"}
@@ -528,7 +561,9 @@ def test_git_changes_rejects_malformed_projected_filter_records(
             del command, kwargs
             return ExecResult(exit_code=0, stdout=f"{record}\0", stderr="")
 
-    result = asyncio.run(git_module._configured_filter_names(ConfigRunner(), cwd="/workspace"))
+    result = asyncio.run(
+        git_module._configured_filter_names(ConfigRunner(), cwd="/workspace", timeout_s=120)
+    )
 
     assert isinstance(result, ToolResult)
     assert result.structured == {"error": "git_filter_name_unsupported"}
@@ -551,7 +586,9 @@ def test_git_changes_rejects_inconsistent_filter_query_status(
             del command, kwargs
             return ExecResult(exit_code=exit_code, stdout=stdout, stderr="")
 
-    result = asyncio.run(git_module._configured_filter_names(ConfigRunner(), cwd="/workspace"))
+    result = asyncio.run(
+        git_module._configured_filter_names(ConfigRunner(), cwd="/workspace", timeout_s=120)
+    )
 
     assert isinstance(result, ToolResult)
     assert result.structured == {"error": "git_filter_name_unsupported"}

@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from cayu._exception_groups import exception_cause, rebuild_exception_group, set_exception_cause
 from cayu._validation import FrozenJsonDict, FrozenJsonList
 from cayu.mcp._exception_handoffs import copy_mcp_failure_handoffs
-from cayu.mcp._jsonrpc import McpProtocolError
+from cayu.mcp._jsonrpc import DEFAULT_MCP_REQUEST_TIMEOUT_S, McpProtocolError
 from cayu.vaults import SecretRedactor
 
 DEFAULT_MCP_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
@@ -34,8 +34,8 @@ class McpTransportLimits(BaseModel):
 
     max_message_bytes: int = DEFAULT_MCP_MAX_MESSAGE_BYTES
     max_response_bytes: int = DEFAULT_MCP_MAX_RESPONSE_BYTES
-    idle_timeout_s: float = 30.0
-    total_call_timeout_s: float = 30.0
+    idle_timeout_s: float = DEFAULT_MCP_REQUEST_TIMEOUT_S
+    total_call_timeout_s: float = DEFAULT_MCP_REQUEST_TIMEOUT_S
 
     @field_validator("max_message_bytes", "max_response_bytes", mode="before")
     @classmethod

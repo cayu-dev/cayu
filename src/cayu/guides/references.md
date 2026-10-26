@@ -289,7 +289,8 @@ creates a new task to retry the same event, pass the same
 minutes by default) stops the event; past it `create_task` raises
 `TaskRetryBudgetExhausted`. See `cayu guide long-running#time-limit-for-worker-runs`.
 Provider rate limits and outages are retried inside each run by `RetryPolicy`
-(5 attempts and 7.5 to 9.5 seconds of backoff by default); widen it before
+(5 attempts by default, with rate limits and overloads spread over up to 300
+seconds); widen it before
 creating new tasks or sessions to retry them. See
 `cayu guide providers#provider-retries`.
 

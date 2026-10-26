@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tarfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -884,6 +885,65 @@ def test_large_trees_and_files_move_as_staged_copies(tmp_path: Path, monkeypatch
     asyncio.run(scenario())
 
 
+def test_staged_copies_mode_chooses_how_the_workspace_moves(tmp_path: Path, monkeypatch) -> None:
+    limit = 64 * 1024
+    monkeypatch.setattr(runner_module, "MAX_ARCHIVE_BYTES", limit)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.archive_limit = limit
+    broker.staged_copies = {"max_bytes": 8 * 1024 * 1024, "sandbox_max_bytes": 32 * 1024 * 1024}
+    # Larger than one archive in all, but every file fits in one.
+    files = {f"repo/part-{index}.bin": os.urandom(limit // 2) for index in range(4)}
+    data = _tar(files)
+
+    def archive_puts() -> int:
+        return len([call for call in broker.calls if call[0] == "PUT"])
+
+    def staged_uploads() -> int:
+        return len([request for request in broker.storage_requests if request.method == "PUT"])
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        root = broker.sandboxes[runner.sandbox_id].root
+        # auto: a staged copy-in that fails part-way is sent again as archives.
+        broker.fail_copy_ins = 1
+        await BrokeredSandboxWorkspace(runner).write_tar_stream(
+            io.BytesIO(data), archive_bytes=len(data)
+        )
+        assert staged_uploads() == 1 and archive_puts() > 1
+        assert {name: (root / name).read_bytes() for name in files} == files
+        # never: archives only, even where staged copies are offered.
+        uploads, puts = staged_uploads(), archive_puts()
+        never = BrokeredSandboxWorkspace(runner, staged_copies="never")
+        await never.write_tar_stream(io.BytesIO(data), archive_bytes=len(data))
+        assert staged_uploads() == uploads and archive_puts() > puts
+        (root / "big.bin").write_bytes(os.urandom(2 * limit))
+        with pytest.raises(RuntimeError, match="larger than one broker archive"):
+            await never.read_tar_stream(["big.bin"], io.BytesIO(), max_file_bytes=4 * limit)
+        # always: even a small tree moves as one staged copy, and a failed one
+        # is not sent again.
+        uploads, puts = staged_uploads(), archive_puts()
+        always = BrokeredSandboxWorkspace(runner, staged_copies="always")
+        small = _tar({"small.txt": b"small"})
+        await always.write_tar_stream(io.BytesIO(small), archive_bytes=len(small))
+        assert staged_uploads() == uploads + 1 and archive_puts() == puts
+        assert (root / "small.txt").read_bytes() == b"small"
+        broker.fail_copy_ins = 1
+        with pytest.raises(SandboxCopyFailedError):
+            await always.write_tar_stream(io.BytesIO(data), archive_bytes=len(data))
+        await runner.close()
+        broker.staged_copies = None
+        plain = await _ready_runner(broker)
+        with pytest.raises(RuntimeError, match="offers no staged copies"):
+            await BrokeredSandboxWorkspace(plain, staged_copies="always").write_tar_stream(
+                io.BytesIO(small), archive_bytes=len(small)
+            )
+        await plain.close()
+        with pytest.raises(ValueError, match="staged_copies"):
+            BrokeredSandboxWorkspace(plain, staged_copies="sometimes")  # type: ignore[arg-type]
+
+    asyncio.run(scenario())
+
+
 def test_the_client_moves_staged_copies_and_reports_failures(tmp_path: Path) -> None:
     broker = FakeBroker(tmp_path / "cloud")
     broker.staged_copies = {"max_bytes": 1024 * 1024, "sandbox_max_bytes": 4 * 1024 * 1024}
@@ -961,6 +1021,73 @@ def test_files_larger_than_one_archive_need_staged_copies(tmp_path: Path) -> Non
     asyncio.run(scenario())
 
 
+def test_the_default_file_limit_follows_the_sandboxs_staged_copies(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    project = _project(tmp_path)
+
+    async def file_limit(factory, name: str) -> int:
+        result = await factory.create(_request(name))
+        try:
+            return result.environment.binding.max_file_bytes
+        finally:
+            await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    async def scenario():
+        default = _factory(broker, project)
+        # Without staged copies a file must fit in one archive.
+        assert await file_limit(default, "plain") == runner_module.MAX_TRANSFER_FILE_BYTES
+        broker.staged_copies = {
+            "max_bytes": 32 * 1024 * 1024,
+            "sandbox_max_bytes": 64 * 1024 * 1024,
+        }
+        assert await file_limit(default, "staged") == (
+            32 * 1024 * 1024 - runner_module.STAGED_FILE_OVERHEAD_BYTES
+        )
+        # Explicit limits and staged_copies="never" keep their own bound.
+        explicit = _factory(
+            broker,
+            project,
+            transfer_limits=SandboxWorkspaceTransferLimits(max_file_bytes=1024 * 1024),
+        )
+        assert await file_limit(explicit, "explicit") == 1024 * 1024
+        never = _factory(broker, project, staged_copies="never")
+        assert await file_limit(never, "never") == runner_module.MAX_TRANSFER_FILE_BYTES
+
+    asyncio.run(scenario())
+    with pytest.raises(ValueError, match="staged_copies='never'"):
+        _factory(
+            broker,
+            project,
+            staged_copies="never",
+            transfer_limits=SandboxWorkspaceTransferLimits(max_file_bytes=16 * 1024 * 1024),
+        )
+    broker.staged_copies = None
+    always = _factory(broker, project, staged_copies="always")
+    with pytest.raises(RuntimeError, match="offers no staged copies"):
+        asyncio.run(always.create(_request("always")))
+    assert broker.sandboxes[next(reversed(broker.sandboxes))].status == "destroyed"
+    assert always.execution_profile_identity != _factory(broker, project).execution_profile_identity
+
+
+def test_setup_commands_take_a_timeout_and_report_their_output(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    project = _project(tmp_path)
+    failing = _factory(
+        broker, project, setup_commands=["echo installing; echo 'no such package' >&2; exit 3"]
+    )
+    with pytest.raises(RuntimeError) as failed:
+        asyncio.run(failing.create(_request("failing")))
+    message = str(failed.value)
+    assert "setup command failed (exit code 3)" in message
+    assert "stderr: no such package" in message and "stdout: installing" in message
+    slow = _factory(broker, project, setup_commands=["sleep 5"], setup_command_timeout_s=1)
+    with pytest.raises(RuntimeError, match="timed out after 1 seconds"):
+        asyncio.run(slow.create(_request("slow")))
+    assert all(sandbox.status == "destroyed" for sandbox in broker.sandboxes.values())
+    with pytest.raises(ValueError, match="setup_command_timeout_s"):
+        _factory(broker, project, setup_command_timeout_s=0)
+
+
 def test_paths_keep_their_whitespace(tmp_path: Path) -> None:
     broker = FakeBroker(tmp_path / "cloud")
 
@@ -1031,6 +1158,87 @@ def test_commands_run_asynchronously_in_the_workspace(tmp_path: Path) -> None:
 
     asyncio.run(scenario())
     assert broker.started[0] == ["/bin/sh", "-c", "pwd; echo $GREETING"]
+
+
+def _started_timeouts(broker: FakeBroker, sandbox_id: str) -> list[int]:
+    return [
+        command.body["timeout_seconds"]
+        for command in broker.sandboxes[sandbox_id].commands.values()
+    ]
+
+
+def test_a_command_without_a_timeout_leaves_a_clock_margin(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    # The broker checks the timeout against its own clock, which here runs
+    # half a minute ahead of the Agent's.
+    broker.clock_ahead_seconds = 30
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        remaining = runner._remaining_lifetime_seconds()
+        assert remaining is not None
+        assert (await runner.exec(ExecCommand.process("true"))).exit_code == 0
+        await runner.close()
+        return remaining
+
+    remaining = asyncio.run(scenario())
+    assert broker.lifetime_refusals == 0
+    (timeout,) = _started_timeouts(broker, next(iter(broker.sandboxes)))
+    assert remaining - 61 <= timeout <= remaining - 60
+
+
+def test_a_refused_lifetime_timeout_is_retried_once_with_the_brokers_number(
+    tmp_path: Path,
+) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    # Beyond the margin: the broker refuses, naming the lifetime it sees.
+    broker.clock_ahead_seconds = 600
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        assert (await runner.exec(ExecCommand.process("true"))).exit_code == 0
+        # An explicit timeout within the Agent's remaining lifetime is asked
+        # again too, so clock skew alone never fails it.
+        explicit = runner._remaining_lifetime_seconds() - 300
+        assert (await runner.exec(ExecCommand.process("true"), timeout_s=explicit)).exit_code == 0
+        # Past the Agent's own remaining lifetime it is refused before sending.
+        with pytest.raises(ValueError, match="remaining lifetime"):
+            await runner.exec(ExecCommand.process("true"), timeout_s=9 * 3600)
+        sandbox = broker.sandboxes[runner.sandbox_id]
+        broker_remaining = int((sandbox.max_expires_at - datetime.now(UTC)).total_seconds())
+        await runner.close()
+        return broker_remaining - 600
+
+    broker_remaining = asyncio.run(scenario())
+    assert broker.lifetime_refusals == 2
+    timeouts = _started_timeouts(broker, next(iter(broker.sandboxes)))
+    assert len(timeouts) == 2
+    assert all(broker_remaining - 5 <= timeout <= broker_remaining + 1 for timeout in timeouts)
+
+
+def test_a_second_lifetime_refusal_is_final(tmp_path: Path, monkeypatch) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        # A broker whose clock keeps moving past every number it names.
+        original = broker._start
+
+        async def refusing(sandbox, body):
+            broker.clock_ahead_seconds += 3600
+            return await original(sandbox, body)
+
+        monkeypatch.setattr(broker, "_start", refusing)
+        with pytest.raises(SandboxBrokerRefusedError, match="remaining lifetime"):
+            await runner.exec(ExecCommand.process("true"))
+        # The refusals started nothing, so the runner stays usable.
+        monkeypatch.setattr(broker, "_start", original)
+        broker.clock_ahead_seconds = 0
+        assert (await runner.exec(ExecCommand.process("true"))).exit_code == 0
+        await runner.close()
+
+    asyncio.run(scenario())
+    assert broker.lifetime_refusals == 2
 
 
 def test_a_dropped_start_is_recovered_by_replaying_its_id(tmp_path: Path) -> None:

@@ -28,7 +28,7 @@ from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation
 from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost
 from cayu.budgets.run_limits import RunLimits
-from cayu.configuration import CayuConfig, RunDefaults, ToolExecutionConfig
+from cayu.configuration import DEFAULT_MAX_STEPS, CayuConfig, RunDefaults, ToolExecutionConfig
 from cayu.context.base import (
     CheckpointCompactionContextPolicy,
     MessageWindowContextPolicy,
@@ -235,6 +235,7 @@ def test_builtin_provider_deadlines_are_exact_execution_profile_material() -> No
         "text_progress_policy_version": 2,
         "semantic_cleanup_policy_version": 1,
         "http_cleanup_observation_policy_version": 1,
+        "absolute_output_idle_policy_version": 1,
         "transport_idle_timeout_s": 11.0,
         "protocol_idle_timeout_s": 12.0,
         "semantic_progress_timeout_s": 13.0,
@@ -9319,7 +9320,7 @@ def test_runtime_generated_model_profile_survives_exact_workload_secret_collisio
         baseline_app.register_provider(_completed_provider(), default=True)
         baseline_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         baseline_profile = _session_execution_profile._execution_profile_identity(
-            max_steps=64,
+            max_steps=DEFAULT_MAX_STEPS,
             registered_agent=baseline_app._agents["assistant"],
             provider_name="fake",
             registered_provider=baseline_app._provider_registry.registrations["fake"],

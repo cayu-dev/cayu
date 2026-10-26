@@ -54,7 +54,12 @@ from cayu.egress.errors import (
     UnsupportedEgressError,
 )
 from cayu.egress.grants import VirtualCredentialGrant
-from cayu.egress.proxy_server import SessionCertificateAuthority, TransparentEgressProxyServer
+from cayu.egress.proxy_server import (
+    DEFAULT_EGRESS_PROXY_MAX_CONNECTIONS,
+    SessionCertificateAuthority,
+    TransparentEgressProxyServer,
+    validate_egress_proxy_max_connections,
+)
 from cayu.environments.admission import (
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
@@ -374,6 +379,10 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     container still shares the host kernel, so untrusted-code isolation stays
     unsupported.
 
+    ``proxy_max_connections`` is how many guest connections each session's
+    egress proxy serves at once (default 64, at most 512); one more is refused.
+    Each open connection holds a proxy worker thread.
+
     See ``cayu guide untrusted-code`` for the hardened composition.
     """
 
@@ -477,7 +486,11 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         reconnect_state_dir: str | Path | None = None,
         reconnect_timeout_s: float = 20.0,
         workload_restrictions: DockerWorkloadRestrictions | None = None,
+        proxy_max_connections: int = DEFAULT_EGRESS_PROXY_MAX_CONNECTIONS,
     ) -> None:
+        self._proxy_max_connections = validate_egress_proxy_max_connections(
+            proxy_max_connections, "proxy_max_connections"
+        )
         if type(reconnect_timeout_s) not in {int, float} or not 0 < reconnect_timeout_s <= 60:
             raise ValueError("reconnect_timeout_s must be positive and at most 60 seconds.")
         if workload_restrictions is not None:
@@ -718,6 +731,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     transport_auth_token=transport_authorization.token,
                     authority=certificate_authority,
                     owns_authority=owns_certificate_authority,
+                    max_workers=self._proxy_max_connections,
                 )
             else:
                 server = TransparentEgressProxyServer(
@@ -725,6 +739,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     loop=loop,
                     host=bind_host,
                     transport_auth_token=transport_authorization.token,
+                    max_workers=self._proxy_max_connections,
                 )
         except BaseException:
             transport_authorization.close()
@@ -997,6 +1012,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             ca_mount=(request.ca_cert_host_path, request.guest_ca_path),
             seccomp_profile=self._seccomp_profile_for_image(request.image),
             setup_commands=request.setup_commands,
+            setup_command_timeout_s=request.setup_command_timeout_s,
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
             workload_restrictions=self._workload_restrictions,
         )

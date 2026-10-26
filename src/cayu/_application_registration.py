@@ -25,7 +25,7 @@ from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
-from cayu.tools.base import DurableToolRecovery, Tool, ToolSpec
+from cayu.tools.base import DurableToolRecovery, Tool, ToolSpec, enforced_terminal_payload_bound
 from cayu.tools.catalogue import (
     SEARCH_TOOLS_NAME,
     ToolDescriptor,
@@ -153,7 +153,11 @@ def _validate_registered_tool(
     execution_contract = (
         ToolExecutionContract.model_validate(execution_contract)
         .model_copy(
-            update={"max_terminal_payload_bytes": validated_spec.max_terminal_payload_bytes}
+            update={
+                "max_terminal_payload_bytes": enforced_terminal_payload_bound(
+                    validated_spec.max_terminal_payload_bytes
+                )
+            }
         )
         .model_dump(mode="json")
     )

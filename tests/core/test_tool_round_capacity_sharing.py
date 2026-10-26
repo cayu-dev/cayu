@@ -1,4 +1,4 @@
-"""Concurrent sessions share terminal publication capacity unless a tool declares no bound."""
+"""Concurrent sessions share terminal publication capacity, declared or not."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import logging
 import sys
 
 from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu._validation import DURABLE_EVENT_LIMITS
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import MessageRole, TextPart, ToolCallPart
@@ -221,7 +222,7 @@ def test_concurrent_coding_sessions_share_capacity_without_waiting(tmp_path, cap
     assert not [record for record in caplog.records if record.name == _GOVERNOR_LOGGER]
 
 
-def test_an_undeclared_tool_holds_every_other_session_until_its_round_drains(tmp_path, caplog):
+def test_an_undeclared_tool_shares_capacity_with_other_sessions(tmp_path, caplog):
     async def scenario():
         governor = ToolTerminalPublicationGovernor(
             round_admission_timeout_s=None, round_admission_notice_s=0.05
@@ -232,42 +233,35 @@ def test_an_undeclared_tool_holds_every_other_session_until_its_round_drains(tmp
 
         holder = asyncio.create_task(_run(app, "holder", tmp_path))
         await asyncio.wait_for(unbounded.entered.wait(), timeout=30)
-        assert governor.snapshot().active_exclusive_rounds == 1
+        snapshot = governor.snapshot()
+        assert snapshot.active_exclusive_rounds == 0
+        # The undeclared call reserves the largest terminal the event limit admits.
+        assert snapshot.reserved_round_bytes == DURABLE_EVENT_LIMITS.max_bytes
 
+        # Other sessions' rounds run to completion while the holder's tool is
+        # still running.
         labels = [f"session-{index}" for index in range(2)]
-        others = [asyncio.create_task(_run(app, label, tmp_path)) for label in labels]
-        for _ in range(2000):
-            if governor.snapshot().round_reservation_waiters == len(labels):
-                break
-            await asyncio.sleep(0.005)
-        assert governor.snapshot().round_reservation_waiters == len(labels)
-        # Declared rounds of other sessions wait without running any tool.
-        assert not list(tmp_path.glob("session-*.txt"))
-        for _ in range(2000):
-            if any("exclusive_holder_sessions=holder" in r.getMessage() for r in caplog.records):
-                break
-            await asyncio.sleep(0.005)
+        runs = await asyncio.wait_for(
+            asyncio.gather(*(_run(app, label, tmp_path) for label in labels)), timeout=60
+        )
+        assert all(events[-1].type is EventType.SESSION_COMPLETED for events in runs)
+        assert not holder.done()
 
         release.set()
-        runs = await asyncio.wait_for(asyncio.gather(holder, *others), timeout=60)
-        assert all(events[-1].type is EventType.SESSION_COMPLETED for events in runs)
+        held = await asyncio.wait_for(holder, timeout=60)
+        assert held[-1].type is EventType.SESSION_COMPLETED
         assert governor.snapshot().active_round_reservations == 0
 
     with caplog.at_level(logging.WARNING):
         asyncio.run(scenario())
-    notices = [
-        record.getMessage()
+    assert not [
+        record
         for record in caplog.records
         if record.name == _GOVERNOR_LOGGER and "still waiting" in record.getMessage()
     ]
-    assert notices
-    assert all("exclusive_holder_sessions=holder" in notice for notice in notices)
-    assert all("exclusive_holder_unbounded_tools=slow_report" in notice for notice in notices)
-    assert all("waiting_round_unbounded_tools" not in notice for notice in notices)
-    assert all("ToolSpec.max_terminal_payload_bytes" in notice for notice in notices)
     warnings = [record.getMessage() for record in caplog.records if record.name == _REGISTRY_LOGGER]
     assert len(warnings) == 1
-    assert warnings[0].startswith("Tool slow_report declares no max_terminal_payload_bytes.")
+    assert warnings[0].startswith("Tool slow_report declares no max_terminal_payload_bytes,")
 
 
 def test_registration_warns_once_per_undeclared_application_tool(caplog):
@@ -280,7 +274,7 @@ def test_registration_warns_once_per_undeclared_application_tool(caplog):
                 _UnboundedTool(release),
                 ExecCommandTool(),
                 WriteFileTool(),
-                # A foreground child keeps its exclusive lease on purpose.
+                # A foreground child returns whatever its child produces.
                 SubagentTool(app, agents={"child": SubagentSpec(agent_name="second")}),
             ],
         )
@@ -291,6 +285,29 @@ def test_registration_warns_once_per_undeclared_application_tool(caplog):
     messages = [record.getMessage() for record in caplog.records]
     assert len(messages) == 1
     assert "Tool slow_report declares no max_terminal_payload_bytes" in messages[0]
-    assert "other sessions' tool rounds wait for them" in messages[0]
+    assert "every call reserves the largest terminal result" in messages[0]
     assert "ToolSpec(max_terminal_payload_bytes=...)" in messages[0]
-    assert "between 65536 and 2031616 bytes" in messages[0]
+    assert "at most 2031616 bytes" in messages[0]
+
+
+def test_application_config_sizes_the_staged_capacity_domain():
+    from cayu.configuration import CayuConfig, ToolExecutionConfig
+
+    default = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+    governor = default._tool_round_executor.invocation.terminals.governor
+    assert governor.staged_capacity_bytes == 512 * 1024 * 1024
+    assert governor.round_admission_timeout_s == 600.0
+
+    app = CayuApp(
+        session_store=InMemorySessionStore(),
+        enable_logging=False,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(
+                tool_terminal_staged_capacity_bytes=64 * 1024 * 1024,
+                tool_round_admission_timeout_seconds=None,
+            )
+        ),
+    )
+    governor = app._tool_round_executor.invocation.terminals.governor
+    assert governor.staged_capacity_bytes == 64 * 1024 * 1024
+    assert governor.round_admission_timeout_s is None

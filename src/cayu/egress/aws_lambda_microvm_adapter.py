@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
+from math import isfinite
 from typing import Any, Literal, TypedDict
 
 from cayu.egress._remote_adapter import (
@@ -245,6 +246,9 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         client_token_replay_window_s: int = DEFAULT_CLIENT_TOKEN_REPLAY_WINDOW_SECONDS,
         browser_workload: bool = False,
         browser_control_relay: LambdaMicroVMBrowserControlRelay | None = None,
+        request_timeout_s: float | None = None,
+        ready_timeout_s: float | None = None,
+        lifecycle_timeout_s: float | None = None,
     ) -> None:
         if (
             type(client_token_replay_window_s) is not int
@@ -328,6 +332,20 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                 "runner_options cannot override adapter-owned options: "
                 + ", ".join(sorted(overlap))
             )
+        # Typed runner timeouts. Each one is either typed here or set in
+        # runner_options, never both; unset ones keep the runner's defaults.
+        for name, value in (
+            ("request_timeout_s", request_timeout_s),
+            ("ready_timeout_s", ready_timeout_s),
+            ("lifecycle_timeout_s", lifecycle_timeout_s),
+        ):
+            if value is None:
+                continue
+            if name in self.runner_options:
+                raise ValueError(f"Set {name} either as an argument or in runner_options.")
+            if type(value) not in {int, float} or not isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive finite number of seconds.")
+            self.runner_options[name] = float(value)
 
     def declared_workload_authority(
         self,

@@ -36,6 +36,40 @@ class _FakeAuthority:
         return b"session-ca"
 
 
+def test_lambda_microvm_adapter_takes_typed_runner_timeouts() -> None:
+    common = {
+        "region_name": "us-east-1",
+        "egress_network_connector_arn": "arn:aws:lambda:us-east-1:123:network-connector:nc-1",
+        "exposure": VpcTaskProxyExposure("10.0.0.5"),
+        "client": object(),
+    }
+    assert LambdaMicroVMEgressAdapter(**common).runner_options == {}
+    adapter = LambdaMicroVMEgressAdapter(
+        **common,
+        request_timeout_s=240,
+        ready_timeout_s=300,
+        lifecycle_timeout_s=90.5,
+        runner_options={"poll_interval_s": 0},
+    )
+    assert adapter.runner_options == {
+        "poll_interval_s": 0,
+        "request_timeout_s": 240.0,
+        "ready_timeout_s": 300.0,
+        "lifecycle_timeout_s": 90.5,
+    }
+    # The untyped spelling still works, but one option has one source.
+    assert LambdaMicroVMEgressAdapter(
+        **common, runner_options={"request_timeout_s": 45}
+    ).runner_options == {"request_timeout_s": 45}
+    with pytest.raises(ValueError, match="either as an argument or in runner_options"):
+        LambdaMicroVMEgressAdapter(
+            **common, request_timeout_s=60, runner_options={"request_timeout_s": 45}
+        )
+    for invalid in (0, -1, float("inf"), True):
+        with pytest.raises(ValueError, match="positive finite"):
+            LambdaMicroVMEgressAdapter(**common, lifecycle_timeout_s=invalid)
+
+
 def test_lambda_microvm_admission_reflects_metadata_isolation_mode() -> None:
     common = {
         "region_name": "us-east-1",

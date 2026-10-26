@@ -180,7 +180,12 @@ def reserve_provider_stream_cleanup(
     with _PROVIDER_STREAM_CLEANUP_REGISTRIES_LOCK:
         owners = _PROVIDER_STREAM_CLEANUP_REGISTRIES.setdefault(loop, set())
         if len(owners) >= max_concurrent_streams:
-            raise RuntimeError("Provider stream cleanup capacity is exhausted.")
+            raise RuntimeError(
+                "Provider stream cleanup capacity is exhausted: "
+                f"{max_concurrent_streams} provider streams are already open in this "
+                "process. Raise ProviderStreamDeadlines(max_concurrent_streams=...) on "
+                "the provider."
+            )
         ownership = _ProviderStreamCleanupOwnership(
             loop,
             _PROVIDER_STREAM_CLEANUP_REGISTRIES,

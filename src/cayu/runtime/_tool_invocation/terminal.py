@@ -227,13 +227,14 @@ class ToolTerminalPublisher:
         secret_redactor: SecretRedactor,
         projection_policy: ToolResultProjectionPolicy | None,
         clock: Callable[[], datetime],
+        governor: ToolTerminalPublicationGovernor | None = None,
     ) -> None:
         self._event_writer = event_writer
         self._hooks = hooks
         self._secret_redactor = secret_redactor
         self._tool_result_projection_policy = projection_policy
         self._clock = clock
-        self.governor = ToolTerminalPublicationGovernor()
+        self.governor = ToolTerminalPublicationGovernor() if governor is None else governor
         self._detached_projections: set[asyncio.Task[Any]] = set()
 
     async def publish_unexecuted(

@@ -32,6 +32,7 @@ from cayu.tools.base import (
     ToolSpec,
 )
 from cayu.tools.display import ToolDisplay
+from cayu.tools.process_diagnostics import MAX_COMMAND_TIMEOUT_SECONDS
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces.base import RunnerBoundWorkspace
 from cayu.workspaces.local import LocalWorkspace
@@ -41,7 +42,9 @@ MAX_GIT_CHANGES_LIMIT = 200
 DEFAULT_GIT_CHANGES_RESULT_BYTES = 32 * 1024
 MAX_GIT_CHANGES_RESULT_BYTES = 200 * 1024
 GIT_STATUS_CAPTURE_BYTES = 1024 * 1024
-GIT_CHANGES_TIMEOUT_SECONDS = 30
+# The default for GitChangesTool(timeout_seconds=...), which bounds each Git
+# command the tool runs. Status and diff in a large repository can take minutes.
+GIT_CHANGES_TIMEOUT_SECONDS = 120
 MAX_GIT_DIFF_OFFSET_BYTES = 4 * 1024 * 1024
 _TRUNCATION_MARKER = "\n[git changes truncated]"
 _GIT_CHANGES_ARGUMENTS = frozenset(
@@ -76,7 +79,16 @@ class GitChangesTool(Tool):
         spec: ToolSpec | None = None,
         *,
         max_terminal_payload_bytes: int | None = None,
+        timeout_seconds: int = GIT_CHANGES_TIMEOUT_SECONDS,
     ) -> None:
+        if (
+            type(timeout_seconds) is not int
+            or not 1 <= timeout_seconds <= MAX_COMMAND_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                f"timeout_seconds must be an integer between 1 and {MAX_COMMAND_TIMEOUT_SECONDS}."
+            )
+        self._timeout_seconds = timeout_seconds
         super().__init__(
             spec_with_terminal_payload_bound(
                 with_intrinsic_execution_requirements(
@@ -147,7 +159,11 @@ class GitChangesTool(Tool):
     )
 
     def _execution_profile_material(self) -> dict[str, object]:
-        return {"result_projection_version": "2"}
+        material: dict[str, object] = {"result_projection_version": "2"}
+        # Added only when set, so existing execution profiles keep their identity.
+        if self._timeout_seconds != GIT_CHANGES_TIMEOUT_SECONDS:
+            material["timeout_seconds"] = self._timeout_seconds
+        return material
 
     @bounded_terminal_result
     @structured_invalid_arguments
@@ -208,6 +224,7 @@ class GitChangesTool(Tool):
             ["rev-parse", "--show-toplevel"],
             cwd=cwd,
             output_limit_bytes=GIT_STATUS_CAPTURE_BYTES,
+            timeout_s=self._timeout_seconds,
         )
         if isinstance(root_result, ToolResult):
             return root_result
@@ -227,7 +244,9 @@ class GitChangesTool(Tool):
                 },
                 is_error=True,
             )
-        filter_names_result = await _configured_filter_names(runner, cwd=cwd)
+        filter_names_result = await _configured_filter_names(
+            runner, cwd=cwd, timeout_s=self._timeout_seconds
+        )
         if isinstance(filter_names_result, ToolResult):
             return filter_names_result
         filter_names = filter_names_result
@@ -237,6 +256,7 @@ class GitChangesTool(Tool):
             cwd=cwd,
             filter_names=filter_names,
             output_limit_bytes=GIT_STATUS_CAPTURE_BYTES,
+            timeout_s=self._timeout_seconds,
         )
         if isinstance(status_result, ToolResult):
             return status_result
@@ -329,6 +349,7 @@ class GitChangesTool(Tool):
                 next_offset=next_offset,
                 truncation_reasons=truncation_reasons,
                 max_result_bytes=max_result_bytes,
+                timeout_s=self._timeout_seconds,
             )
         return await _diff_result(
             runner,
@@ -343,6 +364,7 @@ class GitChangesTool(Tool):
             truncation_reasons=truncation_reasons,
             max_result_bytes=max_result_bytes,
             diff_offset=diff_offset,
+            timeout_s=self._timeout_seconds,
         )
 
 
@@ -359,6 +381,7 @@ async def _summary_result(
     next_offset: int | None,
     truncation_reasons: list[str],
     max_result_bytes: int,
+    timeout_s: int,
 ) -> ToolResult:
     counts: dict[str, dict[str, Any]] = {}
     command_truncated = False
@@ -369,6 +392,7 @@ async def _summary_result(
             cwd=cwd,
             filter_names=filter_names,
             output_limit_bytes=max_result_bytes,
+            timeout_s=timeout_s,
         )
         if isinstance(result, ToolResult):
             return result
@@ -451,6 +475,7 @@ async def _diff_result(
     truncation_reasons: list[str],
     max_result_bytes: int,
     diff_offset: int,
+    timeout_s: int,
 ) -> ToolResult:
     chunks: list[str] = []
     command_truncated = False
@@ -476,6 +501,7 @@ async def _diff_result(
                 cwd=cwd,
                 filter_names=filter_names,
                 output_limit_bytes=max(1, capture_limit - captured_bytes),
+                timeout_s=timeout_s,
             )
             if isinstance(result, ToolResult):
                 return result
@@ -501,6 +527,7 @@ async def _diff_result(
             cwd=cwd,
             filter_names=filter_names,
             output_limit_bytes=max(1, capture_limit - captured_bytes),
+            timeout_s=timeout_s,
         )
         if isinstance(result, ToolResult):
             return result
@@ -558,6 +585,7 @@ async def _exec_git(
     cwd: str,
     filter_names: tuple[str, ...] = (),
     output_limit_bytes: int,
+    timeout_s: int,
 ) -> ExecResult | ToolResult:
     null_device = "NUL" if ntpath.splitdrive(cwd)[0] else "/dev/null"
     try:
@@ -580,7 +608,7 @@ async def _exec_git(
                 "LC_ALL": "C",
             },
             env_remove=_GIT_ENV_REMOVE,
-            timeout_s=GIT_CHANGES_TIMEOUT_SECONDS,
+            timeout_s=timeout_s,
             output_limit_bytes=output_limit_bytes,
         )
     except RunnerUnavailableError as exc:
@@ -642,6 +670,7 @@ async def _configured_filter_names(
     runner: Any,
     *,
     cwd: str,
+    timeout_s: int,
 ) -> tuple[str, ...] | ToolResult:
     result = await _exec_git(
         runner,
@@ -655,6 +684,7 @@ async def _configured_filter_names(
         ],
         cwd=cwd,
         output_limit_bytes=64 * 1024,
+        timeout_s=timeout_s,
     )
     if isinstance(result, ToolResult):
         return result

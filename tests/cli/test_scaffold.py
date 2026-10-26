@@ -594,7 +594,8 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert "select_coding_backend(" in composition_source
     assert "register_coding_environment(" in composition_source
     assert "DockerCodingBackendOptions(" in composition_source
-    assert "DockerWorkspaceTransferLimits" in composition_source
+    # Transfer limits come from the library defaults, not scaffold copies.
+    assert "DockerWorkspaceTransferLimits" not in composition_source
     assert "RunCheckTool" in composition_source
     assert "RunCommandTool" in composition_source
     assert "StructuredCommandToolPolicy" in composition_source

@@ -20,7 +20,7 @@ from cayu.sessions.invocation import SessionInvocation, copy_session_invocation
 TOOL_TERMINAL_PUBLICATION_SLICE_BYTES = 256 * 1024
 TOOL_TERMINAL_PUBLICATION_CAPACITY_BYTES = 4 * 1024 * 1024
 TOOL_TERMINAL_PUBLICATION_MAX_OFFLOADS = 4
-TOOL_TERMINAL_STAGED_CAPACITY_BYTES = 128 * 1024 * 1024
+TOOL_TERMINAL_STAGED_CAPACITY_BYTES = 512 * 1024 * 1024
 TOOL_ROUND_ADMISSION_TIMEOUT_SECONDS = 600.0
 TOOL_ROUND_ADMISSION_NOTICE_SECONDS = 60.0
 # A capacity wait names at most this many sessions and tool names per list.
@@ -79,6 +79,10 @@ class _RoundReservation:
     weight: int
     exclusive: bool
     group: tuple[str, ...]
+    # False when ``maximum_bytes`` is an admission weight, not a bound every
+    # stage was checked against, such as the event-limit ceiling reserved for
+    # a tool that declares no bound.
+    enforce_maximum: bool = True
     # Names of the round's registered tools that declare no terminal payload
     # bound. They explain a wait and take no part in the reservation itself.
     unbounded_tool_names: tuple[str, ...] = field(default=(), compare=False)
@@ -159,15 +163,17 @@ class ToolTerminalPublicationGovernor:
         tool_round_id: str,
         maximum_bytes: int | None,
         unbounded_tool_names: tuple[str, ...] = (),
+        enforce_maximum: bool = True,
     ) -> None:
         """Reserve a deferred round before any of its tool effects execute.
 
-        Declared rounds share the fixed byte budget. A declared round larger
-        than the domain, or a round containing an unbounded tool, receives the
-        standard exclusive oversize lease so partial sibling stages can never
-        deadlock behind unrelated rounds. ``unbounded_tool_names`` names the
-        round's tools that declare no bound, so a round waiting behind this
-        one can say why.
+        Bounded rounds share the fixed byte budget. A round larger than the
+        domain, or one with no byte bound at all, receives the standard
+        exclusive oversize lease so partial sibling stages can never deadlock
+        behind unrelated rounds. ``unbounded_tool_names`` names the round's
+        tools that declare no bound, so a wait can say why. With
+        ``enforce_maximum`` false, ``maximum_bytes`` only weighs admission and
+        stages are not refused for exceeding it.
         """
 
         await self._reserve_round(
@@ -176,6 +182,7 @@ class ToolTerminalPublicationGovernor:
             maximum_bytes=maximum_bytes,
             group=("round", session_id, tool_round_id),
             unbounded_tool_names=unbounded_tool_names,
+            enforce_maximum=enforce_maximum,
         )
 
     async def _reserve_invocation_round(
@@ -187,6 +194,7 @@ class ToolTerminalPublicationGovernor:
         invocation: SessionInvocation,
         lineage: tuple[str, ...] | None = None,
         unbounded_tool_names: tuple[str, ...] = (),
+        enforce_maximum: bool = True,
     ) -> None:
         """Reserve using provenance resolved by the runtime's session owner.
 
@@ -215,6 +223,7 @@ class ToolTerminalPublicationGovernor:
             group=("invocation", invocation.root_invocation_id, invocation.root_session_id),
             lineage=None if lineage is None else frozenset(lineage),
             unbounded_tool_names=unbounded_tool_names,
+            enforce_maximum=enforce_maximum,
         )
 
     def _group_usage(self) -> dict[tuple[str, ...], tuple[int, bool]]:
@@ -243,7 +252,10 @@ class ToolTerminalPublicationGovernor:
         group: tuple[str, ...],
         lineage: frozenset[str] | None = None,
         unbounded_tool_names: tuple[str, ...] = (),
+        enforce_maximum: bool = True,
     ) -> None:
+        if type(enforce_maximum) is not bool:
+            raise TypeError("enforce_maximum must be a bool.")
         if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes <= 0):
             raise ValueError("maximum_bytes must be a positive integer or None.")
         if type(unbounded_tool_names) is not tuple or any(
@@ -258,6 +270,7 @@ class ToolTerminalPublicationGovernor:
             weight=weight,
             exclusive=exclusive,
             group=group,
+            enforce_maximum=enforce_maximum,
             unbounded_tool_names=tuple(sorted(set(unbounded_tool_names))),
         )
         token = object()
@@ -394,10 +407,10 @@ class ToolTerminalPublicationGovernor:
         """Describe, without content, what holds the lease a round waits for.
 
         Beside the counts it names the tools, the exclusive holders' and the
-        waiting round's, that declare no bound, because such a tool is the
-        usual reason a lease is exclusive. Registered tool names belong to the
-        application. Holder session IDs and tool names are included only when
-        ``name_holders`` is set, for the operator log.
+        waiting round's, that declare no bound, because each call to such a
+        tool reserves the largest terminal result Cayu can store. Registered
+        tool names belong to the application. Holder session IDs and tool names
+        are included only when ``name_holders`` is set, for the operator log.
         """
 
         others = [value for group, value in usage.items() if group != waiting.group]
@@ -427,10 +440,10 @@ class ToolTerminalPublicationGovernor:
             )
         if (name_holders and holder_tools) or waiting.unbounded_tool_names:
             description += (
-                ". A round that calls a tool without ToolSpec.max_terminal_payload_bytes "
-                "takes all terminal publication capacity in the process, so such rounds run "
-                "one at a time across every session; declare the largest result each named "
-                "tool returns."
+                ". Each call to a tool without ToolSpec.max_terminal_payload_bytes reserves "
+                "the largest terminal result Cayu can store; declare the largest result each "
+                "named tool returns, or raise ToolExecutionConfig."
+                "tool_terminal_staged_capacity_bytes."
             )
         return description
 
@@ -533,6 +546,7 @@ class ToolTerminalPublicationGovernor:
                         round_staged_bytes = self._round_staged_bytes.get(round_key, 0)
                         if (
                             reservation.maximum_bytes is not None
+                            and reservation.enforce_maximum
                             and round_staged_bytes + payload_bytes > reservation.maximum_bytes
                         ):
                             raise RuntimeError(
@@ -550,6 +564,7 @@ class ToolTerminalPublicationGovernor:
                         )
                         if (
                             reservation.maximum_bytes is not None
+                            and reservation.enforce_maximum
                             and reconciled_round_bytes > reservation.maximum_bytes
                         ):
                             raise RuntimeError(
@@ -578,6 +593,7 @@ class ToolTerminalPublicationGovernor:
                 round_staged_bytes = self._round_staged_bytes.get(round_key, 0)
                 if (
                     reservation.maximum_bytes is not None
+                    and reservation.enforce_maximum
                     and round_staged_bytes + payload_bytes > reservation.maximum_bytes
                 ):
                     raise RuntimeError(

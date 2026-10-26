@@ -64,7 +64,10 @@ from cayu.sessions.store import SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _shared_artifact_results as shared_artifact_results
 from cayu.tools import _web_access_results as web_access_results
-from cayu.tools._terminal_bounds import application_tool_declares_no_bound
+from cayu.tools._terminal_bounds import (
+    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+    application_tool_declares_no_bound,
+)
 from cayu.tools.base import ToolResult, _bound_policy_denial_result, _bound_policy_denial_text
 from cayu.tools.catalogue import ToolExecutionContract
 from cayu.tools.exposure import ResolvedToolExposureAuthority, copy_resolved_tool_exposure_authority
@@ -244,15 +247,27 @@ class _ToolRoundPublicationCoordinator:
             for tool_call_id, limit in self._terminal_payload_limits.items()
         ):
             raise ValueError("Terminal payload limits must map call IDs to positive bytes or None.")
+        # A staged terminal is one durable event, so no call stages more than
+        # the event limit admits. A call without a declared bound, or with a
+        # larger one, reserves that ceiling instead of the whole domain. Only a
+        # caller that names no calls at all leaves the round unbounded.
         limits = tuple(self._terminal_payload_limits.values())
         self._capacity_maximum_bytes = (
             sum(
-                limit + _TOOL_TERMINAL_RUNTIME_PAYLOAD_HEADROOM_BYTES
+                min(
+                    MAX_TOOL_TERMINAL_PAYLOAD_BYTES if limit is None else limit,
+                    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
+                )
+                + _TOOL_TERMINAL_RUNTIME_PAYLOAD_HEADROOM_BYTES
                 for limit in limits
-                if limit is not None
             )
-            if limits and all(limit is not None for limit in limits)
+            if limits
             else None
+        )
+        # A declared bound was enforced on the result before staging; the
+        # ceiling only weighs admission, because redaction can grow a stage.
+        self._capacity_enforced = all(
+            limit is not None and limit <= MAX_TOOL_TERMINAL_PAYLOAD_BYTES for limit in limits
         )
         self._capacity_reserved = False
         self._capacity_sealed = False
@@ -294,6 +309,7 @@ class _ToolRoundPublicationCoordinator:
                 tool_round_id=self._tool_round_identity.tool_round_id,
                 maximum_bytes=self._capacity_maximum_bytes,
                 unbounded_tool_names=self._undeclared_tool_names,
+                enforce_maximum=self._capacity_enforced,
             )
         else:
             await self._publication_governor._reserve_invocation_round(
@@ -303,6 +319,7 @@ class _ToolRoundPublicationCoordinator:
                 invocation=session.invocation,
                 lineage=await self._session_lineage(session),
                 unbounded_tool_names=self._undeclared_tool_names,
+                enforce_maximum=self._capacity_enforced,
             )
         self._capacity_reserved = True
 

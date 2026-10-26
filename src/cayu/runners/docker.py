@@ -2436,6 +2436,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         default_cwd: str | None = None,
         close_action: DockerCloseAction = "remove",
         setup_commands: tuple[str, ...] = (),
+        setup_command_timeout_s: int = 300,
         docker_path: str | None = None,
         replace: bool = True,
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
@@ -2469,7 +2470,8 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         ``default_cwd`` is created (hardened; pair with ``RunnerWorkspace``, which
         needs python3 — install it via ``setup_commands``). ``runtime`` is passed
         to ``docker run --runtime`` (e.g. ``runsc``/``kata``). ``setup_commands``
-        run as root, or as the restricted user with ``workload_restrictions``.
+        run as root, or as the restricted user with ``workload_restrictions``,
+        each for at most ``setup_command_timeout_s``.
 
         For virtual egress, ``network`` attaches the container to a Docker network
         (e.g. an ``--internal`` one that blocks direct internet), ``extra_hosts``
@@ -2573,6 +2575,10 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         _validate_close_action(close_action)
         if type(replace) is not bool:
             raise TypeError("replace must be a bool.")
+        if type(setup_command_timeout_s) is not int or setup_command_timeout_s <= 0:
+            raise ValueError(
+                "setup_command_timeout_s must be a positive integer number of seconds."
+            )
         environment_overlay = dict(env_overlay) if env_overlay else {}
         # Setup and diagnostics must use the same preflight-owned overlay as
         # the returned runner, even if caller data changes during allocation.
@@ -2768,7 +2774,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                         docker,
                         setup_argv,
                         docker_cli_env_allowlist=docker_cli_allowlist,
-                        timeout_s=300,
+                        timeout_s=setup_command_timeout_s,
                     )
                 if res.exit_code != 0:
                     detail = _docker_lifecycle_detail(

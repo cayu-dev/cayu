@@ -1182,18 +1182,20 @@ async def test_repeated_chat_tool_identity_metadata_does_not_refresh_semantic_pr
 
 
 @pytest.mark.anyio
-async def test_continuous_semantic_progress_cannot_extend_absolute_lifetime() -> None:
-    async def progress() -> AsyncIterator[ModelStreamEvent]:
-        while True:
+async def test_absolute_deadline_counts_from_the_last_output() -> None:
+    async def progress_then_silence() -> AsyncIterator[ModelStreamEvent]:
+        for _ in range(30):
             await asyncio.sleep(0.005)
             yield ModelStreamEvent.text_delta("x")
+        await asyncio.Event().wait()
+        yield ModelStreamEvent.completed({})  # pragma: no cover
 
     provider = _DeadlineProvider(
-        progress(),
+        progress_then_silence(),
         ProviderStreamDeadlines(
-            transport_idle_timeout_s=1,
-            protocol_idle_timeout_s=1,
-            semantic_progress_timeout_s=0.03,
+            transport_idle_timeout_s=10,
+            protocol_idle_timeout_s=10,
+            semantic_progress_timeout_s=10,
             absolute_stream_timeout_s=0.05,
         ),
     )
@@ -1204,7 +1206,12 @@ async def test_continuous_semantic_progress_cannot_extend_absolute_lifetime() ->
 
     evidence = captured.value.deadline_evidence
     assert evidence.deadline_kind is ProviderDeadlineKind.ABSOLUTE
-    assert evidence.last_progress_kind is not None
+    assert evidence.last_progress_kind is ProviderProgressKind.CONTENT
+    # Thirty outputs at least 5 ms apart outlast the 50 ms deadline; it
+    # expired only once the stream fell silent.
+    assert evidence.last_progress_elapsed_s is not None
+    assert evidence.last_progress_elapsed_s >= 0.145
+    assert evidence.elapsed_s >= evidence.last_progress_elapsed_s + 0.05
 
 
 @pytest.mark.anyio
@@ -1935,7 +1942,7 @@ def test_text_whitespace_policy_does_not_apply_to_structured_progress(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("clock_start", [None, 511.99999999999994])
-async def test_meaningful_stream_still_reaches_absolute_fake_clock_bound(
+async def test_meaningful_stream_outlives_absolute_fake_clock_bound(
     monkeypatch: pytest.MonkeyPatch,
     clock_start: float | None,
 ) -> None:
@@ -1945,24 +1952,24 @@ async def test_meaningful_stream_still_reaches_absolute_fake_clock_bound(
 
     async def events() -> AsyncIterator[ModelStreamEvent]:
         nonlocal now
-        for _ in range(6):
+        for _ in range(12):
             now += 1
             yield ModelStreamEvent.text_delta("x")
+        now += 1
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     provider = _DeadlineProvider(
         events(),
         ProviderStreamDeadlines(semantic_progress_timeout_s=2, absolute_stream_timeout_s=5),
     )
-    with pytest.raises(ModelStreamDeadlineError) as captured:
-        async for _ in provider.runtime_stream(_request()):
-            pass
-    evidence = captured.value.deadline_evidence
-    assert evidence.deadline_kind is ProviderDeadlineKind.ABSOLUTE
-    # Subtraction across a floating-point exponent boundary need not produce
-    # an exact integer, even when every fake-clock increment is one second.
-    assert evidence.elapsed_s == pytest.approx(5, rel=0, abs=1e-9)
-    assert evidence.last_progress_elapsed_s == pytest.approx(4, rel=0, abs=1e-9)
-    assert evidence.whitespace_since_progress is False
+    received = [event async for event in provider.runtime_stream(_request())]
+
+    # Thirteen seconds of output every second never leaves the stream five
+    # seconds without output, so the absolute deadline does not cut it off.
+    assert [event.type for event in received] == [
+        *([ModelStreamEventType.TEXT_DELTA] * 12),
+        ModelStreamEventType.COMPLETED,
+    ]
 
 
 @pytest.mark.anyio

@@ -412,6 +412,14 @@ factory = SandboxCodingEnvironmentFactory(
 )
 ```
 
+Provider timeouts belong to the adapter. On `LambdaMicroVMEgressAdapter`,
+`request_timeout_s` (default 120 s) bounds each call to the MicroVM's sidecar,
+including each stdin chunk written while the workspace is copied in;
+`ready_timeout_s` (default 180 s) is how long a new or resumed MicroVM has to
+answer; and `lifecycle_timeout_s` (default 120 s) is how long a suspend or
+terminate waits for the control plane to report it done. Each can also be set in
+`runner_options`, but not in both places.
+
 The factory is a preset over `VirtualEgressEnvironmentFactory`, `SyncBinding`
 and `RunnerWorkspace`, and each stays usable on its own. Tools are admitted
 through the adapter's live executable evidence, so a tool whose executables are
@@ -551,7 +559,10 @@ the project's locked dependencies. That needs egress to the package index:
 `egress="allowlist"` naming it (for PyPI, `pypi.org` and
 `files.pythonhosted.org`), or `public_web`. Anything they write under `/workspace` is copied back like
 any other change, so put environments elsewhere
-(`UV_PROJECT_ENVIRONMENT=/tmp/venv`).
+(`UV_PROJECT_ENVIRONMENT=/tmp/venv`). Each setup command may run for
+`setup_command_timeout_s` (default 600 seconds). A failure names the exit
+code or the timeout and ends with the last lines of the command's stderr and
+stdout, masked like other setup diagnostics.
 
 Each session creates one sandbox. Its lease starts when the sandbox is ready,
 and the factory renews it at a third of the lease length. The factory waits up
@@ -569,10 +580,24 @@ one object in the install's storage, and the broker extracts it after
 checking its size and SHA-256. A changed file too large for one archive comes
 back the same way. The storage URL gets only the archive and the headers the
 broker signed, never the sandbox credential, and nothing in the sandbox sees
-it. `transfer_limits.max_file_bytes` may then exceed 8 MiB; a sandbox that
-can't carry a file that large through staged copies is refused at setup and
+it. Without `transfer_limits`, the largest file follows each sandbox: what one
+staged copy carries (its `max_bytes` less 64 KiB of tar framing) where it
+offers them, and one archive's worth otherwise. An explicit
+`transfer_limits.max_file_bytes` may also exceed 8 MiB; a sandbox that can't
+carry a file that large through staged copies is refused at setup and
 destroyed. A file the sandbox's staged copies can't carry back fails copy-back
-naming those limits, not `max_file_bytes`. The tree goes up straight from the
+naming those limits, not `max_file_bytes`.
+
+`staged_copies` chooses when staged copies are used. With `"auto"` (the
+default) they are used as described above, and a staged copy-in that fails
+while the runner is still usable is sent again as split archives; a failed
+copy can leave part of the same tree extracted, and the archives write every
+member again over it. A copy whose stop the broker can't confirm closes the
+runner instead, so the two never race. `"never"` uses only archives, so one
+file must fit in one archive. `"always"` sends every copy-in as one staged
+copy, however small, so a tree larger than one staged copy fails, and it
+refuses a sandbox that doesn't offer staged copies.
+`BrokeredSandboxWorkspace` takes the same option. The tree goes up straight from the
 binding's staged archive, which `staging_capacity` already accounts for, so no
 second host copy is made; only a caller of
 `BrokeredSandboxWorkspace.write_tar_stream` whose source can't seek gets its
@@ -616,7 +641,10 @@ the baseline, for an image without `git`.
 Each command starts under a fresh command id and is polled until it finishes:
 
 - Its timeout is bounded only by the sandbox's remaining lifetime (eight hours
-  from ready). A command with no timeout gets the rest of that lifetime.
+  from ready). A command with no timeout runs until a minute before the end of
+  that lifetime by the Agent's clock, because the broker checks the timeout
+  against its own clock. If the broker still refuses a timeout past the
+  remaining lifetime it names, the runner asks once more with that number.
 - If the connection drops while a command starts or runs, the runner replays
   the same id, and the broker never runs it twice.
 - If the caller cancels a command, the runner cancels it in the sandbox and
@@ -995,7 +1023,7 @@ allocation ID the name derives from the session, environment and configuration
 fingerprint), and the container is created on first use. Every path that acts
 on that name (reconnect, use, disposal, discard and crash release) requires
 exactly the reserved name. `warm_spares=N` (requires
-`deferred=True`, at most 8) keeps N containers pre-started through the exact
+`deferred=True`) keeps N containers pre-started through the exact
 cold-start path. Each idle spare holds its memory reservation (512 MiB by
 default) and a container slot. `deferred=True` cannot be combined with
 `immutable_inputs` yet, and the factory rejects that at construction: immutable
@@ -1325,12 +1353,17 @@ The built-in bindings live in `src/cayu/environments/bindings.py`:
 `SyncBinding` is policy-driven: `sync_back` (`always`/`on_success`/`never`) controls when changed files
 are copied back, while `clean_target`, `delete_missing`, `pattern`, `max_files`, `max_file_bytes`,
 `max_total_bytes`, `max_archive_bytes`, and `preserve_git_modes` control each copy. The per-transfer
-defaults are 64 MiB of logical file data and 128 MiB for the complete raw tar, including framing
-and path metadata.
+defaults are 100,000 files, 4 GiB of logical file data and 8 GiB for the complete raw tar, including
+framing and path metadata. They are ceilings: a transfer measures the files it is about to stage
+(`LocalWorkspace` and `RunnerWorkspace` can) and reserves staging capacity for those sizes. A
+transfer from a workspace that can't measure reserves for its limits, or for what the staging
+capacity holds when the limits are larger, and then copies at most that.
 Those per-binding limits are independent of the process-wide staging governor. By default, all
-`SyncBinding` instances share a governor with four transfer slots and 512 MiB of byte-weighted
-working-set capacity. Pass the same `SyncBindingStagingCapacity` instance to a group of bindings to
-define another capacity domain:
+`SyncBinding` instances share a governor with 16 transfer slots and 4 GiB of byte-weighted
+working-set capacity. Archives spool to temporary files; the capacity also bounds the one file a
+transfer holds in memory at a time. Pass the same `SyncBindingStagingCapacity` instance to a group
+of bindings to define another capacity domain (`DockerCodingEnvironmentFactory`,
+`DockerCodingBackendOptions` and `SandboxCodingEnvironmentFactory` take `staging_capacity=` too):
 
 ```python
 from cayu.environments import SyncBinding, SyncBindingStagingCapacity
@@ -1354,7 +1387,8 @@ environment progress contract. See the `*_sync_binding_live.py` examples below.
 For runtime-managed completed outcomes that require sync-back, finalization is a commit boundary:
 the linked task and public session-completed event are published only after the durable source is
 updated. A failure leaves a private bounded recovery marker and the retained target generation,
-fails the task/session with `workspace_output_committed=false`, and can be retried with
+fails the task/session with `workspace_output_committed=false` (`true` when only a later phase,
+such as closing the runner, failed after copy-back), and can be retried with
 `CayuApp.recover_incomplete_session(...)` after reconnecting the same target. Recovery validates the
 binding policy and, when `source_conflict_policy="require_revision"`, the original revision baseline;
 it does not repeat model or tool execution.

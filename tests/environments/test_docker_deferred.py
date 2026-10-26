@@ -59,7 +59,9 @@ def test_deferred_options_are_validated_and_only_deferred_changes_identity(tmp_p
     with pytest.raises(ValueError, match="requires deferred=True"):
         _factory(tmp_path, warm_spares=1)
     with pytest.raises(ValueError, match="warm_spares"):
-        _factory(tmp_path, deferred=True, warm_spares=99)
+        _factory(tmp_path, deferred=True, warm_spares=-1)
+    # The pool size is the operator's choice; there is no fixed maximum.
+    assert _factory(tmp_path, deferred=True, warm_spares=99).warm_spares == 99
 
 
 def test_deferred_allocation_reserves_a_name_without_creating_a_container(

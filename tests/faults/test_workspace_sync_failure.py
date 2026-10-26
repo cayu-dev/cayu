@@ -21,6 +21,7 @@ from cayu.messages import Message
 from cayu.observability.events import InMemoryEventSink
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime import _environment_lifecycle as lifecycle_module
+from cayu.runtime._binding_cleanup import BindingFinalizeFailure, record_binding_finalize_failures
 from cayu.runtime.verified_task_worker import VerifiedTaskHandler, VerifiedTaskWorker
 from cayu.sessions._completion_finalization import pending_completion_finalization_from_checkpoint
 from cayu.sessions.memory import InMemorySessionStore
@@ -460,6 +461,125 @@ def test_sync_binding_failure_blocks_completion_and_recovers_in_fresh_app(
         "b-fail.txt": "updated-b",
         "created.txt": "created",
     }
+
+
+class DisposalFailsAfterCommitBinding(SyncBinding):
+    """Copy back successfully, then fail the way a slow container close does."""
+
+    def _completion_requires_successful_finalization(self, bound) -> bool:
+        super()._completion_requires_successful_finalization(bound)
+        return True
+
+    def __init__(self, **options: Any) -> None:
+        super().__init__(**options)
+        self.snapshot = None
+
+    async def finalize(self, bound, *, outcome=None, metadata=None):
+        if self.snapshot is not None:
+            # A disposal retry: copy-back is not repeated.
+            super().abandon(bound)
+            return self.snapshot
+        # Keep the generation for a disposal retry, as Docker's binding does.
+        self._defer_finalize_release(bound)
+        self.snapshot = await super().finalize(bound, outcome=outcome, metadata=metadata)
+        error = TimeoutError("Runner finalization has not settled within its deadline.")
+        record_binding_finalize_failures(
+            error,
+            (BindingFinalizeFailure(phase="managed_resource_cleanup", error=error),),
+            workspace_output_committed=True,
+        )
+        raise error
+
+
+@pytest.mark.parametrize("committed", [True, False])
+def test_finalize_failure_reports_whether_workspace_output_committed(
+    tmp_path: Path, committed: bool
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a-updated.txt").write_text("original-a", encoding="utf-8")
+    (source_root / "b-fail.txt").write_text("original-b", encoding="utf-8")
+    (source_root / "removed.txt").write_text("remove-me", encoding="utf-8")
+    source = FailOnceWriteWorkspace(
+        source_root,
+        workspace_id="committed-source",
+        fail_path="" if committed else "b-fail.txt",
+    )
+    target = LocalWorkspace(target_root, workspace_id="committed-target")
+    binding_type = DisposalFailsAfterCommitBinding if committed else SyncBinding
+    binding = binding_type(
+        target_workspace=target,
+        source_conflict_policy="require_revision",
+        max_file_bytes=1024,
+        max_total_bytes=64 * 1024,
+    )
+    store = InMemorySessionStore()
+    tasks = InMemoryTaskStore()
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_mutate_workspace", name="mutate_bound_workspace", arguments={}
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("Done."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ],
+        name="committed-provider",
+    )
+    app = CayuApp(session_store=store, task_store=tasks, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="committed"), workspace=source, binding=binding),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(
+            name="committed-agent", model="scripted-model", provider_name="committed-provider"
+        ),
+        tools=[MutateBoundWorkspaceTool()],
+    )
+
+    async def run() -> None:
+        await tasks.create_task(TaskCreate(task_id="committed-task", type="candidate-build"))
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="committed-agent",
+                    session_id="committed-session",
+                    task_id="committed-task",
+                    messages=[Message.text("user", "Apply the workspace changes.")],
+                )
+            )
+        ]
+        failed = next(event for event in events if event.type == EventType.SESSION_FAILED)
+        assert failed.payload["failure_phase"] == "workspace_finalize"
+        assert failed.payload["workspace_output_committed"] is committed
+        finalize_error = failed.payload["binding_finalize_error"]
+        if committed:
+            assert finalize_error["workspace_output_committed"] is True
+            assert [failure["phase"] for failure in finalize_error["failures"]] == [
+                "managed_resource_cleanup"
+            ]
+            assert (source_root / "b-fail.txt").read_text(encoding="utf-8") == "updated-b"
+        else:
+            assert "workspace_output_committed" not in finalize_error
+            assert [failure["phase"] for failure in finalize_error["failures"]] == [
+                "workspace_finalize"
+            ]
+        task = await tasks.load_task("committed-task")
+        assert task is not None
+        assert task.status is TaskStatus.FAILED
+        assert task.error is not None
+        assert task.error["workspace_output_committed"] is committed
+
+    asyncio.run(run())
 
 
 def test_sync_binding_retains_owner_until_finalize_failure_evidence_is_durable(

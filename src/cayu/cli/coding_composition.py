@@ -3852,12 +3852,6 @@ def _coding_backend(
                 extra_admission_probes=(
                     _docker_platform_probe(receipt.platform_architecture),
                 ),
-                transfer_limits=DockerWorkspaceTransferLimits(
-                    max_files=10_000,
-                    max_file_bytes=8 * 1024 * 1024,
-                    max_total_bytes=64 * 1024 * 1024,
-                    max_archive_bytes=128 * 1024 * 1024,
-                ),
                 verify_local_image=verify_local_image,
             ),
         },
@@ -6666,7 +6660,6 @@ def _docker_composition_source(source: str) -> str:
             "    CodingDependencyInput,\n"
             "    CodingToolchainProfile,\n"
             "    DockerCodingBackendOptions,\n"
-            "    DockerWorkspaceTransferLimits,\n"
             "    register_coding_environment,\n"
             "    select_coding_backend,\n"
             ")\n"

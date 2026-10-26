@@ -2,8 +2,9 @@
 
 A deferred tool round reserves the result size each of its tools declares in
 ``ToolSpec.max_terminal_payload_bytes`` from capacity shared by the whole
-process. A tool without a declaration makes its round exclusive, so every
-built-in declares one, except ``subagent`` with a foreground child unless the
+process. A tool without a declaration reserves the largest terminal result the
+durable event limit admits, ``MAX_TOOL_TERMINAL_PAYLOAD_BYTES``. Every built-in
+declares a smaller bound, except ``subagent`` with a foreground child unless the
 application sets its bound (see ``_subagent_terminal_payload_bound``). The
 declaration is honest only if the tool keeps its
 result inside it: ``bounded_terminal_result`` fits whatever ``run`` returns to
@@ -19,14 +20,21 @@ from typing import Any, TypeVar
 
 from cayu._validation import DURABLE_EVENT_LIMITS, JsonUtf8SizeCounter, _json_string_body_size
 from cayu.tools._redaction import active_secret_redactor_snapshot, record_ambiguous_secret_output
-from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.base import (
+    MIN_ENFORCED_TERMINAL_PAYLOAD_BYTES,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolSpec,
+    enforced_terminal_payload_bound,
+)
 from cayu.vaults import SecretRedactor
 
 KIB = 1024
 MIB = 1024 * KIB
 
-# ToolSpec refuses a smaller declaration.
-MIN_TOOL_TERMINAL_PAYLOAD_BYTES = 64 * KIB
+# A smaller declaration is accepted and rounded up to this.
+MIN_TOOL_TERMINAL_PAYLOAD_BYTES = MIN_ENFORCED_TERMINAL_PAYLOAD_BYTES
 # The terminal event carries the whole result beside up to 64 KiB of runtime
 # envelope, and Cayu stores no event larger than the durable event limit.
 MAX_TOOL_TERMINAL_PAYLOAD_BYTES = DURABLE_EVENT_LIMITS.max_bytes - 64 * KIB
@@ -55,29 +63,36 @@ _RunMethod = Callable[[_ToolT, ToolContext, dict[str, Any]], Awaitable[ToolResul
 
 
 def tool_terminal_payload_bound(value: object, *, default: int) -> int:
-    """Validate an application's bound for a built-in tool, or return ``default``."""
+    """Validate an application's bound for a built-in tool, or return ``default``.
+
+    A bound below ``MIN_TOOL_TERMINAL_PAYLOAD_BYTES`` is rounded up to it, so
+    the tool's own framing and the runtime's failure results still fit.
+    """
 
     if value is None:
         return default
     if type(value) is not int:
         raise TypeError("max_terminal_payload_bytes must be an integer number of bytes.")
-    if not MIN_TOOL_TERMINAL_PAYLOAD_BYTES <= value <= MAX_TOOL_TERMINAL_PAYLOAD_BYTES:
+    if not 1 <= value <= MAX_TOOL_TERMINAL_PAYLOAD_BYTES:
         raise ValueError(
-            "max_terminal_payload_bytes must be between "
-            f"{MIN_TOOL_TERMINAL_PAYLOAD_BYTES} and {MAX_TOOL_TERMINAL_PAYLOAD_BYTES} bytes."
+            "max_terminal_payload_bytes must be a positive number of bytes no larger "
+            f"than {MAX_TOOL_TERMINAL_PAYLOAD_BYTES}."
         )
-    return value
+    return max(value, MIN_TOOL_TERMINAL_PAYLOAD_BYTES)
 
 
 def spec_with_terminal_payload_bound(spec: ToolSpec, value: object, *, default: int) -> ToolSpec:
     """Return ``spec`` declaring the application's bound, its own, or ``default``.
 
     An explicit ``value`` always wins. Otherwise a bound the spec already
-    declares is kept, and a spec without one gets ``default``.
+    declares is kept, rounded up like an explicit one, and a spec without one
+    gets ``default``.
     """
 
     if value is None and spec.max_terminal_payload_bytes is not None:
-        return spec
+        if spec.max_terminal_payload_bytes >= MIN_TOOL_TERMINAL_PAYLOAD_BYTES:
+            return spec
+        value = spec.max_terminal_payload_bytes
     bound = tool_terminal_payload_bound(value, default=default)
     if spec.max_terminal_payload_bytes == bound:
         return spec
@@ -90,9 +105,9 @@ def application_tool_declares_no_bound(
     """Whether to tell an application that its tool declares no terminal bound.
 
     Application implementations and process-isolated application specs are
-    reported. Cayu's own tools declare a bound, except ``subagent`` with a
-    foreground child, whose exclusive lease is deliberate, and MCP tools,
-    which have no declaration to set.
+    reported, because such a tool reserves the largest terminal result Cayu can
+    store for every call. Cayu's own tools declare a bound, except ``subagent``
+    with a foreground child, and MCP tools, which have no declaration to set.
     """
 
     if max_terminal_payload_bytes is not None:
@@ -227,7 +242,9 @@ def bounded_terminal_result(run: _RunMethod[_ToolT]) -> _RunMethod[_ToolT]:
         result = await run(self, ctx, args)
         if type(result) is not ToolResult:
             return result
-        return fit_redacted_tool_result(ctx, result, self.spec.max_terminal_payload_bytes)
+        return fit_redacted_tool_result(
+            ctx, result, enforced_terminal_payload_bound(self.spec.max_terminal_payload_bytes)
+        )
 
     return wrapper
 

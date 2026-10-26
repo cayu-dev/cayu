@@ -77,10 +77,16 @@ class BindingFinalizeFailure:
 
 @dataclass(frozen=True)
 class BindingFinalizeStatus:
-    """Ordered finalization failures attached to the propagated exception."""
+    """Ordered finalization failures attached to the propagated exception.
+
+    ``workspace_output_committed`` is set by a binding whose output phase, such
+    as copy-back to the source, finished before a later phase (typically
+    disposing of its runner) failed.
+    """
 
     failures: tuple[BindingFinalizeFailure, ...]
     supplemental_redactor: SecretRedactor | None = None
+    workspace_output_committed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,8 +242,13 @@ def record_binding_finalize_failures(
     failures: tuple[BindingFinalizeFailure, ...],
     *,
     supplemental_redactor: SecretRedactor | None = None,
+    workspace_output_committed: bool = False,
 ) -> BindingFinalizeStatus:
-    """Attach trusted phase ordering without replacing any child exception."""
+    """Attach trusted phase ordering without replacing any child exception.
+
+    Pass ``workspace_output_committed=True`` only when the binding's output
+    phase had finished before the recorded failures.
+    """
 
     if type(failures) is not tuple or not failures:
         raise ValueError("Binding finalization failures cannot be empty.")
@@ -254,9 +265,12 @@ def record_binding_finalize_failures(
             raise TypeError("Binding finalization failure errors must be exceptions.")
     if supplemental_redactor is not None and not isinstance(supplemental_redactor, SecretRedactor):
         raise TypeError("supplemental_redactor must be a SecretRedactor or None.")
+    if type(workspace_output_committed) is not bool:
+        raise TypeError("workspace_output_committed must be a bool.")
     status = BindingFinalizeStatus(
         failures=failures,
         supplemental_redactor=supplemental_redactor,
+        workspace_output_committed=workspace_output_committed,
     )
     _attach_binding_status(
         error,
@@ -275,6 +289,13 @@ def binding_finalize_status(error: BaseException) -> BindingFinalizeStatus | Non
         expected_type=BindingFinalizeStatus,
     )
     return status if type(status) is BindingFinalizeStatus else None
+
+
+def binding_finalize_workspace_output_committed(error: BaseException) -> bool:
+    """Whether the failed binding reported its output committed before failing."""
+
+    status = binding_finalize_status(error)
+    return status is not None and status.workspace_output_committed is True
 
 
 def binding_finalize_cancellation(error: BaseException) -> asyncio.CancelledError | None:
@@ -383,6 +404,9 @@ def append_binding_finalize_cancellation(
         aggregate,
         failures,
         supplemental_redactor=(status.supplemental_redactor if status is not None else None),
+        workspace_output_committed=(
+            status.workspace_output_committed if status is not None else False
+        ),
     )
     return aggregate
 

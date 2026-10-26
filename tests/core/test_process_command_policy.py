@@ -156,7 +156,7 @@ def test_process_command_policy_rejects_invalid_host_configuration(
         ({"allow_stdin": 1}, TypeError, "must be a boolean"),
         ({"max_stdin_bytes": -1}, ValueError, "cannot be negative"),
         ({"max_timeout_s": 0}, ValueError, "greater than zero"),
-        ({"max_timeout_s": 3_601}, ValueError, "cannot exceed 3600"),
+        ({"max_timeout_s": 12 * 3_600 + 1}, ValueError, "cannot exceed 43200"),
         ({"shell_decision": "allow"}, TypeError, "CommandPolicyDecision"),
     ],
 )

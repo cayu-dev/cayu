@@ -94,8 +94,11 @@ DEFAULT_LAMBDA_MICROVM_CWD = "/workspace"
 DEFAULT_LAMBDA_MICROVM_PORT = 8080
 DEFAULT_LAMBDA_MICROVM_AUTH_TOKEN_MINUTES = 30
 DEFAULT_LAMBDA_MICROVM_POLL_INTERVAL_SECONDS = 0.1
-DEFAULT_LAMBDA_MICROVM_REQUEST_TIMEOUT_SECONDS = 30.0
-DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS = 60.0
+# Bounds each sidecar endpoint call, including one stdin chunk during copy-in.
+DEFAULT_LAMBDA_MICROVM_REQUEST_TIMEOUT_SECONDS = 120.0
+DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS = 180.0
+# How long a suspend or terminate waits for the control plane to report it done.
+DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_LAMBDA_MICROVM_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS = 0.01
@@ -932,6 +935,8 @@ class LambdaMicroVMRunner(Runner):
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         env_overlay: Mapping[str, str] | None = None,
+        ready_timeout_s: float = DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS,
+        lifecycle_timeout_s: float = DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS,
     ) -> None:
         if client is None:
             raise TypeError("LambdaMicroVMRunner client cannot be None.")
@@ -946,6 +951,9 @@ class LambdaMicroVMRunner(Runner):
         self.close_action = _validate_close_action(close_action)
         self.poll_interval_s = _nonnegative_float(poll_interval_s, "poll_interval_s")
         self.request_timeout_s = _positive_float(request_timeout_s, "request_timeout_s")
+        # A resume waits this long for the sidecar again, as allocation does.
+        self.ready_timeout_s = _positive_float(ready_timeout_s, "ready_timeout_s")
+        self.lifecycle_timeout_s = _positive_float(lifecycle_timeout_s, "lifecycle_timeout_s")
         if type(auth_token_expiration_minutes) is not int or auth_token_expiration_minutes <= 0:
             raise ValueError("auth_token_expiration_minutes must be a positive integer.")
         self.auth_token_expiration_minutes = auth_token_expiration_minutes
@@ -1267,6 +1275,7 @@ class LambdaMicroVMRunner(Runner):
         env_overlay: Mapping[str, str] | None = None,
         client_token: str | None = None,
         client_token_not_after: float | None = None,
+        lifecycle_timeout_s: float = DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS,
     ) -> LambdaMicroVMRunner:
         """Allocate a MicroVM and wait until its sidecar is ready.
 
@@ -1296,6 +1305,7 @@ class LambdaMicroVMRunner(Runner):
             cancellation_cleanup=cancellation_cleanup,
             timeout_cleanup=timeout_cleanup,
             env_overlay=env_overlay,
+            lifecycle_timeout_s=lifecycle_timeout_s,
         )
         run_options = lambda_microvm_run_options(
             image,
@@ -1360,6 +1370,8 @@ class LambdaMicroVMRunner(Runner):
                     cancellation_cleanup=cancellation_cleanup,
                     timeout_cleanup=timeout_cleanup,
                     env_overlay=environment_overlay,
+                    ready_timeout_s=ready_timeout_s,
+                    lifecycle_timeout_s=lifecycle_timeout_s,
                 )
                 reclamation.runner = runner
                 if not reclamation.abandoned:
@@ -1484,6 +1496,7 @@ class LambdaMicroVMRunner(Runner):
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         env_overlay: Mapping[str, str] | None = None,
+        lifecycle_timeout_s: float = DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS,
     ) -> LambdaMicroVMRunner:
         identifier = require_clean_nonblank(microvm_id, "microvm_id")
         guest_root = _validate_guest_root(default_cwd)
@@ -1498,6 +1511,7 @@ class LambdaMicroVMRunner(Runner):
             cancellation_cleanup=cancellation_cleanup,
             timeout_cleanup=timeout_cleanup,
             env_overlay=env_overlay,
+            lifecycle_timeout_s=lifecycle_timeout_s,
         )
         if identifier in _LAMBDA_ATTACHMENT_OWNERS:
             raise LambdaMicroVMError("A Lambda MicroVM attachment or its cleanup is still pending.")
@@ -1547,6 +1561,8 @@ class LambdaMicroVMRunner(Runner):
                     cancellation_cleanup=cancellation_cleanup,
                     timeout_cleanup=timeout_cleanup,
                     env_overlay=environment_overlay,
+                    ready_timeout_s=ready_timeout_s,
+                    lifecycle_timeout_s=lifecycle_timeout_s,
                 )
                 reclamation.runner = runner
 
@@ -1966,11 +1982,11 @@ class LambdaMicroVMRunner(Runner):
     async def suspend(self) -> None:
         await self._settle_public_lifecycle(self._suspend, action="suspend")
 
-    async def wait_until_suspended(
-        self,
-        timeout_s: float = DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS,
-    ) -> None:
-        """Wait for positive control-plane evidence that guest execution is suspended."""
+    async def wait_until_suspended(self, timeout_s: float | None = None) -> None:
+        """Wait for positive control-plane evidence that guest execution is suspended.
+
+        ``timeout_s`` defaults to the runner's ``lifecycle_timeout_s``.
+        """
 
         async with self._lifecycle_lock:
             if not self._suspended:
@@ -1978,7 +1994,7 @@ class LambdaMicroVMRunner(Runner):
             await self._wait_for_lifecycle_state(
                 terminal_state="SUSPENDED",
                 transitional_states={"RUNNING", "SUSPENDING"},
-                timeout_s=timeout_s,
+                timeout_s=self.lifecycle_timeout_s if timeout_s is None else timeout_s,
             )
 
     async def _suspend(self, *, fenced: bool = True) -> None:
@@ -2015,9 +2031,7 @@ class LambdaMicroVMRunner(Runner):
             if state in {"PENDING", "RUNNING"}:
                 return
             if state == "SUSPENDING":
-                await self._prepare_existing_for_attach(
-                    state, DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS
-                )
+                await self._prepare_existing_for_attach(state, self.ready_timeout_s)
                 self._suspended = False
                 return
             if state != "SUSPENDED":
@@ -2025,7 +2039,7 @@ class LambdaMicroVMRunner(Runner):
         await asyncio.to_thread(self._client.resume_microvm, microvmIdentifier=self.microvm_id)
         self._auth_token = None
         self._auth_token_expires_at = 0.0
-        await self._wait_until_ready(DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS)
+        await self._wait_until_ready(self.ready_timeout_s)
         self._suspended = False
 
     async def terminate(self) -> None:
@@ -2053,7 +2067,7 @@ class LambdaMicroVMRunner(Runner):
                             if action == "suspend"
                             else {"RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING"}
                         ),
-                        timeout_s=self.request_timeout_s,
+                        timeout_s=self.lifecycle_timeout_s,
                     )
 
         def settled(task: asyncio.Task[CapturedAwaitableOutcome[None]]) -> None:
@@ -2089,8 +2103,10 @@ class LambdaMicroVMRunner(Runner):
             task.add_done_callback(settled)
         outcome = await await_shielded_task_outcome(
             task,
+            # The provider call, then the wait for its state (or, after a
+            # resume, for the sidecar to answer again).
             timeout_s=self.request_timeout_s
-            + (DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS if action == "resume" else 0),
+            + (self.ready_timeout_s if action == "resume" else self.lifecycle_timeout_s),
             timeout_after_cancellation_s=self.cancel_timeout_s,
         )
         failure = outcome.error if outcome.result is None else outcome.result.error
@@ -2113,11 +2129,11 @@ class LambdaMicroVMRunner(Runner):
                 raise RuntimeError("Lambda MicroVM lifecycle dependency was cancelled.") from None
             raise failure
 
-    async def wait_until_terminated(
-        self,
-        timeout_s: float = DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS,
-    ) -> None:
-        """Wait for positive control-plane evidence that guest execution terminated."""
+    async def wait_until_terminated(self, timeout_s: float | None = None) -> None:
+        """Wait for positive control-plane evidence that guest execution terminated.
+
+        ``timeout_s`` defaults to the runner's ``lifecycle_timeout_s``.
+        """
 
         async with self._lifecycle_lock:
             if not self._termination_requested:
@@ -2125,7 +2141,7 @@ class LambdaMicroVMRunner(Runner):
             await self._wait_for_lifecycle_state(
                 terminal_state="TERMINATED",
                 transitional_states={"RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING"},
-                timeout_s=timeout_s,
+                timeout_s=self.lifecycle_timeout_s if timeout_s is None else timeout_s,
             )
 
     async def close(self) -> None:
@@ -4124,12 +4140,14 @@ def _preflight_runner_creation(
     cancellation_cleanup: RunnerCleanupPolicy,
     timeout_cleanup: RunnerCleanupPolicy,
     env_overlay: Mapping[str, str] | None,
+    lifecycle_timeout_s: float,
 ) -> dict[str, str]:
     """Reject local configuration before allocating or attaching provider resources."""
 
     _optional_clean_string(region_name, "region_name")
     _validate_close_action(close_action)
     _positive_float(ready_timeout_s, "ready_timeout_s")
+    _positive_float(lifecycle_timeout_s, "lifecycle_timeout_s")
     _nonnegative_float(poll_interval_s, "poll_interval_s")
     _positive_float(request_timeout_s, "request_timeout_s")
     if type(auth_token_expiration_minutes) is not int or auth_token_expiration_minutes <= 0:

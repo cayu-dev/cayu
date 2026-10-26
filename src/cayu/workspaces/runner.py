@@ -43,6 +43,7 @@ from cayu.workspaces.base import (
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
     WorkspaceListResult,
+    WorkspaceManifestLimits,
     WorkspaceMoveResult,
     WorkspaceMutationResult,
     WorkspaceReadResult,
@@ -77,6 +78,13 @@ DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES = MAX_READ_LIMIT_BYTES
 DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT = 500
 RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES = 4096
 RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES
+# With manifest limits, listings and manifests may use this many bytes per
+# allowed path: a manifest entry is its path plus about 100 bytes of digest,
+# size and mode. 100,000 paths come to 25 MiB, within every built-in runner's
+# command output.
+RUNNER_WORKSPACE_LISTING_BYTES_PER_PATH = 256
+# Paths per size measurement, so each command's input stays small.
+_RUNNER_WORKSPACE_MEASURE_BATCH_BYTES = 256 * 1024
 # The largest streamed tar a guest stages in memory when its temporary storage
 # cannot hold it. The guest also refuses less when its memory limit leaves no
 # room for the staged archive plus the files it extracts.
@@ -648,6 +656,31 @@ def write_tar_from_workspace(root_fd, preflight_files, fileobj, mode):
                 close_fd(parent_fd)
 
 
+def measure_files_operation(root_fd):
+    total_bytes = 0
+    largest_file_bytes = 0
+    for rel_path in json.loads(sys.stdin.read())["paths"]:
+        parent_fd = None
+        leaf_fd = None
+        try:
+            parent_fd, leaf_name = open_path(root_fd, rel_path)
+            leaf_fd, info = open_guarded_regular(leaf_name, parent_fd)
+        except GuardPathError as exc:
+            if exc.status == "notfile":
+                fail("not_found", f"Workspace file not found: {rel_path}")
+            fail_guard(exc, rel_path)
+        finally:
+            close_fd(leaf_fd)
+            close_fd(parent_fd)
+        total_bytes += info.st_size
+        largest_file_bytes = max(largest_file_bytes, info.st_size)
+    print(json.dumps({
+        "ok": True,
+        "total_bytes": total_bytes,
+        "largest_file_bytes": largest_file_bytes,
+    }))
+
+
 def read_tar_operation(root_fd):
     rel_paths, preflight_files, total_bytes = read_tar_preflight(root_fd)
     buffer = io.BytesIO()
@@ -985,6 +1018,8 @@ def main():
                 git_entries_operation(root_fd)
             elif operation in ("content_manifest", "revision_manifest"):
                 content_manifest_operation(root_fd)
+            elif operation == "measure_files":
+                measure_files_operation(root_fd)
             elif operation == "read_tar":
                 read_tar_operation(root_fd)
             elif operation == "read_tar_stream":
@@ -1041,9 +1076,22 @@ class RunnerWorkspace(
         enable_workspace_branches: bool = False,
         branch_operation_timeout_s: int = 300,
         branch_authority_resolver: WorkspaceBranchBindingAuthorityProvider | None = None,
+        manifest_limits: WorkspaceManifestLimits | None = None,
     ) -> None:
         if not isinstance(runner, Runner):
             raise TypeError("RunnerWorkspace runner must be a Runner.")
+        if manifest_limits is not None and type(manifest_limits) is not WorkspaceManifestLimits:
+            raise TypeError("RunnerWorkspace manifest_limits must be WorkspaceManifestLimits.")
+        # The bounds a command's complete workspace manifest is captured within.
+        self.manifest_limits = manifest_limits
+        self._list_payload_limit_bytes = (
+            RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES
+            if manifest_limits is None
+            else max(
+                RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES,
+                manifest_limits.max_paths * RUNNER_WORKSPACE_LISTING_BYTES_PER_PATH,
+            )
+        )
         self._runner = runner
         self.cwd = _validate_optional_cwd(cwd)
         self.python_executable = require_clean_nonblank(python_executable, "python_executable")
@@ -1390,10 +1438,10 @@ class RunnerWorkspace(
             "list",
             translate_list_pattern(pattern),
             str(effective_limit),
-            str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
+            str(self._list_payload_limit_bytes),
             json.dumps(tuple(sorted(self._excluded_directory_keys))),
             json.dumps(self._excluded_path_regexes),
-            output_limit_bytes=_json_list_output_limit(),
+            output_limit_bytes=self._json_list_output_limit(),
         )
         validated = _validate_workspace_list_result(
             result,
@@ -1425,10 +1473,10 @@ class RunnerWorkspace(
         result = await self._run_json_operation(
             "git_entries",
             str(effective_limit),
-            str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
+            str(self._list_payload_limit_bytes),
             json.dumps(tuple(sorted(self._excluded_directory_keys))),
             json.dumps(self._excluded_path_regexes),
-            output_limit_bytes=_json_list_output_limit(),
+            output_limit_bytes=self._json_list_output_limit(),
         )
         validated = _validate_workspace_git_entry_result(
             result,
@@ -1460,10 +1508,10 @@ class RunnerWorkspace(
         result = await self._run_json_operation(
             "content_manifest",
             *(str(value) for value in limits),
-            str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
+            str(self._list_payload_limit_bytes),
             json.dumps(tuple(sorted(self._excluded_directory_keys))),
             json.dumps(self._excluded_path_regexes),
-            output_limit_bytes=_json_list_output_limit(),
+            output_limit_bytes=self._json_list_output_limit(),
         )
         raw_entries = result.get("entries")
         if type(raw_entries) is not list or any(type(row) is not list for row in raw_entries):
@@ -1499,11 +1547,11 @@ class RunnerWorkspace(
             str(_validate_required_limit(max_paths, "max_paths")),
             str(_validate_required_limit(max_file_bytes, "max_file_bytes")),
             str(_validate_required_limit(max_total_bytes, "max_total_bytes")),
-            str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
+            str(self._list_payload_limit_bytes),
             json.dumps(tuple(sorted(self._excluded_directory_keys))),
             json.dumps(self._excluded_path_regexes),
             str(_validate_required_limit(max_path_bytes, "max_path_bytes")),
-            output_limit_bytes=_json_list_output_limit(),
+            output_limit_bytes=self._json_list_output_limit(),
         )
         if "limit" in result:
             code = result["limit"]
@@ -1751,6 +1799,48 @@ class RunnerWorkspace(
                 f"Runner workspace operation failed with exit code {result.exit_code}: "
                 f"{result.stderr.strip() or result.stdout.strip()}"
             )
+
+    def _json_list_output_limit(self) -> int:
+        return self._list_payload_limit_bytes + RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES
+
+    async def _observe_transfer_sizes(self, paths: tuple[str, ...]) -> tuple[int, int]:
+        """Return the total and largest size of regular files, measured in the guest.
+
+        SyncBinding sizes its staging reservation from this; it reads nothing.
+        """
+        validated_paths = _validate_tar_paths(paths)
+        for path in validated_paths:
+            self._require_path_allowed(path)
+        total_bytes = 0
+        largest_file_bytes = 0
+        batch: list[str] = []
+        batch_bytes = 0
+        for index, path in enumerate(validated_paths):
+            batch.append(path)
+            batch_bytes += len(path.encode("utf-8")) + 4
+            if (
+                index + 1 < len(validated_paths)
+                and batch_bytes < _RUNNER_WORKSPACE_MEASURE_BATCH_BYTES
+            ):
+                continue
+            result = await self._run_json_operation(
+                "measure_files",
+                stdin=json.dumps({"paths": batch}),
+                output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
+            )
+            measured_total = result.get("total_bytes")
+            measured_largest = result.get("largest_file_bytes")
+            if (
+                type(measured_total) is not int
+                or type(measured_largest) is not int
+                or not 0 <= measured_largest <= measured_total
+            ):
+                raise RuntimeError("Runner workspace returned invalid file sizes.")
+            total_bytes += measured_total
+            largest_file_bytes = max(largest_file_bytes, measured_largest)
+            batch = []
+            batch_bytes = 0
+        return total_bytes, largest_file_bytes
 
     async def _run_json_operation(
         self,
@@ -2018,10 +2108,6 @@ def _validate_tar_paths(paths: Sequence[str]) -> tuple[str, ...]:
 
 def _json_read_output_limit(max_bytes: int) -> int:
     return (4 * ((max_bytes + 2) // 3)) + RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES
-
-
-def _json_list_output_limit() -> int:
-    return RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES + RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES
 
 
 def _decode_base64(value: Any, field_name: str) -> bytes:

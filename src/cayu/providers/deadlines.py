@@ -25,7 +25,7 @@ DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS = 300.0
 DEFAULT_ABSOLUTE_STREAM_TIMEOUT_SECONDS = 600.0
-DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS = 100
+DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS = 1000
 
 
 def _positive_finite_seconds(value: object, field_name: str) -> float:
@@ -50,6 +50,17 @@ def _positive_stream_capacity(value: object, field_name: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class ProviderStreamDeadlines:
+    """Stream clocks and process-wide stream capacity for one provider.
+
+    The three idle clocks expire when raw bytes, decoded events, or semantic
+    progress (content, reasoning, tool calls and the like) stop arriving.
+    ``absolute_stream_timeout_s`` expires when the stream has produced no
+    semantic progress for that long on the wall clock, consumer pauses
+    included; a stream that keeps producing output is not cut off by it.
+    ``max_concurrent_streams`` bounds open provider streams in the process;
+    a dispatch over it fails at once instead of waiting.
+    """
+
     transport_idle_timeout_s: float = DEFAULT_TRANSPORT_IDLE_TIMEOUT_SECONDS
     protocol_idle_timeout_s: float = DEFAULT_PROTOCOL_IDLE_TIMEOUT_SECONDS
     semantic_progress_timeout_s: float = DEFAULT_SEMANTIC_PROGRESS_TIMEOUT_SECONDS
@@ -267,7 +278,12 @@ def _reserve_provider_deadline_await_ownership(
 
     with _PROVIDER_DEADLINE_AWAIT_OWNERS_LOCK:
         if len(_PROVIDER_DEADLINE_AWAIT_OWNERS) >= max_concurrent_streams:
-            raise RuntimeError("Provider stream deadline-read capacity is exhausted.")
+            raise RuntimeError(
+                "Provider stream deadline-read capacity is exhausted: "
+                f"{max_concurrent_streams} provider streams are already open in this "
+                "process. Raise ProviderStreamDeadlines(max_concurrent_streams=...) on "
+                "the provider."
+            )
         ownership = _ProviderDeadlineAwaitOwnership()
         _PROVIDER_DEADLINE_AWAIT_OWNERS.add(ownership)
     return ownership
@@ -437,7 +453,16 @@ class ProviderStreamDeadlineController:
 
     def _deadline_at(self, kind: ProviderDeadlineKind) -> float:
         if kind is ProviderDeadlineKind.ABSOLUTE:
-            return self._started_at + self.deadlines.absolute_stream_timeout_s
+            # Measured from the last accepted progress, or the start, on the
+            # wall clock: consumer pauses are not excluded, so it still bounds
+            # a stream whose idle clocks keep being extended, while a stream
+            # that keeps producing output is never cut off by it.
+            last_output_at = (
+                self._started_at
+                if self._last_progress_observed_at is None
+                else self._last_progress_observed_at
+            )
+            return last_output_at + self.deadlines.absolute_stream_timeout_s
         if kind is ProviderDeadlineKind.SEMANTIC_IDLE:
             return self._last_semantic_at + self.deadlines.semantic_progress_timeout_s
         if kind is ProviderDeadlineKind.PROTOCOL_IDLE:
@@ -828,6 +853,7 @@ def _provider_deadline_material(deadlines: object) -> dict[str, float | int]:
         "text_progress_policy_version": 2,
         "semantic_cleanup_policy_version": 1,
         "http_cleanup_observation_policy_version": 1,
+        "absolute_output_idle_policy_version": 1,
         "transport_idle_timeout_s": deadlines.transport_idle_timeout_s,
         "protocol_idle_timeout_s": deadlines.protocol_idle_timeout_s,
         "semantic_progress_timeout_s": deadlines.semantic_progress_timeout_s,

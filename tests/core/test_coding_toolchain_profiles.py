@@ -23,6 +23,7 @@ from cayu.environments import (
     DockerCodingFixedEnvironmentVariable,
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
+    DockerWorkspaceTransferLimits,
     owned_coding_toolchain_profile,
     verify_coding_toolchain_dependencies,
     verify_docker_coding_toolchain_dependencies,
@@ -235,11 +236,19 @@ def test_docker_typed_tool_and_factory_identities_match_the_release_before() -> 
 
 
 def test_docker_factory_identity_matches_the_release_before(tmp_path: Path) -> None:
+    # The transfer limits are part of the identity and their defaults changed,
+    # so the release before's defaults are passed explicitly.
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(
             tmp_path, workspace_id="golden", excluded_directory_names=(".git",)
         ),
         toolchain_profile=_golden_profile(),
+        transfer_limits=DockerWorkspaceTransferLimits(
+            max_files=10_000,
+            max_file_bytes=8 * 1024 * 1024,
+            max_total_bytes=64 * 1024 * 1024,
+            max_archive_bytes=128 * 1024 * 1024,
+        ),
     )
 
     assert factory.execution_profile_identity.model_dump(mode="json") == {

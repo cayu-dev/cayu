@@ -313,6 +313,8 @@ async def test_failed_allocation_retries_unbound_client_close(monkeypatch, cance
         {"poll_interval_s": float("nan")},
         {"request_timeout_s": float("inf")},
         {"request_timeout_s": -1},
+        {"lifecycle_timeout_s": 0},
+        {"lifecycle_timeout_s": float("nan")},
         {"auth_token_expiration_minutes": True},
         {"auth_token_expiration_minutes": 0},
         {"cancellation_cleanup": "invalid"},
@@ -1744,6 +1746,44 @@ async def test_lambda_microvm_runner_waits_for_positive_lifecycle_quiescence() -
     assert len(terminated_client.get_calls) == 2
     await terminated_runner.wait_until_terminated(timeout_s=1)
     assert len(terminated_client.get_calls) == 3
+
+
+class StuckSuspendingLambdaMicroVMClient(FakeLambdaMicroVMClient):
+    def get_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        response = super().get_microvm(**kwargs)
+        response["state"] = "SUSPENDING"
+        return response
+
+
+def test_lambda_microvm_runner_timeout_defaults() -> None:
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=FakeEndpointTransport(),
+    )
+    assert runner.request_timeout_s == 120.0
+    assert runner.ready_timeout_s == 180.0
+    assert runner.lifecycle_timeout_s == 120.0
+
+
+@pytest.mark.anyio
+async def test_lambda_microvm_lifecycle_wait_follows_its_own_timeout() -> None:
+    client = StuckSuspendingLambdaMicroVMClient()
+    runner = LambdaMicroVMRunner(
+        client,
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=FakeEndpointTransport(),
+        poll_interval_s=0,
+        # Long enough that only the lifecycle bound can end the wait.
+        request_timeout_s=300,
+        lifecycle_timeout_s=0.2,
+    )
+    with pytest.raises(LambdaMicroVMError, match=r"SUSPENDED within 0\.2 seconds"):
+        await runner.suspend()
+    with pytest.raises(LambdaMicroVMError, match=r"SUSPENDED within 0\.1 seconds"):
+        await runner.wait_until_suspended(timeout_s=0.1)
 
 
 @pytest.mark.anyio

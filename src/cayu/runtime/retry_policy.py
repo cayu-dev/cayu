@@ -12,6 +12,7 @@ from cayu.providers._retry_decision import RetrySuppression as RetrySuppression
 from cayu.providers.retry_policy import (
     DEFAULT_RETRYABLE_STATUS_CODES as DEFAULT_RETRYABLE_STATUS_CODES,
 )
+from cayu.providers.retry_policy import RATE_LIMIT_STATUS_CODES as RATE_LIMIT_STATUS_CODES
 from cayu.providers.retry_policy import RetryPolicy as RetryPolicy
 from cayu.providers.retry_policy import copy_retry_policy as copy_retry_policy
 
@@ -61,6 +62,7 @@ def retry_decision(
     unknown_provider_error: bool = False,
     retryable_output: bool = False,
     suppression: RetrySuppression | None = None,
+    elapsed_s: float | None = None,
 ) -> RetryDecision:
     """Classify one failed model attempt into a retry decision.
 
@@ -79,6 +81,9 @@ def retry_decision(
     `retryable_output` marks a caller-validated output failure, independently of
     transport retry settings. It requires an explicit retryable verdict and no
     HTTP status; suppression and the general attempt ceiling still apply.
+    `elapsed_s` is the time since the model step's first attempt started. With
+    it, a rate-limit or overload failure is paced by the policy's
+    `max_retry_elapsed_s`; without it the budget does not apply.
     """
 
     policy = copy_retry_policy(policy)
@@ -101,6 +106,10 @@ def retry_decision(
             raise ValueError("retry_after_s must be a finite non-negative number.") from None
         if not math.isfinite(retry_after_s) or retry_after_s < 0:
             raise ValueError("retry_after_s must be a finite non-negative number.")
+    if elapsed_s is not None and (
+        type(elapsed_s) not in {int, float} or not math.isfinite(elapsed_s) or elapsed_s < 0
+    ):
+        raise ValueError("elapsed_s must be a finite non-negative number.")
 
     if suppression is not None and type(suppression) is not RetrySuppression:
         raise TypeError("suppression must be a RetrySuppression or None.")
@@ -133,6 +142,16 @@ def retry_decision(
     else:
         effective_max_attempts = policy.max_attempts
     can_retry = reason is not None and attempt < effective_max_attempts
+    budget_remaining_s = (
+        _rate_limit_budget_remaining(policy, reason, classified_status, elapsed_s)
+        if can_retry
+        else None
+    )
+    if budget_remaining_s is not None and budget_remaining_s <= 0:
+        # The time budget ran out before the attempts did. Report it as the
+        # configured retries running out, which also lets failover proceed.
+        can_retry = False
+        effective_max_attempts = attempt
     if suppression is not None:
         disposition = RetryDisposition.SUPPRESSED
     elif can_retry:
@@ -163,7 +182,15 @@ def retry_decision(
         reason=reason,
         status_code=classified_status,
         delay_seconds=(
-            _retry_delay(policy, attempt, retry_after_s=retry_after_s) if can_retry else 0.0
+            _retry_delay(
+                policy,
+                attempt,
+                retry_after_s=retry_after_s,
+                budget_remaining_s=budget_remaining_s,
+                retries_left=effective_max_attempts - attempt,
+            )
+            if can_retry
+            else 0.0
         ),
         attempt=attempt,
         next_attempt=attempt + 1 if can_retry else None,
@@ -301,22 +328,55 @@ def _is_permanent_provider_error(*, status_code: int | None, normalized_error: s
     return 400 <= status_code < 500
 
 
+def _rate_limit_budget_remaining(
+    policy: RetryPolicy,
+    reason: RetryReason | None,
+    status_code: int | None,
+    elapsed_s: float | None,
+) -> float | None:
+    """Seconds left in the rate-limit time budget, or None when it does not apply."""
+
+    if policy.max_retry_elapsed_s is None or elapsed_s is None:
+        return None
+    if reason is not RetryReason.RATE_LIMIT and status_code not in RATE_LIMIT_STATUS_CODES:
+        return None
+    return policy.max_retry_elapsed_s - float(elapsed_s)
+
+
 def _retry_delay(
     policy: RetryPolicy,
     attempt: int,
     *,
     retry_after_s: float | None = None,
+    budget_remaining_s: float | None = None,
+    retries_left: int = 1,
 ) -> float:
     if retry_after_s is not None:
         # A provider `Retry-After` directive is authoritative: waiting less just
         # earns another rejection. Still bound it by `max_delay_s` so a hostile
         # or buggy header can't stall the run indefinitely.
-        return float(min(retry_after_s, policy.max_delay_s))
-    base_delay = policy.initial_delay_s * (policy.backoff_multiplier ** (attempt - 1))
-    delay = min(base_delay, policy.max_delay_s)
-    # An explicit zero initial delay remains a no-wait policy even when the
-    # default jitter is enabled. This keeps deterministic tests and callers
-    # able to disable backoff without restating both fields.
-    if delay > 0 and policy.jitter_s > 0:
-        delay += random.uniform(0, policy.jitter_s)
-    return float(min(delay, policy.max_delay_s))
+        delay = float(min(retry_after_s, policy.max_delay_s))
+    else:
+        base_delay = policy.initial_delay_s * (policy.backoff_multiplier ** (attempt - 1))
+        delay = min(base_delay, policy.max_delay_s)
+        # An explicit zero initial delay remains a no-wait policy even when the
+        # default jitter is enabled. This keeps deterministic tests and callers
+        # able to disable backoff without restating both fields.
+        if delay > 0 and policy.jitter_s > 0:
+            delay += random.uniform(0, policy.jitter_s)
+        delay = float(min(delay, policy.max_delay_s))
+    if budget_remaining_s is not None and attempt > 1 and policy.initial_delay_s > 0:
+        # The first retry keeps ordinary backoff, so a brief rate limit costs
+        # no more than before. Later retries spread the time that is left over
+        # the attempts that are left, growing by the backoff multiplier, so a
+        # sustained limit is waited out instead of exhausting the attempts at
+        # once. An explicit zero initial delay stays a no-wait policy.
+        retries = max(1, retries_left)
+        multiplier = policy.backoff_multiplier
+        share = (
+            1.0 / retries if multiplier == 1.0 else (multiplier - 1.0) / (multiplier**retries - 1.0)
+        )
+        delay = min(max(delay, budget_remaining_s * share), policy.max_delay_s)
+    if budget_remaining_s is not None:
+        delay = min(delay, budget_remaining_s)
+    return float(delay)

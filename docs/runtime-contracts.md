@@ -41,7 +41,7 @@ for examples and the distinction between wildcard exports and explicit imports.
 ## Application Runtime Configuration
 
 `CayuConfig` is the immutable application tuning API. `CayuApp()` uses a
-64-step model budget for interactive runs. Task-backed runs omit the step cap
+1,000-step model budget for interactive runs. Task-backed runs omit the step cap
 unless the request or application explicitly configures one. `max_steps=None`
 on a run, resume, application default, or workflow role means no step cap. A finite
 cap must be a strict positive integer up to `2**53 - 1` (9,007,199,254,740,991),
@@ -3263,7 +3263,7 @@ active workload-secret redactor both before persistence and on durable readback.
 A copied parent receipt also prevents a fork from falling back to ordinary
 create without an explicit recoverable allocation transition.
 
-When an environment has a `WorkspaceBinding`, the runtime emits durable binding lifecycle events around the session execution boundary. `environment.binding.started` and `environment.binding.completed` are emitted before `session.started` or before approved tool-continuation work resumes. `environment.binding.failed` is emitted before the terminal failure when binding cannot be created. If binding rollback or its runtime-owned retry carries cancellation alongside an ordinary bind failure, Cayu first preserves the ordinary failure and structured cleanup status in `environment.binding.failed`, then re-raises a cancellation-containing aggregate instead of replacing either signal. Terminal session events are preceded by `environment.binding.finalize_started` and either `environment.binding.finalize_completed` or `environment.binding.finalize_failed`. Finalize failures are also copied onto the terminal event payload as `binding_finalize_error` so session outcome and cleanup outcome can be inspected together. Both diagnostic surfaces retain the compatibility fields `error`, `error_type`, and `outcome` and add an ordered `failures` array. Each failure contains only `phase`, `error`, and `error_type`; generic binding failures use `workspace_finalize`, while virtual-egress bindings distinguish `workspace_finalize` from `managed_resource_cleanup`. Before persistence, exception text is scrubbed with the app's configured `SecretRedactor` and any binding-owned supplemental redactor, normalized to valid UTF-8, and capped at 512 UTF-8 bytes. Virtual-egress bindings include their exact minted presented values in that private supplemental redactor without adding those values to events. The original in-process exception objects and messages are unchanged. These fields never serialize exception attributes, tracebacks, request data, or live workspace and runner objects. `BoundWorkspace.source_workspace` is the durable workspace originally provided by the environment. `BoundWorkspace.workspace` is the workspace visible to tools during the run; for native bindings they can be the same object, while copy/mount bindings may expose a different sandbox workspace.
+When an environment has a `WorkspaceBinding`, the runtime emits durable binding lifecycle events around the session execution boundary. `environment.binding.started` and `environment.binding.completed` are emitted before `session.started` or before approved tool-continuation work resumes. `environment.binding.failed` is emitted before the terminal failure when binding cannot be created. If binding rollback or its runtime-owned retry carries cancellation alongside an ordinary bind failure, Cayu first preserves the ordinary failure and structured cleanup status in `environment.binding.failed`, then re-raises a cancellation-containing aggregate instead of replacing either signal. Terminal session events are preceded by `environment.binding.finalize_started` and either `environment.binding.finalize_completed` or `environment.binding.finalize_failed`. Finalize failures are also copied onto the terminal event payload as `binding_finalize_error` so session outcome and cleanup outcome can be inspected together. Both diagnostic surfaces retain the compatibility fields `error`, `error_type`, and `outcome` and add an ordered `failures` array. Each failure contains only `phase`, `error`, and `error_type`; generic binding failures use `workspace_finalize`, while virtual-egress bindings and the Docker coding binding distinguish `workspace_finalize` from `managed_resource_cleanup`. When a binding reports that its workspace output had committed before the failure, `binding_finalize_error` also carries `workspace_output_committed: true`; the field is absent otherwise. The Docker coding binding reports a container close that fails after copy-back this way, and virtual-egress bindings report a teardown failure after an inner `SyncBinding` pass that copied back for the outcome this way. An outcome whose sync-back policy skips copy-back never reports committed output. Before persistence, exception text is scrubbed with the app's configured `SecretRedactor` and any binding-owned supplemental redactor, normalized to valid UTF-8, and capped at 512 UTF-8 bytes. Virtual-egress bindings include their exact minted presented values in that private supplemental redactor without adding those values to events. The original in-process exception objects and messages are unchanged. These fields never serialize exception attributes, tracebacks, request data, or live workspace and runner objects. `BoundWorkspace.source_workspace` is the durable workspace originally provided by the environment. `BoundWorkspace.workspace` is the workspace visible to tools during the run; for native bindings they can be the same object, while copy/mount bindings may expose a different sandbox workspace.
 
 Binding lifecycle status is carried through runtime-authenticated exception
 attachments and read through the base exception implementation; extension
@@ -3311,9 +3311,9 @@ generation for convergence instead.
 
 Virtual-egress finalization fences new managed command dispatch before its first await, revokes authority, drains commands admitted before the fence, and then syncs or unmounts the workspace while its runner-backed target remains readable. Only the exact retained binding owner may use the managed runner during that synchronization. Provider runner/resource cleanup starts after a successful authoritative sync. A partial copy or deletion failure leaves the provider runner open, the target readable, and the exact binding generation held so retry resumes from the same baseline and converges the durable source. Independently detached guest processes are outside managed command-dispatch accounting; applications must not use them for filesystem effects that must be captured by sync-back. A single phase failure is propagated unchanged. When the workspace and managed-resource phases both fail, Cayu follows its cleanup aggregation convention: the workspace exception is first and the managed-resource exception is second in an `ExceptionGroup`; a cancellation in either position produces a `BaseExceptionGroup` so cancellation remains observable without dropping the other failure. The durable `failures` array uses the same order, except that cancellation deferred while authority revocation completes precedes those phases as `cancellation`. Cancellation received during post-finalization revocation diagnostics is appended after the phase failures, and cancellation received while `environment.binding.finalize_failed` is being written is deferred until the original phase evidence is durable. If cleanup itself fails after caller cancellation, both signals are retained in a cancellation-containing aggregate. Cancellation-containing aggregates are then re-raised rather than converted into an ordinary terminal result. Managed cleanup is complete only after runner teardown, adapter/proxy/network release, and ownership-claim release succeed. A failed managed-cleanup attempt retains its coordinator, and a later finalization or runner-close attempt resumes it without re-reading a runner-backed target whose authoritative sync already succeeded. Successful retry does not repeat completed logical teardown or grant-revocation evidence. Each adapter returns explicit runner-finalization evidence rather than treating `Runner.is_closed` as proof that remote mutations stopped. A copied workspace arms its mutation-quiescence requirement before the bound environment is exposed and remains fenced until the provider confirms that the sandbox is stopped, suspended, removed, or otherwise mutation-quiescent. A detach-only result is insufficient. Reconnectable Microsandbox sessions use a stopped, allocation-preserving boundary; non-reconnectable adapters use their terminal boundary. The exact workspace owner remains fenced until positive quiescence, so an old workload cannot overlap a replacement owner.
 
-`SyncBinding` is the built-in copy binding. It copies files from the durable source workspace into a target workspace during `bind(...)`, exposes the target workspace to tools, and can copy creates/updates/deletes back to the source during `finalize(...)`. The target workspace is usually a session-scoped sandbox workspace such as `E2BWorkspace`, `MicrosandboxWorkspace`, or `RunnerWorkspace`; it can also be a local scratch workspace for tests and local development. A `target_workspace_plan_factory` receives `SyncBindingContext` with source workspace, runner, session id, agent name, environment name, and request metadata and returns `SyncTargetWorkspacePlan` with a stable, quiescent per-session target identity; Cayu invokes the plan provision callback only after reserving both resource identities. The legacy `target_workspace_factory` entrance is rejected before callback invocation because its former create-or-attach contract could mutate an unidentified, unreserved target. External target allocation and cleanup remain owned by the surrounding `EnvironmentFactoryResult` lifecycle. During a runtime-managed failed bind, the exact source-target reservation transfers to that cleanup owner and remains held until direct or deferred factory cleanup positively reaches quiescence. Source and target must be different workspaces. By default, `SyncBinding` cleans the target workspace before copying in, syncs back for every terminal outcome, propagates deletions, caps each copy-in or copy-back transfer at 64 MiB of logical file data, and caps the complete raw tar at 128 MiB. Apps can configure `pattern`, `max_files`, `max_file_bytes`, `max_total_bytes`, `max_archive_bytes`, `clean_target`, `sync_back`, and `delete_missing` to match their lifecycle policy. The target workspace should be dedicated to that binding/session when `clean_target="always"` is used. Every active generation atomically reserves both the resolved source and target by their stable `Workspace.resource_key` values through one opaque process-local owner generation before the first mutating workspace operation. A factory-backed bind first reserves its source provisionally under that exact generation before invoking the identity resolver, then atomically promotes the claim to the complete pair before target provisioning or releases it on failure. When opposite factory binds each resolve the other's provisional source as their target, the first promotion contender atomically yields its source so the other generation can complete instead of both failing. Fixed targets, resolved targets, separate wrappers, and separate `SyncBinding` instances all compose through that registry; an owned resource cannot participate in another binding in either role. Elapsed time never releases a live reservation: only successful finalization or `abandon()` of that exact bound generation can make both resources reusable. A workspace mutation that has already been dispatched remains fenced to that generation until the mutation definitively returns; caller cancellation is then propagated without allowing an old worker to overlap a retry. For direct `SyncBinding` callers, failed or cancelled finalization retains both reservations and baseline state for retry, and concurrent finalization and abandonment fail closed. Direct callers that will not finalize again must call `abandon()` explicitly.
+`SyncBinding` is the built-in copy binding. It copies files from the durable source workspace into a target workspace during `bind(...)`, exposes the target workspace to tools, and can copy creates/updates/deletes back to the source during `finalize(...)`. The target workspace is usually a session-scoped sandbox workspace such as `E2BWorkspace`, `MicrosandboxWorkspace`, or `RunnerWorkspace`; it can also be a local scratch workspace for tests and local development. A `target_workspace_plan_factory` receives `SyncBindingContext` with source workspace, runner, session id, agent name, environment name, and request metadata and returns `SyncTargetWorkspacePlan` with a stable, quiescent per-session target identity; Cayu invokes the plan provision callback only after reserving both resource identities. The legacy `target_workspace_factory` entrance is rejected before callback invocation because its former create-or-attach contract could mutate an unidentified, unreserved target. External target allocation and cleanup remain owned by the surrounding `EnvironmentFactoryResult` lifecycle. During a runtime-managed failed bind, the exact source-target reservation transfers to that cleanup owner and remains held until direct or deferred factory cleanup positively reaches quiescence. Source and target must be different workspaces. By default, `SyncBinding` cleans the target workspace before copying in, syncs back for every terminal outcome, propagates deletions, caps each copy-in or copy-back transfer at 100,000 files and 4 GiB of logical file data, and caps the complete raw tar at 8 GiB. Apps can configure `pattern`, `max_files`, `max_file_bytes`, `max_total_bytes`, `max_archive_bytes`, `clean_target`, `sync_back`, and `delete_missing` to match their lifecycle policy. The target workspace should be dedicated to that binding/session when `clean_target="always"` is used. Every active generation atomically reserves both the resolved source and target by their stable `Workspace.resource_key` values through one opaque process-local owner generation before the first mutating workspace operation. A factory-backed bind first reserves its source provisionally under that exact generation before invoking the identity resolver, then atomically promotes the claim to the complete pair before target provisioning or releases it on failure. When opposite factory binds each resolve the other's provisional source as their target, the first promotion contender atomically yields its source so the other generation can complete instead of both failing. Fixed targets, resolved targets, separate wrappers, and separate `SyncBinding` instances all compose through that registry; an owned resource cannot participate in another binding in either role. Elapsed time never releases a live reservation: only successful finalization or `abandon()` of that exact bound generation can make both resources reusable. A workspace mutation that has already been dispatched remains fenced to that generation until the mutation definitively returns; caller cancellation is then propagated without allowing an old worker to overlap a retry. For direct `SyncBinding` callers, failed or cancelled finalization retains both reservations and baseline state for retry, and concurrent finalization and abandonment fail closed. Direct callers that will not finalize again must call `abandon()` explicitly.
 
-Runtime-managed sessions invoke finalization through the environment lifecycle. When a completed outcome requires sync-back, the runtime first persists a private bounded finalization marker containing the exact binding generation, source path baseline and any required revision baseline, target identity, binding policy, and frozen execution-profile fingerprint. Task completion and the public `session.completed` event follow successful finalization. A failure instead fails the linked task and session with `phase="workspace_finalize"` and `workspace_output_committed=false`; diagnostics identify only the failing path, error type, and count of already applied operations, never file contents. The target remains owned and readable rather than destroying the only copy of mutations. `CayuApp.recover_incomplete_session(...)` claims that marker durably, reconnects the registered environment, reconstructs the exact `SyncBinding` owner without repeating copy-in, and retries only finalization—never provider or tool effects. With `source_conflict_policy="require_revision"`, partial publication updates the marker's revision baseline. A repeated conditional create, replace, or delete is accepted only when the durable source already has the exact intended content and mode; any different concurrent source change remains a `SyncBindingSourceConflictError`. The marker clears only after successful sync-back. Current binding policy, source/target IDs, and the reconnected target must match the marker, so restart recovery requires a static registration or environment factory that resolves the same retained target. Composite managed-egress bindings propagate this completion and recovery capability through their runner fence.
+Runtime-managed sessions invoke finalization through the environment lifecycle. When a completed outcome requires sync-back, the runtime first persists a private bounded finalization marker containing the exact binding generation, source path baseline and any required revision baseline, target identity, binding policy, and frozen execution-profile fingerprint. Task completion and the public `session.completed` event follow successful finalization. A failure instead fails the linked task and session with `phase="workspace_finalize"` and `workspace_output_committed=false`, or `workspace_output_committed=true` when the binding reports that its output (copy-back) had committed before a later phase, such as closing its runner, failed; diagnostics identify only the failing path, error type, and count of already applied operations, never file contents. The target remains owned and readable rather than destroying the only copy of mutations. `CayuApp.recover_incomplete_session(...)` claims that marker durably, reconnects the registered environment, reconstructs the exact `SyncBinding` owner without repeating copy-in, and retries only finalization—never provider or tool effects. With `source_conflict_policy="require_revision"`, partial publication updates the marker's revision baseline. A repeated conditional create, replace, or delete is accepted only when the durable source already has the exact intended content and mode; any different concurrent source change remains a `SyncBindingSourceConflictError`. The marker clears only after successful sync-back. Current binding policy, source/target IDs, and the reconnected target must match the marker, so restart recovery requires a static registration or environment factory that resolves the same retained target. Composite managed-egress bindings propagate this completion and recovery capability through their runner fence.
 
 If failure evidence cannot be confirmed durable, the lifecycle retains the exact generation and stable pending event identity. Cayu starts at most 16 retained cleanup tasks at once and polls them for at most 10 milliseconds during an unrelated admission. Each exact owner keeps one task until its dispatched cleanup reaches a definite outcome. `CayuApp(max_environment_lifecycle_owners=...)` bounds all process-local active, in-flight, and retained lifecycle owners (default 256); capacity exhaustion raises `EnvironmentCapacityError` before factory provisioning or binding mutation. `CayuApp.drain_environment_cleanups(...)` gives idle SDK processes an explicit bounded settlement path, and the server calls it during shutdown without cancelling mutation-capable work that exceeds the grace period. It also trims factory-held idle resources such as warm spares, which later sessions may recreate, within the same deadline. `CayuApp.close_idle_environment_resources(timeout_s=...)` releases them for good at shutdown; application shutdown, including server shutdown, calls it after the environment drain within the same deadline. A release still running at either deadline is not cancelled: the call returns `False`, the application keeps owning that release, and a later drain or close waits for it and reports its outcome. `WorkspaceBinding.abandon()` returns `False` when a composite binding cannot yet retire its owner. Managed-egress bindings use that refusal to retain the complete retry handle until their runner has positive mutation-quiescence evidence. If managed cleanup fails while the target remains readable, a later settlement retry syncs from the retained baseline before retrying teardown; successful cleanup releases the exact owner without accessing the closed runner. Separate `SyncBinding` instances share the process-local reservation registry; separate processes coordinate runtime recovery through the durable session-recovery claim, but that claim is not a distributed workspace lock for unrelated direct binding users. Applications that require general distributed workspace ownership must provide a custom durable binding whose renewable lease carries an opaque fencing generation, expires only after positive lease-loss evidence, and accepts close/release only from the current generation; record age alone is never ownership-loss evidence. When `clean_target="never"` is used, Cayu records the target baseline at bind time and does not sync pre-existing target-only files back to the source; it only syncs source-origin files plus files created during the run. `SyncBinding` owns `bound.metadata["sync_binding"]` and final snapshot metadata keys `target_workspace_id`, `outcome`, `copied_files`, `copied_bytes`, and `deleted_files`; app-provided binding metadata must not use those keys. `max_file_bytes=None` means `SyncBinding` does not add its own per-file cap, but the workspace being read may still enforce its default read limit. `max_total_bytes` measures logical file sizes and defaults to 64 MiB; `max_archive_bytes` measures raw tar bytes including headers, padding, and path metadata and defaults to 128 MiB. Either limit accepts `None` as an explicit opt-out. Bounded generic transfers are staged before copied-file writes, preventing a limit failure from partially syncing changes back during finalization.
 
@@ -3322,7 +3322,7 @@ limit. The aggregate staging capacity remains finite and authoritative, so even
 a generic file-by-file transfer cannot read or retain a payload larger than the
 configured staging byte ceiling.
 
-Every `SyncBinding` also participates in a process-local aggregate staging capacity domain. The default `DEFAULT_SYNC_BINDING_STAGING_CAPACITY` admits at most four copy operations and 512 MiB of byte-weighted payload reservations across all default bindings. A custom `SyncBindingStagingCapacity(max_concurrency=..., max_staged_bytes=..., reuse_sealed_archives=...)` shared by selected bindings defines an independent domain. The concurrency and byte queues are FIFO within their class; byte work belonging to an admitted transfer is considered before another transfer slot so slot saturation cannot prevent active work from settling. An archive builder admits its conservative peak archive-plus-transient requirement atomically before it allocates the private spool. Its builder reference retains that peak allowance through source verification and target consumption, then shrinks the reservation to exact sealed archive bytes while reusers remain. A permit is not released while a shielded delegated write, compatibility copy, validation, or spool read can still consume the data. Success, failure, cancellation, timeout, and acknowledgement failure converge through the same reference-counted cleanup path.
+Every `SyncBinding` also participates in a process-local aggregate staging capacity domain. The default `DEFAULT_SYNC_BINDING_STAGING_CAPACITY` admits at most 16 copy operations and 4 GiB of byte-weighted payload reservations across all default bindings. A transfer reserves for the sizes it measures before staging (`LocalWorkspace` stats the files; `RunnerWorkspace` stats them in the guest, one command per batch of paths) and then copies within those sizes, so a file that grows after measurement fails the transfer instead of overrunning its reservation; the configured limits stay the ceiling. A transfer whose source cannot be measured reserves for its configured limits, or, when those exceed the domain, copies at most what the domain holds. A custom `SyncBindingStagingCapacity(max_concurrency=..., max_staged_bytes=..., reuse_sealed_archives=...)` shared by selected bindings defines an independent domain. The concurrency and byte queues are FIFO within their class; byte work belonging to an admitted transfer is considered before another transfer slot so slot saturation cannot prevent active work from settling. An archive builder admits its conservative peak archive-plus-transient requirement atomically before it allocates the private spool. Its builder reference retains that peak allowance through source verification and target consumption, then shrinks the reservation to exact sealed archive bytes while reusers remain. A permit is not released while a shielded delegated write, compatibility copy, validation, or spool read can still consume the data. Success, failure, cancellation, timeout, and acknowledgement failure converge through the same reference-counted cleanup path.
 
 Staged tar data lives in an unnamed or implementation-private `TemporaryFile` opened with restrictive permissions. Adapters receive binary stream objects, never the host spool path. `BoundedTarStreamReader` and `TarStreamWriter` are explicit opt-in capabilities; `RunnerWorkspace` uses raw bounded subprocess streams and a private guest spool, avoiding complete base64/JSON archive copies. The older `BoundedTarReader` and `TarWriter` byte capabilities remain compatible but require an additional admitted whole-archive transient allowance. Generic workspaces retain one admitted file buffer at a time. All tar paths and logical, per-file, and raw archive bounds are revalidated before target mutation.
 
@@ -3354,45 +3354,42 @@ the largest durable result payload a tool may produce. It participates in the
 catalogue and execution-profile identity. For a deferred round,
 Cayu reserves the sum of those result declarations, published model-argument
 sizes, and fixed runtime-envelope headroom before dispatching any tool effect.
-A round whose hooks may modify published arguments receives an exclusive lease
-because the effective argument size is not known at admission. Declared rounds
-share one process-local byte domain; a round containing an undeclared tool, or
-whose complete declaration exceeds that domain, receives an exclusive oversize
-lease. The lease remains owned until every durable staged terminal has been
-published. This whole-round admission prevents sibling results from deadlocking
-after their effects have executed.
+Cayu stores no event larger than the 2 MiB durable event limit, and a larger
+result becomes a bounded failure or an artifact projection before it is staged,
+so no call stages more than 1,984 KiB of result plus the 64 KiB runtime
+envelope. A call whose size Cayu cannot know at admission reserves that
+ceiling instead of a declaration: a tool that declares no bound, a declaration
+larger than the ceiling, and a call whose hooks may modify published arguments.
+A declaration below 64 KiB reserves and enforces 64 KiB, so the runtime's own
+bounded failure result always fits. Rounds share one process-local byte domain,
+`CayuConfig(tool_execution=ToolExecutionConfig(tool_terminal_staged_capacity_bytes=...))`
+(default 512 MiB); a round or family whose complete reservation exceeds that
+domain receives an exclusive oversize lease. The lease remains owned until every
+durable staged terminal has been published. This whole-round admission prevents
+sibling results from deadlocking after their effects have executed.
 
 Every built-in tool declares a bound and keeps its results inside it, except
 `subagent` with a foreground child, which declares none unless the application
-sets one, so its rounds take the exclusive lease; see
+sets one; see
 [Built-in terminal payload bounds](#built-in-terminal-payload-bounds).
 
-An undeclared tool costs every session in the process: while a round that calls
-it holds the exclusive lease, no other session's deferred round is admitted,
-and it is admitted only when no other round holds capacity. When an application
-registers a tool implemented outside Cayu that declares no bound, Cayu logs a
-warning, once per tool name, and `cayu check` reports
-`TOOL_TERMINAL_PAYLOAD_UNBOUNDED` for each agent that registers it. Cayu's own
-tools are not reported: `subagent` with a foreground child takes the lease on
-purpose, and MCP tools have no declaration to set, so a round calling an MCP
-tool is exclusive too.
+An undeclared tool reserves more capacity than it usually needs, so fewer rounds
+fit at once. When an application registers a tool implemented outside Cayu that
+declares no bound, Cayu logs a warning, once per tool name, and `cayu check`
+reports `TOOL_TERMINAL_PAYLOAD_UNBOUNDED` for each agent that registers it.
+Cayu's own tools are not reported: `subagent` with a foreground child returns
+whatever its child produces, and MCP tools have no declaration to set.
 
-The exclusive lease is not about size. Cayu stores no event larger than the
-2 MiB durable event limit, so an undeclared tool's terminal payload is no
-larger than that, and a larger result already becomes a bounded failure or an
-artifact projection before it is staged. Cayu still does not reserve a bounded
-default for an undeclared tool, because the lease also decides nested
-admission. A tool's `run` may await child rounds in its invocation family, as
-`subagent` does with a foreground child. Under an exclusive lease such a child
-round is always admitted. Under a bounded lease it is refused whenever another
-family holds the capacity it needs, since waiting could deadlock two families
-that each await their own child. Cayu cannot tell from a `ToolSpec` whether a
-tool awaits child rounds, so an undeclared tool keeps the exclusive lease, and
-a tool that declares a bound accepts that its child rounds may be refused.
+A tool's `run` may await child rounds in its invocation family, as `subagent`
+does with a foreground child. Such a child round is admitted ahead of queued
+rounds, and it is refused before it dispatches any tool when the domain cannot
+fit it beside the other families' reservations, since waiting could deadlock two
+families that each await their own child. With the default domain that takes
+about 250 concurrent undeclared calls.
 
 Related rounds use the same capacity family, identified from their durable
 invocation root after validating the current session incarnation and run epoch.
-An inline subagent therefore does not wait behind its parent's exclusive lease.
+An inline subagent therefore does not wait behind its parent's lease.
 Each round retains its own payload declaration and release ownership; releasing
 the parent does not release an active child's reservation or vice versa.
 Bounded declarations aggregate across the family and unrelated families. A family
@@ -3412,7 +3409,9 @@ drained. Caller-supplied parent metadata does not establish this grouping.
 Because nested rounds can enter ahead of unrelated waiters, a family whose
 nested work keeps overlapping can hold capacity for as long as it stays busy. A
 round therefore waits a bounded time for its lease: Cayu logs a warning naming
-the round after 60 seconds, and after 600 seconds the round fails with
+the round after 60 seconds, and after
+`ToolExecutionConfig.tool_round_admission_timeout_seconds` (default 600; `None`
+waits until capacity is released) the round fails with
 `ToolRoundAdmissionTimeoutError` before any of its tools run. The session's
 `session.failed` event then carries content-free counts of the families that
 held the lease. `waiting_round_unbounded_tools` names only the waiting round's
@@ -3436,8 +3435,8 @@ erase workspace-settlement evidence. If the fixed failure plus runtime-owned
 effect evidence cannot fit the declaration, publication fails closed. A
 checkpoint write with an uncertain acknowledgement retains its lease until
 readback, retry, or recovery reconciles the stage; proven pre-commit rejection
-can release it. Tools without a declaration preserve exact results under the
-exclusive rule. `CayuApp.tool_terminal_publication_status()` exposes only
+can release it. Tools without a declaration preserve exact results up to the
+durable event limit. `CayuApp.tool_terminal_publication_status()` exposes only
 content-free counts, byte totals, waiters, oldest delay, validation CPU, and
 publication lag. Large validation/projection work is offloaded under a
 separate bounded cooperative scheduling domain so unrelated sessions,
@@ -10455,7 +10454,7 @@ estimated-cost bound. Add count limits only when the application needs them.
 | --- | --- |
 | `execution_deadline` | Unbounded unless supplied; cancels in-flight work when its absolute deadline expires. Continuations inherit it, including time spent waiting for a person. An omitted value takes the enclosing `execution_deadline_scope`, or at run admission the default set by `default_run_deadline(...)` (which `run_task_worker(execution_timeout_s=...)` applies to each handler call); an explicit value replaces that default. Inside a `HandlerTimeLimit` (which `run_task_worker(execution_timeout_s=...)` puts around each handler call), a new top-level run is refused once the limit has passed, whatever its own deadline. |
 | `budget_limits` | No request budget; estimates cost from recorded usage and the selected price book. Existing policy budgets and reservations still apply. |
-| `max_steps` | 64 for interactive SDK runs; no cap for task-backed SDK runs unless explicitly configured. HTTP runs and product services use the application cap (64 by default). `None` disables it. |
+| `max_steps` | 1,000 for interactive SDK runs; no cap for task-backed SDK runs unless explicitly configured. HTTP runs and product services use the application cap (1,000 by default). `None` disables it. |
 | `limits.max_tool_calls` | `None`, meaning no call-count cap. |
 | `limits.max_input_tokens`, `max_output_tokens`, `max_total_tokens` | `None`; evaluated from observed model usage. |
 | `limits.max_elapsed_seconds` | `None`; a cooperative check between operations. Run scope counts active invocation time and excludes recorded human waits; session scope counts wall time since creation. Use a deadline to interrupt a stalled operation. |
@@ -10987,6 +10986,19 @@ from the trusted response header, never an event JSON field; the runtime uses
 it in preference to exponential backoff, capped by `RetryPolicy.max_delay_s`
 (30 seconds by default; set it up to 3,600 seconds to honor a long rate-limit
 window). `max_attempts` and `max_unknown_attempts` accept up to 50.
+`max_retry_elapsed_s` (off by default, up to 86,400 seconds) is a time budget
+for rate-limit and overload failures: HTTP 429, 503 and 529, or the
+`rate_limit` reason. It counts from the start of the model step's first
+attempt. While it applies, each retry waits at least the remaining budget
+divided by the remaining attempts, so they spread across the budget, and at
+most `max_delay_s` or the remaining budget; once it is spent the failure is
+terminal with `retry_disposition="configured_attempt_exhaustion"` and
+`effective_max_attempts` equal to the last attempt, which still permits model
+failover. `max_attempts` remains the attempt ceiling. Agent model steps and
+automatic compaction apply the budget; auxiliary inference and provider
+completion verifiers use ordinary backoff. A policy without a budget
+serializes exactly as before the field existed, so its execution-profile
+identity is unchanged.
 Structured in-band stream errors use the same retry contract and retain an
 explicit valid `status_code` when the event supplies one:
 Anthropic-shaped overload/rate-limit/API/timeout identities map to
@@ -11570,9 +11582,17 @@ finite positive values: `transport_idle_timeout_s` observes raw response bytes,
 `protocol_idle_timeout_s` observes complete valid decoded events,
 `semantic_progress_timeout_s` observes only accepted response identity,
 reasoning, content, tool calls, hosted-tool activity, citations, usage, or
-terminal progress, and `absolute_stream_timeout_s` caps the active streaming
-dispatch until an authoritative terminal response is accepted. Their defaults
-are 300, 300, 300, and 600 seconds respectively. Configure the six bundled
+terminal progress, and `absolute_stream_timeout_s` bounds how long the active
+streaming dispatch may go without producing any of that progress, measured on
+the wall clock from dispatch or the last accepted progress until an
+authoritative terminal response is accepted. Their defaults are 300, 300, 300,
+and 600 seconds respectively. Unlike the semantic clock, the absolute clock
+never excludes downstream consumer pauses, so it still ends a stream whose idle
+clocks keep being extended; a stream that keeps producing output is not cut off
+by it. Bound the total length of a run with `execution_deadline` or
+`RunLimits` instead. The fixed `absolute_output_idle_policy_version=1`
+participates in execution-profile identity; before it, the absolute clock ran
+from dispatch regardless of output. Configure the six bundled
 providers with one immutable `ProviderStreamDeadlines` policy:
 
 ```python
@@ -11740,8 +11760,9 @@ unchanged; local cleanup evidence does not authorize retrying an unknown remote
 operation.
 
 Provider stream configuration also declares `max_concurrent_streams`, defaulting
-to 100 so the normal N9 evaluation capacity does not encounter a lower hidden
-ceiling. Runtime reserves both deadline-read and live cleanup ownership before
+to 1,000 so the normal N9 evaluation capacity does not encounter a lower hidden
+ceiling. A dispatch over the limit fails before provider entry with an error
+that names the limit; it does not wait for a slot. Runtime reserves both deadline-read and live cleanup ownership before
 provider entry against that process-wide limit. Operators choosing a larger
 evaluation capacity must set the provider capacity from measured downstream and
 cleanup capacity; the value is validated as a positive integer and is included
@@ -12800,16 +12821,17 @@ Default built-in tool caps are intentionally large enough for normal coding work
 - `read_file`: 256 KB by default, 4 MB maximum per call, including a `files` batch as a whole; at most 20 files per batch
 - `read_file` native file attachments: 8 MB by default, 8 MB maximum per call for the built-in tool instance. Applications may raise or lower that tool-facing cap with `ReadFileTool(default_attachment_limit_bytes=..., max_attachment_limit_bytes=...)`.
 - Runtime file attachment resolution: 8 MB maximum per attachment, 32 MB maximum total per provider request, and 20 attachments maximum per provider request by default. Applications may override those runtime caps with `CayuApp(max_file_attachment_bytes=..., max_total_file_attachment_bytes=..., max_file_attachments_per_request=...)`.
-- `write_file`: 256 KB by default, 4 MB maximum per call
-- `edit_file` and `delete_file`: 256 KB complete-file precondition by default, 4 MB maximum per call; edit diff previews are 32 KB by default and 200 KB maximum
+- `write_file`: 256 KB by default, 64 MiB maximum per call
+- `edit_file` and `delete_file`: 256 KB complete-file precondition by default, 64 MiB maximum per call; edit diff previews are 32 KB by default and 200 KB maximum
+- `apply_patch`: 4 MiB per file and 8 MiB of source and of output per patch by default; `ApplyPatchTool(max_file_bytes=..., max_source_bytes=..., max_output_bytes=...)` accepts up to 64 MiB per file and 128 MiB per patch
 - `list_files`: 500 paths by default, 10,000 maximum per call; 50 KB projected
   model-facing result by default, 200 KB maximum; deterministic continuation up to a
   1,000,000-entry offset; registered tool instances scan at most 100,000 source entries
   by default and may configure a ceiling up to 1,000,000
 - `search_text`: 100 entries by default, 500 maximum per call; 500 bytes of preview text per content match by default, 4 KB maximum per match; 20 KB of rendered model-facing text by default, 128 KB maximum per call; 1 MB of runner output captured by default, 4 MB maximum; files larger than 2 MB skipped by default, with a 64 MB maximum; 30 seconds by default, 120 seconds maximum
-- `git_changes`: 50 changes by default, 200 maximum per page; 32 KB model-facing output by default, 200 KB maximum; deterministic diff continuation up to a 4 MB byte offset; 1 MB status capture; 30-second command timeout
+- `git_changes`: 50 changes by default, 200 maximum per page; 32 KB model-facing output by default, 200 KB maximum; deterministic diff continuation up to a 4 MB byte offset; 1 MB status capture; 120-second timeout per Git command by default, set with `GitChangesTool(timeout_seconds=...)`
 - `list_artifacts`: 500 artifacts by default, 10,000 maximum per call
-- `exec_command`: 60 seconds by default, 600 seconds maximum per call; 50,000 bytes stdout and 50,000 bytes stderr by default, 200,000 bytes maximum per stream per call
+- `exec_command`: 60 seconds by default, 3,600 seconds maximum per call unless `ExecCommandTool(max_timeout_seconds=...)` or the command policy's `max_timeout_s` raises it, up to 12 hours; 50,000 bytes stdout and 50,000 bytes stderr by default, and at most the tool's `max_terminal_payload_bytes` (1 MiB by default) per stream per call
 - `list_knowledge`: 10 entries or facets per group by default, 25 maximum per call/group; 240 bytes of preview text per entry by default, 4 KB maximum per entry, and 20 KB total preview text by default, 128 KB maximum per call
 - `search_knowledge`: 10 hits by default, 25 maximum per call; 320 bytes of preview text per hit by default, 4 KB maximum per hit, and 20 KB total preview text by default, 128 KB maximum per call
 - `read_knowledge`: 5 chunks by default, 50 maximum per call; 20 KB chunk text by default, 128 KB maximum per call
@@ -12819,19 +12841,19 @@ Default built-in tool caps are intentionally large enough for normal coding work
 
 Every built-in tool except `subagent` with a foreground child declares
 `ToolSpec.max_terminal_payload_bytes`, so a deferred round of those built-ins
-shares terminal-publication capacity instead of taking the exclusive lease an
-undeclared tool takes (see
+reserves only what they can return instead of the 1,984 KiB ceiling an
+undeclared tool reserves (see
 [Tool terminal publication capacity](#tool-terminal-publication-capacity)).
-A round that includes `subagent` with a foreground child still takes the
-exclusive lease unless the application sets its bound (see below). A
-bound must be between 64 KiB and 1,984 KiB: the durable event limit of 2 MiB
-less the 64 KiB runtime envelope that travels with every terminal result.
+A bound can be at most 1,984 KiB: the durable event limit of 2 MiB less the
+64 KiB runtime envelope that travels with every terminal result. A bound below
+64 KiB is accepted and rounded up to 64 KiB.
 
 Each built-in's constructor takes `max_terminal_payload_bytes=` to set or
 tighten its bound, for example `ExecCommandTool(policy=policy,
 max_terminal_payload_bytes=256 * 1024)`. Leaving it out keeps the default
-below, or the bound an explicitly passed `spec` already declares. A value
-outside the range, or not an integer, is refused at construction.
+below, or the bound an explicitly passed `spec` already declares. A value that
+is not a positive integer, or is larger than 1,984 KiB, is refused at
+construction.
 
 | Default | Tools | When a result would exceed it |
 | --- | --- | --- |
@@ -12900,11 +12922,9 @@ limits a line-range read that cuts a line, the continuation hint points to
 byte paging, because a larger `max_bytes` cannot help.
 
 `subagent` with a foreground child declares no bound unless the application
-sets one. The child's rounds run inside the parent's round: while that round
-holds the exclusive lease, a child round with a tool that declares no bound is
-always admitted, but under a bounded parent such a round fails whenever another
-session holds capacity. Set `max_terminal_payload_bytes` on `SubagentTool` when
-every tool its foreground children can call declares a bound.
+sets one, so the child's final output is returned whole up to the durable event
+limit. Set `max_terminal_payload_bytes` on `SubagentTool` to reserve less and
+fit the child's result to that bound.
 
 Tools marked "never cut" return attested evidence or text a person supplied.
 Their results are naturally within the default, and the default for those
@@ -12914,7 +12934,7 @@ to store. An application's own tools and process-isolated tools declare their
 bounds themselves; Cayu warns at registration and `cayu check` reports each one
 that does not (see
 [Tool terminal publication capacity](#tool-terminal-publication-capacity)). MCP
-tools have no bound to declare yet, so their rounds take the exclusive lease.
+tools have no bound to declare yet, so each call reserves the 1,984 KiB ceiling.
 
 ### Workspace search progression
 
@@ -13652,8 +13672,11 @@ explicit non-success result even when the admitted process exits zero.
 
 Every structured selector runs inside the conservative workspace-mutation fence.
 Immediately before dispatch and after runner settlement, `RunCommandTool` captures
-a complete content-and-Git-mode manifest under the Docker coding copy bounds: at
-most 10,000 paths, 8 MiB per file, and 64 MiB total. A read-only selector that changes any
+a complete content-and-Git-mode manifest within the workspace's
+`manifest_limits`, which the Docker and sandbox coding factories set from their
+transfer limits (at most 40,000 paths, because the command journal keeps the
+before manifest), or at most 10,000 paths, 8 MiB per file and 64 MiB total for a
+workspace that declares none. A read-only selector that changes any
 path, or a mutating selector that changes a path outside its declared prefixes,
 returns `unexpected_workspace_mutation` even when the process exits zero. If the
 post-command manifest cannot be completed, the result is `partial`; it cannot
@@ -14050,12 +14073,15 @@ Evidence-bearing Docker creation and `DockerRunner.reconnect_strict()` accept
 `command_cleanup="command_or_sandbox"` opts in to keeping the container for
 commands without a durable receipt (see below), and the choice is part of the
 factory's configuration fingerprint, so a preserved session resumes only under
-the cleanup rules it was created with. `cancel_timeout_s` (default five seconds)
-is passed to every runner the factory creates, reconnects or disposes, and bounds
-how long one command cleanup or container removal waits for Docker. A final
-container close that outlives it fails workspace finalization and keeps the
-durable cleanup obligation while the removal continues in the background. The
-deadline is operational and stays out of the configuration fingerprint. When an
+the cleanup rules it was created with. `cancel_timeout_s` (default 30 seconds;
+a standalone `DockerRunner` keeps five) is passed to every runner the factory
+creates, reconnects or disposes, and bounds how long one command cleanup or
+container removal waits for Docker. A final container close that outlives it
+fails workspace finalization and keeps the durable cleanup obligation while the
+removal continues in the background. When copy-back had already finished, the
+failure is reported in the `managed_resource_cleanup` phase and the session
+reports `workspace_output_committed=true`. The deadline is operational and stays
+out of the configuration fingerprint. When an
 evidence-bearing runner's admitted executables include `python3`, it runs every
 command, shell or process, in isolated mode (`python3 -I -S`) under a Python
 supervisor that is a child subreaper (`PR_SET_CHILD_SUBREAPER`),
@@ -15639,6 +15665,10 @@ shared_artifact_tools = (
 )
 ```
 
+`max_bytes` defaults to 16 MiB and accepts up to 1 GiB. Publication and
+materialization hold the whole file in memory, so size it to what the host can
+spare.
+
 The model-facing flow is deliberately explicit:
 
 ```text
@@ -16518,8 +16548,8 @@ Every MCP exchange also has a Cayu-owned transport envelope. Pass one immutable
 `max_response_bytes`, `idle_timeout_s`, and `total_call_timeout_s` together.
 The default byte ceilings are 16 MiB per JSON-RPC message or SSE event and
 64 MiB per aggregate HTTP response. When no limits object is supplied, the
-legacy stdio `request_timeout_s` and HTTP `timeout_s` behavior remains: stdio
-uses 30 seconds and HTTP uses 120 seconds for both idle and total time. An
+legacy stdio `request_timeout_s` and HTTP `timeout_s` behavior remains: both
+use 300 seconds for idle and total time, as does a default `McpTransportLimits`. An
 explicit limits object cannot be combined with the matching legacy timeout;
 HTTP `metadata["timeout"]` remains a per-server compatibility override only
 when the client does not have explicit transport limits.

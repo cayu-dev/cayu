@@ -66,6 +66,7 @@ from cayu.sessions.requests import RunRequest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import InvocationArtifactStoreHandle, InvocationWorkspaceHandle
 from cayu.tools._runner import InvocationRunnerHandle
+from cayu.tools._terminal_bounds import MAX_TOOL_TERMINAL_PAYLOAD_BYTES
 from cayu.tools.base import (
     _POLICY_DENIAL_TEXT_MAX_BYTES,
     _POLICY_DENIAL_TRUNCATION_MARKER,
@@ -573,13 +574,13 @@ def test_builtin_tool_limits_are_model_context_sized():
     assert DEFAULT_ATTACHMENT_LIMIT_BYTES == DEFAULT_MAX_FILE_ATTACHMENT_BYTES
     assert DEFAULT_MAX_ATTACHMENT_LIMIT_BYTES == DEFAULT_MAX_FILE_ATTACHMENT_BYTES
     assert DEFAULT_WRITE_LIMIT_BYTES == 256 * 1024
-    assert MAX_WRITE_LIMIT_BYTES == 4 * 1024 * 1024
+    assert MAX_WRITE_LIMIT_BYTES == 64 * 1024 * 1024
     assert DEFAULT_LIST_LIMIT == 500
     assert MAX_LIST_LIMIT == 10_000
     assert DEFAULT_OUTPUT_LIMIT_BYTES == 50_000
-    assert MAX_OUTPUT_LIMIT_BYTES == 200_000
+    assert MAX_OUTPUT_LIMIT_BYTES == MAX_TOOL_TERMINAL_PAYLOAD_BYTES
     assert DEFAULT_TIMEOUT_SECONDS == 60
-    assert MAX_TIMEOUT_SECONDS == 3_600
+    assert MAX_TIMEOUT_SECONDS == 12 * 3_600
 
     assert ReadFileTool().schema["properties"]["max_bytes"]["default"] == 256 * 1024
     assert ReadFileTool().schema["properties"]["max_bytes"]["maximum"] == 4 * 1024 * 1024
@@ -600,7 +601,7 @@ def test_builtin_tool_limits_are_model_context_sized():
         12 * 1024 * 1024
     )
     assert WriteFileTool().schema["properties"]["max_bytes"]["default"] == 256 * 1024
-    assert WriteFileTool().schema["properties"]["max_bytes"]["maximum"] == 4 * 1024 * 1024
+    assert WriteFileTool().schema["properties"]["max_bytes"]["maximum"] == 64 * 1024 * 1024
     assert ListFilesTool().schema["properties"]["limit"]["default"] == 500
     assert ListFilesTool().schema["properties"]["limit"]["maximum"] == 10_000
     assert ListFilesTool().schema["properties"]["offset"]["default"] == 0
@@ -608,7 +609,14 @@ def test_builtin_tool_limits_are_model_context_sized():
     assert ListArtifactsTool().schema["properties"]["limit"]["default"] == 500
     assert ListArtifactsTool().schema["properties"]["limit"]["maximum"] == 10_000
     assert ExecCommandTool().schema["properties"]["max_output_bytes"]["default"] == 50_000
-    assert ExecCommandTool().schema["properties"]["max_output_bytes"]["maximum"] == 200_000
+    # The per-stream maximum follows the terminal bound, 1 MiB by default.
+    assert ExecCommandTool().schema["properties"]["max_output_bytes"]["maximum"] == 1024 * 1024
+    assert (
+        ExecCommandTool(max_terminal_payload_bytes=256 * 1024).schema["properties"][
+            "max_output_bytes"
+        ]["maximum"]
+        == 256 * 1024
+    )
     assert ExecCommandTool().schema["properties"]["timeout_s"]["default"] == 60
     assert ExecCommandTool().schema["properties"]["timeout_s"]["maximum"] == 3_600
     assert ExecCommandTool().schema["properties"]["argv"]["minItems"] == 1
@@ -622,6 +630,37 @@ def test_builtin_tool_limits_are_model_context_sized():
     assert "oneOf" not in ExecCommandTool().schema
     assert "anyOf" not in ExecCommandTool().schema
     assert "allOf" not in ExecCommandTool().schema
+
+
+def test_exec_command_timeout_ceiling_is_raised_where_the_tool_is_built():
+    from cayu.tools import ProcessCommandPolicy
+
+    default = ExecCommandTool()
+    assert default.schema["properties"]["timeout_s"]["maximum"] == 3_600
+    assert "max_timeout_seconds" not in default._execution_profile_material()
+    # The default policy keeps the one-hour ceiling; it can be raised to 12 hours.
+    assert ProcessCommandPolicy().process_capabilities.max_timeout_s == 3_600
+
+    long_running = ExecCommandTool(max_timeout_seconds=6 * 3_600)
+    assert long_running.schema["properties"]["timeout_s"]["maximum"] == 6 * 3_600
+    assert long_running._execution_profile_material()["max_timeout_seconds"] == 6 * 3_600
+    runner = RecordingRunner()
+    ctx = ToolContext(session_id="sess_1", runner=runner)
+    result = asyncio.run(long_running.run(ctx, {"argv": ["make"], "timeout_s": 5 * 3_600}))
+    assert result.is_error is False
+    assert runner.timeout_s == 5 * 3_600
+    refused = asyncio.run(default.run(ctx, {"argv": ["make"], "timeout_s": 5 * 3_600}))
+    assert refused.content == "Tool argument `timeout_s` must be at most 3600."
+
+    # A policy admitting longer commands raises the tool's ceiling with it.
+    policy = ProcessCommandPolicy(allowed_executables=("make",), max_timeout_s=8 * 3_600)
+    assert ExecCommandTool(policy=policy).schema["properties"]["timeout_s"]["maximum"] == 8 * 3_600
+    with pytest.raises(ValueError, match="max_timeout_s cannot exceed 43200"):
+        ProcessCommandPolicy(max_timeout_s=12 * 3_600 + 1)
+    with pytest.raises(ValueError, match="max_timeout_seconds"):
+        ExecCommandTool(max_timeout_seconds=12 * 3_600 + 1)
+    with pytest.raises(ValueError, match="default_timeout_seconds"):
+        ExecCommandTool(default_timeout_seconds=120, max_timeout_seconds=60)
 
 
 def test_workspace_tools_read_write_and_list_files(tmp_path):
@@ -1036,7 +1075,7 @@ def test_edit_file_rejects_amplified_result_before_constructing_it(tmp_path):
                         "expected_replacements": 1000,
                     }
                 ],
-                "max_bytes": MAX_WRITE_LIMIT_BYTES,
+                "max_bytes": 4 * 1024 * 1024,
             },
         )
     )
@@ -1048,6 +1087,35 @@ def test_edit_file_rejects_amplified_result_before_constructing_it(tmp_path):
     assert result.structured["after_bytes"] == 50_000_000
     assert peak < 10 * 1024 * 1024
     assert path.read_bytes() == original
+
+
+def test_edit_file_at_the_largest_max_bytes_allocates_only_the_file(tmp_path):
+    path = tmp_path / "notes.txt"
+    original = b"alpha\n"
+    path.write_bytes(original)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    tracemalloc.start()
+    result = asyncio.run(
+        EditFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+                "edits": [{"old_text": "alpha", "new_text": "beta"}],
+                "max_bytes": MAX_WRITE_LIMIT_BYTES,
+            },
+        )
+    )
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert result.is_error is False
+    assert path.read_bytes() == b"beta\n"
+    assert peak < 10 * 1024 * 1024
 
 
 def test_delete_file_requires_the_current_content_digest(tmp_path):
@@ -4535,11 +4603,11 @@ def test_exec_command_output_limit_guidance_is_field_specific(kind, explicit_kin
     runner = RecordingRunner()
     ctx = ToolContext(session_id="sess_1", runner=runner)
 
-    result = asyncio.run(ExecCommandTool().run(ctx, {**args, "max_output_bytes": 300_000}))
+    result = asyncio.run(ExecCommandTool().run(ctx, {**args, "max_output_bytes": 2_000_000}))
 
     assert result.is_error
     assert result.structured == {"error": "invalid_arguments"}
-    assert result.content == "Tool argument `max_output_bytes` must be at most 200000."
+    assert result.content == "Tool argument `max_output_bytes` must be at most 1048576."
     assert "sensitive-command-content" not in json.dumps(result.model_dump(mode="json"))
     assert runner.command is None
 

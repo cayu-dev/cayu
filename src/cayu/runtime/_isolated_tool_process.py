@@ -47,7 +47,12 @@ from cayu.runtime.application_lifecycle import (
     ApplicationAdmission,
     _current_operation_admission,
 )
-from cayu.tools.base import ToolContext, ToolResult, _runtime_tool_invocation_authority
+from cayu.tools.base import (
+    ToolContext,
+    ToolResult,
+    _runtime_tool_invocation_authority,
+    enforced_terminal_payload_bound,
+)
 from cayu.tools.gateway import validate_effective_tool_arguments
 from cayu.tools.isolated import (
     MAX_ISOLATED_TOOL_JSON_NODES,
@@ -886,7 +891,9 @@ def isolated_tool_execution_contract(
         ),
         "protocol": "cayu.isolated-tool",
         "protocol_version": 1,
-        "max_terminal_payload_bytes": tool.spec.max_terminal_payload_bytes,
+        "max_terminal_payload_bytes": enforced_terminal_payload_bound(
+            tool.spec.max_terminal_payload_bytes
+        ),
     }
     return copy_durable_json_object(material, "isolated_tool_execution_contract")
 

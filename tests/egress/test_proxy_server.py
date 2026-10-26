@@ -1162,7 +1162,7 @@ def test_transport_auth_token_requires_nonempty_bytes() -> None:
 
 @pytest.mark.parametrize(
     ("max_workers", "error_type"),
-    [(True, TypeError), (0, ValueError), (65, ValueError)],
+    [(True, TypeError), (0, ValueError), (513, ValueError)],
 )
 def test_proxy_worker_capacity_is_strictly_bounded(
     max_workers: Any,
@@ -1179,6 +1179,25 @@ def test_proxy_worker_capacity_is_strictly_bounded(
             )
     finally:
         loop.close()
+
+
+def test_proxy_connection_slots_default_to_64_and_are_configurable() -> None:
+    from cayu.egress.docker_adapter import DockerEgressAdapter
+
+    loop = asyncio.new_event_loop()
+    try:
+        broker, _registry = _broker(_CapturingUpstream())
+        default = TransparentEgressProxyServer(broker, loop=loop)
+        widest = TransparentEgressProxyServer(broker, loop=loop, max_workers=512)
+        assert default._connection_slots._value == 64
+        assert widest._connection_slots._value == 512
+        default._executor.shutdown()
+        widest._executor.shutdown()
+    finally:
+        loop.close()
+    assert DockerEgressAdapter(proxy_max_connections=256)._proxy_max_connections == 256
+    with pytest.raises(ValueError, match="between 1 and 512"):
+        DockerEgressAdapter(proxy_max_connections=513)
 
 
 def test_connect_to_non_https_port_is_rejected_without_broker_call() -> None:

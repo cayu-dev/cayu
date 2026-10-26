@@ -42,6 +42,7 @@ from cayu.environments._ephemeral_git import (
     sync_bound_tree_size,
 )
 from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
+from cayu.environments._sync_staging import SyncBindingStagingCapacity
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
@@ -53,6 +54,10 @@ from cayu.environments.admission import (
 )
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.bindings import (
+    MAX_WORKSPACE_TRANSFER_ARCHIVE_BYTES,
+    MAX_WORKSPACE_TRANSFER_FILE_BYTES,
+    MAX_WORKSPACE_TRANSFER_FILES,
+    MAX_WORKSPACE_TRANSFER_TOTAL_BYTES,
     BoundWorkspace,
     SyncBinding,
     WorkspaceSnapshot,
@@ -93,9 +98,14 @@ from cayu.runners._cleanup import validate_cancel_timeout
 from cayu.runners.base import ExecCommand, Runner
 from cayu.runners.docker import DockerRunner, _require_docker, validate_docker_seccomp_profile
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
+from cayu.runtime._binding_cleanup import (
+    BindingFinalizeFailure,
+    binding_finalize_status,
+    record_binding_finalize_failures,
+)
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools.base import ToolContext
-from cayu.workspaces.base import Workspace, matches_list_pattern
+from cayu.workspaces.base import Workspace, WorkspaceManifestLimits, matches_list_pattern
 from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.revisions import (
     WorkspaceRevisionDeltaStatus,
@@ -112,12 +122,16 @@ if TYPE_CHECKING:
     from cayu.knowledge.scopes import KnowledgeAccessScope
 
 DOCKER_CODING_PROTECTED_DIRECTORY_NAMES = (".cayu", ".git", ".runtime")
-MAX_DOCKER_WARM_SPARES = 8
 _DEFERRED_RECONNECT_KIND = "docker_coding_deferred"
 _CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 _ALLOCATION_ID = re.compile(r"ealloc_[0-9a-f]{32}\Z")
 _SPARE_NAME_PREFIX = "cayu-coding-spare-"
 _WARM_SPARE_DOCKER_TIMEOUT_S = 30.0
+# How long a coding runner's command cleanup or container removal waits for
+# Docker. The final close of a finished session waits this long, and
+# ``docker rm -f`` on a loaded host can take far longer than the standalone
+# runner's five seconds.
+DEFAULT_DOCKER_CODING_CANCEL_TIMEOUT_SECONDS = 30.0
 _DOCKER_CODING_RUNTIME_EXECUTABLES = ("git", "python3", "rm", "sh", "sleep")
 _GIT_HASH_PATH_CHUNK_BYTES = 24 * 1024
 _GIT_HASH_PATH_CHUNK_COUNT = 512
@@ -137,29 +151,45 @@ class _DockerCodingBindAuthority:
 class _DockerCodingFinalizeState:
     snapshot: WorkspaceSnapshot | None
     runner_closed: bool = False
+    # Copy-back finished; what remains is disposing of the container.
+    output_committed: bool = False
 
 
 class DockerWorkspaceTransferLimits(BaseModel):
-    """Finite copy-in/copy-back limits for one coding container."""
+    """Finite copy-in/copy-back limits for one coding container.
+
+    Transfers spool to disk and reserve staging capacity from the files they
+    measure, so these are ceilings, not reservations. A single file is held in
+    memory while it is copied, which the staging capacity bounds.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    max_files: int = Field(default=10_000, ge=1, le=100_000)
+    max_files: int = Field(default=100_000, ge=1, le=MAX_WORKSPACE_TRANSFER_FILES)
     max_file_bytes: int = Field(
-        default=8 * 1024 * 1024,
+        default=256 * 1024 * 1024,
         ge=1,
-        le=64 * 1024 * 1024,
+        le=MAX_WORKSPACE_TRANSFER_FILE_BYTES,
     )
     max_total_bytes: int = Field(
-        default=64 * 1024 * 1024,
+        default=4 * 1024 * 1024 * 1024,
         ge=1,
-        le=1024 * 1024 * 1024,
+        le=MAX_WORKSPACE_TRANSFER_TOTAL_BYTES,
     )
     max_archive_bytes: int = Field(
-        default=128 * 1024 * 1024,
+        default=8 * 1024 * 1024 * 1024,
         ge=1024,
-        le=2 * 1024 * 1024 * 1024,
+        le=MAX_WORKSPACE_TRANSFER_ARCHIVE_BYTES,
     )
+
+    def manifest_limits(self) -> WorkspaceManifestLimits:
+        """The bounds a command's workspace manifest is captured within."""
+
+        return WorkspaceManifestLimits(
+            max_paths=self.max_files,
+            max_file_bytes=self.max_file_bytes,
+            max_total_bytes=self.max_total_bytes,
+        )
 
 
 def _validate_immutable_inputs(
@@ -382,6 +412,7 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         immutable_input_attachments: Sequence[ImmutableInputAttachment] = (),
         path: str = "/workspace",
         git_baseline: bool = True,
+        staging_capacity: SyncBindingStagingCapacity | None = None,
     ) -> None:
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
@@ -431,6 +462,7 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             delete_missing=True,
             source_conflict_policy="require_revision",
             preserve_git_modes=True,
+            staging_capacity=staging_capacity,
         )
 
     async def observe_revision(self, bound: BoundWorkspace) -> WorkspaceRevisionObservation:
@@ -812,7 +844,11 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                     metadata={**snapshot.metadata, "final_git_evidence": final_git_evidence},
                 )
             )
-            cleanup_state = _DockerCodingFinalizeState(snapshot=final_snapshot)
+            cleanup_state = _DockerCodingFinalizeState(
+                snapshot=final_snapshot,
+                # Nothing was published when this outcome does not copy back.
+                output_committed=_should_sync_back(self.sync_back, outcome),
+            )
             with self._coding_authority_lock:
                 existing = self._coding_finalize_states.setdefault(
                     state_key,
@@ -820,7 +856,26 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                 )
             if existing is not cleanup_state:  # pragma: no cover - finalize is generation-owned
                 raise RuntimeError("Docker coding finalization raced its owner.")
+        try:
+            return await self._dispose_finalized(bound, runner, state_key, cleanup_state)
+        except Exception as exc:
+            if cleanup_state.output_committed and binding_finalize_status(exc) is None:
+                # Copy-back already committed. Report the failure as disposal so
+                # the session outcome does not claim the output was lost.
+                record_binding_finalize_failures(
+                    exc,
+                    (BindingFinalizeFailure(phase="managed_resource_cleanup", error=exc),),
+                    workspace_output_committed=True,
+                )
+            raise
 
+    async def _dispose_finalized(
+        self,
+        bound: BoundWorkspace,
+        runner: DockerRunner,
+        state_key: str,
+        cleanup_state: _DockerCodingFinalizeState,
+    ) -> WorkspaceSnapshot | None:
         # A retry must prove the same source/target generation before disposing
         # its runner; a state-key match alone is not cleanup authority.
         if not super()._requires_mutation_quiescence(bound):
@@ -930,10 +985,12 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
 
     ``cancel_timeout_s`` bounds how long one command cleanup or container
     removal waits for Docker, as ``DockerRunner(cancel_timeout_s=...)`` does;
-    ``None`` keeps the runner default of five seconds. When it expires the
+    ``None`` means 30 seconds (``DEFAULT_DOCKER_CODING_CANCEL_TIMEOUT_SECONDS``),
+    longer than a standalone runner's five seconds. When it expires the
     removal keeps running in the background, but a session's final container
     close fails its workspace finalization and the session ends ``failed`` with
-    a retained cleanup obligation. Raise it on hosts where ``docker rm -f`` can
+    a retained cleanup obligation; when copy-back had already finished, the
+    session reports ``workspace_output_committed: true``. Raise it on hosts where ``docker rm -f`` can
     be slow, such as heavily loaded machines. It is operational and stays out
     of the factory's configuration fingerprint, so raising it does not strand
     sessions that are waiting to retry their cleanup.
@@ -969,9 +1026,14 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         warm_spares: int = 0,
         command_cleanup: Literal["command_or_sandbox", "sandbox"] = "sandbox",
         cancel_timeout_s: float | None = None,
+        staging_capacity: SyncBindingStagingCapacity | None = None,
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
+        if staging_capacity is not None and not isinstance(
+            staging_capacity, SyncBindingStagingCapacity
+        ):
+            raise TypeError("staging_capacity must be a SyncBindingStagingCapacity or None.")
         if type(command_cleanup) is not str or command_cleanup not in {
             "command_or_sandbox",
             "sandbox",
@@ -981,8 +1043,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             raise TypeError("git_baseline must be a bool.")
         if type(deferred) is not bool:
             raise TypeError("deferred must be a bool.")
-        if type(warm_spares) is not int or not 0 <= warm_spares <= MAX_DOCKER_WARM_SPARES:
-            raise ValueError(f"warm_spares must be an integer from 0 to {MAX_DOCKER_WARM_SPARES}.")
+        if type(warm_spares) is not int or warm_spares < 0:
+            raise ValueError("warm_spares must be a non-negative integer.")
         if warm_spares and not deferred:
             raise ValueError(
                 "warm_spares requires deferred=True: an eager allocation's container must "
@@ -1045,7 +1107,11 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self.deferred = deferred
         self.warm_spares = warm_spares
         self.command_cleanup: Literal["command_or_sandbox", "sandbox"] = command_cleanup
-        self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
+        self.cancel_timeout_s = validate_cancel_timeout(
+            DEFAULT_DOCKER_CODING_CANCEL_TIMEOUT_SECONDS
+            if cancel_timeout_s is None
+            else cancel_timeout_s
+        )
         runtime_executables = (
             _DOCKER_CODING_RUNTIME_EXECUTABLES
             if git_baseline
@@ -1060,6 +1126,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             )
         )
         self.transfer_limits = transfer_limits or DockerWorkspaceTransferLimits()
+        # Process-local, so it stays out of the configuration fingerprint.
+        self.staging_capacity = staging_capacity
         self.runtime = runtime
         self.seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
         self.docker_path = docker_path
@@ -1231,6 +1299,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             immutable_input_store=self.immutable_input_store,
             immutable_input_attachments=immutable_input_attachments,
             git_baseline=self.git_baseline,
+            staging_capacity=self.staging_capacity,
         )
 
     def allocation_scope(
@@ -1648,6 +1717,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 python_executable="python3",
                 default_read_limit_bytes=self.transfer_limits.max_file_bytes,
                 default_list_limit=self.transfer_limits.max_files,
+                manifest_limits=self.transfer_limits.manifest_limits(),
                 excluded_directory_names=_merge_protected_directory_names(
                     self.source_workspace.excluded_directory_names
                 ),
@@ -2039,6 +2109,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             python_executable="python3",
             default_read_limit_bytes=self.transfer_limits.max_file_bytes,
             default_list_limit=self.transfer_limits.max_files,
+            manifest_limits=self.transfer_limits.manifest_limits(),
             excluded_directory_names=_merge_protected_directory_names(
                 self.source_workspace.excluded_directory_names
             ),
@@ -3114,7 +3185,8 @@ class DockerCodingBackendOptions:
     With ``verify_local_image`` (the default) the backend checks, when it is
     built, that the local daemon holds exactly that image, so a stale or
     missing image fails at startup rather than in the first session.
-    ``cancel_timeout_s`` is passed to every factory the backend builds.
+    ``cancel_timeout_s`` and ``staging_capacity`` are passed to every factory
+    the backend builds.
     """
 
     image_identity: DockerImageIdentity
@@ -3125,10 +3197,15 @@ class DockerCodingBackendOptions:
     docker_path: str | None = None
     verify_local_image: bool = True
     cancel_timeout_s: float | None = None
+    staging_capacity: SyncBindingStagingCapacity | None = None
 
     def __post_init__(self) -> None:
         if type(self.image_identity) is not DockerImageIdentity:
             raise TypeError("image_identity must be a DockerImageIdentity.")
+        if self.staging_capacity is not None and not isinstance(
+            self.staging_capacity, SyncBindingStagingCapacity
+        ):
+            raise TypeError("staging_capacity must be a SyncBindingStagingCapacity or None.")
         if type(self.verify_local_image) is not bool:
             raise TypeError("verify_local_image must be a bool.")
         if self.cancel_timeout_s is not None:
@@ -3217,6 +3294,7 @@ def docker_coding_backend(context: Any) -> Any:
             transfer_limits=options.transfer_limits,
             docker_path=docker_path,
             cancel_timeout_s=options.cancel_timeout_s,
+            staging_capacity=options.staging_capacity,
         )
 
     return CodingBackend(

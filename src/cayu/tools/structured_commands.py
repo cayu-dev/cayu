@@ -74,6 +74,7 @@ from cayu.workspaces.base import (
     WorkspaceContentManifest,
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
+    WorkspaceManifestLimits,
     WorkspaceReadResult,
 )
 
@@ -98,9 +99,15 @@ _COMMAND_ERROR_EXPLANATIONS = MappingProxyType(
         "output_publication_incomplete": "The complete command output could not be retained.",
     }
 )
+# A command observes the workspace within the manifest limits the workspace
+# declares, normally its environment's transfer limits, or within these.
 _COMMAND_MANIFEST_MAX_PATHS = 10_000
 _COMMAND_MANIFEST_MAX_FILE_BYTES = 8 * 1024 * 1024
 _COMMAND_MANIFEST_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+# The journal record keeps the before manifest, five durable JSON nodes per
+# path, and a durable record holds at most 250,000 nodes.
+_COMMAND_MANIFEST_MAX_PATHS_CEILING = 40_000
+_COMMAND_MANIFEST_MAX_TOTAL_BYTES_CEILING = 64 * 1024 * 1024 * 1024
 _COMMAND_JOURNAL_RECORD_TYPE = "cayu.run_command.journal"
 _COMMAND_JOURNAL_SCHEMA_VERSION = 2
 _DURABLE_RUNNER_OPERATION_SCHEMA = "cayu.durable_runner_operation.v1"
@@ -1397,34 +1404,53 @@ def _mutation_scope_identity(authority: CodingCommandAuthority) -> str:
     )
 
 
+def _command_manifest_limits(workspace: WorkspaceHandle) -> tuple[int, int, int]:
+    """Return the path, per-file and total bounds for one command manifest."""
+
+    declared = getattr(workspace, "manifest_limits", None)
+    if type(declared) is not WorkspaceManifestLimits:
+        return (
+            _COMMAND_MANIFEST_MAX_PATHS,
+            _COMMAND_MANIFEST_MAX_FILE_BYTES,
+            _COMMAND_MANIFEST_MAX_TOTAL_BYTES,
+        )
+    max_total_bytes = min(declared.max_total_bytes, _COMMAND_MANIFEST_MAX_TOTAL_BYTES_CEILING)
+    return (
+        min(declared.max_paths, _COMMAND_MANIFEST_MAX_PATHS_CEILING),
+        min(declared.max_file_bytes, max_total_bytes),
+        max_total_bytes,
+    )
+
+
 async def _capture_workspace_command_manifest(
     workspace: WorkspaceHandle,
 ) -> _WorkspaceCommandManifest:
-    """Capture one complete content manifest within the coding copy bounds."""
+    """Capture one complete content manifest within the workspace's manifest bounds."""
 
+    max_paths, max_file_bytes, max_total_bytes = _command_manifest_limits(workspace)
     try:
         capture = getattr(workspace, "capture_content_manifest", None)
         if callable(capture):
             manifest = await capture(
-                max_paths=_COMMAND_MANIFEST_MAX_PATHS,
-                max_file_bytes=_COMMAND_MANIFEST_MAX_FILE_BYTES,
-                max_total_bytes=_COMMAND_MANIFEST_MAX_TOTAL_BYTES,
+                max_paths=max_paths,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=max_total_bytes,
             )
             if manifest is not None:
                 if type(manifest) is not WorkspaceContentManifest:
                     raise _WorkspaceManifestError
                 manifest = WorkspaceContentManifest(manifest.entries, manifest.total_bytes)
                 if (
-                    len(manifest.entries) > _COMMAND_MANIFEST_MAX_PATHS
-                    or manifest.total_bytes > _COMMAND_MANIFEST_MAX_TOTAL_BYTES
-                    or any(row[2] > _COMMAND_MANIFEST_MAX_FILE_BYTES for row in manifest.entries)
+                    len(manifest.entries) > max_paths
+                    or manifest.total_bytes > max_total_bytes
+                    or any(row[2] > max_file_bytes for row in manifest.entries)
                 ):
                     raise _WorkspaceManifestError
                 return _WorkspaceCommandManifest(manifest.entries, manifest.total_bytes)
         list_git_entries = getattr(workspace, "list_git_entries", None)
         if not callable(list_git_entries):
             raise _WorkspaceManifestError
-        listing = await list_git_entries(limit=_COMMAND_MANIFEST_MAX_PATHS + 1)
+        listing = await list_git_entries(limit=max_paths + 1)
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
@@ -1433,7 +1459,7 @@ async def _capture_workspace_command_manifest(
         type(listing) is not WorkspaceGitEntryListResult
         or listing.truncated
         or listing.total_count != len(listing.entries)
-        or len(listing.entries) > _COMMAND_MANIFEST_MAX_PATHS
+        or len(listing.entries) > max_paths
     ):
         raise _WorkspaceManifestError
 
@@ -1449,7 +1475,7 @@ async def _capture_workspace_command_manifest(
             if target_sha256 is None or target_bytes is None:
                 raise _WorkspaceManifestError
             total_bytes += target_bytes
-            if total_bytes > _COMMAND_MANIFEST_MAX_TOTAL_BYTES:
+            if total_bytes > max_total_bytes:
                 raise _WorkspaceManifestError
             entries.append((path, target_sha256, target_bytes, "120000"))
             continue
@@ -1457,7 +1483,7 @@ async def _capture_workspace_command_manifest(
             result = await workspace.read_bytes(
                 path,
                 offset=0,
-                max_bytes=_COMMAND_MANIFEST_MAX_FILE_BYTES + 1,
+                max_bytes=max_file_bytes + 1,
             )
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -1470,12 +1496,12 @@ async def _capture_workspace_command_manifest(
             or result.redaction_truncated
             or result.source_bytes_read != result.total_bytes
             or result.sha256 is None
-            or result.total_bytes > _COMMAND_MANIFEST_MAX_FILE_BYTES
+            or result.total_bytes > max_file_bytes
             or result.git_mode != observed_entry.git_mode
         ):
             raise _WorkspaceManifestError
         total_bytes += result.total_bytes
-        if total_bytes > _COMMAND_MANIFEST_MAX_TOTAL_BYTES:
+        if total_bytes > max_total_bytes:
             raise _WorkspaceManifestError
         entries.append((path, result.sha256, result.total_bytes, result.git_mode))
     return _WorkspaceCommandManifest(entries=tuple(entries), total_bytes=total_bytes)
@@ -2008,7 +2034,7 @@ def _recover_before_command_manifest(
     record: Mapping[str, object],
 ) -> _WorkspaceCommandManifest | None:
     raw_entries = record.get("before_manifest_entries")
-    if type(raw_entries) is not list or len(raw_entries) > _COMMAND_MANIFEST_MAX_PATHS:
+    if type(raw_entries) is not list or len(raw_entries) > _COMMAND_MANIFEST_MAX_PATHS_CEILING:
         return None
     entries: list[tuple[str, str, int, str]] = []
     total_bytes = 0
@@ -2046,7 +2072,7 @@ def _recover_before_command_manifest(
         except (TypeError, ValueError):
             return None
         total_bytes += byte_count
-        if total_bytes > _COMMAND_MANIFEST_MAX_TOTAL_BYTES:
+        if total_bytes > _COMMAND_MANIFEST_MAX_TOTAL_BYTES_CEILING:
             return None
         entries.append((path, content_sha256, byte_count, normalized_git_mode))
     manifest = _WorkspaceCommandManifest(entries=tuple(entries), total_bytes=total_bytes)

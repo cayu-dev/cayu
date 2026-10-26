@@ -82,7 +82,9 @@ MAX_PDF_SOURCE_BYTES = 32 * 1024 * 1024
 # still apply to the extracted pages.
 MAX_PDF_PAGES_PER_READ = 100
 DEFAULT_WRITE_LIMIT_BYTES = 256 * 1024
-MAX_WRITE_LIMIT_BYTES = 4 * 1024 * 1024
+# write_file and edit_file hold the file in memory; the workspace's own read
+# limit still applies.
+MAX_WRITE_LIMIT_BYTES = 64 * 1024 * 1024
 DEFAULT_EDIT_DIFF_LIMIT_BYTES = 32 * 1024
 MAX_EDIT_DIFF_LIMIT_BYTES = 200 * 1024
 MAX_EDIT_OPERATIONS = 100

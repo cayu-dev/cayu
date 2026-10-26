@@ -44,16 +44,18 @@ def cases():
 # Captured against current main before checking the concept migration.
 # The Anthropic entries changed deliberately when prompt caching became the
 # default (AnthropicProvider().cache_policy is now CachePolicy(), #2289).
+# Every streaming provider changed deliberately when the absolute stream deadline
+# began counting from the last output (absolute output-idle policy v1, #2800).
 _BASE_MATERIAL_SHA256 = {
-    "anthropic": "d2bc2f91061bd0d31bb3890a4fb03ce04d99b43d5ccede5f1ecba103544e821c",
-    "anthropic-tokens": "f1a60f8a16d81c7d815562030f4ed4b98b8780ad51db2c3ae111b7066bc5bbf2",
-    "bedrock": "369bf7120cf10c9212db958362187d33b99808531a11d3c564b97d27ae902390",
-    "bedrock-route": "3527dc6dba95186eb5a71bc8e76b400945959c4aa5e937d6ada8bb757732ab85",
-    "chat": "d50e4dab344cc06426827e645bf50e85bdb39ca8b3c99d8930c7178b8db029ef",
-    "openai": "6eb9e24f4030fdaafd474a737c8626a3242a24ce81216bceaa48fafb84764f27",
-    "openai-background": "23a3d61609b86ddd06a8e26240b43a3ddbd52ec7b1a235ea92d78def886f21db",
-    "openai-search": "6a35bfd929b5e74d1923e92bf9b08d1952d1158e9b1174d8c14c6b7624c0943b",
-    "openrouter": "a793fc4ae759234dbd792c85bc6a3e6131f3ddfec706298d251d9d824f58fff5",
+    "anthropic": "5752745f4e9163a4c25e92d1a6807617e11d175535d5ba4e202ebbf28cee8359",
+    "anthropic-tokens": "f0ab2706bce94d182651a849de81c9dd8628bb4df87281a7e2ace761a81d1d68",
+    "bedrock": "d044630621b700d8cf9ccae560ecc8e7d7c775367838c1c51114474d0022c6e8",
+    "bedrock-route": "3870ad81f70e1544041527d7b480d00484287480ec1b011e746f862fface6044",
+    "chat": "3a152f2176015ef97e16dca84cf78da7a7b08dbc710bd73b7557464c2c74ad09",
+    "openai": "6c2a30c9eefa61c650f0b986e28f85390e4ff432775b7844f6c132d450a05956",
+    "openai-background": "49c21fb2d544ac9dc29466e452c40816fbbc194541dd3fb4689f7344a7c16634",
+    "openai-search": "ec5ed69c8dff9d6d75086fe7ebef3996b3be17b2535a3b31dd26ce4a1893edaa",
+    "openrouter": "0b651ea447a9f186c9ec420bbf92f139dc2053ab7ad86d67720fabeab221afff",
     "scripted": "06548d202a0bac8275f5b0440ef995d442f547383da12717e99a84d23d30e803",
     "scripted-background": "019d2934ee5f333b455cd092d2adb2ca99d8c7d399253444befad745921ada5a",
 }

@@ -78,12 +78,23 @@ credentials stay in the trusted Cayu process and never reach runners or sandboxe
 
 A run retries a model call that fails with HTTP 429, 500, 502, 503, 504 or 529,
 a timeout, a connection error, a rate limit, or another error the provider marks
-retryable. `RetryPolicy` controls how. The default allows 5 attempts with 0.5,
-1, 2 and 4 seconds of backoff between them, each plus up to 0.5 seconds of
-jitter: 7.5 to 9.5 seconds in all. That suits an interactive run and is short
-for a usage limit or an outage of a minute or more. A provider `Retry-After` is
-honored up to `max_delay_s` (30 seconds by default). Failures Cayu can't
+retryable. `RetryPolicy` controls how. The default allows 5 attempts. Most
+failures get 0.5, 1, 2 and 4 seconds of backoff between them, each plus up to
+0.5 seconds of jitter: 7.5 to 9.5 seconds in all. A provider `Retry-After` is
+honored up to `max_delay_s` (60 seconds by default). Failures Cayu can't
 classify stop after `max_unknown_attempts` (2).
+
+Rate limits and overloads (HTTP 429, 503 and 529, or a rate-limit message) have
+a time budget, `max_retry_elapsed_s` (300 seconds by default), counted from the
+model step's first attempt. The first retry uses ordinary backoff, so a brief
+limit costs at most a second. Each later retry waits its share of the time left,
+spread over the attempts left and growing by `backoff_multiplier`, at most
+`max_delay_s` and never past the budget's end. With the defaults the four
+retries wait about 1, 43, 60 and 60 seconds. The step stops retrying once the
+budget is spent, and `max_attempts` still bounds the attempts:
+`RetryPolicy(max_attempts=10, max_delay_s=120.0, max_retry_elapsed_s=900.0)`
+waits out a limit of about a quarter of an hour. `max_retry_elapsed_s=None`
+turns the budget off, and a zero `initial_delay_s` never waits.
 
 Widen it for every run of an application, or for one run, before writing your
 own loop that retries whole sessions:

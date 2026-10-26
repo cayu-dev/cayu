@@ -1074,6 +1074,7 @@ def test_e2b_adapter_handoff_budget_covers_every_setup_command(
         guest_ca_path="/etc/cayu/ca.pem",
         setup_commands=("first", "second"),
         egress_destinations=("api.stripe.com",),
+        setup_command_timeout_s=300,
     )
 
     runner = asyncio.run(adapter.create_runner(request))

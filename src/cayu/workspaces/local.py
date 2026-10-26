@@ -462,6 +462,26 @@ class LocalWorkspace(Workspace, WorkspaceGitModeMutator, WorkspaceDirectoryPrune
             self._excluded_path_pattern_keys,
         )
 
+    async def _observe_transfer_sizes(self, paths: tuple[str, ...]) -> tuple[int, int]:
+        """Return the total and largest size of regular files, without reading them.
+
+        SyncBinding sizes its staging reservation from this; the copy itself
+        still enforces every limit.
+        """
+
+        def measure() -> tuple[int, int]:
+            total_bytes = 0
+            largest_file_bytes = 0
+            for path in paths:
+                info = self.resolve_no_symlinks(path).lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError(f"Workspace path is not a regular file: {path}")
+                total_bytes += info.st_size
+                largest_file_bytes = max(largest_file_bytes, info.st_size)
+            return total_bytes, largest_file_bytes
+
+        return await asyncio.to_thread(measure)
+
     def resolve(self, path: str) -> Path:
         relative_path = _validate_workspace_relative_path(path)
         self._require_path_allowed(relative_path)
@@ -567,7 +587,13 @@ def _read_file(
         if offset > total_bytes:
             raise WorkspaceReadOffsetError(offset, total_bytes)
         file.seek(offset)
-        content = file.read() if max_bytes is None else file.read(max_bytes)
+        # A sized read allocates its whole size up front, so ask for no more
+        # than the file holds; the extra byte still reveals a file that grew.
+        content = (
+            file.read()
+            if max_bytes is None
+            else file.read(min(max_bytes, total_bytes - offset + 1))
+        )
         file_mode = os.fstat(file.fileno()).st_mode
     complete = offset == 0 and len(content) == total_bytes
     revision, digest = content_identity(content) if complete else (None, None)

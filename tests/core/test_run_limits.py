@@ -37,6 +37,7 @@ from cayu.budgets.base import (
 from cayu.budgets.billing import BillingIdentity
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.budgets.run_limits import RunLimits
+from cayu.configuration import DEFAULT_MAX_STEPS
 from cayu.events import Event, EventType
 from cayu.execution_units import (
     ModelAttemptIdentity,
@@ -127,7 +128,7 @@ def _profiled_identity_for_app(
     registered_agent = app._agents["assistant"]
     registered_provider = app._provider_registry.registrations["fake"]
     profile = _session_execution_profile._execution_profile_identity(
-        max_steps=64,
+        max_steps=DEFAULT_MAX_STEPS,
         registered_agent=registered_agent,
         provider_name=registered_provider.name,
         registered_provider=registered_provider,

@@ -1277,7 +1277,7 @@ async def test_byte_active_heartbeat_only_sse_crosses_semantic_deadline(
 
 
 @pytest.mark.anyio
-async def test_semantically_active_real_sse_is_bounded_by_absolute_lifetime(
+async def test_real_sse_absolute_deadline_counts_from_the_last_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lines = [
@@ -1294,15 +1294,17 @@ async def test_semantically_active_real_sse_is_bounded_by_absolute_lifetime(
                 "",
             ]
         )
+    # Keep-alive comments are transport activity, not output.
+    lines.extend([": keep-alive"] * 25)
     response = _StreamingResponse(lines, heartbeat_sleep_s=0.04)
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
     provider = OpenAIProvider(
         api_key="test-key",
         stream_deadlines=ProviderStreamDeadlines(
             transport_idle_timeout_s=0.15,
-            semantic_progress_timeout_s=0.2,
-            protocol_idle_timeout_s=0.2,
-            absolute_stream_timeout_s=0.55,
+            semantic_progress_timeout_s=2.0,
+            protocol_idle_timeout_s=2.0,
+            absolute_stream_timeout_s=0.25,
         ),
     )
 
@@ -1314,8 +1316,12 @@ async def test_semantically_active_real_sse_is_bounded_by_absolute_lifetime(
 
     evidence = captured.value.deadline_evidence
     assert evidence.deadline_kind is ProviderDeadlineKind.ABSOLUTE
-    assert evidence.elapsed_s >= 0.5
+    # About a second of output did not trip the 0.25 s deadline; the
+    # keep-alives that followed did.
     assert evidence.last_progress_kind is not None
+    assert evidence.last_progress_elapsed_s is not None
+    assert evidence.last_progress_elapsed_s >= 0.9
+    assert evidence.elapsed_s >= evidence.last_progress_elapsed_s + 0.25
     assert response.byte_stream.closed is True
 
 

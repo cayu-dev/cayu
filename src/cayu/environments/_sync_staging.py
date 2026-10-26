@@ -11,8 +11,8 @@ from collections.abc import Awaitable, Callable, Hashable
 from dataclasses import dataclass
 from typing import BinaryIO, Literal
 
-DEFAULT_SYNC_STAGING_MAX_CONCURRENCY = 4
-DEFAULT_SYNC_STAGING_MAX_BYTES = 512 * 1024 * 1024
+DEFAULT_SYNC_STAGING_MAX_CONCURRENCY = 16
+DEFAULT_SYNC_STAGING_MAX_BYTES = 4 * 1024 * 1024 * 1024
 
 
 class SyncBindingStagingCapacityError(RuntimeError):

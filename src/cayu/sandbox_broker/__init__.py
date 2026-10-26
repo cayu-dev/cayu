@@ -60,6 +60,7 @@ from cayu.sandbox_broker.lease import SandboxLeaseKeeper
 from cayu.sandbox_broker.runner import (
     BrokeredSandboxRunner,
     BrokeredSandboxWorkspace,
+    StagedCopiesMode,
     sandbox_capability_claims,
 )
 
@@ -105,6 +106,7 @@ __all__ = [
     "SandboxStagedCopies",
     "SandboxStdinWrite",
     "SandboxStdoutChunk",
+    "StagedCopiesMode",
     "sandbox_capability_claims",
     "validate_egress_hosts",
 ]

@@ -15969,7 +15969,7 @@
               "type": "null"
             }
           ],
-          "default": 64,
+          "default": 1000,
           "title": "Max Steps"
         },
         "profile_adoption": {
@@ -16109,7 +16109,7 @@
     },
     "RetryPolicy": {
       "additionalProperties": false,
-      "description": "Retry controls for one provider model step.\n\n`max_attempts` includes the initial attempt. The default permits five total\nattempts for classified transient provider failures, with 7.5 to 9.5 seconds\nof backoff in all; `cayu guide providers#provider-retries` shows how to wait\nout longer outages. Unknown provider failures retain the stricter\n`max_unknown_attempts` ceiling.\n\nFrozen: policies are immutable value objects, so they can be shared across\nattempts and sessions without per-attempt defensive copies.",
+      "description": "Retry controls for one provider model step.\n\n`max_attempts` includes the initial attempt. The default permits five total\nattempts for classified transient provider failures; other failures get 7.5\nto 9.5 seconds of backoff in all. `cayu guide providers#provider-retries`\nshows how to wait out longer outages. Unknown provider failures retain the\nstricter `max_unknown_attempts` ceiling.\n\n`max_retry_elapsed_s` is a time budget for rate-limit and overload failures\n(HTTP 429, 503 and 529, or a provider rate-limit message), counted from the\nstart of the model step's first attempt; 300 seconds by default, `None`\nturns it off. The first such retry uses ordinary backoff. Each later one\nwaits at least its share of the time left, spread over the attempts left\nand growing by `backoff_multiplier`, so a sustained limit is waited out\ninstead of exhausting the attempts in seconds. No retry waits longer than\n`max_delay_s` (60 seconds by default) or the time left, and once the budget\nis spent the step stops retrying them. `max_attempts` still bounds the\nattempts, and a zero `initial_delay_s` still never waits. The budget\napplies to agent model steps and automatic compaction.\n\nFrozen: policies are immutable value objects, so they can be shared across\nattempts and sessions without per-attempt defensive copies.",
       "properties": {
         "backoff_multiplier": {
           "default": 2.0,
@@ -16140,11 +16140,25 @@
           "type": "integer"
         },
         "max_delay_s": {
-          "default": 30.0,
+          "default": 60.0,
           "maximum": 3600.0,
           "minimum": 0.0,
           "title": "Max Delay S",
           "type": "number"
+        },
+        "max_retry_elapsed_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "maximum": 86400.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 300.0,
+          "title": "Max Retry Elapsed S"
         },
         "max_unknown_attempts": {
           "default": 2,
@@ -16279,7 +16293,7 @@
               "type": "null"
             }
           ],
-          "default": 64,
+          "default": 1000,
           "title": "Max Steps"
         },
         "prompt": {

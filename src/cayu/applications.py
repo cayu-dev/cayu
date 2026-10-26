@@ -255,6 +255,7 @@ from cayu.collaboration.waits import (
     WaitSnapshot,
 )
 from cayu.configuration import (
+    CAYU_CONFIG_FIELD_OWNERS,
     CayuConfig,
     CayuConfigSource,
     copy_cayu_config,
@@ -776,7 +777,10 @@ from cayu.tools.rounds import (
 from cayu.tools.targeted_projection import (
     TargetedToolMode,
 )
-from cayu.tools.terminal_publication import ToolTerminalPublicationMetricsSnapshot
+from cayu.tools.terminal_publication import (
+    ToolTerminalPublicationGovernor,
+    ToolTerminalPublicationMetricsSnapshot,
+)
 from cayu.vaults.redaction import SecretRedactionStream, SecretRedactor
 from cayu.verification._verified_completion import VerifiedCompletionCoordinator
 from cayu.verification.completion_evaluators import CompletionEvaluator
@@ -846,30 +850,11 @@ if TYPE_CHECKING:
     from cayu.tasks.operations import TaskCreationOperation
 
 
-_CAYU_CONFIG_FIELD_OWNERS = {
-    "evals.max_concurrency": "cayu.configuration.EvalConfig",
-    "run.max_steps": "cayu.configuration.RunDefaults",
-    "run.limits": "cayu.runtime.stop_policy.RunLimits",
-    "run.retry_policy": "cayu.providers.retry_policy.RetryPolicy",
-    "run.thinking": "cayu.context.thinking.ThinkingConfig",
-    "tool_execution.max_file_attachment_bytes": "cayu.configuration.ToolExecutionConfig",
-    "tool_execution.max_total_file_attachment_bytes": ("cayu.configuration.ToolExecutionConfig"),
-    "tool_execution.max_file_attachments_per_request": ("cayu.configuration.ToolExecutionConfig"),
-    "tool_execution.image_max_frame_bytes": "cayu.configuration.ToolExecutionConfig",
-    "tool_execution.image_max_total_bytes": "cayu.configuration.ToolExecutionConfig",
-    "tool_execution.image_max_frames": "cayu.configuration.ToolExecutionConfig",
-    "tool_execution.tool_timeout_seconds": "cayu.configuration.ToolExecutionConfig",
-    "tool_execution.max_parallel_tool_calls": "cayu.configuration.ToolExecutionConfig",
-    "operations.max_environment_lifecycle_owners": "cayu.configuration.OperationsConfig",
-    "operations.recovery_cleanup_policy": ("cayu.sessions.cleanup.RecoveryCleanupPolicy"),
-}
-
-
 def _resolve_cayu_app_config(
     config: CayuConfig | None,
 ) -> tuple[CayuConfig, dict[str, CayuConfigSource]]:
     resolved = copy_cayu_config(config)
-    sources: dict[str, CayuConfigSource] = {path: "framework" for path in _CAYU_CONFIG_FIELD_OWNERS}
+    sources: dict[str, CayuConfigSource] = {path: "framework" for path in CAYU_CONFIG_FIELD_OWNERS}
     if config is not None:
         for section_name in config.model_fields_set:
             section = getattr(config, section_name)
@@ -1056,7 +1041,7 @@ class CayuApp:
             "Mapping[str, CayuConfigSource]",
             MappingProxyType(dict(config_sources)),
         )
-        self._config_owners = MappingProxyType(dict(_CAYU_CONFIG_FIELD_OWNERS))
+        self._config_owners = MappingProxyType(dict(CAYU_CONFIG_FIELD_OWNERS))
         if session_store is not None and not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")
         if task_store is not None and not isinstance(task_store, TaskStore):
@@ -1479,6 +1464,10 @@ class CayuApp:
             secret_redactor=self._secret_redactor,
             projection_policy=self._tool_result_projection_policy,
             clock=self._clock,
+            governor=ToolTerminalPublicationGovernor(
+                staged_capacity_bytes=tool_execution.tool_terminal_staged_capacity_bytes,
+                round_admission_timeout_s=tool_execution.tool_round_admission_timeout_seconds,
+            ),
         )
 
         self._recovery_ownership = RecoveryOwnership(

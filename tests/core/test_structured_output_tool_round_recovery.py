@@ -12,7 +12,7 @@ from cayu import CayuConfig
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.run_limits import RunLimits
-from cayu.configuration import ToolExecutionConfig
+from cayu.configuration import DEFAULT_MAX_STEPS, ToolExecutionConfig
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
 from cayu.events import Event, EventType
 from cayu.execution_units import ModelAttemptIdentity, ToolRoundIdentity
@@ -206,7 +206,7 @@ async def _publish_structured_model_step(
     )
     tool_capability_ceiling = ToolCapabilityCeiling(tool_names=tuple(tool.name for tool in tools))
     execution_profile = _session_execution_profile._execution_profile_identity(
-        max_steps=64,
+        max_steps=DEFAULT_MAX_STEPS,
         registered_agent=profile_app._agents["assistant"],
         provider_name=provider.name,
         registered_provider=profile_app._provider_registry.registrations[provider.name],

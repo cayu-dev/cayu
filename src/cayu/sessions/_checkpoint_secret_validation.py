@@ -253,6 +253,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "max_input_tokens",
     "max_output_tokens",
     "max_retries",
+    "max_retry_elapsed_s",
     "max_steps",
     "max_steps_unbounded",
     "on_limit",

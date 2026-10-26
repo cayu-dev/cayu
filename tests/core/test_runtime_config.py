@@ -31,7 +31,7 @@ from cayu.sessions.requests import RunRequest, copy_run_request
 def test_zero_configuration_uses_canonical_runtime_defaults() -> None:
     config = CayuConfig()
 
-    assert config.run.max_steps == DEFAULT_MAX_STEPS == 64
+    assert config.run.max_steps == DEFAULT_MAX_STEPS == 1000
     assert MAX_STEPS == 2**53 - 1
     assert config.run.limits.model_dump(mode="python") == RunLimits().model_dump(mode="python")
     assert config.run.thinking is None

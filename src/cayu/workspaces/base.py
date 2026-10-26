@@ -27,6 +27,25 @@ WorkspaceGitEntryMode = Literal["100644", "100755", "120000"]
 
 
 @dataclass(frozen=True)
+class WorkspaceManifestLimits:
+    """Bounds for one complete content manifest of a workspace.
+
+    A coding environment sets them from its transfer limits, so commands can
+    observe every tree the environment can copy in or back.
+    """
+
+    max_paths: int
+    max_file_bytes: int
+    max_total_bytes: int
+
+    def __post_init__(self) -> None:
+        for name in ("max_paths", "max_file_bytes", "max_total_bytes"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"WorkspaceManifestLimits.{name} must be a positive integer.")
+
+
+@dataclass(frozen=True)
 class WorkspaceContentManifest:
     """Complete content identities, with no file contents or symlink targets."""
 

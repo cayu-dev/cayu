@@ -1367,12 +1367,12 @@ def _subagent_terminal_payload_bound(
 ) -> int | None:
     """The bound ``subagent`` declares, or ``None`` while a foreground child may need it.
 
-    A foreground child's rounds run inside the parent's round. While the parent
-    round holds an exclusive lease, a child round with a tool that declares no
-    bound is always admitted; under a bounded parent it fails whenever another
-    session holds capacity. So ``subagent`` declares a bound by default only when
-    every child is asynchronous, and an application that knows every tool its
-    foreground children call declares one sets it explicitly.
+    A foreground child returns its final output through the parent's round, so
+    without an application bound ``subagent`` declares none and its call
+    reserves the largest terminal result Cayu can store. The child's own rounds
+    join the parent's capacity family and are admitted ahead of queued rounds;
+    one is refused only when the process's staged capacity cannot fit it.
+    ``subagent`` declares the default bound when every child is asynchronous.
     """
 
     if value is not None:

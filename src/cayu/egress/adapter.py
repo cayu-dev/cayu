@@ -37,7 +37,19 @@ from cayu.workspaces.revisions import (
 )
 
 DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS = 15.0
+#: How long each sandbox setup command may run, unless the factory sets otherwise.
+DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS = 300
 _CleanupResultT = TypeVar("_CleanupResultT")
+
+
+def validate_setup_command_timeout(value: object) -> int:
+    """Return a setup command timeout: a positive whole number of seconds."""
+
+    if type(value) is not int or value <= 0:
+        raise ValueError("setup_command_timeout_s must be a positive integer number of seconds.")
+    return value
+
+
 _ExecutionCapabilityPosture = Literal[
     "available",
     "live_verified",
@@ -590,6 +602,8 @@ class VirtualEgressRunnerRequest:
     #: Adapter-owned inputs pinned in the durable allocation intent before the
     #: first provider mutation; empty outside recoverable allocation.
     allocation_metadata: Mapping[str, Any] = field(default_factory=dict)
+    #: The bound on each of ``setup_commands``, in seconds.
+    setup_command_timeout_s: int = DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)

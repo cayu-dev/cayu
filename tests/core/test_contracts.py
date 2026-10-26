@@ -1965,7 +1965,8 @@ def test_retry_policy_validates_retry_controls():
         "max_attempts": 5,
         "max_unknown_attempts": 2,
         "initial_delay_s": 0.5,
-        "max_delay_s": 30.0,
+        "max_delay_s": 60.0,
+        "max_retry_elapsed_s": 300.0,
         "backoff_multiplier": 2.0,
         "jitter_s": 0.5,
         "retry_on_status_codes": [429, 500, 502, 503, 504, 529],
@@ -2193,17 +2194,17 @@ def test_retry_policy_honors_retry_after_directive_capped_by_max_delay():
     assert decision.delay_seconds == 10.0
 
 
-def test_retry_policy_default_caps_retry_after_at_thirty_seconds():
+def test_retry_policy_default_caps_retry_after_at_sixty_seconds():
     decision = retry_decision(
         policy=RetryPolicy(),
         attempt=1,
         error="HTTP 429: rate limited",
         status_code=429,
-        retry_after_s=45.0,
+        retry_after_s=75.0,
     )
 
     assert decision.retry is True
-    assert decision.delay_seconds == 30.0
+    assert decision.delay_seconds == 60.0
 
 
 def test_retry_policy_uses_retry_after_below_max_delay_verbatim():

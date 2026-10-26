@@ -155,6 +155,7 @@ from cayu.runtime._binding_cleanup import (
     binding_finalize_failure_payload,
     binding_finalize_fatal_signal,
     binding_finalize_safe_payload,
+    binding_finalize_workspace_output_committed,
 )
 from cayu.runtime._diagnostics import (
     ExceptionDiagnostic,
@@ -8687,7 +8688,11 @@ def _binding_finalize_error_payload(
     failures = binding_finalize_failure_payload(error, redactor=redactor)
     if failures is None:
         failures = [{"phase": "workspace_finalize", **details}]
-    return {**details, "outcome": outcome, "failures": failures}
+    payload: dict[str, Any] = {**details, "outcome": outcome, "failures": failures}
+    if binding_finalize_workspace_output_committed(error):
+        # The binding's output phase finished; only a later phase failed.
+        payload["workspace_output_committed"] = True
+    return payload
 
 
 def _binding_finalize_publication_failure_payload(

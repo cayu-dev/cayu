@@ -111,10 +111,17 @@ chunk by chunk instead; see [Streamed responses](#streamed-responses)). The
 broker rejects any returned response above its configured limit:
 `TransparentEgressBroker(upstream_max_response_bytes=...)` defaults to 256 MiB
 and accepts up to the 2 GiB hard ceiling, and
-`upstream_total_timeout_s` (default 600 seconds, at most one hour) bounds each
+`upstream_total_timeout_s` (default and maximum one hour) bounds each
 upstream request including its body. The default HTTPX upstream takes both
 values from the broker; a supplied `HttpxUpstream` keeps its own ceilings, and
-the smaller limit applies.
+the smaller limit applies. A broker runs at most `max_active_upstream_operations`
+upstream requests at once (default 64, at most 512); one more is refused with
+503 `upstream_capacity_exhausted` rather than queued. `VirtualEgressEnvironmentFactory`
+and `SandboxCodingEnvironmentFactory` accept all three and pass them to every
+session broker they create. The Docker adapter's proxy serves at most
+`DockerEgressAdapter(proxy_max_connections=...)` guest connections at once
+(default 64, at most 512) and refuses one more; each open connection holds a
+proxy worker thread.
 
 Buffered responses also draw on an `EgressResponseBufferBudget` (default 1 GiB,
 at most 64 GiB), which bounds the bytes held at once. A broker built directly
@@ -1283,8 +1290,9 @@ a fresh guest process must prove the common non-root, metadata, and
 protected-file boundary. Virtual-egress preflight then proves the proxy/TLS
 route, direct public TLS denial, MMDS GET, and token acquisition before any
 configured setup command runs. The preflight retains its configured timeout,
-and each setup command retains its 300-second execution limit; the adapter adds
-all of those allowances to the bounded handoff deadline.
+and each setup command retains the factory's `setup_command_timeout_s` (300
+seconds by default); the adapter adds all of those allowances to the bounded
+handoff deadline.
 
 Trusted control planes that need an additional root-owned verification input
 may pass `protected_bootstrap=async_callback` to `E2BEgressAdapter`. The callback

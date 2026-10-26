@@ -74,7 +74,9 @@ SHARED_ARTIFACT_REFERENCE_PREFIX = "cayu-shared-artifact-v1."
 PUBLISH_WORKSPACE_ARTIFACT_TOOL_NAME = "publish_workspace_artifact"
 MATERIALIZE_SHARED_ARTIFACT_TOOL_NAME = "materialize_shared_artifact"
 DEFAULT_SHARED_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
-MAX_SHARED_ARTIFACT_BYTES = 64 * 1024 * 1024
+# The largest SharedArtifactPolicy.max_bytes. Content is held in memory while it
+# is published or materialized, so raise the policy only as far as hosts allow.
+MAX_SHARED_ARTIFACT_BYTES = 1024 * 1024 * 1024
 DEFAULT_SHARED_ARTIFACT_MAX_PUBLICATIONS = 64
 MAX_SHARED_ARTIFACT_PUBLICATIONS = 1024
 DEFAULT_SHARED_ARTIFACT_GRANT_TTL_SECONDS = 24 * 60 * 60

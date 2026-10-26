@@ -138,9 +138,9 @@ from cayu.vaults import (
     validate_secret_resolver,
 )
 
-# Remote tool calls can be slow, so the HTTP default is generous (the stdio default
-# is 30s). Both are overridable per-server via McpServerSpec.metadata["timeout"].
-DEFAULT_HTTP_MCP_TIMEOUT_S = 120.0
+# Remote tool calls can be slow; HTTP and stdio both default to 300s. Both are
+# overridable per-server via McpServerSpec.metadata["timeout"].
+DEFAULT_HTTP_MCP_TIMEOUT_S = 300.0
 DEFAULT_HTTP_MCP_CONNECT_TIMEOUT_S = 10.0
 _JSON_CONTENT_TYPE = "application/json"
 _SSE_CONTENT_TYPE = "text/event-stream"

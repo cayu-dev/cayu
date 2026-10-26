@@ -881,6 +881,7 @@ class DockerReconnect:
                 ca_mount=(str(claim.ca_path), request.guest_ca_path),
                 seccomp_profile=seccomp_profile,
                 setup_commands=request.setup_commands,
+                setup_command_timeout_s=request.setup_command_timeout_s,
                 docker_cli_env_allowlist=self.adapter._docker_cli_env_allowlist,
             )
             runner = cast("_OwnedDockerRunner", runner)

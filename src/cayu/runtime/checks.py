@@ -466,13 +466,14 @@ def check_manifest(
                         path=f"agents.{agent.name}.tools.{tool.name}.max_terminal_payload_bytes",
                         message=(
                             f"Tool '{tool.name}' declares no max_terminal_payload_bytes, so "
-                            "every deferred round that calls it takes all terminal publication "
-                            "capacity in the process and other sessions' tool rounds wait "
-                            "for it."
+                            "every call reserves the largest terminal result Cayu can store "
+                            "(1,984 KiB) from the terminal publication capacity shared by "
+                            "every session in the process."
                         ),
                         hint=(
                             "Declare ToolSpec(max_terminal_payload_bytes=...) as the largest "
-                            "result the tool returns, between 64 KiB and 1,984 KiB."
+                            "result the tool returns, at most 1,984 KiB. A bound below 64 KiB "
+                            "reserves 64 KiB."
                         ),
                         tags=("authoring", "deploy"),
                         parameters={"agent": agent.name, "tool": tool.name},

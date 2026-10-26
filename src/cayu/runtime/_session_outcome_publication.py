@@ -326,6 +326,11 @@ class SessionOutcomePublication:
                     raise RuntimeError(
                         "Workspace finalization failure lost its durable diagnostic."
                     )
+                # A binding reports when its output (copy-back) had committed
+                # before a later phase, such as closing its runner, failed.
+                workspace_output_committed = (
+                    finalize_error.get("workspace_output_committed") is True
+                )
                 if task_id is not None and invocation_context.work_attempt is None:
                     task = await self._session_finalization.fail_task(
                         task_id=task_id,
@@ -340,7 +345,7 @@ class SessionOutcomePublication:
                             session_id=state.session.id,
                             additional_fields={
                                 "phase": "workspace_finalize",
-                                "workspace_output_committed": False,
+                                "workspace_output_committed": workspace_output_committed,
                             },
                         ),
                     )
@@ -391,7 +396,7 @@ class SessionOutcomePublication:
                         "error": error_message,
                         "error_type": error_type,
                         "failure_phase": "workspace_finalize",
-                        "workspace_output_committed": False,
+                        "workspace_output_committed": workspace_output_committed,
                     }
                 )
                 failed_terminal = copy_event(prefinalized_completion.event).model_copy(

@@ -37,6 +37,7 @@ from cayu.tools._redaction import active_secret_redactor_snapshot, record_ambigu
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.tools._terminal_bounds import (
     DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+    MAX_TOOL_TERMINAL_PAYLOAD_BYTES,
     bounded_terminal_result,
     cut_text_to_json_bytes,
     json_string_body_bytes,
@@ -56,14 +57,20 @@ from cayu.tools.base import (
 )
 from cayu.tools.display import ToolDisplay
 from cayu.tools.process_diagnostics import (
+    DEFAULT_MAX_COMMAND_TIMEOUT_SECONDS,
     MAX_COMMAND_TIMEOUT_SECONDS,
     ProcessCommandCapabilities,
     ProcessCommandDiagnostic,
 )
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
-MAX_OUTPUT_LIMIT_BYTES = 200_000
+# The largest per-stream capture any exec_command may allow. A tool allows at
+# most its own max_terminal_payload_bytes per stream, since its result is fitted
+# to that bound anyway.
+MAX_OUTPUT_LIMIT_BYTES = MAX_TOOL_TERMINAL_PAYLOAD_BYTES
 DEFAULT_TIMEOUT_SECONDS = 60
+# ExecCommandTool(max_timeout_seconds=...) raises the default up to the maximum.
+DEFAULT_MAX_TIMEOUT_SECONDS = DEFAULT_MAX_COMMAND_TIMEOUT_SECONDS
 MAX_TIMEOUT_SECONDS = MAX_COMMAND_TIMEOUT_SECONDS
 
 
@@ -224,14 +231,14 @@ class ExecCommandTool(Tool):
                 "timeout_s": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_TIMEOUT_SECONDS,
+                    "maximum": DEFAULT_MAX_TIMEOUT_SECONDS,
                     "default": DEFAULT_TIMEOUT_SECONDS,
                 },
                 "stdin": {"type": "string"},
                 "max_output_bytes": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_OUTPUT_LIMIT_BYTES,
+                    "maximum": DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
                     "default": DEFAULT_OUTPUT_LIMIT_BYTES,
                 },
             },
@@ -246,7 +253,11 @@ class ExecCommandTool(Tool):
     def _execution_profile_material(self) -> dict[str, object]:
         """Return Cayu-owned behavior inputs; command policy is profiled separately."""
 
-        return {"default_timeout_seconds": self._default_timeout_seconds}
+        material: dict[str, object] = {"default_timeout_seconds": self._default_timeout_seconds}
+        # Added only when raised, so existing execution profiles keep their identity.
+        if self._max_timeout_seconds != DEFAULT_MAX_TIMEOUT_SECONDS:
+            material["max_timeout_seconds"] = self._max_timeout_seconds
+        return material
 
     def __init__(
         self,
@@ -255,20 +266,45 @@ class ExecCommandTool(Tool):
         policy: CommandPolicy | None = None,
         default_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
         max_terminal_payload_bytes: int | None = None,
+        max_timeout_seconds: int | None = None,
     ) -> None:
+        if policy is not None and not isinstance(policy, CommandPolicy):
+            raise TypeError("ExecCommandTool policy must implement CommandPolicy.")
+        capabilities = None if policy is None else policy.process_capabilities
+        if max_timeout_seconds is None:
+            # A policy that admits longer commands raises the tool's ceiling too.
+            max_timeout_seconds = max(
+                DEFAULT_MAX_TIMEOUT_SECONDS,
+                0 if capabilities is None else capabilities.max_timeout_s,
+            )
+        if (
+            isinstance(max_timeout_seconds, bool)
+            or not isinstance(max_timeout_seconds, int)
+            or not 1 <= max_timeout_seconds <= MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                f"max_timeout_seconds must be an integer between 1 and {MAX_TIMEOUT_SECONDS}"
+            )
         if (
             isinstance(default_timeout_seconds, bool)
             or not isinstance(default_timeout_seconds, int)
-            or not 1 <= default_timeout_seconds <= MAX_TIMEOUT_SECONDS
+            or not 1 <= default_timeout_seconds <= max_timeout_seconds
         ):
             raise ValueError(
-                f"default_timeout_seconds must be an integer between 1 and {MAX_TIMEOUT_SECONDS}"
+                f"default_timeout_seconds must be an integer between 1 and {max_timeout_seconds}"
             )
         base_spec = type(self).spec if spec is None else spec
+        bounded_spec = spec_with_terminal_payload_bound(
+            base_spec,
+            max_terminal_payload_bytes,
+            default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
+        )
+        output_maximum = bounded_spec.max_terminal_payload_bytes
+        assert output_maximum is not None
         schema = base_spec.input_schema
         schema["properties"]["timeout_s"]["default"] = default_timeout_seconds
-        if policy is not None and not isinstance(policy, CommandPolicy):
-            raise TypeError("ExecCommandTool policy must implement CommandPolicy.")
+        schema["properties"]["timeout_s"]["maximum"] = max_timeout_seconds
+        schema["properties"]["max_output_bytes"]["maximum"] = output_maximum
         names = None if policy is None else policy.allowed_environment_names
         if names is not None:
             safe_names = tuple(name for name in names if _safe_env_name(name))[:64]
@@ -286,21 +322,16 @@ class ExecCommandTool(Tool):
                     else ". The policy still validates values and execution authority."
                 )
             )
-        capabilities = None if policy is None else policy.process_capabilities
         if capabilities is not None:
             schema["description"] = (
                 "Effective process policy capabilities (unpublished names and cwd paths are withheld): "
                 + capabilities.model_dump_json()
             )
-        super().__init__(
-            spec_with_terminal_payload_bound(
-                base_spec.model_copy(update={"input_schema": schema}),
-                max_terminal_payload_bytes,
-                default=DEFAULT_TEXT_TOOL_TERMINAL_PAYLOAD_BYTES,
-            )
-        )
+        super().__init__(bounded_spec.model_copy(update={"input_schema": schema}))
         self._policy = policy
         self._default_timeout_seconds = default_timeout_seconds
+        self._max_timeout_seconds = max_timeout_seconds
+        self._max_output_bytes = output_maximum
 
     @property
     def command_policy(self) -> CommandPolicy | None:
@@ -322,13 +353,13 @@ class ExecCommandTool(Tool):
                 args,
                 "max_output_bytes",
                 default=DEFAULT_OUTPUT_LIMIT_BYTES,
-                maximum=MAX_OUTPUT_LIMIT_BYTES,
+                maximum=self._max_output_bytes,
             )
             timeout_s = _optional_limited_int(
                 args,
                 "timeout_s",
                 default=self._default_timeout_seconds,
-                maximum=MAX_TIMEOUT_SECONDS,
+                maximum=self._max_timeout_seconds,
             )
             command = _command_from_args(args)
             cwd = _optional_string(args, "cwd")

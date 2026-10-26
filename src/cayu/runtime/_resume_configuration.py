@@ -247,9 +247,11 @@ async def inherit_resume_configuration(
                 f"limits.{field}: stored={stored_value}, requested={requested_value}"
             )
     retry = resolved.retry_policy or default_retry
-    for field, stored_value in context.retry_policy.model_dump().items():
+    # Walk the fields, not the dump, which omits an unset retry time budget.
+    for field in type(context.retry_policy).model_fields:
+        stored_value = getattr(context.retry_policy, field)
         requested_value = getattr(retry, field)
-        if requested_value != getattr(context.retry_policy, field):
+        if requested_value != stored_value:
             differences.append(
                 f"retry_policy.{field}: stored={stored_value}, requested={requested_value}"
             )

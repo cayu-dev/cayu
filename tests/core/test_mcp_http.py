@@ -2605,7 +2605,7 @@ def test_http_timeout_defaults_to_120s() -> None:
             await session.close()
 
     read_timeout, connect_timeout = asyncio.run(run())
-    assert read_timeout == DEFAULT_HTTP_MCP_TIMEOUT_S == 120.0
+    assert read_timeout == DEFAULT_HTTP_MCP_TIMEOUT_S == 300.0
     assert connect_timeout == DEFAULT_HTTP_MCP_CONNECT_TIMEOUT_S == 10.0
 
 

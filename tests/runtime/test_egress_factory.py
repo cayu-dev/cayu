@@ -129,6 +129,7 @@ from cayu.runtime._binding_cleanup import (
     append_binding_finalize_cancellation,
     binding_finalize_failure_payload,
     binding_finalize_fatal_signal,
+    binding_finalize_status,
     record_binding_finalize_failures,
 )
 from cayu.testing.base import verify_provider_credential_isolation
@@ -7730,6 +7731,75 @@ def test_finalize_preserves_single_failure_identity(failed_phase: str) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("inner_kind", "outcome", "committed"),
+    [
+        ("sync", "completed", True),
+        ("sync", "failed", False),
+        ("other", "completed", False),
+    ],
+)
+def test_teardown_failure_reports_committed_output_only_after_copy_back(
+    tmp_path: Path, inner_kind: str, outcome: str, committed: bool
+) -> None:
+    cleanup_error = RuntimeError("runner cleanup failed")
+
+    class _OtherInner(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            return BoundWorkspace(runner=runner)
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            return None
+
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    inner: WorkspaceBinding = (
+        SyncBinding(
+            target_workspace=LocalWorkspace(target_root, workspace_id="target"),
+            sync_back="on_success",
+        )
+        if inner_kind == "sync"
+        else _OtherInner()
+    )
+
+    async def workspace_factory(_runner):  # type: ignore[no-untyped-def]
+        return source
+
+    async def run() -> BaseException:
+        session_id = f"sess_committed_{inner_kind}_{outcome}"
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(),
+            workspace_factory=workspace_factory,
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id=session_id, agent_name="agent", environment_name="egress-env"
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(source, runner, session_id=session_id)
+
+        async def fail_cleanup(*, outcome: str | None) -> None:
+            raise cleanup_error
+
+        runner.finalize = fail_cleanup  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError) as exc_info:
+            await binding.finalize(bound, outcome=outcome)
+        return exc_info.value
+
+    failure = asyncio.run(run())
+
+    # Copy-back ran only for a SyncBinding whose policy syncs back this outcome.
+    status = binding_finalize_status(failure)
+    assert status is not None
+    assert status.workspace_output_committed is committed
+
+
 def test_finalize_preserves_external_workspace_cancellation_with_cleanup_failure() -> None:
     workspace_started = asyncio.Event()
     cleanup_error = RuntimeError("runner cleanup failed")
@@ -9473,6 +9543,47 @@ def test_factory_drains_request_audit_before_revoked_events() -> None:
     assert types.index(EventType.EGRESS_REQUEST_AUTHORIZED) < types.index(
         EventType.EGRESS_GRANT_REVOKED
     )
+
+
+def test_factory_passes_broker_limits_to_every_session_broker() -> None:
+    async def broker_for(factory: VirtualEgressEnvironmentFactory) -> TransparentEgressBroker:
+        adapter = factory._adapter
+        await factory.create(
+            EnvironmentFactoryRequest(
+                session_id="sess_broker_limits",
+                agent_name="assistant",
+                environment_name="egress-env",
+            )
+        )
+        return adapter.captured["broker"]
+
+    default = asyncio.run(broker_for(_virtual_factory(adapter=_RecordingAdapter())))
+    assert default._max_active_upstream_operations == 64
+    assert default._upstream_max_response_bytes == 256 * 1024 * 1024
+    assert default.upstream_total_timeout_s == 3600.0
+
+    configured = asyncio.run(
+        broker_for(
+            _virtual_factory(
+                adapter=_RecordingAdapter(),
+                max_active_upstream_operations=512,
+                upstream_max_response_bytes=512 * 1024 * 1024,
+                upstream_total_timeout_s=120,
+            )
+        )
+    )
+    assert configured._max_active_upstream_operations == 512
+    assert configured._upstream_max_response_bytes == 512 * 1024 * 1024
+    assert configured.upstream_total_timeout_s == 120.0
+    with pytest.raises(ValueError, match="between 1 and 512"):
+        _virtual_factory(adapter=_RecordingAdapter(), max_active_upstream_operations=513)
+    with pytest.raises(ValueError, match="at most"):
+        _virtual_factory(adapter=_RecordingAdapter(), upstream_total_timeout_s=3601)
+    with pytest.raises(ValueError, match="largest response"):
+        # A 2 GiB response cannot fit the default 1 GiB shared buffer budget.
+        _virtual_factory(
+            adapter=_RecordingAdapter(), upstream_max_response_bytes=2 * 1024 * 1024 * 1024
+        )
 
 
 def test_factory_shares_one_response_buffer_budget_across_sessions() -> None:

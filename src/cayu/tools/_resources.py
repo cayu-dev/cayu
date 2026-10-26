@@ -30,7 +30,7 @@ from cayu.workspaces import (
     WorkspaceMutationResult,
     WorkspaceReadResult,
 )
-from cayu.workspaces.base import WorkspaceContentManifest
+from cayu.workspaces.base import WorkspaceContentManifest, WorkspaceManifestLimits
 from cayu.workspaces.revisions import _runner_revision_manifest_capture
 
 
@@ -589,6 +589,13 @@ class InvocationWorkspaceHandle(Workspace):
 
     async def list(self, pattern: str = "**/*", *, limit: int | None = None):
         return await self.__workspace.list(pattern, limit=limit)
+
+    @property
+    def manifest_limits(self) -> WorkspaceManifestLimits | None:
+        """The delegate's declared command-manifest bounds, if any."""
+
+        limits = getattr(self.__workspace, "manifest_limits", None)
+        return limits if type(limits) is WorkspaceManifestLimits else None
 
     async def capture_content_manifest(self, **limits):
         # Identity-only evidence contains no file content to redact. The delegate

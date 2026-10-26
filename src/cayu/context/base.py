@@ -4960,6 +4960,8 @@ async def _run_compaction_model(
     )
     try:
         attempt = 1
+        # The rate-limit retry budget counts from the first attempt.
+        retry_window_started_at = asyncio.get_running_loop().time()
         terminal_dispatch_error: BaseException | None = None
         terminal_dispatch_cause: BaseException | None = None
         while True:
@@ -5047,6 +5049,9 @@ async def _run_compaction_model(
                             RetrySuppression.AUTOMATIC_RETRY_DISABLED
                             if exc.__dict__.get("_cayu_compaction_budget_settlement_failed") is True
                             else None
+                        ),
+                        elapsed_s=max(
+                            0.0, asyncio.get_running_loop().time() - retry_window_started_at
                         ),
                     )
                 # Only a provider rejection without a completion is classified;

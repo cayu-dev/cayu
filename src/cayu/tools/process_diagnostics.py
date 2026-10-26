@@ -5,9 +5,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# One hour covers real test suites and builds; CommandPolicy(max_timeout_s=...)
-# narrows what a model may request. Re-exported as tools.commands.MAX_TIMEOUT_SECONDS.
-MAX_COMMAND_TIMEOUT_SECONDS = 3_600
+# The longest command timeout Cayu accepts anywhere. Long builds, test suites
+# and data jobs can take hours; the execution backend's own lifetime still
+# applies. Re-exported as tools.commands.MAX_TIMEOUT_SECONDS.
+MAX_COMMAND_TIMEOUT_SECONDS = 12 * 3_600
+# What a model may request unless the application raises it, through
+# ProcessCommandPolicy(max_timeout_s=...) or ExecCommandTool(max_timeout_seconds=...).
+DEFAULT_MAX_COMMAND_TIMEOUT_SECONDS = 3_600
 
 
 class ProcessCommandDenialCode(StrEnum):

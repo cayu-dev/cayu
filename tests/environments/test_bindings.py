@@ -3273,7 +3273,7 @@ def test_sync_binding_enforces_total_bytes_and_accepts_exact_boundary(tmp_path) 
     assert (exact_target_root / "b.txt").read_bytes() == b"def"
     assert (exact_target_root / "empty.txt").read_bytes() == b""
     assert bound.metadata["sync_binding"]["max_total_bytes"] == 6
-    assert bound.metadata["sync_binding"]["max_archive_bytes"] == 128 * 1024 * 1024
+    assert bound.metadata["sync_binding"]["max_archive_bytes"] == 8 * 1024 * 1024 * 1024
     assert bound.metadata["sync_binding"]["copied_bytes"] == 6
 
 
@@ -3802,8 +3802,9 @@ def test_sync_binding_bulk_transfers_runner_workspace_files(tmp_path) -> None:
     # Bind costs one exec to list the target for cleaning plus one bulk tar
     # write, independent of how many files are copied in.
     assert bind_execs == 2
-    # Two manual writes plus finalize's list + bulk tar read.
-    assert runner.exec_calls == 6
+    # Two manual writes plus finalize's list, size measurement for the
+    # staging reservation, and bulk tar read.
+    assert runner.exec_calls == 7
     assert (target_root / "nested" / "c.txt").read_text(encoding="utf-8") == "charlie"
     assert (source_root / "a.txt").read_text(encoding="utf-8") == "changed"
     assert (source_root / "new.txt").read_text(encoding="utf-8") == "created"
@@ -4515,6 +4516,179 @@ def test_sync_binding_aggregate_capacity_remains_authoritative_without_copy_limi
     assert snapshot.peak_staged_bytes == 1
 
 
+def test_sync_binding_reserves_staging_from_measured_tree_not_declared_limits(
+    tmp_path,
+) -> None:
+    # A small measured tree must fit even when its declared limits exceed
+    # the staging capacity.
+    source_root = tmp_path / "source-measured"
+    target_root = tmp_path / "target-measured"
+    source_root.mkdir()
+    target_root.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (source_root / name).write_bytes(b"x" * 100)
+    mib = 1024 * 1024
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=8 * mib)
+    target = RunnerWorkspace(
+        LocalRunner(target_root, inherit_env=False),
+        workspace_id="target-measured",
+        python_executable=sys.executable,
+    )
+    binding = SyncBinding(
+        target_workspace=target,
+        max_file_bytes=4 * mib,
+        max_total_bytes=4 * 1024 * mib,
+        max_archive_bytes=8 * 1024 * mib,
+        source_conflict_policy="require_revision",
+        staging_capacity=capacity,
+    )
+    source = LocalWorkspace(source_root, workspace_id="source-measured")
+
+    async def run() -> int:
+        bound = await binding.bind(source, None, session_id="sess-measured")
+        copy_in_peak = capacity.snapshot().peak_staged_bytes
+        await target.write_bytes("a.txt", b"changed")
+        await binding.finalize(bound, outcome="completed")
+        return copy_in_peak
+
+    copy_in_peak = asyncio.run(run())
+
+    assert (target_root / "b.txt").read_bytes() == b"x" * 100
+    assert (source_root / "a.txt").read_bytes() == b"changed"
+    # Copy-in reserved the measured tree, not 3 x 4 MiB; its peak is the
+    # revision capture's one-file read allowance.
+    assert copy_in_peak <= 4 * mib + 64 * 1024
+    snapshot = capacity.snapshot()
+    # Copy-back keeps the declared per-file allowance for the source revision
+    # checks beside the measured archive.
+    assert 4 * mib < snapshot.peak_staged_bytes < 4 * mib + 64 * 1024
+    assert snapshot.staged_bytes == 0
+
+
+def test_sync_binding_copies_back_a_tree_of_only_empty_files(tmp_path) -> None:
+    # A measured total of zero bytes still gives the tar readers a positive limit.
+    source_root = tmp_path / "source-empty"
+    target_root = tmp_path / "target-empty"
+    source_root.mkdir()
+    target_root.mkdir()
+    target = RunnerWorkspace(
+        LocalRunner(target_root, inherit_env=False),
+        workspace_id="target-empty",
+        python_executable=sys.executable,
+    )
+    binding = SyncBinding(target_workspace=target)
+    source = LocalWorkspace(source_root, workspace_id="source-empty")
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess-empty-files")
+        (target_root / "__init__.py").touch()
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+    assert (source_root / "__init__.py").read_bytes() == b""
+
+
+def test_completion_marker_budget_fits_inside_the_saved_marker_limit() -> None:
+    from cayu.sessions._completion_finalization import (
+        _MAX_COMPLETION_FINALIZATION_CHECKPOINT_BYTES,
+    )
+
+    assert (
+        bindings_module._COMPLETION_MARKER_STATE_MAX_BYTES
+        < _MAX_COMPLETION_FINALIZATION_CHECKPOINT_BYTES
+    )
+
+
+def test_completion_marker_capacity_admits_the_old_default_and_refuses_large_trees() -> None:
+    def tree(count: int) -> tuple[tuple[str, ...], tuple[str, ...], tuple[Any, ...]]:
+        paths = tuple(f"src/package/module_{index:06d}.py" for index in range(count))
+        revisions = tuple(
+            bindings_module._SyncSourceRevision(path, "sha256:" + "0" * 64, "100644")
+            for path in paths
+        )
+        return paths, paths, revisions
+
+    bindings_module._require_completion_marker_capacity(*tree(10_000))
+    with pytest.raises(RuntimeError, match="cannot finalize this tree"):
+        bindings_module._require_completion_marker_capacity(*tree(30_000))
+
+
+@pytest.mark.parametrize("sync_back", ["on_success", "never"])
+def test_sync_binding_refuses_at_bind_a_tree_its_completion_record_cannot_hold(
+    tmp_path, monkeypatch, sync_back
+) -> None:
+    source_root = tmp_path / "source-marker"
+    target_root = tmp_path / "target-marker"
+    source_root.mkdir()
+    target_root.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (source_root / name).write_text(name)
+    monkeypatch.setattr(bindings_module, "_COMPLETION_MARKER_STATE_MAX_NODES", 2)
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(target_root, workspace_id="target-marker"),
+        sync_back=sync_back,
+    )
+    source = LocalWorkspace(source_root, workspace_id="source-marker")
+
+    async def run() -> BoundWorkspace:
+        return await binding.bind(source, None, session_id=f"sess-marker-{sync_back}")
+
+    if sync_back == "never":
+        # Nothing is saved at completion without copy-back, so the tree binds.
+        bound = asyncio.run(run())
+        binding.abandon(bound)
+        return
+    with pytest.raises(RuntimeError, match="cannot finalize this tree"):
+        asyncio.run(run())
+    # The refused bind released its resources, so the pair binds again.
+    monkeypatch.setattr(bindings_module, "_COMPLETION_MARKER_STATE_MAX_NODES", 200_000)
+    binding.abandon(asyncio.run(run()))
+
+
+class _UnmeasuredLocalWorkspace(LocalWorkspace):
+    _observe_transfer_sizes = None
+
+
+def test_sync_binding_caps_unmeasured_transfer_at_staging_capacity(tmp_path) -> None:
+    source_root = tmp_path / "source-unmeasured"
+    target_root = tmp_path / "target-unmeasured"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "small.txt").write_bytes(b"small")
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=256 * 1024)
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(target_root, workspace_id="target-unmeasured"),
+        staging_capacity=capacity,
+    )
+    source = _UnmeasuredLocalWorkspace(source_root, workspace_id="source-unmeasured")
+
+    # The default 4 GiB ceiling exceeds the domain; an unmeasured tree that
+    # fits copies within what the domain holds instead of failing.
+    asyncio.run(binding.bind(source, None, session_id="sess-unmeasured-small"))
+    assert (target_root / "small.txt").read_bytes() == b"small"
+    assert capacity.snapshot().peak_staged_bytes <= 256 * 1024
+
+    large_root = tmp_path / "source-unmeasured-large"
+    large_root.mkdir()
+    (large_root / "large.bin").write_bytes(b"y" * (200 * 1024))
+    large_target_root = tmp_path / "target-unmeasured-large"
+    large_target_root.mkdir()
+    with pytest.raises(RuntimeError, match="exceed") as raised:
+        asyncio.run(
+            SyncBinding(
+                target_workspace=LocalWorkspace(large_target_root, workspace_id="target-large"),
+                staging_capacity=capacity,
+            ).bind(
+                _UnmeasuredLocalWorkspace(large_root, workspace_id="source-large"),
+                None,
+                session_id="sess-unmeasured-large",
+            )
+        )
+    assert any("could not measure" in note for note in raised.value.__notes__)
+    assert capacity.snapshot().staged_bytes == 0
+
+
 def test_sync_binding_aggregate_capacity_limits_peak_not_total_transfer_bytes(
     tmp_path,
 ) -> None:
@@ -5169,9 +5343,10 @@ def test_binding_constructors_validate_values() -> None:
     invalid_delete_missing: Any = "yes"
     invalid_staging_capacity: Any = object()
 
-    assert SyncBinding().max_total_bytes == 64 * 1024 * 1024
+    assert SyncBinding().max_files == 100_000
+    assert SyncBinding().max_total_bytes == 4 * 1024 * 1024 * 1024
     assert SyncBinding(max_total_bytes=None).max_total_bytes is None
-    assert SyncBinding().max_archive_bytes == 128 * 1024 * 1024
+    assert SyncBinding().max_archive_bytes == 8 * 1024 * 1024 * 1024
     assert SyncBinding(max_archive_bytes=None).max_archive_bytes is None
     assert SyncBinding().staging_capacity is SyncBinding().staging_capacity
 

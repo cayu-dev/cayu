@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, BinaryIO, TypeVar
+from typing import Any, BinaryIO, Literal, TypeVar
 from urllib.parse import quote
 
 from cayu._validation import canonical_durable_json_bytes
@@ -83,6 +83,7 @@ __all__ = [
     "BROKERED_SANDBOX_CANDIDATE",
     "BrokeredSandboxRunner",
     "BrokeredSandboxWorkspace",
+    "StagedCopiesMode",
     "sandbox_capability_claims",
 ]
 
@@ -96,6 +97,12 @@ _START_RECOVERY_SECONDS = 120.0
 _POLL_RECOVERY_GRACE_SECONDS = 120.0
 _CANCEL_SETTLE_SECONDS = 30.0
 _DEFAULT_TIMEOUT_SECONDS = 300
+# A command without a timeout runs until this long before the sandbox's end of
+# life by the Agent's clock. The broker checks the timeout against its own,
+# later and possibly skewed, clock and refuses one past the remaining lifetime.
+_LIFETIME_CLOCK_MARGIN_SECONDS = 60
+# How the broker refuses a timeout past the sandbox's remaining lifetime.
+_REMAINING_LIFETIME_REFUSAL = re.compile(r"remaining lifetime \((\d+) seconds\)")
 _ADMISSION_PROBE_TIMEOUT_SECONDS = 10
 _SHA256_IDENTITY = re.compile(r"sha256:[0-9a-f]{64}\Z")
 # Leave room in each archive for tar headers, long-name records and padding.
@@ -106,6 +113,8 @@ _ARCHIVE_QUERY_BUDGET = 6 * 1024
 MAX_TRANSFER_FILE_BYTES = MAX_ARCHIVE_BYTES - 64 * 1024
 #: What a staged copy of one file may take beyond the file: its tar headers and padding.
 STAGED_FILE_OVERHEAD_BYTES = 64 * 1024
+#: When a brokered workspace uses the sandbox's staged copies.
+StagedCopiesMode = Literal["auto", "never", "always"]
 
 
 def sandbox_capability_claims(
@@ -220,8 +229,10 @@ class BrokeredSandboxRunner(Runner):
 
     Each command starts under a fresh ``command_id`` and is polled until it
     finishes, so its length is bounded only by its timeout and the sandbox's
-    lifetime (a command without a timeout may run until the sandbox's maximum
-    lifetime). A dropped connection is recovered by replaying the same id,
+    lifetime (a command without a timeout may run until a minute before the
+    sandbox's maximum lifetime, by the Agent's clock; a broker that names a
+    shorter remaining lifetime when it refuses the timeout is asked once more
+    with that number). A dropped connection is recovered by replaying the same id,
     which the broker never runs twice. A command cancelled by its caller is
     cancelled in the sandbox; only if the broker can't confirm it stopped is
     the runner's exec path closed for good. Bounds that can't be met (stdin
@@ -568,6 +579,7 @@ class BrokeredSandboxRunner(Runner):
         busy_deadline = loop.time() + _BUSY_RETRY_SECONDS
         recovery_deadline = loop.time() + _START_RECOVERY_SECONDS
         delay = 0.25
+        lifetime_retried = False
         while True:
             # Every dispatch, retries included, must pass the exec fence: another
             # command may have poisoned the runner while this one waited.
@@ -596,7 +608,16 @@ class BrokeredSandboxRunner(Runner):
                     if dispatch.outcome_unknown:
                         await self._settle_cancelled(command_id, dispatch)
                     raise
-            except SandboxBrokerRefusedError:
+            except SandboxBrokerRefusedError as error:
+                # The broker checks a timeout against the remaining lifetime by
+                # its own clock, and only for a command id it has not stored,
+                # so this refusal started nothing. Ask once more, for the
+                # lifetime it named.
+                remaining = None if lifetime_retried else _refused_remaining_lifetime(error)
+                if remaining is not None and remaining < options["timeout_seconds"]:
+                    lifetime_retried = True
+                    options = {**options, "timeout_seconds": remaining}
+                    continue
                 # A refused replay says nothing about an earlier attempt that
                 # may have started the command, so stop that one first.
                 if dispatch.outcome_unknown:
@@ -671,7 +692,9 @@ class BrokeredSandboxRunner(Runner):
     def _timeout_seconds(self, timeout: int | None) -> int:
         remaining = self._remaining_lifetime_seconds()
         if timeout is None:
-            return _DEFAULT_TIMEOUT_SECONDS if remaining is None else max(1, remaining)
+            if remaining is None:
+                return _DEFAULT_TIMEOUT_SECONDS
+            return max(1, remaining - _LIFETIME_CLOCK_MARGIN_SECONDS)
         if remaining is not None and timeout > remaining:
             raise ValueError(
                 f"Command timeout of {timeout} seconds exceeds the sandbox's remaining "
@@ -929,17 +952,41 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
     uploads the tree in archives of at most ``MAX_ARCHIVE_BYTES`` each, after
     checking every member against the workspace's exclusions; copy-back reads
     the named files in batches with the selective archive read, splitting a
-    batch the broker reports as too large. Where the sandbox offers staged
-    copies, a tree larger than one archive goes in as one staged copy, and a
-    file too large for one archive comes back as one; otherwise one file must
-    fit in one archive.
+    batch the broker reports as too large.
+
+    ``staged_copies`` chooses when staged copies are used. With ``"auto"`` (the
+    default), where the sandbox offers them, a tree larger than one archive
+    goes in as one staged copy, and a file too large for one archive comes back
+    as one; a staged copy-in that fails while the runner stays usable is sent
+    again as split archives. With ``"never"`` only archives are used, so one
+    file must fit in one archive. ``"always"`` sends every copy-in, whatever
+    its size, as one staged copy and refuses a sandbox that offers none.
     """
 
-    def __init__(self, runner: BrokeredSandboxRunner, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        runner: BrokeredSandboxRunner,
+        *,
+        staged_copies: StagedCopiesMode = "auto",
+        **kwargs: Any,
+    ) -> None:
         if not isinstance(runner, BrokeredSandboxRunner):
             raise TypeError("BrokeredSandboxWorkspace requires a BrokeredSandboxRunner.")
+        self.staged_copies = validate_staged_copies_mode(staged_copies)
         super().__init__(runner, **kwargs)
         self._brokered_runner = runner
+
+    def _offered_staged_copies(self) -> SandboxStagedCopies | None:
+        """The sandbox's staged copies this workspace may use, or None."""
+
+        if self.staged_copies == "never":
+            return None
+        staged = self._brokered_runner.staged_copies
+        if staged is None and self.staged_copies == "always":
+            raise RuntimeError(
+                "staged_copies='always', but this sandbox broker offers no staged copies."
+            )
+        return staged
 
     def tar_stream_writer(self):
         return self
@@ -954,7 +1001,10 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
             raise TypeError("BrokeredSandboxWorkspace tar source must be a binary stream.")
         if type(archive_bytes) is not int or archive_bytes < 0:
             raise ValueError("BrokeredSandboxWorkspace archive_bytes must be a non-negative int.")
-        staged = self._brokered_runner.staged_copies
+        staged = self._offered_staged_copies()
+        if staged is not None and self.staged_copies == "always":
+            await self._write_staged(source, archive_bytes, staged)
+            return
         # Include the splitter's conservative per-member allowance when selecting
         # staging. Preserve split uploads when the tree exceeds the staged cap.
         if (
@@ -964,6 +1014,9 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
         ):
             await self._write_staged(source, archive_bytes, staged)
             return
+        await self._write_split(source, archive_bytes)
+
+    async def _write_split(self, source: BinaryIO, archive_bytes: int) -> None:
         chunks = await asyncio.to_thread(self._split_archive, source, archive_bytes)
         for chunk in chunks:
             await self._brokered_runner.put_archive(chunk, path=self.cwd)
@@ -1021,7 +1074,7 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
             # they arrive, and tar framing makes the reported size no measure
             # of file content.
             if len(batch) == 1:
-                staged = self._brokered_runner.staged_copies
+                staged = self._offered_staged_copies()
                 if staged is None:
                     raise RuntimeError(
                         f"Workspace file is larger than one broker archive: {batch[0]}"
@@ -1116,6 +1169,12 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
         second, so no host copy is made beside it. Only a source that can't
         seek is spooled to a host temporary file first; that spool is outside
         any ``staging_capacity``.
+
+        With ``staged_copies="auto"``, a staged copy that fails while the runner
+        stays usable is sent again as split archives. A failed copy can leave
+        part of the same tree extracted; the archives write every member again
+        over it. A copy whose stop the broker can't confirm closes the runner,
+        so it is never raced.
         """
 
         if archive_bytes > staged.max_bytes:
@@ -1129,16 +1188,44 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
             # The broker checks the upload against this digest, so a source that
             # changed between the passes is refused rather than extracted.
             source.seek(origin)
-            await self._brokered_runner.copy_in(
-                source, size=archive_bytes, sha256=digest, path=self.cwd
-            )
+            await self._copy_in_or_split(source, origin, archive_bytes, digest)
             return
         with tempfile.TemporaryFile() as spool:
             digest = await asyncio.to_thread(self._spool_checked, source, archive_bytes, spool)
             spool.seek(0)
+            await self._copy_in_or_split(spool, 0, archive_bytes, digest)
+
+    async def _copy_in_or_split(
+        self, source: BinaryIO, origin: int, archive_bytes: int, digest: str
+    ) -> None:
+        try:
             await self._brokered_runner.copy_in(
-                spool, size=archive_bytes, sha256=digest, path=self.cwd
+                source, size=archive_bytes, sha256=digest, path=self.cwd
             )
+            return
+        except SandboxLeaseLostError:
+            raise
+        except SandboxBrokerError as error:
+            if self.staged_copies != "auto" or not _exec_usable(self._brokered_runner):
+                raise
+            _LOGGER.warning(
+                "Staged copy-in to brokered sandbox %s failed (%s); sending the workspace "
+                "as split archives instead.",
+                self._brokered_runner.sandbox_id,
+                error.code or type(error).__name__,
+            )
+            failure = error
+        source.seek(origin)
+        try:
+            await self._write_split(source, archive_bytes)
+        except Exception as split_error:
+            # A file too large for one archive can only move staged; report why
+            # staging failed too.
+            split_error.add_note(
+                f"The workspace was sent as split archives after its staged copy failed "
+                f"({failure.code or type(failure).__name__})."
+            )
+            raise
 
     def _spool_checked(self, source: BinaryIO, archive_bytes: int, spool: BinaryIO | None) -> str:
         """Read the archive, checking its members as the split path does, and return its
@@ -1312,6 +1399,36 @@ class _CountingWriter(io.RawIOBase):
         self._destination.write(bytes(data))
         self.written += size
         return size
+
+
+def validate_staged_copies_mode(value: object) -> StagedCopiesMode:
+    if value == "auto" and type(value) is str:
+        return "auto"
+    if value == "never" and type(value) is str:
+        return "never"
+    if value == "always" and type(value) is str:
+        return "always"
+    raise ValueError("staged_copies must be 'auto', 'never' or 'always'.")
+
+
+def _exec_usable(runner: BrokeredSandboxRunner) -> bool:
+    try:
+        runner._ensure_exec_open()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _refused_remaining_lifetime(error: SandboxBrokerRefusedError) -> int | None:
+    """The remaining lifetime a broker named when it refused a command's timeout."""
+
+    if error.status != 422 or error.code != "sandbox_invalid":
+        return None
+    match = _REMAINING_LIFETIME_REFUSAL.search(str(error))
+    if match is None:
+        return None
+    remaining = int(match.group(1))
+    return remaining if remaining >= 1 else None
 
 
 @dataclass

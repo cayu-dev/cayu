@@ -33,6 +33,7 @@ from cayu.environments.bindings import (
     NoWorkspaceBinding,
     SyncBinding,
     SyncBindingSourceConflictError,
+    SyncBindingStagingCapacity,
 )
 from cayu.environments.docker_coding import (
     DockerCodingEnvironmentFactory,
@@ -70,6 +71,7 @@ from cayu.runners.docker import (
 )
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 from cayu.runners.local import LocalRunner
+from cayu.runtime._binding_cleanup import binding_finalize_status
 from cayu.sessions.requests import RunRequest
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tools.base import ToolExecutableRequirement, ToolExecutionRequirement
@@ -1371,7 +1373,7 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
         expected_cleanup = command_cleanup or "sandbox"
         assert runner.timeout_cleanup == expected_cleanup
         assert runner.cancellation_cleanup == expected_cleanup
-        assert runner.cancel_timeout_s == (cancel_timeout_s or 5.0)
+        assert runner.cancel_timeout_s == (cancel_timeout_s or 30.0)
         cancellation = next(
             claim for claim in evidence["claims"] if claim["capability"] == "confirmed_cancellation"
         )
@@ -1449,7 +1451,7 @@ def test_docker_coding_cancel_timeout_is_an_operational_option(tmp_path: Path) -
     default = factory()
     patient = factory(cancel_timeout_s=60)
 
-    assert default.cancel_timeout_s == 5.0
+    assert default.cancel_timeout_s == 30.0
     assert patient.cancel_timeout_s == 60.0
     # Raising the deadline after a slow cleanup must not strand the session
     # whose disposal retry is waiting under the earlier identity.
@@ -1458,6 +1460,43 @@ def test_docker_coding_cancel_timeout_is_an_operational_option(tmp_path: Path) -
         factory(cancel_timeout_s=0)
     with pytest.raises(TypeError, match="must be numeric"):
         factory(cancel_timeout_s="30")
+
+
+def test_docker_coding_staging_capacity_and_manifest_limits_follow_the_factory(
+    tmp_path: Path,
+) -> None:
+    def factory(**kwargs: Any) -> DockerCodingEnvironmentFactory:
+        return DockerCodingEnvironmentFactory(
+            source_workspace=LocalWorkspace(tmp_path),
+            toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
+            **kwargs,
+        )
+
+    capacity = SyncBindingStagingCapacity(max_concurrency=2, max_staged_bytes=1024 * 1024)
+    limits = DockerWorkspaceTransferLimits(max_files=50, max_total_bytes=4096)
+    default = factory()
+    configured = factory(staging_capacity=capacity, transfer_limits=limits)
+    target = configured._target_workspace(LocalRunner(tmp_path), "docker:target")
+    binding = DockerCodingWorkspaceBinding(
+        target_workspace=target,
+        limits=limits,
+        staging_capacity=capacity,
+    )
+
+    assert default.transfer_limits == DockerWorkspaceTransferLimits()
+    assert default.transfer_limits.max_files == 100_000
+    assert default.transfer_limits.max_total_bytes == 4 * 1024 * 1024 * 1024
+    assert configured.staging_capacity is capacity
+    assert binding.staging_capacity is capacity
+    # run_command observes the workspace within the factory's transfer limits.
+    assert target.manifest_limits == limits.manifest_limits()
+    # The staging domain is process-local and stays out of the identity.
+    assert (
+        factory(transfer_limits=limits).execution_profile_identity
+        == configured.execution_profile_identity
+    )
+    with pytest.raises(TypeError, match="staging_capacity"):
+        factory(staging_capacity=object())
 
 
 def test_docker_coding_container_removal_keeps_the_released_fingerprint() -> None:
@@ -1470,7 +1509,14 @@ def test_docker_coding_container_removal_keeps_the_released_fingerprint() -> Non
         "restrictions": DockerWorkloadRestrictions(),
         "artifact_store_fingerprint": None,
         "required_executables": ("git", "python3", "sh"),
-        "transfer_limits": DockerWorkspaceTransferLimits(),
+        # The 0.13.0 defaults. Transfer limits are part of the fingerprint, so
+        # a session preserved under them resumes only with the same limits.
+        "transfer_limits": DockerWorkspaceTransferLimits(
+            max_files=10_000,
+            max_file_bytes=8 * 1024 * 1024,
+            max_total_bytes=64 * 1024 * 1024,
+            max_archive_bytes=128 * 1024 * 1024,
+        ),
         "runtime": None,
         "seccomp_sha256": None,
         "toolchain_profile_fingerprint": "sha256:" + "b" * 64,
@@ -2979,8 +3025,19 @@ def test_docker_coding_close_failure_retains_exact_generation_for_retry(
         assert binding._completion_requires_successful_finalization(bound) is True
         assert bound.workspace is not None
         await bound.workspace.write_bytes("code.py", b"value = 2\n")
-        with pytest.raises(asyncio.CancelledError if fault == "cancel" else OSError):
+        with pytest.raises(asyncio.CancelledError if fault == "cancel" else OSError) as raised:
             await binding.finalize(bound, outcome="completed")
+        if fault == "error" and sync_back == "always":
+            # Copy-back finished before the close failed, so the binding reports
+            # a disposal failure with its output committed.
+            status = binding_finalize_status(raised.value)
+            assert status is not None
+            assert status.workspace_output_committed is True
+            assert [failure.phase for failure in status.failures] == ["managed_resource_cleanup"]
+        elif fault == "error":
+            # Nothing was copied back, so the binding claims no committed output.
+            status = binding_finalize_status(raised.value)
+            assert status is None or status.workspace_output_committed is False
         assert binding.abandon(bound) is False
         assert binding._completion_finalization_recovery_state(bound) is not None
         with pytest.raises(ValueError, match="exact DockerRunner"):

@@ -145,6 +145,7 @@ def _attach_detached_binding_statuses(
                 )
                 for failure in finalize_status.failures
             ),
+            workspace_output_committed=finalize_status.workspace_output_committed,
         )
     if (safe_payload := binding_finalize_safe_payload(source)) is not None:
         attach_binding_finalize_safe_payload(target, safe_payload)
