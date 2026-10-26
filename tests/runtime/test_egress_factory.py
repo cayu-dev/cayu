@@ -4950,7 +4950,8 @@ def test_unbound_release_reused_error_does_not_cycle_settlement_owner() -> None:
         )
         await adapter.owned_cleanup_started.wait()
         adapter.allow_owned_cleanup.set()
-        async with asyncio.timeout(0.3):
+        # A hang guard only; retries back off in real time on loaded CI workers.
+        async with asyncio.timeout(5):
             await settlement_task
         return adapter, settlement_task
 
@@ -5461,7 +5462,8 @@ def test_managed_factory_settlement_retries_child_only_cancellation() -> None:
         managed = result.environment.runner
         assert managed is not None
         settlement_task = managed.defer_finalization_settlement(outcome=None)
-        async with asyncio.timeout(0.3):
+        # A hang guard only; retries back off in real time on loaded CI workers.
+        async with asyncio.timeout(5):
             await settlement_task
         return adapter.attempts
 
