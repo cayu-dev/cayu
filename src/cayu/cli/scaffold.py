@@ -18,7 +18,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import TextIO, cast
 
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
@@ -54,8 +54,11 @@ from cayu.cli.scaffold_plan import (
     PRESETS,
     ApplicationPlan,
     ScaffoldPlanError,
+    capability_dependents,
     capability_spec,
     normalize_application_plan,
+    preset_spec,
+    removed_capability_files,
 )
 from cayu.workspaces.local import LocalWorkspace
 
@@ -1018,7 +1021,7 @@ yourself, use the Cayu feature that already does it:
 | Reminders, chasing, or expiry ("remind after 24 hours", "expire after a week") | A one-shot task with `available_at` and `TaskSchedulePolicy`, run by `run_task_worker`. Do not write a polling loop over timestamps. | `cayu guide long-running#timers` |
 | Remembering facts across conversations | The knowledge tools (remember, search) | `cayu guide references#knowledge` |
 | Running a fixed command or parsing files in isolation | `cayu new NAME --execution docker` on the agent preset: a hardened per-session sandbox your tools reach with `require_sandbox_runner(ctx)`. Don't switch to the coding preset for this. | `cayu guide references#environments` |
-| Another agent for a sub-task | Subagent tools | `cayu guide references#subagents` |
+__CODING_CONVERSION_ROW__| Another agent for a sub-task | Subagent tools | `cayu guide references#subagents` |
 | Spending or usage limits | Budgets and run limits | `cayu guide references#cost-control` |
 | A public or multi-user product | `cayu new NAME --preset service` | `cayu guide references#server` |
 
@@ -2646,7 +2649,10 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         action="append",
         default=[],
         metavar="CAPABILITY",
-        help="Disable an optional preset capability while retaining its ownership home.",
+        help=(
+            "Turn off a default preset capability and leave out the files only it uses; "
+            "--dry-run groups the files by the flag that removes them."
+        ),
     )
     parser.add_argument(
         "--interactive",
@@ -2758,17 +2764,26 @@ def project_files(
 ) -> dict[str, str]:
     """Render every project file, keeping only the selected capability branches."""
 
-    files = _rendered_project_files(
-        name,
-        agent_name=agent_name,
-        provider=provider,
-        coding_toolchain=coding_toolchain,
-        coding_command_authority=coding_command_authority,
-        preset=preset,
-        execution=execution,
-        with_capabilities=with_capabilities,
-        without_capabilities=without_capabilities,
-        application_plan=application_plan,
+    if application_plan is None:
+        application_plan = normalize_application_plan(
+            name=name,
+            agent_name=name if agent_name is None else agent_name,
+            preset=preset or "agent",
+            provider=provider or "neutral",
+            execution=execution or "none",
+            coding_toolchain=coding_toolchain,
+            coding_command_authority=coding_command_authority,
+            with_capabilities=with_capabilities,
+            without_capabilities=without_capabilities,
+        )
+    files = _without_removed_capability_files(
+        _rendered_project_files(
+            name,
+            coding_toolchain=coding_toolchain,
+            coding_command_authority=coding_command_authority,
+            application_plan=application_plan,
+        ),
+        application_plan,
     )
     simplified: dict[str, str] = {}
     for relative, content in files.items():
@@ -2780,6 +2795,34 @@ def project_files(
         except ConstantBranchError as exc:
             raise ConstantBranchError(f"{relative}: {exc}") from exc
     return simplified
+
+
+def _without_removed_capability_files(
+    files: dict[str, str], plan: ApplicationPlan
+) -> dict[str, str]:
+    """Leave out the owned files of default capabilities the plan turned off."""
+
+    removed = removed_capability_files(plan)
+    kept_paths = [path for path in files if path not in removed]
+    # A preset can put its own module in a capability's package, such as the
+    # coding preset's knowledge/coding.py; that package keeps its __init__.py.
+    packages = {path.rsplit("/", 1)[0] + "/" for path in kept_paths if "/" in path}
+    return {
+        path: content
+        for path, content in files.items()
+        if path not in removed
+        or (path.endswith("/__init__.py") and path.removesuffix("__init__.py") in packages)
+    }
+
+
+def project_file_paths(plan: ApplicationPlan) -> frozenset[str]:
+    """Return the paths ``project_files`` writes for a plan, skipping its branch simplification."""
+
+    return frozenset(
+        _without_removed_capability_files(
+            _rendered_project_files(plan.name, application_plan=plan), plan
+        )
+    )
 
 
 def _rendered_project_files(
@@ -2917,6 +2960,14 @@ def _rendered_project_files(
                 )
             ),
             # The coding primary's constrained policy refuses `generate tool --effect external`.
+            "__CODING_CONVERSION_ROW__": (
+                ""
+                if plan.preset == "coding"
+                else "| Editing files and running tests in a code repository | "
+                "`uv run --no-sync cayu generate preset coding --execution docker` converts "
+                "this project to the coding preset; review `--dry-run --table` first. It "
+                "never overwrites files you changed. | `cayu guide applications#planning` |\n"
+            ),
             "__EXTERNAL_APPROVAL_GENERATOR__": (
                 "A specialist generated with `cayu generate slice NAME --tool TOOL --effect "
                 "external`, which gets its own approval boundary; use snake_case names, such "
@@ -2995,8 +3046,10 @@ def _rendered_project_files(
     files["pyproject.toml"] += scaffold_contract(plan)
     if "tasks" not in plan.capabilities:
         for relative in ("tests/test_agent.py", "evals/agent.py"):
-            files[relative] = files[relative].replace(
-                "task_store=InMemoryTaskStore(),", "task_store=None,"
+            files[relative] = (
+                files[relative]
+                .replace("task_store=InMemoryTaskStore(),", "task_store=None,")
+                .replace("from cayu.tasks import InMemoryTaskStore\n", "")
             )
     files["README.md"] += application_guidance(plan)
     files["AGENTS.md"] += application_guidance(plan)
@@ -3037,6 +3090,193 @@ def _rendered_project_files(
         }
     )
     return files
+
+
+def _private_files(plan: ApplicationPlan) -> tuple[str, ...]:
+    return ("data/memory-evidence.key",) if "memory" in plan.capabilities else ()
+
+
+def _plan_without(plan: ApplicationPlan, names: tuple[str, ...]) -> ApplicationPlan | None:
+    """Return the same plan with ``names`` turned off, or None when the preset needs them."""
+
+    defaults = set(preset_spec(plan.preset).default_capabilities)
+    remaining = set(plan.capabilities) - set(names)
+    try:
+        reduced = normalize_application_plan(
+            name=plan.name,
+            agent_name=plan.agent_name,
+            preset=plan.preset,
+            provider=plan.provider,
+            execution=plan.execution,
+            with_capabilities=tuple(sorted(remaining - defaults)),
+            without_capabilities=tuple(sorted(defaults - remaining)),
+        )
+    except ScaffoldPlanError:
+        return None
+    return reduced if set(reduced.capabilities) == remaining else None
+
+
+def capability_file_groups(plan: ApplicationPlan) -> list[dict[str, object]]:
+    """Group a plan's files by the capability whose removal also removes them.
+
+    Each group is measured by rendering the plan without that capability, so it
+    shows exactly what the printed flag leaves out. Files no single choice
+    removes are ``core``; they may still contain wiring a choice turns off.
+    """
+
+    defaults = set(preset_spec(plan.preset).default_capabilities)
+    paths = project_file_paths(plan)
+    private = set(_private_files(plan))
+    removed_by: dict[str, tuple[set[str], set[str]]] = {}
+    required: list[str] = []
+    for spec in CAPABILITIES:
+        if spec.name not in plan.capabilities:
+            continue
+        reduced = _plan_without(plan, capability_dependents(plan, spec.name))
+        if reduced is None:
+            required.append(spec.name)
+            continue
+        removed_by[spec.name] = (
+            set(paths - project_file_paths(reduced)),
+            private - set(_private_files(reduced)),
+        )
+    owned: dict[str, tuple[set[str], set[str]]] = {}
+    for name, (files, private_files) in removed_by.items():
+        own_files, own_private = set(files), set(private_files)
+        for dependent in capability_dependents(plan, name):
+            if dependent != name and dependent in removed_by:
+                own_files -= removed_by[dependent][0]
+                own_private -= removed_by[dependent][1]
+        owned[name] = (own_files, own_private)
+    owners: dict[str, tuple[str, ...]] = {}
+    for path in sorted(paths | private):
+        owners[path] = tuple(
+            name for name, (files, private_files) in owned.items() if path in files | private_files
+        )
+    # Some files go only when every capability sharing them is turned off,
+    # such as operations/approvals.py for approvals and human-input.
+    joint: dict[str, tuple[str, ...]] = {}
+    everything_off = _plan_without(
+        plan, tuple(item for name in owned for item in capability_dependents(plan, name))
+    )
+    if everything_off is not None:
+        gone = (paths | private) - project_file_paths(everything_off)
+        gone -= set(_private_files(everything_off))
+        for path in sorted(gone):
+            sharing = tuple(
+                spec.name
+                for spec in CAPABILITIES
+                if path in spec.owned_files and spec.name in owned
+            )
+            if not owners[path] and len(sharing) > 1:
+                joint[path] = sharing
+
+    def flag(names: tuple[str, ...]) -> str:
+        ordered: list[str] = []
+        for name in names:
+            for item in (name, *capability_dependents(plan, name)):
+                if item not in ordered:
+                    ordered.append(item)
+        turned_off = [item for item in ordered if item in defaults]
+        added = [item for item in ordered if item not in defaults]
+        parts = []
+        if turned_off:
+            parts.append("--without " + ",".join(turned_off))
+        parts.extend(f"omit --with {item}" for item in added)
+        return " and ".join(parts)
+
+    def group(
+        name: str,
+        capabilities: tuple[str, ...],
+        remove_with: str | None,
+        selected_paths: list[str],
+    ) -> dict[str, object]:
+        return {
+            "name": name,
+            "capabilities": list(capabilities),
+            "remove_with": remove_with,
+            "required": name in required,
+            "files": [path for path in selected_paths if path not in private],
+            "private_files": [path for path in selected_paths if path in private],
+        }
+
+    groups = [
+        group(
+            "core",
+            (),
+            None,
+            [path for path, items in owners.items() if not items and path not in joint],
+        )
+    ]
+    for spec in CAPABILITIES:
+        if spec.name in required:
+            groups.append(group(spec.name, (spec.name,), None, []))
+        elif spec.name in owned:
+            groups.append(
+                group(
+                    spec.name,
+                    (spec.name,),
+                    flag((spec.name,)),
+                    [path for path, items in owners.items() if items == (spec.name,)],
+                )
+            )
+    together: dict[tuple[str, ...], list[str]] = {}
+    for path, items in joint.items():
+        together.setdefault(items, []).append(path)
+    for items, joint_paths in together.items():
+        groups.append(group("together", items, flag(items), joint_paths))
+    shared: dict[tuple[str, ...], list[str]] = {}
+    for path, items in owners.items():
+        if len(items) > 1:
+            # Also name capabilities that remove the file by forcing a dependent off.
+            every = tuple(
+                name
+                for name, (files, private_files) in removed_by.items()
+                if path in files | private_files
+            )
+            shared.setdefault(every, []).append(path)
+    for items, shared_paths in shared.items():
+        groups.append(
+            group(
+                "any",
+                items,
+                "--without any one of them"
+                if all(item in defaults for item in items)
+                else " or ".join(flag((item,)) for item in items),
+                shared_paths,
+            )
+        )
+    return groups
+
+
+def _render_file_groups(groups: list[dict[str, object]]) -> list[str]:
+    lines: list[str] = []
+    for item in groups:
+        files = cast("list[str]", item["files"])
+        private_files = cast("list[str]", item["private_files"])
+        count = f"{len(files)} file" + ("" if len(files) == 1 else "s")
+        if private_files:
+            count += f" and {len(private_files)} private"
+        if item["name"] == "core":
+            heading = f"core ({count}; generated with every capability choice)"
+        elif item["required"]:
+            heading = f"{item['name']} (required by this preset; no --without)"
+        elif item["name"] == "together":
+            capabilities = " and ".join(cast("list[str]", item["capabilities"]))
+            heading = f"{capabilities} together ({count}; remove with {item['remove_with']})"
+        elif item["name"] == "any":
+            capabilities = ", ".join(cast("list[str]", item["capabilities"]))
+            heading = f"needs all of {capabilities} ({count}; removed by {item['remove_with']})"
+        elif not files and not private_files:
+            heading = f"{item['name']} (no files of its own; to turn it off: {item['remove_with']})"
+        else:
+            heading = f"{item['name']} ({count}; remove with {item['remove_with']})"
+        lines.append(f"  {heading}:")
+        lines.extend(f"    create {path}" for path in files)
+        lines.extend(
+            f"    create private {path} (content generated on apply)" for path in private_files
+        )
+    return lines
 
 
 def _new_error(*, code: str, message: str, as_json: bool) -> int:
@@ -3118,6 +3358,11 @@ def _run_new_discovery(args: argparse.Namespace) -> int | None:
             print("Implies: " + ", ".join(spec.implied))
         if spec.files:
             print("Canonical homes: " + ", ".join(spec.files))
+        if spec.owned_files:
+            print(
+                f"Removed by --without {spec.name} (when the preset turns it on by default): "
+                + ", ".join(spec.owned_files)
+            )
     return 0
 
 
@@ -3509,14 +3754,17 @@ def run_new(args: argparse.Namespace) -> int:
     if "artifacts" in plan.capabilities:
         directories.add("data/artifacts")
     directories.update(parent for path in files if (parent := str(Path(path).parent)) != ".")
+    groups = capability_file_groups(plan)
+    plan_payload = plan.as_dict(
+        files=tuple(sorted(files)),
+        directories=tuple(sorted(directories)),
+        private_files=_private_files(plan),
+    )
+    plan_payload["file_groups"] = groups
     payload: dict[str, object] = {
         "status": "planned" if args.dry_run else "created",
         "target": str(target),
-        "plan": plan.as_dict(
-            files=tuple(sorted(files)),
-            directories=tuple(sorted(directories)),
-            private_files=(("data/memory-evidence.key",) if "memory" in plan.capabilities else ()),
-        ),
+        "plan": plan_payload,
         "agent_context": _agent_context(plan),
     }
     if newer is not None:
@@ -3527,10 +3775,9 @@ def run_new(args: argparse.Namespace) -> int:
         else:
             print(f"Plan for {target}/ ({len(files)} files, no writes):")
             print(f"  preset={plan.preset} provider={plan.provider} execution={plan.execution}")
-            for relative in sorted(files):
-                print(f"  create {relative}")
-            if "memory" in plan.capabilities:
-                print("  create private data/memory-evidence.key (content generated on apply)")
+            print("  capabilities: " + (", ".join(plan.capabilities) or "none"))
+            for line in _render_file_groups(groups):
+                print(line)
         return 0
 
     try:

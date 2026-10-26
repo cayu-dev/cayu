@@ -340,6 +340,27 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_docker=True,
     ),
     VerificationCheck(
+        id="docker-live-generated-coding-image",
+        capability=(
+            "A freshly scaffolded `cayu new --preset coding --execution docker` project "
+            "builds its Dockerfile.coding from a wheel of this commit and runs, repairs, "
+            "and copies back a change in the built image"
+        ),
+        lane="docker",
+        command=("uv", "run", "pytest", "tests/cli/test_scaffold_docker_live.py", "-q"),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "Docker daemon (linux/amd64)",
+            "network to snapshot.debian.org and PyPI for the image build",
+            "CAYU_DOCKER_GENERATED_CODING_WHEEL naming a wheel built from this commit",
+        ),
+        env={"CAYU_REQUIRE_GENERATED_DOCKER_CODING": "1"},
+        unset_env=_LIVE_CREDENTIAL_ENV,
+        required_env=("CAYU_DOCKER_GENERATED_CODING_WHEEL",),
+        requires_docker=True,
+        timeout_s=3600.0,
+    ),
+    VerificationCheck(
         id="docker-live-virtual-egress",
         capability=(
             "Docker container virtual-egress enforcement conformance (not sandbox isolation)"

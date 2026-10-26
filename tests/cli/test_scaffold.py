@@ -952,6 +952,108 @@ def test_generated_docker_builder_uses_one_immutable_input_snapshot(
     assert captured_build_contexts[-1]["uv.lock"] == original_lock
 
 
+def test_generated_docker_builder_snapshots_declared_uv_projects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bypass_coding_dependency_preflight(monkeypatch)
+    assert (
+        main(
+            [
+                "new",
+                "uv-targets",
+                "--preset",
+                "coding",
+                "--execution",
+                "docker",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    project = tmp_path / "uv-targets"
+    dockerfile = (project / "Dockerfile.coding").read_bytes()
+    assert b"--mount=type=bind,source=.,target=/opt/cayu-build-context,ro" in dockerfile
+    (project / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    target = project / "targets" / "service"
+    target.mkdir(parents=True)
+    (target / "pyproject.toml").write_text('[project]\nname = "service"\n', encoding="utf-8")
+    (target / "uv.lock").write_text("version = 1\n# service\n", encoding="utf-8")
+    build_path = project / "docker-coding-build.json"
+    build = json.loads(build_path.read_text(encoding="utf-8"))
+    assert build["extra_uv_projects"] == []
+    spec = importlib.util.spec_from_file_location(
+        "uv_targets_build_coding_image", project / "build_coding_image.py"
+    )
+    assert spec is not None and spec.loader is not None
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    without_targets = builder._trusted_build_context_snapshot()
+
+    build["extra_uv_projects"] = [{"path": "targets/service", "extras": ["dev"]}]
+    build_path.write_text(json.dumps(build, indent=2) + "\n", encoding="utf-8")
+    snapshot = builder._trusted_build_context_snapshot()
+
+    assert set(snapshot) - set(without_targets) == {
+        "targets/service/pyproject.toml",
+        "targets/service/uv.lock",
+    }
+    assert snapshot["targets/service/uv.lock"] == b"version = 1\n# service\n"
+    fingerprint = builder._trusted_build_context_sha256(snapshot)
+    (target / "uv.lock").write_text("version = 1\n# changed\n", encoding="utf-8")
+    assert (
+        builder._trusted_build_context_sha256(builder._trusted_build_context_snapshot())
+        != fingerprint
+    )
+    # The Dockerfile never changes with the declared projects.
+    assert (project / "Dockerfile.coding").read_bytes() == dockerfile
+
+    (target / "uv.lock").unlink()
+    with pytest.raises(RuntimeError, match=r"build input 'targets/service/uv\.lock'"):
+        builder._trusted_build_context_snapshot()
+    build["extra_build_inputs"] = [{"path": "targets/service/pyproject.toml", "max_bytes": 64}]
+    build_path.write_text(json.dumps(build), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="declared twice"):
+        builder._trusted_build_context_snapshot()
+
+
+def test_generated_dockerfile_installs_declared_uv_projects_into_opt_targets() -> None:
+    from cayu.cli.coding_composition import _DOCKERFILE
+
+    step = _DOCKERFILE.split("--mount=type=bind,source=.,target=/opt/cayu-build-context,ro")[1]
+    assert '"/opt/targets/" + os.path.basename(project["path"])' in step
+    assert '["uv", "sync", "--frozen", "--no-install-project"]' in step
+    assert 'command += ["--extra", extra]' in step
+    assert '["--python", "/usr/local/bin/python"]' in step
+    assert 'UV_PROJECT_ENVIRONMENT=target + "/.venv"' in step
+    assert 'json.load(handle).get("extra_uv_projects", [])' in step
+
+
+def test_generated_dockerfile_installs_dependencies_as_an_unprivileged_build_user() -> None:
+    from cayu.cli.coding_composition import _DOCKERFILE
+
+    root_part, build_part = _DOCKERFILE.split("COPY pyproject.toml uv.lock ./\n")
+    # Root installs only system packages and uv; no dependency sync runs as root.
+    assert 'python -m pip install --no-cache-dir "uv==${CAYU_UV_VERSION}"' in root_part
+    assert "uv sync" not in root_part
+    lines = build_part.splitlines()
+    install_lines = [line for line in lines if "uv sync" in line or "uv pip install" in line]
+    assert install_lines == [
+        "as_build_user uv sync --frozen --extra dev --no-install-project",
+        "    as_build_user uv pip install --python /opt/cayu-project/.venv/bin/python \\",
+    ]
+    assert "as_build_user python3 -I - <<'PY'" in build_part
+    assert "setpriv --reuid=10001 --regid=10001 --clear-groups --no-new-privs" in build_part
+    assert "--shell /usr/sbin/nologin cayu-build" in build_part
+    assert "chown -h -R root:root /opt/cayu-project /opt/targets" in build_part
+    assert "-exec chmod u-s,g-s {} +" in build_part
+    assert "os.kill(-1, signal.SIGKILL)" in build_part
+    assert 'echo "files owned by the build user remain" >&2' in build_part
+    # One RUN step does it all, so the Dockerfile never depends on declared projects.
+    assert build_part.count("\nRUN ") + build_part.startswith("RUN ") == 1
+
+
 def test_generated_docker_builder_resolves_only_null_pins(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

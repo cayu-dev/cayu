@@ -95,6 +95,10 @@ class CapabilitySpec:
     supported_executions: tuple[ExecutionName, ...] = ("none", "docker")
     files: tuple[str, ...] = ()
     verification: tuple[str, ...] = ()
+    # Generated files that exist only for this capability. `--without` removes
+    # them when the preset turns the capability on by default. Shared seams that
+    # every project imports, such as configuration/storage.py, stay in `files`.
+    owned_files: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -112,6 +116,7 @@ class CapabilitySpec:
             "environment": list(self.environment),
             "supported_executions": list(self.supported_executions),
             "files": list(self.files),
+            "owned_files": list(self.owned_files),
             "verification": list(self.verification),
         }
 
@@ -240,6 +245,14 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         extension_presets=("service",),
         files=("knowledge/", "configuration/storage.py"),
         verification=("uv run --no-sync cayu check --json",),
+        owned_files=(
+            "knowledge/__init__.py",
+            "knowledge/retrieval.py",
+            "knowledge/curation.py",
+            "knowledge/maintenance.py",
+            "knowledge/seeds/.gitkeep",
+            "knowledge/CAPABILITY.md",
+        ),
     ),
     CapabilitySpec(
         name="memory",
@@ -249,6 +262,13 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         implied=("knowledge",),
         files=("memory/", "policies/context.py"),
         verification=("uv run --no-sync pytest -q tests/test_memory.py",),
+        owned_files=(
+            "memory/__init__.py",
+            "memory/context.py",
+            "memory/recall.py",
+            "memory/CAPABILITY.md",
+            "tests/test_memory.py",
+        ),
     ),
     CapabilitySpec(
         name="mcp",
@@ -263,6 +283,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         status="preset-owned",
         supported_presets=("agent", "service", "coding", "long-running"),
         files=("operations/tasks.py",),
+        owned_files=("operations/tasks.py", "operations/TASKS.md"),
     ),
     CapabilitySpec(
         name="workers",
@@ -279,6 +300,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         supported_presets=("coding",),
         extension_presets=("service",),
         files=("operations/completion.py", "agents/registration.py"),
+        owned_files=("operations/DELEGATION.md",),
     ),
     CapabilitySpec(
         name="human-input",
@@ -286,6 +308,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         status="preset-owned",
         supported_presets=("agent", "coding", "long-running"),
         files=("operations/approvals.py",),
+        owned_files=("operations/approvals.py", "operations/HUMAN_INPUT.md"),
     ),
     CapabilitySpec(
         name="approvals",
@@ -293,6 +316,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         status="preset-owned",
         supported_presets=("agent", "service", "coding", "long-running"),
         files=("operations/approvals.py", "policies/tools.py"),
+        owned_files=("operations/approvals.py", "operations/APPROVALS.md"),
     ),
     CapabilitySpec(
         name="artifacts",
@@ -302,6 +326,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         extension_presets=("service",),
         files=("environments/local.py", "data/artifacts/"),
         verification=("uv run --no-sync pytest -q tests/test_application.py",),
+        owned_files=("environments/ARTIFACTS.md",),
     ),
     CapabilitySpec(
         name="recovery",
@@ -310,6 +335,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         supported_presets=("agent", "service", "coding", "long-running"),
         files=("operations/recovery.py", "operations/workers.py"),
         verification=("uv run --no-sync cayu inspect --json",),
+        owned_files=("operations/recovery.py", "operations/RECOVERY.md"),
     ),
     CapabilitySpec(
         name="evals",
@@ -318,6 +344,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         supported_presets=("agent", "service", "coding", "long-running"),
         files=("evals/",),
         verification=("uv run --no-sync cayu eval run",),
+        owned_files=("evals/__init__.py", "evals/agent.py", "evals/CAPABILITY.md"),
     ),
     CapabilitySpec(
         name="observability",
@@ -326,6 +353,12 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         supported_presets=("agent", "service", "long-running"),
         files=("configuration/runtime.py", "observability/"),
         verification=("uv run --no-sync cayu inspect --json", "uv run --no-sync pytest"),
+        owned_files=(
+            "observability/__init__.py",
+            "observability/events.py",
+            "observability/tracing.py",
+            "observability/CAPABILITY.md",
+        ),
     ),
     CapabilitySpec(
         name="remote-git-delivery",
@@ -669,6 +702,41 @@ def _plan_dependencies(plan: ApplicationPlan) -> tuple[str, ...]:
     for name in plan.capabilities:
         dependencies.update(capability_spec(name).dependencies)
     return tuple(sorted(dependencies))
+
+
+def removed_capability_files(plan: ApplicationPlan) -> frozenset[str]:
+    """Return the owned files a plan's `--without` choices leave out.
+
+    A file is removed when a capability that owns it is a preset default the
+    plan turned off and no capability that owns it is still selected. Presets
+    keep the homes of capabilities they don't turn on by default, so those can
+    be wired in later.
+    """
+
+    selected = set(plan.capabilities)
+    excluded = set(_PRESET_BY_NAME[plan.preset].default_capabilities) - selected
+    removed: set[str] = set()
+    for name in excluded:
+        for path in _CAPABILITY_BY_NAME[name].owned_files:
+            owners = {spec.name for spec in CAPABILITIES if path in spec.owned_files}
+            if not owners & selected:
+                removed.add(path)
+    return frozenset(removed)
+
+
+def capability_dependents(plan: ApplicationPlan, name: str) -> tuple[str, ...]:
+    """Return ``name`` and every selected capability that requires it, in catalog order."""
+
+    selected = set(plan.capabilities)
+    dependents = {name}
+    changed = True
+    while changed:
+        changed = False
+        for candidate in selected - dependents:
+            if dependents & set(_CAPABILITY_BY_NAME[candidate].implied):
+                dependents.add(candidate)
+                changed = True
+    return tuple(spec.name for spec in CAPABILITIES if spec.name in dependents)
 
 
 def normalize_extension_declarations(

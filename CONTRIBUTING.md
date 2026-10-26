@@ -34,7 +34,9 @@ can run `ci.yml` manually against a selected branch or tag from the Actions UI o
 with `gh workflow run ci.yml --ref <branch-or-tag>`. Manual runs validate without
 publishing. `v*` tag pushes retain release validation and gated publishing.
 `nightly.yml` runs the Python test jobs with every store each night and on
-manual dispatch. Full-scale qualification also retains its separate nightly
+manual dispatch, and builds a freshly scaffolded Docker coding image from a
+wheel of the commit (`docker-live-generated-coding-image` in
+`scripts/nightly_verification.py`). Full-scale qualification also retains its separate nightly
 schedule and manual trigger.
 
 ## Before you start: search first

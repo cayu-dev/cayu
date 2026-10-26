@@ -282,6 +282,84 @@ Toolchain failures carry a stable `code`, and, where paths are involved, only
 `path_count` and `paths_fingerprint`; validation errors name the selector or
 probe that is wrong.
 
+## Target project dependencies in the generated coding image
+
+A `cayu new --preset coding --execution docker` project builds its image from
+an unmodified `Dockerfile.coding`; Cayu Cloud accepts only that exact file and
+reproduces its steps. A target project inside the repository that has its own
+`pyproject.toml` and `uv.lock` is declared in `docker-coding-build.json`
+(schema version 2) instead of being copied by an edited Dockerfile:
+
+```json
+"extra_uv_projects": [{"path": "targets/my-service", "extras": ["dev"]}]
+```
+
+Each entry is an object with exactly the keys `path` and `extras`:
+
+- `path`: a project-relative directory matching `[A-Za-z0-9._/-]{1,256}`, already
+  normalized (no empty, `.` or `..` components, no leading or trailing `/`),
+  whose first component isn't `.cayu`, `.git` or `.runtime`. Its last component
+  is the target's name; it must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and be
+  unique across entries.
+- `extras`: a list of at most 16 unique names matching
+  `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, passed to `uv sync --extra` in order.
+
+At most 8 entries. A build file without the key has none, so earlier v2 files
+stay valid. `build_coding_image.py` and the app's `read_coding_image_receipt`
+apply the same rules.
+
+`<path>/pyproject.toml` (at most 1 MiB) and `<path>/uv.lock` (at most 64 MiB)
+become build inputs. They must be regular files without symlinks in their
+path, and neither may also be listed in `extra_build_inputs`. The builder copies
+them into its private build context with the other inputs, records each in
+`docker-coding-image.json`'s `dependency_inputs` (checked like the project's own
+lock, so editing one requires a rebuild), and includes them in
+`trusted_build_context_sha256`: the sha256 of the compact, key-sorted JSON list
+of `{"path", "content_sha256"}` for every build input sorted by path, where
+`content_sha256` is `sha256:` plus the hex digest of the file's bytes.
+
+Every dependency install in `Dockerfile.coding` runs as an unprivileged build
+user; root installs only the pinned system packages and `uv` itself (`python -m
+pip install uv==<uv_version>`). After `COPY pyproject.toml uv.lock ./` into
+`/opt/cayu-project`, one fixed `RUN` step, with the reviewed wheel context
+mounted read-only at `/opt/cayu-wheel` and the build context at
+`/opt/cayu-build-context`, does this as root:
+
+1. Create group `cayu-build` (gid 10001) and system user `cayu-build` (uid 10001,
+   no home directory, home `/nonexistent`, shell `/usr/sbin/nologin`, no
+   password).
+2. Create `/tmp/cayu-build-home` (mode 0700) and `/opt/targets` (mode 0755) owned
+   by 10001:10001, and give 10001:10001 ownership of `/opt/cayu-project` (the
+   directory only; the copied `pyproject.toml` and `uv.lock` stay root-owned).
+3. Run each of the following as the build user, with `setpriv --reuid=10001
+   --regid=10001 --clear-groups --no-new-privs` and the environment
+   `HOME=/tmp/cayu-build-home UV_CACHE_DIR=/tmp/cayu-build-home/uv-cache`:
+   - in `/opt/cayu-project`: `uv sync --frozen --extra dev --no-install-project`;
+   - if the wheel context holds a `*.whl` file: `uv pip install --python
+     /opt/cayu-project/.venv/bin/python --no-deps <wheel>`;
+   - for each `extra_uv_projects` entry, in order: create `/opt/targets/<name>`
+     (an error if it exists), copy `<path>/pyproject.toml` and `<path>/uv.lock`
+     from the build context into it, and in that directory, with
+     `UV_PROJECT_ENVIRONMENT=/opt/targets/<name>/.venv`, run `uv sync --frozen
+     --no-install-project [--extra EXTRA ...] --python /usr/local/bin/python`.
+4. As the build user, send `SIGKILL` to every process it can signal
+   (`kill(-1, SIGKILL)`), so nothing it started survives.
+5. As root: remove `/tmp/cayu-build-home` and anything in `/tmp` or `/var/tmp`
+   owned by uid or gid 10001; `chown -h -R root:root /opt/cayu-project
+   /opt/targets`; clear setuid and setgid bits on everything under them except
+   symlinks; delete the `cayu-build` user and group.
+6. Fail the build if uid or gid 10001 still has a passwd or group entry, or if
+   any file outside `/proc` and the two mounts is still owned by uid or gid 10001.
+
+The result is root-owned and world-readable, so the runtime user can run but
+not change it. The target's own package isn't installed, and path
+dependencies or uv workspace members aren't supported. To run the target's
+tools, add their absolute paths under `/opt/targets/<name>/.venv/bin` to
+`extra_probe_executables`, add `/opt/targets/<name>` to the profile's
+`read_only_support_paths`, and give the profile a command authority with that
+executable. The generated project's README shows a complete `target-test`
+selector.
+
 ## Writable home and tool caches
 
 Runtime-created Docker coding containers receive a private, disposable home at

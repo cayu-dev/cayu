@@ -2540,13 +2540,78 @@ RUN test -n "${CAYU_UV_VERSION}" \
 
 WORKDIR /opt/cayu-project
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --extra dev --no-install-project
+# Dependencies install as the unprivileged build user cayu-build (uid and gid
+# 10001); root installed only the system packages and uv. Then root owns what was
+# built and the build user is gone. This step is the same for every project.
 RUN --mount=type=bind,from=cayu-wheel,source=/,target=/opt/cayu-wheel,ro \
-    set -- /opt/cayu-wheel/*.whl; \
-    if [ -f "$1" ]; then \
-        uv pip install --python /opt/cayu-project/.venv/bin/python \
-            --no-deps "$1"; \
-    fi
+    --mount=type=bind,source=.,target=/opt/cayu-build-context,ro <<'SH'
+set -eu
+groupadd --system --gid 10001 cayu-build
+useradd --system --uid 10001 --gid 10001 --no-create-home \
+    --home-dir /nonexistent --shell /usr/sbin/nologin cayu-build
+install -d -o 10001 -g 10001 -m 0700 /tmp/cayu-build-home
+install -d -o 10001 -g 10001 -m 0755 /opt/targets
+chown 10001:10001 /opt/cayu-project
+as_build_user() {
+    setpriv --reuid=10001 --regid=10001 --clear-groups --no-new-privs \
+        env HOME=/tmp/cayu-build-home UV_CACHE_DIR=/tmp/cayu-build-home/uv-cache "$@"
+}
+as_build_user uv sync --frozen --extra dev --no-install-project
+set -- /opt/cayu-wheel/*.whl
+if [ -f "$1" ]; then
+    as_build_user uv pip install --python /opt/cayu-project/.venv/bin/python \
+        --no-deps "$1"
+fi
+# Locked dependencies for each target project in extra_uv_projects, in
+# /opt/targets/<directory name>/.venv.
+as_build_user python3 -I - <<'PY'
+import json
+import os
+import shutil
+import subprocess
+
+context = "/opt/cayu-build-context"
+with open(os.path.join(context, "docker-coding-build.json"), "rb") as handle:
+    projects = json.load(handle).get("extra_uv_projects", [])
+for project in projects:
+    target = "/opt/targets/" + os.path.basename(project["path"])
+    os.makedirs(target)
+    for name in ("pyproject.toml", "uv.lock"):
+        shutil.copyfile(
+            os.path.join(context, project["path"], name), os.path.join(target, name)
+        )
+    command = ["uv", "sync", "--frozen", "--no-install-project"]
+    for extra in project["extras"]:
+        command += ["--extra", extra]
+    command += ["--python", "/usr/local/bin/python"]
+    environment = dict(os.environ, UV_PROJECT_ENVIRONMENT=target + "/.venv")
+    subprocess.run(command, cwd=target, env=environment, check=True)
+PY
+# Stop anything the build user left running, remove its temporary files, and
+# give root everything it built, without setuid or setgid bits.
+as_build_user python3 -I -c 'import os, signal
+try:
+    os.kill(-1, signal.SIGKILL)
+except ProcessLookupError:
+    pass'
+rm -rf /tmp/cayu-build-home
+find /tmp /var/tmp -mindepth 1 \( -uid 10001 -o -gid 10001 \) -prune -exec rm -rf {} +
+chown -h -R root:root /opt/cayu-project /opt/targets
+find /opt/cayu-project /opt/targets ! -type l \( -perm -4000 -o -perm -2000 \) \
+    -exec chmod u-s,g-s {} +
+userdel cayu-build
+groupdel cayu-build 2>/dev/null || true
+if getent passwd 10001 >/dev/null || getent group 10001 >/dev/null; then
+    echo "the build user still exists" >&2
+    exit 1
+fi
+if [ -n "$(find / -xdev \( -path /proc -o -path /opt/cayu-build-context \
+    -o -path /opt/cayu-wheel \) -prune -o \( -uid 10001 -o -gid 10001 \) \
+    -print -quit)" ]; then
+    echo "files owned by the build user remain" >&2
+    exit 1
+fi
+SH
 
 ENV HOME=/tmp
 ENV PATH=/opt/cayu-project/.venv/bin:/usr/local/bin:/usr/bin:/bin
@@ -2583,6 +2648,7 @@ _DOCKER_BUILD_CONFIG = """{
   "cayu_wheel": null,
   "cayu_wheel_sha256": null,
   "extra_build_inputs": [],
+  "extra_uv_projects": [],
   "extra_probe_executables": []
 }
 """
@@ -2608,8 +2674,11 @@ docker-coding-build.json with current values, without building. Review them, the
 run ``python build_coding_image.py`` to build and record the immutable image.
 
 docker-coding-build.json also declares ``extra_build_inputs`` (more files the
-Dockerfile copies, each with a byte limit) and ``extra_probe_executables`` (more
-executables the built image must contain), and the toolchain ``profile_revision``.
+Dockerfile copies, each with a byte limit), ``extra_uv_projects`` (target
+projects whose locked dependencies the image installs in
+/opt/targets/<directory name>/.venv; their pyproject.toml and uv.lock become
+build inputs), ``extra_probe_executables`` (more executables the built image
+must contain), and the toolchain ``profile_revision``.
 Declare them there once; the image receipt records them and the app reads them.
 """
 
@@ -2655,6 +2724,13 @@ _DEPENDENCY_INPUT_MAX_BYTES = 16 * 1024 * 1024
 _WHEEL_MAX_BYTES = 64 * 1024 * 1024
 _PROFILE_REVISION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}\Z")
 _EXECUTABLE = re.compile(r"/[A-Za-z0-9._+/-]+\Z")
+# extra_uv_projects: each target's pyproject.toml and uv.lock are build inputs.
+_UV_PROJECT_INPUT_LIMITS = {"pyproject.toml": 1024 * 1024, "uv.lock": 64 * 1024 * 1024}
+_UV_PROJECT_PATH = re.compile(r"[A-Za-z0-9._/-]{1,256}\Z")
+_UV_PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_UV_EXTRA = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_MAX_UV_PROJECTS = 8
+_MAX_UV_EXTRAS = 16
 
 
 def _read_project_input(relative_path: str, *, max_bytes: int) -> bytes:
@@ -2717,21 +2793,82 @@ def _build_context_input_limits(raw_build_configuration: bytes) -> dict[str, int
     limits = dict(_BASE_BUILD_CONTEXT_INPUT_LIMITS)
     for item in _validated_extra_inputs(value.get("extra_build_inputs")):
         limits[item["path"]] = item["max_bytes"]
+    for path, limit in _uv_project_input_limits(value.get("extra_uv_projects", [])).items():
+        if path in limits:
+            raise RuntimeError(f"build input {path!r} is declared twice")
+        limits[path] = limit
     return dict(sorted(limits.items()))
+
+
+def _validated_uv_projects(value: object) -> list[dict]:
+    """Require extra_uv_projects to be [{"path": ..., "extras": [...]}, ...]."""
+
+    if type(value) is not list or len(value) > _MAX_UV_PROJECTS:
+        raise RuntimeError(
+            f"extra_uv_projects must be a list of at most {_MAX_UV_PROJECTS} projects"
+        )
+    names = set()
+    for item in value:
+        if (
+            type(item) is not dict
+            or set(item) != {"path", "extras"}
+            or type(item["path"]) is not str
+            or type(item["extras"]) is not list
+        ):
+            raise RuntimeError(
+                'extra_uv_projects entries must be {"path": ..., "extras": [...]}'
+            )
+        path = item["path"]
+        parts = path.split("/")
+        name = parts[-1]
+        if (
+            not _UV_PROJECT_PATH.fullmatch(path)
+            or any(part in {"", ".", ".."} for part in parts)
+            or parts[0] in {".cayu", ".git", ".runtime"}
+            or not _UV_PROJECT_NAME.fullmatch(name)
+        ):
+            raise RuntimeError(f"extra uv project {path!r} is not a project subdirectory")
+        if name in names:
+            raise RuntimeError(f"extra uv projects share the directory name {name!r}")
+        names.add(name)
+        extras = item["extras"]
+        if (
+            len(extras) > _MAX_UV_EXTRAS
+            or any(type(extra) is not str or not _UV_EXTRA.fullmatch(extra) for extra in extras)
+            or len(set(extras)) != len(extras)
+        ):
+            raise RuntimeError(
+                f"extra uv project {path!r} extras must be at most {_MAX_UV_EXTRAS} "
+                "unique extra names"
+            )
+    return value
+
+
+def _uv_project_input_limits(value: object) -> dict[str, int]:
+    return {
+        f"{item['path']}/{name}": limit
+        for item in _validated_uv_projects(value)
+        for name, limit in _UV_PROJECT_INPUT_LIMITS.items()
+    }
 
 
 def _trusted_build_context_snapshot() -> dict[str, bytes]:
     raw = _read_project_input(
         "docker-coding-build.json", max_bytes=_BUILD_CONFIG_MAX_BYTES
     )
-    return {
-        path: (
-            raw
-            if path == "docker-coding-build.json"
-            else _read_project_input(path, max_bytes=limit)
-        )
-        for path, limit in _build_context_input_limits(raw).items()
-    }
+    snapshot = {}
+    for path, limit in _build_context_input_limits(raw).items():
+        if path == "docker-coding-build.json":
+            snapshot[path] = raw
+            continue
+        try:
+            snapshot[path] = _read_project_input(path, max_bytes=limit)
+        except RuntimeError as exc:
+            if path in _BASE_BUILD_CONTEXT_INPUT_LIMITS:
+                raise
+            # Name the declared extra input or extra_uv_projects file.
+            raise RuntimeError(f"build input {path!r}: {exc}") from None
+    return snapshot
 
 
 def _validated_extra_inputs(value: object) -> list[dict]:
@@ -2790,9 +2927,10 @@ def _configuration(raw: bytes) -> dict:
         "extra_build_inputs",
         "extra_probe_executables",
     }
+    # extra_uv_projects came later in schema version 2; a file without it has none.
     if (
         type(value) is not dict
-        or set(value) != expected
+        or set(value) - {"extra_uv_projects"} != expected
         or value.get("schema_version") != "2"
     ):
         raise RuntimeError("docker-coding-build.json does not match schema version 2")
@@ -2800,6 +2938,7 @@ def _configuration(raw: bytes) -> dict:
     if type(revision) is not str or not _PROFILE_REVISION.fullmatch(revision):
         raise RuntimeError("profile_revision must be a portable version identifier")
     _validated_extra_inputs(value.get("extra_build_inputs"))
+    _validated_uv_projects(value.get("extra_uv_projects", []))
     executables = value.get("extra_probe_executables")
     if (
         type(executables) is not list
@@ -3274,6 +3413,10 @@ _BASE_DEPENDENCY_PATHS = (
     "pyproject.toml",
     "uv.lock",
 )
+# Each extra_uv_projects entry adds its pyproject.toml and uv.lock to that set.
+_UV_PROJECT_PATH = re.compile(r"[A-Za-z0-9._/-]{1,256}\Z")
+_UV_PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_UV_EXTRA = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _SOURCE_EXCLUDED_DIRECTORY_NAMES = (
     ".cache",
     ".cayu",
@@ -3416,7 +3559,46 @@ def _required_dependency_paths(build_configuration: object) -> tuple[str, ...]:
         type(item) is not dict or type(item.get("path")) is not str for item in extra
     ):
         raise RuntimeError("docker-coding-build.json has invalid extra_build_inputs")
-    return tuple(sorted({*_BASE_DEPENDENCY_PATHS, *(item["path"] for item in extra)}))
+    paths = [*_BASE_DEPENDENCY_PATHS, *(item["path"] for item in extra)]
+    for project in _validated_uv_projects(build_configuration.get("extra_uv_projects", [])):
+        paths.extend(f"{project['path']}/{name}" for name in ("pyproject.toml", "uv.lock"))
+    if len(set(paths)) != len(paths):
+        raise RuntimeError("docker-coding-build.json declares a build input twice")
+    return tuple(sorted(paths))
+
+
+def _validated_uv_projects(value: object) -> list[dict]:
+    """The same extra_uv_projects rules build_coding_image.py enforces."""
+
+    if type(value) is not list or len(value) > 8:
+        raise RuntimeError("docker-coding-build.json has invalid extra_uv_projects")
+    names = set()
+    for item in value:
+        if (
+            type(item) is not dict
+            or set(item) != {"path", "extras"}
+            or type(item["path"]) is not str
+            or type(item["extras"]) is not list
+        ):
+            raise RuntimeError("docker-coding-build.json has invalid extra_uv_projects")
+        parts = item["path"].split("/")
+        name = parts[-1]
+        extras = item["extras"]
+        if (
+            _UV_PROJECT_PATH.fullmatch(item["path"]) is None
+            or any(part in {"", ".", ".."} for part in parts)
+            or parts[0] in {".cayu", ".git", ".runtime"}
+            or _UV_PROJECT_NAME.fullmatch(name) is None
+            or name in names
+            or len(extras) > 16
+            or any(type(extra) is not str or _UV_EXTRA.fullmatch(extra) is None for extra in extras)
+            or len(set(extras)) != len(extras)
+        ):
+            raise RuntimeError(
+                f"docker-coding-build.json has an invalid extra uv project {item['path']!r}"
+            )
+        names.add(name)
+    return value
 
 
 def read_coding_image_receipt() -> CodingImageReceipt:
@@ -4091,12 +4273,61 @@ The optional `cayu_wheel` and `cayu_wheel_sha256` pair can select a reviewed
 project-relative wheel (for example under protected `.cayu/`) for release or CI
 proof; leave both null to use the Cayu artifact in the frozen lock.
 `profile_revision` is the toolchain profile's revision; the image receipt copies
-it. To bake more inputs into the image (for example a target repository's
-`pyproject.toml` and `uv.lock`), list each once in `extra_build_inputs` as
-`{"path": ..., "max_bytes": ...}`, copy it in `Dockerfile.coding`, and list any
+it. To bake more inputs into the image, list each once in `extra_build_inputs`
+as `{"path": ..., "max_bytes": ...}`, copy it in `Dockerfile.coding`, and list any
 executables the image must then contain in `extra_probe_executables`. The
 builder snapshots exactly those inputs, the receipt records them, and the app
-requires the receipt to match `docker-coding-build.json`. Review
+requires the receipt to match `docker-coding-build.json`.
+
+When the agent works on a target project inside this repository that has its
+own `pyproject.toml` and `uv.lock`, declare it in `extra_uv_projects` instead of
+editing `Dockerfile.coding` (Cayu Cloud builds only the unmodified file):
+
+```json
+"extra_uv_projects": [{"path": "targets/my-service", "extras": ["dev"]}],
+"extra_probe_executables": ["/opt/targets/my-service/.venv/bin/pytest"]
+```
+
+`path` is a project-relative directory (no `..`, not under `.cayu`, `.git` or
+`.runtime`); its last component names the target and must be unique. Its
+`pyproject.toml` (at most 1 MiB) and `uv.lock` (at most 64 MiB) become build
+inputs, recorded in `docker-coding-image.json` and in
+`trusted_build_context_sha256`, so editing either requires a rebuild. The fixed
+`Dockerfile.coding` step copies them to `/opt/targets/<name>/` and runs
+`uv sync --frozen --no-install-project [--extra EXTRA ...] --python
+/usr/local/bin/python` there with `UV_PROJECT_ENVIRONMENT=/opt/targets/<name>/.venv`.
+Like the project's own `uv sync`, it runs as a temporary unprivileged build user;
+root then owns the result, so the runtime user can run but not change it. The
+target's own
+package isn't installed: its tests import it from the workspace copy, so give
+the target's pytest configuration a `pythonpath` (for example `["src"]`). Path
+dependencies and uv workspace members aren't supported. Then run the target's
+tests from its environment by adding a selector to `_python_toolchain_profile`
+in `operations/coding.py`, and add `/opt/targets/my-service` to its sorted
+`read_only_support_paths`:
+
+```python
+CodingCommandAuthority(
+    selector="target-test",
+    revision="1",
+    description="Run the target project's tests from its locked environment.",
+    exposure="structured_command",
+    executable="/opt/targets/my-service/.venv/bin/pytest",
+    fixed_arguments=("-q", "-p", "no:cacheprovider"),
+    allow_positional_arguments=True,
+    positional_arguments_are_paths=True,
+    positional_path_prefixes=("targets/my-service/tests",),
+    positional_path_suffixes=(".py",),
+    allow_pytest_node_ids=True,
+    max_arguments=4,
+    timeout_seconds=300,
+    max_output_bytes=100_000,
+    allowed_exit_codes=(0, 1, 2, 3, 4, 5),
+),
+```
+
+Keep command authorities sorted by selector, and bump `profile_revision` in
+`docker-coding-build.json` when the profile changes. Review
 `Dockerfile.coding`, then run:
 
 ```bash
@@ -4546,6 +4777,45 @@ def test_image_build_requires_reviewed_pinned_inputs() -> None:
         build_coding_image._configuration(
             json.dumps(configuration, sort_keys=True).encode("utf-8")
         )
+
+
+@pytest.mark.parametrize(
+    "projects",
+    (
+        [{"path": "../outside", "extras": []}],
+        [{"path": "/abs/target", "extras": []}],
+        [{"path": ".git/target", "extras": []}],
+        [{"path": "targets/app/", "extras": []}],
+        [{"path": "targets/app", "extras": ["dev", "dev"]}],
+        [{"path": "targets/app", "extras": ["dev"], "groups": []}],
+        [{"path": "a/app", "extras": []}, {"path": "b/app", "extras": []}],
+    ),
+)
+def test_extra_uv_projects_are_validated_by_the_builder_and_the_app(
+    projects: list[dict],
+) -> None:
+    configuration = json.loads(build_coding_image._BUILD_CONFIG.read_bytes())
+    configuration["extra_uv_projects"] = projects
+    raw = json.dumps(configuration).encode("utf-8")
+    with pytest.raises(RuntimeError, match="extra uv project|extra_uv_projects"):
+        build_coding_image._build_context_input_limits(raw)
+    with pytest.raises(RuntimeError, match="extra uv project|extra_uv_projects"):
+        composition._required_dependency_paths(configuration)
+
+
+def test_extra_uv_projects_add_their_lock_inputs() -> None:
+    configuration = json.loads(build_coding_image._BUILD_CONFIG.read_bytes())
+    configuration["extra_uv_projects"] = [{"path": "targets/app", "extras": ["dev"]}]
+    limits = build_coding_image._build_context_input_limits(
+        json.dumps(configuration).encode("utf-8")
+    )
+    assert limits["targets/app/pyproject.toml"] == 1024 * 1024
+    assert limits["targets/app/uv.lock"] == 64 * 1024 * 1024
+    assert set(composition._required_dependency_paths(configuration)) == {
+        *composition._BASE_DEPENDENCY_PATHS,
+        "targets/app/pyproject.toml",
+        "targets/app/uv.lock",
+    }
 
 
 def test_image_receipt_requires_the_build_inputs_its_build_config_declares(

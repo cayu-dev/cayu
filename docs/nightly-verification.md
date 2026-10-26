@@ -1,13 +1,25 @@
 # Nightly verification
 
-**Status:** capability-report runner exists; scheduled GitHub Actions automation
-is not yet implemented.
+**Status:** capability-report runner exists; GitHub Actions runs only the
+`docker-live-generated-coding-image` check on a schedule (see below).
 
 Separately, `.github/workflows/nightly.yml` runs the regular Python test jobs each
 night with `CAYU_TEST_STORES=all`, covering the memory and Postgres store variants
 that pull requests skip, and uploads per-test timings for
 `scripts/merge_test_durations.py` (see CONTRIBUTING.md). It does not produce this
-capability report.
+capability report. Its `generated-docker-coding` job is the one scheduled
+capability check: on a linux/amd64 runner it builds a wheel of the commit and
+runs `docker-live-generated-coding-image`, which scaffolds a fresh
+`cayu new --preset coding --execution docker` project, builds its
+`Dockerfile.coding` with that wheel and runs `tests/cli/test_scaffold_docker_live.py`.
+Run the same check locally with:
+
+```bash
+uv build --wheel --out-dir dist
+CAYU_DOCKER_GENERATED_CODING_WHEEL="$(realpath dist/cayu-*.whl)" \
+  uv run python scripts/nightly_verification.py \
+  --check docker-live-generated-coding-image --strict
+```
 
 Run the current report with:
 
@@ -106,7 +118,7 @@ or in CI.
 | Process-death recovery | POSIX `SIGKILL`; deterministic SQLite stores and scripted providers | $0 | `sigkill-recovery` |
 | Controlled fault injection | loopback TCP, durable SQLite/filesystems, and POSIX process groups | $0 | `provider-stream-abort`, `sqlite-write-failure`, `runner-cleanup-failure`, `workspace-sync-failure` |
 | Postgres integration | Docker/testcontainers or `CAYU_TEST_POSTGRES_DSN` | $0 | `postgres-required` |
-| Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
+| Docker runner live | Docker daemon; `docker-live-generated-coding-image` also needs `CAYU_DOCKER_GENERATED_CODING_WHEEL` and network to snapshot.debian.org and PyPI | $0 | `docker-runner`, `docker-live-*` |
 | microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for network-default, virtual-egress, and guest-agent-liveness checks | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
 | AWS Lambda MicroVM live | `cayu[aws]`, plus `cayu[egress]` for the metadata-isolation check, AWS credentials/region, an operator-selected protocol-compatible image for the generic runner task; canonical image-build and deployed integrated-stack prerequisites for their dedicated tasks | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-recoverable-allocation-live`, `aws-lambda-microvm-replacement-live`, `aws-lambda-microvm-coding-live`, `aws-lambda-microvm-browser-live`, `aws-lambda-microvm-browser-control-live`, `aws-lambda-microvm-tool-admission-live`, `aws-lambda-microvm-image-build-live`, `aws-lambda-microvm-metadata-isolation-live` |

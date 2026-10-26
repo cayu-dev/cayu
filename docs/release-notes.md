@@ -343,6 +343,48 @@ not affect execution or approval.
   temporary copy and the rewrite. On PostgreSQL the flag is rejected: autovacuum reuses the freed
   space, and `docs/storage-retention.md` describes `VACUUM (FULL)` and
   `pg_repack` for returning it to the operating system.
+- `cayu new --without CAPABILITY` now leaves out the files only that capability
+  uses (its package, capability card and tests) instead of keeping its home;
+  `--explain` lists them. Turning off all nine `agent` defaults now gives 41
+  files instead of 65. The dry-run lists the capabilities and groups the files
+  by the `--without` flag that removes them, and `--json` adds the same groups
+  as `plan.file_groups`. `cayu check` no longer requires the removed files.
+  Presets still keep the homes of capabilities they don't turn on by default.
+  With `--without tasks`, the generated `tests/test_agent.py` no longer fails
+  ruff with an unused import.
+- New `cayu generate preset PRESET` converts an existing `cayu new` project to
+  another preset or capability set, for example `cayu generate preset coding
+  --execution docker` for an agent project that needs to edit files and run
+  tests. It renders the declared and requested plans with the same templates as
+  `cayu new`, creates and replaces files that still match what was generated,
+  removes generated files the new plan drops, and leaves files you added alone.
+  A file you changed is reported as a conflict and nothing is written.
+  `--dry-run` shows the plan; `--execution` and `--provider` default to the
+  declared values, and `--with`, `--without` and `--agent-name` work as in
+  `cayu new`. The plan notes when the local database path changes. Generated
+  `AGENTS.md` and `README.md` point to it.
+- `docker-coding-build.json` (schema version 2) takes `extra_uv_projects`, for
+  example `[{"path": "targets/my-service", "extras": ["dev"]}]`, for a target
+  project the coding agent works on. Its `pyproject.toml` and `uv.lock` become
+  build inputs recorded in the image receipt and `trusted_build_context_sha256`,
+  and a fixed `Dockerfile.coding` step installs its locked dependencies in
+  `/opt/targets/<name>/.venv`, so the Dockerfile stays unmodified (Cayu Cloud
+  builds only the unmodified file). A build file without the key declares
+  none. The generated README shows a `target-test` selector that runs the
+  target's tests from that environment.
+- The generated `Dockerfile.coding` installs dependencies (the project's
+  `uv sync`, the optional reviewed wheel and each `extra_uv_projects` sync) as
+  a temporary unprivileged build user instead of root, matching Cayu Cloud's
+  image builds. Root installs only the system packages and `uv`, then takes
+  ownership of the environments, clears setuid and setgid bits, deletes the
+  build user, and fails the build if any file it owned remains.
+  `docs/docker-coding-toolchains.md` lists the exact steps.
+- The nightly workflow now builds a freshly scaffolded `Dockerfile.coding` with
+  a wheel of the commit on an amd64 runner and runs
+  `tests/cli/test_scaffold_docker_live.py`, so a coding image that stops
+  building is caught within a day instead of at release. It is the
+  `docker-live-generated-coding-image` check in
+  `scripts/nightly_verification.py`.
 
 ## v0.14.0
 

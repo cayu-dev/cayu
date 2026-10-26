@@ -10,6 +10,26 @@ from cayu.cli.scaffold_plan import (
     ApplicationPlan,
     capability_spec,
     preset_spec,
+    removed_capability_files,
+)
+
+# Packages every project declares; a home whose capability `--without`
+# removed is left out of the generated architecture test.
+_CONVENTION_HOMES = (
+    "configuration",
+    "agents",
+    "prompts",
+    "tools",
+    "policies",
+    "environments",
+    "workflows",
+    "operations",
+    "knowledge",
+    "memory",
+    "domain",
+    "integrations",
+    "evals",
+    "observability",
 )
 
 _APP_PY = '''"""Composition root for __PROJECT_NAME__.
@@ -1571,21 +1591,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 REQUIRED_HOMES = (
-    "configuration",
-    "agents",
-    "prompts",
-    "tools",
-    "policies",
-    "environments",
-    "workflows",
-    "operations",
-    "knowledge",
-    "memory",
-    "domain",
-    "integrations",
-    "evals",
-    "observability",
-)
+__REQUIRED_HOMES__)
 
 
 def test_declared_convention_homes_exist() -> None:
@@ -1719,9 +1725,12 @@ Run the command through `uv --no-sync` so the disposable reference uses this
 project's installed, exactly pinned Cayu version even though its target directory
 is elsewhere. The project-local uv cache under ignored `.cayu/` keeps these
 commands usable in workspace-restricted coding-agent sandboxes. `cayu new`
-creates projects; it does not migrate an existing repository. For a reviewed
-plan change, adjust the reference flags, compare only the owning files, then
-update this project and `[tool.cayu.scaffold]` explicitly.
+creates projects. `uv run --no-sync cayu generate preset PRESET --dry-run --table`
+plans a change to another preset or capability set, such as `coding --execution
+docker`; it updates only files that still match what was generated and lists the
+ones you changed as conflicts instead of overwriting them. For anything else,
+adjust the reference flags, compare only the owning files, then update this
+project and `[tool.cayu.scaffold]` explicitly.
 
 Do not grant authority through prompts, add filesystem auto-discovery, rewrite
 arbitrary Python, start lifecycle work during import, or delete the scaffold
@@ -1766,6 +1775,7 @@ def convention_files(
     """Return the complete architecture overlay for one normalized plan."""
 
     selected = set(plan.capabilities)
+    removed = removed_capability_files(plan)
     agent_sandbox = plan.preset == "agent" and plan.execution == "docker"
     public_app_factories = (
         '["build_app", "build_coding_product_application"]'
@@ -1807,6 +1817,11 @@ def convention_files(
             "__TASKS_ENABLED__": repr("tasks" in selected),
             "__ENABLE_LOGGING__": repr("observability" in selected),
             "__PUBLIC_APP_FACTORIES__": public_app_factories,
+            "__REQUIRED_HOMES__": "".join(
+                f'    "{home}",\n'
+                for home in _CONVENTION_HOMES
+                if f"{home}/__init__.py" not in removed
+            ),
             "__TEST_KNOWLEDGE_IMPORT__": (
                 "from cayu.storage import InMemoryKnowledgeStore\n"
                 if "knowledge" in selected
@@ -1868,10 +1883,26 @@ def convention_files(
         return render(template, replacements)
 
     settings = configured(_SETTINGS_PY)
+    app = configured(_APP_PY)
+    # `--without` removed these packages, so the composition root skips them.
+    if "knowledge/retrieval.py" in removed:
+        app = _replace_once(app, "from knowledge.retrieval import build_knowledge_scope\n", "")
+        app = _replace_once(
+            app,
+            "    knowledge_scope = build_knowledge_scope()\n",
+            "    knowledge_scope = None\n",
+        )
+    if "memory/context.py" in removed:
+        app = _replace_once(app, "from memory.context import build_context_policy\n", "")
+        app = _replace_once(
+            app,
+            "        context_policy=build_context_policy(),\n",
+            "        context_policy=None,\n",
+        )
     files = dict(_OWNERSHIP_FILES)
     files.update(
         {
-            "app.py": configured(_APP_PY),
+            "app.py": app,
             "configuration/__init__.py": _CONFIGURATION_INIT_PY,
             "configuration/settings.py": settings,
             "configuration/providers.py": _PROVIDERS_PY,
@@ -1916,6 +1947,12 @@ def convention_files(
         if card_path is not None:
             files[card_path] = capability_card(plan, spec.name)
     return files
+
+
+def _replace_once(source: str, old: str, new: str) -> str:
+    if source.count(old) != 1:
+        raise RuntimeError(f"scaffold could not place {old.strip()!r}")
+    return source.replace(old, new)
 
 
 def capability_card(plan: ApplicationPlan, name: str) -> str:
@@ -2068,6 +2105,15 @@ def _capability_summary(plan: ApplicationPlan) -> str:
         if plan.preset in spec.extension_presets:
             state = "explicit extension; declare after wiring"
         rows.append(f"| `{spec.name}` | {state} | {spec.summary} |")
+    defaults = set(preset_spec(plan.preset).default_capabilities)
+    turned_off = [spec.name for spec in CAPABILITIES if spec.name in defaults - selected]
+    if turned_off:
+        rows.append(
+            "\n`--without` turned off "
+            + ", ".join(f"`{name}`" for name in turned_off)
+            + ", so the files only they use were not generated. To add one back later, "
+            "compare with a `cayu new --dry-run` reference that keeps it."
+        )
     return (
         "\n## Capability profile\n\n"
         "The scaffold contract, explicit registration, capability cards, and commands "

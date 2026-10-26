@@ -157,6 +157,27 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
 
     request.addfinalizer(remove_image)
 
+    # One declared target project: the fixed Dockerfile step installs its locked
+    # dependencies, with its "dev" extra, in /opt/targets/sample/.venv.
+    target = project / "targets" / "sample"
+    target.mkdir(parents=True)
+    (target / "pyproject.toml").write_text(
+        '[project]\nname = "sample"\nversion = "0.1.0"\nrequires-python = ">=3.11"\n'
+        "dependencies = []\n\n[project.optional-dependencies]\n"
+        'dev = ["iniconfig==2.0.0"]\n',
+        encoding="utf-8",
+    )
+    target_locked = subprocess.run(
+        [uv, "lock"],
+        cwd=target,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert target_locked.returncode == 0, (target_locked.stdout + target_locked.stderr)[-4000:]
+
     (project / "docker-coding-build.json").write_text(
         json.dumps(
             {
@@ -172,7 +193,8 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
                 "cayu_wheel": f".cayu/{wheel.name}",
                 "cayu_wheel_sha256": wheel_digest,
                 "extra_build_inputs": [],
-                "extra_probe_executables": [],
+                "extra_uv_projects": [{"path": "targets/sample", "extras": ["dev"]}],
+                "extra_probe_executables": ["/opt/targets/sample/.venv/bin/python"],
             },
             indent=2,
             sort_keys=True,
@@ -222,6 +244,8 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
         not item["path"].startswith(".cayu/") for item in image_configuration["dependency_inputs"]
     )
     assert image_configuration["trusted_build_context_sha256"].startswith("sha256:")
+    recorded_inputs = {item["path"] for item in image_configuration["dependency_inputs"]}
+    assert {"targets/sample/pyproject.toml", "targets/sample/uv.lock"} <= recorded_inputs
 
     spec = importlib.util.spec_from_file_location("live_generated_app", project / "app.py")
     assert spec is not None and spec.loader is not None
@@ -307,6 +331,30 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
             )
             assert installed.exit_code == 0
             assert installed.stdout.strip() == metadata["Version"]
+            target_environment = await environment.runner.exec(
+                ExecCommand.process(
+                    "/opt/targets/sample/.venv/bin/python",
+                    "-c",
+                    "import iniconfig, os, sys; print(sys.prefix, os.access(sys.prefix, os.W_OK))",
+                )
+            )
+            assert target_environment.exit_code == 0, target_environment.stderr
+            assert target_environment.stdout.split() == ["/opt/targets/sample/.venv", "False"]
+            # The unprivileged build user that installed both environments is gone,
+            # and root owns what it built.
+            ownership = await environment.runner.exec(
+                ExecCommand.process(
+                    "python3",
+                    "-c",
+                    "import os, pwd\n"
+                    "owners = {os.stat(path).st_uid for path in ("
+                    "'/opt/cayu-project', '/opt/cayu-project/.venv', "
+                    "'/opt/targets', '/opt/targets/sample/.venv')}\n"
+                    "try:\n    pwd.getpwuid(10001)\nexcept KeyError:\n    print(owners)\n",
+                )
+            )
+            assert ownership.exit_code == 0, ownership.stderr
+            assert ownership.stdout.strip() == "{0}"
             network = await environment.runner.exec(
                 ExecCommand.process(
                     "python3",

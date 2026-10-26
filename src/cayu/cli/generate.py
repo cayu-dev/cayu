@@ -220,6 +220,10 @@ def add_generate_parser(subparsers: Any) -> None:
         help="Plan without writes.",
     )
     add_output_options(service_context_parser)
+    # Imported here: generate_preset builds on this module's plan models.
+    from cayu.cli.generate_preset import add_preset_parser
+
+    add_preset_parser(generators)
 
 
 def run_generate(args: argparse.Namespace) -> int:
@@ -232,6 +236,10 @@ def run_generate(args: argparse.Namespace) -> int:
 
 
 def _run_generate(args: argparse.Namespace) -> int:
+    if args.generate_command == "preset":
+        from cayu.cli.generate_preset import run_generate_preset
+
+        return run_generate_preset(args)
     if args.generate_command not in {"slice", "tool", "service-context"}:
         return 2
     try:

@@ -623,6 +623,46 @@ def test_docker_toolchain_profiles_are_registered_as_uncredentialed_live_verific
     assert check.status_on_success == nightly.STATUS_VERIFIED
 
 
+def test_generated_docker_coding_image_check_needs_a_commit_wheel() -> None:
+    check = next(
+        check for check in nightly.CHECKS if check.id == "docker-live-generated-coding-image"
+    )
+
+    assert check.lane == "docker"
+    assert check.command == (
+        "uv",
+        "run",
+        "pytest",
+        "tests/cli/test_scaffold_docker_live.py",
+        "-q",
+    )
+    assert check.env == {"CAYU_REQUIRE_GENERATED_DOCKER_CODING": "1"}
+    assert check.required_env == ("CAYU_DOCKER_GENERATED_CODING_WHEEL",)
+    assert check.requires_docker is True
+    assert check.unset_env
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+
+    def runner(command, env):
+        pytest.fail("the check must not run without a wheel")
+
+    skipped = nightly.run_checks(
+        [check], environ={"CAYU_DOCKER_PATH": "/missing/docker"}, runner=runner
+    )[0]
+    assert skipped.status == nightly.STATUS_SKIPPED
+    assert "CAYU_DOCKER_GENERATED_CODING_WHEEL" in (skipped.reason or "")
+
+
+def test_nightly_workflow_builds_the_generated_coding_image_from_a_commit_wheel() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[2] / ".github" / "workflows" / "nightly.yml"
+    ).read_text()
+
+    assert "uv build --wheel" in workflow
+    assert "--check docker-live-generated-coding-image" in workflow
+    assert "CAYU_DOCKER_GENERATED_CODING_WHEEL" in workflow
+    assert '"x64"' in workflow or "ubuntu-latest" in workflow
+
+
 def test_microsandbox_guest_agent_liveness_is_registered_and_explicitly_gated() -> None:
     check = next(
         check for check in nightly.CHECKS if check.id == "microsandbox-live-guest-agent-liveness"

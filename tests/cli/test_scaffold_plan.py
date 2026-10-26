@@ -127,7 +127,7 @@ def test_default_agent_plan_is_the_complete_safe_local_profile() -> None:
     assert "tests/test_memory.py" in files
 
 
-def test_without_memory_disables_recall_but_retains_its_truthful_home() -> None:
+def test_without_memory_removes_its_files_and_composition_wiring() -> None:
     plan = normalize_application_plan(
         name="no-memory",
         agent_name="no-memory",
@@ -136,12 +136,68 @@ def test_without_memory_disables_recall_but_retains_its_truthful_home() -> None:
     files = project_files("no-memory", application_plan=plan)
 
     assert "memory" not in plan.capabilities
-    assert "memory/context.py" in files
-    # Disabled recall renders as a plain `return None`, not a literal branch.
-    assert "    return None\n" in files["memory/context.py"]
-    assert "AutomaticRecallContextPolicy(" not in files["memory/context.py"]
+    assert not [path for path in files if path.startswith("memory/")]
     assert "tests/test_memory.py" not in files
-    assert "available but not configured" in files["memory/CAPABILITY.md"]
+    assert "memory.context" not in files["app.py"]
+    assert "        context_policy=None,\n" in files["app.py"]
+    assert '    "memory",\n' not in files["tests/test_architecture.py"]
+    assert "`--without` turned off `memory`" in files["README.md"]
+    # Knowledge stays, and so does its retrieval seam.
+    assert "from knowledge.retrieval import build_knowledge_scope" in files["app.py"]
+    assert "knowledge/retrieval.py" in files
+
+
+def test_without_removes_only_files_no_selected_capability_still_owns() -> None:
+    without_approvals = project_files("shared", without_capabilities=("approvals",))
+    without_both = project_files("shared", without_capabilities=("approvals", "human-input"))
+
+    assert "operations/APPROVALS.md" not in without_approvals
+    assert "operations/approvals.py" in without_approvals
+    assert "operations/approvals.py" not in without_both
+
+
+def test_coding_without_knowledge_keeps_the_package_its_own_module_needs() -> None:
+    files = project_files("coder", preset="coding", without_capabilities=("knowledge",))
+
+    assert "knowledge/coding.py" in files
+    assert "knowledge/__init__.py" in files
+    assert "knowledge/retrieval.py" not in files
+    assert "knowledge/CAPABILITY.md" not in files
+
+
+def test_dry_run_groups_files_by_the_flag_that_removes_them(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["new", "grouped", "--dir", str(tmp_path), "--dry-run", "--json"]) == 0
+    groups = {
+        (item["name"], tuple(item["capabilities"])): item
+        for item in _json_output(capsys)["plan"]["file_groups"]
+    }
+
+    memory = groups[("memory", ("memory",))]
+    assert memory["remove_with"] == "--without memory"
+    assert "tests/test_memory.py" in memory["files"]
+    assert memory["private_files"] == ["data/memory-evidence.key"]
+    assert groups[("knowledge", ("knowledge",))]["remove_with"] == "--without knowledge,memory"
+    together = groups[("together", ("human-input", "approvals"))]
+    assert together["files"] == ["operations/approvals.py"]
+    assert "app.py" in groups[("core", ())]["files"]
+    # Every planned file lands in exactly one group, and every group is accurate.
+    grouped = [path for item in groups.values() for path in item["files"]]
+    assert len(grouped) == len(set(grouped))
+    for (name, _), item in groups.items():
+        if name in {"core", "any"} or item["required"]:
+            continue
+        excluded = item["remove_with"].removeprefix("--without ")
+        reduced = project_files("grouped", without_capabilities=(excluded,))
+        assert reduced.keys().isdisjoint(item["files"]), name
+
+    assert main(["new", "grouped", "--dir", str(tmp_path), "--dry-run"]) == 0
+    text = capsys.readouterr().out
+    assert "  capabilities: approvals, artifacts, evals, human-input, knowledge," in text
+    assert "  memory (5 files and 1 private; remove with --without memory):\n" in text
+    assert "    create private data/memory-evidence.key (content generated on apply)\n" in text
 
 
 def test_standard_capability_acceptance_is_emitted_only_for_its_complete_profile() -> None:
@@ -221,6 +277,7 @@ def test_coding_knowledge_opt_out_reaches_the_overlay(execution: str) -> None:
 def test_without_flags_disable_each_safe_default_deterministically(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     excluded = (
         "approvals",
@@ -252,21 +309,24 @@ def test_without_flags_disable_each_safe_default_deterministically(
     assert "build_tasks = False\n" in (project / "configuration" / "storage.py").read_text(
         encoding="utf-8"
     )
-    assert "AutomaticRecallContextPolicy(" not in (project / "memory" / "context.py").read_text(
-        encoding="utf-8"
-    )
-    for capability in excluded:
-        card_path = {
-            "approvals": "operations/APPROVALS.md",
-            "artifacts": "environments/ARTIFACTS.md",
-            "evals": "evals/CAPABILITY.md",
-            "human-input": "operations/HUMAN_INPUT.md",
-            "memory": "memory/CAPABILITY.md",
-            "observability": "observability/CAPABILITY.md",
-            "recovery": "operations/RECOVERY.md",
-            "tasks": "operations/TASKS.md",
-        }[capability]
-        assert "available but not configured" in (project / card_path).read_text(encoding="utf-8")
+    for removed in (
+        "memory",
+        "evals",
+        "observability",
+        "operations/approvals.py",
+        "operations/recovery.py",
+        "operations/tasks.py",
+        "operations/APPROVALS.md",
+        "operations/HUMAN_INPUT.md",
+        "operations/RECOVERY.md",
+        "operations/TASKS.md",
+        "environments/ARTIFACTS.md",
+    ):
+        assert not (project / removed).exists(), removed
+    assert (project / "knowledge" / "CAPABILITY.md").is_file()
+    # The reduced project still passes the source contract `cayu check` enforces.
+    monkeypatch.chdir(project)
+    assert main(["check", "--fail-on", "warning", "--json"]) == 0, capsys.readouterr().out
 
 
 def test_excluding_a_required_default_fails_before_writes(
@@ -293,7 +353,7 @@ def test_excluding_a_required_default_fails_before_writes(
     assert not (tmp_path / "broken-scope").exists()
 
 
-def test_service_can_disable_selectable_observability_without_erasing_its_home() -> None:
+def test_service_can_disable_selectable_observability_and_its_home() -> None:
     plan = normalize_application_plan(
         name="service",
         agent_name="service",
@@ -303,8 +363,16 @@ def test_service_can_disable_selectable_observability_without_erasing_its_home()
     files = project_files("service", application_plan=plan)
 
     assert "observability" not in plan.capabilities
-    assert "observability/__init__.py" in files
+    assert not [path for path in files if path.startswith("observability/")]
     assert "enable_logging=False" in files["configuration/runtime.py"]
+
+
+def test_presets_keep_homes_of_capabilities_they_do_not_turn_on() -> None:
+    # Memory isn't a coding default, so its home stays for later wiring.
+    files = project_files("coder", preset="coding")
+
+    assert "memory/context.py" in files
+    assert "available but not configured" in files["memory/CAPABILITY.md"]
 
 
 def test_legacy_coding_flags_normalize_to_the_canonical_plan(

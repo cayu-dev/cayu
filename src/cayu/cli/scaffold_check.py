@@ -18,6 +18,7 @@ from cayu.cli.scaffold_plan import (
     normalize_application_plan,
     normalize_extension_declarations,
     preset_spec,
+    removed_capability_files,
 )
 from cayu.runtime.checks import DiagnosticSeverity, ProjectDiagnostic
 from cayu.runtime.manifest import AppManifest
@@ -407,10 +408,14 @@ def _source_diagnostics(
         diagnostics.append(_invalid_scaffold_contract(exc))
         return tuple(diagnostics), None
 
+    # `--without` leaves out the files only a turned-off default capability uses.
+    removed = removed_capability_files(plan)
     required = tuple(
         relative
         for relative in _COMPLETE_REQUIRED_PATHS
-        if relative != "evals/agent.py" or "evals" in plan.capabilities
+        if (relative != "evals/agent.py" or "evals" in plan.capabilities)
+        and relative not in removed
+        and f"{relative}/.gitkeep" not in removed
     )
     for relative in required:
         if not _required_path_is_present(root, relative):
