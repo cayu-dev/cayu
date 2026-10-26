@@ -83,6 +83,7 @@ from cayu.immutable_inputs import (
     LocalImmutableInput,
     docker_immutable_input_capability,
 )
+from cayu.runners._cleanup import validate_cancel_timeout
 from cayu.runners.base import ExecCommand, Runner
 from cayu.runners.docker import DockerRunner, _require_docker, validate_docker_seccomp_profile
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
@@ -906,6 +907,16 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     only to commands without a durable receipt: ``run_command`` and ``run_check``
     inside an app's tool call have one, so their timeout or cancellation always
     removes the container.
+
+    ``cancel_timeout_s`` bounds how long one command cleanup or container
+    removal waits for Docker, as ``DockerRunner(cancel_timeout_s=...)`` does;
+    ``None`` keeps the runner default of five seconds. When it expires the
+    removal keeps running in the background, but a session's final container
+    close fails its workspace finalization and the session ends ``failed`` with
+    a retained cleanup obligation. Raise it on hosts where ``docker rm -f`` can
+    be slow, such as heavily loaded machines. It is operational and stays out
+    of the factory's configuration fingerprint, so raising it does not strand
+    sessions that are waiting to retry their cleanup.
     """
 
     @property
@@ -933,6 +944,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         deferred: bool = False,
         warm_spares: int = 0,
         command_cleanup: Literal["command_or_sandbox", "sandbox"] = "sandbox",
+        cancel_timeout_s: float | None = None,
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
@@ -984,6 +996,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self.deferred = deferred
         self.warm_spares = warm_spares
         self.command_cleanup: Literal["command_or_sandbox", "sandbox"] = command_cleanup
+        self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
         runtime_executables = (
             _DOCKER_CODING_RUNTIME_EXECUTABLES
             if git_baseline
@@ -1364,6 +1377,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                     container_id,
                     close_action="remove",
                     docker_path=self.docker_path,
+                    cancel_timeout_s=self.cancel_timeout_s,
                     _container_id=container_id,
                 ).close()
         store = self.immutable_input_store
@@ -1455,6 +1469,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 container_id,
                 close_action="remove",
                 docker_path=self.docker_path,
+                cancel_timeout_s=self.cancel_timeout_s,
                 _container_id=container_id,
             ).close()
         store = self.immutable_input_store
@@ -1735,6 +1750,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 close_action="remove",
                 docker_path=self.docker_path,
                 replace=False,
+                cancel_timeout_s=self.cancel_timeout_s,
                 cancellation_cleanup=self.command_cleanup,
                 timeout_cleanup=self.command_cleanup,
                 credential_mode=CredentialMode.TRUSTED_TOOL,
@@ -1791,6 +1807,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             immutable_input_mounts=immutable_mounts,
             cancellation_cleanup=self.command_cleanup,
             timeout_cleanup=self.command_cleanup,
+            cancel_timeout_s=self.cancel_timeout_s,
             _execution_environment_authority=(self._execution_environment_authority),
         )
 
@@ -1927,6 +1944,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 container_id,
                 close_action="remove",
                 docker_path=self.docker_path,
+                cancel_timeout_s=self.cancel_timeout_s,
                 _container_id=container_id,
             ).close()
 

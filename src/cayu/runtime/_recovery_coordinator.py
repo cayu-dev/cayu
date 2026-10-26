@@ -4008,6 +4008,7 @@ class RecoveryCoordinator:
                         publish_arguments=(
                             registered_tool is not None and registered_tool.publish_arguments
                         ),
+                        tool_schema=None if registered_tool is None else registered_tool.schema,
                     )
                     reason = tool_execution.policy_denial_reason(public_policy_result)
                     blocked_result = tool_execution.blocked_tool_result(
@@ -5010,6 +5011,7 @@ class RecoveryCoordinator:
                         publish_arguments=(
                             registered_tool is not None and registered_tool.publish_arguments
                         ),
+                        tool_schema=None if registered_tool is None else registered_tool.schema,
                     )
                     reason = tool_execution.policy_denial_reason(public_policy_result)
                     result = tool_execution.blocked_tool_result(

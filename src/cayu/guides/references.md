@@ -226,6 +226,53 @@ history and working files. Use explicit namespace, visibility, status, and
 actor fields. Prove local remember/search behavior with an in-memory or SQLite
 store before adding embeddings or remote infrastructure.
 
+Every store operation runs under a `KnowledgeAccessScope`. A store built with
+`access_scope=` (as the generated production store is) uses it for every call; an
+unbound store, such as a bare `InMemoryKnowledgeStore()` in tests, needs
+`access_scope=` on each call. A bound store refuses a different per-call scope.
+Application code writes and reads like this:
+
+```python
+from cayu.storage import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+    KnowledgeListQuery,
+    KnowledgeQuery,
+    KnowledgeStatus,
+)
+
+scope = KnowledgeAccessScope(
+    allowed_namespaces=["default"], allowed_statuses=[KnowledgeStatus.ACTIVE]
+)
+store = InMemoryKnowledgeStore(access_scope=scope)  # or SQLiteKnowledgeStore(path, access_scope=scope)
+
+await store.create_entry(
+    KnowledgeEntry(
+        id="not-a-bug-src-a-py-foo",
+        namespace="default",
+        kind="not-a-bug",
+        text="foo() in src/a.py returning None for empty input is intended.",
+        labels={"source": "scout", "module": "src/a.py"},
+    )
+)
+entry = await store.get_entry("not-a-bug-src-a-py-foo")
+
+# Filter-only reads (labels, kinds, source) use list_entries, not search.
+page = await store.list_entries(
+    KnowledgeListQuery(
+        namespace="default", kinds=["not-a-bug"], labels={"module": "src/a.py"}, limit=50
+    )
+)
+ids = [item.entry.id for item in page.entries]
+
+# search needs terms or text; filters only narrow it.
+hits = await store.search(KnowledgeQuery(text="empty input", namespace="default"))
+```
+
+Models get the same split through the `list_knowledge`, `search_knowledge` and
+`read_knowledge` tools.
+
 ## background-work
 
 `TaskStore` owns durable work; a dispatcher claims it and a worker executes it.

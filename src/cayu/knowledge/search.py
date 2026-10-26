@@ -253,7 +253,9 @@ class KnowledgeQuery(BaseModel):
             return self
         raise ValueError(
             "Knowledge query requires positive search terms, raw semantic text, "
-            "or exact aspect groups for auto/keyword search."
+            "or exact aspect groups for auto/keyword search. To find entries by "
+            "namespace, labels, kinds or source alone, list them instead with "
+            "`list_entries(KnowledgeListQuery(...))` or the `list_knowledge` tool."
         )
 
 

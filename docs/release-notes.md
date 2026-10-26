@@ -136,6 +136,50 @@ to keep it offline.
   within per-message and total byte bounds using each message's stored size,
   without loading oversized messages. See
   [session inspection](session-inspection.md#let-agents-read-earlier-sessions).
+- A `run_command` result that did not succeed now says why in its first line,
+  which is all most providers send the model. A read-only selector whose passing
+  test wrote a file used to read only "Command selector 'target-test' failed."
+  over a passing pytest summary; it now gives the exit code, says the selector is
+  read-only, and names up to five changed workspace paths. The structured result
+  still keeps only path counts and identities.
+- A denial from a built-in argument rule (`RequiredFieldRule`, `AllowlistRule`,
+  `RequiredAllowlistRule`, `DenyPatternRule`) no longer reaches the model as a
+  bare "Tool call denied by policy." when the tool's arguments are unpublished
+  or its secret scope is dynamic, as for `run_command` with a `base_policy`
+  selector allowlist. The model is told which declared argument failed and why,
+  for example "argument 'selector' is not one of the values this policy allows",
+  in runtime-owned text. Rejected values and allowlists are never published, and
+  the parameter must be declared in the tool's input schema. These rules'
+  denial metadata now includes a `violation` category.
+- `DockerCodingEnvironmentFactory(cancel_timeout_s=...)` sets how long a command
+  cleanup or container removal waits for Docker, for every runner the factory
+  creates, reconnects or disposes. It was fixed at five seconds, so on a heavily
+  loaded host a completed session could fail at its final container close with
+  "Runner finalization has not settled within its deadline." The default is
+  unchanged, and the value stays out of the factory's configuration fingerprint,
+  so raising it does not strand sessions waiting to retry cleanup.
+  `DockerRunner.reconnect_strict()` accepts the same parameter.
+- `cayu check` accepts `Decimal(<string or int literal>)` at import time, as a
+  module constant, dataclass default or Pydantic model default, and accepts
+  `Decimal` and `ZoneInfo` model annotations. `Decimal` values were reported as
+  `SCAFFOLD_IMPORT_SIDE_EFFECT`, which also stopped every check that needs the
+  loaded application. `ZoneInfo(...)` construction at import stays unsupported,
+  because a zone missing from the system database is loaded from the `tzdata`
+  package; build zones lazily. The applications guide now lists these forms,
+  `timedelta(...)` and `Path(...)`, and says that every module in the
+  application packages is checked, including ones the factory does not import at
+  module level.
+- `cayu guide verified-work` no longer says provider verifiers are rejected.
+  Provider-backed completion verifiers have shipped since 0.10.0; the guide now
+  shows how to register a `ProviderCompletionVerifier`, what the provider, task
+  store and identity must support, and how its budget works.
+- `cayu guide references#knowledge` now shows how application code writes an
+  entry, reads it back, lists entries by labels and kinds with
+  `list_entries(KnowledgeListQuery(...))`, and searches, and explains bound and
+  per-call access scopes. A store call without a scope now says to pass
+  `access_scope=` or construct the store with one, and a `KnowledgeQuery` with
+  only filters points to `list_entries(KnowledgeListQuery(...))` and the
+  `list_knowledge` tool.
 
 ## v0.14.0
 

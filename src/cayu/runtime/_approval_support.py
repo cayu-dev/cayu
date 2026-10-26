@@ -390,8 +390,13 @@ def public_policy_denial_result(
     secret_resolution_scope: Literal["static", "dynamic", "unknown"],
     policy_result: ToolPolicyResult,
     publish_arguments: bool = True,
+    tool_schema: Mapping[str, Any] | None = None,
 ) -> ToolPolicyResult:
-    """Remove argument-derived denial output without positive static evidence."""
+    """Remove argument-derived denial output without positive static evidence.
+
+    Without that evidence the model still learns which declared argument an
+    argument rule rejected and why, from runtime-owned text only.
+    """
 
     if secret_resolution_scope not in {"static", "dynamic", "unknown"}:
         raise ValueError("secret_resolution_scope must be static, dynamic, or unknown.")
@@ -411,7 +416,74 @@ def public_policy_denial_result(
         )
     if secret_resolution_scope == "static" and publish_arguments:
         return policy_result.model_copy(deep=True)
+    parameter_denial = _public_parameter_denial(policy_result.metadata, tool_schema)
+    if parameter_denial is not None:
+        return parameter_denial
     return ToolPolicyResult(decision=ToolPolicyDecision.DENY)
+
+
+# Runtime-owned text for argument-rule denials. Only the violation category and
+# a parameter name the tool's own schema declares are published, never values.
+_PARAMETER_DENIAL_HINTS = MappingProxyType(
+    {
+        "missing": "Tool call denied by policy: required argument {parameter} is missing.",
+        "empty": "Tool call denied by policy: argument {parameter} must not be empty.",
+        "wrong_type": "Tool call denied by policy: argument {parameter} has the wrong type.",
+        "disallowed_value": (
+            "Tool call denied by policy: argument {parameter} is not one of the values "
+            "this policy allows."
+        ),
+        "denied_pattern": (
+            "Tool call denied by policy: argument {parameter} matches a pattern this policy denies."
+        ),
+    }
+)
+_PUBLIC_PARAMETER_MAX_CHARS = 128
+
+
+def _public_parameter_denial(
+    metadata: Mapping[str, Any],
+    tool_schema: Mapping[str, Any] | None,
+) -> ToolPolicyResult | None:
+    """Publish a closed argument-rule category for a parameter the tool schema declares.
+
+    Metadata is policy output and may be forged, so neither field is trusted:
+    the category must be one of the closed hints, and the parameter path must
+    name properties the tool already publishes to the model in its schema.
+    """
+
+    violation = metadata.get("violation")
+    parameter = metadata.get("parameter")
+    if (
+        type(violation) is not str
+        or violation not in _PARAMETER_DENIAL_HINTS
+        or type(parameter) is not str
+        or not _schema_declares_parameter(tool_schema, parameter)
+    ):
+        return None
+    return ToolPolicyResult(
+        decision=ToolPolicyDecision.DENY,
+        reason=_PARAMETER_DENIAL_HINTS[violation].format(parameter=f"'{parameter}'"),
+        metadata={"parameter": parameter, "violation": violation},
+    )
+
+
+def _schema_declares_parameter(tool_schema: Mapping[str, Any] | None, parameter: str) -> bool:
+    if (
+        tool_schema is None
+        or not parameter
+        or len(parameter) > _PUBLIC_PARAMETER_MAX_CHARS
+        or not parameter.isprintable()
+        or "'" in parameter
+    ):
+        return False
+    schema: object = tool_schema
+    for segment in parameter.split("."):
+        properties = schema.get("properties") if isinstance(schema, Mapping) else None
+        if not isinstance(properties, Mapping) or segment not in properties:
+            return False
+        schema = properties[segment]
+    return True
 
 
 async def checkpoint_without_pending_approval(

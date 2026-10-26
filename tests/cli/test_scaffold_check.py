@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -1153,6 +1154,43 @@ def test_cli_check_reports_every_source_finding_when_import_is_unsafe(
         "SCAFFOLD_APP_COMPOSITION_DRIFT",
     ]
     assert report["diagnostics"][0]["parameters"]["reason"] == "import_time_effect"
+
+
+def test_cli_check_never_constructs_a_zone_that_can_import_project_tzdata(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    marker = tmp_path / "tzdata-payload-ran"
+    # zoneinfo falls back to importing `tzdata.zoneinfo` for a key missing from
+    # the system database, and the project root is first on sys.path.
+    (project / "tzdata").mkdir()
+    (project / "tzdata" / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    (project / "workflows" / "settings.py").write_text(
+        'from zoneinfo import ZoneInfo\n\nZONE = ZoneInfo("Cayu/Not_A_Zone")\n',
+        encoding="utf-8",
+    )
+    # Reached from the factory, so accepting the call would run the payload.
+    with (project / "agents" / "agent.py").open("a", encoding="utf-8") as agent_source:
+        agent_source.write("\nfrom workflows.settings import ZONE  # noqa: E402,F401\n")
+    for name in [name for name in sys.modules if name == "tzdata" or name.startswith("tzdata.")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert [(item["code"], item["path"]) for item in report["diagnostics"]] == [
+        ("SCAFFOLD_IMPORT_SIDE_EFFECT", "workflows/settings.py:3"),
+        ("SCAFFOLD_APPLICATION_NOT_IMPORTED", "app.py"),
+    ]
+    assert not marker.exists()
 
 
 def test_cli_check_still_loads_the_app_after_a_non_import_source_error(

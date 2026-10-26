@@ -1935,7 +1935,7 @@ The user-input prompt visibility described above requires a statically complete 
 
 A pending round that was durably classified as static cannot be continued after the same registered environment changes to dynamic secret resolution. Cayu rejects that capability upgrade before claiming or mutating the interrupted session because the earlier public prompt or policy fields cannot be recalled. Manual approval, user-input, and ordinary tool-round recovery also require positive static-scope evidence before publishing operator-supplied result, reason, or metadata fields. Dynamic or legacy/unknown recovery retains the operator's completed/failed classification but publishes a fixed unavailable result and empty audit text instead.
 
-Policy output follows the same positive-evidence rule because a custom policy receives private tool arguments and may derive its `reason` or `metadata` from them. A statically complete round retains the existing bounded public policy output. An ordinary denial in a dynamic or legacy/unknown round uses fixed denial diagnostics in its blocked event, hook result, transcript result, and export, so a sibling cannot resolve the same value after argument-derived policy output has already been published. A dynamic or legacy/unknown approval round keeps policy output only in the private approval checkpoint: `tool.call.approval_requested`, the nested `session.interrupted` approval, recovery events, and per-call descriptors omit `reason` and `metadata`, while pending actions use the fixed detail `Approval required`. If approval closure reconstructs a denied sibling, it uses the same fixed denial diagnostics. Approval identity, policy evidence, expiry, and private continuation state remain available.
+Policy output follows the same positive-evidence rule because a custom policy receives private tool arguments and may derive its `reason` or `metadata` from them. A statically complete round retains the existing bounded public policy output. An ordinary denial in a dynamic or legacy/unknown round uses fixed denial diagnostics in its blocked event, hook result, transcript result, and export, so a sibling cannot resolve the same value after argument-derived policy output has already been published. One closed exception applies to argument rules: when denial metadata carries a `violation` of `missing`, `empty`, `wrong_type`, `disallowed_value`, or `denied_pattern` and a `parameter` path that the tool's registered input schema declares, the public denial uses runtime-owned text naming that parameter and category, with metadata limited to those two fields. The built-in `ParameterConstrainedToolPolicy` rules emit these categories. Neither field is trusted: an unknown category or an undeclared path falls back to the fixed diagnostics, and rejected values and allowlists are never published. A dynamic or legacy/unknown approval round keeps policy output only in the private approval checkpoint: `tool.call.approval_requested`, the nested `session.interrupted` approval, recovery events, and per-call descriptors omit `reason` and `metadata`, while pending actions use the fixed detail `Approval required`. If approval closure reconstructs a denied sibling, it uses the same fixed denial diagnostics. Approval identity, policy evidence, expiry, and private continuation state remain available.
 
 Manual tool-round recovery installs an `incomplete_session_recovery_claim` in
 the same transaction that transitions the session to `RUNNING` and advances its
@@ -13658,7 +13658,11 @@ path, or a mutating selector that changes a path outside its declared prefixes,
 returns `unexpected_workspace_mutation` even when the process exits zero. If the
 post-command manifest cannot be completed, the result is `partial`; it cannot
 claim an admitted mutation. Receipts publish only manifest/path-set identities
-and counts, not repository paths or contents. Runtime-owned mutation capture
+and counts, not repository paths or contents. The model-facing text of a
+non-success result starts with one line that says why: for an unexpected
+mutation it gives the exit code, whether the selector is read-only or which
+scope was broken, the count, and up to five of the offending workspace-relative
+paths (longer or unprintable paths are only counted). Runtime-owned mutation capture
 remains an independent durable before/after evidence layer.
 
 The direct Docker process transport is a Linux subreaper. It retains its command
@@ -14046,7 +14050,12 @@ Evidence-bearing Docker creation and `DockerRunner.reconnect_strict()` accept
 `command_cleanup="command_or_sandbox"` opts in to keeping the container for
 commands without a durable receipt (see below), and the choice is part of the
 factory's configuration fingerprint, so a preserved session resumes only under
-the cleanup rules it was created with. When an
+the cleanup rules it was created with. `cancel_timeout_s` (default five seconds)
+is passed to every runner the factory creates, reconnects or disposes, and bounds
+how long one command cleanup or container removal waits for Docker. A final
+container close that outlives it fails workspace finalization and keeps the
+durable cleanup obligation while the removal continues in the background. The
+deadline is operational and stays out of the configuration fingerprint. When an
 evidence-bearing runner's admitted executables include `python3`, it runs every
 command, shell or process, in isolated mode (`python3 -I -S`) under a Python
 supervisor that is a child subreaper (`PR_SET_CHILD_SUBREAPER`),
@@ -16751,7 +16760,9 @@ only when the returned preview contains the complete authoritative source field.
 The bit defaults to false so custom stores that cannot prove completeness fail
 closed at later redaction boundaries.
 
-The store contract is intentionally entry/chunk oriented:
+The store contract is intentionally entry/chunk oriented. The calls below use
+a store bound with `access_scope=` at construction; on an unbound store every
+call also takes `access_scope=` and raises `TypeError` without one:
 
 ```python
 created = await store.create_entry(entry, chunks)

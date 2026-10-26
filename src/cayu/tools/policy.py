@@ -436,15 +436,26 @@ class RequiredFieldRule(ParameterRule):
         }
 
     def check(self, arguments: dict[str, Any]) -> str | None:
-        value = _get_argument_path(arguments, self._path)
-        if value is _MISSING:
-            return f"Required parameter '{self.parameter}' is missing."
-        if _is_empty_parameter_value(value):
-            return f"Required parameter '{self.parameter}' is empty."
-        return None
+        violation = self._violation(arguments)
+        return None if violation is None else violation[0]
+
+    def violation_metadata(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        # Subclasses may redefine ``check``; only this exact rule knows its category.
+        if type(self) is not RequiredFieldRule:
+            return {}
+        violation = self._violation(arguments)
+        return {} if violation is None else {"violation": violation[1]}
 
     def is_validity_violation(self, arguments: dict[str, Any]) -> bool:
         return type(self) is RequiredFieldRule
+
+    def _violation(self, arguments: dict[str, Any]) -> tuple[str, str] | None:
+        value = _get_argument_path(arguments, self._path)
+        if value is _MISSING:
+            return f"Required parameter '{self.parameter}' is missing.", "missing"
+        if _is_empty_parameter_value(value):
+            return f"Required parameter '{self.parameter}' is empty.", "empty"
+        return None
 
 
 class AllowlistRule(ParameterRule):
@@ -471,18 +482,31 @@ class AllowlistRule(ParameterRule):
         return None
 
     def check(self, arguments: dict[str, Any]) -> str | None:
-        value = _get_argument_path(arguments, self._path)
-        if value is _MISSING:
-            return None
-        if type(value) is not str:
-            return f"Parameter '{self.parameter}' must be a string for allowlist validation."
-        if value not in self.values:
-            return f"Parameter '{self.parameter}' value is not allowed."
-        return None
+        violation = self._violation(arguments)
+        return None if violation is None else violation[0]
+
+    def violation_metadata(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if type(self) is not AllowlistRule:
+            return {}
+        violation = self._violation(arguments)
+        return {} if violation is None else {"violation": violation[1]}
 
     def is_validity_violation(self, arguments: dict[str, Any]) -> bool:
         value = _get_argument_path(arguments, self._path)
         return value is not _MISSING and type(value) is not str
+
+    def _violation(self, arguments: dict[str, Any]) -> tuple[str, str] | None:
+        value = _get_argument_path(arguments, self._path)
+        if value is _MISSING:
+            return None
+        if type(value) is not str:
+            return (
+                f"Parameter '{self.parameter}' must be a string for allowlist validation.",
+                "wrong_type",
+            )
+        if value not in self.values:
+            return f"Parameter '{self.parameter}' value is not allowed.", "disallowed_value"
+        return None
 
 
 class RequiredAllowlistRule(ParameterRule):
@@ -559,19 +583,32 @@ class DenyPatternRule(ParameterRule):
         return None
 
     def check(self, arguments: dict[str, Any]) -> str | None:
-        value = _get_argument_path(arguments, self._path)
-        if value is _MISSING:
-            return None
-        if type(value) is not str:
-            return f"Parameter '{self.parameter}' must be a string for pattern validation."
-        for pattern in self._compiled_patterns:
-            if pattern.search(value):
-                return f"Parameter '{self.parameter}' matches a denied pattern."
-        return None
+        violation = self._violation(arguments)
+        return None if violation is None else violation[0]
+
+    def violation_metadata(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if type(self) is not DenyPatternRule:
+            return {}
+        violation = self._violation(arguments)
+        return {} if violation is None else {"violation": violation[1]}
 
     def is_validity_violation(self, arguments: dict[str, Any]) -> bool:
         value = _get_argument_path(arguments, self._path)
         return value is not _MISSING and type(value) is not str
+
+    def _violation(self, arguments: dict[str, Any]) -> tuple[str, str] | None:
+        value = _get_argument_path(arguments, self._path)
+        if value is _MISSING:
+            return None
+        if type(value) is not str:
+            return (
+                f"Parameter '{self.parameter}' must be a string for pattern validation.",
+                "wrong_type",
+            )
+        for pattern in self._compiled_patterns:
+            if pattern.search(value):
+                return f"Parameter '{self.parameter}' matches a denied pattern.", "denied_pattern"
+        return None
 
 
 class EveryCallRule(ParameterRule):

@@ -102,7 +102,11 @@ the check accepts without executing them:
   `frozenset()` or `tuple()` class defaults. A lambda body runs when an instance
   is created, not at import; a lambda with default arguments stays unproven.
 - Fixed instants `datetime(...)` and `date(...)` with integer literal fields and
-  `tzinfo=UTC` or `tzinfo=timezone.utc`.
+  `tzinfo=UTC` or `tzinfo=timezone.utc`, and `timedelta(...)` with literal fields.
+- `Decimal("3")` or `Decimal(3)` with one string or integer literal, as a module
+  constant, dataclass default or model default. Model fields may be annotated
+  `Decimal` or `ZoneInfo`.
+- `Path(...)` and `Path(...).resolve()`, for example `Path(__file__).resolve()`.
 - Type aliases such as `Callable[..., AbstractContextManager[T]]` built from
   `typing`, `collections.abc` and the `contextlib` context-manager ABCs.
 - `Enum`/`StrEnum`/`IntEnum`, `TypedDict` and `NamedTuple` declarations with
@@ -123,7 +127,21 @@ call that clearly performs I/O, network, process or file work (for example
 `reason: unsupported_expression` for a shape the check cannot prove inert (for
 example an application function call such as `load(...)`, including one nested
 inside a `ToolSpec`). Move either kind into a builder, lifecycle hook or tool
-`run`.
+`run`. A module-level call to your own helper, such as
+`RANKER = _helper_agent("ranker", ...)` returning an `AgentSpec`, is an application
+function call too: write the `AgentSpec(...)` out at module level, or build it in a
+function the factory calls.
+
+Build `ZoneInfo(...)` values lazily, inside a function or the factory, not at
+import: a zone missing from the system database is loaded from the `tzdata`
+package, and a project-local `tzdata` module would then run while `cayu check`
+imports the application. A module-level `ZoneInfo("...")` is reported as
+`SCAFFOLD_IMPORT_SIDE_EFFECT`.
+
+Every module in the application packages is checked, whether or not the factory
+imports it at module level. The factory, a service target or a deployment check can
+import modules lazily or by `module:attribute` name while `cayu check` runs, so a
+finding in any of them stops the import.
 
 Each cause is reported once, at the expression the check cannot prove. A class,
 annotation or import that only depends on a failing definition, such as every

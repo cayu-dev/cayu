@@ -1272,14 +1272,15 @@ def test_docker_coding_factory_refuses_weakened_privilege_restrictions(
 
 
 @pytest.mark.parametrize(
-    ("with_artifacts", "command_cleanup"),
-    [(False, None), (True, None), (False, "command_or_sandbox")],
+    ("with_artifacts", "command_cleanup", "cancel_timeout_s"),
+    [(False, None, None), (True, None, None), (False, "command_or_sandbox", 30.0)],
 )
 def test_docker_coding_factory_returns_only_exact_final_evidence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     with_artifacts: bool,
     command_cleanup: str | None,
+    cancel_timeout_s: float | None,
 ) -> None:
     restrictions = DockerWorkloadRestrictions()
     calls: list[list[str]] = []
@@ -1314,6 +1315,7 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
         ),
         docker_path="/usr/bin/docker",
         **({} if command_cleanup is None else {"command_cleanup": command_cleanup}),
+        **({} if cancel_timeout_s is None else {"cancel_timeout_s": cancel_timeout_s}),
     )
     request = EnvironmentFactoryRequest(
         session_id="session",
@@ -1369,6 +1371,7 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
         expected_cleanup = command_cleanup or "sandbox"
         assert runner.timeout_cleanup == expected_cleanup
         assert runner.cancellation_cleanup == expected_cleanup
+        assert runner.cancel_timeout_s == (cancel_timeout_s or 5.0)
         cancellation = next(
             claim for claim in evidence["claims"] if claim["capability"] == "confirmed_cancellation"
         )
@@ -1433,6 +1436,28 @@ def test_docker_coding_command_cleanup_is_an_explicit_option(tmp_path: Path) -> 
     assert default.execution_profile_identity != kept_container.execution_profile_identity
     with pytest.raises(ValueError, match="command_cleanup must be"):
         factory(command_cleanup="command")
+
+
+def test_docker_coding_cancel_timeout_is_an_operational_option(tmp_path: Path) -> None:
+    def factory(**kwargs: Any) -> DockerCodingEnvironmentFactory:
+        return DockerCodingEnvironmentFactory(
+            source_workspace=LocalWorkspace(tmp_path),
+            toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
+            **kwargs,
+        )
+
+    default = factory()
+    patient = factory(cancel_timeout_s=60)
+
+    assert default.cancel_timeout_s == 5.0
+    assert patient.cancel_timeout_s == 60.0
+    # Raising the deadline after a slow cleanup must not strand the session
+    # whose disposal retry is waiting under the earlier identity.
+    assert patient.execution_profile_identity == default.execution_profile_identity
+    with pytest.raises(ValueError, match="greater than zero"):
+        factory(cancel_timeout_s=0)
+    with pytest.raises(TypeError, match="must be numeric"):
+        factory(cancel_timeout_s="30")
 
 
 def test_docker_coding_container_removal_keeps_the_released_fingerprint() -> None:
@@ -1529,6 +1554,7 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
         immutable_inputs=(immutable_input,),
         immutable_input_store=store,
         immutable_input_runtime_compatibility_fingerprint=image_identity.fingerprint,
+        cancel_timeout_s=45,
     )
     create_request = EnvironmentFactoryRequest(
         session_id="reconnect",
@@ -1573,6 +1599,7 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
         assert reconnected.environment.runner.container_id == _CONTAINER_ID
         assert reconnected.environment.runner.timeout_cleanup == "sandbox"
         assert reconnected.environment.runner.cancellation_cleanup == "sandbox"
+        assert reconnected.environment.runner.cancel_timeout_s == 45.0
         assert store.inspect()[0].reference_count == 1
         assert (
             reconnected.environment.runner.execution_capability_evidence()

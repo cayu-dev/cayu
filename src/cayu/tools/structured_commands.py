@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 from cayu._command_diagnostics import CommandDenialCode, CommandValidationError
@@ -77,6 +78,21 @@ _OUTPUT_TRUNCATION_MARKER = "\n[command output preview truncated]"
 # Room a journaled result leaves for the fields terminal recovery adds
 # (``recovered``, ``replayed`` and ``dispatch``, about 64 bytes).
 _RECOVERY_EVIDENCE_HEADROOM_BYTES = 256
+# The model is told which paths broke a selector's mutation scope; the durable
+# evidence keeps only their identity. Longer or unprintable paths are counted.
+_MODEL_CONTENT_MAX_NAMED_PATHS = 5
+_MODEL_CONTENT_MAX_PATH_CHARS = 200
+_COMMAND_ERROR_EXPLANATIONS = MappingProxyType(
+    {
+        "workspace_observation_incomplete": (
+            "Cayu could not observe the whole workspace after the command, so its "
+            "workspace changes are unproven."
+        ),
+        "workspace_cleanup_deferred": "The runner has not finished settling the command.",
+        "workspace_cleanup_uncertain": "The runner could not prove that the command settled.",
+        "output_publication_incomplete": "The complete command output could not be retained.",
+    }
+)
 _COMMAND_MANIFEST_MAX_PATHS = 10_000
 _COMMAND_MANIFEST_MAX_FILE_BYTES = 8 * 1024 * 1024
 _COMMAND_MANIFEST_MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -809,7 +825,7 @@ class RunCommandTool(Tool):
                         authority,
                         before=before_manifest,
                         after=failed_after_manifest,
-                    ),
+                    )[0],
                     **process_timing,
                 },
                 artifacts=exc.artifacts,
@@ -1126,7 +1142,7 @@ class RunCommandTool(Tool):
             if exit_code == 0
             else "nonzero"
         )
-        mutation_evidence = _command_mutation_evidence(
+        mutation_evidence, unexpected_paths = _command_mutation_evidence(
             authority,
             before=before_manifest,
             after=after_manifest,
@@ -1226,9 +1242,9 @@ class RunCommandTool(Tool):
             projected["error"] = "workspace_cleanup_uncertain"
         result = ToolResult(
             content=_model_content(
-                selector=authority.selector,
-                status=status,
-                exit_code=exit_code,
+                headline=_command_headline(
+                    authority.selector, projected, unexpected_paths=unexpected_paths
+                ),
                 stdout=stdout_preview,
                 stdout_encoding=_command_output_encoding(projected, "stdout"),
                 stderr=stderr_preview,
@@ -1273,9 +1289,9 @@ class RunCommandTool(Tool):
                 projected["error"] = "output_publication_incomplete"
             result = ToolResult(
                 content=_model_content(
-                    selector=authority.selector,
-                    status=status,
-                    exit_code=exit_code,
+                    headline=_command_headline(
+                        authority.selector, projected, unexpected_paths=unexpected_paths
+                    ),
                     stdout=stdout_preview,
                     stdout_encoding=_command_output_encoding(projected, "stdout"),
                     stderr=stderr_preview,
@@ -2282,7 +2298,12 @@ def _command_mutation_evidence(
     *,
     before: _WorkspaceCommandManifest,
     after: _WorkspaceCommandManifest | None,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    """Return durable mutation evidence and the unexpected paths it identifies.
+
+    The evidence keeps only counts and identities; the paths are for the
+    model-facing explanation and are never stored with it.
+    """
     scope_identity = _mutation_scope_identity(authority)
     if after is None:
         return {
@@ -2296,7 +2317,7 @@ def _command_mutation_evidence(
             "changed_paths_identity": None,
             "unexpected_path_count": None,
             "unexpected_paths_identity": None,
-        }
+        }, ()
 
     before_paths = before.paths
     after_paths = after.paths
@@ -2313,7 +2334,7 @@ def _command_mutation_evidence(
         if authority.effect == "read_only"
         or not _path_is_within_mutation_scope(path, authority.mutation_path_prefixes)
     )
-    return {
+    evidence: dict[str, object] = {
         "complete": True,
         "scope_admitted": not unexpected_paths,
         "effect": authority.effect,
@@ -2331,6 +2352,7 @@ def _command_mutation_evidence(
             purpose="structured_command_unexpected_paths",
         ),
     }
+    return evidence, unexpected_paths
 
 
 def _path_is_within_mutation_scope(path: str, prefixes: tuple[str, ...]) -> bool:
@@ -2474,6 +2496,12 @@ def _bound_command_result_publication(
         return _minimal_publication_ceiling_result(authority, maximum=maximum)
 
     original = dict(result.structured)
+    # Keep a headline this module wrote, which can name paths the structured
+    # evidence holds only by identity; rebuild it from the evidence otherwise.
+    rebuilt_headline = _command_headline(authority.selector, original)
+    headline = rebuilt_headline
+    if result.content.startswith(f"Command selector {authority.selector!r} "):
+        headline = result.content.split("\n\n", 1)[0]
 
     def candidate(preview_maximum: int) -> ToolResult:
         stdout_preview, stdout_publication_truncated = _truncate_utf8(
@@ -2509,9 +2537,7 @@ def _bound_command_result_publication(
             }
         )
         content = _model_content(
-            selector=authority.selector,
-            status=str(projected["status"]),
-            exit_code=int(projected["exit_code"]),
+            headline=headline,
             stdout=stdout_preview,
             stdout_encoding=_command_output_encoding(projected, "stdout"),
             stderr=stderr_preview,
@@ -2532,6 +2558,9 @@ def _bound_command_result_publication(
     upper = authority.max_model_output_bytes
     # A zero-byte preview omits each stream rather than cutting it.
     bounded = candidate(0)
+    if _tool_result_publication_bytes(bounded) > maximum and headline != rebuilt_headline:
+        headline = rebuilt_headline
+        bounded = candidate(0)
     if _tool_result_publication_bytes(bounded) > maximum:
         return _minimal_publication_ceiling_result(authority, maximum=maximum)
     if not cut_output:
@@ -2621,21 +2650,70 @@ async def _store_output_artifact(
     return "stored", artifact.model_dump(mode="json")
 
 
+def _command_headline(
+    selector: str,
+    structured: Mapping[str, object],
+    *,
+    unexpected_paths: Sequence[str] = (),
+) -> str:
+    """Say in one line what happened, including why a command did not succeed."""
+
+    status = structured.get("status")
+    if status == "nonzero":
+        return (
+            f"Command selector {selector!r} settled with exit code {structured.get('exit_code')}."
+        )
+    headline = f"Command selector {selector!r} {status}."
+    explanation = _command_error_explanation(structured, unexpected_paths)
+    return headline if explanation is None else f"{headline} {explanation}"
+
+
+def _command_error_explanation(
+    structured: Mapping[str, object],
+    unexpected_paths: Sequence[str],
+) -> str | None:
+    error = structured.get("error")
+    if error != "unexpected_workspace_mutation":
+        return _COMMAND_ERROR_EXPLANATIONS.get(error) if type(error) is str else None
+    evidence: Any = structured.get("workspace_mutation_evidence")
+    count = evidence.get("unexpected_path_count") if isinstance(evidence, dict) else None
+    if type(count) is not int or count < 1:
+        count = None
+    noun = "workspace path" if count == 1 else "workspace paths"
+    changed = (
+        f"the command changed {noun}" if count is None else f"the command changed {count} {noun}"
+    )
+    if structured.get("effect") == "read_only":
+        explanation = f"this selector is read-only and {changed}"
+    else:
+        explanation = f"{changed} outside this selector's mutation scope"
+    named = [
+        path
+        for path in unexpected_paths
+        if len(path) <= _MODEL_CONTENT_MAX_PATH_CHARS and path.isprintable()
+    ][:_MODEL_CONTENT_MAX_NAMED_PATHS]
+    if named:
+        explanation += ": " + ", ".join(named)
+        remaining = (len(unexpected_paths) if count is None else count) - len(named)
+        if remaining > 0:
+            explanation += f" and {remaining} more"
+    exit_code = structured.get("exit_code")
+    if structured.get("process_status") in {"succeeded", "nonzero"} and type(exit_code) is int:
+        connector = "but" if structured.get("exit_code_admitted") is True else "and"
+        return f"The process exited with code {exit_code}, {connector} {explanation}."
+    return explanation[0].upper() + explanation[1:] + "."
+
+
 def _model_content(
     *,
-    selector: str,
-    status: str,
-    exit_code: int,
+    headline: str,
     stdout: str,
     stderr: str,
     stdout_encoding: str,
     stderr_encoding: str,
     truncated: bool,
 ) -> str:
-    first = f"Command selector {selector!r} {status}."
-    if status == "nonzero":
-        first = f"Command selector {selector!r} settled with exit code {exit_code}."
-    sections = [first]
+    sections = [headline]
     if stdout.strip():
         sections.append(f"{_command_output_label('stdout', stdout_encoding)}:\n{stdout.strip()}")
     if stderr.strip():

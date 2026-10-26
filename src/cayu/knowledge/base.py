@@ -115,7 +115,11 @@ class KnowledgeStore(ABC):
         default_scope = self._default_access_scope
         if access_scope is None:
             if default_scope is None:
-                raise TypeError("knowledge operation requires `access_scope`.")
+                raise TypeError(
+                    "knowledge operation requires `access_scope`: pass "
+                    "access_scope=KnowledgeAccessScope(...) to this call, or construct the "
+                    "store with access_scope=... to bind one for every call."
+                )
             return _intersect_resource_knowledge_scope(copy_knowledge_access_scope(default_scope))
         explicit_scope = copy_knowledge_access_scope(access_scope)
         if default_scope is not None and explicit_scope != default_scope:

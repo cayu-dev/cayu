@@ -310,6 +310,7 @@ def test_cayu_app_blocks_tool_call_before_execution_with_parameter_policy():
         "parameter": "value",
         "rule": "AllowlistRule",
         "rule_index": 0,
+        "violation": "disallowed_value",
     }
     tool_result_part = provider.requests[1].messages[-1].content[0]
     assert tool_result_part.content == "Parameter 'value' value is not allowed."

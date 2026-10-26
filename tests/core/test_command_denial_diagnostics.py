@@ -19,7 +19,12 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._approval_support import public_policy_denial_result
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult
+from cayu.tools.policy import (
+    ParameterConstrainedToolPolicy,
+    RequiredAllowlistRule,
+    ToolPolicyDecision,
+    ToolPolicyResult,
+)
 from cayu.tools.structured_commands import RunCommandTool, StructuredCommandToolPolicy
 
 
@@ -158,3 +163,108 @@ def test_command_diagnostic_round_checkpoint_roundtrip():
         assert public.command_denial_code == code
         assert public.reason == COMMAND_DENIAL_HINTS[code]
         assert "SECRET" not in public.model_dump_json()
+
+
+@pytest.mark.parametrize("simulated_tool_executables", [("/opt/tools/pytest",)], indirect=True)
+@pytest.mark.usefixtures("simulated_tool_executables")
+def test_base_policy_argument_rule_denial_names_rule_without_value():
+    async def run():
+        profile = _profile()
+        policy = StructuredCommandToolPolicy(
+            toolchain_profile=profile,
+            base_policy=ParameterConstrainedToolPolicy(
+                {"run_command": [RequiredAllowlistRule("selector", values=["focused-test"])]}
+            ),
+        )
+        args = {"selector": "SECRET-selector", "args": []}
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(id="denied", name="run_command", arguments=args),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = simulated_tool_app(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[RunCommandTool(toolchain_profile=profile)],
+            tool_policy=policy,
+        )
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="base-denial",
+                    messages=[Message.text("user", "check")],
+                )
+            )
+        ]
+        denied = next(e for e in events if e.type == EventType.TOOL_CALL_BLOCKED)
+        expected = (
+            "Tool call denied by policy: argument 'selector' is not one of the values "
+            "this policy allows."
+        )
+        assert denied.payload["reason"] == expected
+        assert denied.payload["metadata"] == {
+            "parameter": "selector",
+            "violation": "disallowed_value",
+        }
+        assert "SECRET" not in json.dumps(denied.payload)
+        assert any(expected in str(m) for m in provider.requests[-1].messages)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scope", ["static", "dynamic", "unknown"])
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"parameter": "SECRET", "violation": "disallowed_value"},
+        {"parameter": "selector.SECRET", "violation": "missing"},
+        {"parameter": "selector", "violation": "SECRET"},
+        {"parameter": "selector", "violation": ["missing"]},
+    ],
+)
+def test_argument_rule_denial_publishes_only_declared_parameters(scope, metadata):
+    schema = {"type": "object", "properties": {"selector": {"type": "string"}}}
+    forged = ToolPolicyResult(decision=ToolPolicyDecision.DENY, reason="SECRET", metadata=metadata)
+
+    public = public_policy_denial_result(
+        secret_resolution_scope=scope,
+        policy_result=forged,
+        publish_arguments=False,
+        tool_schema=schema,
+    )
+
+    assert public == ToolPolicyResult(decision=ToolPolicyDecision.DENY)
+
+
+def test_argument_rule_denial_follows_nested_schema_properties():
+    schema = {
+        "type": "object",
+        "properties": {"request": {"type": "object", "properties": {"url": {"type": "string"}}}},
+    }
+    result = ToolPolicyResult(
+        decision=ToolPolicyDecision.DENY,
+        reason="Parameter 'request.url' matches a denied pattern.",
+        metadata={"parameter": "request.url", "violation": "denied_pattern", "extra": "SECRET"},
+    )
+
+    public = public_policy_denial_result(
+        secret_resolution_scope="dynamic",
+        policy_result=result,
+        publish_arguments=False,
+        tool_schema=schema,
+    )
+
+    assert public.reason == (
+        "Tool call denied by policy: argument 'request.url' matches a pattern this policy denies."
+    )
+    assert public.metadata == {"parameter": "request.url", "violation": "denied_pattern"}

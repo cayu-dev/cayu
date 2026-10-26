@@ -735,6 +735,7 @@ class ToolInvocation:
                         secret_resolution_scope=policy_output_secret_resolution_scope,
                         policy_result=resolved_policy_result,
                         publish_arguments=registered_tool.publish_arguments,
+                        tool_schema=registered_tool.schema,
                     )
                 )
                 reason = tool_execution.policy_denial_reason(public_policy_result)
@@ -964,6 +965,7 @@ class ToolInvocation:
                             secret_resolution_scope=policy_output_secret_resolution_scope,
                             policy_result=reauthorization,
                             publish_arguments=registered_tool.publish_arguments,
+                            tool_schema=registered_tool.schema,
                         )
                     )
                     reason = tool_execution.policy_denial_reason(public_reauthorization)

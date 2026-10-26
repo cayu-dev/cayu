@@ -45,7 +45,7 @@ Keep these separate. Each one proves less than people often assume.
 | --- | --- | --- | --- |
 | Structured-output validation | provider request and schema | a response has the expected shape | that any work happened or is correct |
 | Completion proposal | `VerifiedTaskHandler.propose` | the worker claims one digest-bound result, with optional evidence | success; final model prose is never a proposal or a verdict |
-| Verifier decision | the registered `DeterministicCompletionVerifier` | a verdict for every criterion and constraint, with cited evidence and gaps | anything about other attempts; it never mutates state |
+| Verifier decision | the registered `DeterministicCompletionVerifier` or `ProviderCompletionVerifier` | a verdict for every criterion and constraint, with cited evidence and gaps | anything about other attempts; it never mutates state |
 | Result reconstruction | the registered `CompletionResultResolver` | the accepted result can be rebuilt from application evidence | correctness beyond the decision; Cayu only accepts a result whose digest equals the proposal's |
 | Task ownership | Cayu decision application | the task completes once, through a durable receipt | that external side effects happened exactly once |
 
@@ -121,13 +121,81 @@ before the verifier runs instead of silently changing how work is judged.
 - Gap `code` values are stable machine codes; the `summary` is for people and
   does not affect repetition detection.
 
-Provider-backed judging is optional, governed work, not a shortcut around this
-contract. The `provider` verifier kind is reserved: a contract may name it, but
-registering or running such a verifier is rejected today. When a
-model judgment is genuinely needed, run it as its own budgeted, attributable
-step, persist its output as evidence, and let a deterministic verifier decide
-whether that evidence satisfies the criteria. Calibrate such judges with
-`cayu guide evals-ai-quality`.
+## Provider-backed verifiers
+
+When a criterion needs a model's judgment, a contract can name a verifier of kind
+`provider`. Register a `ProviderCompletionVerifier` for it: the runtime calls the
+model as a judge, with no tools, and strictly decodes its answer into the same
+contract-complete decision a deterministic verifier returns.
+
+```python
+from cayu.messages import Message, MessageRole, TextPart
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.tasks import CompletionVerifierDispatchBudget, CompletionVerifierKind, CompletionVerifierRef
+from cayu.verification import ProviderCompletionVerifier, ProviderCompletionVerifierTarget
+
+
+class FindingJudge(ProviderCompletionVerifier):
+    @property
+    def execution_profile_identity(self):
+        return ExecutionProfileBehaviorIdentity(
+            name="example.finding_judge", behavior_version="1", implementation_version="1"
+        )
+
+    @property
+    def target(self):
+        return ProviderCompletionVerifierTarget(
+            provider_name="openai",
+            model="gpt-5",
+            max_input_tokens=20_000,
+            max_output_tokens=2_000,
+            attempt_timeout_seconds=60.0,
+            budget=CompletionVerifierDispatchBudget(max_attempts=4),
+        )
+
+    async def build_messages(self, request):
+        return [Message(role=MessageRole.SYSTEM, content=[TextPart(text="Judge the finding.")])]
+
+
+app.register_completion_verifier(
+    CompletionVerifierRef(
+        verifier_id="finding-judge",
+        version="1",
+        kind=CompletionVerifierKind.PROVIDER,
+        configuration_fingerprint="0" * 64,
+    ),
+    FindingJudge(),
+)
+```
+
+What registration and running need:
+
+- The target provider is already registered with the app, supports bounded
+  auxiliary requests, and has a stable execution-profile identity (the bundled
+  providers do).
+- The verifier declares a stable `execution_profile_identity`; without one,
+  registration fails with "Completion verifier registration requires stable
+  execution-profile identity."
+- `build_messages` is read-only and deterministic and returns text-only messages.
+  The runtime may call it again after a crash, and appends the objective,
+  criteria, constraints and cited evidence itself.
+- The task store records every provider attempt before calling the model. The
+  in-memory, SQLite and PostgreSQL task stores support this; a store without it
+  refuses to run the verifier with `CompletionVerifierUnavailable`.
+- `budget` bounds attempts and tokens per proposal across retries and restarts;
+  past it the verifier raises `ProviderCompletionVerifierBudgetExhausted` before
+  calling the model. Provider, timeout and decoding failures raise typed errors
+  and never count as a rejection. Read spend with
+  `CayuApp.list_completion_verifier_dispatches(...)`.
+- Give the verifier enough time: `VerifiedTaskWorker`'s
+  `verifier_timeout_seconds` (30 s by default) must cover the provider attempts.
+
+A contract names one verifier, so one proposal gets one model verdict. For several
+independent verdicts over the same evidence, run each judge as its own budgeted,
+attributable step, persist its verdict as evidence, and let a deterministic
+verifier decide whether that evidence satisfies the criteria. Calibrate judges with
+`cayu guide evals-ai-quality`. The runtime contract has the full dispatch ledger
+and profile rules.
 
 ## Attempts, repeated gaps, and budgets
 

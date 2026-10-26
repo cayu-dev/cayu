@@ -2924,11 +2924,13 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
         cancellation_cleanup: RunnerCleanupPolicy = "sandbox",
         timeout_cleanup: RunnerCleanupPolicy = "sandbox",
+        cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         _execution_environment_authority: ExecutionEnvironmentAuthority | None = None,
     ) -> DockerRunner:
         """Reattach to one exact strict container after re-verifying live evidence."""
 
         name = require_clean_nonblank(name, "name")
+        cancel_timeout = validate_cancel_timeout(cancel_timeout_s)
         cancellation_policy = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup", allow_sandbox_fallback=True
         )
@@ -3045,6 +3047,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             docker_path=docker,
             credential_mode=CredentialMode.TRUSTED_TOOL,
             allow_raw_secret_env=False,
+            cancel_timeout_s=cancel_timeout,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
             _container_id=container_id,

@@ -275,8 +275,9 @@ def test_in_memory_knowledge_access_scope_conformance() -> None:
 def test_knowledge_store_requires_or_binds_an_explicit_access_scope() -> None:
     async def run() -> None:
         unbound = InMemoryKnowledgeStore()
-        with pytest.raises(TypeError, match="requires `access_scope`"):
+        with pytest.raises(TypeError, match="requires `access_scope`") as missing:
             await unbound.search(KnowledgeQuery(text="anything"))
+        assert "construct the store with access_scope=" in str(missing.value)
 
         original = KnowledgeAccessScope.for_namespace("tenant-a")
         bound = InMemoryKnowledgeStore(access_scope=original)
@@ -655,6 +656,11 @@ def test_knowledge_query_rejects_structured_values_without_search_tokens(
 ) -> None:
     with pytest.raises(ValidationError, match="at least one token|requires"):
         KnowledgeQuery(**query_input)
+
+
+def test_filter_only_knowledge_query_points_to_list_entries() -> None:
+    with pytest.raises(ValidationError, match=r"list_entries\(KnowledgeListQuery"):
+        KnowledgeQuery(namespace="default", labels={"module": "src/a.py"}, kinds=["not-a-bug"])
 
 
 def test_semantic_knowledge_query_accepts_raw_text_without_lexical_tokens() -> None:

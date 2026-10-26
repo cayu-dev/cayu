@@ -177,6 +177,7 @@ def test_parameter_constrained_policy_denies_first_rule_violation_with_metadata(
         "parameter": "to",
         "rule": "AllowlistRule",
         "rule_index": 1,
+        "violation": "disallowed_value",
     }
 
 

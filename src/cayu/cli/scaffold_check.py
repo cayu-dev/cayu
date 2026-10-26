@@ -1535,36 +1535,24 @@ def _trusted_symbol(
     return binding
 
 
-def _stdlib_declaration_is_inert(
+_STDLIB_VALUE_CONSTRUCTORS = frozenset(
+    {
+        ("datetime", "datetime"),
+        ("datetime", "date"),
+        ("datetime", "timedelta"),
+        ("decimal", "Decimal"),
+    }
+)
+
+
+def _stdlib_value_is_inert(
     call: ast.Call,
     imports: Mapping[str, tuple[str, str | None]],
     rebound: frozenset[str],
     root: Path,
-    proofs: Mapping[str, _DeclarativeBinding],
 ) -> bool:
-    """Admit identity declarations with literal data, never arbitrary factories."""
+    """Admit a standard-library value built from literals; it has no descriptor hooks."""
     binding = _trusted_symbol(call.func, imports, rebound, root)
-    if (
-        isinstance(call.func, ast.Name)
-        and call.func.id == "set"
-        and call.func.id not in imports
-        and call.func.id not in rebound
-    ):
-        return not call.args and not call.keywords
-    if (
-        isinstance(call.func, ast.Name)
-        and call.func.id == "len"
-        and "len" not in imports
-        and "len" not in rebound
-    ):
-        return (
-            len(call.args) == 1
-            and not call.keywords
-            and isinstance(call.args[0], ast.Name)
-            and (proof := proofs.get(call.args[0].id)) is not None
-            and proof.enum_members is not None
-            and proof.line < call.lineno
-        )
     if binding in {("datetime", "datetime"), ("datetime", "date")}:
         # A fixed instant such as datetime(1970, 1, 1, tzinfo=UTC).
         fields = ("year", "month", "day") + (
@@ -1596,6 +1584,14 @@ def _stdlib_declaration_is_inert(
                 for keyword in call.keywords
             )
         )
+    if binding == ("decimal", "Decimal"):
+        # A literal amount such as Decimal("3"); a context or float stays unproven.
+        return (
+            len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Constant)
+            and type(call.args[0].value) in {str, int}
+        )
     if binding == ("datetime", "timedelta"):
         return (
             len(call.args) <= 3
@@ -1611,6 +1607,41 @@ def _stdlib_declaration_is_inert(
                 for keyword in call.keywords
             )
         )
+    return False
+
+
+def _stdlib_declaration_is_inert(
+    call: ast.Call,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+    proofs: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    """Admit identity declarations with literal data, never arbitrary factories."""
+    binding = _trusted_symbol(call.func, imports, rebound, root)
+    if (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "set"
+        and call.func.id not in imports
+        and call.func.id not in rebound
+    ):
+        return not call.args and not call.keywords
+    if (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "len"
+        and "len" not in imports
+        and "len" not in rebound
+    ):
+        return (
+            len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Name)
+            and (proof := proofs.get(call.args[0].id)) is not None
+            and proof.enum_members is not None
+            and proof.line < call.lineno
+        )
+    if binding in _STDLIB_VALUE_CONSTRUCTORS:
+        return _stdlib_value_is_inert(call, imports, rebound, root)
     if binding in {
         ("cayu.providers", "RetryPolicy"),
         ("cayu.providers.retry_policy", "RetryPolicy"),
@@ -1819,6 +1850,8 @@ def _pydantic_field_argument_is_declarative(
                 and proof.enum_members is not None
                 and proof.line < value.lineno
             )
+        if isinstance(value, ast.Call):
+            return _stdlib_value_is_inert(value, imports, rebound, root)
         return _declaration_value_is_inert(value, proofs)
     if isinstance(value, ast.Name):
         proof = proofs.get(value.id)
@@ -2015,7 +2048,15 @@ def _unsafe_import_time_expression(
                 if (
                     isinstance(statement, (ast.Assign, ast.AnnAssign))
                     and statement.value is not None
-                    and _declaration_value_is_inert(statement.value, class_proofs)
+                    and (
+                        _declaration_value_is_inert(statement.value, class_proofs)
+                        or (
+                            isinstance(statement.value, ast.Call)
+                            and _stdlib_value_is_inert(
+                                statement.value, import_bindings, class_scope, project_root
+                            )
+                        )
+                    )
                 ):
                     declarative_values.add(statement.value)
                 if isinstance(statement, ast.AnnAssign) and not _pydantic_annotation_is_declarative(
@@ -2128,6 +2169,15 @@ def _unsafe_import_time_expression(
                 )
                 or _empty_immutable_collection(
                     statement.value, import_bindings, rebound_names | class_bindings
+                )
+                or (
+                    isinstance(statement.value, ast.Call)
+                    and _stdlib_value_is_inert(
+                        statement.value,
+                        import_bindings,
+                        rebound_names | class_bindings,
+                        project_root,
+                    )
                 )
             )
         }
@@ -2337,6 +2387,12 @@ def _pydantic_annotation_is_declarative(
                     ("datetime", "datetime"),
                     ("datetime", "date"),
                     ("datetime", "timedelta"),
+                    ("decimal", "Decimal"),
+                    # Pydantic builds a plain validator for the annotation and
+                    # constructs nothing at class creation. Constructing a zone
+                    # can import the `tzdata` package, so `ZoneInfo(...)` calls
+                    # stay unproven.
+                    ("zoneinfo", "ZoneInfo"),
                     ("pydantic", "BaseModel"),
                     ("pydantic", "StrictInt"),
                     ("pydantic", "StrictStr"),

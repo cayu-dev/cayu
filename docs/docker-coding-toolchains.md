@@ -124,6 +124,11 @@ These codes survive durable tool-round recovery. Hints refer to the published
 selector contract and never interpolate rejected arguments or private profile
 values. Arbitrary policy reasons and metadata remain subject to the existing
 publication restrictions; a code permits only its runtime-owned constant hint.
+A `base_policy` denial from a built-in argument rule, such as a
+`RequiredAllowlistRule` on `selector`, reaches the model as runtime-owned text
+naming the declared argument and the violation category (for example "argument
+'selector' is not one of the values this policy allows"), never the rejected
+value or the allowlist.
 
 
 Structured commands also capture bounded content-and-Git-mode manifests immediately
@@ -132,7 +137,10 @@ leave the manifest unchanged; mutating selectors may change only their declared
 path prefixes. The receipt publishes counts and digest identities rather than
 repository paths, including for working directories and stale dependency inputs.
 An out-of-scope mutation is a failed result, while an incomplete post-command
-observation or deferred cleanup is explicitly partial/ambiguous.
+observation or deferred cleanup is explicitly partial/ambiguous. The model-facing
+text says why in its first line, so a read-only test selector whose test writes a
+file reads "failed. The process exited with code 0, but this selector is read-only
+and the command changed 1 workspace path: ..." and names up to five such paths.
 
 `RunnerWorkspace` captures each manifest in one bounded guest operation, hashing
 complete file contents under descriptor containment and rechecking observed

@@ -209,6 +209,65 @@ def test_executing_module_declarations_stay_rejected(tmp_path, statement):
     ]
 
 
+def test_literal_stdlib_values_are_declarative(tmp_path):
+    modules = {
+        "workflows/settings.py": """import decimal
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from pydantic import BaseModel, Field
+
+CAP = Decimal("3")
+FLOOR = decimal.Decimal(1)
+DATA = Path("data")
+
+
+@dataclass(frozen=True)
+class RunSettings:
+    rank_cap_usd: Decimal = Decimal("3")
+    window: timedelta = timedelta(minutes=5)
+    since: datetime = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class Budget(BaseModel):
+    zone: ZoneInfo | None = None
+    cap: Decimal = Decimal("2.50")
+    floor: Decimal = Field(default=Decimal("1"), ge=0)
+""",
+    }
+    assert _findings(tmp_path, modules) == []
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "CAP = Decimal(load())",
+        "CAP = Decimal('3', load())",
+        "CAP = Decimal(0.1)",
+        "ZONE = ZoneInfo('America/Los_Angeles')",
+        "ZONE = ZoneInfo(load())",
+        "ZONE = ZoneInfo(key='UTC')",
+        "ZONE = ZoneInfo.from_file(load())",
+        "@dataclass\nclass Settings:\n    cap: Decimal = Decimal(load())",
+        "@dataclass\nclass Settings:\n    zone: ZoneInfo = ZoneInfo('UTC')",
+    ],
+)
+def test_computed_stdlib_values_stay_rejected(tmp_path, statement):
+    source = (
+        "from dataclasses import dataclass\n"
+        "from decimal import Decimal\n"
+        "from zoneinfo import ZoneInfo\n"
+        "from vendor import load\n" + statement + "\n"
+    )
+    line = 4 + len(statement.splitlines())
+    assert _findings(tmp_path, {"domain/values.py": source}) == [
+        (f"domain/values.py:{line}", "unsupported_expression")
+    ]
+
+
 def test_module_level_effect_is_still_reported_beside_declarations(tmp_path):
     modules = {
         "domain/contracts.py": _MODELS,

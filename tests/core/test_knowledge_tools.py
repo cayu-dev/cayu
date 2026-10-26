@@ -2311,6 +2311,7 @@ def test_search_knowledge_runtime_requires_a_positive_search_field() -> None:
 
     assert result.is_error is True
     assert "requires positive search terms" in result.content
+    assert "`list_knowledge` tool" in result.content
 
 
 def test_search_knowledge_caps_model_facing_preview_per_hit() -> None:

@@ -777,6 +777,10 @@ def test_read_only_selector_rejects_observed_workspace_mutation(tmp_path: Path) 
     assert mutation["changed_path_count"] == 1
     assert mutation["unexpected_path_count"] == 1
     assert "generated/result.txt" not in str(mutation)
+    assert result.content.splitlines()[0] == (
+        "Command selector 'focused-test' failed. The process exited with code 0, but this "
+        "selector is read-only and the command changed 1 workspace path: generated/result.txt."
+    )
     assert result.is_error is True
 
 
@@ -1551,6 +1555,10 @@ def test_mutating_selector_enforces_declared_path_scope(tmp_path: Path) -> None:
     assert outside_scope.structured["status"] == "failed"
     assert outside_scope.structured["error"] == "unexpected_workspace_mutation"
     assert outside_scope.structured["workspace_mutation_evidence"]["scope_admitted"] is False
+    assert outside_scope.content.splitlines()[0] == (
+        "Command selector 'focused-test' failed. The process exited with code 0, but the "
+        "command changed 1 workspace path outside this selector's mutation scope: outside.txt."
+    )
     assert outside_scope.is_error is True
 
 
@@ -1740,3 +1748,28 @@ def test_structured_command_publication_ceiling_fits_the_terminal_bound() -> Non
     # after a restart fits the declared bound exactly as the live one did.
     assert default._result_publication_ceiling == 200_000
     assert tightened._result_publication_ceiling == 64 * 1024 - 4 * 1024
+
+
+def test_mutation_failure_headline_names_bounded_printable_paths() -> None:
+    from cayu.tools.structured_commands import _command_headline
+
+    paths = ["a" * 201, "bad\npath", *(f"out/{index}.txt" for index in range(6))]
+    structured = {
+        "status": "failed",
+        "error": "unexpected_workspace_mutation",
+        "effect": "workspace_mutating",
+        "process_status": "nonzero",
+        "exit_code": 2,
+        "exit_code_admitted": False,
+        "workspace_mutation_evidence": {"unexpected_path_count": len(paths)},
+    }
+
+    assert _command_headline("build", structured, unexpected_paths=paths) == (
+        "Command selector 'build' failed. The process exited with code 2, and the command "
+        "changed 8 workspace paths outside this selector's mutation scope: out/0.txt, "
+        "out/1.txt, out/2.txt, out/3.txt, out/4.txt and 3 more."
+    )
+    assert _command_headline("build", {**structured, "process_status": "timed_out"}) == (
+        "Command selector 'build' failed. The command changed 8 workspace paths outside "
+        "this selector's mutation scope."
+    )
