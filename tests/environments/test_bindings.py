@@ -4579,14 +4579,81 @@ def test_sync_binding_reserves_staging_from_measured_tree_not_declared_limits(
 
     assert (target_root / "b.txt").read_bytes() == b"x" * 100
     assert (source_root / "a.txt").read_bytes() == b"changed"
-    # Copy-in reserved the measured tree, not 3 x 4 MiB; its peak is the
-    # revision capture's one-file read allowance.
-    assert copy_in_peak <= 4 * mib + 64 * 1024
+    # Copy-in, copy-back and their revision checks reserve the measured
+    # 100-byte files and tar overhead, not the 4 MiB per-file limit.
+    assert copy_in_peak < 64 * 1024
     snapshot = capacity.snapshot()
-    # Copy-back keeps the declared per-file allowance for the source revision
-    # checks beside the measured archive.
-    assert 4 * mib < snapshot.peak_staged_bytes < 4 * mib + 64 * 1024
+    assert snapshot.peak_staged_bytes < 64 * 1024
     assert snapshot.staged_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("max_file_bytes", "staging_bytes"),
+    [
+        # A sandbox advertising 8 GiB staged copies derives a 4 GiB file limit,
+        # as large as the default staging domain.
+        (4 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
+        # A small staging domain must still observe and copy a tiny tree.
+        (256 * 1024 * 1024, 1024 * 1024),
+    ],
+)
+def test_revision_checks_reserve_measured_files_not_the_file_limit(
+    tmp_path, max_file_bytes, staging_bytes
+) -> None:
+    source_root = tmp_path / "source-tiny"
+    target_root = tmp_path / "target-tiny"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "one.txt").write_bytes(b"1")
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=staging_bytes)
+    binding = SyncBinding(
+        target_workspace=RunnerWorkspace(
+            LocalRunner(target_root, inherit_env=False),
+            workspace_id="target-tiny",
+            python_executable=sys.executable,
+        ),
+        max_file_bytes=max_file_bytes,
+        source_conflict_policy="require_revision",
+        staging_capacity=capacity,
+    )
+    source = LocalWorkspace(source_root, workspace_id="source-tiny")
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess-tiny")
+        (target_root / "one.txt").write_bytes(b"2")
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+    assert (source_root / "one.txt").read_bytes() == b"2"
+    assert capacity.snapshot().peak_staged_bytes < 64 * 1024
+
+
+def test_revision_check_refuses_a_source_file_that_grew_after_it_was_measured(
+    tmp_path, monkeypatch
+) -> None:
+    source_root = tmp_path / "source-grew"
+    source_root.mkdir()
+    (source_root / "one.txt").write_bytes(b"1")
+    source = LocalWorkspace(source_root, workspace_id="source-grew")
+    original_read = LocalWorkspace.read_bytes
+
+    async def read_after_growth(self, path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        (source_root / "one.txt").write_bytes(b"grown")
+        return await original_read(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(LocalWorkspace, "read_bytes", read_after_growth)
+
+    with pytest.raises(RuntimeError, match="grew while it was observed"):
+        asyncio.run(
+            bindings_module._capture_sync_source_revisions(
+                source,
+                ("one.txt",),
+                max_file_bytes=1024 * 1024,
+                max_total_bytes=1024 * 1024,
+                preserve_git_modes=False,
+            )
+        )
 
 
 def test_sync_binding_copies_back_a_tree_of_only_empty_files(tmp_path) -> None:

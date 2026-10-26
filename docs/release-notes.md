@@ -426,8 +426,11 @@ not affect execution or approval.
 - `SyncBinding` reserves staging capacity for the file sizes it measures
   (`LocalWorkspace` and `RunnerWorkspace` measure) instead of its declared
   limits, so raising the limits no longer fails a small tree with "transfer peak
-  exceeds staged byte capacity". The limits remain ceilings, and a file that
-  grows after it was measured fails the transfer.
+  exceeds staged byte capacity". With `source_conflict_policy="require_revision"`
+  the source revision checks also reserve the largest measured file instead of
+  `max_file_bytes`, so a brokered sandbox whose staged copies allow 8 GiB (and
+  so a 4 GiB file limit) still finalizes a small workspace. The limits remain
+  ceilings, and a file that grows after it was measured fails the transfer.
 - `run_command` and `run_check` capture the workspace manifest within the new
   `RunnerWorkspace(manifest_limits=WorkspaceManifestLimits(...))`, which the
   Docker and sandbox coding factories set from their transfer limits, instead

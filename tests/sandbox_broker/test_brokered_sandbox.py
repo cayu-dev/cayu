@@ -1069,6 +1069,31 @@ def test_the_default_file_limit_follows_the_sandboxs_staged_copies(tmp_path: Pat
     assert always.execution_profile_identity != _factory(broker, project).execution_profile_identity
 
 
+def test_a_tiny_workspace_finalizes_beside_an_8_gib_staged_copy_limit(tmp_path: Path) -> None:
+    # The derived 4 GiB file limit is as large as the default staging domain;
+    # the source revision checks must reserve the measured files, not it.
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.staged_copies = {
+        "max_bytes": 8 * 1024 * 1024 * 1024,
+        "sandbox_max_bytes": 16 * 1024 * 1024 * 1024,
+    }
+    source = _project(tmp_path)
+
+    async def scenario() -> int:
+        result = await _factory(broker, source).create(_request())
+        binding = result.environment.binding
+        bound = await _bind(result)
+        await bound.workspace.write_bytes("calc.py", b"def add(a, b):\n    return a + b\n")
+        await binding.finalize(bound, outcome="completed")
+        return binding.max_file_bytes
+
+    max_file_bytes = asyncio.run(scenario())
+
+    assert max_file_bytes == 4 * 1024 * 1024 * 1024
+    assert (source / "calc.py").read_bytes() == b"def add(a, b):\n    return a + b\n"
+    assert broker.live() == []
+
+
 def test_setup_commands_take_a_timeout_and_report_their_output(tmp_path: Path) -> None:
     broker = FakeBroker(tmp_path / "cloud")
     project = _project(tmp_path)

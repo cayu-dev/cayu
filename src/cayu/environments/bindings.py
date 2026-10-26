@@ -2300,6 +2300,17 @@ class SyncBinding(WorkspaceBinding):
         archive: _SealedTarArchive | None = None
         archive_reader: BinaryIO | None = None
         tar: tarfile.TarFile | None = None
+        # The source revision checks below read one source file at a time;
+        # reserve the largest one measured, not the declared per-file limit.
+        revision_read_limit = (
+            0
+            if allow_idempotent_replay
+            else await _sync_revision_read_limit(
+                source,
+                tuple(item.path for item in revisions),
+                max_file_bytes=max_file_bytes,
+            )
+        )
         try:
             members: dict[str, tarfile.TarInfo] = {}
             copied_bytes = 0
@@ -2327,9 +2338,7 @@ class SyncBinding(WorkspaceBinding):
                     requires_source_observation=True,
                     staging_capacity=staging_capacity,
                     observed=observed,
-                    # Covers the source revision checks below, which read
-                    # host files up to the declared per-file limit.
-                    minimum_transient_bytes=max_file_bytes,
+                    minimum_transient_bytes=revision_read_limit,
                 )
                 if plan is None:
                     raise AssertionError("Revision-aware SyncBinding requires finite staging.")
@@ -2382,6 +2391,7 @@ class SyncBinding(WorkspaceBinding):
                     max_total_bytes=max_total_bytes,
                     preserve_git_modes=self.preserve_git_modes,
                     staging_capacity=None if archive is not None else staging_capacity,
+                    max_read_bytes=revision_read_limit,
                 )
             await _report_sync_lifecycle(
                 EnvironmentLifecyclePhase.COPY_BACK_CONFLICT_PREFLIGHT,
@@ -3145,6 +3155,26 @@ def _validate_source_conflict_policy(value: object) -> SyncSourceConflictPolicy:
     return cast("SyncSourceConflictPolicy", value)
 
 
+async def _sync_revision_read_limit(
+    workspace: Workspace,
+    paths: tuple[str, ...],
+    *,
+    max_file_bytes: int,
+) -> int:
+    """The largest read the revision checks of ``paths`` need.
+
+    Each check reads one whole file at a time, so the largest measured file
+    plus one byte, which shows that a file grew, is enough. Without a
+    measurement the declared per-file limit applies.
+    """
+
+    if not paths:
+        return 0
+    sizes = await _observe_sync_transfer_sizes(workspace, paths)
+    limit = max_file_bytes if sizes is None else min(max_file_bytes, sizes.largest_file_bytes + 1)
+    return workspace.bounded_read_limit(limit)
+
+
 async def _capture_sync_source_revisions(
     workspace: Workspace,
     paths: tuple[str, ...],
@@ -3154,12 +3184,25 @@ async def _capture_sync_source_revisions(
     preserve_git_modes: bool,
     staging_capacity: SyncBindingStagingCapacity | None = None,
     retained_staged_bytes: int = 0,
+    max_read_bytes: int | None = None,
 ) -> _SyncSourceObservation:
+    """Read each file's revision, reserving staging for the measured sizes.
+
+    ``max_read_bytes`` caps each read at what the caller already reserved.
+    A file larger than the planned read changed or exceeds ``max_file_bytes``.
+    """
+
     revisions: list[_SyncSourceRevision] = []
     manifest: list[tuple[str, str, int, WorkspaceGitMode | None]] = []
     observed_bytes = 0
+    declared_read_limit = workspace.bounded_read_limit(max_file_bytes) if paths else 0
+    read_limit = (
+        await _sync_revision_read_limit(workspace, paths, max_file_bytes=max_file_bytes)
+        if max_read_bytes is None
+        else min(max_read_bytes, declared_read_limit)
+    )
     for path in paths:
-        read_reservation = workspace.bounded_read_limit(max_file_bytes)
+        read_reservation = read_limit
         read_lease: _CapacityLease | None = None
         if staging_capacity is not None:
             required = retained_staged_bytes + read_reservation
@@ -3190,6 +3233,8 @@ async def _capture_sync_source_revisions(
             if read_lease is not None:
                 read_lease.release()
         if truncated:
+            if read_limit < declared_read_limit:
+                raise RuntimeError(f"SyncBinding source file grew while it was observed: {path}")
             raise RuntimeError(
                 f"SyncBinding source file exceeds max_file_bytes={max_file_bytes}: {path}"
             )
@@ -3231,6 +3276,7 @@ async def _verify_sync_source_revisions(
     preserve_git_modes: bool,
     staging_capacity: SyncBindingStagingCapacity | None = None,
     retained_staged_bytes: int = 0,
+    max_read_bytes: int | None = None,
 ) -> None:
     try:
         current = await _capture_sync_source_revisions(
@@ -3241,6 +3287,7 @@ async def _verify_sync_source_revisions(
             preserve_git_modes=preserve_git_modes,
             staging_capacity=staging_capacity,
             retained_staged_bytes=retained_staged_bytes,
+            max_read_bytes=max_read_bytes,
         )
     except Exception as exc:
         path = revisions[0].path if revisions else "source-workspace"

@@ -318,6 +318,9 @@ def test_docker_runner_workspace_partial_read_drops_complete_file_identity(
 def _coding_product_test_binding(
     source_root: Path,
     target_root: Path,
+    *,
+    limits: DockerWorkspaceTransferLimits | None = None,
+    staging_capacity: SyncBindingStagingCapacity | None = None,
 ) -> tuple[
     _LocalDockerRunner,
     LocalWorkspace,
@@ -346,11 +349,13 @@ def _coding_product_test_binding(
     )
     binding = DockerCodingWorkspaceBinding(
         target_workspace=target,
-        limits=DockerWorkspaceTransferLimits(
+        limits=limits
+        or DockerWorkspaceTransferLimits(
             max_file_bytes=1024,
             max_total_bytes=4096,
             max_archive_bytes=64 * 1024,
         ),
+        staging_capacity=staging_capacity,
         source_copy_authority=CodingProductSourceCopyAuthority(
             request_fingerprint="sha256:" + "a" * 64,
             source_workspace_id=source.id,
@@ -359,6 +364,36 @@ def _coding_product_test_binding(
         ),
     )
     return runner, source, binding
+
+
+def test_docker_coding_default_limits_finalize_within_a_small_staging_domain(
+    tmp_path: Path,
+) -> None:
+    # The default 256 MiB file limit is far above this domain; the source
+    # revision checks reserve the measured files instead.
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "code.py").write_bytes(b"value = 1\n")
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=1024 * 1024)
+    runner, source, binding = _coding_product_test_binding(
+        source_root,
+        target_root,
+        limits=DockerWorkspaceTransferLimits(),
+        staging_capacity=capacity,
+    )
+
+    async def run() -> None:
+        bound = await binding.bind(source, runner, session_id="small-staging")
+        assert bound.workspace is not None
+        await bound.workspace.write_bytes("code.py", b"value = 2\n")
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+    assert (source_root / "code.py").read_bytes() == b"value = 2\n"
+    assert capacity.snapshot().peak_staged_bytes < 64 * 1024
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX executable modes")
