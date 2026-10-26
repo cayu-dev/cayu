@@ -1280,7 +1280,7 @@ def test_runner_workspace_measures_transfer_sizes_in_batches(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(runner_workspace_module, "_RUNNER_WORKSPACE_MEASURE_BATCH_BYTES", 16)
+    monkeypatch.setattr(runner_workspace_module, "_RUNNER_WORKSPACE_MEASURE_BATCH_BYTES", 40)
     (tmp_path / "nested").mkdir()
     (tmp_path / "a.txt").write_bytes(b"a" * 3)
     (tmp_path / "nested" / "b.txt").write_bytes(b"b" * 10)
@@ -1295,6 +1295,31 @@ def test_runner_workspace_measures_transfer_sizes_in_batches(
     assert runner.exec_calls == 2
     with pytest.raises(FileNotFoundError):
         asyncio.run(workspace._observe_transfer_sizes(("missing.txt",)))
+
+
+@pytest.mark.parametrize("character", ["\n", "界"], ids=["escaped", "unicode"])
+def test_runner_workspace_measurement_batches_fit_serialized_requests(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, character: str
+) -> None:
+    budget = 256
+    monkeypatch.setattr(runner_workspace_module, "_RUNNER_WORKSPACE_MEASURE_BATCH_BYTES", budget)
+    paths = tuple(f"file-{index}-{character * 20}" for index in range(12))
+    for path in paths:
+        (tmp_path / path).write_bytes(b"abc")
+    workspace = RunnerWorkspace(
+        LocalRunner(tmp_path, inherit_env=False), python_executable=sys.executable
+    )
+    operation = workspace._run_json_operation
+    requests: list[str] = []
+
+    async def record(*args, **kwargs):
+        requests.append(kwargs["stdin"])
+        return await operation(*args, **kwargs)
+
+    monkeypatch.setattr(workspace, "_run_json_operation", record)
+    assert asyncio.run(workspace._observe_transfer_sizes(paths)) == (36, 3)
+    assert requests
+    assert all(len(request.encode("utf-8")) <= budget for request in requests)
 
 
 def test_runner_workspace_rejects_path_and_pattern_escape(tmp_path) -> None:

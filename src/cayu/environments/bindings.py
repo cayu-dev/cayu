@@ -2463,10 +2463,13 @@ class SyncBinding(WorkspaceBinding):
                             except Exception:
                                 if not allow_idempotent_replay:
                                     raise
+                                # A larger source cannot match the target. Keep replay
+                                # verification within the admitted target-file room;
+                                # workspace reads require a one-byte probe for empties.
                                 current = await _read_sync_file_result(
                                     source,
                                     path,
-                                    max_file_bytes=max_file_bytes,
+                                    max_file_bytes=max(1, len(content)),
                                     max_total_bytes=max_total_bytes,
                                     copied_bytes=0,
                                 )

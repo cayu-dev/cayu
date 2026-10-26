@@ -2825,14 +2825,27 @@ def test_sync_binding_keeps_state_when_finalize_fails(tmp_path) -> None:
     assert not (source_root / "removed.txt").exists()
 
 
-def test_sync_binding_stale_recovery_replays_an_already_applied_create(tmp_path) -> None:
+@pytest.mark.parametrize("created_content", [b"created", b""], ids=["nonempty", "empty"])
+@pytest.mark.parametrize("source_grew", [False, True], ids=["already-applied", "conflict"])
+def test_sync_binding_stale_recovery_replays_an_already_applied_create(
+    tmp_path, created_content: bytes, source_grew: bool
+) -> None:
     source_root = tmp_path / "source-create-replay"
     target_root = tmp_path / "target-create-replay"
     source_root.mkdir()
     target_root.mkdir()
     (source_root / "b.txt").write_bytes(b"before")
 
+    replay_reads: list[int | None] = []
+
     class FailSecondMutation(LocalWorkspace):
+        async def read_bytes(
+            self, path: str, *, offset: int = 0, max_bytes: int | None = None
+        ) -> WorkspaceReadResult:
+            if path == "a-created.txt":
+                replay_reads.append(max_bytes)
+            return await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+
         failed = False
 
         async def replace_bytes(
@@ -2861,13 +2874,15 @@ def test_sync_binding_stale_recovery_replays_an_already_applied_create(tmp_path)
             max_file_bytes=1024,
         )
         bound = await original.bind(source, None, session_id="create-replay-original")
-        await target.write_bytes("a-created.txt", b"created")
+        await target.write_bytes("a-created.txt", created_content)
         await target.write_bytes("b.txt", b"after")
         stale_state = original._completion_finalization_recovery_state(bound)
         assert stale_state is not None
         with pytest.raises(SyncBindingSourceConflictError):
             await original.finalize(bound, outcome="completed")
         original.abandon(bound)
+        if source_grew:
+            (source_root / "a-created.txt").write_bytes(b"x" * 900)
 
         recovered_binding = SyncBinding(
             target_workspace=target,
@@ -2882,12 +2897,21 @@ def test_sync_binding_stale_recovery_replays_an_already_applied_create(tmp_path)
             environment_name="environment",
             recovery_state=stale_state,
         )
-        await recovered_binding.finalize(recovered, outcome="completed")
-        assert recovered_binding._states == {}
+        replay_reads.clear()
+        if source_grew:
+            with pytest.raises(SyncBindingSourceConflictError):
+                await recovered_binding.finalize(recovered, outcome="completed")
+            recovered_binding.abandon(recovered)
+        else:
+            await recovered_binding.finalize(recovered, outcome="completed")
+            assert recovered_binding._states == {}
+        assert replay_reads == [max(1, len(created_content))]
 
     asyncio.run(run())
-    assert (source_root / "a-created.txt").read_bytes() == b"created"
-    assert (source_root / "b.txt").read_bytes() == b"after"
+    assert (source_root / "a-created.txt").read_bytes() == (
+        b"x" * 900 if source_grew else created_content
+    )
+    assert (source_root / "b.txt").read_bytes() == (b"before" if source_grew else b"after")
 
 
 def test_sync_binding_deferred_finalize_advances_path_baselines(tmp_path) -> None:

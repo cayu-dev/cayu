@@ -1814,13 +1814,16 @@ class RunnerWorkspace(
         total_bytes = 0
         largest_file_bytes = 0
         batch: list[str] = []
-        batch_bytes = 0
+        batch_bytes = len('{"paths": []}')
         for index, path in enumerate(validated_paths):
             batch.append(path)
-            batch_bytes += len(path.encode("utf-8")) + 4
+            # json.dumps escapes non-ASCII and control characters. Count the
+            # serialized request, including separators and its object envelope.
+            batch_bytes += len(json.dumps(path)) + 2
             if (
                 index + 1 < len(validated_paths)
-                and batch_bytes < _RUNNER_WORKSPACE_MEASURE_BATCH_BYTES
+                and batch_bytes + len(json.dumps(validated_paths[index + 1])) + 2
+                <= _RUNNER_WORKSPACE_MEASURE_BATCH_BYTES
             ):
                 continue
             result = await self._run_json_operation(
@@ -1839,7 +1842,7 @@ class RunnerWorkspace(
             total_bytes += measured_total
             largest_file_bytes = max(largest_file_bytes, measured_largest)
             batch = []
-            batch_bytes = 0
+            batch_bytes = len('{"paths": []}')
         return total_bytes, largest_file_bytes
 
     async def _run_json_operation(
