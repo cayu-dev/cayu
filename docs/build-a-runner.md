@@ -539,6 +539,16 @@ contract; keep the leading underscore, and do not override them.
   `result.close_runner` is set, marks the runner closed after a completed
   `kill_sandbox`, and poisons it after any `kill_command` that is not
   `completed` or `deferred`, or any `kill_sandbox` that is not `completed`.
+- `_record_loss(reason)` records why the runner's execution resource is gone,
+  as a short lowercase code with no provider text (the built-in runners use
+  `container_missing`, `container_not_running`, `container_removed`,
+  `docker_daemon_unavailable` and `lease_lost`). The first call wins. When a
+  closed or poisoned runner has a loss reason, the admission check before the
+  next model step refuses it with `reason_code="runner_lost"`, `cause_code` set
+  to that reason, and `cause_event_seq`/`cause_event_id` pointing at the runner
+  event after which Cayu first saw the runner terminal. Read it with the public
+  `loss_reason` property. A runner without one is refused as `runner_closed` or
+  `runner_poisoned`, as before.
 
 ## Checklist
 

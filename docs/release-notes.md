@@ -37,7 +37,42 @@ through `ToolSpec.display`. Built-ins ship labels and `/api/agents` returns thei
 redacted declaration; tools without labels retain the name fallback. Labels do
 not affect execution or approval.
 
+If your app uses `SQLiteSessionStore` or `PostgresSessionStore` without a public
+authority alias keyring, registers an environment factory that doesn't declare
+`secret_resolution_scope = "static"` (or an environment with a vault or
+credential proxy), and gives an agent `write_file`, `exec_command` or another
+workspace-mutating tool, sessions now fail when the factory creates a fresh
+environment with a workspace, before the first model call, with a message naming
+the tool, environment and fixes (see the breaking change below). Before, every
+call to such a tool failed the session after the model had already run. A factory
+whose environments have no workspace is unaffected, and reconnecting an existing
+allocation is never refused. Declare the factory static when it never returns a
+vault or credential proxy, or configure a persistent keyring on the
+store and the app. Tests that use `CayuApp()` with no `session_store` never
+showed this, because the in-memory store makes its own key.
+
 ### Breaking changes
+
+- With a session store that has no public authority alias codec, Cayu now
+  refuses a pairing whose workspace observations it could never record: an
+  agent with a workspace-mutating tool (`WriteFileTool`, `EditFileTool`,
+  `DeleteFileTool`, `ApplyPatchTool`, `ExecCommandTool`, `RunCommandTool`,
+  `RunCheckTool`, `MaterializeSharedArtifactTool`) and an environment with a
+  workspace that resolves secrets dynamically. For a concrete environment with
+  a vault or credential proxy, `register_agent` or `register_environment`
+  raises. For a factory that doesn't declare a static scope, the session fails
+  when the factory creates a fresh environment with a workspace, before the
+  first model call, unless the session's tool ceiling excludes those tools.
+  Reconnecting an existing allocation (resume, recovery, finalization cleanup)
+  is never refused. The `RuntimeError` names the tool, the agent, the environment and
+  the fixes.
+  0.14.0 accepted the setup and failed the session on the tool's first call with
+  "Dynamic workspace observation authority requires a configured public
+  authority alias keyring." If such a call still happens (for example through
+  registrations that bypass `CayuApp`), only that call fails, as
+  `tool.call.failed` with `reason="workspace_observation_keyring_unavailable"`
+  and a message naming the tool and environment, before any workspace state is
+  written; the session goes on.
 
 - `run_task_worker(execution_timeout_s=...)` now includes the grace period. The
   last `execution_grace_s` seconds of the limit are the grace period (30 seconds
@@ -124,6 +159,20 @@ not affect execution or approval.
 
 ### Changes
 
+- When a sandbox disappears mid-session, the admission refusal that ends the
+  session now says so. A closed or poisoned runner whose execution resource is
+  gone is refused with `reason_code="runner_lost"` instead of `runner_closed` or
+  `runner_poisoned`, plus a classified `cause_code` and a reference to the event
+  after which the runner was closed (`cause_event_seq`, `cause_event_id`), in
+  both `execution_admission.refusals` and the message, for example
+  "admission evidence (runner_lost: container_missing, closed after event seq
+  4171) [missing_final_evidence]". After a command fails, `DockerRunner` runs one
+  bounded `docker container inspect` before cleanup and records
+  `container_missing`, `container_not_running` or `docker_daemon_unavailable`;
+  a sandbox removed by command cleanup is `container_removed`, and a brokered
+  sandbox whose lease lapsed is `lease_lost`. Docker's error text is still kept
+  out of events. Custom runners can report a reason with `Runner._record_loss`,
+  and anyone can read it from `Runner.loss_reason`.
 - `cayu-cloud.toml` can declare the command that migrates an Agent's own tables,
   `[database] migrate = "alembic upgrade head"`, so Cayu Cloud can run it on deploy.
   `cayu cloud deploy` sends it only when declared, and names a Cayu Cloud that

@@ -1203,6 +1203,7 @@ class Runner(ABC):
     _exec_closed: bool = False
     _exec_closed_reason: str | None = None
     _exec_poisoned: bool = False
+    _loss_reason: str | None = None
     _command_cleanups_pending: int = 0
     _closing: bool = False
     _terminal_lifecycle_task: asyncio.Task[CapturedAwaitableOutcome[None]] | None = None
@@ -1458,6 +1459,26 @@ class Runner(ABC):
         if self._closing or self._command_cleanups_pending:
             return "closing"
         return "fenced" if self._exec_closed else "reusable"
+
+    @property
+    def loss_reason(self) -> str | None:
+        """Classified reason this runner's execution resource was lost, if known.
+
+        A short, content-free code such as ``"container_missing"``,
+        ``"container_not_running"``, ``"container_removed"``,
+        ``"docker_daemon_unavailable"`` or ``"lease_lost"``; ``None`` when the
+        runner has no evidence of loss. It never carries provider error text.
+        Admission reports it, with the runtime event that closed the runner,
+        when it refuses a runner that is closed or poisoned.
+        """
+
+        return self._loss_reason
+
+    def _record_loss(self, reason: str) -> None:
+        """Keep the first classified loss reason; later causes are consequences."""
+
+        if self._loss_reason is None:
+            self._loss_reason = reason
 
     def workspace_capability(
         self,

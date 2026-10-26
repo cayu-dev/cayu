@@ -1255,6 +1255,32 @@ _COMMAND_TREE_OBSERVER_SYSTEM_TREES = (
 _COMMAND_TREE_OBSERVER_USER = "0:0"
 _COMMAND_TREE_START_SECONDS = 1.0
 _COMMAND_TREE_SETTLE_SECONDS = 2.0
+# Bounds the one container lookup made after a failed command, before cleanup.
+_CONTAINER_LOSS_PROBE_TIMEOUT_SECONDS = 5
+_DOCKER_CONTAINER_MISSING_MARKERS = ("no such container", "no such object")
+# Older and newer Docker CLI wordings for an unreachable daemon.
+_DOCKER_DAEMON_UNAVAILABLE_MARKERS = (
+    "cannot connect to the docker daemon",
+    "is the docker daemon running",
+    "failed to connect to the docker api",
+    "error during connect",
+)
+
+
+def _classify_container_probe(result: ExecResult) -> str | None:
+    """Map one ``docker container inspect`` outcome to a fixed loss code."""
+
+    if result.timed_out:
+        return "docker_daemon_unavailable"
+    if result.exit_code == 0:
+        status = result.stdout.strip()
+        return None if status == "running" else "container_not_running"
+    stderr = result.stderr.lower()
+    if any(marker in stderr for marker in _DOCKER_DAEMON_UNAVAILABLE_MARKERS):
+        return "docker_daemon_unavailable"
+    if any(marker in stderr for marker in _DOCKER_CONTAINER_MISSING_MARKERS):
+        return "container_missing"
+    return None
 
 
 async def _run_docker(
@@ -4000,11 +4026,32 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
                 # the same policy as an interrupted caller before returning the
                 # primary failure; otherwise a failed source/sink can strand work
                 # in the container while the runner still appears reusable.
-                cleanup = await self._cleanup_command(
-                    handle=handle,
-                    policy=self.cancellation_cleanup,
-                    durable=receipt is not None,
-                )
+                # Fence reuse before the loss probe yields, and keep the fence
+                # until cleanup settles, so no new command starts in between.
+                self._command_cleanups_pending += 1
+                try:
+                    try:
+                        loss = await self._observe_container_loss()
+                    except asyncio.CancelledError as cancellation:
+                        cleanup = await self._cleanup_command(
+                            handle=handle,
+                            policy=self.cancellation_cleanup,
+                            durable=receipt is not None,
+                            cancellation=cancellation,
+                        )
+                        self._apply_cleanup_result(cleanup)
+                        attach_cancellation_artifacts(cancellation, cleanup.artifacts)
+                        raise
+                    if loss is not None:
+                        self._record_loss(loss)
+                    cleanup = await self._cleanup_command(
+                        handle=handle,
+                        policy=self.cancellation_cleanup,
+                        durable=receipt is not None,
+                    )
+                finally:
+                    self._command_cleanups_pending -= 1
+                    self._command_cleanup_settled()
                 self._apply_cleanup_result(cleanup)
                 attach_cancellation_artifacts(exc, cleanup.artifacts)
                 raise
@@ -4134,7 +4181,31 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
         await self._settle_terminal_lifecycle(
             self._remove_container, action="remove", timeout_s=self.cancel_timeout_s
         )
+        if self._container_removed:
+            # Command cleanup, not session finalization, removed the sandbox.
+            self._record_loss("container_removed")
         return True
+
+    async def _observe_container_loss(self) -> str | None:
+        """Classify why a failed command's container may be unusable, never raising.
+
+        Runs one bounded ``docker container inspect`` after an exec failure and
+        before cleanup, so the classification describes the container as the
+        failure left it. The result is a fixed code; Docker's text is not kept.
+        """
+
+        try:
+            result = await _run_docker(
+                self.docker_path,
+                ["container", "inspect", "--format", "{{.State.Status}}", self.container_reference],
+                docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+                timeout_s=_CONTAINER_LOSS_PROBE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        return _classify_container_probe(result)
 
     async def _remove_container(self) -> None:
         result = await _run_docker(

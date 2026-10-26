@@ -69,7 +69,9 @@ from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRest
 from cayu.runners.local import LocalRunner
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.memory import InMemorySessionStore
+from cayu.sessions.records import EventRecord
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
@@ -82,6 +84,7 @@ from cayu.tools.base import (
     ToolSpec,
 )
 from cayu.tools.command_policy import ProcessCommandPolicy
+from cayu.tools.commands import ExecCommandTool
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.named_checks import NamedCheck, RunCheckTool
 from cayu.tools.search import SearchTextTool
@@ -2922,6 +2925,105 @@ def test_runner_closed_by_command_cleanup_is_refused_by_state_not_evidence_age(
     ]
 
 
+@pytest.mark.parametrize("terminal_state", ["closed", "poisoned"])
+def test_lost_runner_refusal_names_loss_reason_and_closing_event(terminal_state: str) -> None:
+    """A runner whose sandbox is gone is refused as runner_lost, not as a policy refusal."""
+
+    class LosingRunner(_RenewingEvidenceRunner):
+        def _live_candidate(self, *, valid_for_seconds, drift_field=None):
+            candidate = super()._live_candidate(
+                valid_for_seconds=valid_for_seconds, drift_field=drift_field
+            )
+            evidence = candidate.evidence
+            assert evidence is not None
+            now = datetime.now(UTC)
+            executable = admission_module.ExecutionExecutableEvidence(
+                executable="rg",
+                state="live_verified",
+                observed_at=now,
+                valid_until=now + timedelta(seconds=valid_for_seconds),
+                requirement_fingerprint=ToolExecutableRequirement(executable="rg").fingerprint,
+            )
+            return candidate.model_copy(
+                update={
+                    "evidence": evidence.model_copy(
+                        update={
+                            "tool_requirements": admission_module.ExecutionToolRequirementEvidence(
+                                environment_fingerprint=evidence.environment_fingerprint,
+                                image_fingerprint=evidence.image_fingerprint,
+                                executables=(executable,),
+                            )
+                        }
+                    )
+                }
+            )
+
+        async def exec(self, command, **kwargs) -> ExecResult:
+            del command, kwargs
+            self._record_loss("container_missing")
+            if terminal_state == "closed":
+                self._closed = True
+            else:
+                self._poison_exec()
+            # The command could not reach its sandbox; its cleanup ended the runner.
+            return ExecResult(exit_code=125)
+
+    class ExecProvider(ModelProvider):
+        name = "exec-provider"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call_exec", name="exec_command", arguments={"argv": ["true"]}
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> tuple[list[Event], ExecProvider, LosingRunner, EventRecord]:
+        provider = ExecProvider()
+        runner = LosingRunner()
+        runner.current_candidate = runner._live_candidate(valid_for_seconds=60)
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="hosted"), runner=runner), default=True
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SearchTextTool(), ExecCommandTool()],
+        )
+        session_id = f"sess_lost_runner_{terminal_state}"
+        events = await _run(app, session_id)
+        [record] = await app.session_store.query_events(
+            EventQuery(session_id=session_id, event_type=EventType.RUNNER_EXEC_COMPLETED)
+        )
+        return events, provider, runner, record
+
+    events, provider, runner, record = asyncio.run(run())
+
+    assert runner.lifecycle_state == terminal_state
+    assert len(provider.requests) == 1
+    completion = record.event
+    sequence = record.sequence
+    failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    assert failed.payload["error_type"] == "ExecutionAdmissionError"
+    assert (
+        f"admission evidence (runner_lost: container_missing, closed after event seq "
+        f"{sequence}) [missing_final_evidence]"
+    ) in failed.payload["error"]
+    [refusal] = failed.payload["execution_admission"]["refusals"]
+    assert refusal["code"] == "missing_final_evidence"
+    assert refusal["reason_code"] == "runner_lost"
+    assert refusal["cause_code"] == "container_missing"
+    assert refusal["cause_event_seq"] == sequence
+    assert refusal["cause_event_id"] == completion.id
+
+
 @pytest.mark.parametrize("mismatch", ["runner", "requirements", "type"])
 def test_public_admission_rejects_mismatched_observer_before_provider(mismatch):
     class MismatchedRunner(_EvidenceRunner):
@@ -5698,5 +5800,8 @@ def test_missing_final_runner_evidence_returns_structured_refusal() -> None:
             "observed_state": "mismatched",
             "reason_code": None,
             "remediation_code": None,
+            "cause_code": None,
+            "cause_event_id": None,
+            "cause_event_seq": None,
         }
     ]

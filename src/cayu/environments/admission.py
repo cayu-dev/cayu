@@ -588,6 +588,12 @@ class ExecutionAdmissionRefusal(BaseModel):
     observed_state: ExecutionObservedCapabilityState | None = None
     reason_code: CapabilityIdentity | None = None
     remediation_code: CapabilityIdentity | None = None
+    # Set with reason_code="runner_lost": the runner's classified loss reason
+    # (for example "container_missing" or "lease_lost") and the session event
+    # after which the runner was closed or poisoned, when Cayu observed one.
+    cause_code: CapabilityIdentity | None = None
+    cause_event_id: str | None = Field(default=None, max_length=128)
+    cause_event_seq: int | None = Field(default=None, ge=1)
 
     @field_validator("executable")
     @classmethod
@@ -595,6 +601,13 @@ class ExecutionAdmissionRefusal(BaseModel):
         if value is None:
             return None
         return require_durable_clean_nonblank(value, "executable")
+
+    @field_validator("cause_event_id")
+    @classmethod
+    def validate_optional_cause_event_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "cause_event_id")
 
 
 class ExecutionAdmissionDecision(BaseModel):
@@ -634,10 +647,14 @@ def _structured_execution_refusal(
     code: ExecutionAdmissionRefusalCode,
     stage: ExecutionAdmissionStage = "pre_exposure",
     reason_code: str | None = None,
+    cause_code: str | None = None,
+    cause_event_id: str | None = None,
+    cause_event_seq: int | None = None,
 ) -> ExecutionAdmissionDecision:
     """Build one bounded refusal without retaining extension-owned diagnostics.
 
-    ``reason_code`` is a runtime-owned identity, never extension text.
+    ``reason_code`` and ``cause_code`` are validated identities, never
+    extension text; the cause event fields reference a runtime-written event.
     """
 
     return ExecutionAdmissionDecision(
@@ -652,6 +669,9 @@ def _structured_execution_refusal(
                 code=code,
                 observed_state="mismatched",
                 reason_code=reason_code,
+                cause_code=cause_code,
+                cause_event_id=cause_event_id,
+                cause_event_seq=cause_event_seq,
             ),
         ),
     )
@@ -691,7 +711,12 @@ class ExecutionAdmissionError(RuntimeError):
             else:
                 reason = "admission evidence"
                 if refusal.reason_code is not None:
-                    reason += f" ({refusal.reason_code})"
+                    detail = refusal.reason_code
+                    if refusal.cause_code is not None:
+                        detail += f": {refusal.cause_code}"
+                    if refusal.cause_event_seq is not None:
+                        detail += f", closed after event seq {refusal.cause_event_seq}"
+                    reason += f" ({detail})"
             reason += f" [{refusal.code}]"
             if reason not in seen:
                 seen.add(reason)

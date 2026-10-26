@@ -449,6 +449,16 @@ class DeferredRunner(Runner):
                 return state
         return "reusable"
 
+    @property
+    def loss_reason(self) -> str | None:
+        """Report the wrapper's own loss reason, else the materialized runner's."""
+
+        own = super().loss_reason
+        live = self._live()
+        if own is not None or live is None:
+            return own
+        return live.loss_reason
+
     async def _target(self) -> Runner:
         self._ensure_exec_open()
         return await self._deferred.materialize("use")

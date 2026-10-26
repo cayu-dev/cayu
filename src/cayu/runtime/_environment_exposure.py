@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, SupportsIndex
 
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu.environments.admission import (
+    _CAPABILITY_IDENTITY_ADAPTER,
     ExecutionAdmissionCandidate,
     ExecutionAdmissionDecision,
     ExecutionAdmissionError,
@@ -24,6 +26,7 @@ from cayu.environments.factory import (
     register_environment_factory_cleanup_retry,
     retry_environment_factory_cleanup_settlement_task,
 )
+from cayu.events import Event, event_durable_sequence
 from cayu.runners.base import RunnerExecutionAdmissionObserver
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
 from cayu.vaults.redaction import SecretRedactor
@@ -359,6 +362,15 @@ def _retain_exposure_admission_settlement(
 
 
 @dataclass(frozen=True, slots=True)
+class _RunnerLoss:
+    """Why a terminal runner is gone, from content-free runner and runtime facts."""
+
+    cause_code: str
+    event_id: str | None = None
+    event_seq: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _RunnerAdmissionSnapshot:
     candidate: ExecutionAdmissionCandidate | None
     candidate_supplied: bool
@@ -366,6 +378,14 @@ class _RunnerAdmissionSnapshot:
     authority_failed: bool
     settlement_tasks: tuple[asyncio.Task[None], ...]
     terminal_runner_state: Literal["closed", "poisoned"] | None = None
+    runner_loss: _RunnerLoss | None = None
+
+
+# The runtime event after which each runner was first seen closed or poisoned.
+# Process-local and keyed weakly, like the runner it describes.
+_RUNNER_TERMINAL_EVENTS: weakref.WeakKeyDictionary[Any, tuple[str, int | None]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _terminal_runner_state(runner: Any) -> Literal["closed", "poisoned"] | None:
@@ -383,6 +403,51 @@ def _terminal_runner_state(runner: Any) -> Literal["closed", "poisoned"] | None:
     if state == "poisoned":
         return "poisoned"
     return None
+
+
+def runner_is_terminal(runner: Any) -> bool:
+    """Whether no later probe or command on this runner can succeed."""
+
+    return _terminal_runner_state(runner) is not None
+
+
+def record_runner_terminal_event(runner: Any, event: Event) -> None:
+    """Remember the first runtime event after which ``runner`` was terminal.
+
+    Callers pass a persisted runner event only when the runner was usable when
+    the invocation began and is closed or poisoned now.
+    """
+
+    if runner is None or not runner_is_terminal(runner):
+        return
+    try:
+        if runner in _RUNNER_TERMINAL_EVENTS:
+            return
+        _RUNNER_TERMINAL_EVENTS[runner] = (event.id, event_durable_sequence(event))
+    except TypeError:
+        # A runner that cannot be weakly referenced keeps no event reference.
+        return
+
+
+def _runner_loss(runner: Any) -> _RunnerLoss | None:
+    """Read a terminal runner's classified loss reason and closing event."""
+
+    try:
+        cause_code = runner.loss_reason
+    except Exception:
+        return None
+    if type(cause_code) is not str:
+        return None
+    try:
+        cause_code = _CAPABILITY_IDENTITY_ADAPTER.validate_python(cause_code)
+    except ValueError:
+        return None
+    try:
+        reference = _RUNNER_TERMINAL_EVENTS.get(runner)
+    except TypeError:
+        reference = None
+    event_id, event_seq = reference or (None, None)
+    return _RunnerLoss(cause_code=cause_code, event_id=event_id, event_seq=event_seq)
 
 
 async def _runner_admission_snapshot(
@@ -406,6 +471,7 @@ async def _runner_admission_snapshot(
                 authority_failed=False,
                 settlement_tasks=(),
                 terminal_runner_state=terminal_runner_state,
+                runner_loss=_runner_loss(runner),
             )
         candidate: ExecutionAdmissionCandidate | None = None
         candidate_supplied = False
@@ -467,6 +533,20 @@ def _snapshot_decision(
     snapshot: _RunnerAdmissionSnapshot,
 ) -> ExecutionAdmissionDecision:
     if snapshot.terminal_runner_state is not None:
+        loss = snapshot.runner_loss
+        if loss is not None:
+            # The execution resource itself is gone (container removed or
+            # missing, daemon unreachable, lease lost), not a policy refusal.
+            return _structured_execution_refusal(
+                candidate=exposure.candidate,
+                requirements=exposure.decision.requirements,
+                evidence=None,
+                code="missing_final_evidence",
+                reason_code="runner_lost",
+                cause_code=loss.cause_code,
+                cause_event_id=loss.event_id,
+                cause_event_seq=loss.event_seq,
+            )
         return _structured_execution_refusal(
             candidate=exposure.candidate,
             requirements=exposure.decision.requirements,

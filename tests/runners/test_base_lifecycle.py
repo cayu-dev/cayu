@@ -269,3 +269,46 @@ def test_exec_result_exposes_nonnegative_total_output_bytes():
     properties = ExecResult.model_json_schema()["properties"]
     for field_name in ("stdout_bytes", "stderr_bytes"):
         assert {"minimum": 0, "type": "integer"} in properties[field_name]["anyOf"]
+
+
+def test_record_loss_keeps_the_first_reason() -> None:
+    runner = StubRunner()
+    assert runner.loss_reason is None
+    runner._record_loss("container_missing")
+    runner._record_loss("container_removed")
+    assert runner.loss_reason == "container_missing"
+
+
+def test_built_in_runner_wrappers_forward_the_inner_loss_reason() -> None:
+    from types import SimpleNamespace
+
+    from cayu.egress.runtime import _EgressManagedRunner
+    from cayu.environments.deferred import DeferredRunner
+
+    inner = StubRunner()
+    inner._record_loss("container_missing")
+    inner._closed = True
+
+    deferred = DeferredRunner(
+        SimpleNamespace(materialized_runner=None),  # type: ignore[arg-type]
+        default_cwd="/workspace",
+        configured_candidate=None,
+        environment_authority=None,
+        isolation="stub",
+    )
+    assert deferred.loss_reason is None
+    deferred._deferred = SimpleNamespace(materialized_runner=inner)  # type: ignore[assignment]
+    assert deferred.lifecycle_state == "closed"
+    assert deferred.loss_reason == "container_missing"
+
+    # Only the forwarding properties are under test; skip the egress wiring.
+    managed = object.__new__(_EgressManagedRunner)
+    managed._runner = inner
+    assert managed.lifecycle_state == "closed"
+    assert managed.loss_reason == "container_missing"
+
+    from cayu.runners import LaunchedRunner
+
+    launched = LaunchedRunner(inner, ["sudo", "-u", "sandbox", "--"])
+    assert launched.lifecycle_state == "closed"
+    assert launched.loss_reason == "container_missing"

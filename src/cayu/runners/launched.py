@@ -241,6 +241,13 @@ class LaunchedRunner(Runner):
         return "reusable"
 
     @property
+    def loss_reason(self) -> str | None:
+        """Report the wrapper's own loss reason, else the wrapped runner's."""
+
+        own = super().loss_reason
+        return own if own is not None else self._runner.loss_reason
+
+    @property
     def is_closed(self) -> bool:
         return self._closed or self._runner.is_closed
 

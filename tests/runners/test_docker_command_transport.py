@@ -103,6 +103,8 @@ def test_unproven_oserror_still_requires_guest_cleanup(monkeypatch, error):
 
     async def fail(command, **kwargs):
         calls.append(command.argv)
+        if command.argv[1:3] == ["container", "inspect"]:
+            return ExecResult(stdout="running\n")
         if "kill -TERM" in command.argv[-1]:
             return ExecResult()
         raise error
@@ -112,7 +114,8 @@ def test_unproven_oserror_still_requires_guest_cleanup(monkeypatch, error):
     with pytest.raises(OSError) as caught:
         asyncio.run(runner.exec(ExecCommand.process("true")))
     assert caught.value is error
-    assert len(calls) == 2
+    assert len(calls) == 3
+    assert calls[1][1:3] == ["container", "inspect"]
     assert getattr(error, "artifacts", [])[0]["status"] == "completed"
 
 

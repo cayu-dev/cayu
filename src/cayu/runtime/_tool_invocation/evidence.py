@@ -22,6 +22,7 @@ from cayu.execution_profiles import (
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._environment_exposure import record_runner_terminal_event, runner_is_terminal
 from cayu.runtime._event_writer import RuntimeEventWriter, prepare_runtime_event
 from cayu.runtime._tool_invocation.resources import ToolInvocationCall
 from cayu.runtime._tool_round_staging import (
@@ -91,6 +92,14 @@ class InvocationEvidence:
         self._resolved_redactor_observer = resolved_redactor_observer
         self._staged_runner_completion_events: list[tuple[Event, int]] = []
         self.runner_events: list[Event] = []
+        registered_environment = call.registered_environment
+        self._runner = (
+            None if registered_environment is None else registered_environment.environment.runner
+        )
+        # Only a runner usable at the start can be closed by this invocation.
+        self._runner_usable_at_start = self._runner is not None and not runner_is_terminal(
+            self._runner
+        )
 
     def redactor(self) -> SecretRedactor:
         return self._secret_scope.redactor
@@ -201,8 +210,14 @@ class InvocationEvidence:
                 )
             prepared_events.append(prepare_runtime_event(event, redactor=snapshot.redactor))
         captured_events.clear()
+        last_completion: Event | None = None
         for event in prepared_events:
-            self.runner_events.append(await self._event_writer.emit(event))
+            last_completion = await self._event_writer.emit(event)
+            self.runner_events.append(last_completion)
+        if last_completion is not None and self._runner_usable_at_start:
+            # A terminal runner runs no later command, so the last completion
+            # is the one whose failure or cleanup closed it.
+            record_runner_terminal_event(self._runner, last_completion)
 
     async def persist_sealed(
         self,

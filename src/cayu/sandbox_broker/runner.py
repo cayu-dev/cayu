@@ -711,6 +711,7 @@ class BrokeredSandboxRunner(Runner):
     def _lease_lost(self, error: SandboxBrokerError | None) -> SandboxLeaseLostError:
         # A sandbox that stopped being ready never becomes ready again, so the
         # runner can't be reopened: poison it, which admission treats as terminal.
+        self._record_loss("lease_lost")
         self._poison_exec("the brokered sandbox is no longer ready")
         return SandboxLeaseLostError(
             "The brokered sandbox is no longer ready.",
@@ -725,6 +726,7 @@ class BrokeredSandboxRunner(Runner):
         try:
             keeper.check()
         except SandboxLeaseLostError:
+            self._record_loss("lease_lost")
             self._poison_exec("the brokered sandbox's lease was lost")
             raise
 

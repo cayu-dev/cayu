@@ -203,6 +203,9 @@ from cayu.runtime._invocation_lifecycle import (
     _release_invocation_command_with_cleanup_authority,
 )
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
+from cayu.runtime._workspace_observation_keyring import (
+    require_materialized_workspace_observation_keyring,
+)
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions._checkpoint_mutations import (
@@ -243,6 +246,7 @@ from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, s
 from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
 from cayu.sessions.store import SessionStore
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
+from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     _WORKSPACE_OBSERVATION_OBSERVER_ALIAS_FIELD,
@@ -3489,6 +3493,26 @@ class EnvironmentLifecycle:
             ):
                 raise ValueError(
                     "Static environment factory must not expose a vault or credential proxy."
+                )
+            if (
+                effective_operation is EnvironmentFactoryOperation.CREATE
+                and completion_recovery is None
+                and command_recovery is None
+            ):
+                # Only a fresh allocation starts new work. A reconnect resumes or
+                # finishes cleanup of an existing one; its calls hit the per-call
+                # check, and finalization must always be able to dispose of it.
+                require_materialized_workspace_observation_keyring(
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    environment=environment,
+                    factory_secret_resolution_scope=(
+                        registered_environment.factory_secret_resolution_scope
+                    ),
+                    alias_codec_configured=(
+                        self._session_store.public_authority_alias_codec is not None
+                    ),
+                    permitted_tool_names=_ceiling_tool_names(session),
                 )
             if environment.spec.name != environment_name:
                 raise ValueError(
@@ -8374,6 +8398,15 @@ async def _final_workspace_delta_payload(
         "branch_changed": delta.branch_changed,
         "detail_code": delta.detail_code,
     }
+
+
+def _ceiling_tool_names(session: Session) -> frozenset[str] | None:
+    """Tools this session may dispatch, or ``None`` when no ceiling is recorded."""
+
+    try:
+        return frozenset(tool_capability_ceiling_from_session_metadata(session.metadata).tool_names)
+    except (TypeError, ValueError):
+        return None
 
 
 def _final_workspace_revision_payload(

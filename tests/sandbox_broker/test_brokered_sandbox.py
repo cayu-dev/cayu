@@ -1325,6 +1325,8 @@ def test_a_cancelled_command_is_cancelled_in_the_sandbox(
         await asyncio.sleep(0.3)
         cancellation = await _cancel(abandoned)
         assert runner.lifecycle_state == "poisoned"
+        # An unconfirmed stop poisons the runner, but the sandbox is not lost.
+        assert runner.loss_reason is None
         assert _receipts(cancellation) == ["failed"]
         await runner.close()
 
@@ -1899,6 +1901,7 @@ def test_a_lapsed_lease_found_by_a_command_closes_the_runner(tmp_path: Path) -> 
         # and retained admission evidence must not admit it.
         assert runner.lifecycle_state == "poisoned"
         assert _terminal_runner_state(runner) == "poisoned"
+        assert runner.loss_reason == "lease_lost"
         with pytest.raises(RuntimeError, match="poisoned"):
             runner.reopen_exec()
         await runner.close()
@@ -1917,6 +1920,7 @@ def test_a_lease_the_keeper_lost_poisons_the_runner(tmp_path: Path) -> None:
         with pytest.raises(SandboxLeaseLostError):
             await runner.exec(ExecCommand.process("true"))
         assert _terminal_runner_state(runner) == "poisoned"
+        assert runner.loss_reason == "lease_lost"
         await runner.close()
 
     asyncio.run(scenario())

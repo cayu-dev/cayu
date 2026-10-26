@@ -139,6 +139,10 @@ from cayu.runtime._tool_round_staging import (
     _prepare_tool_result_event,
     _redactor_for_tool_calls,
 )
+from cayu.runtime._workspace_observation_keyring import (
+    WORKSPACE_OBSERVATION_KEYRING_UNAVAILABLE,
+    workspace_observation_keyring_message,
+)
 from cayu.sessions.records import Session
 from cayu.sessions.store import SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
@@ -697,6 +701,62 @@ class ToolInvocation:
                 task_id=task_id,
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
+                redactor=invocation_redactor,
+                output_redactor=provisional_output_redactor,
+                deferred_terminal_stager=deferred_terminal_stager,
+                publication_snapshot=publication_snapshot,
+            ):
+                yield event
+            return
+
+        if (
+            registered_tool.workspace_mutation
+            and registered_environment is not None
+            and _workspace(registered_environment) is not None
+            and invocation_secrets.registered_environment_secret_resolution_scope(
+                registered_environment
+            )
+            == "dynamic"
+            and self._session_store.public_authority_alias_codec is None
+        ):
+            # Registration normally refuses this pairing. Fail only this call,
+            # before any durable workspace state, and name what to configure.
+            publication_snapshot = await publication.static_scope()
+            message = workspace_observation_keyring_message(
+                tool_names=(tool_call.name,),
+                environment_name=environment_name,
+                factory_backed=(
+                    registered_environment.factory is not None
+                    or registered_environment.factory_backed
+                ),
+            )
+            result = ToolResult(
+                content=message,
+                structured={
+                    "status": "rejected",
+                    "reason": WORKSPACE_OBSERVATION_KEYRING_UNAVAILABLE,
+                },
+                is_error=True,
+            )
+            async for event in self.terminals.emit_result(
+                approved_arguments_notice=approved_arguments is not None,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                event_type=EventType.TOOL_CALL_FAILED,
+                result=result,
+                extra_payload={
+                    "reason": WORKSPACE_OBSERVATION_KEYRING_UNAVAILABLE,
+                    "idempotency_key": idempotency_key,
+                },
+                task_id=task_id,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+                tool_round_identity=tool_round_identity,
+                approval_id=approval_id,
+                input_id=input_id,
+                allow_modification=False,
                 redactor=invocation_redactor,
                 output_redactor=provisional_output_redactor,
                 deferred_terminal_stager=deferred_terminal_stager,

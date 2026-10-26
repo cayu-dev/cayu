@@ -20,6 +20,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._workspace_observation_keyring import require_workspace_observation_keyring
 from cayu.runtime.execution_identity import copy_execution_profile_behavior_identity
 from cayu.runtime.session_closure import (
     ArtifactSessionClosureStore,
@@ -64,6 +65,16 @@ class ApplicationEnvironmentRegistry:
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
         self._default_environment_name: str | None = None
         self._session_closure = self._build_session_closure()
+        self._agent_registrations: (
+            Callable[[], Mapping[str, runtime_records.RegisteredAgentState]] | None
+        ) = None
+
+    def link_agent_registrations(
+        self, registrations: Callable[[], Mapping[str, runtime_records.RegisteredAgentState]]
+    ) -> None:
+        """Let concrete environment registration check the registered agents' tools."""
+
+        self._agent_registrations = registrations
 
     @property
     def registrations(self) -> Mapping[str, runtime_records.RegisteredEnvironment]:
@@ -134,6 +145,13 @@ class ApplicationEnvironmentRegistry:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
+        if self._agent_registrations is not None:
+            # Factories are checked when they create an environment instead.
+            require_workspace_observation_keyring(
+                agents=self._agent_registrations(),
+                environments={stored_spec.name: registered_environment},
+                alias_codec_configured=self._session_store.public_authority_alias_codec is not None,
+            )
         self._publish(registered_environment, artifact_store_registration, default=default)
         return environment
 

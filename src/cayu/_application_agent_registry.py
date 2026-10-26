@@ -9,6 +9,7 @@ from dataclasses import replace
 from itertools import islice
 from types import MappingProxyType
 
+from cayu._application_environment_registry import ApplicationEnvironmentRegistry
 from cayu._application_registration import (
     _copy_registered_tool,
     _registered_tool_descriptor,
@@ -41,6 +42,7 @@ from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
 from cayu.runtime._tool_effect_reconciliation import register_tool_effect_reconciler
+from cayu.runtime._workspace_observation_keyring import require_workspace_observation_keyring
 from cayu.runtime.application_lifecycle import (
     ApplicationAdmission,
     ApplicationAdmissionsSealed,
@@ -114,8 +116,14 @@ class ApplicationAgentRegistry:
         mcp_manifest_policy: McpManifestPolicy | None,
         admission: ApplicationAdmission,
         notification_refresh: Callable[[int], Awaitable[None]] | None = None,
+        environment_registry: ApplicationEnvironmentRegistry | None = None,
     ) -> None:
         self._admission = admission
+        # Workspace tools are checked against environments in both registration
+        # orders: this registry checks new agents, the linked one new environments.
+        self._environment_registry = environment_registry
+        if environment_registry is not None:
+            environment_registry.link_agent_registrations(lambda: self._agents)
         self._static_mcp_toolsets: dict[int, McpToolset] = {}
         self._released_mcp_refreshes: set[asyncio.Task[None]] = set()
         self._session_store = session_store
@@ -548,6 +556,13 @@ class ApplicationAgentRegistry:
             registration_symbol=registration_symbol,
             child_session_context_contributor=stored_child_session_context,
         )
+        if self._environment_registry is not None:
+            # Runs before any MCP ownership is claimed or anything is published.
+            require_workspace_observation_keyring(
+                agents={registered_agent.spec.name: registered_agent},
+                environments=self._environment_registry.registrations,
+                alias_codec_configured=self._session_store.public_authority_alias_codec is not None,
+            )
         if (static_mcp_toolsets or stored_mcp_toolsets) and self._admission.sealed:
             # Shutdown hands MCP toolsets back to their caller; a closing app
             # must not take them again.

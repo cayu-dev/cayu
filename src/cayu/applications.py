@@ -498,9 +498,7 @@ from cayu.runtime._tool_round_executor import (
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.runtime._work_attempt_coordinator import WorkAttemptCoordinator, WorkAttemptOperations
 from cayu.runtime._work_attempt_execution import WorkAttemptExecution
-from cayu.runtime._work_attempt_invocation import (
-    WorkAttemptRecoveryOwnership,
-)
+from cayu.runtime._work_attempt_invocation import WorkAttemptRecoveryOwnership
 from cayu.runtime._workspace_observation_recovery import WorkspaceObservationRecovery
 from cayu.runtime.application_lifecycle import (
     DEFAULT_APPLICATION_SHUTDOWN_TIMEOUT_SECONDS,
@@ -1357,6 +1355,7 @@ class CayuApp:
         )
         self._agent_registry = ApplicationAgentRegistry(
             session_store=self.session_store,
+            environment_registry=self._environment_registry,
             secret_redactor=self._secret_redactor,
             tool_timeout_seconds=self._tool_timeout_seconds,
             mcp_manifest_policy=self._mcp_manifest_policy,

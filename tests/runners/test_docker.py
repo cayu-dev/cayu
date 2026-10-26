@@ -18,6 +18,7 @@ from cayu.runners.docker import (
     DOCKER_COMMAND_STATE_DIR,
     DockerRunner,
     _build_docker_exec_argv,
+    _classify_container_probe,
     _kill_supervised_command_script,
     _require_docker,
     _validate_mount_path,
@@ -554,6 +555,8 @@ def test_exec_stream_failure_settles_remote_command_and_preserves_primary_error(
     async def fake_run_subprocess(command, **kwargs):
         del kwargs
         issued.append(command.argv)
+        if command.argv[1:3] == ["container", "inspect"]:
+            return ExecResult(stdout="running\n")
         if "kill -TERM" in command.argv[-1]:
             return ExecResult()
         raise stream_error
@@ -571,9 +574,12 @@ def test_exec_stream_failure_settles_remote_command_and_preserves_primary_error(
 
     assert exc_info.value is stream_error
     assert runner._exec_closed is False
-    assert len(issued) == 2
+    assert len(issued) == 3
     assert "setsid" in issued[0][-1]
-    assert "kill -TERM" in issued[1][-1]
+    # A local stream failure leaves a running container: no loss is recorded.
+    assert issued[1][1:3] == ["container", "inspect"]
+    assert runner.loss_reason is None
+    assert "kill -TERM" in issued[2][-1]
     assert getattr(stream_error, "artifacts", None) == [
         {
             "type": "cayu.runner_cleanup.v1",
@@ -594,6 +600,8 @@ def test_exec_stream_failure_latches_runner_when_remote_settlement_is_unproven(
     async def fake_run_subprocess(command, **kwargs):
         del kwargs
         issued.append(command.argv)
+        if command.argv[1:3] == ["container", "inspect"]:
+            return ExecResult(stdout="running\n")
         if "kill -TERM" in command.argv[-1]:
             return ExecResult(exit_code=1)
         if command.argv[-1].startswith("test -f"):
@@ -616,7 +624,8 @@ def test_exec_stream_failure_latches_runner_when_remote_settlement_is_unproven(
     assert runner._exec_closed_reason == (
         "docker command cleanup did not complete; command state is unknown"
     )
-    assert len(issued) == 3
+    assert len(issued) == 4
+    assert issued[1][1:3] == ["container", "inspect"]
     assert getattr(stream_error, "artifacts", None) == [
         {
             "type": "cayu.runner_cleanup.v1",
@@ -721,6 +730,121 @@ def test_close_stop_and_none(monkeypatch):
     issued.clear()
     asyncio.run(DockerRunner("n", docker_path="/usr/bin/docker", close_action="none").close())
     assert issued == []
+
+
+@pytest.mark.parametrize(
+    ("probe", "expected"),
+    [
+        (ExecResult(stdout="running\n"), None),
+        (ExecResult(stdout="exited\n"), "container_not_running"),
+        (
+            ExecResult(stderr="Error response from daemon: No such container: a1", exit_code=1),
+            "container_missing",
+        ),
+        (
+            ExecResult(
+                stderr=(
+                    "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. "
+                    "Is the docker daemon running?"
+                ),
+                exit_code=1,
+            ),
+            "docker_daemon_unavailable",
+        ),
+        (
+            ExecResult(
+                stderr=(
+                    "failed to connect to the docker API at unix:///var/run/docker.sock; "
+                    "check if the path is correct and if the daemon is running"
+                ),
+                exit_code=1,
+            ),
+            "docker_daemon_unavailable",
+        ),
+        (ExecResult(timed_out=True, exit_code=-9), "docker_daemon_unavailable"),
+        (ExecResult(stderr="permission denied", exit_code=1), None),
+    ],
+)
+def test_container_loss_probe_classification(probe: ExecResult, expected: str | None) -> None:
+    assert _classify_container_probe(probe) == expected
+
+
+def test_exec_failure_records_missing_container_before_sandbox_cleanup(monkeypatch) -> None:
+    issued: list[list[str]] = []
+    failure = OSError("docker exec transport failed")
+
+    async def fake_run_subprocess(command, **kwargs):
+        del kwargs
+        issued.append(command.argv)
+        if command.argv[1:3] == ["container", "inspect"]:
+            return ExecResult(stderr="Error: No such container: a1", exit_code=1)
+        if command.argv[1:3] == ["rm", "-f"]:
+            return ExecResult()
+        raise failure
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner("a1", docker_path="/usr/bin/docker", cancellation_cleanup="sandbox")
+
+    with pytest.raises(OSError):
+        asyncio.run(runner.exec(ExecCommand.process("true")))
+
+    assert issued[1][1:3] == ["container", "inspect"]
+    assert issued[-1] == ["/usr/bin/docker", "rm", "-f", "a1"]
+    assert runner.lifecycle_state == "closed"
+    assert runner.container_removed is True
+    # The probe's cause wins over the cleanup that followed it.
+    assert runner.loss_reason == "container_missing"
+
+
+def test_loss_probe_keeps_failed_runner_fenced_until_cleanup(monkeypatch) -> None:
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+    issued: list[list[str]] = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        del kwargs
+        issued.append(command.argv)
+        if command.argv[1:3] == ["container", "inspect"]:
+            probe_started.set()
+            await release_probe.wait()
+            return ExecResult(stdout="running\n")
+        if "kill -TERM" in command.argv[-1]:
+            return ExecResult()
+        if len(issued) == 1:
+            raise OSError("docker exec transport failed")
+        return ExecResult(stdout="second command ran")
+
+    async def scenario() -> None:
+        runner = DockerRunner("a1", docker_path="/usr/bin/docker")
+        failing = asyncio.create_task(runner.exec(ExecCommand.process("true")))
+        await probe_started.wait()
+        assert runner.lifecycle_state == "closing"
+        with pytest.raises(RuntimeError, match="closed for cleanup"):
+            await runner.exec(ExecCommand.process("echo", "second"))
+        release_probe.set()
+        with pytest.raises(OSError):
+            await failing
+        assert runner.lifecycle_state == "reusable"
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    asyncio.run(scenario())
+    assert not any("second" in " ".join(argv) for argv in issued)
+
+
+def test_sandbox_kill_records_container_removed_but_close_does_not(monkeypatch) -> None:
+    async def fake_run_subprocess(command, **kwargs):
+        del command, kwargs
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    killed = DockerRunner("a1", docker_path="/usr/bin/docker")
+    assert asyncio.run(killed.kill()) is True
+    assert killed.loss_reason == "container_removed"
+
+    closed = DockerRunner("a2", docker_path="/usr/bin/docker", close_action="remove")
+    asyncio.run(closed.close())
+    assert closed.container_removed is True
+    assert closed.loss_reason is None
 
 
 def test_close_remove_failure_keeps_runner_open(monkeypatch):

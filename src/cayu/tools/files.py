@@ -2712,6 +2712,19 @@ class DeleteFileTool(Tool):
 
 
 class WriteFileTool(Tool):
+    """Create a UTF-8 file, or overwrite one at a known revision.
+
+    It mutates the workspace, so each call first records a workspace observation
+    intent. In an environment that resolves secrets dynamically (a factory that
+    doesn't declare ``secret_resolution_scope = "static"``, or an environment with
+    a vault or credential proxy) that record needs the session store's public
+    authority alias keyring. Without one, Cayu refuses the pairing at registration
+    (concrete environments) or before the session's first model call (factories);
+    declare the factory static or configure a persistent keyring (see
+    ``docs/environment-factories.md``). Tests
+    on ``CayuApp()`` don't catch this: its default in-memory store makes its own key.
+    """
+
     spec = ToolSpec(
         display=ToolDisplay(verb="Wrote", noun="file"),
         name="write_file",

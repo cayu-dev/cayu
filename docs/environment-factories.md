@@ -149,6 +149,53 @@ Register it as the default (or under a name) instead of a static `register_envir
 app.register_environment_factory(EnvironmentSpec(name="local"), LocalNativeFactory(base), default=True)
 ```
 
+### Secret scope and workspace-mutating tools
+
+A factory's `secret_resolution_scope` is `"dynamic"` unless it overrides the property
+to return `"static"`. A dynamic environment can resolve secrets after a tool call
+starts, so Cayu can't prove its workspace, observer and artifact-store names are
+secret-free when a workspace-mutating tool (`WriteFileTool`, `EditFileTool`,
+`DeleteFileTool`, `ApplyPatchTool`, `ExecCommandTool`, `RunCommandTool`,
+`RunCheckTool`, `MaterializeSharedArtifactTool`) records its observation intent. It stores them only as keyed aliases,
+which needs the session store's public authority alias keyring.
+
+A factory that never returns a vault or credential proxy should say so. Cayu enforces
+the declaration and rejects a result that breaks it:
+
+```python
+class LocalNativeFactory(EnvironmentFactory):
+    @property
+    def secret_resolution_scope(self):
+        return "static"
+```
+
+A factory that does return a vault or proxy stays dynamic, and the application then
+needs a persistent keyring on its store, generated once and kept with the database:
+
+```python
+from cayu.runtime import public_authority_alias_codec_from_environment
+
+codec = public_authority_alias_codec_from_environment()  # CAYU_PUBLIC_AUTHORITY_ALIAS_* variables
+app = CayuApp(
+    session_store=SQLiteSessionStore(path, public_authority_alias_codec=codec),
+    public_authority_alias_keyring=codec.keyring,
+)
+```
+
+When the store has no keyring, Cayu checks this as early as it can. For a concrete
+environment with a workspace and a vault or credential proxy, registering it next to
+an agent with a workspace-mutating tool raises `RuntimeError`. For a dynamic factory,
+registration can't know whether `create()` returns a workspace (one that doesn't never
+needs the keyring), so the check runs when the factory creates a fresh
+environment: if the result has a workspace and the agent has a workspace-mutating
+tool that the session's tool ceiling allows, the session fails before its first
+model call. Reconnecting an existing allocation (resume, recovery, finalization
+cleanup) isn't refused; a mutating tool call there fails on its own as
+`tool.call.failed`. Either error names the tool,
+the environment and the fixes. Tests built on `CayuApp()` with no `session_store`
+don't catch the problem: the default in-memory store makes its own random key. Test
+with the store and keyring setup you deploy.
+
 ### Per-request local workspaces
 
 `LocalWorkspaceEnvironmentFactory` attaches a prepared directory whose ownership

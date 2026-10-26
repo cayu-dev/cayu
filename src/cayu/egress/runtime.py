@@ -2236,6 +2236,13 @@ class _EgressManagedRunner(Runner):
                 return inner
         return "reusable"
 
+    @property
+    def loss_reason(self) -> str | None:
+        """Report the wrapper's own loss reason, else the underlying allocation's."""
+
+        own = super().loss_reason
+        return own if own is not None else self._runner.loss_reason
+
     def __init__(
         self,
         *,
