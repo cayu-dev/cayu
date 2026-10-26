@@ -126,7 +126,8 @@ LAMBDA_MICROVM_INTERACTIVE_READ_WAIT_SECONDS = 10.0
 # model output reaches the guest as soon as the host service sends it.
 LAMBDA_MICROVM_FORWARD_CHUNK_BYTES = 256 * 1024
 LAMBDA_MICROVM_MAX_RESPONSE_BYTES = 2 * LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES + 64 * 1024
-_LAMBDA_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+# 429 is handled on its own, as LambdaMicroVMEndpointThrottled.
+_LAMBDA_TRANSIENT_HTTP_STATUSES = frozenset({408, 500, 502, 503, 504})
 _LAMBDA_FORWARD_METHODS = (
     "open_forward",
     "accept_forward",
@@ -176,6 +177,13 @@ _LAMBDA_TRANSIENT_CONTROL_ERROR_TYPES = frozenset(
 )
 _LAMBDA_UNUSABLE_ALLOCATION_STATES = frozenset({"FAILED", "TERMINATING", "TERMINATED"})
 _LAMBDA_POLL_ATTEMPTS = 3
+# A throttled endpoint call waits 0.25 s, then doubles to at most 4 s, for six attempts in all
+# (five pauses, 7.75 s; up to 20 s when Retry-After asks for longer), never past the call's
+# deadline. Only _endpoint_call retries a throttle; the outer transient-error retries re-raise
+# it so this bound holds.
+_LAMBDA_THROTTLE_ATTEMPTS = 6
+_LAMBDA_THROTTLE_PAUSE_S = 0.25
+_LAMBDA_THROTTLE_MAX_PAUSE_S = 4.0
 LAMBDA_MICROVM_ADMISSION_PROBE_TIMEOUT_SECONDS = 5
 _LAMBDA_ADMISSION_PROBE_OUTPUT_LIMIT_BYTES = 1024
 _LAMBDA_ADMISSION_RUNNING_STATES = frozenset({"PENDING", "RUNNING"})
@@ -328,6 +336,18 @@ class LambdaMicroVMEndpointUnauthorized(LambdaMicroVMError):
 
 class LambdaMicroVMEndpointTransientError(LambdaMicroVMError):
     """A transport failure eligible for bounded command-state read retry only."""
+
+
+class LambdaMicroVMEndpointThrottled(LambdaMicroVMEndpointTransientError):
+    """The endpoint answered 429: it refused the request before acting on it.
+
+    Lambda caps each MicroVM endpoint's concurrent connections by the MicroVM's size (8 at one
+    vCPU), so a busy guest refuses the overflow. Any endpoint call may be sent again after a
+    pause; ``retry_after_s`` is the endpoint's ``Retry-After``, when it sends one."""
+
+    def __init__(self, message: str, *, retry_after_s: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
 
 
 class LambdaMicroVMOwnershipSuperseded(LambdaMicroVMError):
@@ -860,6 +880,11 @@ class HttpxLambdaMicroVMEndpointTransport:
                     if response.status_code == _LAMBDA_OWNER_LIFECYCLE_LEASED_HTTP_STATUS:
                         raise LambdaMicroVMLifecycleInProgress(
                             "Lambda MicroVM owner is suspending or terminating it."
+                        )
+                    if response.status_code == 429:
+                        raise LambdaMicroVMEndpointThrottled(
+                            "Lambda MicroVM endpoint returned HTTP 429; response body omitted",
+                            retry_after_s=_retry_after_seconds(response.headers.get("retry-after")),
                         )
                     if response.status_code >= 400:
                         error_type = (
@@ -2595,6 +2620,8 @@ class LambdaMicroVMRunner(Runner):
                 result = await self._endpoint_call(
                     "get_command", deadline=deadline, command_id=command_id
                 )
+            except LambdaMicroVMEndpointThrottled:
+                raise
             except LambdaMicroVMEndpointTransientError:
                 if attempt == _LAMBDA_POLL_ATTEMPTS - 1:
                     raise
@@ -2617,6 +2644,8 @@ class LambdaMicroVMRunner(Runner):
             except LambdaMicroVMOwnershipSuperseded:
                 self._mark_superseded()
                 raise
+            except LambdaMicroVMEndpointThrottled:
+                raise
             except LambdaMicroVMEndpointTransientError:
                 if attempt == _LAMBDA_POLL_ATTEMPTS - 1:
                     raise
@@ -2628,11 +2657,17 @@ class LambdaMicroVMRunner(Runner):
     ) -> Mapping[str, Any]:
         method = getattr(self._endpoint_transport, method_name)
         attempts = 1 if method_name == "get_command" else 2
-        for attempt in range(attempts):
-            token = await self._endpoint_token(force_refresh=attempt == 1)
+        attempt = 0
+        refresh_token = False
+        throttled = 0
+        loop = asyncio.get_running_loop()
+        while True:
+            token = await self._endpoint_token(force_refresh=refresh_token)
+            # Refresh once per rejection; a throttle retry reuses the refreshed token.
+            refresh_token = False
             timeout_s = self.request_timeout_s
             if deadline is not None:
-                remaining = deadline - asyncio.get_running_loop().time()
+                remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise TimeoutError("Lambda MicroVM command-state poll exceeded its deadline.")
                 timeout_s = min(timeout_s, remaining)
@@ -2644,15 +2679,32 @@ class LambdaMicroVMRunner(Runner):
                     **kwargs,
                 )
             except LambdaMicroVMEndpointUnauthorized:
-                if attempt + 1 < attempts:
+                attempt += 1
+                if attempt < attempts:
+                    refresh_token = True
                     continue
                 raise
+            except LambdaMicroVMEndpointThrottled as exc:
+                # Refused before the guest acted, so sending it again can't repeat any effect.
+                throttled += 1
+                if throttled >= _LAMBDA_THROTTLE_ATTEMPTS:
+                    raise
+                pause = min(
+                    _LAMBDA_THROTTLE_MAX_PAUSE_S,
+                    max(
+                        exc.retry_after_s or 0.0,
+                        _LAMBDA_THROTTLE_PAUSE_S * 2 ** (throttled - 1),
+                    ),
+                )
+                if deadline is not None and loop.time() + pause >= deadline:
+                    raise
+                await asyncio.sleep(pause)
+                continue
             if not isinstance(result, Mapping):
                 raise LambdaMicroVMProtocolError(
                     f"Lambda MicroVM {method_name} response must be an object."
                 )
             return result
-        raise AssertionError("unreachable endpoint retry loop")
 
     async def _endpoint_token(self, *, force_refresh: bool = False) -> str:
         loop = asyncio.get_running_loop()
@@ -4076,6 +4128,14 @@ def _auth_token(response: Any) -> str:
     if type(value) is not str or not value.strip():
         raise LambdaMicroVMProtocolError("auth-token response omitted X-aws-proxy-auth.")
     return value
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """``Retry-After`` in seconds, when it is a whole number of them; dates aren't used."""
+
+    if value is None or not (value := value.strip()).isdigit():
+        return None
+    return float(value)
 
 
 def _endpoint_base_url(endpoint: str) -> str:

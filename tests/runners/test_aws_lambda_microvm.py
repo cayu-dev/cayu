@@ -7,7 +7,7 @@ import json
 import sys
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -23,6 +23,7 @@ from cayu.runners import (
     LambdaMicroVMProtocolError,
     LambdaMicroVMRunner,
 )
+from cayu.runners.aws_lambda_microvm import LambdaMicroVMEndpointThrottled
 from cayu.testing.base import verify_provider_credential_isolation
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces import RunnerWorkspace
@@ -1204,6 +1205,74 @@ class UnauthorizedOnceEndpointTransport(FakeEndpointTransport):
         )
 
 
+class ThrottledStartEndpointTransport(FakeEndpointTransport):
+    def __init__(self, throttles: int, *, retry_after_s: float | None = None) -> None:
+        super().__init__()
+        self.throttles = throttles
+        self.retry_after_s = retry_after_s
+        self.start_attempts = 0
+
+    async def start_command(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        command_id: str,
+        payload: dict[str, Any],
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        self.start_attempts += 1
+        if self.start_attempts <= self.throttles:
+            raise LambdaMicroVMEndpointThrottled(
+                "Lambda MicroVM endpoint returned HTTP 429; response body omitted",
+                retry_after_s=self.retry_after_s,
+            )
+        return await super().start_command(
+            endpoint=endpoint,
+            token=token,
+            command_id=command_id,
+            payload=payload,
+            timeout_s=timeout_s,
+        )
+
+
+class ScriptedEndpointCallTransport(FakeEndpointTransport):
+    """Raises the scripted failures in order, then answers every call with ``{"ok": True}``."""
+
+    def __init__(self, *failures: Exception) -> None:
+        super().__init__()
+        self.failures = list(failures)
+        self.call_tokens: list[str] = []
+
+    async def _scripted(self, *, token: str, **_: Any) -> dict[str, Any]:
+        self.call_tokens.append(token)
+        if self.failures:
+            raise self.failures.pop(0)
+        return {"ok": True}
+
+    health = get_command = accept_forward = _scripted
+
+
+def _throttled(retry_after_s: float | None = None) -> LambdaMicroVMEndpointThrottled:
+    return LambdaMicroVMEndpointThrottled(
+        "Lambda MicroVM endpoint returned HTTP 429; response body omitted",
+        retry_after_s=retry_after_s,
+    )
+
+
+def _scripted_runner(
+    transport: ScriptedEndpointCallTransport, client: FakeLambdaMicroVMClient | None = None
+) -> LambdaMicroVMRunner:
+    return LambdaMicroVMRunner(
+        client or FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        # The fake implements only the calls these tests make.
+        endpoint_transport=cast("Any", transport),
+        poll_interval_s=0,
+    )
+
+
 class FailingHealthEndpointTransport(FakeEndpointTransport):
     async def health(self, *, endpoint: str, token: str, timeout_s: float) -> dict[str, str]:
         raise RuntimeError("not ready")
@@ -1961,6 +2030,137 @@ async def test_lambda_microvm_runner_refreshes_rejected_endpoint_token_once() ->
 
     assert transport.start_attempt_tokens == ["token-123", "token-456"]
     assert len(client.token_calls) == 2
+
+
+@pytest.mark.anyio
+async def test_a_throttled_endpoint_call_is_sent_again_after_a_growing_pause(monkeypatch) -> None:
+    pauses: list[float] = []
+
+    async def pause(seconds: float) -> None:
+        pauses.append(seconds)
+
+    monkeypatch.setattr(lambda_microvm_module.asyncio, "sleep", pause)
+    transport = ThrottledStartEndpointTransport(throttles=2)
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=transport,
+        poll_interval_s=0,
+    )
+
+    await runner.exec(ExecCommand.process("true"))
+
+    assert transport.start_attempts == 3
+    assert pauses[:2] == [0.25, 0.5]
+
+
+@pytest.mark.anyio
+async def test_a_throttled_call_honours_retry_after_and_gives_up_after_six_attempts(
+    monkeypatch,
+) -> None:
+    pauses: list[float] = []
+
+    async def pause(seconds: float) -> None:
+        pauses.append(seconds)
+
+    monkeypatch.setattr(lambda_microvm_module.asyncio, "sleep", pause)
+    transport = ThrottledStartEndpointTransport(throttles=100, retry_after_s=2.0)
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=transport,
+        poll_interval_s=0,
+    )
+
+    with pytest.raises(LambdaMicroVMEndpointThrottled):
+        await runner.exec(ExecCommand.process("true"))
+
+    assert transport.start_attempts == 6
+    # Retry-After (2 s) until the growing pause passes it, never more than 4 s.
+    assert pauses[:5] == [2.0, 2.0, 2.0, 2.0, 4.0]
+
+
+@pytest.mark.anyio
+async def test_a_long_retry_after_is_capped_before_the_deadline_check(monkeypatch) -> None:
+    pauses: list[float] = []
+
+    async def pause(seconds: float) -> None:
+        pauses.append(seconds)
+
+    monkeypatch.setattr(lambda_microvm_module.asyncio, "sleep", pause)
+    transport = ScriptedEndpointCallTransport(_throttled(retry_after_s=60.0))
+    runner = _scripted_runner(transport)
+    deadline = asyncio.get_running_loop().time() + 10
+
+    # Retry-After asks for 60 s, but the pause is capped at 4 s, which fits the deadline.
+    assert await runner._endpoint_call("get_command", deadline=deadline, command_id="c") == {
+        "ok": True
+    }
+    assert pauses == [4.0]
+    assert len(transport.call_tokens) == 2
+
+
+@pytest.mark.anyio
+async def test_throttle_retries_reuse_the_token_refreshed_after_a_rejection(monkeypatch) -> None:
+    async def pause(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(lambda_microvm_module.asyncio, "sleep", pause)
+    client = FakeLambdaMicroVMClient()
+    transport = ScriptedEndpointCallTransport(
+        LambdaMicroVMEndpointUnauthorized("expired"), *(_throttled() for _ in range(4))
+    )
+    runner = _scripted_runner(transport, client)
+
+    assert await runner._endpoint_call("health") == {"ok": True}
+    assert transport.call_tokens == ["token-123"] + ["token-456"] * 5
+    assert len(client.token_calls) == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("outer_retry", ("owner_call", "command_poll"))
+async def test_outer_transient_retries_do_not_repeat_the_throttle_retry(
+    monkeypatch, outer_retry: str
+) -> None:
+    async def pause(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(lambda_microvm_module.asyncio, "sleep", pause)
+    transport = ScriptedEndpointCallTransport(*(_throttled() for _ in range(100)))
+    runner = _scripted_runner(transport)
+
+    with pytest.raises(LambdaMicroVMEndpointThrottled):
+        if outer_retry == "owner_call":
+            await runner._idempotent_owner_call("accept_forward", after=0, wait_s=1.0)
+        else:
+            deadline = asyncio.get_running_loop().time() + 600
+            await runner._poll_command_until_deadline("c", deadline)
+    assert len(transport.call_tokens) == lambda_microvm_module._LAMBDA_THROTTLE_ATTEMPTS
+
+
+@pytest.mark.anyio
+async def test_an_owner_call_still_retries_a_transient_failure_that_is_not_a_throttle(
+    monkeypatch,
+) -> None:
+    async def pause(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(lambda_microvm_module.asyncio, "sleep", pause)
+    transport = ScriptedEndpointCallTransport(LambdaMicroVMEndpointTransientError("HTTP 503"))
+    runner = _scripted_runner(transport)
+
+    assert await runner._idempotent_owner_call("accept_forward", after=0, wait_s=1.0) == {
+        "ok": True
+    }
+    assert len(transport.call_tokens) == 2
+
+
+def test_retry_after_is_read_as_whole_seconds_only() -> None:
+    assert lambda_microvm_module._retry_after_seconds("3") == 3.0
+    for value in (None, "", "soon", "1.5", "Wed, 21 Oct 2026 07:28:00 GMT"):
+        assert lambda_microvm_module._retry_after_seconds(value) is None
 
 
 @pytest.mark.anyio
