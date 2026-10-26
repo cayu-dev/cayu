@@ -212,10 +212,12 @@ export const realApi: Api = {
   },
   toolCalls: (name, cursor, signal) =>
     json(`/tools/calls${query({ name, cursor, limit: 20 })}`, { signal }),
-  // The Knowledge page adapter is delivered separately.
-  knowledge: async () => [],
-  async removeKnowledge() {
-    throw new Error("Removing knowledge needs the runtime's knowledge API (backend item 12).")
+  knowledge: (params = {}, signal) => json(`/knowledge${query(params)}`, { signal }),
+  async removeKnowledge(id, expectedRevision) {
+    await json(`/knowledge/${encodeURIComponent(id)}/retire`, {
+      method: "POST",
+      body: JSON.stringify({ expected_revision: expectedRevision }),
+    })
   },
   evalSuites: needsEvalReads,
   evalSuite: needsEvalReads,

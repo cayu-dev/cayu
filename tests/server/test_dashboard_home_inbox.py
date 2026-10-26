@@ -467,9 +467,11 @@ def test_inbox_follows_empty_sealed_pages_and_never_shows_hidden_counts(stale):
     async def scenario():
         async with _home_browser(role="member", limited=True) as (page, base, _requests, responses):
             rejected = False
+            list_reads = 0
 
             async def expire_cursor(route):
-                nonlocal rejected
+                nonlocal rejected, list_reads
+                list_reads += 1
                 if (
                     stale
                     and not rejected
@@ -491,6 +493,7 @@ def test_inbox_follows_empty_sealed_pages_and_never_shows_hidden_counts(stale):
             await expect(
                 page.locator("[data-inbox-item]").get_by_role("link", name="visible", exact=True)
             ).to_be_visible()
+            assert list_reads <= 26, "Expired scoped pages get at most one bounded restart"
             pages = [
                 await response.json()
                 for response in responses
@@ -1119,7 +1122,7 @@ def test_home_recent_read_status_preserves_loaded_attention(failed):
     asyncio.run(scenario())
 
 
-def test_inbox_periodic_refetch_recomputes_changed_phase_cursors():
+def test_inbox_explicit_refresh_recomputes_changed_phase_cursors():
     async def scenario():
         captured = {}
         async with _home_browser(
@@ -1131,7 +1134,7 @@ def test_inbox_periodic_refetch_recomputes_changed_phase_cursors():
             await page.get_by_text("Advanced filters", exact=True).click()
             await page.get_by_label("Inbox page size", exact=True).select_option("25")
             await page.get_by_role("button", name="Load more", exact=True).click()
-            await expect(page.locator("[data-inbox-item]")).to_have_count(4)
+            await expect(page.locator("[data-inbox-item]")).to_have_count(2)
             release = asyncio.Event()
 
             async def hold_refresh(route):
@@ -1149,19 +1152,19 @@ def test_inbox_periodic_refetch_recomputes_changed_phase_cursors():
                 ):
                     pass
             release.set()
-            await page.wait_for_function(
-                "() => document.querySelectorAll('[data-inbox-item]').length === 28 || "
-                "document.body.textContent.includes('The Inbox source did not advance.')",
-                timeout=15000,
-            )
+            await page.wait_for_timeout(5500)
+            await expect(page.locator("[data-inbox-item]")).to_have_count(2)
+            await page.get_by_role("button", name="Refresh actions", exact=True).click()
             await expect(
                 page.get_by_text("The Inbox source did not advance. Refresh the list.", exact=True)
             ).to_have_count(0)
-            await expect(page.locator("[data-inbox-item]")).to_have_count(28, timeout=10000)
+            await expect(page.locator("[data-inbox-item]")).to_have_count(25, timeout=10000)
             await page.get_by_role("button", name="Load more", exact=True).click()
-            await expect(page.locator("[data-inbox-item]")).to_have_count(30)
+            await expect(page.locator("[data-inbox-item]")).to_have_count(3)
+            await page.get_by_role("button", name="Load more", exact=True).click()
+            await expect(page.locator("[data-inbox-item]")).to_have_count(2)
             await page.wait_for_timeout(5500)
-            await expect(page.locator("[data-inbox-item]")).to_have_count(30)
+            await expect(page.locator("[data-inbox-item]")).to_have_count(2)
 
     asyncio.run(scenario())
 

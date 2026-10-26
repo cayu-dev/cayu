@@ -3,6 +3,8 @@
 Usage:
     PYTHONPATH=src .venv/bin/python examples/dashboard_knowledge_review.py
     # Open http://127.0.0.1:8000/cayu/knowledge
+    # Review proposals first; Keep moves an entry into Kept, with revision-fenced Remove.
+    # Proposal evidence retains chunks and metadata. Members may Keep/Drop, not Remove.
 """
 
 from __future__ import annotations

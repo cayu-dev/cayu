@@ -6,6 +6,7 @@ import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-quer
 import { useSearch } from "@tanstack/react-router"
 import { ChevronRight, Search } from "lucide-react"
 import { Fragment, useMemo, useState } from "react"
+import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { ToolApproval, ToolSource, ToolUsage, ToolWithDisplay } from "../api/types"
 import { useSpecialists, useToolUsage } from "../app/queries"
@@ -363,13 +364,14 @@ function ToolDetail({
             ) : calls.error ? (
               <div>
                 <ErrorState error={calls.error} />
-                <button
-                  type="button"
+                <Button
+                  variant="outline"
+                  disabled={calls.isFetching}
                   onClick={() => void calls.refetch()}
-                  className="mt-2 rounded-lg border px-3 py-1 text-sm"
+                  className="mt-2"
                 >
                   Refresh calls
-                </button>
+                </Button>
               </div>
             ) : (
               <>
@@ -417,14 +419,14 @@ function ToolDetail({
                   ))}
                 </ul>
                 {calls.hasNextPage && (
-                  <button
-                    type="button"
+                  <Button
+                    variant="outline"
                     disabled={calls.isFetchingNextPage}
                     onClick={() => void calls.fetchNextPage()}
-                    className="mt-2 rounded-lg border border-border px-3 py-1 text-sm"
+                    className="mt-2"
                   >
                     {calls.isFetchingNextPage ? "Loading…" : "Load older calls"}
-                  </button>
+                  </Button>
                 )}
               </>
             )

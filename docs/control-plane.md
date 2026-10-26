@@ -692,3 +692,22 @@ calls refresh a bounded latest window; explicitly loaded older calls retain thei
 snapshot instead of being replayed by each background refresh. Start from latest
 calls to read one continuous fresh cursor chain when newer calls may fall between
 the latest window and loaded history.
+
+### Knowledge page
+
+Knowledge shows proposals first, with the same Keep/Drop decisions and optional
+reason as Inbox. Revision-matched proposal titles and full text are visible before deciding. Proposal evidence retains source metadata,
+chunks and recorded metadata. Kept entries show public previews, recorded
+activation attribution, scoped usage and source-session links when available.
+Missing attribution or usage is explicitly unavailable, never inferred or zero.
+
+Knowledge Reviews, Inbox and Session action lists share one active cursor window: decisions and session progress refresh that window only. Refresh actions/proposals returns to newest; loading more replaces the displayed window. Exact Inbox count chips still come from the separate server count owner.
+
+Lists follow opaque cursors, including empty scoped pages. Automatic traversal
+pauses every 25 pages; pages with source issues also stop for inspection before explicit continuation. Source diagnostics and session links remain visible on that page. Load more continues. Only the current page is displayed
+and searched; loading another page replaces it. Counts label loaded entries,
+not totals. Only the newest page polls automatically; older pages show that
+refresh is paused. An empty older page does not imply that the queue is empty; source failures also prevent an all-clear message. Refresh returns to the newest page after history, an expired
+cursor or an error. Members can review and read. Remove
+is full-access and confirms the displayed revision; after an unconfirmed or
+conflicting removal, refresh canonical state before starting a new intent.

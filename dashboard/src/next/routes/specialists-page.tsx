@@ -46,7 +46,7 @@ export function SpecialistsPage({
       <PageBody width="max-w-3xl">
         <p className="text-sm text-muted-foreground">The specialists this agent registers.</p>
         <label className="mt-4 flex h-8 max-w-sm min-w-0 items-center gap-2 rounded-lg border border-input bg-background px-2.5 text-sm focus-within:border-ring">
-          <Search className="size-4 shrink-0" aria-hidden="true" />
+          <Search className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
           <span className="sr-only">Search specialists</span>
           <input
             value={q}
@@ -149,7 +149,8 @@ function SpecialistCard({
           )}
           <p className="mt-0.5 text-xs text-muted-foreground">
             {agent.model}
-            {agent.provider_name ? ` via ${agent.provider_name}` : ""} · {agent.tool_count} tools
+            {agent.provider_name ? ` via ${agent.provider_name}` : ""} · {agent.tool_count}{" "}
+            {agent.tool_count === 1 ? "tool" : "tools"}
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
             {!recentEnabled

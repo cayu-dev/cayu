@@ -3,6 +3,8 @@
 Usage:
     PYTHONPATH=src .venv/bin/python examples/dashboard_pending_actions.py
     # Open http://127.0.0.1:8001/cayu/
+    # Knowledge proposals can be kept/dropped in Inbox or /cayu/knowledge.
+    # The Knowledge page also shows retained entries and source/usage evidence.
 """
 
 from __future__ import annotations

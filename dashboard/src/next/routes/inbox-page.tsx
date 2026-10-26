@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query"
 import { useSearch } from "@tanstack/react-router"
 import { useState } from "react"
+import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { InboxItem } from "../api/types"
 import { useInbox, useInboxCounts } from "../app/queries"
@@ -185,12 +186,16 @@ export function InboxPage() {
               )}
             </p>
           ))}
-          {inbox.isSuccess && items.length === 0 && (
+          {inbox.isSuccess && !inbox.isFetching && items.length === 0 && (
             <EmptyState
               title={
-                inbox.hasNextPage
-                  ? "No visible items on the pages loaded"
-                  : "Nothing is waiting for you"
+                inbox.data?.issues.length
+                  ? "Some action sources are unavailable"
+                  : inbox.hasNextPage
+                    ? "No visible items on this page"
+                    : inbox.historical
+                      ? "No actions on this older page. Refresh to check newest actions."
+                      : "Nothing is waiting for you"
               }
             >
               Approvals, questions, recovery and knowledge to review show up here as sessions need
@@ -211,16 +216,28 @@ export function InboxPage() {
               }
             />
           ))}
-          {inbox.hasNextPage && (
-            <button
-              type="button"
-              className="rounded border border-border px-3 py-2 text-sm"
-              disabled={inbox.isFetchingNextPage}
-              onClick={() => void inbox.fetchNextPage()}
+          <p className="text-xs text-muted-foreground">
+            Showing the current action page. Load more replaces it; older pages pause automatic
+            refresh.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="outline"
+              disabled={inbox.isFetching}
+              onClick={() => void inbox.refetch()}
             >
-              {items.length === 0 ? "Continue scanning" : "Load more"}
-            </button>
-          )}
+              Refresh actions
+            </Button>
+            {inbox.hasNextPage && (
+              <Button
+                variant="outline"
+                disabled={inbox.isFetching}
+                onClick={() => void inbox.fetchNextPage()}
+              >
+                {items.length === 0 ? "Continue scanning" : "Load more"}
+              </Button>
+            )}
+          </div>
         </div>
         <ChildActions
           key={`${search.session_id}-${search.agent_name}`}

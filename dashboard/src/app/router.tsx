@@ -33,7 +33,10 @@ const EnvironmentsPage = lazyRouteComponent(
   "EnvironmentsPage",
 )
 const EvalsPage = lazyRouteComponent(() => import("../routes/evals"), "EvalsPage")
-const KnowledgePage = lazyRouteComponent(() => import("../routes/knowledge"), "KnowledgePage")
+const KnowledgePage = lazyRouteComponent(
+  () => import("../next/routes/knowledge-entry"),
+  "KnowledgeEntry",
+)
 const PendingActionsPage = lazyRouteComponent(
   () => import("../next/routes/inbox-page"),
   "InboxPage",
@@ -231,6 +234,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   const knowledgeRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/knowledge",
+    staticData: { dashboardLayout: "page" },
     component: () => (
       <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/knowledge"]} title="Knowledge">
         <KnowledgePage />

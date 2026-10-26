@@ -24,6 +24,11 @@ keep 0.2.170.
 `cayu new` may ask PyPI for the latest release; set `CAYU_NO_VERSION_CHECK=1`
 to keep it offline.
 
+The Knowledge page now combines proposal review with scoped kept entries, recorded
+attribution and usage, and full-access revision-fenced Remove. Ejected dashboard
+owners should replace the former `src/routes/knowledge.tsx` route with the new
+Knowledge entry/page and regenerate their build.
+
 ### Breaking changes
 
 - `run_task_worker(execution_timeout_s=...)` now includes the grace period. The

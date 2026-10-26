@@ -3,7 +3,7 @@
  * or waiting keep their queries polling; finished ones don't.
  */
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query"
-import { useEffect, useMemo, useRef } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { ApiClientError } from "@/lib/api"
 import { activityPollInterval } from "@/lib/polling"
 import {
@@ -163,79 +163,84 @@ export function useInbox(query: InboxQuery = {}, poll = true) {
     ],
     [query.session_id, query.agent_name, query.q, query.kind, query.limit],
   )
-  const restarted = useRef<string | null>(null)
-  const result = useInfiniteQuery({
-    queryKey: key,
-    initialPageParam: null as string | null,
-    queryFn: async ({ pageParam, signal }) => {
-      const page = await api.inbox({ limit: 50, ...query, cursor: pageParam }, signal)
-      if (page.next_cursor && page.next_cursor === pageParam)
-        throw new Error("The Inbox source did not advance. Refresh the list.")
-      return page
-    },
-    getNextPageParam: (page, _pages, _cursor, cursors) =>
-      page.next_cursor && !cursors.includes(page.next_cursor) ? page.next_cursor : undefined,
-    retry: false,
-    refetchInterval: poll ? 5000 : false,
+  const identity = JSON.stringify(key)
+  const [position, setPosition] = useState({
+    identity,
+    cursor: null as string | null,
+    visited: [] as string[],
+    number: 1,
   })
-  const last = result.data?.pages.at(-1)
-  // Only the completed current fetch pass can prove a cycle. Cached cursors from
-  // an older pass may legitimately reappear after newly arrived action pages.
+  const current =
+    position.identity === identity ? position : { identity, cursor: null, visited: [], number: 1 }
+  const result = useQuery({
+    queryKey: [...key, current.cursor],
+    queryFn: ({ signal }) => api.inbox({ limit: 50, ...query, cursor: current.cursor }, signal),
+    retry: false,
+    refetchInterval: poll && current.cursor === null ? 5000 : false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  })
+  const page = result.data
+  const next = page?.next_cursor
   const cycleError =
-    last?.next_cursor && result.data?.pageParams.includes(last.next_cursor)
+    next && current.visited.includes(next)
       ? new Error("The Inbox source did not advance. Refresh the list.")
       : null
+  const advance = () => {
+    if (next && !cycleError && !result.isFetching)
+      setPosition({
+        identity,
+        cursor: next,
+        visited: [...current.visited, next],
+        number: current.number + 1,
+      })
+  }
   useEffect(() => {
     if (
-      last?.next_cursor &&
-      last.items.length === 0 &&
-      (result.data?.pages.length ?? 0) % 25 !== 0 &&
+      next &&
+      page.items.length === 0 &&
+      !page.issues?.length &&
+      current.number % 25 !== 0 &&
       !result.isFetching &&
       !result.error &&
       !cycleError
     )
-      void result.fetchNextPage()
-  }, [
-    last,
-    result.data?.pages.length,
-    result.isFetching,
-    result.error,
-    cycleError,
-    result.fetchNextPage,
-  ])
+      setPosition({
+        identity,
+        cursor: next,
+        visited: [...current.visited, next],
+        number: current.number + 1,
+      })
+  }, [next, page, current, identity, result.isFetching, result.error, cycleError])
+  const restarted = useRef<string | null>(null)
   useEffect(() => {
     if (
       result.error instanceof ApiClientError &&
       result.error.status === 422 &&
-      last?.next_cursor &&
-      restarted.current !== JSON.stringify([key, last.next_cursor])
+      current.cursor &&
+      restarted.current !== identity
     ) {
-      restarted.current = JSON.stringify([key, last.next_cursor])
-      void client.resetQueries({ queryKey: key, exact: true })
+      restarted.current = identity
+      setPosition({ identity, cursor: null, visited: [], number: 1 })
+      void client.resetQueries({ queryKey: [...key, null], exact: true })
     }
-  }, [result.error, client, key, last?.next_cursor])
-  const pages = result.data?.pages
-  const byId = new Map(pages?.flatMap((page) => page.items).map((item) => [item.id, item]))
+  }, [result.error, current.cursor, identity, client, key])
+  const refresh = async () => {
+    await client.cancelQueries({ queryKey: key })
+    setPosition({ identity, cursor: null, visited: [], number: 1 })
+    await client.resetQueries({ queryKey: [...key, null], exact: true })
+  }
   return {
     ...result,
+    refetch: refresh,
+    fetchNextPage: advance,
+    isFetchingNextPage: result.isFetching,
+    historical: current.cursor !== null,
     error: result.error ?? cycleError,
     isError: result.isError || !!cycleError,
     isSuccess: result.isSuccess && !cycleError,
-    hasNextPage: result.hasNextPage && !cycleError,
-    data: pages
-      ? {
-          items: [...byId.values()],
-          issues: [
-            ...new Map(
-              pages
-                .flatMap((page) => page.issues ?? [])
-                .map((issue) => [JSON.stringify(issue), issue]),
-            ).values(),
-          ],
-          next_cursor: last?.next_cursor ?? null,
-          has_more: !!last?.next_cursor,
-        }
-      : undefined,
+    hasNextPage: !!next && !cycleError,
+    data: page ? { ...page, issues: page.issues ?? [] } : undefined,
   }
 }
 
@@ -258,11 +263,6 @@ export function useToolUsage(enabled = true) {
     refetchInterval: TASK_POLL_MS,
     retry: false,
   })
-}
-
-export function useKnowledge() {
-  const api = useApi()
-  return useQuery({ queryKey: ["knowledge"], queryFn: () => api.knowledge() })
 }
 
 /** Every task; polls while any is live, as today's Tasks page does. */

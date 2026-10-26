@@ -28,6 +28,7 @@ import type {
   InboxItemState,
   InboxPage,
   InboxSettleRequest,
+  KeptKnowledgeListResponse,
   SessionOverviewCountsResponse,
 } from "@/lib/generated/server-api"
 import type { MutationExecutionOptions } from "@/lib/mutation-browser"
@@ -54,6 +55,7 @@ export type {
   InboxItemState,
   InboxPage,
   InboxSettleRequest,
+  KeptKnowledgeListResponse,
   SessionDetail,
   SessionEventsPage,
   SessionListQuery,
@@ -297,10 +299,13 @@ export type Api = {
     cursor?: string,
     signal?: AbortSignal,
   ): Promise<import("@/lib/generated/server-api").ToolCallsResponse>
-  /** Proposed (backend item 12): `GET /api/knowledge`, active entries. */
-  knowledge(): Promise<KnowledgeEntry[]>
-  /** Proposed (backend item 12): retire an active entry. */
-  removeKnowledge(id: string): Promise<void>
+  /** Public kept entries, bounded cursor page with scoped usage. */
+  knowledge(
+    query?: { cursor?: string | null; limit?: number },
+    signal?: AbortSignal,
+  ): Promise<KeptKnowledgeListResponse>
+  /** Retire the exact observed active revision. */
+  removeKnowledge(id: string, expectedRevision: number): Promise<void>
   /** Proposed (backend item 14): every suite with its last run and baseline. */
   evalSuites(): Promise<EvalSuiteSummary[]>
   evalSuite(id: string): Promise<EvalSuiteDetail>

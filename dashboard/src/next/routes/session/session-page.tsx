@@ -71,6 +71,7 @@ import {
   NavLink,
   SessionSummary,
   StateBadge,
+  sessionPath,
   TopBar,
   useGo,
 } from "../common"
@@ -834,10 +835,69 @@ export function SessionPage({
                       {o?.reason ?? "This session failed."}
                     </p>
                   )}
-                  {state === "interrupted" && items.length === 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      This session was stopped. Send a message to continue it.
+                  {state === "interrupted" &&
+                    inbox.isSuccess &&
+                    !inbox.isFetching &&
+                    !inbox.historical &&
+                    !inbox.hasNextPage &&
+                    !inbox.data?.issues.length &&
+                    items.length === 0 && (
+                      <p className="text-sm text-muted-foreground">
+                        This session was stopped. Send a message to continue it.
+                      </p>
+                    )}
+                  {inbox.error && <ErrorState error={inbox.error} />}
+                  {inbox.data?.issues.map((issue) => (
+                    <p
+                      role="status"
+                      key={JSON.stringify(issue)}
+                      className="text-sm text-warning [overflow-wrap:anywhere]"
+                    >
+                      {issue.detail}{" "}
+                      {issue.session_id && (
+                        <NavLink to={sessionPath(issue.session_id)}>
+                          Inspect session {issue.session_id}
+                        </NavLink>
+                      )}
                     </p>
+                  ))}
+                  {inbox.isSuccess &&
+                    !inbox.isFetching &&
+                    inbox.historical &&
+                    !items.length &&
+                    !inbox.hasNextPage &&
+                    !inbox.data?.issues.length && (
+                      <p className="text-xs text-muted-foreground">
+                        No actions on this older page. Refresh to check newest actions.
+                      </p>
+                    )}
+                  {inbox.historical && (
+                    <p className="text-xs text-muted-foreground">
+                      Showing an older action page. Refresh to return to newest.
+                    </p>
+                  )}
+                  {(inbox.historical ||
+                    inbox.hasNextPage ||
+                    inbox.error ||
+                    !!inbox.data?.issues.length) && (
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        disabled={inbox.isFetching}
+                        onClick={() => void inbox.refetch()}
+                      >
+                        Refresh actions
+                      </Button>
+                      {inbox.hasNextPage && (
+                        <Button
+                          variant="outline"
+                          disabled={inbox.isFetching}
+                          onClick={() => void inbox.fetchNextPage()}
+                        >
+                          Load more actions
+                        </Button>
+                      )}
+                    </div>
                   )}
                   {items.map((item) => (
                     <InboxCard

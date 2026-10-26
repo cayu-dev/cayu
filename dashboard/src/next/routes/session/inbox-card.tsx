@@ -32,6 +32,7 @@ export function InboxCard({
   onRecover,
   mutationBlocked = false,
   recoveryEnabled = false,
+  showKnowledgeEvidence = false,
 }: {
   item: InboxItem
   /** On the Inbox page, the session the item belongs to. */
@@ -39,6 +40,7 @@ export function InboxCard({
   onRecover?: (body: RecoveryRequest) => Promise<"observed" | "unknown">
   mutationBlocked?: boolean
   recoveryEnabled?: boolean
+  showKnowledgeEvidence?: boolean
 }) {
   const api = useApi()
   const { prototype, decisionsEnabled, knowledgeReviewEnabled } = useServices()
@@ -380,6 +382,7 @@ export function InboxCard({
             error={knowledgeSource.error}
             revision={item.knowledge.revision}
             prototype={!!prototype}
+            showEvidence={showKnowledgeEvidence}
           />
         )}
         {item.arguments_unavailable_reason === "quarantined" && (
@@ -557,11 +560,13 @@ function KnowledgeSource({
   error,
   revision,
   prototype,
+  showEvidence,
 }: {
   entry: KnowledgeEntryDetail | undefined
   error: unknown
   revision: number
   prototype: boolean
+  showEvidence: boolean
 }) {
   if (prototype) return null
   if (error) return <p className="text-xs text-muted-foreground">Source details are unavailable.</p>
@@ -571,6 +576,9 @@ function KnowledgeSource({
   return (
     <>
       <h3 className="text-xs font-medium">Full proposal</h3>
+      <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">
+        {entry.title ?? "Untitled proposal"}
+      </p>
       <p className="whitespace-pre-wrap break-words rounded-lg bg-muted px-3 py-2">{entry.text}</p>
       <dl className="grid gap-1 break-words text-xs text-muted-foreground">
         <dt>Namespace</dt>
@@ -585,6 +593,10 @@ function KnowledgeSource({
         <dd>{entry.aspects.join(", ") || "None"}</dd>
         <dt>Impact targets</dt>
         <dd>{entry.impact_targets.join(", ") || "None"}</dd>
+        <dt>Source type</dt>
+        <dd className="[overflow-wrap:anywhere]">{entry.source_type ?? "None"}</dd>
+        <dt>Source ID</dt>
+        <dd className="[overflow-wrap:anywhere]">{entry.source_id ?? "None"}</dd>
         <dt>Source URI</dt>
         <dd>{entry.source_uri || "None"}</dd>
         <dt>Created by</dt>
@@ -593,6 +605,32 @@ function KnowledgeSource({
           {entry.created_by ? `: ${entry.created_by}` : ""}
         </dd>
       </dl>
+      {showEvidence && (
+        <details className="min-w-0 text-xs">
+          <summary className="cursor-pointer">Proposal evidence</summary>
+          <p className="mt-2">
+            Visibility: {entry.visibility}. Created {entry.created_at}.
+          </p>
+          <h4 className="mt-2 font-medium">Chunks</h4>
+          <p>
+            {entry.chunks.length} loaded / limit {entry.chunk_limit}
+          </p>
+          {entry.chunks.map((chunk) => (
+            <div key={chunk.chunk_id} className="mt-2 min-w-0 rounded-lg border p-2">
+              <p className="break-all">
+                Chunk {chunk.chunk_index}: {chunk.chunk_id}
+              </p>
+              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                {chunk.text}
+              </pre>
+            </div>
+          ))}
+          <h4 className="mt-2 font-medium">Metadata</h4>
+          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+            {JSON.stringify(entry.metadata, null, 2)}
+          </pre>
+        </details>
+      )}
     </>
   )
 }

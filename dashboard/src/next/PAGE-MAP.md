@@ -200,3 +200,11 @@ cursor-paged calls. Unavailable reads do not become zero counts. Exact call link
 carry the retained session incarnation into Trace. The old Agents page is removed.
 Built-in display-label runtime work remains separate; tool names remain the
 fallback until labels are supplied by the runtime.
+
+Knowledge page port: `/knowledge` uses runtime kept-entry reads and revision-fenced
+retirement. Reviews reuse Inbox decisions and source evidence; kept usage and
+activation attribution remain nullable. Cursor lists label loaded counts and
+loaded-only search, and offer explicit continuation for bounded empty scans.
+Members Keep/Drop and read; Remove is full-access.
+
+Knowledge Reviews, Inbox and Session pending actions share a bounded active cursor window. Historical windows do not poll; mutations/progress refresh only the active window. Explicit refresh returns to newest. Proposal titles and bodies use revision-matched detail evidence.

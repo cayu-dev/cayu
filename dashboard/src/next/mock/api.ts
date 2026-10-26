@@ -884,7 +884,45 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
         u.recent = u.recent.sort((a, b) => b.at.localeCompare(a.at)).slice(0, 8)
       return wait([...usage.values()])
     },
-    knowledge: () => wait(data.knowledge ?? []),
+    knowledge: () =>
+      wait({
+        entries: (data.knowledge ?? []).map((entry) => ({
+          entry_id: entry.id,
+          revision: 1,
+          text_preview: entry.text,
+          title: null,
+          kind: entry.kind,
+          specialist: entry.agent_name,
+          source_session_id: entry.source_session_id,
+          kept_by: entry.kept_by,
+          kept_at: entry.kept_at,
+          kept_by_kind: "reviewer" as const,
+          attribution_unavailable_reason: null,
+          lookups: String(entry.lookups),
+          last_used_at: entry.last_used_at,
+          namespace: "default",
+          labels: {},
+          aspects: [],
+          impact_targets: [],
+          source_uri: null,
+          created_by: entry.agent_name,
+          created_by_type: "model",
+          created_at: entry.kept_at,
+          updated_at: entry.kept_at,
+          status: "active",
+          visibility: "global",
+          source_id: null,
+          source_type: null,
+          chunk_count: 0,
+          confidence: null,
+          importance: null,
+          importance_source: null,
+        })),
+        next_cursor: null,
+        total_count: null,
+        usage_through_sequence: null,
+        usage_unavailable_reason: null,
+      }),
     async removeKnowledge(id) {
       data.knowledge = (data.knowledge ?? []).filter((k) => k.id !== id)
       return wait(undefined)

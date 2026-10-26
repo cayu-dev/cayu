@@ -74,6 +74,12 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.storage import SQLiteEvalStore
+from cayu.storage.memory import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+    KnowledgeStatus,
+)
 from cayu.tasks import InMemoryTaskStore, TaskCreate
 from cayu.tools import AlwaysRequireApprovalToolPolicy, ToolCapabilityCeiling
 from cayu.workspaces import LocalWorkspace
@@ -390,6 +396,8 @@ class MutationDisconnectFaults:
         self.initial_mutation_ids: list[str] = []
         self.initial_mutation_requests: dict[str, int] = {}
         self.inbox_settle_requests: list[str] = []
+        self.knowledge_settle_path: str | None = None
+        self.session_settle_path: str | None = None
         self.replay_requests: list[tuple[str, str]] = []
         self.slow_summary_started = asyncio.Event()
 
@@ -637,10 +645,16 @@ async def main() -> None:
             },
             "browser session mutations must each be submitted exactly once",
         )
+        require(
+            server_app.knowledge_settle_path is not None
+            and server_app.session_settle_path is not None
+            and server_app.knowledge_settle_path != server_app.session_settle_path,
+            "Knowledge and Session must capture distinct settlement identities",
+        )
         require_equal(
-            len(server_app.inbox_settle_requests),
-            1,
-            "the Session approval must settle exactly once through the canonical Inbox owner",
+            sorted(server_app.inbox_settle_requests),
+            sorted([server_app.knowledge_settle_path, server_app.session_settle_path]),
+            "Knowledge Keep and Session Deny must each settle exactly once through their observed Inbox identity",
         )
         require_equal(
             len(server_app.replay_requests),
@@ -717,7 +731,29 @@ async def _seed_app() -> tuple[
 ]:
     store = InMemorySessionStore()
     task_store = InMemoryTaskStore()
-    app = CayuApp(session_store=store, task_store=task_store, enable_logging=False)
+    knowledge_scope = KnowledgeAccessScope.privileged()
+    knowledge_store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="dashboard-kept",
+                text="Dashboard retained knowledge",
+                status=KnowledgeStatus.ACTIVE,
+            ),
+            KnowledgeEntry(
+                id="dashboard-proposal",
+                text="Dashboard proposed knowledge",
+                status=KnowledgeStatus.PENDING,
+            ),
+        ],
+        access_scope=knowledge_scope,
+    )
+    app = CayuApp(
+        session_store=store,
+        task_store=task_store,
+        knowledge_store=knowledge_store,
+        knowledge_access_scope=knowledge_scope,
+        enable_logging=False,
+    )
     runtime_directory = tempfile.TemporaryDirectory(prefix="cayu-dashboard-runtime-")
     runtime_root = Path(runtime_directory.name)
     workspace_root = runtime_root / "workspace"
@@ -1481,6 +1517,8 @@ async def _exercise_dashboard(
     await _exercise_operational_scope(page, base_url)
     await _exercise_dashboard_inbox(page, base_url)
     await _exercise_specialists_tools(page, base_url)
+
+    faults.knowledge_settle_path = await _exercise_dashboard_knowledge(page, base_url)
     await _exercise_run_agent_inventory(page, base_url)
     await _exercise_mutation_recovery(page, base_url)
     await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
@@ -1499,7 +1537,9 @@ async def _exercise_dashboard(
         "aria-selected", "true"
     )
     await _exercise_session_observation(page, base_url, session_store)
-    await _exercise_existing_session_mutations(page, base_url, provider)
+    faults.session_settle_path = await _exercise_existing_session_mutations(
+        page, base_url, provider
+    )
     await _exercise_captured_evaluation(
         page,
         base_url,
@@ -3020,6 +3060,9 @@ async def _exercise_workflow(
                     f"observed={observed_requests!r}"
                 )
 
+    # The preceding scenario leaves the Sessions document mounted. Destroy it
+    # before observing Workflow so delayed title reads cannot cross ownership.
+    await page.goto("about:blank", wait_until="load")
     page.on("request", record_workflow_request)
     try:
         await page.goto(workflow_url, wait_until="domcontentloaded")
@@ -3663,7 +3706,42 @@ async def _exercise_unconfigured_evals_shell(page: Page, base_url: str) -> None:
         await page.unroute("**/api/contract", serve_without_evals_configuration)
 
 
-async def _exercise_capability_contract(page: Page, base_url: str) -> None:
+async def _exercise_knowledge_capability_contract(page: Page, base_url: str) -> None:
+    """Configured Knowledge stays visible; absent surfaces never trigger reads."""
+    await page.goto(f"{base_url}/cayu/tasks", wait_until="networkidle")
+    await expect(page.get_by_role("link", name="Knowledge", exact=True)).to_be_visible()
+    observed = []
+
+    def record(request) -> None:
+        if "/api/knowledge" in urlsplit(request.url).path:
+            observed.append(request.url)
+
+    async def disabled(route) -> None:
+        response = await route.fetch()
+        body = await response.json()
+        for name in ("reviewed_knowledge", "kept_knowledge"):
+            body["capabilities"]["surfaces"][name] = {
+                "configured": False,
+                "read": {"enabled": False, "unavailable_reason": "not_configured"},
+                "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
+            }
+        await route.fulfill(response=response, json=body)
+
+    await page.route("**/api/contract", disabled)
+    page.on("request", record)
+    try:
+        await page.goto(f"{base_url}/cayu/knowledge", wait_until="networkidle")
+        await expect(page.get_by_role("link", name="Knowledge", exact=True)).to_have_count(0)
+        await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_contain_text(
+            "Knowledge is unavailable"
+        )
+        require(not observed, f"Disabled Knowledge issued reads: {observed!r}")
+    finally:
+        page.remove_listener("request", record)
+        await page.unroute("**/api/contract", disabled)
+
+
+async def _exercise_optional_surface_capabilities(page: Page, base_url: str) -> None:
     observed_requests: list[str] = []
 
     async def serve_without_task_or_artifact_surface(route) -> None:
@@ -3706,7 +3784,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
             "Tasks is unavailable"
         )
         await expect(page.get_by_role("link", name="Tasks", exact=True)).to_have_count(0)
-        await expect(page.get_by_role("link", name="Knowledge", exact=True)).to_have_count(0)
+        await expect(page.get_by_role("link", name="Knowledge", exact=True)).to_be_visible()
         await expect(page.get_by_role("link", name="Artifacts", exact=True)).to_have_count(0)
         await expect(page.get_by_role("link", name="Usage", exact=True)).to_be_visible()
         await expect(page.get_by_role("link", name="System", exact=True)).to_be_visible()
@@ -3739,6 +3817,10 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         page.remove_listener("request", record_api_request)
         await page.unroute("**/api/contract", serve_without_task_or_artifact_surface)
 
+
+async def _exercise_capability_contract(page: Page, base_url: str) -> None:
+    await _exercise_optional_surface_capabilities(page, base_url)
+    await _exercise_knowledge_capability_contract(page, base_url)
     await _exercise_unconfigured_evals_shell(page, base_url)
 
     async def serve_usage_without_pricing_contract(route) -> None:
@@ -3918,6 +4000,36 @@ async def _exercise_dashboard_inbox(page: Page, base_url: str) -> None:
             page.get_by_role("button", name=re.compile(rf"^{kind}(?: \d+)?$"))
         ).to_be_visible()
     await expect(page.get_by_role("heading", name="Child actions", exact=True)).to_be_visible()
+
+
+async def _exercise_dashboard_knowledge(page: Page, base_url: str) -> str:
+    await page.goto(f"{base_url}/cayu/knowledge", wait_until="networkidle")
+    await expect(page.get_by_role("heading", name="Knowledge", exact=True)).to_be_visible()
+    await expect(page.get_by_role("heading", name="Waiting for review", exact=True)).to_be_visible()
+    await expect(page.get_by_role("heading", name="Kept", exact=True)).to_be_visible()
+    await expect(
+        page.get_by_role("textbox", name="Search loaded knowledge", exact=True)
+    ).to_be_visible()
+    await expect(page.get_by_text("Dashboard retained knowledge", exact=True)).to_be_visible()
+    async with page.expect_request(
+        lambda request: (
+            request.method == "POST"
+            and re.fullmatch(r"/api/inbox/[^/]+/settle", urlsplit(request.url).path) is not None
+        )
+    ) as settlement:
+        await page.get_by_role("button", name="Keep", exact=True).click()
+    request = await settlement.value
+    body = request.post_data_json
+    if not isinstance(body, dict):
+        raise AssertionError("Knowledge settlement must send an object")
+    require_equal(body.get("decision"), "keep", "Knowledge must submit Keep")
+    await expect(page.get_by_role("button", name="Keep", exact=True)).to_have_count(0)
+    kept = page.get_by_role("article", name="Knowledge dashboard-kept", exact=True)
+    await kept.get_by_role("button", name="Remove", exact=True).click()
+    await kept.get_by_role("button", name="Confirm remove", exact=True).click()
+    await expect(kept).to_have_count(0)
+
+    return urlsplit(request.url).path
 
 
 async def _exercise_operational_scope(page: Page, base_url: str) -> None:
@@ -4506,7 +4618,7 @@ async def _exercise_mutation_recovery(page: Page, base_url: str) -> None:
 
 async def _exercise_existing_session_mutations(
     page: Page, base_url: str, provider: DashboardContractProvider
-) -> None:
+) -> str:
     await page.goto(f"{base_url}/cayu/sessions/{SESSION_ID}", wait_until="domcontentloaded")
     resume_input = page.locator("#session-composer")
     await expect(resume_input).to_be_visible()
@@ -4529,7 +4641,18 @@ async def _exercise_existing_session_mutations(
     )
     await expect(page.get_by_text("Needs your approval", exact=True).first).to_be_visible()
     deny_button = page.get_by_role("button", name="Deny", exact=True)
-    await deny_button.click()
+    async with page.expect_request(
+        lambda request: (
+            request.method == "POST"
+            and re.fullmatch(r"/api/inbox/[^/]+/settle", urlsplit(request.url).path) is not None
+        )
+    ) as settlement:
+        await deny_button.click()
+    request = await settlement.value
+    body = request.post_data_json
+    if not isinstance(body, dict):
+        raise AssertionError("Session settlement must send an object")
+    require_equal(body.get("decision"), "deny", "Session must submit Deny")
     await provider.wait_for_direct_requests(2)
     await expect(page.get_by_role("button", name="Stop", exact=True)).to_be_visible(timeout=10_000)
     await expect(deny_button).to_have_count(0)
@@ -4616,6 +4739,8 @@ async def _exercise_existing_session_mutations(
         await page.unroute(failure_path, inject_runtime_failure)
 
     await _exercise_manual_mutation_reobservation(page, base_url)
+
+    return urlsplit(request.url).path
 
 
 async def _exercise_manual_mutation_reobservation(page: Page, base_url: str) -> None:
