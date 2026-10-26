@@ -3096,6 +3096,107 @@ five-second policy. Debug-level structured records separately identify
 `result_publication`; each includes elapsed duration, while worker-originated
 checkpoint and publication records work consistently across store backends.
 
+### Suite-centred runtime reads
+
+Server contract 63 adds three authenticated read endpoints under `/api/evals`:
+
+- `GET /suite-views` lists authored definitions and corpus suites. Omit
+  `target_key` for all configured targets, or provide it for one target. `limit`,
+  `cursor`, and `max_result_bytes` bound the page.
+- `GET /suite-views/{suite_key}` returns suite metadata, case definitions with
+  their latest published outcomes, and run history. Cases and runs have separate
+  `cases_cursor`/`cases_limit` and `runs_cursor`/`runs_limit` parameters.
+- `GET /run-views/{run_key}` returns run metadata, progress, and case evidence.
+  `compared_with` selects another run/result; otherwise the approved baseline is
+  used when available. Case results use `cases_cursor` and `cases_limit`.
+
+Use the opaque identifiers returned by these endpoints. A cursor is bound to
+its query scope; it cannot be reused for another suite or comparison. Page
+responses include `items`, `next_cursor`, `has_more`, and `total`. A null total
+means the exact count is unavailable; it is never inferred from page length.
+An individual response that exceeds the requested byte bound returns HTTP 413.
+
+Authored definitions use `baseline_scope: "execution_group"` and have a null
+suite-level `baseline`. Each history run exposes its exact corpus/suite identity
+and that execution group's baseline, including approving actor, time and
+generation. `baseline_result` supplies the baseline's case counts, judge score
+and other retained metadata without another client request. Different authored
+execution groups can have different baselines;
+no single aggregate baseline or aggregate comparison is inferred. Corpus
+suites use `baseline_scope: "suite"` and expose their own baseline directly.
+
+Case counts keep `passed`, `failed`, `error` and `unavailable` disjoint. Display
+`flaky` separately as **Flaky variability (overlapping)**: it counts cases with
+both passed and nonpassed trials, including a case that passes its configured
+minimum-pass threshold. Do not add it to the outcome counts or total. During a
+live run, only settled cases contribute outcomes; incomplete cases are reflected
+in trial progress until the complete trial policy can be applied.
+
+The `eval_suite_views` capability is read-only. Both full-access and member
+roles can use these three endpoints; existing launch, approval, baseline and
+other mutation permissions remain full-access. Missing configuration or an
+adapter without suite-view support returns HTTP 409. These runtime reads do not
+change the bundled Evals page's separate UI contract.
+
+Run identities distinguish native durable runs from captured results. Missing
+native run IDs, source sessions, actors, start/finish times and candidate
+profiles remain null rather than being inferred from HTTP access or labels.
+A fresh result selector preserves its result identity and includes native actor,
+profile and timing metadata when its catalog retains a native-run link.
+Run result cases support optional `case_filter=regressed|improved|failing|flaky`;
+omit it for all cases. Filtering covers the complete bounded result before
+pagination. `results.total` counts matching cases, while run and comparison
+summaries retain whole-run counts. Directional filters include tradeoffs;
+`failing` includes failed, error and unavailable outcomes; `flaky` is the
+separately labelled overlapping variability count. Case cursors bind the filter,
+resolved current and comparison result revisions, and baseline generation.
+Reusing a cursor after any of those values changes returns HTTP 422; restart
+from the first page after changing a filter or baseline.
+
+Published case presentations retain assertion outcomes, reliability, output
+preview availability and truncation. Candidate token totals are exact decimal
+strings and explicitly distinguish complete from partial evidence. A complete
+total requires positive complete usage evidence for every trial. Missing or
+unavailable usage evidence contributes no observed tokens; known partial usage
+remains a partial observation rather than a complete total. They cover
+candidate execution only; aggregate monetary cost is unavailable, while retained
+per-check evidence remains available in case results.
+
+Live progress is one atomic lifecycle/terminal-outcome observation. A case is
+classified only after all trials required by its immutable trial policy have
+settled. Published results supersede checkpoints. Failed or cancelled runs
+without retained results report unavailable progress instead of claiming zero
+work. No claims, raw checkpoint payloads or private error strings are exposed.
+Comparisons reuse the result comparator in both directions: a regression only,
+an improvement only, both, or neither produces `regression`, `improvement`,
+`tradeoff`, or `tie`. Pending, unavailable, missing-baseline and incompatible comparisons have
+no verdict. Terminal runs without a result are unavailable, not pending. Named
+comparison selectors are resolved even while the current run is pending.
+Unavailable and incompatible comparisons retain their reasons. Both regression
+and improvement details use `baseline_*` for the compared result and `current_*`
+for the selected current result, including status, score and reliability.
+The run read's `compared_run` carries the selected run/result's metadata and
+counts; its case evidence is retained beside each current case. Run metadata
+also includes the suite name and specialist. Baseline and compared metadata use
+a nonrecursive projection: they do not trigger a chain of further comparisons.
+Check definitions include an explicit `judge` flag alongside their label and
+complete specification.
+
+Built-in memory, SQLite and PostgreSQL eval stores implement the optional
+`suite_views` extension. Custom stores opt in with `suite_views = True` and
+implement `list_view_index(EvalViewQuery)`,
+`load_latest_case_results(EvalCaseHistoryQuery)`,
+`load_run_view_snapshot(run_id)`, and `load_result_run_view_snapshot(result_revision)`.
+The result lookup uses the catalog’s recorded native-run linkage without scanning
+history. Captured results have no native linkage. A linked snapshot must publish
+the requested result revision; all run/result scope validation still applies.
+Index reads must enforce the complete target and immutable-suite scope before pagination, including configured-target
+filters. Latest-case reads return at most one result reference per requested
+case. Run snapshots must atomically observe lifecycle and unique terminal
+(case, trial-number) outcomes without acquiring or exposing a worker claim.
+Stores without this extension remain explicitly unavailable; the server does
+not scan their complete histories as a fallback.
+
 ### First-class dashboard Evals area
 
 The bundled dashboard always exposes an **Evals** navigation area and accepts

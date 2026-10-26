@@ -3127,6 +3127,14 @@ def run_spec(request: EvalRunRequest) -> EvalRunSpec:
 
 
 if TYPE_CHECKING:
+    from cayu.evals.read_views import (
+        EvalCaseHistoryQuery,
+        EvalCaseResultReference,
+        EvalRunViewSnapshot,
+        EvalSuiteViewIdentity,
+        EvalViewIndexPage,
+        EvalViewQuery,
+    )
     from cayu.storage.retention import (
         EvalRetentionPolicy,
         RetentionAuditRecord,
@@ -3146,8 +3154,36 @@ class EvalStore(ABC):
     trial_checkpointing: ClassVar[bool] = False
     suite_authoring: ClassVar[bool] = False
     judge_calibrations: ClassVar[bool] = False
+    suite_views: ClassVar[bool] = False
     #: Storage retention is an explicit operator capability, never implicit.
     supports_storage_retention: ClassVar[bool] = False
+
+    async def list_view_index(self, query: EvalViewQuery) -> EvalViewIndexPage:
+        """Bounded unified suite catalog or exact-suite run/result history.
+
+        An omitted suite selects the catalog; a supplied immutable suite identity
+        selects its history. Cursors are bound to the complete query scope.
+        """
+        raise NotImplementedError("This EvalStore does not support suite views.")
+
+    async def load_latest_case_results(
+        self,
+        query: EvalCaseHistoryQuery,
+    ) -> tuple[EvalCaseResultReference, ...]:
+        """Latest published result per requested case, bounded by the case page."""
+        raise NotImplementedError("This EvalStore does not support suite views.")
+
+    async def load_run_view_snapshot(self, run_id: str) -> EvalRunViewSnapshot | None:
+        """Atomically read lifecycle and non-secret terminal outcomes, without a claim."""
+        raise NotImplementedError("This EvalStore does not support suite views.")
+
+    async def load_result_run_view_snapshot(self, revision: str) -> EvalRunViewSnapshot | None:
+        """Read the native snapshot positively linked by this immutable result's catalog record.
+
+        Return None for captured results or missing linkage; never infer provenance
+        by scanning history or matching content. The linked run must publish revision.
+        """
+        raise NotImplementedError("This EvalStore does not support suite views.")
 
     @abstractmethod
     async def close(self) -> None:
@@ -3655,6 +3691,15 @@ class _MemoryRunState:
 class _MemoryEvalResultState:
     record: EvalResultRecord
     document: bytes
+    fresh_run_id: str | None = None
+
+
+def _run_matches_view_suite(request: EvalRunRequest, scope: EvalSuiteViewIdentity) -> bool:
+    return request.target_key == scope.target_key and (
+        request.invocation.authored_suite_revision == scope.revision
+        if scope.source == "authored"
+        else request.corpus_revision == scope.revision and request.suite_id == scope.suite_id
+    )
 
 
 def _authored_suite_launch_predecessor_exists(
@@ -3685,6 +3730,185 @@ class InMemoryEvalStore(EvalStore):
     trial_checkpointing: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
     judge_calibrations: ClassVar[bool] = True
+
+    suite_views: ClassVar[bool] = True
+
+    async def list_view_index(self, query: EvalViewQuery) -> EvalViewIndexPage:
+        from cayu.evals.read_views import (
+            EvalViewIndexEntry,
+            EvalViewQuery,
+            bounded_view_index,
+        )
+
+        query = _exact_model(query, EvalViewQuery, "query")
+        boundary = query.boundary()
+
+        def accepts_target(key):
+            return (query.target_key is None or key == query.target_key) and (
+                query.target_keys is None or key in query.target_keys
+            )
+
+        async with self._lock:
+            items = []
+            if query.suite is None:
+                items.extend(
+                    EvalViewIndexEntry(
+                        source="authored",
+                        revision=item.revision,
+                        created_at=item.created_at,
+                        target_key=item.target_key,
+                    )
+                    for item in self._authored_suites.values()
+                    if accepts_target(item.target_key)
+                )
+                for revision, suites in self._suites.items():
+                    corpus = self._corpora[revision]
+                    if accepts_target(corpus.target_key):
+                        items.extend(
+                            EvalViewIndexEntry(
+                                source="corpus",
+                                target_key=corpus.target_key,
+                                revision=revision,
+                                suite_id=item.id,
+                                created_at=corpus.created_at,
+                            )
+                            for item in suites
+                        )
+            else:
+                scope = query.suite
+                for state in self._runs.values():
+                    request = state.request
+                    if _run_matches_view_suite(request, scope):
+                        items.append(
+                            EvalViewIndexEntry(
+                                source="run",
+                                revision=request.run_id,
+                                created_at=state.created_at,
+                                target_key=request.target_key,
+                            )
+                        )
+                if scope.source == "corpus":
+                    native_revisions = {
+                        state.result.revision
+                        for state in self._runs.values()
+                        if state.result is not None
+                    }
+                    for state in self._results.values():
+                        record = state.record
+                        if (
+                            record.target.target_key == query.target_key
+                            and record.corpus_revision == scope.revision
+                            and record.suite_id == scope.suite_id
+                            and record.revision not in native_revisions
+                        ):
+                            items.append(
+                                EvalViewIndexEntry(
+                                    source="result",
+                                    target_key=record.target.target_key,
+                                    revision=record.revision,
+                                    created_at=record.created_at,
+                                )
+                            )
+            items.sort(key=lambda item: item.key)
+            if query.suite is not None:
+                items.sort(key=lambda item: item.created_at, reverse=True)
+            if boundary is not None:
+                timestamp, key = boundary
+                items = [
+                    item
+                    for item in items
+                    if (
+                        item.key > key
+                        if timestamp is None
+                        else item.created_at < timestamp
+                        or (item.created_at == timestamp and item.key > key)
+                    )
+                ]
+            return bounded_view_index(items, query)
+
+    async def load_latest_case_results(
+        self,
+        query: EvalCaseHistoryQuery,
+    ) -> tuple[EvalCaseResultReference, ...]:
+        from cayu.evals.read_views import EvalCaseHistoryQuery, EvalCaseResultReference
+
+        query = _exact_model(query, EvalCaseHistoryQuery, "query")
+        scope = query.suite
+        requested = set(query.case_ids)
+        async with self._lock:
+            selected = {}
+
+            def consider(created_at, source, revision, case_id):
+                old = selected.get(case_id)
+                if (
+                    old is None
+                    or created_at > old[0]
+                    or (created_at == old[0] and (source, revision) < old[1:])
+                ):
+                    selected[case_id] = (created_at, source, revision)
+
+            for state in self._runs.values():
+                request = state.request
+                if _run_matches_view_suite(request, scope) and state.result is not None:
+                    for case in state.result.run.cases:
+                        if case.case_id in requested:
+                            consider(state.created_at, "run", request.run_id, case.case_id)
+            if scope.source == "corpus":
+                for state in self._results.values():
+                    record = state.record
+                    if (
+                        record.origin == EvalResultOrigin.CAPTURED_SESSION
+                        and record.target.target_key == scope.target_key
+                        and record.corpus_revision == scope.revision
+                        and record.suite_id == scope.suite_id
+                    ):
+                        case_id = json.loads(state.document)["score"]["case_id"]
+                        if case_id in requested:
+                            consider(record.created_at, "result", record.revision, case_id)
+            return tuple(
+                EvalCaseResultReference(
+                    case_id=key, source=selected[key][1], revision=selected[key][2]
+                )
+                for key in sorted(selected)
+            )
+
+    async def load_run_view_snapshot(self, run_id: str) -> EvalRunViewSnapshot | None:
+        from cayu.evals.read_views import EvalRunViewSnapshot, EvalTrialViewOutcome
+
+        run_id = _store_identifier(run_id, "run_id")
+        async with self._lock:
+            state = self._runs.get(run_id)
+            if state is None:
+                return None
+            return EvalRunViewSnapshot(
+                run=self._record(state),
+                terminal_trials=tuple(
+                    EvalTrialViewOutcome.model_validate(
+                        {
+                            "case_id": item.case_id,
+                            "trial_number": item.trial_number,
+                            "status": item.result.status,
+                            "score": item.result.score,
+                            "diagnostic_code": item.public_data.diagnostic_code,
+                        }
+                    )
+                    for item in state.trial_checkpoints.values()
+                ),
+            )
+
+    async def load_result_run_view_snapshot(self, revision: str) -> EvalRunViewSnapshot | None:
+        revision = _sha256_revision(revision, "revision")
+        async with self._lock:
+            result = self._results.get(revision)
+            run_id = None if result is None else result.fresh_run_id
+        if run_id is None:
+            return None
+        snapshot = await self.load_run_view_snapshot(run_id)
+        if snapshot is not None and (
+            snapshot.run.result is None or snapshot.run.result.revision != revision
+        ):
+            raise EvalRunStateConflict("Eval result run linkage mismatch.")
+        return snapshot
 
     def __init__(
         self,
@@ -4553,6 +4777,7 @@ class InMemoryEvalStore(EvalStore):
                 validated_result,
                 result_document,
                 created_at=now,
+                fresh_run_id=claim.run_id,
             )
             state.status = EvalRunStatus.COMPLETED
             state.result = validated_result
@@ -4816,6 +5041,7 @@ class InMemoryEvalStore(EvalStore):
         document: bytes,
         *,
         created_at: datetime,
+        fresh_run_id: str | None = None,
     ) -> EvalResultRecord:
         record = eval_result_record(
             result,
@@ -4832,6 +5058,7 @@ class InMemoryEvalStore(EvalStore):
         self._results[record.revision] = _MemoryEvalResultState(
             record=record,
             document=bytes(document),
+            fresh_run_id=fresh_run_id,
         )
         return record.model_copy(deep=True)
 

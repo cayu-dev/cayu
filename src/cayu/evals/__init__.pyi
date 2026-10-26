@@ -994,6 +994,14 @@ from cayu.evals.published import PublishedUsageRecordedDetail as PublishedUsageR
 from cayu.evals.published import PublishedUsageSummaryV1 as PublishedUsageSummaryV1
 from cayu.evals.published import PublishedWorkspaceFileDetail as PublishedWorkspaceFileDetail
 from cayu.evals.published import publish_eval_run as publish_eval_run
+from cayu.evals.read_views import EvalCaseHistoryQuery as EvalCaseHistoryQuery
+from cayu.evals.read_views import EvalCaseResultReference as EvalCaseResultReference
+from cayu.evals.read_views import EvalRunViewSnapshot as EvalRunViewSnapshot
+from cayu.evals.read_views import EvalSuiteViewIdentity as EvalSuiteViewIdentity
+from cayu.evals.read_views import EvalTrialViewOutcome as EvalTrialViewOutcome
+from cayu.evals.read_views import EvalViewIndexEntry as EvalViewIndexEntry
+from cayu.evals.read_views import EvalViewIndexPage as EvalViewIndexPage
+from cayu.evals.read_views import EvalViewQuery as EvalViewQuery
 from cayu.evals.recall_baseline import (
     RECALL_BASELINE_CORPUS_SCHEMA_VERSION as RECALL_BASELINE_CORPUS_SCHEMA_VERSION,
 )

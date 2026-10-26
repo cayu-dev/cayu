@@ -32,6 +32,16 @@ from cayu.evals.corpus import (
 )
 from cayu.evals.execution import CORPUS_EXECUTION_RESULT_MAX_BYTES, CorpusExecutionResult
 from cayu.evals.execution_reporting import corpus_execution_result_from_json
+from cayu.evals.read_views import (
+    EvalCaseHistoryQuery,
+    EvalCaseResultReference,
+    EvalRunViewSnapshot,
+    EvalTrialViewOutcome,
+    EvalViewIndexEntry,
+    EvalViewIndexPage,
+    EvalViewQuery,
+    bounded_view_index,
+)
 from cayu.evals.results import (
     CapturedEvaluationResultV1,
     EvalResultOrigin,
@@ -149,6 +159,7 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDocument,
     eval_suite_document_from_json,
 )
+from cayu.storage._eval_view_queries import latest_case_results_sql, view_index_sql
 from cayu.storage._postgres_base import _PostgresStoreBase
 
 _POSTGRES_EVAL_MIN_REQUIRED_REVISION = 80
@@ -1230,6 +1241,103 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     "duration_seconds": monotonic() - started_at,
                 },
             )
+
+    suite_views: ClassVar[bool] = True
+
+    async def list_view_index(self, query: EvalViewQuery) -> EvalViewIndexPage:
+        query = _exact_model(query, EvalViewQuery, "query")
+        sql, params = view_index_sql(query, postgres=True)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(cast("LiteralString", sql), params)
+            rows = await cur.fetchall()
+        return bounded_view_index(
+            [
+                EvalViewIndexEntry.model_validate(
+                    dict(
+                        zip(
+                            ("source", "revision", "suite_id", "created_at", "target_key"),
+                            row,
+                            strict=True,
+                        )
+                    )
+                )
+                for row in rows
+            ],
+            query,
+        )
+
+    async def load_latest_case_results(
+        self,
+        query: EvalCaseHistoryQuery,
+    ) -> tuple[EvalCaseResultReference, ...]:
+        query = _exact_model(query, EvalCaseHistoryQuery, "query")
+        sql, params = latest_case_results_sql(query, postgres=True)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(cast("LiteralString", sql), params)
+            rows = await cur.fetchall()
+        return tuple(
+            EvalCaseResultReference(case_id=row[0], source=row[1], revision=row[2]) for row in rows
+        )
+
+    async def load_run_view_snapshot(self, run_id: str) -> EvalRunViewSnapshot | None:
+        run_id = _store_identifier(run_id, "run_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            # Checkpoint writers first lock this parent row. A shared read lock
+            # keeps the lifecycle and grouped slots in the same observation.
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"SELECT {_RUN_COLUMNS} FROM cayu_eval_runs WHERE run_id = %s FOR SHARE",
+                ),
+                (run_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            await cur.execute(
+                "SELECT case_id, trial_number, "
+                "checkpoint_json::jsonb #>> '{result,status}', "
+                "(checkpoint_json::jsonb #>> '{result,score}')::double precision, "
+                "checkpoint_json::jsonb #>> '{public_data,diagnostic_code}' "
+                "FROM cayu_eval_run_trial_checkpoints WHERE run_id = %s",
+                (run_id,),
+            )
+            outcomes = await cur.fetchall()
+            return EvalRunViewSnapshot(
+                run=_run_record_from_row(row),
+                terminal_trials=tuple(
+                    EvalTrialViewOutcome(
+                        case_id=item[0],
+                        trial_number=item[1],
+                        status=item[2],
+                        score=item[3],
+                        diagnostic_code=item[4],
+                    )
+                    for item in outcomes
+                ),
+            )
+
+    async def load_result_run_view_snapshot(self, revision: str) -> EvalRunViewSnapshot | None:
+        revision = _sha256_revision(revision, "revision")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT fresh_run_id FROM cayu_eval_result_records WHERE revision = %s AND origin = 'fresh_execution'",
+                (revision,),
+            )
+            row = await cur.fetchone()
+        run_id = None if row is None else row[0]
+        if run_id is None:
+            return None
+        snapshot = await self.load_run_view_snapshot(run_id)
+        if snapshot is not None and (
+            snapshot.run.result is None or snapshot.run.result.revision != revision
+        ):
+            raise EvalRunStateConflict("Eval result run linkage mismatch.")
+        return snapshot
 
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)

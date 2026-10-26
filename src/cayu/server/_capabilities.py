@@ -45,6 +45,7 @@ class ControlPlaneCapabilitySnapshot:
     task_creation_supported: bool = False
     tool_usage_supported: bool = False
     session_overview_supported: bool = False
+    eval_suite_views_supported: bool = False
 
     @property
     def evaluation_promotion_supported(self) -> bool:
@@ -166,6 +167,11 @@ class ControlPlaneCapabilitySnapshot:
                     self.evaluation_promotion_configured,
                     supported=self.evaluation_promotion_supported,
                 ),
+                eval_suite_views=_optional_surface(
+                    self.eval_store_configured and self.eval_target_configured,
+                    read_supported=self.eval_suite_views_supported,
+                    mutation_supported=False,
+                ),
                 evals=_optional_surface(
                     self.evals_configured,
                     mutation_supported=True,
@@ -206,6 +212,7 @@ def inspect_control_plane_capabilities(
     task_creation_supported: bool = False,
     tool_usage_supported: bool = False,
     session_overview_supported: bool = False,
+    eval_suite_views_supported: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
 
@@ -221,6 +228,7 @@ def inspect_control_plane_capabilities(
         else eval_project_identity_configured
     )
     for field_name, value in (
+        ("eval_suite_views_supported", eval_suite_views_supported),
         ("browser_recordings_configured", browser_recordings_configured),
         ("dashboard_configured", dashboard_configured),
         ("tasks_configured", tasks_configured),
@@ -251,6 +259,7 @@ def inspect_control_plane_capabilities(
     ):
         raise ValueError("Configured Evals requires store, target, and project identity evidence.")
     return ControlPlaneCapabilitySnapshot(
+        eval_suite_views_supported=eval_suite_views_supported,
         browser_recordings_configured=browser_recordings_configured,
         task_index_supported=task_index_supported,
         task_creation_supported=task_creation_supported,

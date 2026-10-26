@@ -178,6 +178,7 @@ from cayu.server._corpus_routes import (
     register_corpus_management_routes,
 )
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
+from cayu.server._eval_view_routes import register_eval_view_routes
 from cayu.server._evaluation_promotion_routes import register_evaluation_promotion_routes
 from cayu.server._evaluation_result_routes import register_evaluation_result_routes
 from cayu.server._evaluation_run_routes import register_evaluation_run_routes
@@ -4589,6 +4590,7 @@ def create_router(
         terminal_session_evidence_supported=session_store.supports_terminal_session_evidence,
         session_lineage_supported=session_store.supports_session_lineage,
         session_supervision_events_supported=session_store.supports_supervision_events,
+        eval_suite_views_supported=eval_runtime is not None and eval_runtime.store.suite_views,
         evals_configured=eval_runtime is not None,
         eval_store_configured=(
             eval_runtime is not None
@@ -5003,6 +5005,13 @@ def create_router(
             resolve_public_session_id=_resolve_public_session_id,
             protected=protected,
         )
+
+    register_eval_view_routes(
+        bounded_evals_router,
+        store=None if eval_runtime is None else eval_runtime.store,
+        registry=eval_registry,
+        protected=protected,
+    )
 
     if eval_registry is not None:
         captured_eval_store = None if eval_runtime is None else eval_runtime.store

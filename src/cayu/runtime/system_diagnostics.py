@@ -241,6 +241,7 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     pricing: OptionalSurfaceCapability
     evaluation_promotion: OptionalSurfaceCapability
     evals: OptionalSurfaceCapability
+    eval_suite_views: OptionalSurfaceCapability | None = None
 
 
 class ControlPlaneMutationCapabilities(_DiagnosticsModel):

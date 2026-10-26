@@ -9046,6 +9046,16 @@
           "dashboard": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
+          "eval_suite_views": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "evals": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
@@ -13009,6 +13019,108 @@
         "title": "EvalCaseReliabilityV1",
         "type": "object"
       },
+      "EvalCaseResultView": {
+        "additionalProperties": false,
+        "properties": {
+          "case": {
+            "$ref": "#/components/schemas/EvalCaseView"
+          },
+          "change": {
+            "enum": [
+              "improved",
+              "regressed",
+              "tradeoff",
+              "unchanged",
+              "uncompared"
+            ],
+            "title": "Change",
+            "type": "string"
+          },
+          "compared": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalCasePresentationV2"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "compared_evidence": {
+            "$ref": "#/components/schemas/JsonValue"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/JsonValue"
+          },
+          "improvements": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalViewImprovement"
+            },
+            "title": "Improvements",
+            "type": "array"
+          },
+          "judge_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Judge Score"
+          },
+          "judge_score_state": {
+            "enum": [
+              "available",
+              "not_used",
+              "unavailable"
+            ],
+            "title": "Judge Score State",
+            "type": "string"
+          },
+          "presentation": {
+            "$ref": "#/components/schemas/EvalCasePresentationV2"
+          },
+          "regressions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CorpusExecutionRegression"
+            },
+            "title": "Regressions",
+            "type": "array"
+          },
+          "structured_judgments": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalStructuredJudgeComparisonV1"
+            },
+            "title": "Structured Judgments",
+            "type": "array"
+          },
+          "tool_json_assertions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalToolJsonAssertionComparisonV1"
+            },
+            "title": "Tool Json Assertions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "case",
+          "presentation",
+          "judge_score",
+          "judge_score_state",
+          "evidence",
+          "compared",
+          "compared_evidence",
+          "change"
+        ],
+        "title": "EvalCaseResultView",
+        "type": "object"
+      },
       "EvalCaseSpec": {
         "additionalProperties": false,
         "description": "One deterministic expectation set with optional fresh-run input.\n\nCaptured-session evaluations intentionally set ``input`` to ``None`` when\nthe retained evidence cannot be represented as one corpus-v2 invocation.\nSuch cases remain portable historical evaluation contracts, but execution\nrejects them until a runnable input or scenario is authored.",
@@ -13159,6 +13271,51 @@
           "assertions"
         ],
         "title": "EvalCaseSpec",
+        "type": "object"
+      },
+      "EvalCaseView": {
+        "additionalProperties": false,
+        "properties": {
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Checks",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "input": {
+            "$ref": "#/components/schemas/JsonValue"
+          },
+          "last": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalCasePresentationV2"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "source_session_id": {
+            "title": "Source Session Id",
+            "type": "null"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "input",
+          "checks"
+        ],
+        "title": "EvalCaseView",
         "type": "object"
       },
       "EvalComparisonResponse": {
@@ -15977,6 +16134,469 @@
         "title": "EvalRunStatus",
         "type": "string"
       },
+      "EvalRunViewDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "compared_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunViewMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "comparison": {
+            "$ref": "#/components/schemas/EvalViewComparison"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/EvalViewProgress"
+          },
+          "results": {
+            "$ref": "#/components/schemas/EvalViewPage_EvalCaseResultView_"
+          },
+          "run": {
+            "$ref": "#/components/schemas/EvalRunViewSummary"
+          }
+        },
+        "required": [
+          "run",
+          "compared_run",
+          "comparison",
+          "progress",
+          "results"
+        ],
+        "title": "EvalRunViewDetail",
+        "type": "object"
+      },
+      "EvalRunViewMetadata": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "authored_suite_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authored Suite Revision"
+          },
+          "baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalBaselineRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalExecutionCandidateIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidate_unavailable_reason": {
+            "anyOf": [
+              {
+                "const": "not_retained",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Unavailable Reason"
+          },
+          "cases": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalViewCaseCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "is_baseline": {
+            "title": "Is Baseline",
+            "type": "boolean"
+          },
+          "judge_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Judge Score"
+          },
+          "judge_score_state": {
+            "enum": [
+              "available",
+              "not_used",
+              "unavailable"
+            ],
+            "title": "Judge Score State",
+            "type": "string"
+          },
+          "native_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Run Id"
+          },
+          "origin": {
+            "title": "Origin",
+            "type": "string"
+          },
+          "result_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Revision"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "specialist": {
+            "title": "Specialist",
+            "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "$ref": "#/components/schemas/EvalRunStatus"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteViewIdentity"
+          },
+          "suite_name": {
+            "title": "Suite Name",
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/EvalViewUsage"
+          }
+        },
+        "required": [
+          "id",
+          "native_run_id",
+          "authored_suite_revision",
+          "result_revision",
+          "suite",
+          "suite_name",
+          "specialist",
+          "status",
+          "origin",
+          "actor",
+          "created_at",
+          "started_at",
+          "finished_at",
+          "cases",
+          "score",
+          "judge_score",
+          "judge_score_state",
+          "usage",
+          "candidate",
+          "candidate_unavailable_reason",
+          "baseline",
+          "is_baseline"
+        ],
+        "title": "EvalRunViewMetadata",
+        "type": "object"
+      },
+      "EvalRunViewSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "authored_suite_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authored Suite Revision"
+          },
+          "baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalBaselineRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "baseline_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunViewMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalExecutionCandidateIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidate_unavailable_reason": {
+            "anyOf": [
+              {
+                "const": "not_retained",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Unavailable Reason"
+          },
+          "cases": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalViewCaseCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "comparison": {
+            "$ref": "#/components/schemas/EvalViewComparison"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "is_baseline": {
+            "title": "Is Baseline",
+            "type": "boolean"
+          },
+          "judge_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Judge Score"
+          },
+          "judge_score_state": {
+            "enum": [
+              "available",
+              "not_used",
+              "unavailable"
+            ],
+            "title": "Judge Score State",
+            "type": "string"
+          },
+          "native_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Run Id"
+          },
+          "origin": {
+            "title": "Origin",
+            "type": "string"
+          },
+          "result_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Revision"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "specialist": {
+            "title": "Specialist",
+            "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "$ref": "#/components/schemas/EvalRunStatus"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteViewIdentity"
+          },
+          "suite_name": {
+            "title": "Suite Name",
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/EvalViewUsage"
+          }
+        },
+        "required": [
+          "id",
+          "native_run_id",
+          "authored_suite_revision",
+          "result_revision",
+          "suite",
+          "suite_name",
+          "specialist",
+          "status",
+          "origin",
+          "actor",
+          "created_at",
+          "started_at",
+          "finished_at",
+          "cases",
+          "score",
+          "judge_score",
+          "judge_score_state",
+          "usage",
+          "candidate",
+          "candidate_unavailable_reason",
+          "baseline",
+          "is_baseline",
+          "comparison",
+          "baseline_result"
+        ],
+        "title": "EvalRunViewSummary",
+        "type": "object"
+      },
       "EvalScenarioApprovalDecisionRecord": {
         "additionalProperties": false,
         "properties": {
@@ -18123,6 +18743,172 @@
         "title": "EvalSuiteTrialRequestDraftV3",
         "type": "object"
       },
+      "EvalSuiteViewDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "cases": {
+            "$ref": "#/components/schemas/EvalViewPage_EvalCaseView_"
+          },
+          "runs": {
+            "$ref": "#/components/schemas/EvalViewPage_EvalRunViewSummary_"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteViewSummary"
+          }
+        },
+        "required": [
+          "suite",
+          "cases",
+          "runs"
+        ],
+        "title": "EvalSuiteViewDetail",
+        "type": "object"
+      },
+      "EvalSuiteViewIdentity": {
+        "additionalProperties": false,
+        "properties": {
+          "revision": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Revision",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "authored",
+              "corpus"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "suite_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suite Id"
+          },
+          "target_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target_key",
+          "revision"
+        ],
+        "title": "EvalSuiteViewIdentity",
+        "type": "object"
+      },
+      "EvalSuiteViewSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalBaselineRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "baseline_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunViewMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "baseline_scope": {
+            "description": "Authored definitions use execution_group: their baseline is null and each history run exposes the baseline for its exact corpus/suite group. Corpus suites use suite.",
+            "enum": [
+              "suite",
+              "execution_group"
+            ],
+            "title": "Baseline Scope",
+            "type": "string"
+          },
+          "case_count": {
+            "title": "Case Count",
+            "type": "integer"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/EvalSuiteViewIdentity"
+          },
+          "last_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunViewSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "authored",
+              "corpus"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "specialist": {
+            "title": "Specialist",
+            "type": "string"
+          },
+          "trials": {
+            "$ref": "#/components/schemas/EvalSuiteTrialPolicyV1"
+          }
+        },
+        "required": [
+          "id",
+          "identity",
+          "source",
+          "name",
+          "description",
+          "specialist",
+          "case_count",
+          "trials",
+          "baseline",
+          "baseline_result",
+          "baseline_scope",
+          "last_run"
+        ],
+        "title": "EvalSuiteViewSummary",
+        "type": "object"
+      },
       "EvalTargetCatalogEntry": {
         "additionalProperties": false,
         "description": "Bounded public identity for one server-owned eval execution target.",
@@ -18706,6 +19492,570 @@
           "assertions"
         ],
         "title": "EvalTrialPresentationV1",
+        "type": "object"
+      },
+      "EvalViewCaseCounts": {
+        "additionalProperties": false,
+        "description": "Disjoint settled outcomes plus a separately labelled variability count.",
+        "properties": {
+          "error": {
+            "title": "Error",
+            "type": "integer"
+          },
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "flaky": {
+            "description": "Cases with both passed and nonpassed trials. This overlaps the outcome counts; never add it to passed, failed, error, unavailable or total.",
+            "title": "Flaky variability (overlapping)",
+            "type": "integer"
+          },
+          "passed": {
+            "title": "Passed",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "unavailable": {
+            "title": "Unavailable",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "passed",
+          "failed",
+          "flaky",
+          "error",
+          "unavailable"
+        ],
+        "title": "EvalViewCaseCounts",
+        "type": "object"
+      },
+      "EvalViewComparison": {
+        "additionalProperties": false,
+        "properties": {
+          "compared_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compared With"
+          },
+          "compatibility": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorpusComparisonCompatibility"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "improved_cases": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Improved Cases"
+          },
+          "improvements": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalViewImprovement"
+            },
+            "title": "Improvements",
+            "type": "array"
+          },
+          "regressed_cases": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Regressed Cases"
+          },
+          "regressions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CorpusExecutionRegression"
+            },
+            "title": "Regressions",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "unavailable",
+              "no_baseline",
+              "compared",
+              "incompatible"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "unavailable_reasons": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Unavailable Reasons",
+            "type": "array"
+          },
+          "verdict": {
+            "anyOf": [
+              {
+                "enum": [
+                  "improvement",
+                  "regression",
+                  "tradeoff",
+                  "tie"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verdict"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "EvalViewComparison",
+        "type": "object"
+      },
+      "EvalViewImprovement": {
+        "additionalProperties": false,
+        "description": "A comparator-proven improvement, oriented from compared baseline to current.",
+        "properties": {
+          "baseline_reliability": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorpusReliabilityDistributionV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "baseline_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Score"
+          },
+          "baseline_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passed",
+                  "failed",
+                  "unavailable",
+                  "error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Status"
+          },
+          "case_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Id"
+          },
+          "current_reliability": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorpusReliabilityDistributionV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "current_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Score"
+          },
+          "current_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passed",
+                  "failed",
+                  "unavailable",
+                  "error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Status"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CorpusRegressionKind"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/CorpusRegressionScope"
+          }
+        },
+        "required": [
+          "scope",
+          "kind"
+        ],
+        "title": "EvalViewImprovement",
+        "type": "object"
+      },
+      "EvalViewPage_EvalCaseResultView_": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseResultView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalViewPage[EvalCaseResultView]",
+        "type": "object"
+      },
+      "EvalViewPage_EvalCaseView_": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalViewPage[EvalCaseView]",
+        "type": "object"
+      },
+      "EvalViewPage_EvalRunViewSummary_": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalRunViewSummary"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalViewPage[EvalRunViewSummary]",
+        "type": "object"
+      },
+      "EvalViewPage_EvalSuiteViewSummary_": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalSuiteViewSummary"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalViewPage[EvalSuiteViewSummary]",
+        "type": "object"
+      },
+      "EvalViewProgress": {
+        "additionalProperties": false,
+        "properties": {
+          "completed_cases": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed Cases"
+          },
+          "completed_trials": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed Trials"
+          },
+          "state": {
+            "enum": [
+              "queued",
+              "checkpointed",
+              "published",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "total_cases": {
+            "title": "Total Cases",
+            "type": "integer"
+          },
+          "total_trials": {
+            "title": "Total Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_cases",
+          "total_trials",
+          "completed_cases",
+          "completed_trials",
+          "state"
+        ],
+        "title": "EvalViewProgress",
+        "type": "object"
+      },
+      "EvalViewUsage": {
+        "additionalProperties": false,
+        "properties": {
+          "cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost"
+          },
+          "cost_unavailable_reason": {
+            "const": "aggregate_not_retained",
+            "default": "aggregate_not_retained",
+            "title": "Cost Unavailable Reason",
+            "type": "string"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "observed_tokens": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Tokens"
+          },
+          "scope": {
+            "const": "candidate_execution",
+            "default": "candidate_execution",
+            "title": "Scope",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "complete",
+              "partial",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "tokens": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokens"
+          }
+        },
+        "required": [
+          "state",
+          "tokens",
+          "observed_tokens"
+        ],
+        "title": "EvalViewUsage",
         "type": "object"
       },
       "EvalsOperationReadiness": {
@@ -21987,6 +23337,7 @@
         "title": "InvocationOriginTrust",
         "type": "string"
       },
+      "JsonValue": {},
       "JudgeProfileIdentityV1": {
         "additionalProperties": false,
         "description": "Safe, immutable public snapshot of one trusted model-judge route.",
@@ -34032,7 +35383,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "62",
+            "default": "63",
             "title": "Contract Version",
             "type": "string"
           },
@@ -41448,7 +42799,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "62",
+            "default": "63",
             "title": "Contract Version",
             "type": "string"
           }
@@ -44172,6 +45523,130 @@
         "summary": "Download Catalog Eval Json Report"
       }
     },
+    "/api/evals/run-views/{run_key}": {
+      "get": {
+        "operationId": "get_run_view_api_evals_run_views__run_key__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_key",
+            "required": true,
+            "schema": {
+              "title": "Run Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "compared_with",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Compared With"
+            }
+          },
+          {
+            "in": "query",
+            "name": "case_filter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "regressed",
+                    "improved",
+                    "failing",
+                    "flaky"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Case Filter"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cases_cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cases Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cases_limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Cases Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunViewDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Run View"
+      }
+    },
     "/api/evals/runs": {
       "get": {
         "operationId": "list_eval_runs_api_evals_runs_get",
@@ -45416,6 +46891,214 @@
           }
         },
         "summary": "Save Captured Evaluation"
+      }
+    },
+    "/api/evals/suite-views": {
+      "get": {
+        "operationId": "list_suite_views_api_evals_suite_views_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "target_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Key"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalViewPage_EvalSuiteViewSummary_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "List Suite Views"
+      }
+    },
+    "/api/evals/suite-views/{suite_key}": {
+      "get": {
+        "operationId": "get_suite_view_api_evals_suite_views__suite_key__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "suite_key",
+            "required": true,
+            "schema": {
+              "title": "Suite Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cases_cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cases Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cases_limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Cases Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "runs_cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runs Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "runs_limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Runs Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalSuiteViewDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Suite View"
       }
     },
     "/api/evals/suites": {

@@ -159,6 +159,7 @@ def test_browser_client_is_versioned_with_the_server_contract(entrance: str, tmp
         == BROWSER_CLIENT_VERSION
     )
     assert _exported_constant(types, "CLIENT_VERSION") == BROWSER_CLIENT_VERSION
+    assert "eval_suite_views" in contract["capabilities"]["surfaces"]
     assert "cayu guide app-ui" in module
 
 
@@ -195,10 +196,13 @@ def test_served_browser_client_connects_to_real_contract(entrance, tmp_path):
             """
 import {readFileSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
-const {connect} = await import(pathToFileURL(process.argv[1]));
+const {connect, CONTRACT_VERSION} = await import(pathToFileURL(process.argv[1]));
 const contract = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 const options = {apiBaseUrl:'http://localhost/api', fetch:async()=>new Response(JSON.stringify(contract), {headers:{'content-type':'application/json'}})};
 const connected = await connect(options);
+if (CONTRACT_VERSION !== connected.contract.contract_version || !Object.hasOwn(connected.contract.capabilities.surfaces, 'eval_suite_views')) {
+  throw new Error('Shipped client must connect to the eval-read contract');
+}
 if (connected.contract.capabilities.surfaces.session_trace?.read?.enabled !== true || connected.contract.capabilities.surfaces.session_trace?.mutate?.enabled !== false) {
   throw new Error('Shipped client must retain the read-only trace capability');
 }

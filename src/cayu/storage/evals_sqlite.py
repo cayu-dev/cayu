@@ -37,6 +37,16 @@ from cayu.evals.corpus import (
 )
 from cayu.evals.execution import CORPUS_EXECUTION_RESULT_MAX_BYTES, CorpusExecutionResult
 from cayu.evals.execution_reporting import corpus_execution_result_from_json
+from cayu.evals.read_views import (
+    EvalCaseHistoryQuery,
+    EvalCaseResultReference,
+    EvalRunViewSnapshot,
+    EvalTrialViewOutcome,
+    EvalViewIndexEntry,
+    EvalViewIndexPage,
+    EvalViewQuery,
+    bounded_view_index,
+)
 from cayu.evals.results import (
     CapturedEvaluationResultV1,
     EvalResultOrigin,
@@ -159,6 +169,7 @@ from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
+from cayu.storage._eval_view_queries import latest_case_results_sql, view_index_sql
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.targets import require_sqlite_store_allowed
@@ -1587,6 +1598,85 @@ class SQLiteEvalStore(EvalStore):
                     "duration_seconds": monotonic() - started_at,
                 },
             )
+
+    suite_views: ClassVar[bool] = True
+
+    async def list_view_index(self, query: EvalViewQuery) -> EvalViewIndexPage:
+        query = _exact_model(query, EvalViewQuery, "query")
+        sql, params = view_index_sql(query, postgres=False)
+
+        def operation(connection: sqlite3.Connection) -> EvalViewIndexPage:
+            rows = connection.execute(sql, params).fetchall()
+            return bounded_view_index(
+                [EvalViewIndexEntry.model_validate(dict(row)) for row in rows], query
+            )
+
+        return await self._run_read(operation)
+
+    async def load_latest_case_results(
+        self,
+        query: EvalCaseHistoryQuery,
+    ) -> tuple[EvalCaseResultReference, ...]:
+        query = _exact_model(query, EvalCaseHistoryQuery, "query")
+        sql, params = latest_case_results_sql(query, postgres=False)
+
+        def operation(connection: sqlite3.Connection) -> tuple[EvalCaseResultReference, ...]:
+            rows = connection.execute(sql, params).fetchall()
+            return tuple(EvalCaseResultReference.model_validate(dict(row)) for row in rows)
+
+        return await self._run_read(operation)
+
+    async def load_run_view_snapshot(self, run_id: str) -> EvalRunViewSnapshot | None:
+        run_id = _store_identifier(run_id, "run_id")
+
+        def operation(connection: sqlite3.Connection) -> EvalRunViewSnapshot | None:
+            try:
+                connection.execute("BEGIN")
+                row = self._load_run_row(connection, run_id)
+                if row is None:
+                    connection.commit()
+                    return None
+                outcomes = connection.execute(
+                    "SELECT case_id, trial_number, "
+                    "json_extract(checkpoint_json, '$.result.status') AS status, "
+                    "json_extract(checkpoint_json, '$.result.score') AS score, "
+                    "json_extract(checkpoint_json, '$.public_data.diagnostic_code') AS diagnostic_code "
+                    "FROM cayu_eval_run_trial_checkpoints WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall()
+                snapshot = EvalRunViewSnapshot(
+                    run=_run_record_from_row(row),
+                    terminal_trials=tuple(
+                        EvalTrialViewOutcome.model_validate(dict(item)) for item in outcomes
+                    ),
+                )
+                connection.commit()
+                return snapshot
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run_read(operation)
+
+    async def load_result_run_view_snapshot(self, revision: str) -> EvalRunViewSnapshot | None:
+        revision = _sha256_revision(revision, "revision")
+
+        def operation(connection: sqlite3.Connection) -> str | None:
+            row = connection.execute(
+                "SELECT fresh_run_id FROM cayu_eval_result_records WHERE revision = ? AND origin = 'fresh_execution'",
+                (revision,),
+            ).fetchone()
+            return None if row is None else row["fresh_run_id"]
+
+        run_id = await self._run_read(operation)
+        if run_id is None:
+            return None
+        snapshot = await self.load_run_view_snapshot(run_id)
+        if snapshot is not None and (
+            snapshot.run.result is None or snapshot.run.result.revision != revision
+        ):
+            raise EvalRunStateConflict("Eval result run linkage mismatch.")
+        return snapshot
 
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)
