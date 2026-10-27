@@ -1,5 +1,7 @@
 """Runtime wiring for virtual egress credentials.
 
+See ``cayu guide untrusted-code`` for setup and examples.
+
 Turns the egress library into a first-class, session-lifecycle-managed mode: a
 ``VirtualEgressEnvironmentFactory`` mints per-session grants, stands up the
 broker + an adapter-enforced runner, and emits audit events; teardown (revoke +
@@ -536,6 +538,8 @@ def _virtual_egress_environment_authority(
 class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     """Per-session environment factory that enforces virtual egress.
 
+    See ``cayu guide untrusted-code`` for setup and examples.
+
     ``create`` mints grants, builds a broker (wired to emit audit events),
     prepares the explicitly selected egress adapter, and returns an
     ``Environment`` whose runner is on the enforced network and whose binding
@@ -560,8 +564,6 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     Each of ``setup_commands`` may run for ``setup_command_timeout_s`` (default
     300 s); a failure names the command's exit code or timeout and ends with
     a masked tail of its output.
-
-    See ``cayu guide untrusted-code`` for the hardened Docker composition.
     """
 
     def __init__(

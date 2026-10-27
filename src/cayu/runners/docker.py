@@ -1,3 +1,8 @@
+"""Run commands in Docker containers.
+
+See ``cayu guide untrusted-code`` for setup and examples.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -2157,6 +2162,8 @@ class _DockerRemoteWorkspaceBranchCapability(RemoteWorkspaceBranchCapability):
 class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
     """Executes commands inside a plain Docker container via the ``docker`` CLI.
 
+    See ``cayu guide untrusted-code`` for setup and examples.
+
     Isolation is a parameter: pass ``runtime="runsc"`` (gVisor) or ``"kata"``
     (microVM) to ``create`` for a hardened boundary; the default (``runc``) is a
     convenience tier for trusted development, CI, conformance, and packaging,
@@ -2171,8 +2178,6 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
     host variables must receive their names explicitly through
     ``docker_cli_env_allowlist``; those trusted grants reach only the host-side
     Docker CLI and its helpers, never the container command.
-
-    See ``cayu guide untrusted-code`` to run untrusted code locally.
     """
 
     isolation = "docker"

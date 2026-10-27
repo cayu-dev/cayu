@@ -1,3 +1,8 @@
+"""Control Docker sandbox egress.
+
+See ``cayu guide untrusted-code`` for setup and examples.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -363,6 +368,8 @@ async def resolve_proxy_bind_host(run: DockerRun = _run_docker_stdout) -> str:
 class DockerEgressAdapter(SandboxEgressAdapter):
     """Enforced egress for the Docker runner.
 
+    See ``cayu guide untrusted-code`` for setup and examples.
+
     Egress enforcement is fail-closed by construction: the container joins an
     ``--internal`` Docker network with no route to the internet and no address
     for the engine's host, so the *only* reachable egress is a dual-homed sidecar
@@ -382,8 +389,6 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     ``proxy_max_connections`` is how many guest connections each session's
     egress proxy serves at once (default 64, at most 512); one more is refused.
     Each open connection holds a proxy worker thread.
-
-    See ``cayu guide untrusted-code`` for the hardened composition.
     """
 
     runner_kind = "docker"

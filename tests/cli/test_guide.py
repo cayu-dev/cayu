@@ -683,6 +683,34 @@ def test_entry_point_docstrings_name_a_guide_that_exists(capsys) -> None:
     assert "delete_session" in section
 
 
+def test_sandbox_and_external_agent_guides_are_visible_before_source_details() -> None:
+    import inspect
+
+    import cayu.egress.docker_adapter as docker_egress
+    import cayu.egress.runtime as egress_runtime
+    import cayu.external_agents as external_agents
+    import cayu.external_agents.claude as claude
+    import cayu.external_agents.codex as codex
+    import cayu.runners.docker as docker
+
+    for module, topic in [
+        (docker, "untrusted-code"),
+        (docker_egress, "untrusted-code"),
+        (egress_runtime, "untrusted-code"),
+        (external_agents, "external-agents"),
+        (claude, "external-agents"),
+        (codex, "external-agents"),
+    ]:
+        # A source reader sees this before imports and implementation details.
+        introduction = inspect.getdoc(module) or ""
+        assert f"cayu guide {topic}" in introduction
+
+    root = Path(__file__).resolve().parents[2]
+    introduction = (root / "README.md").read_text().split("## ", 1)[0]
+    assert "cayu guide untrusted-code" in introduction
+    assert "cayu guide external-agents" in introduction
+
+
 def test_structured_output_and_provider_guides_are_credential_free_and_public(capsys) -> None:
     assert main(["guide", "structured-output"]) == 0
     structured = capsys.readouterr().out

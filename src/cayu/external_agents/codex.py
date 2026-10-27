@@ -1,4 +1,7 @@
-"""Optional Codex app-server SDK adapter, with deny-by-default approvals."""
+"""Run Codex through an owned launcher.
+
+See ``cayu guide external-agents`` for setup and examples.
+"""
 
 from __future__ import annotations
 

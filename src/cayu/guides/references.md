@@ -146,6 +146,18 @@ when behavior changes. Undeclared custom guards remain process-local.
 
 ## environments
 
+For untrusted code, start with `cayu guide untrusted-code`. For Claude Code or
+Codex subprocesses, use `cayu guide external-agents` to choose a launcher.
+
+If you already have a sandbox command, `LaunchedRunner` (`cayu.runners`) wraps
+a runner with an argv prefix or an `ExecCommand -> ExecCommand` function.
+For example, `LaunchedRunner(LocalRunner(root), ["my-sandbox", "--"])` routes
+commands through that executable. The wrapper does not itself add isolation:
+your sandbox must enforce filesystem, network and process-cleanup restrictions.
+Interactive processes are available only when the wrapped runner provides them.
+Use a custom `ExternalAgentLaunch` for a vendor CLI if your sandbox exposes
+interactive stdio directly; the external-agents guide includes that contract.
+
 An `Environment` groups a workspace, runner, artifact store, vault, credential
 proxy, knowledge store, and MCP servers. Register a static environment or an
 `EnvironmentFactory`; choose a default explicitly. Local workspaces and runners

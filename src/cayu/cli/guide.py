@@ -52,7 +52,7 @@ _GUIDES = {
     ),
     "external-agents": (
         "external-agents.md",
-        "Run Claude Code or Codex as Cayu sessions; Docker and a gateway are optional.",
+        "Run Claude Code or Codex as a step in your app; choose a launcher and record usage.",
     ),
     "human-attention": (
         "human-attention.md",
@@ -79,7 +79,7 @@ _GUIDES = {
     "tool-effects": ("tool-effects.md", "Replay and mutation effect decisions."),
     "untrusted-code": (
         "untrusted-code.md",
-        "Hardened Docker with allowlisted egress locally; Lambda MicroVM in production.",
+        "Run untrusted code with controlled filesystem and network access; choose a sandbox.",
     ),
     "verified-work": (
         "verified-work.md",

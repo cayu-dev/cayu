@@ -7,6 +7,11 @@ Cayu is a Python runtime for long-running agents: durable sessions that survive
 restarts and redeploys, human approval before side effects, spend caps enforced
 before each model call, and multi-agent collaboration.
 
+Start with the installed guides: `cayu guide untrusted-code` to run untrusted
+code with controlled filesystem and network access, `cayu guide external-agents`
+to run Claude Code or Codex as a step in your app, and `cayu guide long-running`
+for approvals, timers, retries and recovery. `cayu guide --help` lists every topic.
+
 | Capability | Cayu parts |
 | --- | --- |
 | Durable sessions and recovery | `SQLiteSessionStore` or `PostgresSessionStore` (`cayu.storage`) with `ResumeRequest`; `ExecutionProfilePolicy` (`cayu.runtime`) governs resumes on a new build |

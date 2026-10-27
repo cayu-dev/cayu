@@ -34,6 +34,13 @@ Required:
 | `docker_agent_launch` | In a container on an internal Docker network | Docker, an image with the CLI, an internal network |
 | `runner_agent_launch` | In a runner that can open interactive processes, such as `LambdaMicroVMRunner` | That runner |
 
+Choose the launcher for the host you actually have. `local_agent_launch` does
+not confine untrusted code. If Docker and a suitable remote runner are unavailable,
+use an existing sandbox through a [custom `ExternalAgentLaunch`](#write-your-own-launcher).
+`LaunchedRunner` can apply your launcher to runner commands, but it only offers
+interactive processes when the wrapped runner does; wrapping `LocalRunner` does
+not add that capability. See `cayu guide references#environments`.
+
 Optional:
 
 - The credential gateway, `ExternalAgentGateway` in `cayu.external_agents.server`

@@ -1,4 +1,7 @@
-"""Optional Claude Agent SDK adapter. The CLI runs through an owned launcher."""
+"""Run Claude Code through an owned launcher.
+
+See ``cayu guide external-agents`` for setup and examples.
+"""
 
 from __future__ import annotations
 

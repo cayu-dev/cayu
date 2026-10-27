@@ -1,4 +1,7 @@
-"""Optional vendor harness lifecycle and governance."""
+"""Run Claude Code or Codex as a step in your app.
+
+See ``cayu guide external-agents`` for setup and examples.
+"""
 
 from typing import Any as _Any
 
