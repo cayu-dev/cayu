@@ -36,9 +36,9 @@ import { previewEvalAddition, publishEvalAddition } from "../../api/eval-additio
 import { fetchSuiteViews } from "../../api/eval-views"
 import {
   resultSelector,
-  runViewPath,
+  runViewRoute,
   suiteSelector,
-  suiteViewPath,
+  suiteViewRoute,
 } from "../../app/eval-view-model"
 import { useGo } from "../common"
 import { FIELD_CLASS, LoadState, useEvalAccess } from "../evals/shared"
@@ -249,10 +249,13 @@ function AdditionForm({
       onClose()
       const destination = suiteSelector(receipt.plan.destination)
       if (receipt.plan.captured_result_revision)
-        await go(runViewPath(resultSelector(receipt.plan.captured_result_revision)), {
-          placement: destination,
+        await go({
+          ...runViewRoute(resultSelector(receipt.plan.captured_result_revision)),
+          search: {
+            placement: destination,
+          },
         })
-      else await go(suiteViewPath(destination))
+      else await go(suiteViewRoute(destination))
     },
     onError: (error, { attempt, recovering }) => {
       // Only a first-dispatch rejection settles this browser's attempt. A retry

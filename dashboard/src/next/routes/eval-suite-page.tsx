@@ -7,21 +7,20 @@ import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { EvalCaseOutcome } from "../api/types"
 import { OUTCOME_LABEL, OUTCOME_TONE, originText, passRate } from "../app/eval-model"
+import { PrototypeLink as NavLink, usePrototypeGo as useGo } from "../app/prototype-navigation"
 import { useEvalSuite } from "../app/queries"
 import { useApi, useNow } from "../app/services"
 import { when } from "../app/task-model"
 import {
   ErrorState,
-  NavLink,
   PageBody,
   ROW_CLASS,
   ROW_LINK_CLASS,
-  sessionPath,
+  sessionRoute,
   TopBar,
-  useGo,
   useRowClick,
 } from "./common"
-import { PassBar, runPath, SOURCE_LABEL, VerdictText } from "./evals-page"
+import { PassBar, runRoute, SOURCE_LABEL, VerdictText } from "./evals-page"
 
 /** One dot per trial: filled when it passed. */
 export function TrialDots({
@@ -68,7 +67,7 @@ export function EvalSuitePage() {
     mutationFn: () => api.runEvalSuite(suiteId),
     onSuccess: ({ run_id }) => {
       void queryClient.invalidateQueries({ queryKey: ["evals"] })
-      go(runPath(run_id))
+      go(runRoute(run_id))
     },
   })
 
@@ -166,7 +165,7 @@ export function EvalSuitePage() {
                 approved by {s.baseline.approved_by},{" "}
                 {when(Date.parse(s.baseline.approved_at), now())}
               </span>
-              <NavLink to={runPath(s.baseline.run_id)} className="ml-auto text-xs underline">
+              <NavLink {...runRoute(s.baseline.run_id)} className="ml-auto text-xs underline">
                 Open run
               </NavLink>
             </div>
@@ -200,11 +199,11 @@ export function EvalSuitePage() {
                   {s.runs.map((r) => (
                     <tr
                       key={r.id}
-                      onClick={rowClick(runPath(r.id))}
+                      onClick={rowClick(runRoute(r.id))}
                       className={cn(ROW_CLASS, r.is_baseline && "bg-muted/40")}
                     >
                       <td className="px-3 py-2 whitespace-nowrap">
-                        <NavLink to={runPath(r.id)} className={ROW_LINK_CLASS}>
+                        <NavLink {...runRoute(r.id)} className={ROW_LINK_CLASS}>
                           {when(Date.parse(r.started_at), now())}
                         </NavLink>
                         {r.is_baseline && (
@@ -249,7 +248,7 @@ export function EvalSuitePage() {
                 </div>
                 {c.source_session_id && (
                   <NavLink
-                    to={sessionPath(c.source_session_id)}
+                    {...sessionRoute(c.source_session_id)}
                     className="shrink-0 text-xs text-muted-foreground hover:text-foreground hover:underline"
                   >
                     From a session

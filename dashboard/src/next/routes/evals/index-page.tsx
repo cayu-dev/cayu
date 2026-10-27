@@ -9,9 +9,9 @@ import { fetchSuiteViews, resolveLegacyEvalSuite } from "../../api/eval-views"
 import {
   isReportedRun,
   runOrigin,
-  runViewPath,
+  runViewRoute,
   suiteSelector,
-  suiteViewPath,
+  suiteViewRoute,
 } from "../../app/eval-view-model"
 import { NavLink, PageBody, ROW_CLASS, ROW_LINK_CLASS, TopBar, useGo, useRowClick } from "../common"
 import {
@@ -52,7 +52,7 @@ export function EvalsIndexPage() {
     enabled: !!search.corpus && !!search.suite,
   })
   useEffect(() => {
-    if (legacy.data) void go(suiteViewPath(legacy.data), undefined, { replace: true })
+    if (legacy.data) void go({ ...suiteViewRoute(legacy.data), replace: true })
   }, [legacy.data, go])
   if (search.corpus && search.suite)
     return (
@@ -106,7 +106,7 @@ export function EvalsIndexPage() {
               value={search.target ?? ""}
               onChange={(e) => {
                 setCursor(undefined)
-                void go("/evals", { target: e.target.value || undefined })
+                void go({ to: "/evals", search: { target: e.target.value || undefined } })
               }}
             >
               <option value="">All specialists</option>
@@ -147,10 +147,10 @@ export function EvalsIndexPage() {
                   </thead>
                   <tbody>
                     {suites.data.items.map((s) => (
-                      <tr key={s.id} className={ROW_CLASS} onClick={rowClick(suiteViewPath(s.id))}>
+                      <tr key={s.id} className={ROW_CLASS} onClick={rowClick(suiteViewRoute(s.id))}>
                         <td className="max-w-80 px-3 py-2">
                           <NavLink
-                            to={suiteViewPath(s.id)}
+                            {...suiteViewRoute(s.id)}
                             className={`${ROW_LINK_CLASS} block truncate`}
                           >
                             {s.name}
@@ -170,7 +170,7 @@ export function EvalsIndexPage() {
                           {s.last_run ? (
                             <>
                               <NavLink
-                                to={runViewPath(s.last_run.id)}
+                                {...runViewRoute(s.last_run.id)}
                                 search={
                                   !isReportedRun(s.last_run) && s.last_run.placement
                                     ? { placement: suiteSelector(s.last_run.placement.destination) }

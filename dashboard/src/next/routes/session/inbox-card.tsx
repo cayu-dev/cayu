@@ -17,7 +17,7 @@ import { cn } from "@/lib/utils"
 import type { InboxItem, InboxSettleRequest, RecoveryRequest } from "../../api/types"
 import { useApi, useNow, useServices } from "../../app/services"
 import { relativeTime } from "../../app/session-model"
-import { ErrorState, NavLink, sessionPath } from "../common"
+import { ErrorState, NavLink, sessionRoute } from "../common"
 
 const KIND = {
   approval: { icon: ShieldCheck, label: "Needs your approval" },
@@ -240,7 +240,7 @@ export function InboxCard({
       context || !item.session_id ? (
         item.session_id ? (
           <NavLink
-            to={sessionPath(item.session_id)}
+            {...sessionRoute(item.session_id)}
             className="inline-flex h-7 items-center rounded-lg border border-border px-2.5 text-[13px] font-medium hover:bg-muted"
           >
             Recover in the session
@@ -362,7 +362,7 @@ export function InboxCard({
           <>
             <span className="text-muted-foreground">·</span>
             <NavLink
-              to={sessionPath(context.sessionId)}
+              {...sessionRoute(context.sessionId)}
               className="min-w-0 truncate text-muted-foreground hover:text-foreground hover:underline"
             >
               {context.title}

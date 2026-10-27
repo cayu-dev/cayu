@@ -30,8 +30,10 @@ export const suiteSelector = (identity: EvalSuiteViewIdentity) =>
       suite_id: identity.suite_id ?? null,
     },
   ])
-export const suiteViewPath = (id: string) => `/evals/suites/${encodeURIComponent(id)}`
-export const runViewPath = (id: string) => `/evals/runs/${encodeURIComponent(id)}`
+export const suiteViewRoute = (id: string) =>
+  ({ to: "/evals/suites/$suiteId", params: { suiteId: id } }) as const
+export const runViewRoute = (id: string) =>
+  ({ to: "/evals/runs/$runId", params: { runId: id } }) as const
 export function isReportedRun(value: unknown): value is EvalReportedRunView {
   return (
     value !== null && typeof value === "object" && "source" in value && value.source === "reported"

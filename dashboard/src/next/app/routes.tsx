@@ -38,12 +38,12 @@ export function createDashboardRouter(history?: RouterHistory) {
   const root = createRootRoute({ component: Layout })
   const page = (path: string, component: () => React.ReactNode) =>
     createRoute({ getParentRoute: () => root, path, component })
-  const moved = (path: string, to: string) =>
+  const moved = (path: string, to: "/" | "/inbox" | "/specialists") =>
     createRoute({
       getParentRoute: () => root,
       path,
       beforeLoad: () => {
-        throw redirect({ to: to as never })
+        throw redirect({ to })
       },
     })
 
@@ -77,9 +77,9 @@ export function createDashboardRouter(history?: RouterHistory) {
       path: "/sessions/$sessionId/workflow",
       beforeLoad: ({ params }) => {
         throw redirect({
-          to: "/sessions/$sessionId" as never,
-          params: params as never,
-          search: { view: "trace" } as never,
+          to: "/sessions/$sessionId",
+          params,
+          search: { view: "trace" },
         })
       },
     }),

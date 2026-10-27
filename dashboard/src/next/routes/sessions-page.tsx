@@ -31,7 +31,7 @@ import {
   ROW_CLASS,
   ROW_LINK_CLASS,
   StateBadge,
-  sessionPath,
+  sessionRoute,
   TopBar,
   useGo,
   useRowClick,
@@ -63,7 +63,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
   const [startPending, setStartPending] = useState(false)
   const set = useCallback(
     (patch: SessionIndexFilterPatch) =>
-      go("/sessions", sessionIndexSearchWithFilters(search, patch)),
+      go({ to: "/sessions", search: sessionIndexSearchWithFilters(search, patch) }),
     [go, search],
   )
   const rows = sessions.data?.rows ?? []
@@ -97,7 +97,9 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
             value={search.q ?? ""}
             resetVersion={searchReset}
             onCommit={(q) =>
-              go("/sessions", sessionIndexSearchWithFilters(search, { q }), {
+              go({
+                to: "/sessions",
+                search: sessionIndexSearchWithFilters(search, { q }),
                 replace: true,
                 resetScroll: false,
               })
@@ -157,7 +159,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
               size="sm"
               onClick={() => {
                 setSearchReset((version) => version + 1)
-                go("/sessions", sessionIndexSearchWithoutFilters(search))
+                go({ to: "/sessions", search: sessionIndexSearchWithoutFilters(search) })
               }}
             >
               Clear filters
@@ -232,7 +234,9 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
             {search.cursor && (
               <Button
                 variant="ghost"
-                onClick={() => go("/sessions", sessionIndexSearchWithCursor(search, null))}
+                onClick={() =>
+                  go({ to: "/sessions", search: sessionIndexSearchWithCursor(search, null) })
+                }
               >
                 Restart search
               </Button>
@@ -291,13 +295,13 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                   return (
                     <tr
                       key={row.session.id}
-                      onClick={rowClick(sessionPath(row.session.id))}
+                      onClick={rowClick(sessionRoute(row.session.id))}
                       className={ROW_CLASS}
                     >
                       <td className="max-w-[28rem] px-3 py-2">
                         <div className="flex min-w-0 items-center gap-2">
                           <NavLink
-                            to={sessionPath(row.session.id)}
+                            {...sessionRoute(row.session.id)}
                             className={cn("truncate", ROW_LINK_CLASS)}
                           >
                             {row.title}
@@ -387,7 +391,9 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
               {search.cursor && (
                 <Button
                   variant="outline"
-                  onClick={() => go("/sessions", sessionIndexSearchWithCursor(search, null))}
+                  onClick={() =>
+                    go({ to: "/sessions", search: sessionIndexSearchWithCursor(search, null) })
+                  }
                 >
                   First page
                 </Button>
@@ -395,7 +401,9 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
               {next && (
                 <Button
                   variant="outline"
-                  onClick={() => go("/sessions", sessionIndexSearchWithCursor(search, next))}
+                  onClick={() =>
+                    go({ to: "/sessions", search: sessionIndexSearchWithCursor(search, next) })
+                  }
                 >
                   {paused ? "Continue searching" : "Next page"}
                 </Button>

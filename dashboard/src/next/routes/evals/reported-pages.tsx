@@ -17,7 +17,13 @@ import type {
   EvalReportedSuiteDetail,
 } from "@/lib/generated/server-api"
 import type { EvalCaseFilter } from "../../api/eval-views"
-import { evidenceText, runOrigin, suiteSelector, suiteViewPath } from "../../app/eval-view-model"
+import {
+  evalCaseFilter,
+  evidenceText,
+  runOrigin,
+  suiteSelector,
+  suiteViewRoute,
+} from "../../app/eval-view-model"
 import { NavLink, PageBody, TopBar } from "../common"
 import {
   DateText,
@@ -160,7 +166,7 @@ export function ReportedRunPage({
   detail: EvalReportedRunDetail
   filter?: EvalCaseFilter
   selectedId?: string
-  changeSearch: (patch: { filter?: string; case?: string }) => void
+  changeSearch: (patch: { filter?: EvalCaseFilter; case?: string }) => void
 }) {
   const run = detail.run
   const { canReadDetails } = useEvalAccess()
@@ -214,7 +220,7 @@ export function ReportedRunPage({
         </div>
         {run.association && (
           <p className="mt-3 text-sm">
-            <NavLink to={suiteViewPath(suiteSelector(run.association))} className="underline">
+            <NavLink {...suiteViewRoute(suiteSelector(run.association))} className="underline">
               Exact associated corpus suite
             </NavLink>
           </p>
@@ -228,7 +234,7 @@ export function ReportedRunPage({
               value={filter ?? ""}
               className={FIELD_CLASS}
               onChange={(e) =>
-                changeSearch({ filter: e.target.value || undefined, case: undefined })
+                changeSearch({ filter: evalCaseFilter(e.target.value), case: undefined })
               }
             >
               <option value="">All cases</option>

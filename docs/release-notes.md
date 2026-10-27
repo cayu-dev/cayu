@@ -45,6 +45,15 @@ storage migration.
 
 ### Changes
 
+- The Developer dashboard documentation now maps the production shell and pages
+  to their current source owners. Ejected/customised dashboards should follow
+  the [source migration map](../dashboard/README.md#dashboard-structure-and-migration);
+  Usage, Environments, Artifacts and System remain in `src/routes/`. The isolated
+  seeded prototype is retained as a development/demo harness.
+- Judge calibration recovery is documented as replay of an already-stored
+  report, not a durable guarantee for paid calls before report publication.
+  An uncertain retry can repeat those calls; stronger runtime recovery remains
+  separate future work. See [calibration](evals.md#developer-dashboard-calibrate-an-ai-judge).
 - `cayu.server.environment_auth:OPERATOR_ONLY_AUTH` is the ready-made Developer dashboard
   login without dashboard access for people a sign-in proxy signs in as `member`, for an
   application whose own users sign in through that proxy. `cayu cloud init` gives it Cloud

@@ -19,7 +19,7 @@ import {
   needsAttention,
   PageBody,
   StateDot,
-  sessionPath,
+  sessionRoute,
   stateText,
   TopBar,
 } from "./common"
@@ -263,7 +263,7 @@ function Row({
 }) {
   return (
     <NavLink
-      to={sessionPath(row.session.id)}
+      {...sessionRoute(row.session.id)}
       search={trace ? { view: "trace", log: "1", event_type: "session.failed" } : undefined}
       className="flex items-center gap-3 px-3.5 py-2.5 hover:bg-muted/60"
     >

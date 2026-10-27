@@ -23,9 +23,9 @@ import {
   isNativeSuiteDetail,
   isReportedSuiteDetail,
   nativeRunSelector,
-  runViewPath,
+  runViewRoute,
 } from "../../app/eval-view-model"
-import { ActionsMenu, NavLink, PageBody, sessionPath, TopBar, useGo } from "../common"
+import { ActionsMenu, NavLink, PageBody, sessionRoute, TopBar, useGo } from "../common"
 import { ReportedSuitePage } from "./reported-pages"
 import {
   CaseOutcome,
@@ -157,7 +157,7 @@ export function EvalSuiteViewPage() {
     onSuccess: async (id) => {
       await client.invalidateQueries({ queryKey: ["evals"] })
       if (alive.current && router.state.location.href === navigationOrigin.current)
-        await go(runViewPath(nativeRunSelector(id)))
+        await go(runViewRoute(nativeRunSelector(id)))
     },
   })
   const download = useMutation({
@@ -309,7 +309,7 @@ export function EvalSuiteViewPage() {
                   {s.baseline_result && (
                     <>
                       <PassingBar cases={s.baseline_result.cases} />
-                      <NavLink to={runViewPath(s.baseline_result.id)} className="underline">
+                      <NavLink {...runViewRoute(s.baseline_result.id)} className="underline">
                         Open run
                       </NavLink>
                     </>
@@ -357,7 +357,7 @@ export function EvalSuiteViewPage() {
                       <EvalSourceLink suite={suiteId} caseId={c.id} />
                     )}
                     {canReadDetails && c.source_session_id && (
-                      <NavLink to={sessionPath(c.source_session_id)} className="text-xs underline">
+                      <NavLink {...sessionRoute(c.source_session_id)} className="text-xs underline">
                         Source session
                       </NavLink>
                     )}
@@ -365,7 +365,8 @@ export function EvalSuiteViewPage() {
                       s.source === "authored" &&
                       readiness.catalog_write.state === "ready" && (
                         <NavLink
-                          to={`/evals/suites/${encodeURIComponent(suiteId)}/edit`}
+                          to="/evals/suites/$suiteId/edit"
+                          params={{ suiteId }}
                           search={{ case: c.id }}
                           className="text-xs underline"
                           aria-label={`Edit ${c.name}`}

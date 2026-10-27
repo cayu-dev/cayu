@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query"
-import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
+import { Link } from "@tanstack/react-router"
 import {
   AlertTriangle,
   ArrowLeft,
@@ -1517,22 +1517,6 @@ function WorkflowUsageSummary({
         </div>
       )}
     </DataCard>
-  )
-}
-
-export function WorkflowPage() {
-  const { sessionId } = useParams({ from: "/sessions/$sessionId/workflow" })
-  const search = useSearch({ from: "/sessions/$sessionId/workflow" })
-  const navigate = useNavigate({ from: "/sessions/$sessionId/workflow" })
-  return (
-    <TraceWorkflow
-      key={sessionId}
-      sessionId={sessionId}
-      search={search}
-      onSearch={(next) => {
-        void navigate({ search: workflowSearchForUrl(next), resetScroll: false })
-      }}
-    />
   )
 }
 

@@ -19,13 +19,14 @@ import {
   VERDICT_LABEL,
   VERDICT_TONE,
 } from "../app/eval-model"
+import { PrototypeLink as NavLink, usePrototypeGo as useGo } from "../app/prototype-navigation"
 import { useEvalRun, useEvalSuite } from "../app/queries"
 import { useApi, useNow } from "../app/services"
 import { formatDuration, formatTokens } from "../app/session-model"
 import { when } from "../app/task-model"
-import { ErrorState, NavLink, PageBody, sessionPath, TopBar, useGo } from "./common"
+import { ErrorState, PageBody, sessionRoute, TopBar } from "./common"
 import { TrialDots } from "./eval-suite-page"
-import { PassBar, runPath, suitePath } from "./evals-page"
+import { PassBar, runRoute, suiteRoute } from "./evals-page"
 
 type Filter = "all" | "regressed" | "improved" | "failing" | "flaky"
 
@@ -117,7 +118,7 @@ function CaseDrawer({
             <p className="whitespace-pre-wrap rounded-lg bg-muted px-3 py-2">{result.case.input}</p>
             {result.case.source_session_id && (
               <NavLink
-                to={sessionPath(result.case.source_session_id)}
+                {...sessionRoute(result.case.source_session_id)}
                 className="mt-1 inline-block text-xs text-muted-foreground underline"
               >
                 Captured from a session
@@ -219,7 +220,7 @@ function CaseDrawer({
                 {trial.usage.cost != null && <span>${trial.usage.cost.toFixed(3)}</span>}
                 {trial.session_id && (
                   <NavLink
-                    to={sessionPath(trial.session_id)}
+                    {...sessionRoute(trial.session_id)}
                     search={{ view: "trace" }}
                     className="ml-auto text-foreground underline"
                   >
@@ -249,14 +250,15 @@ export function EvalRunPage() {
   const run = useEvalRun(runId, search.compare)
   const r = run.data
   const suite = useEvalSuite(r?.suite.id ?? "")
-  const set = (patch: Partial<typeof search>) => go(runPath(runId), { ...search, ...patch })
+  const set = (patch: Partial<typeof search>) =>
+    go({ ...runRoute(runId), search: { ...search, ...patch } })
   const refresh = () => void queryClient.invalidateQueries({ queryKey: ["evals"] })
   const approve = useMutation({ mutationFn: () => api.approveBaseline(runId), onSuccess: refresh })
   const again = useMutation({
     mutationFn: () => api.runEvalSuite(r?.suite.id ?? ""),
     onSuccess: ({ run_id }) => {
       refresh()
-      go(runPath(run_id))
+      go(runRoute(run_id))
     },
   })
 
@@ -321,7 +323,7 @@ export function EvalRunPage() {
           </NavLink>
           <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
           <NavLink
-            to={suitePath(r.suite.id)}
+            {...suiteRoute(r.suite.id)}
             className="truncate text-muted-foreground hover:text-foreground"
           >
             {r.suite.name}

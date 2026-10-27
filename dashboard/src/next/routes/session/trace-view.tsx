@@ -37,7 +37,7 @@ import {
   type TranscriptPosition,
   traceSpanForPosition,
 } from "../../app/trace-runtime"
-import { ErrorState, NavLink, needsAttention, StateDot, sessionPath } from "../common"
+import { ErrorState, NavLink, needsAttention, StateDot, sessionRoute } from "../common"
 import { TraceEventLog } from "./trace-event-log"
 import { TraceWorkflow } from "./trace-workflow"
 
@@ -756,7 +756,7 @@ function SpanDetail({
       <Section key="subagents" title="Parent and subagent sessions">
         {session.parent_session_id && (
           <NavLink
-            to={sessionPath(session.parent_session_id)}
+            {...sessionRoute(session.parent_session_id)}
             className="block text-sm hover:underline"
           >
             Parent: {session.parent_session_id}
@@ -768,7 +768,7 @@ function SpanDetail({
         {subagents.map((r) => (
           <NavLink
             key={r.session.id}
-            to={sessionPath(r.session.id)}
+            {...sessionRoute(r.session.id)}
             className="flex items-center gap-2 rounded-md py-1 text-sm hover:underline"
           >
             <StateDot state={r.overview?.state} attention={needsAttention(r.overview)} />
@@ -976,7 +976,7 @@ function SpanDetail({
           ) : (
             span.kind === "tool" && (
               <NavLink
-                to={sessionPath(session.id)}
+                {...sessionRoute(session.id)}
                 search={{ view: "conversation" }}
                 className="text-foreground hover:underline"
               >

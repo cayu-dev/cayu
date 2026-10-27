@@ -13,9 +13,9 @@ import {
   ErrorState,
   NavLink,
   PageBody,
-  sessionPath,
+  sessionRoute,
   TopBar,
-  taskPath,
+  taskRoute,
   useGo,
 } from "./common"
 
@@ -51,11 +51,12 @@ export function SpecialistsPage({
           <input
             value={q}
             onChange={(e) =>
-              go(
-                "/specialists",
-                { q: e.target.value || undefined },
-                { replace: true, resetScroll: false },
-              )
+              go({
+                to: "/specialists",
+                search: { q: e.target.value || undefined },
+                replace: true,
+                resetScroll: false,
+              })
             }
             placeholder="Search specialists, models or tools"
             className="grouped-field-input min-w-0 w-full bg-transparent outline-none"
@@ -218,7 +219,7 @@ function SpecialistCard({
             {recent.data?.sessions.map((session) => (
               <NavLink
                 key={session.id}
-                to={sessionPath(session.id)}
+                {...sessionRoute(session.id)}
                 className="mt-1 block rounded px-1 py-1 text-sm hover:bg-muted"
               >
                 {recent.data?.overviews?.find((o) => o.session_id === session.id)?.title ??
@@ -245,7 +246,7 @@ function SpecialistCard({
               tasks.data.map((task) => (
                 <NavLink
                   key={task.id}
-                  to={taskPath(task.id)}
+                  {...taskRoute(task.id)}
                   className="mt-1 block rounded px-1 py-1 text-sm hover:bg-muted"
                 >
                   {task.title || task.id}

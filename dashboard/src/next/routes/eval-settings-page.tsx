@@ -4,8 +4,9 @@
  */
 import { Check, ChevronRight, X } from "lucide-react"
 import type { ReactNode } from "react"
+import { PrototypeLink as NavLink } from "../app/prototype-navigation"
 import { useEvalSettings } from "../app/queries"
-import { ErrorState, NavLink, PageBody, TopBar } from "./common"
+import { ErrorState, PageBody, TopBar } from "./common"
 
 function Section({
   title,

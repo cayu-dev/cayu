@@ -23,10 +23,11 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
+import { PrototypeLink as NavLink, usePrototypeGo as useGo } from "../app/prototype-navigation"
 import { useApp, useInbox, useSessionRows, withoutEvalTrials } from "../app/queries"
 import { useServices } from "../app/services"
 import { useTheme } from "../app/theme"
-import { Kbd, logoUrl, NavLink, ShellContext, useGo, useShell } from "./common"
+import { Kbd, logoUrl, ShellContext, useShell } from "./common"
 
 export function Layout() {
   const [sidebarHidden, setSidebarHidden] = useState(false)
@@ -229,7 +230,7 @@ function Sidebar({ searchRef }: { searchRef: React.RefObject<HTMLInputElement | 
         <form
           onSubmit={(e) => {
             e.preventDefault()
-            go("/sessions", query.trim() ? { q: query.trim() } : {})
+            go({ to: "/sessions", search: query.trim() ? { q: query.trim() } : {} })
           }}
           className="flex h-8 items-center gap-2 rounded-lg px-2.5 text-sm text-muted-foreground focus-within:bg-sidebar-accent hover:bg-sidebar-accent"
         >

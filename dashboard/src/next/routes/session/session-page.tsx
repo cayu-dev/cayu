@@ -74,7 +74,7 @@ import {
   NavLink,
   SessionSummary,
   StateBadge,
-  sessionPath,
+  sessionRoute,
   TopBar,
   useGo,
 } from "../common"
@@ -175,11 +175,11 @@ export function SessionPage({
 
   const panel = PANEL_TABS.find((t) => t === search.panel) as PanelTab | undefined
   const trace = search.view === "trace"
-  const setSearch = (patch: Record<string, unknown>) => {
+  const setSearch = (patch: Partial<SessionDetailSearch>) => {
     const next = { ...search, ...patch }
     for (const k of Object.keys(next))
       if (next[k as keyof typeof next] === undefined) delete next[k as keyof typeof next]
-    go(`/sessions/${encodeURIComponent(sessionId)}`, next)
+    go({ ...sessionRoute(sessionId), search: next })
   }
   const setPanel = (tab: PanelTab | undefined) => setSearch({ panel: tab })
   const openTrace = (span?: string) => setSearch({ view: "trace", span, log: undefined })
@@ -298,7 +298,8 @@ export function SessionPage({
       if (router.state.location.pathname !== origin) return
       if (result && "task_id" in result && result.task_id) {
         setMenuOpen(false)
-        void actionGuard.complete(() => go("/tasks", { task_id: result.task_id }))
+        const taskId = result.task_id
+        void actionGuard.complete(() => go({ to: "/tasks", search: { task_id: taskId } }))
         return
       }
       if (
@@ -308,7 +309,7 @@ export function SessionPage({
         return
       setMenuOpen(false)
       refresh()
-      void actionGuard.complete(() => go(sessionPath(result.session_id!)))
+      void actionGuard.complete(() => go(sessionRoute(result.session_id!)))
     },
   })
   const actionPending =
@@ -370,7 +371,7 @@ export function SessionPage({
   ) => {
     if (!result || router.state.location.pathname !== origin) return
     if (kind === "rerun" && ["terminal", "runtime_failed"].includes(result.phase))
-      void actionGuard.complete(() => go(sessionPath(result.sessionId)))
+      void actionGuard.complete(() => go(sessionRoute(result.sessionId)))
     if (result.phase === "terminal") {
       if (kind === "reply")
         setDraft((current) => (current.trim() === submittedDraft.current ? "" : current))
@@ -803,8 +804,9 @@ export function SessionPage({
                       value={filters.role}
                       onChange={(event) =>
                         setSearch({
-                          transcript_role:
-                            event.target.value === "all" ? undefined : event.target.value,
+                          transcript_role: validateSessionHistorySearch({
+                            transcript_role: event.target.value,
+                          }).transcript_role,
                         })
                       }
                       className={selectClassName}
@@ -821,7 +823,7 @@ export function SessionPage({
                       type="checkbox"
                       checked={filters.includeThinking}
                       onChange={(event) =>
-                        setSearch({ include_thinking: event.target.checked ? undefined : "false" })
+                        setSearch({ include_thinking: event.target.checked ? undefined : false })
                       }
                     />
                     Include thinking
@@ -961,7 +963,7 @@ export function SessionPage({
                     >
                       {issue.detail}{" "}
                       {issue.session_id && (
-                        <NavLink to={sessionPath(issue.session_id)}>
+                        <NavLink {...sessionRoute(issue.session_id)}>
                           Inspect session {issue.session_id}
                         </NavLink>
                       )}

@@ -706,10 +706,17 @@ silently chosen: the server publishes the candidate-route relationship, the
 user must explicitly select the labelled profile, the profile must permit it,
 and the preview and report retain the relationship.
 
-Completed calibration reports are immutable and durable in SQLite/PostgreSQL
-storage revision 68. The run request carries a stable run ID, so a response-loss
-retry or server restart returns the already stored report without paying for or
-executing the judge again. Public reference truth crosses the application
+Completed calibration reports are immutable and durable in the supported
+SQLite/PostgreSQL eval stores. A retry with the same run ID and reviewed
+definition returns an already-stored report without another judge call, including after a server
+restart. This replay guarantee starts when the complete report has been stored.
+There is no durable dispatch claim or checkpoint for partially completed judge
+work before that publication. If a process stops, publication fails, or another
+server process handles the same request before a report is stored, paid calls
+may repeat even with the same run ID. Stronger recovery for that uncertain work
+is separate future runtime work.
+
+Public reference truth crosses the application
 redaction boundary before persistence. Private reference content stays inside
 the server-owned judge binding and is absent from the browser, portable suite,
 calibration evidence, and report.
@@ -726,8 +733,8 @@ The protected HTTP contract mirrors the same review boundary:
   `Idempotency-Key`;
 - `POST /api/evals/judge-calibrations/preview` compiles fixed evidence and human
   labels and reports exact judge work without execution;
-- `POST /api/evals/judge-calibrations` runs or idempotently recovers the reviewed
-  calibration;
+- `POST /api/evals/judge-calibrations` runs the reviewed calibration or replays
+  its already-stored report for the same run ID and definition;
 - `GET /api/evals/judge-calibrations/{revision}` loads an immutable completed
   report.
 
@@ -3892,4 +3899,9 @@ launch** to recover the original run, including its case selection, cost ceiling
 reviewed profiles. **Abandon launch recovery** deliberately permits a separate new
 launch; it does not cancel an earlier run. Private calibration evidence remains only
 in the open editor. Finish or explicitly discard calibration edits before changing
-cases or suite fields; an unconfirmed paid calibration must be retried before leaving.
+cases or suite fields. For an unconfirmed paid calibration, retry the retained
+request or explicitly **Abandon calibration recovery** before leaving. Abandonment
+keeps the draft, releases only local recovery and does not cancel server work.
+A fresh check is required before a deliberate new run. Exact retry does not
+prevent repeated paid calls when the previous report was never stored; see
+[calibration recovery](#developer-dashboard-calibrate-an-ai-judge).

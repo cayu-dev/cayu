@@ -17,7 +17,7 @@ import {
 import { blankEvalScenarioDraft, newSimpleEvalCase } from "@/lib/eval-suite-authoring"
 import { evalErrorMessage, shortEvalIdentity } from "@/lib/evals-dashboard"
 import { formatDateTime } from "@/lib/format"
-import { nativeRunSelector, runViewPath } from "../../app/eval-view-model"
+import { nativeRunSelector, runViewRoute } from "../../app/eval-view-model"
 import { NavLink } from "../common"
 import { LoadState, Pages, Section } from "./shared"
 import { downloadBlob } from "./technical-details"
@@ -221,7 +221,7 @@ function OwnedScenario({
   return (
     <div className="min-w-0 space-y-3">
       {launched && (
-        <NavLink to={runViewPath(nativeRunSelector(launched))} className="text-sm underline">
+        <NavLink {...runViewRoute(nativeRunSelector(launched))} className="text-sm underline">
           Open scenario run
         </NavLink>
       )}

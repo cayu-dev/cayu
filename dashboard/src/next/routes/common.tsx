@@ -1,43 +1,21 @@
 import { Popover } from "@base-ui/react/popover"
-import { Link, useNavigate } from "@tanstack/react-router"
-import { Ellipsis, Menu, PanelLeft } from "lucide-react"
 import {
-  type ComponentProps,
-  createContext,
-  type MouseEvent,
-  type ReactNode,
-  type RefObject,
-  useContext,
-} from "react"
+  Link,
+  type NavigateOptions,
+  type RegisteredRouter,
+  useNavigate,
+} from "@tanstack/react-router"
+import { Ellipsis, Menu, PanelLeft } from "lucide-react"
+import { createContext, type MouseEvent, type ReactNode, type RefObject, useContext } from "react"
 import { Button } from "@/components/ui/button"
 import { dashboardAsset } from "@/lib/config"
 import { cn } from "@/lib/utils"
 import type { SessionOverview, SessionState } from "../api/types"
 import { STATE_LABEL, shouldFollowRowClick } from "../app/session-model"
 
-/**
- * Links and navigation by plain path. The packaged dashboard's router owns the typed
- * route registry until this one replaces it, so paths are passed untyped here.
- */
-export function NavLink({
-  to,
-  search,
-  ...props
-}: Omit<ComponentProps<typeof Link>, "to" | "search"> & {
-  to: string
-  search?: Record<string, unknown>
-}) {
-  return <Link to={to as never} search={search as never} {...props} />
-}
-
-export function useGo() {
-  const navigate = useNavigate()
-  return (
-    to: string,
-    search?: Record<string, unknown>,
-    options?: { replace?: boolean; resetScroll?: boolean },
-  ) => navigate({ to: to as never, search: search as never, ...options })
-}
+/** Keep the registered router's route, parameter and search contracts intact. */
+export const NavLink = Link
+export const useGo = useNavigate
 
 /**
  * A click handler for a list row whose title cell is a real link: a plain click anywhere
@@ -46,23 +24,24 @@ export function useGo() {
  */
 export function useRowClick() {
   const go = useGo()
-  return (to: string, search?: Record<string, unknown>) => (e: MouseEvent<HTMLElement>) => {
-    const target = e.target instanceof Element ? e.target : null
-    const onControl = !!target?.closest("a, button, input, select, textarea, label, summary")
-    if (window.getSelection()?.type === "Range") return
-    if (
-      shouldFollowRowClick({
-        button: e.button,
-        metaKey: e.metaKey,
-        ctrlKey: e.ctrlKey,
-        shiftKey: e.shiftKey,
-        altKey: e.altKey,
-        defaultPrevented: e.defaultPrevented,
-        onControl,
-      })
-    )
-      go(to, search)
-  }
+  return <const TTo extends string>(options: NavigateOptions<RegisteredRouter, string, TTo>) =>
+    (e: MouseEvent<HTMLElement>) => {
+      const target = e.target instanceof Element ? e.target : null
+      const onControl = !!target?.closest("a, button, input, select, textarea, label, summary")
+      if (window.getSelection()?.type === "Range") return
+      if (
+        shouldFollowRowClick({
+          button: e.button,
+          metaKey: e.metaKey,
+          ctrlKey: e.ctrlKey,
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          defaultPrevented: e.defaultPrevented,
+          onControl,
+        })
+      )
+        void go(options)
+    }
 }
 
 /** Classes for a clickable list row; its title link carries keyboard focus. */
@@ -83,8 +62,9 @@ export function EvalTrialTag() {
   )
 }
 
-export const sessionPath = (id: string) => `/sessions/${encodeURIComponent(id)}`
-export const taskPath = (id: string) => `/tasks/${encodeURIComponent(id)}`
+export const sessionRoute = (id: string) =>
+  ({ to: "/sessions/$sessionId", params: { sessionId: id } }) as const
+export const taskRoute = (id: string) => ({ to: "/tasks/$taskId", params: { taskId: id } }) as const
 
 /** The Cayu logo: under the dashboard's base path when served by the runtime, next to the page otherwise. */
 export const logoUrl = () =>

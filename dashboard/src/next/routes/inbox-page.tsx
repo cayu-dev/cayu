@@ -7,7 +7,7 @@ import type { InboxItem } from "../api/types"
 import { useInbox, useInboxCounts } from "../app/queries"
 import { useApi } from "../app/services"
 import { ChildActions } from "./child-actions"
-import { EmptyState, ErrorState, NavLink, PageBody, sessionPath, TopBar, useGo } from "./common"
+import { EmptyState, ErrorState, NavLink, PageBody, sessionRoute, TopBar, useGo } from "./common"
 import { InboxCard } from "./session/inbox-card"
 import { selectClassName } from "./session-filters"
 
@@ -69,11 +69,14 @@ export function InboxPage() {
           onSubmit={(event) => {
             event.preventDefault()
             const values = new FormData(event.currentTarget)
-            go("/inbox", {
-              ...search,
-              q: String(values.get("q") ?? "").trim() || undefined,
-              session_id: String(values.get("session_id") ?? "").trim() || undefined,
-              agent_name: String(values.get("agent_name") ?? "").trim() || undefined,
+            go({
+              to: "/inbox",
+              search: {
+                ...search,
+                q: String(values.get("q") ?? "").trim() || undefined,
+                session_id: String(values.get("session_id") ?? "").trim() || undefined,
+                agent_name: String(values.get("agent_name") ?? "").trim() || undefined,
+              },
             })
           }}
         >
@@ -131,7 +134,7 @@ export function InboxPage() {
               key={label}
               type="button"
               aria-pressed={search.kind === kind}
-              onClick={() => go("/inbox", { ...search, kind })}
+              onClick={() => go({ to: "/inbox", search: { ...search, kind } })}
               className={cn(
                 "inline-flex h-7 items-center gap-1.5 rounded-full border px-3 text-[13px]",
                 search.kind === kind
@@ -180,7 +183,7 @@ export function InboxPage() {
             >
               {issue.detail}
               {issue.session_id && (
-                <NavLink to={sessionPath(issue.session_id)} className="ml-2 underline">
+                <NavLink {...sessionRoute(issue.session_id)} className="ml-2 underline">
                   Inspect session {issue.session_id}
                 </NavLink>
               )}

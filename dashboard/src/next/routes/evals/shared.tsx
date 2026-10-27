@@ -16,10 +16,10 @@ import {
   comparisonLabel,
   isReportedRun,
   runOrigin,
-  runViewPath,
+  runViewRoute,
   suiteSelector,
 } from "../../app/eval-view-model"
-import { NavLink, ROW_CLASS, ROW_LINK_CLASS, sessionPath, useRowClick } from "../common"
+import { NavLink, ROW_CLASS, ROW_LINK_CLASS, sessionRoute, useRowClick } from "../common"
 
 export const FIELD_CLASS =
   "h-8 min-w-0 rounded-lg border border-input bg-background px-2.5 text-sm focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
@@ -236,16 +236,17 @@ export function RunsTable({ runs }: { runs: (EvalRunViewSummary | EvalReportedRu
             <tr
               key={run.id}
               className={ROW_CLASS}
-              onClick={rowClick(
-                runViewPath(run.id),
-                !isReportedRun(run) && run.placement
-                  ? { placement: suiteSelector(run.placement.destination) }
-                  : undefined,
-              )}
+              onClick={rowClick({
+                ...runViewRoute(run.id),
+                search:
+                  !isReportedRun(run) && run.placement
+                    ? { placement: suiteSelector(run.placement.destination) }
+                    : undefined,
+              })}
             >
               <td className="px-3 py-2">
                 <NavLink
-                  to={runViewPath(run.id)}
+                  {...runViewRoute(run.id)}
                   search={
                     !isReportedRun(run) && run.placement
                       ? { placement: suiteSelector(run.placement.destination) }
@@ -297,7 +298,7 @@ export function EvalSourceLink({
   })
   if (query.data?.state === "available" && query.data.session_id)
     return (
-      <NavLink to={sessionPath(query.data.session_id)} className="text-xs underline">
+      <NavLink {...sessionRoute(query.data.session_id)} className="text-xs underline">
         Source session
       </NavLink>
     )

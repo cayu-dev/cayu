@@ -120,7 +120,10 @@ function SettingsTools() {
               value={selected}
               disabled={state.dirty || state.locked}
               onChange={(event) =>
-                void go("/evals/settings", { tool: search.tool, target: event.target.value })
+                void go({
+                  to: "/evals/settings",
+                  search: { tool: search.tool, target: event.target.value },
+                })
               }
             >
               {!target && <option value={selected}>Specialist unavailable</option>}

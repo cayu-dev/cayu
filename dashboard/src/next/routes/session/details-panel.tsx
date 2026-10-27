@@ -13,7 +13,7 @@ import type { SessionDetail, SessionOverview } from "../../api/types"
 import type { SessionRow } from "../../app/queries"
 import { useServices } from "../../app/services"
 import { formatDuration } from "../../app/session-model"
-import { LabelChips, NavLink, SessionSummary, sessionPath } from "../common"
+import { LabelChips, NavLink, SessionSummary, sessionRoute } from "../common"
 
 export const PANEL_TABS = ["overview", "usage", "artifacts", "browser"] as const
 export type PanelTab = (typeof PANEL_TABS)[number]
@@ -199,7 +199,7 @@ export function DetailsPanel({
                 <Row k="Started by">{session.invocation.source.replaceAll("_", " ")}</Row>
                 {parent && (
                   <Row k="Parent session">
-                    <NavLink to={sessionPath(parent.session.id)} className="hover:underline">
+                    <NavLink {...sessionRoute(parent.session.id)} className="hover:underline">
                       {parent.overview?.title ?? parent.session.id}
                     </NavLink>
                   </Row>

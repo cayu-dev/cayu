@@ -29,9 +29,9 @@ import {
   NavLink,
   PageBody,
   StateBadge,
-  sessionPath,
+  sessionRoute,
   TopBar,
-  taskPath,
+  taskRoute,
 } from "./common"
 import { ValueView } from "./session/value-view"
 import { TaskActions } from "./task-actions"
@@ -96,7 +96,7 @@ function TaskLink({
   const group = groupOf(task.status)
   return (
     <NavLink
-      to={taskPath(task.id)}
+      {...taskRoute(task.id)}
       className="flex min-w-0 items-center gap-2 border-b border-border px-3 py-2 text-sm last:border-0 hover:bg-muted/60"
     >
       <span className={cn("size-2 shrink-0 rounded-full", GROUP_DOT[group])} aria-hidden="true" />
@@ -222,7 +222,7 @@ function TaskPageView({ taskId }: { taskId: string }) {
             )}
             {task.session_id && (
               <NavLink
-                to={sessionPath(task.session_id)}
+                {...sessionRoute(task.session_id)}
                 className={buttonVariants({ variant: "outline", size: "sm" })}
               >
                 Open session
@@ -358,7 +358,7 @@ function TaskPageView({ taskId }: { taskId: string }) {
                       a.id === task.id && "bg-muted/50",
                     )}
                   >
-                    <NavLink to={taskPath(a.id)} className="shrink-0 hover:underline">
+                    <NavLink {...taskRoute(a.id)} className="shrink-0 hover:underline">
                       Attempt {a.retry_series?.attempt}
                     </NavLink>
                     <span
@@ -371,7 +371,7 @@ function TaskPageView({ taskId }: { taskId: string }) {
                     </span>
                     {a.session_id ? (
                       <NavLink
-                        to={sessionPath(a.session_id)}
+                        {...sessionRoute(a.session_id)}
                         className="flex shrink-0 items-center gap-2 text-xs hover:underline"
                       >
                         <StateBadge overview={undefined} />
@@ -404,7 +404,7 @@ function TaskPageView({ taskId }: { taskId: string }) {
             {task.session_id ? (
               <List>
                 <NavLink
-                  to={sessionPath(task.session_id)}
+                  {...sessionRoute(task.session_id)}
                   className="flex min-w-0 items-center gap-3 px-3 py-2 text-sm hover:bg-muted/60"
                 >
                   <span className="min-w-0 flex-1 truncate">{task.session_id}</span>

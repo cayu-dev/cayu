@@ -288,9 +288,11 @@ arguments and answer. Any other settle of a settled item gets 409 `already_settl
 A person's identity is `subject`, `tenant` and the verified source, not the token's
 other claims, so a refreshed token repeats the same request.
 
-For a knowledge proposal, keeping it again as the same person replays the recorded
-approval, and dropping it again answers with the existing settlement, since a drop
-records no person.
+For a knowledge proposal, both Keep and Drop bind the exact proposal revision,
+reviewer and optional reason to a recorded decision. Repeating that decision as
+the same reviewer with the same reason replays its receipt; changing the reviewer
+or reason conflicts. A decision made outside the reviewed workflow may have no
+recorded reviewer; that is not a reviewed Drop receipt.
 
 ## Who decides, and who may
 
@@ -372,8 +374,8 @@ claim, and keeps or drops the same entry `POST /api/knowledge/{id}/approve` and
 
 - `GET /api/inbox/{item_id}` reports it settled, with the person, wherever it was
   decided.
-- `GET /api/pending-actions` stops listing it, and the Developer dashboard's pending
-  actions page and session page show it resolved.
+- `GET /api/pending-actions` stops listing it, and the Developer dashboard's
+  Inbox and session page show it resolved.
 - `POST /api/supervision-events/query` returns the touch (`approve`, `edit`, `deny`,
   `answer`) with the same `attention_id` and actor.
 - `GET /api/human-attention/{attention_id}` and the attention handoff report it

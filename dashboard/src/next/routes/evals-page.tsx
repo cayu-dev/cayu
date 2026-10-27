@@ -18,23 +18,22 @@ import {
   VERDICT_LABEL,
   VERDICT_TONE,
 } from "../app/eval-model"
+import { suiteViewRoute as suiteRoute } from "../app/eval-view-model"
+import { PrototypeLink as NavLink, usePrototypeGo as useGo } from "../app/prototype-navigation"
 import { useEvalSettings, useEvalSuites, useSpecialists } from "../app/queries"
 import { useApi, useNow } from "../app/services"
 import { relativeTime } from "../app/session-model"
 import {
   EmptyState,
   ErrorState,
-  NavLink,
   PageBody,
   ROW_CLASS,
   ROW_LINK_CLASS,
   TopBar,
-  useGo,
   useRowClick,
 } from "./common"
 
-export const suitePath = (id: string) => `/evals/suites/${encodeURIComponent(id)}`
-export const runPath = (id: string) => `/evals/runs/${encodeURIComponent(id)}`
+export { runViewRoute as runRoute, suiteViewRoute as suiteRoute } from "../app/eval-view-model"
 
 export const SOURCE_LABEL: Record<EvalSuiteSummary["source"], string> = {
   authored: "Written here",
@@ -116,7 +115,7 @@ function NewSuite({ onClose }: { onClose: () => void }) {
       }),
     onSuccess: ({ suite_id }) => {
       void queryClient.invalidateQueries({ queryKey: ["evals"] })
-      go(suitePath(suite_id))
+      go(suiteRoute(suite_id))
     },
   })
   const field =
@@ -316,10 +315,10 @@ export function EvalsPage() {
               </thead>
               <tbody>
                 {rows.map((s) => (
-                  <tr key={s.id} onClick={rowClick(suitePath(s.id))} className={ROW_CLASS}>
+                  <tr key={s.id} onClick={rowClick(suiteRoute(s.id))} className={ROW_CLASS}>
                     <td className="max-w-[22rem] px-3 py-2">
                       <NavLink
-                        to={suitePath(s.id)}
+                        {...suiteRoute(s.id)}
                         className={cn("block truncate", ROW_LINK_CLASS)}
                       >
                         {s.name}

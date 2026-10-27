@@ -11,9 +11,9 @@ import {
   isNativeSuiteDetail,
   isReportedSuiteDetail,
   nativeRunSelector,
-  runViewPath,
+  runViewRoute,
   suiteSelector,
-  suiteViewPath,
+  suiteViewRoute,
 } from "../../app/eval-view-model"
 import { NavLink, PageBody, TopBar, useGo } from "../common"
 import { FIELD_CLASS, LoadState, useEvalAccess } from "./shared"
@@ -100,7 +100,7 @@ function EditorPage() {
       </TopBar>
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2 text-sm">
         {suiteId ? (
-          <NavLink to={suiteViewPath(suiteId)} className="underline">
+          <NavLink {...suiteViewRoute(suiteId)} className="underline">
             Back to suite
           </NavLink>
         ) : (
@@ -111,7 +111,9 @@ function EditorPage() {
               value={target ?? ""}
               disabled={!targets.data || scopeLocked}
               aria-label="Specialist"
-              onChange={(event) => void go("/evals/suites/new", { target: event.target.value })}
+              onChange={(event) =>
+                void go({ to: "/evals/suites/new", search: { target: event.target.value } })
+              }
             >
               {!knownTarget && (
                 <option value={target ?? ""}>{target ?? "Choose specialist"}</option>
@@ -130,7 +132,7 @@ function EditorPage() {
       </div>
       {scope && savedViews[scope] && (
         <div className="px-4 py-2 text-sm">
-          <NavLink to={suiteViewPath(savedViews[scope])} className="underline">
+          <NavLink {...suiteViewRoute(savedViews[scope])} className="underline">
             View saved suite
           </NavLink>
         </div>
@@ -185,7 +187,7 @@ function EditorPage() {
           }
           onLaunched={async (ids) => {
             if (alive.current && router.state.location.href === origin && ids[0])
-              await go(runViewPath(nativeRunSelector(ids[0])))
+              await go(runViewRoute(nativeRunSelector(ids[0])))
           }}
         />
       ))}

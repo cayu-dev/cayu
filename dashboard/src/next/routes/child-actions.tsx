@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query"
 import { useState } from "react"
 import { fetchPendingActions } from "@/lib/api"
-import { ErrorState, NavLink, sessionPath } from "./common"
+import { ErrorState, NavLink, sessionRoute } from "./common"
 
 /** Delegated actions are inspected in their session; they are not Inbox settlements. */
 export function ChildActions({ sessionId, agentName }: { sessionId?: string; agentName?: string }) {
@@ -47,7 +47,7 @@ export function ChildActions({ sessionId, agentName }: { sessionId?: string; age
         >
           {issue.detail}
           {issue.session_id && (
-            <NavLink to={sessionPath(issue.session_id)} className="ml-2 underline">
+            <NavLink {...sessionRoute(issue.session_id)} className="ml-2 underline">
               Inspect session {issue.session_id}
             </NavLink>
           )}
@@ -56,7 +56,7 @@ export function ChildActions({ sessionId, agentName }: { sessionId?: string; age
       {query.data?.actions.map((action) => (
         <NavLink
           key={`${action.session.id}-${action.attention_id}-${action.tool_call_id}`}
-          to={sessionPath(action.delegated_action?.child_session_id ?? action.session.id)}
+          {...sessionRoute(action.delegated_action?.child_session_id ?? action.session.id)}
           className="block [overflow-wrap:anywhere] rounded border border-border p-3 text-sm hover:bg-muted/60"
         >
           {action.session.id} · {action.tool_name ?? action.kind} · Open child

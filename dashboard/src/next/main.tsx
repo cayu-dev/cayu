@@ -39,7 +39,7 @@ function App() {
           api.setSeed(id)
           setSeedId(id)
           queryClient.clear()
-          void router.navigate({ to: "/" as never })
+          void router.navigate({ to: "/" })
         },
         reset: () => {
           api.reset()

@@ -10,7 +10,7 @@ import { useServices } from "../app/services"
 import { FINISHED_STATUSES } from "../app/task-model"
 import { TaskOperation } from "../app/task-operation"
 import { TASK_POLL_MS } from "../app/task-polling"
-import { ErrorState, taskPath, useGo } from "./common"
+import { ErrorState, taskRoute, useGo } from "./common"
 
 const replayOwners = new WeakMap<Api, Map<string, TaskOperation>>()
 
@@ -68,7 +68,7 @@ export function TaskActions({ task }: { task: TaskInfo }) {
         const id = replay.state.taskId!
         replay.clear()
         void cache.invalidateQueries({ queryKey: ["tasks"] })
-        go(taskPath(id))
+        go(taskRoute(id))
       }
     } finally {
       replayStarting.current = false
@@ -174,7 +174,7 @@ export function TaskActions({ task }: { task: TaskInfo }) {
           onClick={() => {
             const id = replayState.taskId!
             replay.clear()
-            go(taskPath(id))
+            go(taskRoute(id))
           }}
         >
           Open replayed task

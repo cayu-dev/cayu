@@ -1,6 +1,6 @@
 import { Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { suiteSelector, suiteViewPath } from "@/next/app/eval-view-model"
+import { suiteSelector } from "@/next/app/eval-view-model"
 import { useGo } from "@/next/routes/common"
 
 /** All authoring entrances share the full-page owner. */
@@ -18,9 +18,6 @@ export function EvalSuiteAuthoringAction({
   reviewRun?: boolean
 }) {
   const go = useGo()
-  const path = initialRevision
-    ? `${suiteViewPath(suiteSelector({ source: "authored", target_key: targetKey, revision: initialRevision, suite_id: null }))}/edit`
-    : "/evals/suites/new"
   return (
     <Button
       data-testid="new-evaluation"
@@ -28,7 +25,20 @@ export function EvalSuiteAuthoringAction({
       variant="outline"
       disabled={disabled}
       onClick={() =>
-        void go(path, initialRevision ? { run: reviewRun || undefined } : { target: targetKey })
+        void (initialRevision
+          ? go({
+              to: "/evals/suites/$suiteId/edit",
+              params: {
+                suiteId: suiteSelector({
+                  source: "authored",
+                  target_key: targetKey,
+                  revision: initialRevision,
+                  suite_id: null,
+                }),
+              },
+              search: { run: reviewRun || undefined },
+            })
+          : go({ to: "/evals/suites/new", search: { target: targetKey } }))
       }
     >
       <Plus /> {label}

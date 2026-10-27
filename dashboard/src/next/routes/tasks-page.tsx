@@ -31,7 +31,7 @@ import {
   ROW_CLASS,
   ROW_LINK_CLASS,
   TopBar,
-  taskPath,
+  taskRoute,
   useGo,
   useRowClick,
 } from "./common"
@@ -73,10 +73,10 @@ export function TasksPage() {
   const [draft, setDraft] = useState(search.q ?? "")
   useEffect(() => setDraft(search.q ?? ""), [search.q])
   useEffect(() => {
-    if (search.task_id) go(taskPath(search.task_id), undefined, { replace: true })
+    if (search.task_id) go({ ...taskRoute(search.task_id), replace: true })
   }, [search.task_id, go])
   const set = (patch: Partial<Filters>) =>
-    go("/tasks", { ...search, ...patch }, { replace: true, resetScroll: false })
+    go({ to: "/tasks", search: { ...search, ...patch }, replace: true, resetScroll: false })
   const all = [
     ...new Map(
       (tasks.data?.pages.flatMap((page) => page.items) ?? []).map((task) => [task.id, task]),
@@ -254,7 +254,7 @@ export function TasksPage() {
           variant="ghost"
           onClick={() => {
             setDraft("")
-            go("/tasks", {}, { replace: true, resetScroll: false })
+            go({ to: "/tasks", search: {}, replace: true, resetScroll: false })
           }}
         >
           Clear filters
@@ -294,14 +294,14 @@ export function TasksPage() {
                 {rows.map((t) => {
                   const group = groupOf(t.status)
                   return (
-                    <tr key={t.id} onClick={rowClick(taskPath(t.id))} className={ROW_CLASS}>
+                    <tr key={t.id} onClick={rowClick(taskRoute(t.id))} className={ROW_CLASS}>
                       <td className="max-w-[26rem] px-3 py-2">
                         <div className="flex min-w-0 items-center gap-2">
                           <span
                             className={cn("size-2 shrink-0 rounded-full", GROUP_DOT[group])}
                             aria-hidden="true"
                           />
-                          <NavLink to={taskPath(t.id)} className={cn("truncate", ROW_LINK_CLASS)}>
+                          <NavLink {...taskRoute(t.id)} className={cn("truncate", ROW_LINK_CLASS)}>
                             {taskName(t)}
                           </NavLink>
                           {isCayuTask(t) && (

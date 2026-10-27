@@ -470,7 +470,7 @@ server counts/accounting endpoint. Eval trials and forks are excluded. Cost is
 shown when pricing is configured, with an explicit partial marker when incomplete;
 otherwise the summary shows input plus output tokens. Needs attention, recent
 sessions and task samples are lists, never population totals. Failure links open
-the existing session event log filtered to `session.failed` until the Trace port.
+Session Trace with its event log filtered to `session.failed`.
 Starting a session uses its own execution permission and remains available to
 full-access users even when a custom store cannot supply Home overview reads.
 

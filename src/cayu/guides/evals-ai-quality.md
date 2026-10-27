@@ -97,9 +97,12 @@ criterion. **Check calibration** shows the exact judge work and cost exposure;
 **Run calibration** may repeat judge calls over the same retained evidence. It
 does not rerun candidate tools or sessions. While a paid request is unresolved,
 retry it here before switching checks or leaving the tool; the retry keeps its
-original run identity. After a report arrives, it remains visible until you
-choose another check or leave. **Discard calibration** clears edited fixed
-evidence; private evidence is not stored in the URL or browser storage.
+original run identity. The server replays an already-stored report for that exact
+run and definition without another judge call. If judge calls happened but the
+report was not stored, retrying can repeat paid work, including after a server
+restart; the retained browser identity is not a durable dispatch guarantee.
+After a report arrives, it remains visible until you choose another check or
+leave. **Discard calibration** clears edited fixed evidence; private evidence is not stored in the URL or browser storage.
 A catalog refresh that temporarily hides the specialist preserves this workbench
 and its exact unresolved request. New calibration work waits for the specialist
 to become available; an exact retry remains subject to server authorization and
@@ -111,7 +114,6 @@ releases its local run identity after confirmation. Your private draft remains;
 again before intentionally starting a new run. Abandoning does not cancel or
 erase server work and can allow duplicate paid calls; it is unavailable while a
 request is in flight.
-
 
 Use clearly good, clearly bad, and difficult boundary examples. If repeated
 judge scores move materially on identical evidence, refine the rubric or use a

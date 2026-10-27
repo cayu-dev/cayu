@@ -10,7 +10,7 @@ import {
   type ToolUse,
   workSummary,
 } from "../../app/session-model"
-import { NavLink, StateBadge, sessionPath } from "../common"
+import { NavLink, StateBadge, sessionRoute } from "../common"
 import { ValueView } from "./value-view"
 
 const LONG_MESSAGE = 1200
@@ -327,7 +327,7 @@ export function SubagentRows({ rows }: { rows: SessionRow[] }) {
       {rows.map(({ session, overview, title }) => (
         <NavLink
           key={session.id}
-          to={sessionPath(session.id)}
+          {...sessionRoute(session.id)}
           className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm hover:bg-muted"
         >
           <CornerDownRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />

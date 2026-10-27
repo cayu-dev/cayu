@@ -8,10 +8,11 @@ import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { AddToEvals } from "../../api/types"
+import { usePrototypeGo as useGo } from "../../app/prototype-navigation"
 import { useEvalSuites } from "../../app/queries"
 import { useApi } from "../../app/services"
-import { ErrorState, useGo } from "../common"
-import { runPath, suitePath } from "../evals-page"
+import { ErrorState } from "../common"
+import { runRoute, suiteRoute } from "../evals-page"
 
 const MODES: { id: AddToEvals["mode"]; label: string; text: string }[] = [
   {
@@ -54,7 +55,7 @@ export function AddToEvalsDialog({
       }),
     onSuccess: ({ suite_id, run_id }) => {
       void queryClient.invalidateQueries({ queryKey: ["evals"] })
-      go(run_id ? runPath(run_id) : suitePath(suite_id))
+      go(run_id ? runRoute(run_id) : suiteRoute(suite_id))
     },
   })
   useEffect(() => {

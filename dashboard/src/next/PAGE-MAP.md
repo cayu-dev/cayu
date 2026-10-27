@@ -1,79 +1,73 @@
-# Developer dashboard rework
+# Developer dashboard page map
 
-The reworked Developer dashboard (`/cayu/`), built in this folder as the real app on a
-fake API. It uses the dashboard's own Tailwind tokens and shadcn components and the
-server's generated types, and replaces `src/routes` and `src/Layout.tsx` area by area
-(see Porting), each area shipping against today's server where it can.
+The production Developer dashboard uses `src/main.tsx`, `src/app/router.tsx` and
+`src/app/layout.tsx`. The shell supplies `api/real.ts`, checks the server contract
+before page reads, and respects the configured dashboard base path. Home, Inbox,
+Sessions, Session/Trace, Tasks, Specialists, Tools, Knowledge and Evals use the
+pages in this directory. Usage, Environments, Artifacts and System retain their
+existing implementations under `src/routes/` inside the production shell.
 
-- **The plan:** backend prerequisites and the area-by-area porting sequence are listed below.
-- **Clickable prototype:** https://claude.ai/artifact/JXhabogyvF8bLbt9YqBCrS
-- **This page map, published (takes comments):** https://claude.ai/artifact/HxQypvmhJmouPdgKYWpP8X
+This map describes the implemented surfaces, their owners and current runtime
+contracts.
 
-## Sessions production port
+## Development and demo prototype
 
-Sessions now uses this area's page in production with the real overview API. Runtime
-metadata, overview and bounded query contracts are available. Existing filters and
-links remain supported; eval trials and forks are off by default. The footer shows
-loaded rows because filtered totals are intentionally null. The shared prototype
-continues to use its fake API; other areas below remain separate ports.
-
-## Session detail production port
-
-The Session route now uses the Conversation page with native bounded transcript windows,
-structured results, inline decisions and exact recovery, follow-ups, interruption,
-provider resolution, and task-aware replay. Trace and its event log share one incremental
-sequence follower; the former Workflow URL opens the embedded tree and causal usage.
-The details panel retains annotations, artifacts, and browser takeover/recordings.
-Queued messages remain available only with authenticated identity and the deployment's
-message access policy. Existing evaluation promotion remains available in the menu.
-
-## Run it
+The prototype is deliberately retained for development, demonstrations and design
+comparison. It is not the production server integration or a substitute for its
+permissions, persistence and recovery checks. The published
+[prototype](https://claude.ai/artifact/JXhabogyvF8bLbt9YqBCrS) and
+[original design map](https://claude.ai/artifact/HxQypvmhJmouPdgKYWpP8X) are design
+references; current runtime contracts take precedence over their simulated data.
 
 ```bash
-npm run dev                        # then open /prototype.html
-CAYU_PROTOTYPE=1 npx vite build    # dist/prototype/, relative URLs, works from any folder
+npm run dev                       # production development entry; /api proxies to localhost:8000
+# Open /prototype.html for the separate seeded prototype.
+CAYU_PROTOTYPE=1 npx vite build   # prototype-only output in dist/prototype/
 ```
 
-To add snapshots of real deployments, point `CAYU_PROTOTYPE_SEEDS` at a JSON array of
-seeds (`AppSeed` in `mock/model.ts`) kept **outside the repository**. The dashboard
-source archive packs every file under `dashboard/`, so real data must never live
-in this folder.
+`prototype.html` starts `src/next/main.tsx` with hash routing, `src/next/mock/api.ts` and the
+fake fetch adapter in `src/next/mock/legacy/`. Its bar switches seeded agents and resets
+simulated state. `src/next/routes/legacy-page.tsx` and `src/next/legacy-config.ts` adapt the four
+retained pages to that harness; production mounts those pages directly.
+The normal production build starts `src/main.tsx`, not this mock entry point.
+The prototype sources remain in the editable source archive; its separate build
+is not the dashboard served by the Python package.
 
-The prototype bar at the top switches between agents and resets the fake data.
+`CAYU_PROTOTYPE_SEEDS` may point to a JSON array of `AppSeed` values kept outside
+the repository. Use made-up data for shared demos. Never put deployment snapshots,
+credentials or private content under `dashboard/`: the source archive includes
+that source tree. A prototype build containing supplied snapshots is also a copy
+of that data.
 
-## Why
+## Product principles
 
-The current dashboard is an audit console for the stores with an evals workbench attached.
-
-- Home is a page of store metrics.
-- Session rows lead with random IDs and repeat the same values in several columns.
-- The session page is one 3,855-line component, and the browser box renders on every session.
-- Approvals are split between Pending and Knowledge, and neither page can act on them. The server's unified `/api/inbox` is never called.
-
-Cayu Cloud now links to `/cayu/sessions/{id}` for a run's full conversation, so this dashboard is the detailed view of one agent, locally and behind Cloud.
-
-It is the **developer's** tool for looking deeply into the whole agent. Cayu agents are autonomous workers, not chat assistants. The people the agent works for (an analyst, an accountant, a lawyer) use the agent's own UI, which each agent builds; it doesn't ship with Cayu.
-
-## Principles
-
-- **One agent in depth.** Cloud covers many agents and the organization.
-- **Nothing agent-specific.** Titles, summaries, labels, metadata and structured output come from generic session fields. The prototype switches between unrelated agents to keep that honest.
-- **Everything is inspectable.** Each session has a Trace: every model step, tool call, command and wait, with its exact events.
-- **The session reads as a conversation.** A run of tool calls collapses into one muted line ("Read 9 files, searched 10 times"), as in Claude desktop.
-- **What needs a person is the loudest thing on screen.** It shows as the Inbox count in the sidebar, Needs attention on Home, inline cards in the session, and one inbox.
-- **The sidebar is navigation.** Every area of the dashboard stays one click away, grouped as Home, Inbox, Sessions, Tasks; Improve (Evals, Usage); Agent (Specialists, Tools, Knowledge, Environments, Artifacts, System). Sessions are listed on the Sessions page, not in the sidebar.
-- **Existing links keep working.**
+- **One agent in depth.** Developers inspect this agent; Cloud covers multiple
+  agents and the organization. End users use the agent's own UI.
+- **Generic information.** Titles, summaries, labels and structured output come
+  from session fields, not assumptions about a particular agent.
+- **Conversation and Trace.** Conversation shows the work and decisions; Trace
+  exposes exact server spans, events, workflow topology and execution diagnostics.
+- **Human attention first.** Home, Inbox and inline session decisions reflect the
+  same runtime records. Counts come from authoritative server reads, not samples.
+- **Roles and capabilities.** Actions follow the server's effective permissions
+  and configured capabilities. A custom role string is not itself a grant.
+- **Navigation stays useful.** Existing supported route aliases and query mappings
+  lead to the corresponding current surfaces.
 
 ## Pages
 
-| New | Replaces | URL |
+Page visibility and actions depend on the deployment and viewer permissions.
+Baseline, comparison and execution controls apply to native Evals sources;
+reported series expose their supported read-only evidence and downloads.
+
+| Page | Previous surface | URL |
 |---|---|---|
-| Sidebar: ⌘K search (opens Sessions filtered), Home, Inbox with a count, Sessions with the running count, Tasks; Improve: Evals, Usage; Agent: Specialists, Tools, Knowledge (with the review count), Environments, Artifacts, System; theme | Four nav groups | – |
+| Sidebar: ⌘K search (opens Sessions filtered), Home, Inbox with a count, Sessions with the running count when available, Tasks; Improve: Evals, Usage; Agent: Specialists, Tools, Knowledge (with the review count), Environments, Artifacts, System; theme | Four nav groups | – |
 | Home: one line on the last 24 hours (sessions, failed, cost or tokens), Needs attention (sessions waiting on a person, and failures from the last day, which open their trace), and Recent sessions. "Start a session" is a small form for testing. It opens on Run a specialist, which works for every agent. Create a task (the agent's own worker runs it) sits next to it and is disabled, with a tooltip saying why, until the agent declares task types. | Dashboard, New Run | `/` (`/run` redirects; `?start=1` opens the form) |
 | Session: conversation, collapsed tool work, structured output, inline approval / question / recovery cards, a compact "Message this session…" bar with Stop, and Run again in the menu | Session detail | `/sessions/:id` |
 | Trace: a waterfall of the session's spans (turns, model steps, tool rounds, tool calls, commands, waits) built from its events, the selected span's detail (what went into a model request, tools offered, arguments, results, exit codes, raw events), and the event log with filters and a live tail, where a selected event opens in its own panel. Values the server withholds are named as hidden, never shown as raw markers. Conversation steps link to their span and back. | Event timeline, event detail, Workflow page, execution snapshots and other debug blocks | `?view=trace&span=…`, `&log=1` for the event log; `/sessions/:id/workflow` opens it |
 | Details panel: Overview, Usage, Artifacts, Browser (only if used), and Open trace | Header stats, annotations | `?panel=…` |
-| Sessions: "Start a session" (the same form as Home), title first, one state column, duration, tool calls, cost or tokens; columns that never vary are hidden and named once | Sessions | `/sessions` |
+| Sessions: "Start a session" (the same form as Home), title first, one state column, duration, tool calls, cost or tokens; server filters and cursor paging | Sessions | `/sessions` |
 | Inbox: approvals, questions, recovery, knowledge, settled inline | Pending | `/inbox` (`/pending-actions` redirects) |
 | Tools: every tool across specialists with its source (Cayu built-in, agent code, package, MCP server, provider), declared effect, its approval (never, always, sometimes, blocked), which specialists use it, calls, failures and last use; a tool opens to its description, input schema, approvals and recent calls (each opening its trace) | Tool lists inside Agents | `/tools` |
 | Knowledge: entries waiting for review (also in the Inbox), then the kept entries with their kind, specialist, who kept them and when, lookups, the session they came from, and Remove | Knowledge (review only) | `/knowledge` |
@@ -87,129 +81,79 @@ It is the **developer's** tool for looking deeply into the whole agent. Cayu age
 | Eval settings: what trials run with per specialist, the judge, limits, what this deployment supports, and the advanced tools (corpus import and export, judge calibration, memory reports, production scenarios) | Readiness and execution profile cards, header actions | `/evals/settings` |
 | Usage, Environments, Artifacts, System | unchanged, in the sidebar; the prototype shows today's pages as they are, marked "Today's page, unchanged" | same URLs |
 
-## Decisions
+## Current runtime contracts
 
-- **The dashboard is for developers to dive into the whole agent.** End users have the agent's own UI. Home is an overview of the agent, not a chat composer; starting a session is a small test action.
-- **Trace is the deep view.** Every session can be read as a conversation or as a trace. The real Trace component uses backend item 10 and exact transcript positions. Event-order linkage remains only in the explicit prototype fixture.
+These numbers retain the original plan's backend-item references. They describe
+current behavior rather than outstanding proposals.
 
-- **Audience:** developers. Customer operators use Cloud and the agent's own UI.
-- **The word "Agent":** the UI calls the whole thing an agent ("this agent", "Agent code"), never an app. "App" is the code's internal name (`app.run`, `AppInfo`). The agents it registers are Specialists.
-- **The word "Session":** it matches Anthropic Managed Agents, Google ADK, AWS AgentCore and the API. Cloud's rebuild should rename its "runs" to match.
-- **Specialists and the Developer dashboard:** registered agents are Specialists, and the product is the Developer dashboard.
-- **Look:** keep the current look; add dark mode (`.dark` tokens in `src/index.css`).
-- **Evals, answered on 22 October:** suites are the main list; results and runs are one thing, a run; a run is always read against the approved baseline (or a run you pick); "Add to evals" sits in a finished session's menu, either scoring the session as it is or keeping it as a case that reruns; the readiness and execution-profile details, judge calibration, memory reports and corpus import move to Evals settings.
+| Item | Implemented contract and authoritative documentation |
+| --- | --- |
+| 1 | Session title through `RunRequest.title` and the HTTP run body; summary and explicit tone use reserved session metadata. Specialist descriptions use registered metadata. See [session display metadata](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
+| 2 | `GET /api/sessions?include=overview` and overview counts share session-state rules with Cloud. Dashboard counts and the default Sessions view exclude eval trials/forks; the HTTP list exposes inclusion flags. Filtered lists show loaded rows, not an invented exact total. See [session overview](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
+| 3 | Inbox filters, public-text search and exact counts; approval arguments remain withheld. Configured human review owns disclosure. Recovery links to the session. See [Inbox](https://github.com/cayu-tech/cayu/blob/main/docs/inbox.md). |
+| 4–5 | Structured-output transcript parts and follow-ups use the session/runtime contracts. Queued messages additionally require authenticated identity and the deployment's message access policy. See [session operations](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
+| 6 | `cayu serve --reload` watches development source and restarts the server; see [serving and reload](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
+| 7, 13 | Declared task types, creation/replay, relations, lifecycle operations, exact status counts and internal-task filtering. See [tasks](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
+| 8 | `GET /api/app` provides the configured project name, then deployment name, then `Cayu`; runtime version; actual authenticated role string or null; and effective `full_access`. See [dashboard identity](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
+| 9, 11 | Registered tool display labels, source/approval classification and bounded usage/call reads. Unknown or unavailable values remain explicit; display labels never grant authority or change call identity. See [Specialists and Tools](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
+| 10 | Server-owned Trace spans and exact transcript positions; public event-order inference is confined to the prototype. See [Trace](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
+| 12 | Kept-knowledge reads and revision-fenced retirement. Reviews share Inbox decisions and source evidence. Members may read and Keep/Drop; Remove requires full access. See [Knowledge](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
+| 14 | Suite-centred native reads and reported CI series. Reported evidence does not grant native execution, comparison or baseline authority. See [Evals](https://github.com/cayu-tech/cayu/blob/main/docs/evals.md) and [CI reporting](https://github.com/cayu-tech/cayu/blob/main/docs/recipes/ci-eval-reporting.md). |
 
-- **Tools and Knowledge sit under Agent.** The sidebar group is called Agent, not App: it holds what the agent is made of (specialists, tools, knowledge) and where it runs. Knowledge reviews show both in the Inbox and on the Knowledge page.
+## Production ownership and navigation
 
-- **Answered on 22 October:**
-  - "Start a session" offers Create a task next to Run a specialist, and every session and task gets Run again (backend item 7).
-  - Any session can take a follow-up (backend item 5).
-  - The composer becomes a compact one-line bar that grows when focused, with Stop while running.
-  - Execution snapshots, retry cascade and mutation transport status live in the trace's session span, collapsed. No Debug tab and no developer-mode switch.
-  - Built-in tools ship display labels; other tools show their name unless their definition sets one.
-  - The details panel starts closed.
-- **Tasks, answered on 22 October:** a task opens its own page; the list groups the twelve statuses into five plain groups and says why per row; Cayu's own tasks are hidden behind a switch; worker, lease and concurrency key move to the task's Debug section.
+- `src/app/` owns production routing, layout, identity and the contract gate.
+  `src/next/api/real.ts` implements the shared page API; generated HTTP types and
+  the maintained clients remain the runtime boundary.
+- `src/next/routes/` owns the ported pages. `src/routes/usage.tsx`,
+  `environments.tsx`, `artifacts.tsx` and `system.tsx` remain live production
+  implementations. The old `src/Layout.tsx` and ported route modules are removed.
+  See [editable-dashboard migration](../../README.md#dashboard-structure-and-migration).
+- `/agents` maps to `/specialists`; `/pending-actions` maps to `/inbox`; `/run`
+  opens Home's Start form. The former `/sessions/:id/workflow` URL opens the
+  embedded workflow in Trace and retains its supported filters/expansion state.
+  Supported old Evals run/result query links map to the suite/run surfaces.
+- `src/next/app/trace-runtime.ts` uses exact server span IDs and transcript positions.
+  `src/next/app/trace-history.ts` keeps bounded historical/live cursors.
+  `src/next/app/session-progress.ts` shares one incremental sequence follower between
+  Conversation and Trace; paused and historical windows do not jump to the tail.
+  `src/next/app/trace-model.ts` retains event-order construction only for mock fixtures.
+- Session details retain annotations, usage, artifacts and Browser tools when
+  used, including takeover and recordings. Start, task replay, queued messages
+  and evaluation actions retain their own permission and recovery boundaries.
+- Home failures open Trace's event log filtered to `session.failed`. Inbox and
+  Session use protected review and explicit task continuation where required;
+  a settled decision can still have execution running in the background.
+- Tasks use the runtime index and exact detail reads, retain explicit continuation
+  for retry attempts, and keep operation identity after an unconfirmed response.
+- Specialists retain expandable configuration and bounded recent work. Tools
+  retain declaration variants and exact call links; unavailable reads are not
+  zero counts. Knowledge lists label loaded counts/search scope. Historical
+  knowledge and Inbox cursor windows do not poll; explicit refresh returns to
+  newest, and proposal detail stays bound to its revision.
+- Evals uses suite/run read models, a full-page suite/case editor and Settings
+  tools for profiles, calibration, scenarios, memory reports and import/export.
+  Native and reported sources remain distinct. The guides are
+  [first evaluation](https://github.com/cayu-tech/cayu/blob/main/src/cayu/guides/evals-first.md),
+  [AI quality](https://github.com/cayu-tech/cayu/blob/main/src/cayu/guides/evals-ai-quality.md) and
+  [production evaluations](https://github.com/cayu-tech/cayu/blob/main/src/cayu/guides/evals-production.md).
 
-## Code
+## Calibration recovery boundary
 
-- **`api/types.ts`** holds every call the pages make. Existing endpoints use the generated server types.
-- **`mock/api.ts`** answers those calls from an in-memory seed. Writes play out a short simulated run.
-- **`api/real.ts`** makes the same calls against the server. Switching to it is the port.
-- **`app/`** holds the query hooks, routes, services, theme and `session-model.ts`, which contains the pure helpers that `tests/next-session-model.test.mjs` covers.
-- **`app/trace-runtime.ts`** consumes server span identities and exact transcript positions; `app/trace-history.ts` keeps separate bounded historical and live cursors. `app/trace-model.ts` retains event-order construction only for the prototype fixture. `app/session-progress.ts` mounts once in Session and shares visibility-aware, cancellable sequence progress with Conversation and Trace.
-- **`routes/`** holds the pages. `legacy-page.tsx` mounts today's unchanged pages from `src/routes/` in a second router that shares the history, so the new router picks up their links.
-- **`mock/legacy/`** is a fake server for those pages: it answers their `/api` calls through `fetch`, from the same seed. `contract.ts` is a real 0.13.0 capture. `legacy-config.ts` points their links into the hash.
-- **`mock/seeds/`** holds the made-up agents: Month-end close (three specialists, every state) and New agent (empty).
-- **Real snapshots** come in through `CAYU_PROTOTYPE_SEEDS` (see Run it) and are listed after Month-end close. They never live in the repository.
-- **`next.css`** loads Tailwind plus the shared tokens in `src/theme.css`, and adds status colors and dark mode. `src/index.css` also scans `next/` now that Sessions uses these components in production.
+Calibration retries return an already-stored report for the same run ID and
+reviewed definition without another judge call. That is not a durable claim on
+work before report publication: if paid work ran but no report was stored,
+retrying may repeat it. The open workbench retains private evidence and exact
+request identity across catalog refreshes and offers confirmed local abandonment;
+it does not persist that private draft across reload or cancel server work.
+Stronger protection for uncertain paid work before publication is separate future
+runtime work. See [calibration semantics](https://github.com/cayu-tech/cayu/blob/main/docs/evals.md#developer-dashboard-calibrate-an-ai-judge).
 
-## Backend items (calls marked "Proposed" in `api/types.ts`)
+## Maintenance
 
-Each page area has a separate port, with shared runtime prerequisites implemented independently.
-
-1. **Agent-set title and summary.** Store them under the reserved metadata keys `cayu:title` and `cayu:summary`, set from `app.run(..., title=)` and at completion. An optional `cayu:summary_tone` (`neutral` or `attention`) lets the agent say a result needs a person to look. The dashboard shows an attention summary in the warning color and never guesses tone from the summary text, because "1 finding" is bad news for a reviewer and the expected result for others. Sessions have no title today. Display falls back to the labels, then the first user message, then the ID; the prototype's "Agent-set titles" switch shows both. Real data showed that the first message can be the same instruction preamble on every session. Specialists get the same treatment: `AgentSpec` has no description today, so an app-set `cayu:description` in agent metadata gives the Specialists page its one-line summary.
-2. **`GET /api/sessions?include=overview`**. It returns the merged state, title, summary, start and end times, last activity, steps, tool calls, tokens, cost (when a price book is configured) and `uses`, which covers browser, subagents and artifacts. Move `CloudRunStatus` and `_RunReader.runs()` out of `cayu/cloud_reporting.py` into a provider-neutral `cayu.sessions.overview` that both use. It also flags eval trials (`cayu:eval_trial`) and forks, which the dashboard leaves out of counts as Cloud does.
-3. **Inbox.**
-   - Add `session_id`, `agent_name` and `kind` filters.
-   - Return tool arguments on approvals; `_action_from_record` drops them today.
-   - Add counts per kind for the chips and the sidebar badge.
-   - Recovery stays out of the inbox's settle call, as `main` intends ("settled in the Developer dashboard, with the evidence of what happened"): the Inbox lists it and links to the session, which settles it through the existing recovery path.
-4. **A `structured_output` transcript part**, so the UI doesn't depend on the internal `__cayu_submit_structured_output` tool name.
-5. **Any session can take a follow-up**, completed ones included, as a new turn in the same session: `/resume` with a prompt, or `POST /api/sessions/{id}/messages`.
-6. **`cayu serve --reload`.**
-7. **Task types and Run again.** Cayu agents have no single entrypoint; they start sessions from their own code, usually by creating a durable task. Apps declare the task types they handle with an input schema (`GET /api/task-types`), and `POST /api/tasks` creates one so the app's own worker runs it the real way. Run again replays a task's input the same way. Today the server only lists tasks (`GET /api/tasks`).
-8. **A small `GET /api/app`** returning the agent's name, runtime version and the viewer's role (`admin`, `developer`, `member`; `src/cayu/server/proxy_identity.py`), so pages hide what the viewer can't do.
-9. **A display label on tools**, so a run of tool calls reads as one line ("Read 9 files, searched 10 times"), the way Claude shows "Ran 2 commands". Add an optional `display` to the tool spec: a verb, an optional noun and an optional plural. Return it on `/api/agents` tool summaries. Built-in tools ship with labels; other tools fall back to their name ("used query_ledger 2 times"). The prototype labels every built-in in `src/cayu/tools` (files, search, commands, git, browser, web, subagents, artifacts, knowledge), not only the ones the reviewer uses.
-10. **`GET /api/sessions/{id}/trace`**: the span tree, built on the server. **Required**, not just faster: the public event projection (`runtime/_event_projection.py`) hides `model_step_id` and `execution_id` (`[PRIVATE_EVENT_AUTHORITY]`) and gives `tool_call_id`/`tool_round_id` per-event aliases that never match across events, so the browser can only link spans by event order. The endpoint links them with the private IDs and returns public span IDs, plus the tool call ID the transcript uses.
-11. **Tool registration and usage.** Each tool summary on `/api/agents` gains `source` and `approval`, with the classification built for Cloud in `src/cayu/cloud_inventory.py` (sources `agent`, `cayu`, `package`, `mcp`, `provider`, `unknown`; approval `never`, `always`, `sometimes`, `blocked`, `unknown`), and a usage read returns calls, failures, approval decisions and recent calls per tool, reusing the usage counting in the same module. This is the local side of tool registration with Cloud.
-12. **`GET /api/knowledge`** for kept entries (kind, specialist, source session, who kept it and when, lookups and last use from the `knowledge.lookup` event) and a way to retire one. Today only the review side exists (`/api/knowledge/pending`, approve, reject).
-13. **Task relations and lifecycle.** Serialize `graph_id` and `prerequisite_task_ids` on task list and detail (the store has them; the Tasks page shows Waiting on and Needed by from them), add a general cancel (today only scheduled tasks can be cancelled), return status counts with the list so the chips don't depend on the page size, exclude `cayu.*` tasks on the server, and add a dependents read for Needed by. The retry series' attempts are found by walking predecessor and successor links; a series read would save the extra requests.
-14. **Suite-centred eval reads** and **CI reports in the eval store**. Reporting-only credentials grant explicit target keys; uploaded evidence stays in reported series with authenticated publisher and submitted branch/commit/PR metadata. Reports expose history, cases and download, with unknown declared revisions shown honestly and comparisons/baseline approval unavailable. Exact stored corpus association may add a report to that suite’s history without native execution authority. One read for the suite list with each suite's last run, verdict and baseline, a suite read with its runs and per-case latest outcome, and a run read that compares case by case with the baseline or a named run (the server already decides compatibility and regressions in `/api/evals/result-comparisons`). Authored suites and corpus suites become one list. Authoring beyond "final output contains" needs a separate design.
-
-## Porting
-
-Every area follows the shared rules for roles, the contract check, the transition, scale, CSP, accessibility, docs and tests, and must preserve the actions the current dashboard offers.
-
-1. Mount `createDashboardRouter()` from `src/main.tsx` with `realApi` and the dashboard's base path, keep the server-contract check and capability gating, and register its router type so `NavLink` and `useGo` become typed links. Keep every old route mounted with its old search params until its area lands.
-2. Port area by area, each against today's server with the fallbacks the prototype already has, and switch each to the runtime change it needs as it lands. Evals is the exception: it needs suite-centred eval reads first.
-3. Move Usage, Environments, Artifacts and System in unchanged, wrapped in `TopBar`/`PageBody`. The browser operator and recordings go into the session's Browser tab, and execution snapshots into the trace's session span.
-4. Remove the old routes, `Layout.tsx` and their tests once their area has landed. Rewrite each area's part of `examples/dashboard_behavior_live.py`, and update the chunk-name assertions in `tests/server/test_server.py`.
-
-
-### Home/Inbox production port
-
-Home and Inbox now use runtime contract56: exact daily accounting (excluding eval
-trials/forks), server-side public Inbox search and counts, durable optional decision
-reasons, and explicit owned task continuation. Proposed arguments stay withheld;
-configured protected review owns their disclosure. Members read and decide without
-argument overrides. Recovery opens its session; failures temporarily open the
-existing event log filtered by `session.failed` until Trace is ported. Child actions
-remain a separate read-only panel. `/pending-actions` redirects to `/inbox` with
-filters; `/run` redirects to `/?start=1`. Shared Start and title/query owners are
-those used by the Sessions production page. Counts are never inferred from samples.
-
-Task runtime contract60 supplies backend item13: graph/prerequisite fields,
-exact status counts with cursor pages, server internal-task exclusion, dependents
-and native cancellation. Schedule-history reads follow task read authority. The
-Tasks list and detail now use the real task index and exact task reads. Retry attempts
-retain predecessor/successor reads with explicit continuation; creation and replay
-retain exact operation identity after response loss. Legacy Tasks side-panel code is removed.
-
-### Trace activation
-
-The exact Trace components and shared progress owner are mounted by the production
-Session page. The old Workflow URL redirects into this view, retaining its filters
-and expansion state.
-`TraceWorkflow` contains the existing full topology, task relations, filters,
-expansion state and causal usage. The activation owner forwards `WorkflowSearch`
-and maps old workflow links to the session span. No third Tree view is introduced.
-
-`useSessionProgress` mounts once per Session. Its callback invalidates current
-reads, preserves older transcript windows, and follows the latest transcript only
-while pinned to the tail. Event-log invalidation respects
-`query.meta.sessionProgress !== false`, so Pause and older pages retain their
-position while explicit history/filter reads remain available. Focused trace
-reads bind to the loaded session incarnation; conflicts require reloading the
-session. Tool links use absolute message and part positions, never provider IDs.
-
-## Specialists and Tools production port
-
-Specialists uses the prototype cards with expandable configuration and bounded
-per-specialist recent work; `/agents?q=` redirects to `/specialists?q=`. Tools
-retains declaration variants and uses the real public-name usage aggregates and
-cursor-paged calls. Unavailable reads do not become zero counts. Exact call links
-carry the retained session incarnation into Trace. The old Agents page is removed.
-`/api/agents` supplies optional registered `display` labels, advertised by the
-read-only `tool_display` capability. Built-ins declare labels; custom, MCP and
-hosted tools retain the name fallback when none is declared. Session collapsed work,
-expanded steps and completed Trace tool spans share the session specialist's declared
-labels. Unavailable labels or ambiguous public names keep the tool-name fallback;
-labels do not change call identity or links between Conversation and Trace.
-
-Knowledge page port: `/knowledge` uses runtime kept-entry reads and revision-fenced
-retirement. Reviews reuse Inbox decisions and source evidence; kept usage and
-activation attribution remain nullable. Cursor lists label loaded counts and
-loaded-only search, and offer explicit continuation for bounded empty scans.
-Members Keep/Drop and read; Remove is full-access.
-
-Knowledge Reviews, Inbox and Session pending actions share a bounded active cursor window. Historical windows do not poll; mutations/progress refresh only the active window. Explicit refresh returns to newest. Proposal titles and bodies use revision-matched detail evidence.
+Keep page behavior, the runtime contract, these instructions and guides together.
+Rebuild the editable source archive when dashboard source or documentation changes;
+keep the packaged notice and compiled/source digests synchronized. Production
+verification uses the real server and installed/ejected assets. The retained
+prototype is an additional visual/development harness, not production acceptance
+evidence.

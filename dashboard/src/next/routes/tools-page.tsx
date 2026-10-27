@@ -13,7 +13,7 @@ import { useSpecialists, useToolUsage } from "../app/queries"
 import { useApi, useNow } from "../app/services"
 import { relativeTime } from "../app/session-model"
 import { TASK_POLL_MS } from "../app/task-polling"
-import { EmptyState, ErrorState, NavLink, PageBody, sessionPath, TopBar, useGo } from "./common"
+import { EmptyState, ErrorState, NavLink, PageBody, sessionRoute, TopBar, useGo } from "./common"
 
 type ToolRow = {
   key: string
@@ -78,7 +78,12 @@ export function ToolsPage({ usageEnabled = true }: { usageEnabled?: boolean } = 
   const q = search.q ?? ""
   const go = useGo()
   const setQ = (value: string) =>
-    go("/tools", { q: value || undefined }, { replace: true, resetScroll: false })
+    go({
+      to: "/tools",
+      search: { q: value || undefined },
+      replace: true,
+      resetScroll: false,
+    })
   const [open, setOpen] = useState<string | null>(null)
 
   const rows = useMemo(() => {
@@ -403,7 +408,7 @@ function ToolDetail({
                   {visibleCalls.map((call) => (
                     <li key={`${call.session_instance_id}:${call.sequence}`}>
                       <NavLink
-                        to={sessionPath(call.session_id)}
+                        {...sessionRoute(call.session_id)}
                         search={{
                           view: "trace",
                           log: "1",
@@ -437,7 +442,7 @@ function ToolDetail({
               {usage.recent.map((c) => (
                 <li key={`${c.session_id}-${c.at}`}>
                   <NavLink
-                    to={sessionPath(c.session_id)}
+                    {...sessionRoute(c.session_id)}
                     search={{ view: "trace" }}
                     className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-background"
                   >

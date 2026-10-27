@@ -36,11 +36,11 @@ import {
   isReportedRunDetail,
   resultSelector,
   runOrigin,
-  runViewPath,
+  runViewRoute,
   suiteSelector,
-  suiteViewPath,
+  suiteViewRoute,
 } from "../../app/eval-view-model"
-import { NavLink, PageBody, sessionPath, TopBar, useGo } from "../common"
+import { NavLink, PageBody, sessionRoute, TopBar, useGo } from "../common"
 import { ComparisonSummary } from "./comparison-details"
 import { ReportedRunPage } from "./reported-pages"
 import {
@@ -184,7 +184,7 @@ function CaseDrawer({
               </div>
               {link ? (
                 <NavLink
-                  to={sessionPath(link.session_id)}
+                  {...sessionRoute(link.session_id)}
                   search={{ view: "trace" }}
                   className="inline-block text-sm underline"
                 >
@@ -224,7 +224,7 @@ export function EvalRunViewPage() {
   const search = useSearch({ strict: false }) as {
     compare?: string
     placement?: string
-    filter?: string
+    filter?: ReturnType<typeof evalCaseFilter>
     case?: string
   }
   const go = useGo()
@@ -361,7 +361,7 @@ export function EvalRunViewPage() {
       ("filter" in patch && patch.filter !== search.filter)
     )
       setCursor(undefined)
-    void go(runViewPath(runId), { ...search, ...patch }, { resetScroll: false })
+    void go({ ...runViewRoute(runId), search: { ...search, ...patch }, resetScroll: false })
   }
   const selected = detail?.results.items.find((item) => item.case.id === search.case)
   if (reported)
@@ -410,7 +410,7 @@ export function EvalRunViewPage() {
         </NavLink>
         {r?.placement && (
           <NavLink
-            to={suiteViewPath(suiteSelector(r.placement.destination))}
+            {...suiteViewRoute(suiteSelector(r.placement.destination))}
             className="mr-2 truncate text-muted-foreground"
           >
             Destination suite /
@@ -455,7 +455,7 @@ export function EvalRunViewPage() {
                 </div>
               )}
             <NavLink
-              to={suiteViewPath(suiteSelector(r.suite))}
+              {...suiteViewRoute(suiteSelector(r.suite))}
               className="text-sm text-muted-foreground underline"
             >
               {r.suite_name}
@@ -567,7 +567,7 @@ export function EvalRunViewPage() {
                 <>
                   {" "}
                   ·{" "}
-                  <NavLink to={runViewPath(detail.compared_run.id)} className="underline">
+                  <NavLink {...runViewRoute(detail.compared_run.id)} className="underline">
                     Open compared run
                   </NavLink>
                 </>
@@ -580,9 +580,7 @@ export function EvalRunViewPage() {
                   size="sm"
                   variant={(search.filter ?? "all") === filter ? "secondary" : "ghost"}
                   aria-pressed={(search.filter ?? "all") === filter}
-                  onClick={() =>
-                    changeSearch({ filter: filter === "all" ? undefined : filter, case: undefined })
-                  }
+                  onClick={() => changeSearch({ filter: evalCaseFilter(filter), case: undefined })}
                 >
                   {filter.charAt(0).toUpperCase() + filter.slice(1)}
                 </Button>

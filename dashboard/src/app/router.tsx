@@ -6,13 +6,14 @@ import {
   lazyRouteComponent,
   type RouterHistory,
   redirect,
+  type SearchSchemaInput,
 } from "@tanstack/react-router"
 import { useContext } from "react"
 import { CapabilityRoute } from "../components/dashboard/server-contract"
 import { FullAccessRoute } from "../components/dashboard/viewer"
 import { dashboardConfig } from "../lib/config"
 import { DASHBOARD_ROUTE_REQUIREMENTS } from "../lib/dashboard-capabilities"
-import { validateEvalSettingsSearch } from "../lib/eval-settings-search"
+import { type EvalSettingsTool, validateEvalSettingsSearch } from "../lib/eval-settings-search"
 import { validateEvalsSearch } from "../lib/evals-search"
 import { parseDashboardSearch, stringifyDashboardSearch } from "../lib/search-params"
 import { validateSessionDetailSearch, workflowSearchPatch } from "../lib/session-detail-search"
@@ -79,6 +80,16 @@ const TasksPage = lazyRouteComponent(() => import("../next/routes/tasks-page"), 
 const TaskPage = lazyRouteComponent(() => import("../next/routes/task-page"), "TaskPage")
 const UsagePage = lazyRouteComponent(() => import("../routes/usage"), "UsagePage")
 const SystemPage = lazyRouteComponent(() => import("../routes/system"), "SystemPage")
+const TASK_SEARCH_KEYS = [
+  "q",
+  "group",
+  "type",
+  "agent",
+  "assigned_agent_name",
+  "session_id",
+  "cayu",
+  "task_id",
+] as const
 
 function RoutePending() {
   const pageLayout = useContext(ShellContext)?.pageLayout
@@ -191,7 +202,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/evals/suites/new",
-    validateSearch: (s: Record<string, unknown>) => ({
+    validateSearch: (s: Record<string, unknown>): { target?: string } => ({
       target: typeof s.target === "string" ? s.target : undefined,
     }),
     component: editorComponent,
@@ -201,7 +212,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     getParentRoute: () => rootRoute,
     path: "/evals/suites/$suiteId/edit",
     remountDeps: ({ params }) => params,
-    validateSearch: (s: Record<string, unknown>) => ({
+    validateSearch: (s: Record<string, unknown>): { case?: string; run?: true } => ({
       case: typeof s.case === "string" ? s.case : undefined,
       run: s.run === "true" || s.run === true ? true : undefined,
     }),
@@ -212,7 +223,14 @@ export function createDashboardRouter(history?: RouterHistory) {
     getParentRoute: () => rootRoute,
     path: "/evals/runs/$runId",
     remountDeps: ({ params }) => params,
-    validateSearch: (s: Record<string, unknown>) => ({
+    validateSearch: (
+      s: Record<string, unknown>,
+    ): {
+      compare?: string
+      placement?: string
+      filter?: ReturnType<typeof evalCaseFilter>
+      case?: string
+    } => ({
       compare: typeof s.compare === "string" ? s.compare : undefined,
       placement: typeof s.placement === "string" ? s.placement : undefined,
       filter: evalCaseFilter(s.filter),
@@ -228,7 +246,8 @@ export function createDashboardRouter(history?: RouterHistory) {
     staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/evals/settings",
-    validateSearch: validateEvalSettingsSearch,
+    validateSearch: (search: SearchSchemaInput & { tool?: EvalSettingsTool; target?: string }) =>
+      validateEvalSettingsSearch(search),
     component: () => (
       <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
         <EvalSettingsPage />
@@ -240,11 +259,13 @@ export function createDashboardRouter(history?: RouterHistory) {
     staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/tasks",
-    validateSearch: (search: Record<string, unknown>) =>
+    validateSearch: (
+      search: Record<string, unknown>,
+    ): Partial<Record<(typeof TASK_SEARCH_KEYS)[number], string>> =>
       Object.fromEntries(
-        ["q", "group", "type", "agent", "assigned_agent_name", "session_id", "cayu", "task_id"]
-          .filter((key) => typeof search[key] === "string" && search[key] !== "")
-          .map((key) => [key, search[key]]),
+        TASK_SEARCH_KEYS.filter((key) => typeof search[key] === "string" && search[key] !== "").map(
+          (key) => [key, search[key]],
+        ),
       ),
     component: () => (
       <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/tasks"]} title="Tasks">
@@ -283,7 +304,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     ),
   })
 
-  const specialistSearch = (search: Record<string, unknown>) => ({
+  const specialistSearch = (search: Record<string, unknown>): { q?: string } => ({
     q: typeof search.q === "string" ? search.q : undefined,
   })
   const agentsRoute = createRoute({

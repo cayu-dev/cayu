@@ -23,7 +23,7 @@ import { useSpecialists, useTaskTypes } from "../app/queries"
 import { useApi, useServices } from "../app/services"
 import { useSessionActionGuard } from "../app/session-action-guard"
 import { TaskOperation } from "../app/task-operation"
-import { ErrorState, sessionPath, taskPath, useGo } from "./common"
+import { ErrorState, sessionRoute, taskRoute, useGo } from "./common"
 
 const taskOperations = new WeakMap<Api, TaskOperation>()
 
@@ -157,7 +157,7 @@ function StartSessionForm({ onClose, initialMode, onPendingChange }: StartSessio
   const missing = fields?.filter((f) => f.required && !(values[f.name] ?? "").trim()) ?? []
 
   // A new session opens; a new task opens its task page, where its session shows up.
-  const done = (path: string) => {
+  const done = (path: ReturnType<typeof sessionRoute | typeof taskRoute>) => {
     if (!mounted.current || router.state.location.pathname !== origin) return
     void queryClient.invalidateQueries({ queryKey: ["sessions"] })
     void queryClient.invalidateQueries({ queryKey: ["session-list"] })
@@ -191,7 +191,7 @@ function StartSessionForm({ onClose, initialMode, onPendingChange }: StartSessio
         if (result.snapshot && !["terminal", "runtime_failed"].includes(result.snapshot.phase))
           return null
         if (!result.session_id) throw new Error("The runtime did not return a session identity.")
-        return sessionPath(result.session_id)
+        return sessionRoute(result.session_id)
       }
       const input = fields
         ? inputFrom(fields, values)
@@ -201,7 +201,7 @@ function StartSessionForm({ onClose, initialMode, onPendingChange }: StartSessio
       await taskOperation.submit({ type: typeName, input })
       if (!mounted.current) return null
       if (taskOperation.state.phase === "succeeded") {
-        const path = taskPath(taskOperation.state.taskId!)
+        const path = taskRoute(taskOperation.state.taskId!)
         taskOperation.clear()
         return path
       }
@@ -251,7 +251,7 @@ function StartSessionForm({ onClose, initialMode, onPendingChange }: StartSessio
             onClick={() => {
               const id = taskSnapshot.taskId!
               taskOperation.clear()
-              done(taskPath(id))
+              done(taskRoute(id))
             }}
           >
             Open created task
@@ -496,7 +496,7 @@ function StartSessionForm({ onClose, initialMode, onPendingChange }: StartSessio
                     if (!mounted.current || router.state.location.pathname !== origin) return
                     setSnapshot(next)
                     if (["terminal", "runtime_failed"].includes(next.phase) && next.sessionId)
-                      done(sessionPath(next.sessionId))
+                      done(sessionRoute(next.sessionId))
                   })
                   .catch(setObservationError)
                   .finally(() => setRetrying(false))

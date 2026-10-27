@@ -10,7 +10,7 @@ import { useKeptKnowledge } from "../app/knowledge-query"
 import { useInbox } from "../app/queries"
 import { useApi, useNow, useServices } from "../app/services"
 import { relativeTime } from "../app/session-model"
-import { EmptyState, ErrorState, NavLink, PageBody, sessionPath, TopBar } from "./common"
+import { EmptyState, ErrorState, NavLink, PageBody, sessionRoute, TopBar } from "./common"
 import { InboxCard } from "./session/inbox-card"
 
 export function KnowledgePage({
@@ -169,7 +169,9 @@ function Reviews() {
         <p role="status" key={JSON.stringify(issue)} className="break-words text-sm text-warning">
           {issue.detail}{" "}
           {issue.session_id ? (
-            <NavLink to={sessionPath(issue.session_id)}>Inspect session {issue.session_id}</NavLink>
+            <NavLink {...sessionRoute(issue.session_id)}>
+              Inspect session {issue.session_id}
+            </NavLink>
           ) : null}
         </p>
       ))}
@@ -248,7 +250,7 @@ function Entry({ entry }: { entry: ApiKeptKnowledgeItem }) {
         </span>
         {entry.source_session_id && (
           <NavLink
-            to={sessionPath(entry.source_session_id)}
+            {...sessionRoute(entry.source_session_id)}
             className="min-w-0 break-all hover:underline"
           >
             from {entry.source_session_id}
