@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from cayu._import_migration import import_replacement, replacement_import
+from cayu.cli._task_retry_checks import task_retry_policy_diagnostics
 from cayu.cli.scaffold_convention import local_database_path
 from cayu.cli.scaffold_plan import (
     ApplicationPlan,
@@ -120,6 +121,10 @@ def check_declared_scaffold_source(
     """Check declared source structure without importing project code."""
 
     diagnostics, _ = _source_diagnostics(root)
+    diagnostics = (
+        *diagnostics,
+        *task_retry_policy_diagnostics(root, _application_module_paths(root)),
+    )
     return _filter(diagnostics, tags=tags, deploy_only=deploy_only)
 
 
@@ -228,6 +233,7 @@ def check_declared_scaffold(
 
     source_diagnostics, declared = _source_diagnostics(root)
     diagnostics = list(source_diagnostics)
+    diagnostics.extend(task_retry_policy_diagnostics(root, _application_module_paths(root)))
     if declared:
         diagnostics.extend(_check_registration_provenance(manifest))
         diagnostics.extend(check_scaffold_capabilities(root, manifest))

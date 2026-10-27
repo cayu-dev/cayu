@@ -957,7 +957,7 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
     assert main(["guide", "long-running"]) == 0
     guide = capsys.readouterr().out
     snippets = re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
-    assert len(snippets) == 8
+    assert len(snippets) == 9
     namespace: dict[str, Any] = {}
     for snippet in snippets:
         exec(compile(snippet, "long-running", "exec"), namespace)
@@ -1374,3 +1374,41 @@ def test_guide_echo_tools_enforce_bounds_before_effects(
         result = asyncio.run(tool.run(context, {field: text}))
         assert not result.is_error
         assert tool_result_payload_bytes(result) <= tool.spec.max_terminal_payload_bytes
+
+
+def test_long_running_event_retry_example_settles_successfully(capsys):
+    from cayu import CayuApp
+    from cayu.tasks import TaskStatus
+    from cayu.tasks.memory import InMemoryTaskStore
+
+    assert main(["guide", "long-running"]) == 0
+    guide = capsys.readouterr().out
+    section = guide.split("## Event retry policy", 1)[1].split("## Time limit", 1)[0]
+    snippet = re.search(r"```python\n(.*?)```", section, re.DOTALL)
+    assert snippet is not None
+    namespace: dict[str, Any] = {}
+    exec(compile(snippet.group(1), "event-retry-example", "exec"), namespace)
+
+    async def scenario():
+        store = InMemoryTaskStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await namespace["submit_event"](
+            app,
+            "one",
+            {"message": "hello"},
+            max_attempts=2,
+            deadline_seconds=30,
+        )
+        deliveries = []
+
+        async def deliver(request, *, event_id):
+            deliveries.append((event_id, request))
+            return {"delivered": True}
+
+        await namespace["run_event_jobs"](app, deliver, max_tasks=1)
+        task = await store.load_task("delivery-event-one")
+        assert task.status is TaskStatus.COMPLETED
+        assert task.result == {"delivered": True}
+        assert deliveries == [("one", {"message": "hello"})]
+
+    asyncio.run(scenario())

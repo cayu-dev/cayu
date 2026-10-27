@@ -21,6 +21,17 @@ Installed packages also report replacement imports when a removed name is
 accessed directly. These known removed routes raise `ImportError`; unknown
 attributes retain `AttributeError`. No removed route loads its former object.
 
+## task-event-retry-policy-undeclared
+
+`TASK_EVENT_RETRY_POLICY_UNDECLARED` is an advisory source finding: a worker
+sets `execution_timeout_s`, while a `TaskCreate` for the same literal type has
+neither `retry_policy` nor `retry_key`. A task timeout cannot stop a sweeper
+from creating a new task for the event. Choose an event policy from the
+application's requirements; see `cayu guide long-running#event-retry-policy`.
+The check does not infer event identity, require a particular deadline, or
+change runtime behavior. Dynamic calls and policies passed through `**kwargs`
+are not analyzed. A creation that is never retried needs no event budget.
+
 ## app-no-agents
 
 `APP_NO_AGENTS` means the factory returned an app with no registered specialist.

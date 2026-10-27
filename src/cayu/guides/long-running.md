@@ -148,6 +148,73 @@ deadline. The handler checks the action and the session's status before acting;
 the preset's `operations/timers.py` runs as `cayu worker timers`.
 Deep guide: [task scheduling](https://github.com/cayu-dev/cayu/blob/main/docs/task-scheduling.md).
 
+## Event retry policy
+
+Choose the event's completion contract before setting timeouts. A service that
+must eventually deliver a result may intentionally retry for hours or days.
+A service with a deadline must instead expose a terminal failure when it gives
+up. Cayu does not infer event identity from equal inputs or impose a universal
+event deadline. Two identical jobs can be independent work.
+
+Prefer submitting an event once and letting `TaskRetryPolicy` own its failed
+attempts. Its elapsed budget spans the retry series and the worker enforces it
+on the active handler. Pick both limits from the application's requirements:
+
+```python
+from cayu.tasks import (
+    TaskCreate, TaskQuery, TaskRetryPolicy, TaskRetryAttemptReport,
+    TaskRetryAttemptDisposition, run_task_worker,
+)
+
+
+async def submit_event(app, event_id, request, *, max_attempts, deadline_seconds):
+    return await app.create_task(TaskCreate(
+        task_id=f"delivery-event-{event_id}", type="event-delivery",
+        input={"request": request, "event_id": event_id},
+        retry_policy=TaskRetryPolicy(
+            max_attempts=max_attempts, max_elapsed_seconds=float(deadline_seconds),
+        ),
+    ))
+
+
+async def run_event_jobs(app, deliver, *, max_tasks=None):
+    async def handle_event(app, task, worker_id):
+        result = await deliver(task.input["request"], event_id=task.input["event_id"])
+        return TaskRetryAttemptReport(
+            idempotency_key=f"delivered-{task.id}",
+            disposition=TaskRetryAttemptDisposition.SUCCEEDED,
+            result=result,
+        )
+
+    await run_task_worker(
+        app, app.task_store, handle_event, worker_id="deliveries",
+        query=TaskQuery(type="event-delivery"), max_tasks=max_tasks,
+    )
+```
+
+Supply an async `deliver(request, *, event_id)` that returns a JSON object and
+uses the stable event ID to make external effects idempotent. This retry-series
+worker returns `TaskRetryAttemptReport`; it must not call `complete_managed_task`
+like the ordinary invoice worker below. Classify expected retryable failures
+with a retryable report; unexpected exceptions follow the worker's classification.
+
+Retain the event-to-task identity durably and inspect that task's retry series;
+do not have a sweeper create a new root after the series has given up. Handlers
+must report failed attempts through the task retry APIs (or let the worker
+handle their exceptions), not complete failed work as successful.
+
+If the application needs to own resubmission, pass a stable `retry_key` and an
+explicit `TaskRetryBudget` on every submission. That budget only decides whether
+another task may be created: its elapsed limit does not cancel an already-running
+handler. Carry the event's remaining execution deadline into attempts as well.
+`TaskRetryBudget.unlimited()` explicitly opts out of admission limits for an
+event that must keep retrying. A handler timeout alone does not bound resubmission.
+
+`cayu check` warns with `TASK_EVENT_RETRY_POLICY_UNDECLARED` when source declares
+a bounded worker and unkeyed, policy-free task creation for the same literal
+task type. It is an advisory source check, not proof that the application retries;
+dynamic declarations may not be visible. It changes no runtime policy.
+
 ## Time limit for worker runs
 
 ```python
