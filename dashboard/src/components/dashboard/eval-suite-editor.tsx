@@ -641,12 +641,8 @@ export function EvalSuiteEditor({
         if (evalTargetCatalogMayBeStale(launchError)) {
           await queryClient.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
         }
-        if (
-          launchError instanceof ApiClientError &&
-          evalLaunchFailureIsDefinitive(launchError.status)
-        ) {
-          settleLaunch(attempt)
-        }
+        // A later group can reject after earlier groups were admitted. Even a 4xx
+        // is not evidence that this complete multi-part operation had no effect.
         throw launchError
       }
       if (signal.aborted || !activeRef.current) return
@@ -983,6 +979,7 @@ export function EvalSuiteEditor({
                 checks={
                   <>
                     <EvalSuiteChecks
+                      targetKey={targetKey}
                       key={activeCaseRowKey}
                       assertions={activeCase.assertions}
                       target={target}

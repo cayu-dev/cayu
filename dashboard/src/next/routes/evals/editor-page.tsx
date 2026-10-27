@@ -60,14 +60,15 @@ function EditorPage() {
   const native = isNativeSuiteDetail(suite.data) ? suite.data : undefined
   const reported = isReportedSuiteDetail(suite.data)
   const identity = native?.suite.identity
-  const target = suiteId
-    ? identity?.target_key
-    : (search.target ?? targets.data?.default_target_key)
+  const [defaultTarget, setDefaultTarget] = useState<string>()
+  if (!defaultTarget && targets.data?.default_target_key)
+    setDefaultTarget(targets.data.default_target_key)
+  const target = suiteId ? identity?.target_key : (search.target ?? defaultTarget)
   const knownTarget = targets.data?.items.some((item) => item.target_key === target)
   const authored = !suiteId || identity?.source === "authored"
   const revision = suiteId && authored ? identity?.revision : undefined
   const scope =
-    target && knownTarget && authored && (!suiteId || revision)
+    target && authored && (!suiteId || revision)
       ? JSON.stringify([target, revision ?? null])
       : undefined
   const [owners, setOwners] = useState<DraftOwner[]>([])
@@ -75,7 +76,7 @@ function EditorPage() {
   const [scopeLocked, setScopeLocked] = useState(false)
   const [navigationLocked, setNavigationLocked] = useState(false)
   const [savedViews, setSavedViews] = useState<Record<string, string>>({})
-  if (scope && target && !owners.some((owner) => owner.scope === scope)) {
+  if (scope && target && knownTarget && !owners.some((owner) => owner.scope === scope)) {
     setOwners([...owners, { target, revision, scope }])
   }
   const hasUnsaved = Object.values(dirty).some(Boolean)

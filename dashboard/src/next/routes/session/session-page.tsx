@@ -19,6 +19,7 @@ import { ProviderOperationResolutionBanner } from "@/components/dashboard/provid
 import { TranscriptPart } from "@/components/dashboard/transcript-part"
 import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
+import { ApiClientError } from "@/lib/api"
 import { executeResolveProviderOperationMutation } from "@/lib/mutation-browser"
 import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
 import {
@@ -113,7 +114,7 @@ export function SessionPage({
   const origin = router.state.location.pathname
   const api = useApi()
   const viewer = useViewer()
-  const { canWrite: canAddEvals, readiness: evalReadiness } = useEvalAccess()
+  const { canWrite: canAddEvals } = useEvalAccess()
   const services = useServices()
   const canExecute =
     !!services.prototype || (viewer?.full_access === true && services.executionEnabled === true)
@@ -412,7 +413,13 @@ export function SessionPage({
     setProductionEvals(false)
   }, [sessionId])
 
-  if (detail.error) {
+  // Cached-data read failures must not destroy private Evals recovery owners.
+  // Explicit authorization loss still removes the protected page immediately.
+  if (
+    detail.error &&
+    (!detail.data ||
+      (detail.error instanceof ApiClientError && [401, 403].includes(detail.error.status)))
+  ) {
     return (
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <TopBar>Session</TopBar>
@@ -438,6 +445,7 @@ export function SessionPage({
     )
   }
 
+  const evalSourceStatus = detail.error ? "" : (detail.data?.status ?? "")
   const o = overview.data
   const title = detail.data
     ? sessionDisplayTitle(detail.data, o?.title, firstUser.data?.messages[0])
@@ -453,9 +461,9 @@ export function SessionPage({
     <div className="flex h-full min-h-0 min-w-0 flex-1">
       {!services.prototype && detail.data && (
         <SessionEvalAdditionDialog
-          key={`${sessionId}:${detail.data.status}`}
+          key={sessionId}
           sessionId={sessionId}
-          status={detail.data.status}
+          status={evalSourceStatus}
           open={productionEvals}
           onOpenChange={setProductionEvals}
         />
@@ -535,17 +543,15 @@ export function SessionPage({
               >
                 <PanelRight />
               </Button>
-              {!services.prototype &&
-                !canAddEvals &&
-                viewer?.full_access === true &&
-                evalReadiness.captured_evaluation.state === "ready" &&
-                finished && (
-                  <EvaluationPromotionAction
-                    compact
-                    sessionId={sessionId}
-                    status={detail.data?.status ?? ""}
-                  />
-                )}
+              {!services.prototype && viewer?.full_access === true && (
+                <EvaluationPromotionAction
+                  key={sessionId}
+                  compact
+                  triggerVisible={!canAddEvals}
+                  sessionId={sessionId}
+                  status={evalSourceStatus}
+                />
+              )}
               <ActionsMenu open={menuOpen} onOpenChange={setMenuOpen}>
                 {canExecute && (
                   <MenuItem
@@ -620,6 +626,19 @@ export function SessionPage({
           <p role="status" className="px-4 py-2 text-sm">
             An action is unconfirmed. Keep this session open to recover the original outcome.
           </p>
+        )}
+        {detail.error && (
+          <div className="px-4 py-2">
+            <ErrorState error={detail.error} />
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={detail.isFetching}
+              onClick={() => void detail.refetch()}
+            >
+              Retry session details
+            </Button>
+          </div>
         )}
         {!!progress.error && (
           <div role="status" className="px-4 py-2 text-sm">

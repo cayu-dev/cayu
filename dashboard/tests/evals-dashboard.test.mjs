@@ -4,7 +4,6 @@ import { QueryClient, QueryObserver } from "@tanstack/react-query"
 
 import {
   authoredSuiteEvalLaunchRequestIdentity,
-  capturedEvalLaunchRequestIdentity,
   createEvalIdempotencyKey,
   EVAL_RESULT_QUERY_RETENTION,
   EVAL_TARGET_QUERY_KEY,
@@ -14,7 +13,6 @@ import {
   evalComparisonReasonText,
   evalLaunchFailureIsDefinitive,
   evalLaunchNotice,
-  evalLaunchRequestIdentity,
   evalRunCanCancel,
   evalRunHasResult,
   evalRunIsActive,
@@ -219,16 +217,20 @@ test("eval launch idempotency keys use secure browser UUIDs", () => {
 
 test("eval launch retries reuse their key across page reloads until reconciled", () => {
   const storage = new MemoryStorage()
-  const identity = evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4, "sha256:profile")
+  const identity = scenarioEvalLaunchRequestIdentity(
+    "sha256:scenario",
+    "sha256:binding",
+    "sha256:profile",
+  )
   const originalKey = new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity)
 
   assert.equal(new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity), originalKey)
   assert.notEqual(
     identity,
-    evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4, "sha256:new-profile"),
+    scenarioEvalLaunchRequestIdentity("sha256:scenario", "sha256:binding", "sha256:new-profile"),
   )
 
-  new EvalLaunchIdempotencyRegistry(storage, "/api").resolve(identity)
+  new EvalLaunchIdempotencyRegistry(storage, "/api").resolve(identity, originalKey)
   assert.notEqual(new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity), originalKey)
 })
 
@@ -283,50 +285,20 @@ test("authored suite retry identity binds the suite, selection, exposure, and pr
   )
 })
 
-test("captured eval retry identities include every execution contraction", () => {
-  const request = {
-    trial_request: { trials: 1, timeout_seconds: 45 },
-    max_concurrency: 1,
-    max_steps: 8,
-    limits: {
-      max_input_tokens: 100,
-      max_output_tokens: 200,
-      max_total_tokens: 300,
-      max_tool_calls: 4,
-      max_elapsed_seconds: 30,
-      scope: "run",
-    },
-    cost_budget: { max_estimated_cost: "0.25", currency: "USD" },
-  }
-  const identity = capturedEvalLaunchRequestIdentity("session-1", "sha256:candidate", request)
-
-  assert.notEqual(
-    identity,
-    capturedEvalLaunchRequestIdentity("session-1", "sha256:candidate", {
-      ...request,
-      limits: { ...request.limits, scope: "session" },
-    }),
-  )
-  assert.notEqual(
-    identity,
-    capturedEvalLaunchRequestIdentity("session-1", "sha256:candidate", {
-      ...request,
-      cost_budget: { ...request.cost_budget, max_estimated_cost: "0.50" },
-    }),
-  )
-  assert.notEqual(identity, capturedEvalLaunchRequestIdentity("session-1", "sha256:other", request))
-})
-
 test("eval launch retries are isolated between API mounts on one origin", () => {
   const storage = new MemoryStorage()
-  const identity = evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4, "sha256:profile")
+  const identity = scenarioEvalLaunchRequestIdentity(
+    "sha256:scenario",
+    "sha256:binding",
+    "sha256:profile",
+  )
   const first = new EvalLaunchIdempotencyRegistry(storage, "/app-a/api")
   const second = new EvalLaunchIdempotencyRegistry(storage, "/app-b/api")
   const firstKey = first.keyFor(identity)
   const secondKey = second.keyFor(identity)
 
   assert.notEqual(firstKey, secondKey)
-  second.resolve(identity)
+  second.resolve(identity, secondKey)
   assert.equal(first.keyFor(identity), firstKey)
   assert.notEqual(second.keyFor(identity), secondKey)
 })
@@ -354,9 +326,9 @@ test("permanent launch rejections release their retry-state capacity", () => {
 
   for (let index = 0; index < 64; index += 1) {
     const identity = `permanently-rejected-request-${index}`
-    registry.keyFor(identity)
+    const key = registry.keyFor(identity)
     assert.equal(evalLaunchFailureIsDefinitive(index % 2 === 0 ? 405 : 501), true)
-    registry.resolve(identity)
+    registry.resolve(identity, key)
   }
 
   assert.equal(storage.getItem(evalLaunchRegistryKey("/api")), null)
@@ -499,4 +471,19 @@ test("eval comparison reasons remain specific and operator-readable", () => {
     evalComparisonReasonText("assertion_contract_mismatch"),
     "At least one assertion contract changed between runs.",
   )
+})
+
+test("late scenario settlement cannot clear a new intent after explicit abandonment", () => {
+  const storage = new MemoryStorage()
+  const oldOwner = new EvalLaunchIdempotencyRegistry(storage, "/api")
+  const identity = scenarioEvalLaunchRequestIdentity("scenario", "binding", "profile")
+  const oldKey = oldOwner.keyFor(identity)
+  oldOwner.resolve(identity, oldKey)
+  const newOwner = new EvalLaunchIdempotencyRegistry(storage, "/api")
+  const newKey = newOwner.keyFor(identity)
+  assert.notEqual(newKey, oldKey)
+  oldOwner.resolve(identity, oldKey)
+  assert.equal(newOwner.keyFor(identity), newKey)
+  newOwner.resolve(identity, newKey)
+  assert.notEqual(newOwner.keyFor(identity), newKey)
 })

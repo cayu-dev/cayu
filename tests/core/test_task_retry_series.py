@@ -79,6 +79,7 @@ def _retry_cancellation_reconciliation_request(
         TaskRetryCancellationReconciliationOutcome.QUIESCENT
     ),
     evidence_sha256: str = "a" * 64,
+    reconciliation_requested_at: datetime | None = None,
 ) -> TaskRetryCancellationReconciliationRequest:
     assert task.retry_series is not None
     assert task.worker_id is not None
@@ -90,7 +91,8 @@ def _retry_cancellation_reconciliation_request(
     assert isinstance(cancellation_event, dict)
     cancellation_requested_at = cancellation_event["occurred_at"]
     assert isinstance(cancellation_requested_at, str)
-    reconciliation_requested_at = datetime.now(UTC)
+    if reconciliation_requested_at is None:
+        reconciliation_requested_at = datetime.now(UTC)
     return TaskRetryCancellationReconciliationRequest(
         task_id=task.id,
         series_id=task.retry_series.series_id,
@@ -1063,7 +1065,7 @@ def test_task_retry_owner_lost_cancellation_reconciliation_is_fenced_and_idempot
     tmp_path: Path,
 ) -> None:
     async def run() -> None:
-        clock = _MutableClock(datetime.now(UTC))
+        clock = _MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
         store = (
             InMemoryTaskStore(clock=clock, ownership_clock=clock)
             if store_kind == "memory"
@@ -1087,7 +1089,11 @@ def test_task_retry_owner_lost_cancellation_reconciliation_is_fenced_and_idempot
             claimed = await store.claim_task("lost-worker", lease_seconds=1)
             assert claimed is not None
             requested = await store.cancel_task(claimed.id, {"code": "operator"})
-            request = _retry_cancellation_reconciliation_request(requested)
+            # Request evidence and store ownership share the same controlled clock;
+            # slow SQLite setup must not introduce a future wall-clock timestamp.
+            request = _retry_cancellation_reconciliation_request(
+                requested, reconciliation_requested_at=clock.value
+            )
 
             with pytest.raises(
                 TaskRetryCancellationReconciliationConflict,

@@ -33,6 +33,7 @@ import {
 import { dashboardConfig } from "@/lib/config"
 import { scenarioArtifactBindingsRequireMaterialization } from "@/lib/eval-suite-authoring"
 import {
+  confirmAbandonEvalRecovery,
   EVAL_TARGET_QUERY_KEY,
   EVAL_TARGET_STALE_TIME_MS,
   EvalLaunchIdempotencyRegistry,
@@ -352,6 +353,8 @@ export function ScenarioAuthoring({
   }
 
   const launch = () => {
+    if (disabled || pending !== null || controllerRef.current) return
+    const recovering = launchAttempt !== null
     let attempt = launchAttempt
     if (!attempt) {
       const binding = preview?.preflight.binding
@@ -405,16 +408,17 @@ export function ScenarioAuthoring({
           await queryClient.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
         }
         if (
+          !recovering &&
           launchError instanceof ApiClientError &&
           evalLaunchFailureIsDefinitive(launchError.status)
         ) {
-          registry.resolve(dispatched.identity)
+          registry.resolve(dispatched.identity, dispatched.key)
           setLaunchAttempt((current) => (current === dispatched ? null : current))
         }
         throw launchError
       }
       if (signal.aborted) return
-      registry.resolve(dispatched.identity)
+      registry.resolve(dispatched.identity, dispatched.key)
       setLaunchAttempt((current) => (current === dispatched ? null : current))
       setAcceptedSettings(settingsIdentity(settings))
       queryClient.setQueryData(["evals", "run", launched.spec.run_id], launched)
@@ -422,6 +426,25 @@ export function ScenarioAuthoring({
       onLaunched?.(launched.spec.run_id)
       await queryClient.invalidateQueries({ queryKey: ["evals", "runs"] })
     })
+  }
+
+  const abandonLaunch = () => {
+    const attempt = launchAttempt
+    const registry = launchRegistryRef.current
+    if (!attempt || !registry || pending !== null || controllerRef.current) return
+    if (!confirmAbandonEvalRecovery("scenario launch")) return
+    try {
+      registry.resolve(attempt.identity, attempt.key)
+      setLaunchAttempt((current) => (current === attempt ? null : current))
+      setPreview(null)
+      setPreviewIdentity(null)
+      setError(null)
+      setNotice(
+        "Local launch recovery abandoned. Your draft and settings are kept; check readiness before starting new work.",
+      )
+    } catch (error) {
+      setError(evalErrorMessage(error, "Could not release local scenario recovery."))
+    }
   }
 
   const prepareArtifact = (requirementId: string) => {
@@ -851,7 +874,23 @@ export function ScenarioAuthoring({
             {notice}
           </div>
         )}
+        {unresolvedLaunch && (
+          <p role="status" className="text-sm text-muted-foreground">
+            This launch is unconfirmed. Run scenario retries its exact request; abandoning recovery
+            keeps your draft but does not cancel server work.
+          </p>
+        )}
         <div className="flex flex-wrap justify-end gap-2">
+          {unresolvedLaunch && (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={pending !== null}
+              onClick={abandonLaunch}
+            >
+              Abandon scenario recovery
+            </Button>
+          )}
           <Button
             type="button"
             variant="outline"

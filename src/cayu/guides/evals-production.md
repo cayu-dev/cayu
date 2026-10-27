@@ -57,6 +57,14 @@ environment, policies, and limits. A readiness message that names a missing
 tool, environment, secret, fixture, approval path, or evidence field is a real
 current dependency—not a request to fabricate it in the browser.
 
+If the launch response is lost, **Retry exact launch** sends the original evidence,
+execution profile, limits, budget and operation key. Catalog updates do not turn
+that retry into a different launch. The private request remains in this open
+workbench; it is not stored in the URL or browser storage. Closing, navigating
+away or previewing different evidence requires explicitly abandoning its recovery
+once the request is no longer pending. Abandoning is not cancellation, and the
+original work may already be running. Reloading cannot restore private evidence.
+
 ## Build a controlled multi-stage scenario
 
 Use **Production scenario** from a captured session, or choose **Multi-stage
@@ -83,7 +91,12 @@ effects, evidence policy, limits, trials, concurrency, timeout, and cost bound.
 Prepare retained artifacts only through the displayed server-owned **Prepare
 fixture** action. **Run scenario** admits that exact reviewed binding. If its
 response is lost, retry **Run scenario** here before switching tools; the original
-request identity is retained. Closing the browser does not cancel server work.
+request identity is retained. If recovery remains unavailable, **Abandon scenario
+recovery** releases only this tab's recovery handle after confirmation. It keeps
+your draft and settings and requires a fresh readiness check before a new run.
+It does not cancel or erase accepted server work; a new run can duplicate that
+work. Abandonment is unavailable while a request is in flight. Closing the
+browser does not cancel server work.
 
 During execution, the run page shows queued, running, awaiting-input,
 awaiting-approval, cancelling, and terminal trial phases. Approve or deny only

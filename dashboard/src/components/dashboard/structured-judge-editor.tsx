@@ -20,6 +20,7 @@ import {
   validateJudgeCalibrationDraft,
 } from "@/lib/eval-judge-authoring"
 import {
+  confirmAbandonEvalRecovery,
   evalErrorMessage,
   evalLaunchFailureIsDefinitive,
   shortEvalIdentity,
@@ -37,6 +38,7 @@ const SELECT_CLASS =
 
 export function StructuredJudgeEditor({
   assertion,
+  targetKey,
   target,
   reviewedAssertion,
   defaultTask,
@@ -48,6 +50,7 @@ export function StructuredJudgeEditor({
   onCalibrationStateChange,
 }: {
   assertion: StructuredModelJudgeAssertionDraftV1
+  targetKey: string
   target: EvalTargetCatalogEntry | undefined
   reviewedAssertion: StructuredModelJudgeAssertionSpec | null
   defaultTask: string
@@ -469,7 +472,8 @@ export function StructuredJudgeEditor({
         )}
 
         <JudgeCalibrationPanel
-          targetKey={target?.target_key ?? ""}
+          targetKey={targetKey}
+          freshDisabled={!target}
           assertion={reviewedAssertion}
           defaultTask={defaultTask}
           disabled={calibrationDisabled}
@@ -488,12 +492,14 @@ export function JudgeCalibrationPanel({
   defaultTask,
   disabled,
   onStateChange,
+  freshDisabled = false,
 }: {
   targetKey: string
   assertion: StructuredModelJudgeAssertionSpec | null
   defaultTask: string
   disabled: boolean
   onStateChange?: (state: CalibrationState) => void
+  freshDisabled?: boolean
 }) {
   const fieldPrefix = useId()
   const [draft, setDraft] = useState<EvalJudgeCalibrationDraftV1 | null>(null)
@@ -564,7 +570,7 @@ export function JudgeCalibrationPanel({
   }
 
   const check = () => {
-    if (!draft || pending || unresolved) return
+    if (disabled || freshDisabled || !draft || pending || unresolved) return
     try {
       validateJudgeCalibrationDraft(draft)
     } catch (validationError) {
@@ -584,7 +590,16 @@ export function JudgeCalibrationPanel({
   }
 
   const run = () => {
-    if (!previewCurrent || !preview?.ready || !runId || pending) return
+    if (
+      disabled ||
+      (freshDisabled && !unresolved) ||
+      !previewCurrent ||
+      !preview?.ready ||
+      !runId ||
+      pending
+    )
+      return
+    const recovering = unresolved
     setUnresolved(true)
     void runAction("run", async (signal) => {
       let result: Awaited<ReturnType<typeof runEvalJudgeCalibration>>
@@ -600,6 +615,7 @@ export function JudgeCalibrationPanel({
       } catch (error) {
         if (
           !signal.aborted &&
+          !recovering &&
           error instanceof ApiClientError &&
           evalLaunchFailureIsDefinitive(error.status)
         )
@@ -612,6 +628,18 @@ export function JudgeCalibrationPanel({
         setTouched(false)
       }
     })
+  }
+
+  const abandonRun = () => {
+    if (!unresolved || pending !== null || controllerRef.current) return
+    if (!confirmAbandonEvalRecovery("calibration run")) return
+    setUnresolved(false)
+    setPreview(null)
+    setPreviewIdentity(null)
+    setRunId("")
+    setReport(null)
+    setError(null)
+    // The private draft remains owned until separately saved or discarded.
   }
 
   if (!assertion || !draft) {
@@ -741,7 +769,8 @@ export function JudgeCalibrationPanel({
       </div>
       {unresolved && (
         <p role="status" className="text-xs">
-          The calibration outcome is unconfirmed. Retry this exact run before editing or leaving.
+          The calibration outcome is unconfirmed. Retry this exact run or deliberately abandon its
+          local recovery. Abandoning keeps your draft and does not cancel server work.
         </p>
       )}
       {touched && (
@@ -750,6 +779,17 @@ export function JudgeCalibrationPanel({
         </p>
       )}
       <div className="flex flex-wrap gap-2">
+        {unresolved && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={pending !== null}
+            onClick={abandonRun}
+          >
+            Abandon calibration recovery
+          </Button>
+        )}
         <Button
           type="button"
           size="sm"
@@ -771,7 +811,7 @@ export function JudgeCalibrationPanel({
           type="button"
           size="sm"
           variant="outline"
-          disabled={disabled || pending !== null || unresolved}
+          disabled={disabled || freshDisabled || pending !== null || unresolved}
           onClick={check}
         >
           <CheckCircle2 /> {pending === "preview" ? "Checking..." : "Check calibration"}
@@ -779,7 +819,13 @@ export function JudgeCalibrationPanel({
         <Button
           type="button"
           size="sm"
-          disabled={disabled || pending !== null || !previewCurrent || !preview?.ready}
+          disabled={
+            disabled ||
+            (freshDisabled && !unresolved) ||
+            pending !== null ||
+            !previewCurrent ||
+            !preview?.ready
+          }
           onClick={run}
         >
           <FlaskConical /> {pending === "run" ? "Running judge..." : "Run calibration"}

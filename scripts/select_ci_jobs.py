@@ -77,6 +77,7 @@ _RELEASE_EXACT_PATHS = {
     "examples/dashboard_behavior_live.py",
     "examples/dashboard_eval_authoring.py",
     "examples/dashboard_eval_settings.py",
+    "examples/dashboard_eval_recovery.py",
     "examples/fixtures/dashboard-memory-report-request.json",
     "examples/dashboard_eval_boundaries.py",
     "examples/dashboard_eval_editor_layout.py",

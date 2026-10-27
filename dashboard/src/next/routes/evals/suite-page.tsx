@@ -4,13 +4,17 @@ import { Download, Play } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import { EvalSuiteAuthoringAction } from "@/components/dashboard/eval-suite-authoring"
 import { Button } from "@/components/ui/button"
-import { ApiClientError, createEvalRun, downloadEvalCorpus, fetchEvalTargets } from "@/lib/api"
+import { createEvalRun, downloadEvalCorpus, fetchEvalTargets } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
 import {
+  type CorpusLaunchAttempt,
+  clearCorpusLaunchAttempt,
+  readCorpusLaunchAttempt,
+  saveCorpusLaunchAttempt,
+} from "@/lib/eval-corpus-launch-attempt"
+import {
+  createEvalIdempotencyKey,
   EVAL_TARGET_QUERY_KEY,
-  EvalLaunchIdempotencyRegistry,
-  evalLaunchFailureIsDefinitive,
-  evalLaunchRequestIdentity,
   evalTargetCatalogMayBeStale,
 } from "@/lib/evals-dashboard"
 import { fetchSuiteView } from "../../api/eval-views"
@@ -55,7 +59,28 @@ export function EvalSuiteViewPage() {
       alive.current = false
     }
   }, [])
-  const registry = useRef<EvalLaunchIdempotencyRegistry | null>(null)
+  const [recovery, setRecovery] = useState<{
+    suite: string
+    attempt: CorpusLaunchAttempt | null
+    error: Error | null
+  } | null>(null)
+  useEffect(() => {
+    if (!canWrite) return
+    try {
+      const attempt = readCorpusLaunchAttempt(
+        window.sessionStorage,
+        dashboardConfig.apiBaseUrl,
+        suiteId,
+      )
+      setRecovery({ suite: suiteId, attempt, error: null })
+      if (attempt) setConcurrency(String(attempt.request.max_concurrency))
+    } catch (error) {
+      setRecovery({ suite: suiteId, attempt: null, error: error as Error })
+    }
+  }, [canWrite, suiteId])
+  const recoveryReady = recovery?.suite === suiteId
+  const retained = recoveryReady ? recovery.attempt : null
+  const recoveryError = recoveryReady ? recovery.error : null
   const query = useQuery({
     queryKey: ["evals", "suite-view", suiteId, casesCursor, runsCursor],
     queryFn: ({ signal }) =>
@@ -78,45 +103,54 @@ export function EvalSuiteViewPage() {
     parsedConcurrency <= (target?.max_concurrency ?? 1)
   const launch = useMutation({
     mutationFn: async () => {
-      if (
-        !canWrite ||
-        !validConcurrency ||
-        !s ||
-        s.source !== "corpus" ||
-        !s.identity.suite_id ||
-        !target?.execution_profile_ready ||
-        !target.execution_profile
-      )
-        throw new Error(
-          "The current execution profile is unavailable. Refresh settings before launching.",
+      if (!canWrite || !recoveryReady || recoveryError)
+        throw new Error("Launch recovery is unavailable.")
+      // Recovery owns the original envelope; current metadata only prepares a new intent.
+      let attempt = retained
+      if (!attempt) {
+        if (
+          !validConcurrency ||
+          !s ||
+          s.source !== "corpus" ||
+          !s.identity.suite_id ||
+          !target?.execution_profile_ready ||
+          !target.execution_profile ||
+          readiness.fresh_launch.state !== "ready"
         )
-      const identity = evalLaunchRequestIdentity(
-        s.identity.revision,
-        s.identity.suite_id,
-        parsedConcurrency,
-        target.execution_profile.revision,
-      )
-      const owned =
-        registry.current ??
-        new EvalLaunchIdempotencyRegistry(window.sessionStorage, dashboardConfig.apiBaseUrl)
-      registry.current = owned
-      try {
-        const run = await createEvalRun(
-          {
+          throw new Error(
+            "The current execution profile is unavailable. Refresh settings before launching.",
+          )
+        attempt = {
+          key: createEvalIdempotencyKey(),
+          request: {
             corpus_revision: s.identity.revision,
             suite_id: s.identity.suite_id,
             max_concurrency: parsedConcurrency,
             expected_execution_profile_revision: target.execution_profile.revision,
           },
-          owned.keyFor(identity),
+        }
+        saveCorpusLaunchAttempt(window.sessionStorage, dashboardConfig.apiBaseUrl, suiteId, attempt)
+        setRecovery({ suite: suiteId, attempt, error: null })
+      }
+      try {
+        const run = await createEvalRun(attempt.request, attempt.key)
+        if (
+          clearCorpusLaunchAttempt(
+            window.sessionStorage,
+            dashboardConfig.apiBaseUrl,
+            suiteId,
+            attempt,
+          )
         )
-        owned.resolve(identity)
+          setRecovery((current) =>
+            current?.attempt?.key === attempt.key
+              ? { suite: suiteId, attempt: null, error: null }
+              : current,
+          )
         return run.spec.run_id
       } catch (error) {
         if (evalTargetCatalogMayBeStale(error))
           void client.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
-        if (error instanceof ApiClientError && evalLaunchFailureIsDefinitive(error.status))
-          owned.resolve(identity)
         throw error
       }
     },
@@ -164,14 +198,17 @@ export function EvalSuiteViewPage() {
                   size="sm"
                   disabled={
                     launch.isPending ||
-                    !validConcurrency ||
-                    !target?.execution_profile_ready ||
-                    readiness.fresh_launch.state !== "ready"
+                    !recoveryReady ||
+                    !!recoveryError ||
+                    (!retained &&
+                      (!validConcurrency ||
+                        !target?.execution_profile_ready ||
+                        readiness.fresh_launch.state !== "ready"))
                   }
                   onClick={() => launch.mutate()}
                 >
                   <Play />
-                  {launch.isPending ? "Starting…" : "Run suite"}
+                  {launch.isPending ? "Starting…" : retained ? "Retry exact launch" : "Run suite"}
                 </Button>
               ))}
             <ActionsMenu open={toolsOpen} onOpenChange={setToolsOpen}>
@@ -204,6 +241,47 @@ export function EvalSuiteViewPage() {
       </TopBar>
       <PageBody width="max-w-5xl">
         <LoadState error={query.error} pending={query.isPending} retry={query.refetch} />
+        {canWrite && recoveryError && <p role="alert">{recoveryError.message}</p>}
+        {canWrite && retained && (
+          <section
+            aria-label="Unconfirmed launch"
+            className="space-y-2 rounded-xl border border-border p-4 text-sm"
+          >
+            <p>
+              The previous launch may already be running. Retry its exact request to recover the
+              result.
+            </p>
+            <p>
+              Concurrency: {retained.request.max_concurrency}. The original execution profile is
+              retained.
+            </p>
+            <Button
+              variant="outline"
+              disabled={launch.isPending}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    "The previous run may already be executing. Abandon its recovery and review a separate new launch?",
+                  )
+                )
+                  return
+                if (
+                  clearCorpusLaunchAttempt(
+                    window.sessionStorage,
+                    dashboardConfig.apiBaseUrl,
+                    suiteId,
+                    retained,
+                  )
+                ) {
+                  setRecovery({ suite: suiteId, attempt: null, error: null })
+                  launch.reset()
+                }
+              }}
+            >
+              Abandon launch recovery
+            </Button>
+          </section>
+        )}
         {s && detail && (
           <>
             <h1 className="text-xl font-semibold break-words">{s.name}</h1>
@@ -318,6 +396,7 @@ export function EvalSuiteViewPage() {
                       min={1}
                       max={target?.max_concurrency ?? 1}
                       value={concurrency}
+                      disabled={!!retained || !!recoveryError || launch.isPending}
                       onChange={(e) => setConcurrency(e.target.value)}
                       className={`${FIELD_CLASS} w-24`}
                     />

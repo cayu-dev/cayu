@@ -67,6 +67,14 @@ case and trial before trusting the aggregate status.
   case ID and content remain unchanged.
 - Saving does not run the specialist. If the save response is lost, use **Retry
   exact save** to confirm the original revision before editing again.
+- If a launch response fails or disappears, choose **Retry exact launch**. The
+  dashboard retains the original request and operation key, including the selected
+  cases, reviewed profiles, exposure and budget. A multi-group authored launch can
+  accept earlier groups before rejecting a later group, even with a validation
+  error. Retrying the original operation recovers accepted groups without starting
+  them again. Corpus launch recovery also survives reloading this tab.
+- **Abandon launch recovery** is an explicit new intent, not cancellation: the
+  previous work may already be running. Check existing runs before abandoning it.
 - A repeated-trial policy retains every outcome. Required passes are not a way
   to hide evaluator errors or unavailable evidence; those still fail closed.
 

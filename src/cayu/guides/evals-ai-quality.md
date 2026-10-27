@@ -100,6 +100,18 @@ retry it here before switching checks or leaving the tool; the retry keeps its
 original run identity. After a report arrives, it remains visible until you
 choose another check or leave. **Discard calibration** clears edited fixed
 evidence; private evidence is not stored in the URL or browser storage.
+A catalog refresh that temporarily hides the specialist preserves this workbench
+and its exact unresolved request. New calibration work waits for the specialist
+to become available; an exact retry remains subject to server authorization and
+readiness. Keep this tab open: private calibration drafts do not survive reload.
+
+If an uncertain calibration cannot be recovered, **Abandon calibration recovery**
+releases its local run identity after confirmation. Your private draft remains;
+**Discard calibration** is a separate choice that removes it. Check calibration
+again before intentionally starting a new run. Abandoning does not cancel or
+erase server work and can allow duplicate paid calls; it is unavailable while a
+request is in flight.
+
 
 Use clearly good, clearly bad, and difficult boundary examples. If repeated
 judge scores move materially on identical evidence, refine the rubric or use a

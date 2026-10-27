@@ -1,4 +1,4 @@
-import type { CapturedEvaluationLaunch, EvalRun, EvalStatus } from "./api.ts"
+import type { EvalRun, EvalStatus } from "./api.ts"
 import { formatCurrencyWithCode } from "./format.ts"
 import type {
   CorpusComparisonReason,
@@ -66,6 +66,12 @@ export function createEvalIdempotencyKey(): string {
   return `cayu-dashboard-${crypto.randomUUID()}`
 }
 
+export function confirmAbandonEvalRecovery(operation: "scenario launch" | "calibration run") {
+  return window.confirm(
+    `Abandon local recovery for this ${operation}? Your draft and settings will be kept. This does not cancel or erase server work, which may already have been accepted. Starting a new run can duplicate that work.`,
+  )
+}
+
 export function evalLaunchFailureIsDefinitive(status: number): boolean {
   return (
     (status >= 400 && status < 500 && !AMBIGUOUS_EVAL_LAUNCH_FAILURE_STATUSES.has(status)) ||
@@ -130,9 +136,11 @@ export class EvalLaunchIdempotencyRegistry {
     return key
   }
 
-  resolve(requestIdentity: string): void {
+  resolve(requestIdentity: string, expectedKey: string): void {
     const document = this.#read()
-    const entries = document.entries.filter(([identity]) => identity !== requestIdentity)
+    const entries = document.entries.filter(
+      ([identity, key]) => identity !== requestIdentity || key !== expectedKey,
+    )
     if (entries.length === document.entries.length) return
     if (entries.length === 0) {
       this.#remove()
@@ -209,21 +217,6 @@ export class EvalLaunchIdempotencyRegistry {
   }
 }
 
-export function evalLaunchRequestIdentity(
-  corpusRevision: string,
-  suiteId: string,
-  maxConcurrency: number,
-  executionProfileRevision: string,
-): string {
-  return JSON.stringify([
-    "corpus-v2",
-    corpusRevision,
-    suiteId,
-    maxConcurrency,
-    executionProfileRevision,
-  ])
-}
-
 export function scenarioEvalLaunchRequestIdentity(
   scenarioRevision: string,
   bindingRevision: string,
@@ -252,31 +245,6 @@ export function authoredSuiteEvalLaunchRequestIdentity(
     selectionRevision,
     exposureRevision,
     executionProfiles,
-  ])
-}
-
-export function capturedEvalLaunchRequestIdentity(
-  sessionId: string,
-  candidateRevision: string,
-  request: Omit<CapturedEvaluationLaunch, "candidate" | "expected_candidate_revision">,
-): string {
-  return JSON.stringify([
-    "captured-v1",
-    sessionId,
-    candidateRevision,
-    request.expected_execution_profile_revision,
-    request.trial_request?.trials ?? 1,
-    request.trial_request?.timeout_seconds ?? 300,
-    request.max_concurrency ?? 1,
-    request.max_steps ?? null,
-    request.limits?.max_input_tokens ?? null,
-    request.limits?.max_output_tokens ?? null,
-    request.limits?.max_total_tokens ?? null,
-    request.limits?.max_tool_calls ?? null,
-    request.limits?.max_elapsed_seconds ?? null,
-    request.limits?.scope ?? null,
-    request.cost_budget?.max_estimated_cost ?? null,
-    request.cost_budget?.currency ?? null,
   ])
 }
 

@@ -107,6 +107,7 @@ async def exercise_eval_authoring(flow: str = "all") -> None:
             page.on("pageerror", lambda error: errors.append(str(error)))
             expected_aborts: list[str] = []
             expected_console: list[str] = []
+            expected_http: list[tuple[str, int]] = []
 
             def console(message):
                 if message.type != "error":
@@ -117,6 +118,11 @@ async def exercise_eval_authoring(flow: str = "all") -> None:
                     and "403" in message.text
                 ):
                     return  # This fixture deliberately has no session message access policy.
+                if any(
+                    url == expected_url and str(status) in message.text
+                    for expected_url, status in expected_http
+                ):
+                    return
                 if url in expected_console and "net::ERR_CONNECTION_RESET" in message.text:
                     expected_console.remove(url)
                 else:
@@ -145,6 +151,7 @@ async def exercise_eval_authoring(flow: str = "all") -> None:
                 lambda response: (
                     errors.append(f"HTTP {response.status}: {response.url}")
                     if response.status >= 400
+                    and (response.url, response.status) not in expected_http
                     and not (
                         response.status == 403
                         and re.search(r"/api/sessions/[^/]+/messages(?:\?|$)", response.url)
@@ -174,14 +181,90 @@ async def exercise_eval_authoring(flow: str = "all") -> None:
                 )
                 if flow in {"all", "calibration"}:
                     await _exercise_calibration(
-                        page, base, provider, expected_aborts, expected_console
+                        page, base, provider, expected_aborts, expected_console, expected_http
                     )
+                for rejection in (404, 409, 422):
+                    if flow in {
+                        "all",
+                        "recovery-abandon-sequence",
+                        f"calibration-abandon-{rejection}",
+                    }:
+                        await _exercise_calibration(
+                            page,
+                            base,
+                            provider,
+                            expected_aborts,
+                            expected_console,
+                            expected_http,
+                            abandon_status=rejection,
+                        )
+                    if flow in {
+                        "all",
+                        "recovery-abandon-sequence",
+                        f"scenario-abandon-{rejection}",
+                    }:
+                        from dashboard_eval_settings import _scenarios
+
+                        await _scenarios(
+                            page,
+                            base,
+                            provider,
+                            expected_aborts,
+                            expected_console,
+                            expected_http=expected_http,
+                            abandon_status=rejection,
+                        )
                 if flow in {"all", "navigation"}:
                     await _exercise_navigation_and_access(page, base)
                 if flow in {"all", "late"}:
                     await _exercise_late_launch(page, base, provider, expected_aborts)
                 if flow in {"all", "run"}:
                     await _exercise_reviewed_run(page, base, provider)
+                if flow in {"all", "recovery-corpus"}:
+                    from dashboard_eval_recovery import exercise_corpus_recovery
+
+                    await exercise_corpus_recovery(
+                        page, base, store, app, policy, expected_aborts, expected_console
+                    )
+                if flow in {"all", "recovery-captured"}:
+                    from dashboard_eval_recovery import exercise_captured_recovery
+
+                    await exercise_captured_recovery(page, base, expected_aborts, expected_console)
+                for lifetime in (
+                    "nested-status",
+                    "direct-status",
+                    "nested-error",
+                    "direct-error",
+                    "direct-authorization",
+                    "nested-abandon",
+                ):
+                    if flow in {"all", f"recovery-captured-{lifetime}"}:
+                        from dashboard_eval_recovery import exercise_captured_lifetime
+
+                        await exercise_captured_lifetime(
+                            page,
+                            base,
+                            _sessions,
+                            expected_aborts,
+                            expected_console,
+                            expected_http,
+                            lifetime,
+                        )
+                if flow in {"all", "recovery-scenario"}:
+                    from dashboard_eval_settings import _scenarios
+
+                    await _scenarios(
+                        page,
+                        base,
+                        provider,
+                        expected_aborts,
+                        expected_console,
+                        expected_http=expected_http,
+                    )
+                if flow in {"all", "recovery-authored"}:
+                    from dashboard_eval_recovery import exercise_authored_partial_recovery
+
+                    await exercise_authored_partial_recovery(page, base, store, app, expected_http)
                 assert not expected_aborts and not expected_console, (
                     expected_aborts,
                     expected_console,
@@ -450,7 +533,9 @@ async def _exercise_scenario(page, base):
     print("AUTHORING EMBEDDED SCENARIO OWNERSHIP PASS", flush=True)
 
 
-async def _exercise_calibration(page, base, provider, expected_aborts, expected_console):
+async def _exercise_calibration(
+    page, base, provider, expected_aborts, expected_console, expected_http, *, abandon_status=None
+):
     before = len(provider.requests)
     judges_before = len(provider.judge_requests)
     await page.goto(
@@ -525,8 +610,30 @@ async def _exercise_calibration(page, base, provider, expected_aborts, expected_
     try:
         await calibration.get_by_role("button", name="Run calibration", exact=True).click()
         await asyncio.wait_for(dispatched.wait(), 15)
+        abandon = calibration.get_by_role("button", name="Abandon calibration recovery", exact=True)
+        if abandon_status is not None and await abandon.count():
+            await expect(abandon).to_be_disabled()
         await expect(case_buttons.nth(1)).to_be_disabled()
         await expect(editor.get_by_test_id("authored-suite-name")).to_be_disabled()
+        # Catalog refresh must not discard the private paid calibration owner.
+        from dashboard_eval_settings import _refresh_targets
+
+        async def removed_target(route):
+            response = await route.fetch()
+            body = await response.json()
+            body.update(items=[], default_target_key=None)
+            await route.fulfill(response=response, json=body)
+
+        await page.route("**/api/evals/targets", removed_target)
+        await _refresh_targets(page)
+        await expect(
+            page.get_by_text("This specialist is not available.", exact=True)
+        ).to_be_visible()
+        await expect(calibration).to_be_visible()
+        await expect(output).to_have_value("dashboard authored evaluation output")
+        assert "dashboard authored evaluation output" not in await page.evaluate(
+            "JSON.stringify([sessionStorage, localStorage])"
+        )
         await page.get_by_role("link", name="Home", exact=True).first.click()
         dialog = page.get_by_role("dialog")
         await expect(dialog.get_by_role("button", name="Leave editor", exact=True)).to_be_disabled()
@@ -539,6 +646,84 @@ async def _exercise_calibration(page, base, provider, expected_aborts, expected_
         await expect(case_buttons.nth(1)).to_be_disabled()
         assert len(provider.requests) == before + 2
         assert len(provider.judge_requests) == judges_before + 2
+
+        # A temporary server-side absence during recovery cannot prove the first
+        # acknowledged-by-server operation never ran.
+        rejected = []
+
+        async def temporarily_unavailable(route):
+            if (
+                abandon_status is not None
+                and route.request.post_data_json["run_id"] != lost["request"]["run_id"]
+            ):
+                await route.fallback()
+                return
+            rejected.append(route.request.post_data_json)
+            await route.fulfill(
+                status=abandon_status or 404,
+                json={"detail": "Calibration target temporarily unavailable."},
+            )
+
+        expected_http.append((url, abandon_status or 404))
+        await page.route(url, temporarily_unavailable)
+        await calibration.get_by_role("button", name="Run calibration", exact=True).click()
+        await expect(calibration.get_by_role("alert")).to_contain_text("temporarily unavailable")
+        await expect(
+            calibration.get_by_role("button", name="Discard calibration", exact=True)
+        ).to_be_disabled()
+        if abandon_status is not None:
+            from dashboard_eval_recovery import confirm_recovery_abandonment
+
+            await calibration.get_by_role("button", name="Run calibration", exact=True).click()
+            await expect(calibration.get_by_role("alert")).to_contain_text(
+                "temporarily unavailable"
+            )
+            assert rejected == [lost["request"], lost["request"]]
+            assert len(provider.judge_requests) == judges_before + 2
+            await confirm_recovery_abandonment(page, abandon, accept=False)
+            await expect(output).to_be_disabled()
+            await confirm_recovery_abandonment(page, abandon, accept=True)
+            await expect(output).to_be_enabled()
+            await expect(output).to_have_value("dashboard authored evaluation output")
+            await expect(
+                calibration.get_by_role("button", name="Run calibration", exact=True)
+            ).to_be_disabled()
+            await expect(
+                calibration.get_by_role("button", name="Discard calibration", exact=True)
+            ).to_be_enabled()
+            await page.get_by_role("link", name="Home", exact=True).first.click()
+            await expect(
+                page.get_by_role("button", name="Leave editor", exact=True)
+            ).to_be_enabled()
+            await page.get_by_role("button", name="Keep editing", exact=True).click()
+            await page.unroute("**/api/evals/targets", removed_target)
+            await _refresh_targets(page)
+            await calibration.get_by_role("button", name="Check calibration", exact=True).click()
+            await expect(
+                calibration.get_by_role("button", name="Run calibration", exact=True)
+            ).to_be_enabled()
+            async with page.expect_response(
+                lambda response: response.url == url and response.request.method == "POST"
+            ) as new_info:
+                await calibration.get_by_role("button", name="Run calibration", exact=True).click()
+            new_response = await new_info.value
+            assert new_response.status == 201, await new_response.text()
+            fresh_request = new_response.request.post_data_json
+            assert fresh_request["run_id"] != lost["request"]["run_id"]
+            assert {k: v for k, v in fresh_request.items() if k != "run_id"} == {
+                k: v for k, v in lost["request"].items() if k != "run_id"
+            }
+            await expect(
+                calibration.get_by_text(re.compile(r"Calibration complete"))
+            ).to_be_visible()
+            # Abandoning local observation does not delete the accepted old report.
+            old = await page.request.post(url, data=lost["request"])
+            assert old.status == 201 and await old.json() == lost["response"]
+            assert len(provider.judge_requests) == judges_before + 4
+            await page.unroute(url, temporarily_unavailable)
+            print(f"CALIBRATION PERSISTENT {abandon_status} ABANDON / NEW INTENT PASS", flush=True)
+            return
+        await page.unroute(url, temporarily_unavailable)
         async with page.expect_response(
             lambda response: response.url == url and response.request.method == "POST"
         ) as info:
@@ -555,6 +740,9 @@ async def _exercise_calibration(page, base, provider, expected_aborts, expected_
         await expect(editor.get_by_test_id("authored-suite-save")).to_be_enabled()
         await expect(calibration.get_by_text(re.compile(r"Calibration complete"))).to_be_visible()
         assert len(provider.requests) == before + 2
+        await page.unroute("**/api/evals/targets", removed_target)
+        await _refresh_targets(page)
+        await expect(output).to_have_value("dashboard authored evaluation output")
     finally:
         release.set()
         await page.unroute(url, lose_acknowledgement)
@@ -1090,11 +1278,28 @@ if __name__ == "__main__":
             "scenario",
             "parent",
             "calibration",
+            "calibration-abandon-404",
+            "calibration-abandon-409",
+            "calibration-abandon-422",
+            "scenario-abandon-404",
+            "scenario-abandon-409",
+            "scenario-abandon-422",
+            "recovery-abandon-sequence",
             "run",
             "navigation",
             "late",
             "keyboard",
             "settings",
+            "recovery-corpus",
+            "recovery-captured",
+            "recovery-captured-nested-status",
+            "recovery-captured-direct-status",
+            "recovery-captured-nested-error",
+            "recovery-captured-direct-error",
+            "recovery-captured-direct-authorization",
+            "recovery-captured-nested-abandon",
+            "recovery-authored",
+            "recovery-scenario",
         ],
         default="all",
     )

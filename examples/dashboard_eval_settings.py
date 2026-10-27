@@ -144,7 +144,32 @@ async def _calibration(page, base, provider, expected_aborts, expected_console):
     await expect(page.get_by_label("Calibration suite", exact=True)).to_be_enabled()
 
 
-async def _scenarios(page, base, provider, expected_aborts, expected_console, change="missing"):
+async def _wait_for_scenario_runs(page, base, run_ids):
+    # A settled launch response only proves admission. Do not let owned provider
+    # work leak into the next browser flow's no-dispatch assertions.
+    for run_id in run_ids:
+        async with asyncio.timeout(30):
+            while True:
+                response = await page.request.get(f"{base}/api/evals/runs/{run_id}")
+                assert response.status == 200, await response.text()
+                run = await response.json()
+                if run["status"] in {"completed", "failed", "cancelled"}:
+                    break
+                await asyncio.sleep(0.05)
+        assert run["status"] == "completed", run
+
+
+async def _scenarios(
+    page,
+    base,
+    provider,
+    expected_aborts,
+    expected_console,
+    change="missing",
+    *,
+    expected_http=None,
+    abandon_status=None,
+):
     await page.goto(f"{base}/cayu/evals/settings?tool=scenarios", wait_until="networkidle")
     await page.get_by_role("button", name="New scenario", exact=True).click()
     editor = page.get_by_test_id("scenario-authoring")
@@ -168,16 +193,36 @@ async def _scenarios(page, base, provider, expected_aborts, expected_console, ch
     await expect(page.get_by_role("button", name="New scenario", exact=True)).to_be_enabled()
     url = f"{base}/api/evals/scenarios/{quote(saved['revision'], safe='')}/runs"
     lost, requests = {}, []
+    admitted, release = asyncio.Event(), asyncio.Event()
     before = len(provider.requests)
 
     async def lose_ack(route, request):
         requests.append((request.post_data_json, request.headers.get("idempotency-key")))
+        if expected_http is not None and len(requests) == 1:
+            await route.fulfill(status=422, json={"detail": "Fixture rejected before admission."})
+            return
+        if expected_http is not None and (
+            len(requests) == 3
+            or (
+                abandon_status is not None
+                and len(requests) > 3
+                and requests[-1][1] == requests[1][1]
+            )
+        ):
+            await route.fulfill(
+                status=abandon_status or 404,
+                json={"detail": "Scenario target temporarily unavailable."},
+            )
+            return
         if lost:
             await route.continue_()
             return
         response = await route.fetch()
         assert response.status == 202, await response.text()
         lost["response"] = await response.json()
+        admitted.set()
+        if abandon_status is not None:
+            await release.wait()
         expected_aborts.append(url)
         expected_console.append(url)
         await route.abort("connectionreset")
@@ -196,8 +241,21 @@ async def _scenarios(page, base, provider, expected_aborts, expected_console, ch
         await route.fulfill(response=response, json=body)
 
     await page.route(url, lose_ack)
+    if expected_http is not None:
+        expected_http.append((url, 422))
     try:
+        if expected_http is not None:
+            await editor.get_by_role("button", name="Run scenario", exact=True).click()
+            await expect(editor.get_by_role("alert")).to_contain_text("before admission")
+            await expect(editor.get_by_label("Scenario name", exact=True)).to_be_enabled()
+            assert len(provider.requests) == before
         await editor.get_by_role("button", name="Run scenario", exact=True).click()
+        if abandon_status is not None:
+            await asyncio.wait_for(admitted.wait(), 15)
+            abandon = editor.get_by_role("button", name="Abandon scenario recovery", exact=True)
+            if await abandon.count():
+                await expect(abandon).to_be_disabled()
+            release.set()
         await expect(editor.get_by_role("alert")).to_be_visible()
         await page.route("**/api/evals/targets", changed_target)
         await _refresh_targets(page)
@@ -211,18 +269,72 @@ async def _scenarios(page, base, provider, expected_aborts, expected_console, ch
         await page.get_by_role("link", name="Import / export", exact=True).click()
         await expect(page.get_by_role("button", name="Leave tool", exact=True)).to_be_disabled()
         await page.get_by_role("button", name="Keep working", exact=True).click()
+        if expected_http is not None:
+            expected_http.append((url, abandon_status or 404))
+            await editor.get_by_role("button", name="Run scenario", exact=True).click()
+            await expect(editor.get_by_role("alert")).to_contain_text("temporarily unavailable")
+            await expect(editor.get_by_label("Scenario name", exact=True)).to_be_disabled()
+            await expect(
+                page.get_by_role("button", name="New scenario", exact=True)
+            ).to_be_disabled()
+        if abandon_status is not None:
+            from dashboard_eval_recovery import confirm_recovery_abandonment
+
+            await editor.get_by_role("button", name="Run scenario", exact=True).click()
+            await expect(editor.get_by_role("alert")).to_contain_text("temporarily unavailable")
+            assert requests[1] == requests[2] == requests[3]
+            await confirm_recovery_abandonment(page, abandon, accept=False)
+            await expect(text).to_be_disabled()
+            await confirm_recovery_abandonment(page, abandon, accept=True)
+            # Fresh editing remains gated by the live catalog after the paid
+            # recovery owner is released; restoring it must preserve the draft.
+            await page.unroute("**/api/evals/targets", changed_target)
+            await _refresh_targets(page)
+            await expect(text).to_be_enabled()
+            await expect(text).to_have_value("Exercise one fresh control plane-authored evaluation")
+            await expect(
+                editor.get_by_role("button", name="Run scenario", exact=True)
+            ).to_be_disabled()
+            await text.fill("A separate unsaved scenario edit")
+            await page.get_by_role("link", name="Import / export", exact=True).click()
+            await expect(page.get_by_role("button", name="Leave tool", exact=True)).to_be_enabled()
+            await page.get_by_role("button", name="Keep working", exact=True).click()
+            await text.fill("Exercise one fresh control plane-authored evaluation")
+            await editor.get_by_role("button", name="Check readiness", exact=True).click()
+            await expect(
+                editor.get_by_role("button", name="Run scenario", exact=True)
+            ).to_be_enabled()
+            async with page.expect_response(
+                lambda response: response.url == url and response.request.method == "POST"
+            ) as new_info:
+                await editor.get_by_role("button", name="Run scenario", exact=True).click()
+            fresh = await new_info.value
+            assert fresh.status == 202, await fresh.text()
+            assert requests[-1][0] == requests[1][0]
+            assert requests[-1][1] != requests[1][1]
+            fresh_run_id = (await fresh.json())["spec"]["run_id"]
+            old_run_id = lost["response"]["spec"]["run_id"]
+            assert fresh_run_id != old_run_id
+            await _wait_for_scenario_runs(page, base, (old_run_id, fresh_run_id))
+            assert len(provider.requests) == before + 8
+            await expect(
+                editor.get_by_role("button", name="Run scenario", exact=True)
+            ).to_be_enabled()
+            print(f"SCENARIO PERSISTENT {abandon_status} ABANDON / NEW INTENT PASS", flush=True)
+            return
+        await expect(editor.get_by_role("button", name="Run scenario", exact=True)).to_be_enabled()
         await editor.get_by_role("button", name="Run scenario", exact=True).click()
         await expect(editor.get_by_role("alert")).not_to_be_visible()
-        assert len(requests) == 2 and requests[0] == requests[1]
+        assert len(requests) == (4 if expected_http is not None else 2)
+        recovery_requests = requests[1:] if expected_http is not None else requests
+        assert all(request == recovery_requests[0] for request in recovery_requests)
+        if expected_http is not None:
+            assert requests[0][1] != requests[1][1]
         assert requests[0][1]
-        for _ in range(100):
-            run_id = lost["response"]["spec"]["run_id"]
-            response = await page.request.get(f"{base}/api/evals/runs/{run_id}")
-            if (await response.json())["status"] in {"completed", "failed", "cancelled"}:
-                break
-            await asyncio.sleep(0.05)
+        await _wait_for_scenario_runs(page, base, (lost["response"]["spec"]["run_id"],))
         assert len(provider.requests) == before + 4
     finally:
+        release.set()
         await page.unroute(url, lose_ack)
         await page.unroute("**/api/evals/targets", changed_target)
     await _refresh_targets(page)

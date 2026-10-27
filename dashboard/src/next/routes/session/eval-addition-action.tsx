@@ -69,7 +69,7 @@ export function SessionEvalAdditionDialog({
 }) {
   const { canWrite, readiness } = useEvalAccess()
   const [capturedOpen, setCapturedOpen] = useState(false)
-  if (!canWrite || !["completed", "failed"].includes(status)) return null
+  if (!canWrite) return null
   return (
     <Sheet
       open={open}
@@ -93,9 +93,11 @@ export function SessionEvalAdditionDialog({
             onClose={() => onOpenChange(false)}
             onCapturedOpenChange={setCapturedOpen}
             unavailable={
-              readiness.session_additions.state === "ready"
-                ? null
-                : evalsReadinessReasonText(readiness.session_additions)
+              !["completed", "failed"].includes(status)
+                ? "The source session is currently unavailable for new additions."
+                : readiness.session_additions.state === "ready"
+                  ? null
+                  : evalsReadinessReasonText(readiness.session_additions)
             }
           />
         )}

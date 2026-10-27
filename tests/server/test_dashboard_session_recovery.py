@@ -120,6 +120,11 @@ def test_task_replay_guards_departure_and_recovers_exact_receipt(detail_failure)
                 await expect(page.get_by_role("alert")).to_contain_text(
                     "Injected session read failure", timeout=15_000
                 )
+                # A refetch failure retains the cached Session subtree: its
+                # private Evals owners must coexist with task-replay recovery.
+                await expect(
+                    page.get_by_role("tab", name="Conversation", exact=True)
+                ).to_be_visible()
             await attempt_departure_and_stay(page)
             if detail_failure == "leave":
                 await page.get_by_role("link", name="Sessions", exact=True).first.click()

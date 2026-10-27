@@ -35,7 +35,6 @@ import { Textarea } from "@/components/ui/textarea"
 import {
   ApiClientError,
   type CapturedEvaluationLaunch,
-  type CapturedEvaluationLaunched,
   type EvalTarget,
   type CapturedEvaluationCandidateDraft as EvaluationPromotionCandidateDraft,
   type CapturedEvaluationPreview as EvaluationPromotionPreview,
@@ -47,13 +46,10 @@ import {
   saveCapturedEvaluation,
   selectEvalBaseline,
 } from "@/lib/api"
-import { dashboardConfig } from "@/lib/config"
 import {
-  capturedEvalLaunchRequestIdentity,
+  createEvalIdempotencyKey,
   EVAL_TARGET_QUERY_KEY,
   EVAL_TARGET_STALE_TIME_MS,
-  EvalLaunchIdempotencyRegistry,
-  evalLaunchFailureIsDefinitive,
   evalTargetCatalogMayBeStale,
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
@@ -110,18 +106,21 @@ export function EvaluationPromotionAction({
   status,
   label = "Evaluate",
   compact = false,
+  triggerVisible = true,
   onOpenChange,
 }: {
   sessionId: string
   status: string
   label?: string
   compact?: boolean
+  triggerVisible?: boolean
   onOpenChange?: (open: boolean) => void
 }) {
   const readiness = useServerContract().capabilities.evals_readiness
   const capturedReadiness = readiness.captured_evaluation
   const persistenceReadiness = readiness.captured_result_persistence
   const freshReadiness = readiness.fresh_launch
+  const freshSourceEligible = capturedReadiness.state === "ready" && ELIGIBLE_STATUSES.has(status)
   const scenarioCatalogReady = readiness.catalog_write.state === "ready"
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
@@ -134,10 +133,15 @@ export function EvaluationPromotionAction({
   })
   const [scenarioReset, setScenarioReset] = useState(0)
   const [transition, setTransition] = useState<"close" | "preview" | null>(null)
+  const [launchAttempt, setLaunchAttempt] = useState<{
+    key: string
+    request: CapturedEvaluationLaunch
+  } | null>(null)
   const scenarioOwned = scenarioState.edited || scenarioState.pending
+  const owned = scenarioOwned || launchAttempt !== null
   const routeBlocker = useBlocker({
-    shouldBlockFn: () => open && scenarioOwned,
-    enableBeforeUnload: open && scenarioOwned,
+    shouldBlockFn: () => open && owned,
+    enableBeforeUnload: open && owned,
     withResolver: true,
   })
   const [preview, setPreview] = useState<EvaluationPromotionPreview | null>(null)
@@ -159,7 +163,6 @@ export function EvaluationPromotionAction({
   const previewRequestRef = useRef<{ generation: number; controller: AbortController } | null>(null)
   const exportControllerRef = useRef<AbortController | null>(null)
   const generationRef = useRef(0)
-  const launchRegistryRef = useRef<EvalLaunchIdempotencyRegistry | null>(null)
   const targets = useQuery({
     queryKey: EVAL_TARGET_QUERY_KEY,
     queryFn: ({ signal }) => fetchEvalTargets(signal),
@@ -179,6 +182,7 @@ export function EvaluationPromotionAction({
 
   const loadPreview = useCallback(
     async (nextDraft?: EvaluationPromotionCandidateDraft) => {
+      if (!freshSourceEligible) return
       if (nextDraft !== undefined) {
         const validation = validatePromotionDraft(nextDraft)
         if (!validation.ok) {
@@ -214,10 +218,11 @@ export function EvaluationPromotionAction({
         }
       }
     },
-    [sessionId],
+    [sessionId, freshSourceEligible],
   )
 
   const openPromotion = () => {
+    if (!freshSourceEligible || open) return
     cancelRequests()
     setPreview(null)
     setDraft(null)
@@ -240,7 +245,7 @@ export function EvaluationPromotionAction({
   }
 
   const changeOpen = (nextOpen: boolean) => {
-    if (!nextOpen && scenarioOwned) {
+    if (!nextOpen && owned) {
       setTransition("close")
       return
     }
@@ -256,11 +261,13 @@ export function EvaluationPromotionAction({
   }
 
   const requestPreview = () => {
-    if (scenarioOwned) setTransition("preview")
+    if (!freshSourceEligible) return
+    if (owned) setTransition("preview")
     else if (draft) void loadPreview(draft)
   }
   const discardScenario = () => {
-    if (scenarioState.pending) return
+    if (scenarioState.pending || launching) return
+    setLaunchAttempt(null)
     setScenarioState({ dirty: false, edited: false, pending: false })
     setScenarioReset((value) => value + 1)
     if (routeBlocker.status === "blocked") routeBlocker.proceed()
@@ -272,7 +279,7 @@ export function EvaluationPromotionAction({
   }
 
   const editDraft = (edit: (next: EvaluationPromotionCandidateDraft) => void) => {
-    if (draft === null) return
+    if (draft === null || launchAttempt) return
     const next = structuredClone(draft)
     edit(next)
     setDraft(next)
@@ -300,7 +307,7 @@ export function EvaluationPromotionAction({
   )
 
   useEffect(() => {
-    if (selectedTarget === undefined) return
+    if (selectedTarget === undefined || launchAttempt) return
     setFreshExecution((current) => {
       const timeout = Number(current.timeoutSeconds)
       const timeoutSeconds =
@@ -317,10 +324,10 @@ export function EvaluationPromotionAction({
       }
       return { ...current, timeoutSeconds, currency }
     })
-  }, [selectedTarget])
+  }, [selectedTarget, launchAttempt])
 
   const exportPreviewedCandidate = (signal: AbortSignal) => {
-    if (!previewIsCurrent || preview === null) return null
+    if (!freshSourceEligible || !previewIsCurrent || preview === null) return null
     return exportEvaluationPromotion(
       sessionId,
       {
@@ -332,7 +339,7 @@ export function EvaluationPromotionAction({
   }
 
   const exportCandidate = async () => {
-    if (!previewIsCurrent || preview === null) return
+    if (!freshSourceEligible || !previewIsCurrent || preview === null) return
     exportControllerRef.current?.abort()
     const controller = new AbortController()
     exportControllerRef.current = controller
@@ -359,7 +366,7 @@ export function EvaluationPromotionAction({
   }
 
   const saveCandidate = async () => {
-    if (!previewIsCurrent || preview === null) return
+    if (!freshSourceEligible || !previewIsCurrent || preview === null) return
     exportControllerRef.current?.abort()
     const controller = new AbortController()
     exportControllerRef.current = controller
@@ -401,63 +408,54 @@ export function EvaluationPromotionAction({
   }
 
   const launchFreshTrial = async () => {
-    if (
-      !previewIsCurrent ||
-      preview === null ||
-      !preview.runnable_conversion.available ||
-      freshReadiness.state !== "ready" ||
-      !freshLaunch.ok ||
-      selectedTarget?.execution_profile === null ||
-      selectedTarget?.execution_profile === undefined
-    ) {
-      return
+    if (launching || scenarioOwned) return
+    let attempt = launchAttempt
+    if (!attempt) {
+      if (
+        !freshSourceEligible ||
+        !previewIsCurrent ||
+        preview === null ||
+        !preview.runnable_conversion.available ||
+        freshReadiness.state !== "ready" ||
+        persistenceReadiness.state !== "ready" ||
+        !freshLaunch.ok ||
+        !selectedTarget?.execution_profile
+      )
+        return
+      try {
+        attempt = {
+          key: createEvalIdempotencyKey(),
+          request: structuredClone({
+            candidate: preview.candidate,
+            expected_candidate_revision: preview.candidate.revision,
+            expected_execution_profile_revision: selectedTarget.execution_profile.revision,
+            ...freshLaunch.request,
+          }),
+        }
+        setLaunchAttempt(attempt)
+      } catch (error) {
+        setError(promotionErrorMessage(error))
+        return
+      }
     }
+    // Candidate evidence stays only with this private owner, never in browser storage.
+    const dispatched = attempt
     exportControllerRef.current?.abort()
     const controller = new AbortController()
     exportControllerRef.current = controller
-    const request: CapturedEvaluationLaunch = {
-      candidate: preview.candidate,
-      expected_candidate_revision: preview.candidate.revision,
-      expected_execution_profile_revision: selectedTarget.execution_profile.revision,
-      ...freshLaunch.request,
-    }
-    const requestIdentity = capturedEvalLaunchRequestIdentity(
-      sessionId,
-      preview.candidate.revision,
-      request,
-    )
     setLaunching(true)
     setSavedRevision(null)
     setLaunchedRunId(null)
     setError(null)
     try {
-      const registry =
-        launchRegistryRef.current ??
-        new EvalLaunchIdempotencyRegistry(window.sessionStorage, dashboardConfig.apiBaseUrl)
-      launchRegistryRef.current = registry
-      const idempotencyKey = registry.keyFor(requestIdentity)
-      let launched: CapturedEvaluationLaunched
-      try {
-        launched = await launchCapturedEvaluation(
-          sessionId,
-          request,
-          idempotencyKey,
-          controller.signal,
-        )
-      } catch (launchError) {
-        if (evalTargetCatalogMayBeStale(launchError)) {
-          await queryClient.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
-        }
-        if (
-          launchError instanceof ApiClientError &&
-          evalLaunchFailureIsDefinitive(launchError.status)
-        ) {
-          registry.resolve(requestIdentity)
-        }
-        throw launchError
-      }
-      registry.resolve(requestIdentity)
+      const launched = await launchCapturedEvaluation(
+        sessionId,
+        dispatched.request,
+        dispatched.key,
+        controller.signal,
+      )
       if (controller.signal.aborted) return
+      setLaunchAttempt((current) => (current?.key === dispatched.key ? null : current))
       setSavedRevision(launched.captured.record.revision)
       setSavedCorpusRevision(launched.run.spec.corpus_revision)
       setSavedTargetKey(launched.run.spec.target_key)
@@ -471,10 +469,8 @@ export function EvaluationPromotionAction({
       ])
     } catch (launchError) {
       if (controller.signal.aborted) return
-      if (isPromotionConflict(launchError)) {
-        setPreview(null)
-        setDraft(null)
-      }
+      if (evalTargetCatalogMayBeStale(launchError))
+        void queryClient.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
       setError(promotionErrorMessage(launchError))
     } finally {
       if (exportControllerRef.current === controller) {
@@ -508,20 +504,22 @@ export function EvaluationPromotionAction({
     }
   }
 
-  if (capturedReadiness.state !== "ready" || !ELIGIBLE_STATUSES.has(status)) return null
+  if (!freshSourceEligible && !open) return null
 
   return (
     <>
-      <Button
-        size="sm"
-        variant="outline"
-        aria-label={label}
-        data-testid="evaluate-session"
-        onClick={openPromotion}
-      >
-        <FlaskConical className="h-4 w-4" />
-        <span className={compact ? "hidden sm:inline" : undefined}>{label}</span>
-      </Button>
+      {triggerVisible && freshSourceEligible && (
+        <Button
+          size="sm"
+          variant="outline"
+          aria-label={label}
+          data-testid="evaluate-session"
+          onClick={openPromotion}
+        >
+          <FlaskConical className="h-4 w-4" />
+          <span className={compact ? "hidden sm:inline" : undefined}>{label}</span>
+        </Button>
+      )}
       <Sheet open={open} onOpenChange={changeOpen}>
         <SheetContent
           className="w-full! gap-0 sm:max-w-4xl!"
@@ -538,6 +536,12 @@ export function EvaluationPromotionAction({
           </SheetHeader>
 
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
+            {!freshSourceEligible && (
+              <p role="status" className="mb-4 rounded-lg border border-border p-3 text-sm">
+                The source session is currently unavailable for new evaluations. Your open work and
+                exact launch recovery remain here; the server checks whether recovery is permitted.
+              </p>
+            )}
             {previewing && draft === null ? (
               <div className="flex min-h-56 items-center justify-center gap-2 text-muted-foreground">
                 <LoaderCircle className="h-4 w-4 animate-spin" />
@@ -548,12 +552,22 @@ export function EvaluationPromotionAction({
                 <p className="max-w-md text-sm text-muted-foreground">
                   The captured evidence could not be loaded. No evaluation has been saved.
                 </p>
-                <Button variant="outline" onClick={() => void loadPreview()} disabled={previewing}>
+                <Button
+                  variant="outline"
+                  onClick={() => void loadPreview()}
+                  disabled={previewing || !freshSourceEligible}
+                >
                   <RotateCcw /> Retry preview
                 </Button>
               </div>
             ) : (
               <div className="space-y-4">
+                {launchAttempt && (
+                  <p role="status" className="rounded-lg border border-border p-3 text-sm">
+                    The launch outcome is unconfirmed. Its original evidence, settings and operation
+                    key are retained here. Retry the exact launch before changing them.
+                  </p>
+                )}
                 {preview && (
                   <PromotionEvidenceSummary preview={preview} current={previewIsCurrent} />
                 )}
@@ -563,6 +577,8 @@ export function EvaluationPromotionAction({
                     onAuthoringStateChange={setScenarioState}
                     captured={preview.scenario_conversion.scenario}
                     disabled={
+                      launchAttempt !== null ||
+                      (!freshSourceEligible && !scenarioState.pending) ||
                       !scenarioCatalogReady ||
                       previewing ||
                       exporting ||
@@ -575,6 +591,8 @@ export function EvaluationPromotionAction({
                 <fieldset
                   className="contents"
                   disabled={
+                    !freshSourceEligible ||
+                    launchAttempt !== null ||
                     scenarioState.pending ||
                     previewing ||
                     exporting ||
@@ -645,7 +663,7 @@ export function EvaluationPromotionAction({
                     size="xs"
                     variant="outline"
                     className="ml-2"
-                    disabled={baselining || scenarioOwned}
+                    disabled={baselining || owned}
                     onClick={() => void approveBaseline()}
                   >
                     {baselining ? <LoaderCircle className="animate-spin" /> : <CheckCircle2 />}
@@ -671,6 +689,7 @@ export function EvaluationPromotionAction({
               variant="outline"
               data-testid="promotion-preview"
               disabled={
+                !freshSourceEligible ||
                 draft === null ||
                 scenarioState.pending ||
                 previewing ||
@@ -687,7 +706,8 @@ export function EvaluationPromotionAction({
             <Button
               data-testid="promotion-export"
               disabled={
-                scenarioOwned ||
+                !freshSourceEligible ||
+                owned ||
                 !previewIsCurrent ||
                 previewing ||
                 exporting ||
@@ -703,7 +723,8 @@ export function EvaluationPromotionAction({
             <Button
               data-testid="promotion-save"
               disabled={
-                scenarioOwned ||
+                !freshSourceEligible ||
+                owned ||
                 !previewIsCurrent ||
                 persistenceReadiness.state !== "ready" ||
                 previewing ||
@@ -722,22 +743,32 @@ export function EvaluationPromotionAction({
               data-testid="promotion-launch"
               disabled={
                 scenarioOwned ||
-                !previewIsCurrent ||
-                preview?.runnable_conversion.available !== true ||
-                persistenceReadiness.state !== "ready" ||
-                freshReadiness.state !== "ready" ||
-                !freshLaunch.ok ||
                 previewing ||
                 exporting ||
                 saving ||
                 launching ||
-                baselining
+                baselining ||
+                (!launchAttempt &&
+                  (!freshSourceEligible ||
+                    !previewIsCurrent ||
+                    preview?.runnable_conversion.available !== true ||
+                    persistenceReadiness.state !== "ready" ||
+                    freshReadiness.state !== "ready" ||
+                    !freshLaunch.ok))
               }
-              title={freshExecutionUnavailable ?? persistenceUnavailable ?? undefined}
+              title={
+                launchAttempt
+                  ? "Retry the exact original request"
+                  : (freshExecutionUnavailable ?? persistenceUnavailable ?? undefined)
+              }
               onClick={() => void launchFreshTrial()}
             >
               {launching ? <LoaderCircle className="animate-spin" /> : <Play />}
-              {launching ? "Starting..." : "Run on current app"}
+              {launching
+                ? "Starting..."
+                : launchAttempt
+                  ? "Retry exact launch"
+                  : "Run on current app"}
             </Button>
           </SheetFooter>
         </SheetContent>
@@ -754,11 +785,15 @@ export function EvaluationPromotionAction({
         <Dialog.Portal>
           <Dialog.Backdrop className="fixed inset-0 z-50 bg-black/40" />
           <Dialog.Popup className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 space-y-4 rounded-xl border border-border bg-background p-5 shadow-xl">
-            <Dialog.Title className="font-semibold">Keep this scenario?</Dialog.Title>
+            <Dialog.Title className="font-semibold">
+              {launchAttempt ? "Keep launch recovery?" : "Keep this scenario?"}
+            </Dialog.Title>
             <Dialog.Description className="text-sm text-muted-foreground">
-              {scenarioState.pending
-                ? "Finish or retry the scenario operation before leaving. Its exact recovery is retained here."
-                : "Continuing discards the unsaved scenario edits and launch selections."}
+              {launchAttempt
+                ? "This launch may already be running. Leaving or reviewing new evidence abandons its exact recovery and can allow duplicate work. Keep working to retry the original request."
+                : scenarioState.pending
+                  ? "Finish or retry the scenario operation before leaving. Its exact recovery is retained here."
+                  : "Continuing discards the unsaved scenario edits and launch selections."}
             </Dialog.Description>
             <div className="flex justify-end gap-2">
               <Button
@@ -770,8 +805,8 @@ export function EvaluationPromotionAction({
               >
                 Keep working
               </Button>
-              <Button disabled={scenarioState.pending} onClick={discardScenario}>
-                Discard scenario edits
+              <Button disabled={scenarioState.pending || launching} onClick={discardScenario}>
+                {launchAttempt ? "Abandon launch recovery" : "Discard scenario edits"}
               </Button>
             </div>
           </Dialog.Popup>

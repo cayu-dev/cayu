@@ -60,6 +60,7 @@ const GROUPS: { label: string; kinds: Kind[] }[] = [
 /** Mount with a stable case-row key. Check rows own calibration state, never suite publication. */
 export function EvalSuiteChecks({
   assertions,
+  targetKey,
   target,
   defaultJudgeProfile,
   reviewedAssertions,
@@ -70,6 +71,7 @@ export function EvalSuiteChecks({
   onChange,
 }: {
   assertions: Check[]
+  targetKey: string
   target: EvalTargetCatalogEntry | undefined
   defaultJudgeProfile: JudgeProfileIdentityV1 | undefined
   reviewedAssertions: Parameters<typeof structuredAssertionFromReviewedSuite>[1]
@@ -191,6 +193,7 @@ export function EvalSuiteChecks({
           <div className="space-y-3 border-t border-border p-3">
             {assertion.kind === "structured_model_judge" ? (
               <StructuredJudgeEditor
+                targetKey={targetKey}
                 assertion={assertion}
                 target={target}
                 reviewedAssertion={structuredAssertionFromReviewedSuite(
