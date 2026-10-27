@@ -108,6 +108,18 @@ storage migration.
   tasks fenced after their worker was lost (`result.task_health`), with how to
   list and settle them.
 
+### Changes
+
+- Managed settings: parts declare the settings Cayu Cloud can manage where they
+  are registered (`register_agent`, `register_provider` and
+  `register_environment_factory` take `settings=`; `CayuApp.declare_settings`
+  for the application's own), from `cayu.managed_settings`. The framework
+  declares chosen `CayuConfig` run fields and each application budget limit's
+  amount. `app.describe()` gains a `settings` section, and the agent registry
+  registration publishes it as `settings_schema`
+  (`cayu.managed-settings-schema/v1`). `CayuConfigSource` gains `"managed"`. See
+  `docs/managed-settings.md`.
+
 ### Fixes
 
 - A settle that carries `execution_deadline`, or renews a task-handler default,

@@ -57,6 +57,11 @@ Cloud has no cursor for (an in-memory store after a restart, a replaced database
 starts at its `start_cursor`. If the store's identity changes under a running
 process, the reporter registers the new store, counting from its newest event.
 
+The body also carries `settings_schema`, the Release's managed settings schema
+(`cayu.managed-settings-schema/v1`, see [managed-settings.md](managed-settings.md)).
+If Cloud refuses it with 422, the reporter logs a warning and registers again
+without it for the rest of the process's life.
+
 Each tool is reported once by name, with every specialist that has it, its
 declared description, effect, approval and source:
 

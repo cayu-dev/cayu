@@ -34,6 +34,7 @@ from cayu.context.footprints import (
 )
 from cayu.environments.admission import ExecutionRequirements
 from cayu.environments.base import NO_ENVIRONMENT
+from cayu.managed_settings import ManagedSetting
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools._terminal_bounds import application_tool_declares_no_bound
 from cayu.tools.catalogue import ToolExecutionContract
@@ -460,6 +461,14 @@ class RuntimeManifest(_ManifestModel):
     recovery_cleanup_policy: RecoveryCleanupPolicyManifest
 
 
+class ManagedSettingsManifest(_ManifestModel):
+    """The Release's ``cayu.managed-settings-schema/v1`` document, sorted by key."""
+
+    contract: Literal["cayu.managed-settings-schema/v1"]
+    digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    settings: tuple[ManagedSetting, ...]
+
+
 class AppManifest(_ManifestModel):
     schema_version: Literal["17"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
@@ -470,6 +479,10 @@ class AppManifest(_ManifestModel):
     defaults: ApplicationDefaultsManifest
     runtime: RuntimeManifest
     capabilities: tuple[CapabilityManifest, ...]
+    # Absent only from manifests recorded before parts could declare settings.
+    settings: ManagedSettingsManifest | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def _app_manifest_fingerprint(payload: dict[str, object]) -> str:
@@ -627,6 +640,9 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
     if type(normalized_payload) is not dict:
         raise TypeError("Application manifest redaction must preserve the JSON object shape.")
     structural_payload = cast("dict[str, object]", normalized_payload)
+    # The schema is published to Cloud as assembled, so the manifest carries it
+    # unnormalized. Declaration already refuses settings that contain a secret.
+    structural_payload["settings"] = app.managed_settings_schema()
     manifest = AppManifest.model_validate(
         {
             **normalized_payload,

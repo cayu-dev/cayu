@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -40,6 +40,7 @@ from cayu.workspaces.local import LocalWorkspace
 
 if TYPE_CHECKING:
     from cayu.artifacts.base import ArtifactStore
+    from cayu.managed_settings import ManagedSetting
 
 #: Names the one backend a deployment requires; startup fails if it can't be used.
 CODING_BACKEND_ENV = "CAYU_CODING_BACKEND"
@@ -317,13 +318,15 @@ def register_coding_environment(
     default: bool = False,
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
     metadata: Mapping[str, object] | None = None,
+    settings: Iterable[ManagedSetting] | None = None,
 ) -> EnvironmentFactory:
     """Register one source workspace's coding environment under ``name`` and return its factory.
 
     Call it once per workspace, for example once per clone that a parallel
     worker edits; ``RunRequest.environment_name`` then picks the workspace. The
     spec's metadata records the backend, the toolchain profile's evidence and
-    the factory's identity, plus any non-secret ``metadata`` given here.
+    the factory's identity, plus any non-secret ``metadata`` given here. ``settings``
+    are the environment's managed settings, passed to ``register_environment_factory``.
     """
 
     if type(backend) is not CodingBackend:
@@ -351,6 +354,7 @@ def register_coding_environment(
         factory,
         artifact_store=artifact_store,
         default=default,
+        settings=settings,
     )
     return factory
 

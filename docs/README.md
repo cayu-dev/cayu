@@ -54,6 +54,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Opt-in knowledge offers](knowledge-offers.md)
 - [Private tool-argument continuity](private-argument-continuity.md)
 - [Model catalog](model-catalog.md)
+- [Managed settings](managed-settings.md)
 - [Model policy](model-policy.md)
 - [Operation outcomes](operation-outcomes.md)
 - [Participant identity administration](participant-identity.md)

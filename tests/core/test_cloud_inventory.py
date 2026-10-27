@@ -63,6 +63,8 @@ REGISTRATION_KEYS = {
     "store_id",
     "start_cursor",
     "replaces_cursor",
+    # Optional in v1: the Release's managed settings schema (docs/managed-settings.md).
+    "settings_schema",
 }
 # Only the publisher knows the store and the cursor Cloud answered.
 _PUBLISHER_KEYS = {"store_id", "replaces_cursor"}
@@ -529,6 +531,31 @@ class _Cloud:
             self.lose_next_answer = False
             return httpx.Response(503)
         return httpx.Response(200, json={"usage_cursor": body["through"]})
+
+
+def test_registration_carries_the_settings_schema_and_drops_it_when_cloud_refuses_it(caplog):
+    async def scenario():
+        app = await _usage_app()
+        cloud = _Cloud()
+        cloud.next_errors.append(
+            httpx.Response(422, json={"error": {"code": "invalid_settings_schema", "detail": {}}})
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(cloud)) as client:
+            publisher = CloudInventoryPublisher(app, _config(), client=client)
+            with caplog.at_level(logging.WARNING, logger="cayu.cloud_inventory"):
+                await publisher.publish_once()
+            first, second = (json.loads(request.content) for request in cloud.requests)
+            assert first["settings_schema"] == app.managed_settings_schema()
+            assert first["settings_schema"]["contract"] == "cayu.managed-settings-schema/v1"
+            # Cloud kept the rest of the registration; the reporter keeps working without it.
+            assert "settings_schema" not in second
+            assert cloud.current == RELEASE.id
+            assert "settings schema" in caplog.text
+            await publisher.register()
+            assert "settings_schema" not in json.loads(cloud.requests[-1].content)
+        await app.aclose()
+
+    asyncio.run(scenario())
 
 
 def _calls(cloud: _Cloud) -> int:
@@ -1143,7 +1170,7 @@ def test_registration_usage_allowlist_matches_the_fitted_tool_inventory(monkeypa
                 tools=[_Tool(f"tool_{j}") for j in range(8)],
             )
         registration, registered = await _build_registration(
-            app, project_root=None, start_cursor=None
+            app, project_root=None, start_cursor=None, settings_schema=False
         )
         assert 0 < len(registration.tools) < 8
         assert len(_encode(registration)) <= 1000

@@ -36,7 +36,8 @@ MAX_STEPS = 2**53 - 1
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
 DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS = 256
 
-CayuConfigSource = Literal["framework", "application", "explicit"]
+# "managed": a value set in Cayu Cloud (see cayu.managed_settings) replaced the code default.
+CayuConfigSource = Literal["framework", "application", "managed", "explicit"]
 
 
 _CONFIG_MODEL = ConfigDict(

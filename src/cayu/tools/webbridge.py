@@ -50,7 +50,10 @@ from cayu.tools.web import (
 from cayu.vaults import SecretRef, copy_secret_ref
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from cayu.applications import CayuApp
+    from cayu.managed_settings import ManagedSetting
     from cayu.tools.web_access import WebAccessRoutePolicy, WebBridgeRoute
 
 DEFAULT_WEBBRIDGE_BROWSER_IMAGE = PINNED_BROWSER_FETCH_WORKLOAD.image
@@ -491,8 +494,12 @@ class WebBridge:
         spec: AgentSpec,
         *,
         environment_name: str | None = None,
+        settings: Iterable[ManagedSetting] | None = None,
     ) -> AgentSpec:
-        """Validate this bridge against an app environment, then register its agent."""
+        """Validate this bridge against an app environment, then register its agent.
+
+        ``settings`` are the agent's managed settings, passed to ``register_agent``.
+        """
 
         from cayu.applications import CayuApp
 
@@ -505,6 +512,7 @@ class WebBridge:
             spec,
             tools=self.tools,
             execution_requirements=self.execution_requirements,
+            settings=settings,
         )
 
     def _validate_registration(

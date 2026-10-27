@@ -32,6 +32,7 @@ from cayu._application_environment_maintenance import (
     unregister_application_environment,
 )
 from cayu._application_environment_registry import ApplicationEnvironmentRegistry
+from cayu._application_managed_settings import ManagedSettingsEntrances
 from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import _registration_site, _validate_runtime_hooks
 from cayu._application_session_deletion import delete_app_session, export_app_session_closure
@@ -329,6 +330,7 @@ from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
 )
+from cayu.managed_settings import ManagedSetting
 from cayu.mcp.tools import (
     McpToolset,
     McpToolsetRefreshResult,
@@ -931,7 +933,7 @@ class _ParticipantExecutionSettlementReader(PermitSettlementReader):
 _PROVIDER_RECONCILIATION_BUDGET_SHARE = 0.5
 
 
-class CayuApp(WorkflowEntrances):
+class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
     """Application runtime for registered specialists, providers, and session state."""
 
     def __init__(
@@ -5928,8 +5930,12 @@ class CayuApp(WorkflowEntrances):
         loop_policies: Iterable[LoopPolicy] | None = None,
         execution_requirements: ExecutionRequirements | None = None,
         environment_name: str | NoEnvironment | None = None,
+        settings: Iterable[ManagedSetting] | None = None,
     ) -> AgentSpec:
-        return self._agent_registry.register_agent(
+        declared = self._agent_managed_settings(
+            spec, settings, default_thinking=self._config.run.thinking
+        )
+        registered = self._agent_registry.register_agent(
             spec,
             default_thinking=self._config.run.thinking,
             default_thinking_source=self._config_sources["run.thinking"],
@@ -5951,6 +5957,8 @@ class CayuApp(WorkflowEntrances):
             execution_requirements=execution_requirements,
             environment_name=environment_name,
         )
+        self._add_managed_settings(declared)
+        return registered
 
     def enroll_fork_controller(self, controller: ForkController) -> None:
         """Let one outside controller fork the named agents with its own overlay."""
@@ -6038,13 +6046,17 @@ class CayuApp(WorkflowEntrances):
         *,
         default: bool = False,
         model_patterns: Iterable[str] | None = None,
+        settings: Iterable[ManagedSetting] | None = None,
     ) -> ModelProvider:
-        return self._provider_registry.register(
+        declared = self._part_managed_settings(settings, part="provider", name=provider.name)
+        registered = self._provider_registry.register(
             provider,
             default=default,
             model_patterns=model_patterns,
             registration_site=_registration_site(),
         )
+        self._add_managed_settings(declared)
+        return registered
 
     def register_environment(
         self,
@@ -6217,14 +6229,18 @@ class CayuApp(WorkflowEntrances):
         *,
         artifact_store: ArtifactStore | None = None,
         default: bool = False,
+        settings: Iterable[ManagedSetting] | None = None,
     ) -> EnvironmentFactory:
-        return self._environment_registry.register_factory(
+        declared = self._part_managed_settings(settings, part="environment", name=spec.name)
+        registered = self._environment_registry.register_factory(
             spec,
             factory,
             artifact_store=artifact_store,
             default=default,
             registration_site=_registration_site(),
         )
+        self._add_managed_settings(declared)
+        return registered
 
     def get_agent(self, name: str) -> runtime_records.RegisteredAgent:
         return self._agent_registry.get_agent(name)
@@ -6341,6 +6357,7 @@ class CayuApp(WorkflowEntrances):
         """
 
         await unregister_application_environment(self, name)
+        self._drop_managed_settings(owner=f"environment:{name}")
 
     def register_environment_rebuilder(
         self, kind: str, rebuilder: EnvironmentRebuilder

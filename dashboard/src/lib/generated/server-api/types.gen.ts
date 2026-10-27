@@ -2749,6 +2749,7 @@ export type AppManifest = {
      * Schema Version
      */
     schema_version?: '17';
+    settings?: ManagedSettingsManifest | null;
     stores: StoreManifest;
 };
 
@@ -4396,7 +4397,7 @@ export type ConfigurationFieldProvenanceManifest = {
     /**
      * Source
      */
-    source: 'framework' | 'application' | 'explicit';
+    source: 'framework' | 'application' | 'managed' | 'explicit';
 };
 
 /**
@@ -12408,6 +12409,98 @@ export type ListSessionsResponse = {
      * Present only for `include=usage`: one exact usage summary per listed session, in the same order as `sessions`.
      */
     usage?: Array<SessionUsageSummary> | null;
+};
+
+/**
+ * ManagedSetting
+ *
+ * One setting descriptor (``docs/managed-settings.md``, section 1).
+ *
+ * Parts declare settings with a key relative to themselves (``"max_steps"``);
+ * registration puts the part's namespace in front (``"agent.reviewer.max_steps"``)
+ * and sets ``owner``. ``default`` is the code's value, or ``None`` when unset.
+ */
+export type ManagedSetting = {
+    /**
+     * Applies
+     */
+    applies?: 'restart' | 'next_session' | 'live';
+    /**
+     * Choices
+     */
+    choices?: Array<ManagedSettingChoice> | null;
+    /**
+     * Default
+     */
+    default?: boolean | number | number | string | null;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Max Length
+     */
+    max_length?: number | null;
+    /**
+     * Maximum
+     */
+    maximum?: number | null;
+    /**
+     * Minimum
+     */
+    minimum?: number | null;
+    /**
+     * Owner
+     */
+    owner?: string | null;
+    /**
+     * Type
+     */
+    type: 'bool' | 'int' | 'number' | 'string' | 'enum' | 'secret_ref';
+};
+
+/**
+ * ManagedSettingChoice
+ *
+ * One allowed value of an ``enum`` setting.
+ */
+export type ManagedSettingChoice = {
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Value
+     */
+    value: string;
+};
+
+/**
+ * ManagedSettingsManifest
+ *
+ * The Release's ``cayu.managed-settings-schema/v1`` document, sorted by key.
+ */
+export type ManagedSettingsManifest = {
+    /**
+     * Contract
+     */
+    contract: 'cayu.managed-settings-schema/v1';
+    /**
+     * Digest
+     */
+    digest: string;
+    /**
+     * Settings
+     */
+    settings: Array<ManagedSetting>;
 };
 
 /**

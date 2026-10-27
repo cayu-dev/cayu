@@ -3,7 +3,9 @@
 This is the Runtime side of Cloud's ``cayu.agent-registry/v1`` contract. The outbound
 credential is used only for this Agent's registry routes. Only allowlisted declarations
 cross this boundary: no prompt, argument schema, argument, result, provider option,
-metadata value, knowledge text or conversation-derived knowledge.
+metadata value, knowledge text or conversation-derived knowledge. The registration also
+carries the Release's managed settings schema: the settings its parts declared, with the
+code's values as defaults (``docs/managed-settings.md``).
 """
 
 from __future__ import annotations
@@ -141,6 +143,9 @@ class CloudRegistration(_Model):
     agents: tuple[str, ...]
     tools: tuple[CloudTool, ...]
     knowledge: CloudKnowledge
+    # The Release's cayu.managed-settings-schema/v1 document (docs/managed-settings.md).
+    # A plain mapping, so that encoding keeps each setting's null default.
+    settings_schema: dict[str, Any] | None = None
 
 
 class CloudToolUsage(_Model):
@@ -293,6 +298,7 @@ async def _build_registration(
     transport_redactor: SecretRedactor | None = None,
     store_id: str | None = None,
     replaces_cursor: int | None = None,
+    settings_schema: bool = True,
 ) -> tuple[CloudRegistration, _Registered]:
     from cayu.mcp.tools import McpToolAdapter
     from cayu.runtime.manifest import describe_inventory_tools
@@ -400,6 +406,12 @@ async def _build_registration(
     if transport_redactor is not None:
         registration_value = CloudRegistration.model_validate(
             transport_redactor.redact_json(registration_value.model_dump(mode="json"))
+        )
+    if settings_schema:
+        # Added after redaction so that Cloud's recomputed digest matches; declaring a
+        # setting already refuses one that contains a secret.
+        registration_value = registration_value.model_copy(
+            update={"settings_schema": app.managed_settings_schema()}
         )
     registration_value = _fit_registration(registration_value)
     return registration_value, _Registered(
@@ -692,6 +704,9 @@ class CloudInventoryPublisher:
         # A replacement Cloud hasn't answered yet: the cursor replaced and the start sent, kept
         # so a retry doesn't move the start past events written in between.
         self._replacement: tuple[int, int] | None = None
+        # Cloud refuses an invalid settings schema with 422 and keeps the rest of the
+        # registration; later registrations leave the schema out.
+        self._settings_schema_refused = False
 
     def _route(self, suffix: str = "") -> str:
         return (
@@ -758,15 +773,28 @@ class CloudInventoryPublisher:
         if start_cursor is None:
             start_cursor = self._start_cursor if self._cursor is None else self._cursor
         store_id = await _session_store_identity(self._app)
-        registration, registered = await _build_registration(
-            self._app,
-            project_root=self._project_root,
-            start_cursor=start_cursor,
-            transport_redactor=SecretRedactor(self._config.token),
-            store_id=store_id,
-            replaces_cursor=replaces_cursor,
-        )
-        answer = await self._send("PUT", self._route(), registration)
+        while True:
+            registration, registered = await _build_registration(
+                self._app,
+                project_root=self._project_root,
+                start_cursor=start_cursor,
+                transport_redactor=SecretRedactor(self._config.token),
+                store_id=store_id,
+                replaces_cursor=replaces_cursor,
+                settings_schema=not self._settings_schema_refused,
+            )
+            try:
+                answer = await self._send("PUT", self._route(), registration)
+            except CloudRegistryRefused as refused:
+                if refused.status != 422 or registration.settings_schema is None:
+                    raise
+                logger.warning(
+                    "Cayu Cloud refused this Release's managed settings schema; "
+                    "registering without it, so Cloud can't manage its Agent settings."
+                )
+                self._settings_schema_refused = True
+                continue
+            break
         self._registered = registered
         self._store_id = store_id
         self._cursor = self._cursor_from(answer.get("usage_cursor"))

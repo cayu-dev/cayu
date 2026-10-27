@@ -5394,6 +5394,16 @@
           "title": "Schema Version",
           "type": "string"
         },
+        "settings": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ManagedSettingsManifest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "stores": {
           "$ref": "#/components/schemas/StoreManifest"
         }
@@ -6596,6 +6606,7 @@
           "enum": [
             "framework",
             "application",
+            "managed",
             "explicit"
           ],
           "title": "Source",
@@ -15808,6 +15819,183 @@
         "next_cursor"
       ],
       "title": "ListSessionsResponse",
+      "type": "object"
+    },
+    "ManagedSetting": {
+      "additionalProperties": false,
+      "description": "One setting descriptor (``docs/managed-settings.md``, section 1).\n\nParts declare settings with a key relative to themselves (``\"max_steps\"``);\nregistration puts the part's namespace in front (``\"agent.reviewer.max_steps\"``)\nand sets ``owner``. ``default`` is the code's value, or ``None`` when unset.",
+      "properties": {
+        "applies": {
+          "default": "next_session",
+          "enum": [
+            "restart",
+            "next_session",
+            "live"
+          ],
+          "title": "Applies",
+          "type": "string"
+        },
+        "choices": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/ManagedSettingChoice"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Choices"
+        },
+        "default": {
+          "title": "Default",
+          "type": [
+            "boolean",
+            "integer",
+            "number",
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Description"
+        },
+        "key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Key",
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 80,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string"
+        },
+        "max_length": {
+          "anyOf": [
+            {
+              "maximum": 4096.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Length"
+        },
+        "maximum": {
+          "title": "Maximum",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "minimum": {
+          "title": "Minimum",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Owner"
+        },
+        "type": {
+          "enum": [
+            "bool",
+            "int",
+            "number",
+            "string",
+            "enum",
+            "secret_ref"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "type",
+        "label"
+      ],
+      "title": "ManagedSetting",
+      "type": "object"
+    },
+    "ManagedSettingChoice": {
+      "additionalProperties": false,
+      "description": "One allowed value of an ``enum`` setting.",
+      "properties": {
+        "label": {
+          "maxLength": 80,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string"
+        },
+        "value": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "label"
+      ],
+      "title": "ManagedSettingChoice",
+      "type": "object"
+    },
+    "ManagedSettingsManifest": {
+      "additionalProperties": false,
+      "description": "The Release's ``cayu.managed-settings-schema/v1`` document, sorted by key.",
+      "properties": {
+        "contract": {
+          "const": "cayu.managed-settings-schema/v1",
+          "title": "Contract",
+          "type": "string"
+        },
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "settings": {
+          "items": {
+            "$ref": "#/components/schemas/ManagedSetting"
+          },
+          "title": "Settings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "contract",
+        "digest",
+        "settings"
+      ],
+      "title": "ManagedSettingsManifest",
       "type": "object"
     },
     "MemoryAttribution": {
