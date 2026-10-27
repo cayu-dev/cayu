@@ -48,6 +48,13 @@ the patched dependency versions. No storage migration is required.
   (source task_worker)." The inbox's 409 for an expired deadline carries this
   message.
 
+### Changes
+
+- `cayu cloud settings list|set|unset --application AGENT` reads and changes an
+  Agent's managed settings in Cayu Cloud: each setting's effective value, source
+  and status, all-or-nothing changes with an operation id, and `--json` for the
+  usual envelope. An older Cayu Cloud answers `settings_unsupported`.
+
 ### Fixes
 
 - Raise the minimum Pillow, pypdf, Brotli, and OpenTelemetry versions to include

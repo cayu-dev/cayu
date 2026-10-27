@@ -45,6 +45,7 @@ from cayu.cli._cloud_project import (
     resolve_project,
     schedule_input_json,
 )
+from cayu.cli._cloud_settings import CloudSettingsError, add_settings_parser, settings_command
 
 _DEPLOYMENT_FAILURES = {"cancelled", "destroyed", "failed"}
 _DEPLOYMENT_IN_PROGRESS = {
@@ -672,6 +673,8 @@ def run_cloud_cli(arguments: Sequence[str]) -> int:
 
 
 def _run_cloud(arguments: argparse.Namespace) -> int:
+    # A command with its own text output (`settings`) prints JSON only with `--json`.
+    render = None if getattr(arguments, "json", False) else arguments._cloud_render
     try:
         result = _execute(arguments)
     except (
@@ -682,12 +685,17 @@ def _run_cloud(arguments: argparse.Namespace) -> int:
         OSError,
         ValueError,
     ) as exc:
-        return _cloud_failure(exc)
+        return _cloud_failure(
+            exc, render=None if render is None else arguments._cloud_render_failure
+        )
+    if render is not None:
+        print(render(result))
+        return 0
     print(json.dumps({"ok": True, **result}, sort_keys=True))
     return 0
 
 
-def _cloud_failure(exc: Exception) -> int:
+def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | None = None) -> int:
     if isinstance(exc, (CloudApiError, CloudAuthError, CloudCommandError)):
         category, message = exc.category, str(exc)
     elif isinstance(exc, OSError):
@@ -718,7 +726,7 @@ def _cloud_failure(exc: Exception) -> int:
         error.update(exc.details)
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
-    if isinstance(exc, (_CloudDeployCheckError, CompassWriteError)):
+    if isinstance(exc, (_CloudDeployCheckError, CompassWriteError, CloudSettingsError)):
         error.update(exc.details)
     if isinstance(
         exc,
@@ -734,6 +742,9 @@ def _cloud_failure(exc: Exception) -> int:
     if isinstance(exc, _CloudServicePublicationError):
         error.update(exc.details)
         error["publication_error"] = exc.publication_error
+    if render is not None:
+        print(render(error), file=sys.stderr)
+        return 2
     print(
         json.dumps(
             {"error": error, "ok": False},
@@ -750,7 +761,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _configure_parser(parser: argparse.ArgumentParser) -> None:
-    parser.set_defaults(_cloud_preflight=None)
+    parser.set_defaults(_cloud_preflight=None, _cloud_render=None, _cloud_render_failure=None)
     parser.add_argument("--api-key-file", type=Path, help="Defaults to context.")
     parser.add_argument("--context", type=Path, help="Private Cayu Cloud context JSON.")
     parser.add_argument("--evidence-dir", type=Path)
@@ -1070,6 +1081,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "(at most 4096 bytes compact; never a secret)."
         ),
     )
+
+    add_settings_parser(commands)
 
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
 
@@ -1854,6 +1867,12 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         return _environment(arguments, client=client)
     if arguments.command == "schedule":
         return _schedule(arguments, client=client)
+    if arguments.command == "settings":
+        return settings_command(
+            arguments,
+            client=client,
+            application_id=_application_id(client, arguments.application),
+        )
     if arguments.command == "compass":
         return compass_command(
             arguments,

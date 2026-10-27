@@ -58,8 +58,9 @@ _SAFE_API_ERROR_DETAILS = {
 CANDIDATE_REFUSAL_CODES = frozenset({"candidate_baseline_changed", "candidate_expired"})
 
 # Cloud's documented refusals whose code and own message the CLI reports, filtered like a
-# conflict's reason, since the message says what to fix: Compass's (`cayu cloud compass`)
-# and a schedule run's (`cayu cloud schedule run`).
+# conflict's reason, since the message says what to fix: Compass's (`cayu cloud compass`),
+# a schedule run's (`cayu cloud schedule run`) and a settings change's (`cayu cloud
+# settings`), whose structured fields that command reads from `CloudApiError.body`.
 _REPORTED_API_REFUSALS = frozenset(
     {
         (403, "compass_disabled"),
@@ -78,6 +79,8 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "no_schedule"),
         (409, "no_selected_release"),
         (409, "release_source_unreadable"),
+        (409, "settings_revision_conflict"),
+        (422, "invalid_setting"),
         (422, "invalid_settings"),
         (422, "no_objectives"),
         (422, "release_too_large"),
@@ -115,6 +118,7 @@ class CloudApiError(RuntimeError):
         detail: str | None = None,
         code: str | None = None,
         rejected_fields: tuple[tuple[str, str], ...] = (),
+        body: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
@@ -127,6 +131,9 @@ class CloudApiError(RuntimeError):
         # The request fields an HTTP 422 names, as (dotted path, error type) pairs such as
         # ("body.candidate", "extra_forbidden").
         self.rejected_fields = rejected_fields
+        # Cloud's structured rejection (FastAPI's `detail` object), only with a documented
+        # `code`. Its other fields are Cloud's, so a caller checks each one it reads.
+        self.body = body
 
 
 @dataclass(frozen=True)
@@ -238,6 +245,7 @@ class CloudApiClient:
                 else _plain_api_error_detail(response),
                 code=code,
                 rejected_fields=_rejected_fields(response),
+                body=None if code is None or structured is None else structured[1],
             ) from None
         if response.status_code == 204:
             return {}

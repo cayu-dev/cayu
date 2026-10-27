@@ -84,6 +84,7 @@ def test_cloud_help_exposes_first_party_customer_commands(
         "rollback",
         "runtimes",
         "service",
+        "settings",
         "whoami",
     ):
         assert command in help_text

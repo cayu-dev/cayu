@@ -28,7 +28,8 @@ cayu cloud service status --application my-agent
 - `runtimes list|status` for retained runtime artifacts;
 - `service credentials|destroy|logs|pause|restart|resume|sleep|status|wake` for Agent
   infrastructure, and `schedule run` to run a schedule now;
-- `env list|set|unset` for Agent-owned configuration;
+- `env list|set|unset` for Agent-owned configuration, and `settings list|set|unset`
+  for the Agent's [managed settings](#agent-settings);
 - `compass agents|show|enroll|disable|verify|pass|job|missions|findings` for
   [Compass](#compass); and
 - `evidence list|show|verify` for local content-free command records.
@@ -1095,6 +1096,64 @@ If submission loses its response, the CLI reports `deployment_id` and
 `retry_idempotency_key` for `cayu cloud deployment retry DEPLOYMENT_ID
 --idempotency-key KEY`. Agent process health failures, on either smoke provider, and
 other nonretryable failures require repairing the source.
+
+## Agent settings
+
+Managed settings change how an Agent runs without a new deploy. The Release gives
+each setting its value, and a value set in Cloud (from the portal, the API or this
+command) wins until it is unset. Each setting is in one of two namespaces:
+`platform` settings are how Cloud runs the Agent, such as `web.sleep` or
+`web.resources`; `agent` settings are the ones the Agent's own parts declare, and
+Cloud knows them once the Release has started.
+
+```console
+cayu cloud settings list --application my-agent
+cayu cloud settings set web.sleep=always_on --application my-agent
+cayu cloud settings set web.sleep=3600 agent.reviewer.max_steps=60 --application my-agent
+cayu cloud settings unset web.sleep --application my-agent
+```
+
+`list` shows each setting's effective value, its source (`release` or `cloud`) and
+its status (`applied`, `applying`, `conflict` or `refused`). For an Agent setting it
+also shows how many of the Agent's processes adopted it, and lists the reasons a
+process refused one. Values Cloud keeps but can't apply to the selected Release, for
+example a setting the Release no longer declares, are listed as conflicts.
+
+`set` takes one or more `KEY=VALUE` assignments and sends them as one change: either
+all of them apply or none does. A value is read as JSON when it parses as JSON and as
+a string otherwise, so `60` is a number, `true` a boolean,
+`'{"cpu_millis": 512, "memory_mb": 1024}'` an object and `always_on` a string; write
+`'"60"'` to send the string `60`. The command reads the current settings first to
+find each key's namespace and the revision to write against. A key that both
+namespaces have needs a prefix, `platform:KEY` or `agent:KEY`, and a prefixed key is
+sent as written, which also reaches an Agent setting before the Release has
+published its settings.
+
+Each change carries an operation id, which the output names. If the answer to a
+change is lost, run the same command with `--operation-id ID`: Cloud answers a
+repeated id with its first answer instead of changing anything again.
+
+`unset KEY` clears the value set in Cloud, so the Release's value applies again. It
+also clears a value listed as a conflict.
+
+Cloud refuses a change, and changes nothing, when:
+
+- someone else changed the Agent's settings after the command read them (`code`
+  `settings_revision_conflict`, with the current `revision`). Check them with `list`
+  and run the command again;
+- a value isn't valid for its setting (`code` `invalid_setting`). `errors` lists each
+  setting's `namespace`, `key`, `reason` and, when Cloud offers them, the `allowed`
+  values;
+- the setting needs an organization admin, such as `web.sleep=always_on` (`code`
+  `organization_admin_required`, with the `key`).
+
+Unlike the other `cayu cloud` commands, `settings` prints a table, and its errors go
+to standard error. Add `--json` for the same JSON envelope the other commands print:
+`result` is Cloud's settings document, and `set` and `unset` add the keys they
+changed and, for `set`, the `operation_id`.
+
+These commands need a Cayu Cloud release with the settings API; an older one answers
+`settings_unsupported`.
 
 ## Sandboxes for an Agent's tools
 
