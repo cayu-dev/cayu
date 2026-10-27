@@ -382,7 +382,7 @@ def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> No
     assert "needs: [verification-scope, package-build]" in checks
     assert "needs.verification-scope.outputs.release_artifacts == 'true'" in checks
     assert (
-        "group: [core, layout, server, campaign, dashboard, authoring, coding, docker, service]"
+        "group: [core, layout, server, evals, campaign, dashboard, authoring, coding, docker, service]"
         in checks
     )
     assert "matrix.group == 'core'" in checks

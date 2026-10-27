@@ -23,6 +23,9 @@ from cayu.storage.evals_sqlite import SQLiteEvalStore
 
 async def exercise_eval_boundaries() -> None:
     selected = os.environ.get("CAYU_EVAL_BOUNDARY", "all")
+    # CI runs these boundaries as their own package group beside the main journey.
+    if selected == "none":
+        return
     for mode in ("editor", "large", "suites", "storeless"):
         if (
             selected != "all"

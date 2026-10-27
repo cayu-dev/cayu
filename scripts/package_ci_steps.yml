@@ -53,10 +53,10 @@ steps:
     groups: build
     run: uv run python scripts/check_release_artifacts.py dist/first/*
   - name: Create base release environment
-    groups: core, layout, server, campaign, dashboard, authoring, coding, docker, service
+    groups: core, layout, server, evals, campaign, dashboard, authoring, coding, docker, service
     run: uv venv --python 3.11 .release-venv
   - name: Install built wheel
-    groups: core, layout, server, campaign, dashboard, authoring, coding, docker, service
+    groups: core, layout, server, evals, campaign, dashboard, authoring, coding, docker, service
     run: uv pip install --python .release-venv/bin/python dist/first/*.whl
   - name: Verify complete public concept layout from the built wheel
     groups: layout
@@ -176,26 +176,33 @@ steps:
       }
       PY
   - name: Create server release environment
-    groups: server, dashboard, service
+    groups: server, evals, dashboard, service
     run: uv venv --python 3.11 .release-server-venv
   - name: Install built wheel with server extra
-    groups: server, dashboard, service
+    groups: server, evals, dashboard, service
     run: |
       for wheel_path in dist/first/*.whl; do
         uv pip install --python .release-server-venv/bin/python "${wheel_path}[server,browser]"
       done
   - name: Install release Playwright Chromium
-    groups: server, dashboard
+    groups: server, evals, dashboard
     run: .release-server-venv/bin/playwright install --with-deps chromium
   - name: Smoke-test protected cayu serve from the built wheel
     groups: server
     run: .release-server-venv/bin/python scripts/smoke_built_wheel_serve.py
   - name: Verify the installed-wheel dashboard-to-local eval journey
+    # The evals group runs the journey's eval-page boundaries beside it.
     groups: server
     run: |
       unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
       unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-      .release-server-venv/bin/python examples/dashboard_behavior_live.py
+      CAYU_EVAL_BOUNDARY=none .release-server-venv/bin/python examples/dashboard_behavior_live.py
+  - name: Verify the installed-wheel dashboard eval boundaries
+    groups: evals
+    run: |
+      unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
+      unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+      .release-server-venv/bin/python examples/dashboard_eval_boundaries.py
   - name: Verify installed benchmark campaign lifecycle
     # Its own group: it runs beside the server journeys instead of after them.
     groups: campaign

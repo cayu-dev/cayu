@@ -112,6 +112,7 @@ _PACKAGE_VERIFICATION_GROUPS = (
     "core",
     "layout",
     "server",
+    "evals",
     "campaign",
     "dashboard",
     "authoring",

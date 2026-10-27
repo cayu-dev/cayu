@@ -134,15 +134,16 @@ jobs:
     name: Release package contracts (${{ matrix.group }})
     needs: [verification-scope, package-build]
     if: needs.verification-scope.outputs.release_artifacts == 'true'
-    # Core verifies the ARM64 sidecar on native ARM. The server journey and the
-    # layout checks are the longest groups, so they take the larger general workers.
-    runs-on: ${{ fromJSON(github.event.repository.private && (matrix.group == 'core' && '["self-hosted","linux","arm64","gcp-ci"]' || (matrix.group == 'server' || matrix.group == 'layout') && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["self-hosted","linux","x64","gcp-ci","gcp-ci-package"]') || (matrix.group == 'core' && '["ubuntu-24.04-arm"]' || '["ubuntu-latest"]')) }}
-    # Server and dashboard install browser system packages on each fresh runner.
-    timeout-minutes: ${{ (matrix.group == 'server' || matrix.group == 'dashboard') && 30 || 10 }}
+    # Core verifies the ARM64 sidecar on native ARM. The server journey, its eval
+    # boundaries and the layout checks are the longest groups, so they take the
+    # larger general workers.
+    runs-on: ${{ fromJSON(github.event.repository.private && (matrix.group == 'core' && '["self-hosted","linux","arm64","gcp-ci"]' || (matrix.group == 'server' || matrix.group == 'evals' || matrix.group == 'layout') && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["self-hosted","linux","x64","gcp-ci","gcp-ci-package"]') || (matrix.group == 'core' && '["ubuntu-24.04-arm"]' || '["ubuntu-latest"]')) }}
+    # Browser groups install browser system packages on each fresh runner.
+    timeout-minutes: ${{ (matrix.group == 'server' || matrix.group == 'evals' || matrix.group == 'dashboard') && 30 || 10 }}
     strategy:
       fail-fast: false
       matrix:
-        group: [core, layout, server, campaign, dashboard, authoring, coding, docker, service]
+        group: [core, layout, server, evals, campaign, dashboard, authoring, coding, docker, service]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         # Verification consumes the shared archives and current scripts. Only
