@@ -26,7 +26,11 @@ import {
 import { createEvalIdempotencyKey, shortEvalIdentity } from "@/lib/evals-dashboard"
 import { evalsReadinessReasonText } from "@/lib/evals-readiness"
 import type { PromotionAssertion } from "@/lib/evaluation-promotion"
-import type { EvalAdditionPlan, EvalAdditionRequest } from "@/lib/generated/server-api"
+import type {
+  EvalAdditionPlan,
+  EvalAdditionRequest,
+  EvalSuiteViewSummary,
+} from "@/lib/generated/server-api"
 import { cn } from "@/lib/utils"
 import { previewEvalAddition, publishEvalAddition } from "../../api/eval-additions"
 import { fetchSuiteViews } from "../../api/eval-views"
@@ -171,7 +175,13 @@ function AdditionForm({
     getNextPageParam: (last) => (last.has_more ? (last.next_cursor ?? undefined) : undefined),
     enabled: !!capture.data && !pending,
   })
-  const choices = suites.data?.pages.flatMap((page) => page.items) ?? []
+  const choices =
+    suites.data?.pages
+      .flatMap((page) => page.items)
+      .filter(
+        (suite): suite is EvalSuiteViewSummary =>
+          suite.source === "authored" || suite.source === "corpus",
+      ) ?? []
   const chosen = destination || choices[0]?.id || "new"
   const request: EvalAdditionRequest = {
     mode,

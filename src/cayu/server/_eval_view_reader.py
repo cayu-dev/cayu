@@ -15,6 +15,7 @@ from cayu.evals.read_views import (
     EvalCaseHistoryQuery,
     EvalCaseResultReference,
     EvalCaseView,
+    EvalReportedRunView,
     EvalRunCaseFilter,
     EvalRunPlacement,
     EvalRunViewDetail,
@@ -28,9 +29,11 @@ from cayu.evals.read_views import (
     EvalViewPage,
     EvalViewQuery,
     decode_run_view,
+    decode_suite_view,
     run_view_id,
     validate_view_index,
 )
+from cayu.evals.reported import EvalReportedSeriesSelector
 from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.results import CapturedEvaluationResultV1, validate_captured_result_for_corpus
 from cayu.evals.store import (
@@ -41,8 +44,9 @@ from cayu.evals.store import (
     _exact_model,
 )
 from cayu.evals.suite_authoring import _validated_eval_suite_document
+from cayu.server._eval_report_views import EvalReportViewReader, report_comparison
 from cayu.server._eval_result_loader import load_catalog_eval_result
-from cayu.server._eval_view_comparison import compare_view_results
+from cayu.server._eval_view_comparison import EvalViewComparisonData, compare_view_results
 from cayu.server._eval_view_projection import (
     EvalRunViewData,
     case_page,
@@ -70,6 +74,7 @@ class EvalViewReader:
     def __init__(self, store: EvalStore, registry: EvalTargetRegistry):
         self.store = store
         self.registry = registry
+        self.reports = EvalReportViewReader(store, registry)
         self._baseline_snapshots: dict[tuple[str, str, str], EvalBaselineRecord | None] = {}
         self._baseline_results: dict[str, EvalRunViewMetadata | None] = {}
         self._detail_snapshots: dict[
@@ -87,6 +92,10 @@ class EvalViewReader:
         return target
 
     async def suite_document(self, identity):
+        if not isinstance(identity, EvalSuiteViewIdentity):
+            raise HTTPException(
+                status_code=422, detail="Reported series has no native suite document."
+            )
         self.target(identity.target_key)
         if identity.source == "authored":
             document = await self.store.load_authored_suite(identity.revision)
@@ -244,6 +253,14 @@ class EvalViewReader:
         cases_cursor: str | None = None,
         cases_limit: int = 50,
     ) -> EvalRunViewDetail:
+        if decode_run_view(selector)[0] == "report":
+            return await self.reports.run_detail(
+                selector,
+                compared_with=compared_with,
+                case_filter=case_filter,
+                cases_cursor=cases_cursor,
+                cases_limit=cases_limit,
+            )
         key = (selector, compared_with, cases_cursor, cases_limit, case_filter)
         if key in self._detail_snapshots:
             return self._detail_snapshots[key]
@@ -275,7 +292,12 @@ class EvalViewReader:
         selected = compared_with or (
             run_view_id("result", baseline.result_revision) if baseline else None
         )
-        previous = None if selected is None else await self.run_data(selected)
+        external_comparison = selected is not None and decode_run_view(selected)[0] == "report"
+        if external_comparison:
+            await self.reports.record(selected)
+        previous = (
+            None if selected is None or external_comparison else await self.run_data(selected)
+        )
         compared_run = None
         if previous is not None:
             if compared_with is None and previous.identity != data.identity:
@@ -302,6 +324,8 @@ class EvalViewReader:
             None if previous is None else previous.snapshot,
             selected,
         )
+        if external_comparison:
+            comparison = EvalViewComparisonData(report_comparison(selected))
         metadata = run_metadata(
             data,
             baseline=baseline,
@@ -334,6 +358,15 @@ class EvalViewReader:
         )
 
     async def with_history_scope(self, run: EvalRunViewMetadata, identity: EvalSuiteViewIdentity):
+        if type(run) is EvalReportedRunView:
+            record = await self.reports.record(run.id)
+            if identity != record.series.selector and identity != run.association:
+                raise HTTPException(status_code=409, detail="Reported history identity mismatch.")
+            return run
+        if not isinstance(identity, EvalSuiteViewIdentity):
+            raise HTTPException(
+                status_code=409, detail="Native runs cannot belong to reported series."
+            )
         matches = (
             run.suite == identity
             if identity.source == "corpus"
@@ -373,6 +406,8 @@ class EvalViewReader:
         )
 
     async def suite_summary(self, identity: EvalSuiteViewIdentity) -> EvalSuiteViewSummary:
+        if identity.source == "reported":
+            return await self.reports.suite_summary(identity)
         suite, cases = await self.suite_document(identity)
         history = await self.index(
             EvalViewQuery(target_key=identity.target_key, suite=identity, limit=1)
@@ -410,6 +445,17 @@ class EvalViewReader:
         page = await self.index(query)
         items = []
         for entry in page.items:
+            if entry.source == "reported_suite":
+                identity = decode_suite_view(entry.revision)
+                if not isinstance(identity, EvalReportedSeriesSelector):
+                    raise HTTPException(
+                        status_code=409, detail="Reported catalog identity mismatch."
+                    )
+                reported = await self.reports.suite_summary(identity)
+                if reported.identity.target_key != entry.target_key:
+                    raise HTTPException(status_code=409, detail="Reported catalog target mismatch.")
+                items.append(reported)
+                continue
             if entry.source not in {"authored", "corpus"}:
                 raise HTTPException(status_code=409, detail="Invalid eval suite catalog entry.")
             identity = EvalSuiteViewIdentity(
@@ -432,6 +478,10 @@ class EvalViewReader:
         runs_cursor: str | None = None,
         runs_limit: int = 20,
     ) -> EvalSuiteViewDetail:
+        if identity.source == "reported":
+            return await self.reports.suite_detail(
+                identity, runs_cursor=runs_cursor, runs_limit=runs_limit
+            )
         summary = await self.suite_summary(identity)
         _, definitions = await self.suite_document(identity)
         history = await self.index(

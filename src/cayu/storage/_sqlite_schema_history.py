@@ -670,6 +670,31 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    132: """
+CREATE TABLE IF NOT EXISTS cayu_eval_report_series (
+    series_id TEXT PRIMARY KEY,
+    target_key TEXT NOT NULL,
+    selector_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cayu_eval_report_series_target
+    ON cayu_eval_report_series(target_key, series_id);
+CREATE TABLE IF NOT EXISTS cayu_eval_reports (
+    report_key TEXT PRIMARY KEY,
+    publisher_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    series_id TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    association_key TEXT,
+    record_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(publisher_id, operation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_history
+    ON cayu_eval_reports(series_id, created_at, report_key);
+CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
+    ON cayu_eval_reports(association_key, created_at, report_key);
+    """,
     130: """CREATE TABLE IF NOT EXISTS cayu_eval_session_additions (
         operation_id TEXT PRIMARY KEY,
         destination_selector TEXT NOT NULL,

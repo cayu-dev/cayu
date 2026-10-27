@@ -6,9 +6,12 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Annotated
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 
 from cayu.evals.read_views import (
+    EvalReportedRunDetail,
+    EvalReportedSuiteDetail,
+    EvalReportedSuiteView,
     EvalRunCaseFilter,
     EvalRunViewDetail,
     EvalSuiteViewDetail,
@@ -68,7 +71,7 @@ def register_eval_view_routes(
 
     @router.get(
         "/evals/suite-views",
-        response_model=EvalViewPage[EvalSuiteViewSummary],
+        response_model=EvalViewPage[EvalSuiteViewSummary | EvalReportedSuiteView],
         responses=EVALS_ENDPOINT_RESPONSES,
         dependencies=protected,
     )
@@ -86,7 +89,7 @@ def register_eval_view_routes(
 
     @router.get(
         "/evals/suite-views/{suite_key}",
-        response_model=EvalSuiteViewDetail,
+        response_model=EvalSuiteViewDetail | EvalReportedSuiteDetail,
         responses=EVALS_ENDPOINT_RESPONSES,
         dependencies=protected,
     )
@@ -110,7 +113,7 @@ def register_eval_view_routes(
 
     @router.get(
         "/evals/run-views/{run_key}",
-        response_model=EvalRunViewDetail,
+        response_model=EvalRunViewDetail | EvalReportedRunDetail,
         responses=EVALS_ENDPOINT_RESPONSES,
         dependencies=protected,
     )
@@ -134,10 +137,25 @@ def register_eval_view_routes(
             if placement is not None:
                 identity = decode_suite_view(placement)
                 view_reader = reader()
-                await view_reader.suite_document(identity)
+                await view_reader.suite_summary(identity)
                 result = result.model_copy(
                     update={
                         "run": await view_reader.with_history_scope(result.run, identity),
                     }
                 )
             return enforce_view_bytes(result, max_result_bytes)
+
+    @router.get("/evals/reports/{run_key}/download", dependencies=protected)
+    async def download_report(run_key: str):
+        from cayu.evals.reported import report_canonical_bytes
+
+        with _view_errors():
+            record = await reader().reports.record(run_key)
+            return Response(
+                content=report_canonical_bytes(record.report),
+                media_type="application/json",
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "Content-Disposition": 'attachment; filename="eval-report.json"',
+                },
+            )

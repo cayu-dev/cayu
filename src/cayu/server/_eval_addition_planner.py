@@ -72,6 +72,10 @@ class EvalAdditionPlanner:
         destination = request.destination
         if isinstance(destination, EvalExistingDestination):
             parent = decode_suite_view(destination.selector)
+            if not isinstance(parent, EvalSuiteViewIdentity):
+                raise HTTPException(
+                    status_code=422, detail="Reported series cannot receive session additions."
+                )
             if parent.target_key != baseline.target_key:
                 raise HTTPException(
                     status_code=409, detail="Session and destination targets differ."

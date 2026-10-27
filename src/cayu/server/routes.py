@@ -179,6 +179,7 @@ from cayu.server._corpus_routes import (
 )
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
 from cayu.server._eval_addition_routes import register_eval_addition_routes
+from cayu.server._eval_report_routes import reporting_router
 from cayu.server._eval_view_routes import register_eval_view_routes
 from cayu.server._evaluation_promotion_routes import register_evaluation_promotion_routes
 from cayu.server._evaluation_result_routes import register_evaluation_result_routes
@@ -299,6 +300,7 @@ from cayu.server.contracts import (
     UsageRollupRequest,
     UsageRollupResponse,
 )
+from cayu.server.eval_report_auth import EvalReportingAccess
 from cayu.server.evals_registry import (
     generated_eval_target_registry,
     resolved_evals_runtime,
@@ -4308,6 +4310,7 @@ def create_router(
     evaluation_promotion_pricing: PriceBook | None = None,
     generated_evals_pricing: PriceBook | None = None,
     evals: EvalsConfig | None = None,
+    eval_reporting: EvalReportingAccess | None = None,
     continuation_loop_policy_provider: (
         Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
     ) = None,
@@ -4594,6 +4597,7 @@ def create_router(
         session_lineage_supported=session_store.supports_session_lineage,
         session_supervision_events_supported=session_store.supports_supervision_events,
         eval_suite_views_supported=eval_runtime is not None and eval_runtime.store.suite_views,
+        eval_reports_supported=eval_runtime is not None and eval_runtime.store.reports,
         eval_session_additions_supported=eval_runtime is not None
         and eval_runtime.store.session_additions,
         evals_configured=eval_runtime is not None,
@@ -5010,6 +5014,16 @@ def create_router(
             resolve_public_session_id=_resolve_public_session_id,
             protected=protected,
         )
+
+    router.include_router(
+        reporting_router(
+            _BoundedPrivateJsonBodyRoute,
+            store=None if eval_runtime is None else eval_runtime.store,
+            registry=eval_registry,
+            access=eval_reporting,
+            cayu_app=cayu_app,
+        )
+    )
 
     register_eval_view_routes(
         bounded_evals_router,

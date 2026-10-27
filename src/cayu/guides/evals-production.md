@@ -219,3 +219,32 @@ policy, or pricing may make two apparently similar runs unsafe to compare.
 
 Use `cayu guide evals-first` for the smallest author-first workflow and `cayu
 guide evals-ai-quality` for rubric, reference, calibration, and judge semantics.
+
+## Show CI results in the Developer dashboard
+
+Opt in when running an ordinary direct, corpus, workflow or multiprocess eval:
+
+```console
+cayu eval run --output result.json \
+  --report-to https://dashboard.example/api \
+  --report-target YOUR_REGISTERED_TARGET_KEY --report-file report.json
+```
+
+Use a dedicated reporting credential in `CAYU_EVAL_REPORT_TOKEN`. The server’s
+`CAYU_EVAL_REPORTERS` digest grants bind it to a stable publisher and explicit
+targets; operator credentials cannot publish reports. Remote URLs require HTTPS.
+For a local server, explicitly enable `--report-allow-loopback-http`.
+
+Reported series show the publisher and submitted branch, tested commit and PR.
+They are read-only external evidence: an unknown declared suite revision stays
+unknown, and reported runs cannot become native baselines or comparisons.
+`--report-associate-corpus` only accepts an exactly matching already-stored corpus.
+Benchmark campaign reporting is rejected before execution.
+
+The normal result remains available when reporting fails; the command exits 2.
+Retain the credential-free `report.json` as a CI artifact, then use
+`cayu eval publish report.json` to retry the exact publication without rerunning
+the workload. GitHub metadata defaults come from environment/event fields; use
+`--report-commit` when checkout tests a different SHA from `GITHUB_SHA`.
+See `docs/recipes/ci-eval-reporting.md` for grants, metadata overrides, rotation
+and the artifact-retention workflow.

@@ -5,13 +5,20 @@ import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
 import type {
   EvalCasePresentationV2,
+  EvalReportedRunView,
   EvalRunViewMetadata,
   EvalRunViewSummary,
   EvalViewCaseCounts,
 } from "@/lib/generated/server-api"
 import { cn } from "@/lib/utils"
 import { fetchEvalCaseSource } from "../../api/eval-additions"
-import { comparisonLabel, runOrigin, runViewPath, suiteSelector } from "../../app/eval-view-model"
+import {
+  comparisonLabel,
+  isReportedRun,
+  runOrigin,
+  runViewPath,
+  suiteSelector,
+} from "../../app/eval-view-model"
 import { NavLink, ROW_CLASS, ROW_LINK_CLASS, sessionPath, useRowClick } from "../common"
 
 export const FIELD_CLASS =
@@ -149,7 +156,9 @@ export function CaseOutcome({ presentation }: { presentation: EvalCasePresentati
   )
 }
 
-export function Verdict({ run }: { run: EvalRunViewSummary }) {
+export function Verdict({ run }: { run: EvalRunViewSummary | EvalReportedRunView }) {
+  if (isReportedRun(run))
+    return <span className="text-muted-foreground">Comparison unavailable</span>
   if (run.status !== "completed")
     return (
       <span className={run.status === "failed" ? "text-destructive" : "text-muted-foreground"}>
@@ -182,7 +191,8 @@ export function Verdict({ run }: { run: EvalRunViewSummary }) {
     </span>
   )
 }
-export function RunUsage({ run }: { run: EvalRunViewMetadata }) {
+export function RunUsage({ run }: { run: EvalRunViewMetadata | EvalReportedRunView }) {
+  if (isReportedRun(run)) return <>Not retained</>
   if (run.usage.cost != null)
     return (
       <>
@@ -205,7 +215,7 @@ export function Section({ title, children }: { title: string; children: ReactNod
     </section>
   )
 }
-export function RunsTable({ runs }: { runs: EvalRunViewSummary[] }) {
+export function RunsTable({ runs }: { runs: (EvalRunViewSummary | EvalReportedRunView)[] }) {
   const rowClick = useRowClick()
   if (!runs.length)
     return <p className="text-sm text-muted-foreground">No runs recorded for this suite yet.</p>
@@ -228,14 +238,16 @@ export function RunsTable({ runs }: { runs: EvalRunViewSummary[] }) {
               className={ROW_CLASS}
               onClick={rowClick(
                 runViewPath(run.id),
-                run.placement ? { placement: suiteSelector(run.placement.destination) } : undefined,
+                !isReportedRun(run) && run.placement
+                  ? { placement: suiteSelector(run.placement.destination) }
+                  : undefined,
               )}
             >
               <td className="px-3 py-2">
                 <NavLink
                   to={runViewPath(run.id)}
                   search={
-                    run.placement
+                    !isReportedRun(run) && run.placement
                       ? { placement: suiteSelector(run.placement.destination) }
                       : undefined
                   }
@@ -245,7 +257,9 @@ export function RunsTable({ runs }: { runs: EvalRunViewSummary[] }) {
                 </NavLink>
               </td>
               <td className="max-w-64 px-3 py-2 break-words text-muted-foreground">
-                {run.placement ? "Scored session · one captured case" : runOrigin(run)}
+                {!isReportedRun(run) && run.placement
+                  ? "Scored session · one captured case"
+                  : runOrigin(run)}
               </td>
               <td className="px-3 py-2">
                 <PassingBar cases={run.cases} />

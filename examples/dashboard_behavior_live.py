@@ -552,6 +552,9 @@ async def main() -> None:
 
     await asyncio.create_task(exercise_eval_authoring())
     await exercise_eval_boundaries()
+    from dashboard_eval_reporting import exercise_reported_evals
+
+    await asyncio.create_task(exercise_reported_evals())
     app, provider, store, task_store, runtime_directory = await _seed_app()
     price_book = _dashboard_price_book()
     judge_app = CayuApp(enable_logging=False)

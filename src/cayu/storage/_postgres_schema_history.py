@@ -689,6 +689,13 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    132: (
+        'CREATE TABLE IF NOT EXISTS cayu_eval_report_series (\n    series_id TEXT COLLATE "C" PRIMARY KEY,\n    target_key TEXT COLLATE "C" NOT NULL,\n    selector_json TEXT COLLATE "C" NOT NULL,\n    created_at TIMESTAMPTZ NOT NULL\n)',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_report_series_target\n    ON cayu_eval_report_series(target_key, series_id)",
+        'CREATE TABLE IF NOT EXISTS cayu_eval_reports (\n    report_key TEXT COLLATE "C" PRIMARY KEY,\n    publisher_id TEXT COLLATE "C" NOT NULL,\n    operation_id TEXT COLLATE "C" NOT NULL,\n    series_id TEXT COLLATE "C" NOT NULL,\n    target_key TEXT COLLATE "C" NOT NULL,\n    association_key TEXT COLLATE "C",\n    record_json TEXT COLLATE "C" NOT NULL,\n    created_at TIMESTAMPTZ NOT NULL,\n    UNIQUE(publisher_id, operation_id)\n)',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_history\n    ON cayu_eval_reports(series_id, created_at, report_key)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association\n    ON cayu_eval_reports(association_key, created_at, report_key)",
+    ),
     131: (
         "ALTER TABLE cayu_eval_authored_suites ADD COLUMN IF NOT EXISTS "
         'parent_revision TEXT COLLATE "C" CONSTRAINT cayu_eval_authored_parent_revision_check '

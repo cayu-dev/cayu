@@ -514,7 +514,7 @@ def test_parent_binding_schema_migrates_existing_documents_and_rejects_missing_c
     from cayu.storage.migrations import RevisionKind, SchemaMode, SchemaTooOld, revision
 
     assert revision(131).kind is RevisionKind.ADDITIVE
-    assert _SQLITE_EVAL_MIN_REQUIRED_REVISION == _POSTGRES_EVAL_MIN_REQUIRED_REVISION == 131
+    assert _SQLITE_EVAL_MIN_REQUIRED_REVISION == _POSTGRES_EVAL_MIN_REQUIRED_REVISION == 132
     server, _, _ = addition_environment()
     with TestClient(server) as client:
         parent, case_id = _linked_parent(client)
@@ -524,7 +524,7 @@ def test_parent_binding_schema_migrates_existing_documents_and_rejects_missing_c
         connection.execute("ALTER TABLE cayu_eval_authored_suites DROP COLUMN parent_revision")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 131")
         connection.execute("PRAGMA user_version = 130")
-    with pytest.raises(SchemaTooOld, match="requires >= 131"):
+    with pytest.raises(SchemaTooOld, match="requires >= 132"):
         SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
     migrated = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
     restarted, _, _ = addition_environment(store_override=migrated)

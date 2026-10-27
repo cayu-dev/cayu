@@ -1,9 +1,11 @@
-/** Contract 65 suite-centred reads. Preserve server authority and unavailable states. */
+/** Contract 67 suite-centred reads. Preserve server authority and unavailable states. */
 
 import type {
+  EvalReportedRunDetail,
+  EvalReportedSuiteDetail,
   EvalRunViewDetail,
   EvalSuiteViewDetail,
-  EvalViewPageEvalSuiteViewSummary,
+  EvalViewPageUnionEvalSuiteViewSummaryEvalReportedSuiteView,
 } from "@/lib/generated/server-api"
 import { isApiPayloadTooLarge, queryString, requestJson } from "../../lib/api.ts"
 export type EvalCaseFilter = "regressed" | "improved" | "failing" | "flaky"
@@ -45,7 +47,7 @@ export function fetchSuiteViews(
   query: { target_key?: string; cursor?: string } = {},
   signal?: AbortSignal,
 ) {
-  return requestViewPage<EvalViewPageEvalSuiteViewSummary>(
+  return requestViewPage<EvalViewPageUnionEvalSuiteViewSummaryEvalReportedSuiteView>(
     "/evals/suite-views",
     query,
     { limit: 25 },
@@ -57,7 +59,7 @@ export function fetchSuiteView(
   query: { cases_cursor?: string; runs_cursor?: string } = {},
   signal?: AbortSignal,
 ) {
-  return requestViewPage<EvalSuiteViewDetail>(
+  return requestViewPage<EvalSuiteViewDetail | EvalReportedSuiteDetail>(
     `/evals/suite-views/${encodeURIComponent(id)}`,
     query,
     { cases_limit: 25, runs_limit: 20 },
@@ -74,7 +76,7 @@ export function fetchRunView(
   } = {},
   signal?: AbortSignal,
 ) {
-  return requestViewPage<EvalRunViewDetail>(
+  return requestViewPage<EvalRunViewDetail | EvalReportedRunDetail>(
     `/evals/run-views/${encodeURIComponent(id)}`,
     query,
     { cases_limit: 25 },

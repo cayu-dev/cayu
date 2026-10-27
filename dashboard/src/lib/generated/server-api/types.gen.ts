@@ -4474,6 +4474,7 @@ export type ControlPlaneSurfaceCapabilities = {
     artifacts: OptionalSurfaceCapability;
     browser_recordings?: OptionalSurfaceCapability | null;
     dashboard: OptionalSurfaceCapability;
+    eval_reported_views?: OptionalSurfaceCapability | null;
     eval_suite_views?: OptionalSurfaceCapability | null;
     evals: OptionalSurfaceCapability;
     evaluation_promotion: OptionalSurfaceCapability;
@@ -6615,6 +6616,28 @@ export type EvalCorpusDocument = {
 };
 
 /**
+ * EvalCorpusReportEvidence
+ */
+export type EvalCorpusReportEvidence = {
+    /**
+     * Kind
+     */
+    kind?: 'corpus';
+    result: CorpusExecutionResult;
+};
+
+/**
+ * EvalDirectReportEvidence
+ */
+export type EvalDirectReportEvidence = {
+    /**
+     * Kind
+     */
+    kind?: 'direct';
+    run: EvalReportedRun;
+};
+
+/**
  * EvalExecutionCandidateIdentityV1
  *
  * Safe current candidate identity selected by runtime preparation.
@@ -7479,6 +7502,470 @@ export type EvalNewDestination = {
      * Suite Id
      */
     suite_id: string;
+};
+
+/**
+ * EvalOutcome
+ *
+ * One evaluated assertion outcome.
+ *
+ * ``unavailable`` means the assertion could not obtain complete evidence;
+ * ``error`` means execution or evaluation failed. Neither has a numeric score.
+ */
+export type EvalOutcome = 'passed' | 'failed' | 'unavailable' | 'error';
+
+/**
+ * EvalReport
+ */
+export type EvalReport = {
+    association?: EvalReportCorpusAssociation | null;
+    /**
+     * Declared Suite Revision
+     */
+    declared_suite_revision?: string | null;
+    /**
+     * Evidence
+     */
+    evidence: ({
+        kind: 'direct';
+    } & EvalDirectReportEvidence) | ({
+        kind: 'corpus';
+    } & EvalCorpusReportEvidence);
+    origin?: EvalReportOrigin;
+    /**
+     * Program Key
+     */
+    program_key: string;
+    /**
+     * Report Id
+     */
+    report_id: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalReportCorpusAssociation
+ */
+export type EvalReportCorpusAssociation = {
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+};
+
+/**
+ * EvalReportOrigin
+ *
+ * Publisher-supplied attribution, separate from authenticated publisher identity.
+ */
+export type EvalReportOrigin = {
+    /**
+     * Branch
+     */
+    branch?: string | null;
+    /**
+     * Commit
+     */
+    commit?: string | null;
+    /**
+     * Job
+     */
+    job?: string | null;
+    /**
+     * Kind
+     */
+    kind?: 'cli' | 'ci';
+    /**
+     * Pr Head Commit
+     */
+    pr_head_commit?: string | null;
+    /**
+     * Provider
+     */
+    provider?: string | null;
+    /**
+     * Pull Request
+     */
+    pull_request?: number | null;
+    /**
+     * Repository
+     */
+    repository?: string | null;
+    /**
+     * Run Attempt
+     */
+    run_attempt?: number | null;
+    /**
+     * Run Id
+     */
+    run_id?: string | null;
+    /**
+     * Run Url
+     */
+    run_url?: string | null;
+    /**
+     * Sources
+     */
+    sources?: {
+        [key: string]: 'flag' | 'environment';
+    };
+};
+
+/**
+ * EvalReportReceipt
+ */
+export type EvalReportReceipt = {
+    /**
+     * Accepted At
+     */
+    accepted_at: string;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Publisher Id
+     */
+    publisher_id: string;
+    /**
+     * Report Id
+     */
+    report_id: string;
+    /**
+     * Run Key
+     */
+    run_key: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalReportedCase
+ */
+export type EvalReportedCase = {
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Error
+     */
+    error?: string | null;
+    /**
+     * Score
+     */
+    score?: number | null;
+    status: EvalStatus;
+    trial_policy: EvalSuiteTrialPolicyV1;
+    /**
+     * Trials
+     */
+    trials: Array<EvalReportedTrial>;
+    /**
+     * Unavailable Reason
+     */
+    unavailable_reason?: string | null;
+};
+
+/**
+ * EvalReportedCaseView
+ */
+export type EvalReportedCaseView = {
+    /**
+     * Change
+     */
+    change?: 'uncompared';
+    /**
+     * Evidence
+     */
+    evidence: EvalReportedCase | PublishedEvalCaseResult | null;
+    /**
+     * Evidence Omitted
+     *
+     * Evidence above the per-case view bound is retained in the full report download.
+     */
+    evidence_omitted: boolean;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Score
+     */
+    score: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'error' | 'unavailable' | 'skipped';
+    /**
+     * Trial Count
+     */
+    trial_count: number;
+};
+
+/**
+ * EvalReportedCheck
+ */
+export type EvalReportedCheck = {
+    /**
+     * Message
+     */
+    message?: string;
+    /**
+     * Name
+     */
+    name: string;
+    outcome: EvalOutcome;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Threshold
+     */
+    threshold?: number | null;
+};
+
+/**
+ * EvalReportedRun
+ *
+ * Allowlisted direct evidence, without arbitrary metadata, trajectories or local handles.
+ */
+export type EvalReportedRun = {
+    /**
+     * Cases
+     */
+    cases: Array<EvalReportedCase>;
+    /**
+     * Completed At
+     */
+    completed_at: string;
+    /**
+     * Duration Ms
+     */
+    duration_ms: number;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Started At
+     */
+    started_at: string;
+    status: EvalStatus;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+};
+
+/**
+ * EvalReportedRunDetail
+ */
+export type EvalReportedRunDetail = {
+    /**
+     * Compared Run
+     */
+    compared_run?: null;
+    comparison: EvalViewComparison;
+    results: EvalViewPageEvalReportedCaseView;
+    run: EvalReportedRunView;
+};
+
+/**
+ * EvalReportedRunView
+ */
+export type EvalReportedRunView = {
+    association?: EvalSuiteViewIdentity | null;
+    /**
+     * Baseline
+     */
+    baseline?: null;
+    /**
+     * Baseline Result
+     */
+    baseline_result?: null;
+    cases: EvalViewCaseCounts;
+    comparison: EvalViewComparison;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Declared Suite Revision
+     */
+    declared_suite_revision: string | null;
+    /**
+     * Download Url
+     */
+    download_url: string;
+    /**
+     * Finished At
+     */
+    finished_at: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Is Baseline
+     */
+    is_baseline?: false;
+    origin: EvalReportOrigin;
+    /**
+     * Publisher Id
+     */
+    publisher_id: string;
+    /**
+     * Report Id
+     */
+    report_id: string;
+    /**
+     * Score
+     */
+    score: number | null;
+    /**
+     * Source
+     */
+    source?: 'reported';
+    /**
+     * Specialist
+     */
+    specialist: string;
+    /**
+     * Started At
+     */
+    started_at: string | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'error' | 'unavailable' | 'skipped';
+    suite: EvalReportedSeriesIdentity;
+};
+
+/**
+ * EvalReportedSeriesIdentity
+ *
+ * An external history grouping; deliberately has no invented immutable revision.
+ */
+export type EvalReportedSeriesIdentity = {
+    /**
+     * Program Key
+     */
+    program_key: string;
+    /**
+     * Publisher Id
+     */
+    publisher_id: string;
+    /**
+     * Source
+     */
+    source?: 'reported';
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalReportedSuiteDetail
+ */
+export type EvalReportedSuiteDetail = {
+    runs: EvalViewPageEvalReportedRunView;
+    suite: EvalReportedSuiteView;
+};
+
+/**
+ * EvalReportedSuiteView
+ */
+export type EvalReportedSuiteView = {
+    /**
+     * Baseline
+     */
+    baseline?: null;
+    /**
+     * Baseline Result
+     */
+    baseline_result?: null;
+    /**
+     * Baseline Scope
+     */
+    baseline_scope?: 'unavailable';
+    /**
+     * Case Count
+     */
+    case_count: number;
+    /**
+     * Id
+     */
+    id: string;
+    identity: EvalReportedSeriesIdentity;
+    last_run: EvalReportedRunView;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Source
+     */
+    source?: 'reported';
+    /**
+     * Specialist
+     */
+    specialist: string;
+};
+
+/**
+ * EvalReportedTrial
+ */
+export type EvalReportedTrial = {
+    /**
+     * Assertions
+     */
+    assertions: Array<EvalReportedCheck>;
+    /**
+     * Error
+     */
+    error?: string | null;
+    /**
+     * Final Output
+     */
+    final_output?: string;
+    /**
+     * Score
+     */
+    score?: number | null;
+    status: EvalStatus;
+    structured_output?: JsonValue;
+    /**
+     * Trial Number
+     */
+    trial_number: number;
+    /**
+     * Unavailable Reason
+     */
+    unavailable_reason?: string | null;
 };
 
 /**
@@ -8702,6 +9189,11 @@ export type EvalSimpleInputStimulusV1 = {
 };
 
 /**
+ * EvalStatus
+ */
+export type EvalStatus = 'passed' | 'failed' | 'unavailable' | 'error' | 'skipped';
+
+/**
  * EvalStructuredJudgeComparisonV1
  *
  * Explainable comparison of one exact case/trial/assertion observation.
@@ -9365,7 +9857,7 @@ export type EvalSuiteTrialRequestDraftV3 = {
  */
 export type EvalSuiteViewDetail = {
     cases: EvalViewPageEvalCaseView;
-    runs: EvalViewPageEvalRunViewSummary;
+    runs: EvalViewPageUnionEvalRunViewSummaryEvalReportedRunView;
     suite: EvalSuiteViewSummary;
 };
 
@@ -9416,7 +9908,10 @@ export type EvalSuiteViewSummary = {
      */
     id: string;
     identity: EvalSuiteViewIdentity;
-    last_run: EvalRunViewSummary | null;
+    /**
+     * Last Run
+     */
+    last_run: EvalRunViewSummary | EvalReportedRunView | null;
     /**
      * Name
      */
@@ -9858,9 +10353,9 @@ export type EvalViewPageEvalCaseView = {
 };
 
 /**
- * EvalViewPage[EvalRunViewSummary]
+ * EvalViewPage[EvalReportedCaseView]
  */
-export type EvalViewPageEvalRunViewSummary = {
+export type EvalViewPageEvalReportedCaseView = {
     /**
      * Has More
      */
@@ -9868,7 +10363,7 @@ export type EvalViewPageEvalRunViewSummary = {
     /**
      * Items
      */
-    items: Array<EvalRunViewSummary>;
+    items: Array<EvalReportedCaseView>;
     /**
      * Next Cursor
      */
@@ -9880,9 +10375,9 @@ export type EvalViewPageEvalRunViewSummary = {
 };
 
 /**
- * EvalViewPage[EvalSuiteViewSummary]
+ * EvalViewPage[EvalReportedRunView]
  */
-export type EvalViewPageEvalSuiteViewSummary = {
+export type EvalViewPageEvalReportedRunView = {
     /**
      * Has More
      */
@@ -9890,7 +10385,51 @@ export type EvalViewPageEvalSuiteViewSummary = {
     /**
      * Items
      */
-    items: Array<EvalSuiteViewSummary>;
+    items: Array<EvalReportedRunView>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+    /**
+     * Total
+     */
+    total?: number | null;
+};
+
+/**
+ * EvalViewPage[Union[EvalRunViewSummary, EvalReportedRunView]]
+ */
+export type EvalViewPageUnionEvalRunViewSummaryEvalReportedRunView = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Items
+     */
+    items: Array<EvalRunViewSummary | EvalReportedRunView>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+    /**
+     * Total
+     */
+    total?: number | null;
+};
+
+/**
+ * EvalViewPage[Union[EvalSuiteViewSummary, EvalReportedSuiteView]]
+ */
+export type EvalViewPageUnionEvalSuiteViewSummaryEvalReportedSuiteView = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Items
+     */
+    items: Array<EvalSuiteViewSummary | EvalReportedSuiteView>;
     /**
      * Next Cursor
      */
@@ -23379,6 +23918,73 @@ export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewP
 
 export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponse = PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses[keyof PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses];
 
+export type PublishReportApiEvalsReportsPostData = {
+    body: EvalReport;
+    path?: never;
+    query?: never;
+    url: '/api/evals/reports';
+};
+
+export type PublishReportApiEvalsReportsPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type PublishReportApiEvalsReportsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalReportReceipt;
+};
+
+export type PublishReportApiEvalsReportsPostResponse = PublishReportApiEvalsReportsPostResponses[keyof PublishReportApiEvalsReportsPostResponses];
+
+export type DownloadReportApiEvalsReportsRunKeyDownloadGetData = {
+    body?: never;
+    path: {
+        /**
+         * Run Key
+         */
+        run_key: string;
+    };
+    query?: never;
+    url: '/api/evals/reports/{run_key}/download';
+};
+
+export type DownloadReportApiEvalsReportsRunKeyDownloadGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DownloadReportApiEvalsReportsRunKeyDownloadGetError = DownloadReportApiEvalsReportsRunKeyDownloadGetErrors[keyof DownloadReportApiEvalsReportsRunKeyDownloadGetErrors];
+
+export type DownloadReportApiEvalsReportsRunKeyDownloadGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
 export type CompareCatalogEvalResultsApiEvalsResultComparisonsPostData = {
     /**
      * EvalResultComparisonRequest
@@ -23730,9 +24336,11 @@ export type GetRunViewApiEvalsRunViewsRunKeyGetErrors = {
 
 export type GetRunViewApiEvalsRunViewsRunKeyGetResponses = {
     /**
+     * Response Get Run View Api Evals Run Views  Run Key  Get
+     *
      * Successful Response
      */
-    200: EvalRunViewDetail;
+    200: EvalRunViewDetail | EvalReportedRunDetail;
 };
 
 export type GetRunViewApiEvalsRunViewsRunKeyGetResponse = GetRunViewApiEvalsRunViewsRunKeyGetResponses[keyof GetRunViewApiEvalsRunViewsRunKeyGetResponses];
@@ -24819,7 +25427,7 @@ export type ListSuiteViewsApiEvalsSuiteViewsGetResponses = {
     /**
      * Successful Response
      */
-    200: EvalViewPageEvalSuiteViewSummary;
+    200: EvalViewPageUnionEvalSuiteViewSummaryEvalReportedSuiteView;
 };
 
 export type ListSuiteViewsApiEvalsSuiteViewsGetResponse = ListSuiteViewsApiEvalsSuiteViewsGetResponses[keyof ListSuiteViewsApiEvalsSuiteViewsGetResponses];
@@ -24882,9 +25490,11 @@ export type GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetErrors = {
 
 export type GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetResponses = {
     /**
+     * Response Get Suite View Api Evals Suite Views  Suite Key  Get
+     *
      * Successful Response
      */
-    200: EvalSuiteViewDetail;
+    200: EvalSuiteViewDetail | EvalReportedSuiteDetail;
 };
 
 export type GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetResponse = GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetResponses[keyof GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetResponses];

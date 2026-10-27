@@ -22,6 +22,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.json_schema import (
+    SkipJsonSchema,  # noqa: TC002 -- Pydantic resolves this annotation at runtime.
+)
 from pydantic_core import InitErrorDetails, PydanticSerializationError, to_jsonable_python
 
 from cayu._validation import (
@@ -47,6 +50,7 @@ from cayu.server.contracts import (
     SERVER_API_PREFIX,
     validate_usage_rollup_price_book,
 )
+from cayu.server.eval_report_auth import EvalReportingAccess
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionsRecoveryRequest
 
@@ -620,6 +624,9 @@ class ServerConfig(BaseModel):
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     evaluation_promotion: EvaluationPromotionConfig | None = None
     evals: EvalsConfig | None = None
+    eval_reporting: SkipJsonSchema[EvalReportingAccess | None] = Field(
+        default=None, exclude=True, repr=False
+    )
     browser_control: BrowserControlServerConfig | None = None
     docs: DocsConfig = Field(default_factory=DocsConfig)
     cors: CorsConfig = Field(default_factory=CorsConfig)

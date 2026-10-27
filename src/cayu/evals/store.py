@@ -3135,6 +3135,7 @@ if TYPE_CHECKING:
         EvalViewIndexPage,
         EvalViewQuery,
     )
+    from cayu.evals.reported import EvalReport, EvalReportRecord
     from cayu.evals.session_additions import EvalAdditionRecord, PreparedEvalAddition
     from cayu.storage.retention import (
         EvalRetentionPolicy,
@@ -3147,6 +3148,18 @@ if TYPE_CHECKING:
 
 class EvalStore(ABC):
     """Bounded persistence for public eval corpora, run state, and safe results."""
+
+    reports: ClassVar[bool] = False
+
+    async def publish_report(
+        self, report: EvalReport, publisher_id: str, *, redact_json: Callable[[Any], Any]
+    ) -> EvalReportRecord:
+        """Atomically publish external evidence and reconcile an exact immutable replay."""
+        raise NotImplementedError("External eval reporting is unavailable.")
+
+    async def load_report(self, report_key: str) -> EvalReportRecord | None:
+        """Read bounded external evidence; never a native run claim or result."""
+        raise NotImplementedError("External eval reporting is unavailable.")
 
     durable: ClassVar[bool] = False
     session_additions: ClassVar[bool] = False
@@ -3777,6 +3790,47 @@ class InMemoryEvalStore(EvalStore):
     suite_authoring: ClassVar[bool] = True
     judge_calibrations: ClassVar[bool] = True
 
+    reports: ClassVar[bool] = True
+
+    async def publish_report(self, report, publisher_id, *, redact_json):
+        from cayu.evals._report_publication import (
+            prepare_report_record,
+            replay_report,
+            validate_report_association,
+        )
+        from cayu.evals.reported import EvalReportRecord
+
+        record = await asyncio.to_thread(
+            prepare_report_record, report, publisher_id, redact_json=redact_json
+        )
+        async with self._lock:
+            existing = self._reports.get(record.receipt.id)
+            if existing is not None:
+                return replay_report(EvalReportRecord.model_validate_json(existing), record)
+            association = record.report.association
+            document = (
+                None
+                if association is None
+                else self._corpus_documents.get(association.corpus_revision)
+            )
+            corpus = None if document is None else EvalCorpusDocument.model_validate_json(document)
+            validate_report_association(record, corpus)
+            self._reports[record.receipt.id] = record.model_dump_json()
+            return record
+
+    async def load_report(self, report_key):
+        from cayu.evals._report_publication import validate_report_key, validate_report_record
+        from cayu.evals.reported import EvalReportRecord
+
+        report_key = validate_report_key(report_key)
+        async with self._lock:
+            document = self._reports.get(report_key)
+            return (
+                None
+                if document is None
+                else validate_report_record(EvalReportRecord.model_validate_json(document))
+            )
+
     suite_views: ClassVar[bool] = True
 
     async def load_case_addition(
@@ -3942,7 +3996,7 @@ class InMemoryEvalStore(EvalStore):
                             )
                             for item in suites
                         )
-            else:
+            elif query.suite.source != "reported":
                 scope = query.suite
                 for state in self._runs.values():
                     request = state.request
@@ -4002,6 +4056,34 @@ class InMemoryEvalStore(EvalStore):
                             )
                         )
                         present.add(("result", state.record.revision))
+            from cayu.evals._report_publication import report_association_selector
+            from cayu.evals.reported import EvalReportRecord
+
+            series_seen = set()
+            for payload in self._reports.values():
+                report = EvalReportRecord.model_validate_json(payload)
+                if not accepts_target(report.report.target_key):
+                    continue
+                if query.suite is None:
+                    if report.series.id in series_seen:
+                        continue
+                    series_seen.add(report.series.id)
+                    source, revision = "reported_suite", report.series.id
+                elif (
+                    query.suite.id == report.series.id
+                    or query.suite.id == report_association_selector(report)
+                ):
+                    source, revision = "report", report.receipt.id
+                else:
+                    continue
+                items.append(
+                    EvalViewIndexEntry(
+                        source=source,
+                        revision=revision,
+                        created_at=report.receipt.accepted_at,
+                        target_key=report.report.target_key,
+                    )
+                )
             items.sort(key=lambda item: item.key)
             if query.suite is not None:
                 items.sort(key=lambda item: item.created_at, reverse=True)
@@ -4128,6 +4210,7 @@ class InMemoryEvalStore(EvalStore):
         self._results: dict[str, _MemoryEvalResultState] = {}
         self._baselines: dict[tuple[str, str, str], EvalBaselineRecord] = {}
         self._baseline_mutations: dict[str, EvalBaselineMutationRecord] = {}
+        self._reports: dict[str, str] = {}
         self._session_additions: dict[str, str] = {}
         self._case_addition_sources: dict[tuple[str, str], tuple[str, str]] = {}
 

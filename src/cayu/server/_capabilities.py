@@ -46,6 +46,7 @@ class ControlPlaneCapabilitySnapshot:
     tool_usage_supported: bool = False
     session_overview_supported: bool = False
     eval_suite_views_supported: bool = False
+    eval_reports_supported: bool = False
     eval_session_additions_supported: bool = False
 
     @property
@@ -169,6 +170,11 @@ class ControlPlaneCapabilitySnapshot:
                     self.evaluation_promotion_configured,
                     supported=self.evaluation_promotion_supported,
                 ),
+                eval_reported_views=_optional_surface(
+                    self.eval_store_configured and self.eval_target_configured,
+                    read_supported=self.eval_reports_supported,
+                    mutation_supported=False,
+                ),
                 eval_suite_views=_optional_surface(
                     self.eval_store_configured and self.eval_target_configured,
                     read_supported=self.eval_suite_views_supported,
@@ -215,6 +221,7 @@ def inspect_control_plane_capabilities(
     tool_usage_supported: bool = False,
     session_overview_supported: bool = False,
     eval_suite_views_supported: bool = False,
+    eval_reports_supported: bool = False,
     eval_session_additions_supported: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
@@ -232,6 +239,7 @@ def inspect_control_plane_capabilities(
     )
     for field_name, value in (
         ("eval_suite_views_supported", eval_suite_views_supported),
+        ("eval_reports_supported", eval_reports_supported),
         ("eval_session_additions_supported", eval_session_additions_supported),
         ("browser_recordings_configured", browser_recordings_configured),
         ("dashboard_configured", dashboard_configured),
@@ -264,6 +272,7 @@ def inspect_control_plane_capabilities(
         raise ValueError("Configured Evals requires store, target, and project identity evidence.")
     return ControlPlaneCapabilitySnapshot(
         eval_suite_views_supported=eval_suite_views_supported,
+        eval_reports_supported=eval_reports_supported,
         eval_session_additions_supported=eval_session_additions_supported,
         browser_recordings_configured=browser_recordings_configured,
         task_index_supported=task_index_supported,

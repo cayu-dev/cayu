@@ -14,6 +14,11 @@ from pathlib import Path
 from uuid import uuid4
 
 from cayu.build_provenance import current_runtime_build_provenance
+from cayu.cli._eval_process_reporting import (
+    ReportedProcessEvalRun,
+    combine_worker_reports,
+    save_worker_report,
+)
 from cayu.evals._admission import (
     LaunchAdmission,
     LaunchScheduling,
@@ -127,9 +132,11 @@ async def run_process_eval(
     max_concurrency: int,
     case_timeout_seconds: float | None,
     stagger_seconds: float = 0,
+    reporting: bool = False,
+    reporting_context: dict | None = None,
     startup_timeout_seconds: float = 120,
     shutdown_grace_seconds: float = 30,
-) -> EvalRun:
+) -> EvalRun | ReportedProcessEvalRun:
     stagger_seconds = validate_stagger_seconds(stagger_seconds)
     if os.name != "posix":
         raise ValueError("Multi-process Cayu execution currently requires POSIX.")
@@ -163,13 +170,21 @@ async def run_process_eval(
         "startup_timeout_seconds": startup_timeout_seconds,
         "shutdown_grace_seconds": shutdown_grace_seconds,
     }
+    context_json = ""
+    if reporting:
+        manifest["reporting"] = True
+        context_json = json.dumps(reporting_context, sort_keys=True, separators=(",", ":"))
+        manifest["reporting_context_hash"] = hashlib.sha256(context_json.encode()).hexdigest()
     _write_json(directory / "launch.json", manifest)
     print(f"Eval process launch {launch_id}: {directory}", file=sys.stderr, flush=True)
     commands = [
         ProcessWorkerCommand(
             argv=(sys.executable, "-m", "cayu.cli._eval_processes", str(directory), str(index)),
             cwd=project_root,
-            environment=process_worker_environment(index, count),
+            environment={
+                **process_worker_environment(index, count),
+                **({"CAYU_EVAL_REPORT_CONTEXT": context_json} if reporting else {}),
+            },
             log_path=directory / f"worker-{index}.log",
         )
         for index in range(count)
@@ -314,6 +329,10 @@ async def run_process_eval(
             },
         )
         _write_json(directory / "completed.json", {"launch_id": launch_id})
+        if reporting:
+            return ReportedProcessEvalRun(
+                result, combine_worker_reports(directory, assignments, launch_id, result)
+            )
         return result
     except BaseException as exc:
         _write_json(
@@ -423,6 +442,7 @@ async def _worker(directory: Path, index: int) -> None:
             if await _plan_identity(plan) != identity:
                 raise RuntimeError("Process eval target changed during execution.")
             _write_json(directory / f"result-{index}.json", json.loads(eval_run_to_json(result)))
+            save_worker_report(directory, index, launch, plan, result)
     finally:
         watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -547,6 +567,7 @@ async def _dynamic_worker(directory, index, launch, identity, plan):
     )
     if result is not None:
         _write_json(directory / f"result-{index}.json", result.model_dump(mode="json"))
+        save_worker_report(directory, index, launch, plan, result)
 
 
 if __name__ == "__main__":

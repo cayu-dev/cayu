@@ -168,7 +168,7 @@ from cayu.storage._eval_view_queries import latest_case_results_sql, view_index_
 from cayu.storage._postgres_base import _configure_store_connection, _PostgresStoreBase
 from cayu.storage._postgres_verified_work import PostgresMutationMixin
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 131
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 132
 
 logger = logging.getLogger(__name__)
 
@@ -1289,6 +1289,36 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                     "duration_seconds": monotonic() - started_at,
                 },
             )
+
+    reports: ClassVar[bool] = True
+
+    async def publish_report(self, report, publisher_id, *, redact_json):
+        from cayu.evals._report_publication import prepare_report_record
+        from cayu.storage._eval_report_publication import publish_postgres_report
+
+        record = await asyncio.to_thread(
+            prepare_report_record, report, publisher_id, redact_json=redact_json
+        )
+        await self._ensure_ready()
+
+        async def publish(conn, cur):
+            return await publish_postgres_report(cur, record)
+
+        return await self._run_owned_mutation(publish)
+
+    async def load_report(self, report_key):
+        from cayu.evals._report_publication import validate_report_key
+        from cayu.storage._eval_report_publication import load_report_document
+
+        report_key = validate_report_key(report_key)
+
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT record_json FROM cayu_eval_reports WHERE report_key = %s", (report_key,)
+            )
+            row = await cur.fetchone()
+        return load_report_document(None if row is None else row[0])
 
     suite_views: ClassVar[bool] = True
 

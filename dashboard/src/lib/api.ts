@@ -1017,6 +1017,14 @@ export async function downloadCatalogEvalResultHtml(
   )
 }
 
+export function downloadEvalReport(runKey: string, signal?: AbortSignal) {
+  return downloadFile(
+    `/evals/reports/${encodeURIComponent(runKey)}/download`,
+    "eval-report.json",
+    signal,
+  )
+}
+
 async function downloadFile(
   path: string,
   fallbackFilename: string,

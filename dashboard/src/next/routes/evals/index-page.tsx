@@ -6,7 +6,13 @@ import { EvalSuiteAuthoringAction } from "@/components/dashboard/eval-suite-auth
 import { fetchEvalTargets } from "@/lib/api"
 import { EVAL_TARGET_QUERY_KEY } from "@/lib/evals-dashboard"
 import { fetchSuiteViews, resolveLegacyEvalSuite } from "../../api/eval-views"
-import { runOrigin, runViewPath, suiteSelector, suiteViewPath } from "../../app/eval-view-model"
+import {
+  isReportedRun,
+  runOrigin,
+  runViewPath,
+  suiteSelector,
+  suiteViewPath,
+} from "../../app/eval-view-model"
 import { NavLink, PageBody, ROW_CLASS, ROW_LINK_CLASS, TopBar, useGo, useRowClick } from "../common"
 import {
   DateText,
@@ -150,8 +156,13 @@ export function EvalsIndexPage() {
                             {s.name}
                           </NavLink>
                           <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                            {s.specialist} · {s.source === "authored" ? "Written here" : "Corpus"} ·{" "}
-                            {s.trials.trial_count} trials
+                            {s.specialist} ·{" "}
+                            {s.source === "reported"
+                              ? "Reported series"
+                              : s.source === "authored"
+                                ? "Written here"
+                                : "Corpus"}
+                            {"trials" in s && ` · ${s.trials.trial_count} trials`}
                           </p>
                         </td>
                         <td className="px-3 py-2 tabular-nums">{s.case_count}</td>
@@ -161,7 +172,7 @@ export function EvalsIndexPage() {
                               <NavLink
                                 to={runViewPath(s.last_run.id)}
                                 search={
-                                  s.last_run.placement
+                                  !isReportedRun(s.last_run) && s.last_run.placement
                                     ? { placement: suiteSelector(s.last_run.placement.destination) }
                                     : undefined
                                 }
@@ -171,7 +182,7 @@ export function EvalsIndexPage() {
                               <p className="mt-1 text-xs text-muted-foreground">
                                 <DateText value={s.last_run.started_at ?? s.last_run.created_at} />{" "}
                                 ·{" "}
-                                {s.last_run.placement
+                                {!isReportedRun(s.last_run) && s.last_run.placement
                                   ? "Scored session · one captured case"
                                   : runOrigin(s.last_run)}
                               </p>
@@ -190,6 +201,8 @@ export function EvalsIndexPage() {
                             </>
                           ) : s.baseline_scope === "execution_group" ? (
                             "Per execution group"
+                          ) : s.source === "reported" ? (
+                            "Unavailable for reports"
                           ) : (
                             "Not approved"
                           )}

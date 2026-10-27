@@ -153,6 +153,9 @@ def test_postgres_read_plans_preserve_binary_order_under_a_linguistic_default(vi
             CREATE TABLE cayu_eval_result_records (revision TEXT, created_at TEXT, target_key TEXT,
                 corpus_revision TEXT, suite_id TEXT, origin TEXT, captured_result TEXT);
             CREATE TABLE cayu_eval_session_additions (destination_selector TEXT, result_revision TEXT);
+            CREATE TABLE cayu_eval_report_series (selector_json TEXT, created_at TEXT, target_key TEXT);
+            CREATE TABLE cayu_eval_reports (report_key TEXT, created_at TEXT, target_key TEXT,
+                series_id TEXT, association_key TEXT);
         """)
         revision = "sha256:" + "a" * 64
         at = datetime(2026, 1, 1, tzinfo=UTC)

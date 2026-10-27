@@ -137,6 +137,9 @@ def add_eval_parser(subparsers: Any) -> None:
     from cayu.cli._benchmark_campaigns import add_benchmark_arguments
 
     add_benchmark_arguments(run, inner)
+    from cayu.cli._eval_reporting import add_report_arguments
+
+    add_report_arguments(run, inner)
 
     for command in ("status", "failures"):
         inspection = inner.add_parser(
@@ -265,6 +268,10 @@ def add_eval_parser(subparsers: Any) -> None:
 
 def run_eval_command(args: argparse.Namespace) -> int:
     try:
+        if args.eval_command == "publish":
+            from cayu.cli._eval_reporting import publish_saved
+
+            return asyncio.run(publish_saved(args))
         if args.eval_command == "run":
             return asyncio.run(_run(args))
         if args.eval_command == "package":
@@ -447,8 +454,10 @@ def _inspection_text(value: str) -> str:
 
 async def _run(args: argparse.Namespace) -> int:
     from cayu.cli._benchmark_campaigns import require_package_for_benchmark_options, run_benchmark
+    from cayu.cli._eval_reporting import prepare_report_request
 
     if getattr(args, "package", None) is not None:
+        prepare_report_request(args)
         return await run_benchmark(args)
     require_package_for_benchmark_options(args)
     admission = LaunchAdmission(getattr(args, "stagger_seconds", 0))
@@ -457,6 +466,12 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmission) -> int:
+    from cayu.cli._eval_reporting import (
+        finish_report,
+        prepare_report_request,
+        report_request_context,
+    )
+
     project = resolve_eval_project(args.target)
     label = (
         "Command-line eval target"
@@ -464,14 +479,24 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
         else f"Configured eval target from {project.root / 'pyproject.toml'}"
     )
     with project_context(project.root):
+        report_request = prepare_report_request(args)
         # Relative eval paths are interpreted from the resolved project root,
         # so collision checks must run in that same filesystem context.
         _reject_output_path_aliases(
             outputs=(
                 ("--output", args.output),
                 ("--html-output", args.html_output),
+                ("--report-file", None if report_request is None else str(report_request.file)),
             ),
-            protected=(("--corpus", args.corpus),),
+            protected=(
+                ("--corpus", args.corpus),
+                (
+                    "--report-token-file",
+                    None
+                    if report_request is None or report_request.credential_file is None
+                    else str(report_request.credential_file),
+                ),
+            ),
         )
         if getattr(args, "processes", 1) > 1:
             if args.corpus is not None or args.suite is not None:
@@ -490,7 +515,7 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
                     raise ValueError(
                         "Eval report output must be outside its private process directory."
                     )
-            run = await run_process_eval(
+            process_result = await run_process_eval(
                 target=project.target,
                 project_root=project.root,
                 directory=directory,
@@ -498,11 +523,27 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
                 stagger_seconds=admission.stagger_seconds,
                 max_concurrency=args.max_concurrency,
                 case_timeout_seconds=args.case_timeout_seconds,
+                reporting=report_request is not None,
+                reporting_context=None
+                if report_request is None
+                else report_request_context(report_request, project.target),
             )
+            from cayu.cli._eval_process_reporting import ReportedProcessEvalRun
+
+            if isinstance(process_result, ReportedProcessEvalRun):
+                run, projected = process_result.run, process_result.report
+            else:
+                run, projected = process_result, None
             _write_or_print(eval_run_to_json(run), args.output)
             if args.html_output is not None:
                 Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
-            return _status_exit_code(run.status)
+            reported = await finish_report(
+                report_request,
+                run,
+                program_key=project.target,
+                projected=projected,
+            )
+            return _status_exit_code(run.status) if reported else 2
         if getattr(args, "process_directory", None) is not None:
             raise ValueError("--process-directory requires --processes greater than one.")
         plan = await _load_eval_plan(project.target, label=label)
@@ -530,7 +571,10 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
             _write_or_print(output, args.output)
             if args.html_output is not None:
                 Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
-            return _status_exit_code(run.status)
+            reported = await finish_report(
+                report_request, run, program_key=project.target, plan=plan
+            )
+            return _status_exit_code(run.status) if reported else 2
 
         if plan.corpus_target is None and plan.workflow_target is None:
             raise ValueError(
@@ -560,7 +604,10 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
                 render_corpus_execution_html(result),
                 encoding="utf-8",
             )
-        return _status_exit_code(result.run.status)
+        reported = await finish_report(
+            report_request, result, program_key=project.target, plan=plan
+        )
+        return _status_exit_code(result.run.status) if reported else 2
 
 
 async def _load_eval_plan(target: str, *, label: str) -> EvalPlan:

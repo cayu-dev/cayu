@@ -12,7 +12,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from cayu._eval_limits import EVAL_SUITE_MAX_CONCURRENCY
 from cayu._validation import MAX_SESSION_ID_BYTES
@@ -101,6 +109,8 @@ class EvalProcessInspectionV1(_Model):
 
 
 class _Launch(_Model):
+    reporting: StrictBool = False
+    reporting_context_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     schema_version: Literal[1, 2, 3]
     launch_id: str = Field(min_length=1, max_length=512)
     target: str = Field(min_length=1, max_length=4096)

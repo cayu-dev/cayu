@@ -31,6 +31,13 @@ from cayu.evals.execution_comparison import (
     EvalToolJsonAssertionComparisonV1,
 )
 from cayu.evals.execution_profiles import EvalExecutionCandidateIdentityV1
+from cayu.evals.published import PublishedEvalCaseResult
+from cayu.evals.reported import (
+    EvalReportedCase,
+    EvalReportedSeriesIdentity,
+    EvalReportedSeriesSelector,
+    EvalReportOrigin,
+)
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
 from cayu.evals.result_presentation import EvalCasePresentationV2
 from cayu.evals.store import (
@@ -88,8 +95,10 @@ def decode_view_token(token: str) -> object:
     return value
 
 
-def decode_suite_view(token: str) -> EvalSuiteViewIdentity:
+def decode_suite_view(token: str) -> EvalSuiteViewIdentity | EvalReportedSeriesSelector:
     value = decode_view_token(token)
+    if isinstance(value, list) and len(value) == 2 and value[0] == "reported-suite":
+        return EvalReportedSeriesSelector.model_validate(value[1])
     if not isinstance(value, list) or len(value) != 2 or value[0] != "suite":
         raise ValueError("Invalid suite selector.")
     return EvalSuiteViewIdentity.model_validate(value[1])
@@ -105,7 +114,7 @@ def decode_run_view(token: str) -> tuple[str, str]:
         not isinstance(value, list)
         or len(value) != 2
         or type(value[0]) is not str
-        or value[0] not in {"run", "result"}
+        or value[0] not in {"run", "result", "report"}
         or type(value[1]) is not str
         or not 1 <= len(value[1]) <= 256
     ):
@@ -118,7 +127,7 @@ class EvalViewQuery(EvalViewModel):
     target_keys: tuple[StrictStr, ...] | None = Field(
         default=None, max_length=EVAL_STORE_MAX_CLAIM_TARGETS
     )
-    suite: EvalSuiteViewIdentity | None = None
+    suite: EvalSuiteViewIdentity | EvalReportedSeriesSelector | None = None
     cursor: StrictStr | None = Field(default=None, max_length=EVAL_STORE_MAX_CURSOR_BYTES)
     limit: StrictInt = Field(
         default=EVAL_STORE_DEFAULT_PAGE_SIZE, ge=1, le=EVAL_STORE_MAX_PAGE_SIZE
@@ -136,7 +145,10 @@ class EvalViewQuery(EvalViewModel):
                 raise ValueError("Target filters must be bounded, unique and sorted.")
             if self.target_key is not None and self.target_key not in self.target_keys:
                 raise ValueError("Target is outside the permitted query scope.")
-        if self.suite is not None and self.suite.target_key != self.target_key:
+        if (
+            isinstance(self.suite, EvalSuiteViewIdentity)
+            and self.suite.target_key != self.target_key
+        ):
             raise ValueError("Suite query target mismatch.")
         return self
 
@@ -178,7 +190,7 @@ class EvalViewQuery(EvalViewModel):
 
 class EvalViewIndexEntry(EvalViewModel):
     target_key: StrictStr = Field(min_length=1, max_length=128)
-    source: Literal["authored", "corpus", "run", "result"]
+    source: Literal["authored", "corpus", "reported_suite", "run", "result", "report"]
     revision: StrictStr
     suite_id: StrictStr | None = None
     created_at: datetime
@@ -406,6 +418,66 @@ class EvalRunViewSummary(EvalRunViewMetadata):
     baseline_result: EvalRunViewMetadata | None
 
 
+class EvalReportedRunView(EvalViewModel):
+    source: Literal["reported"] = "reported"
+    id: str
+    report_id: str
+    publisher_id: str
+    suite: EvalReportedSeriesIdentity
+    specialist: str
+    declared_suite_revision: str | None
+    origin: EvalReportOrigin
+    status: Literal["passed", "failed", "error", "unavailable", "skipped"]
+    score: float | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    cases: EvalViewCaseCounts
+    comparison: EvalViewComparison
+    baseline: None = None
+    baseline_result: None = None
+    is_baseline: Literal[False] = False
+    association: EvalSuiteViewIdentity | None = None
+    download_url: str
+
+
+class EvalReportedSuiteView(EvalViewModel):
+    source: Literal["reported"] = "reported"
+    id: str
+    identity: EvalReportedSeriesIdentity
+    name: str
+    specialist: str
+    case_count: int
+    baseline: None = None
+    baseline_result: None = None
+    baseline_scope: Literal["unavailable"] = "unavailable"
+    last_run: EvalReportedRunView
+
+
+class EvalReportedCaseView(EvalViewModel):
+    id: str
+    status: Literal["passed", "failed", "error", "unavailable", "skipped"]
+    score: float | None
+    trial_count: int
+    evidence: EvalReportedCase | PublishedEvalCaseResult | None
+    evidence_omitted: bool = Field(
+        description="Evidence above the per-case view bound is retained in the full report download."
+    )
+    change: Literal["uncompared"] = "uncompared"
+
+
+class EvalReportedRunDetail(EvalViewModel):
+    run: EvalReportedRunView
+    compared_run: None = None
+    comparison: EvalViewComparison
+    results: EvalViewPage[EvalReportedCaseView]
+
+
+class EvalReportedSuiteDetail(EvalViewModel):
+    suite: EvalReportedSuiteView
+    runs: EvalViewPage[EvalReportedRunView]
+
+
 class EvalSuiteViewSummary(EvalViewModel):
     id: str
     identity: EvalSuiteViewIdentity
@@ -420,7 +492,7 @@ class EvalSuiteViewSummary(EvalViewModel):
     baseline_scope: Literal["suite", "execution_group"] = Field(
         description="Authored definitions use execution_group: their baseline is null and each history run exposes the baseline for its exact corpus/suite group. Corpus suites use suite.",
     )
-    last_run: EvalRunViewSummary | None
+    last_run: EvalRunViewSummary | EvalReportedRunView | None
 
 
 class EvalCaseView(EvalViewModel):
@@ -450,7 +522,7 @@ class EvalCaseResultView(EvalViewModel):
 class EvalSuiteViewDetail(EvalViewModel):
     suite: EvalSuiteViewSummary
     cases: EvalViewPage[EvalCaseView]
-    runs: EvalViewPage[EvalRunViewSummary]
+    runs: EvalViewPage[EvalRunViewSummary | EvalReportedRunView]
 
 
 class EvalRunViewDetail(EvalViewModel):

@@ -8,6 +8,8 @@ import { fetchEvalTargets } from "@/lib/api"
 import { EVAL_TARGET_QUERY_KEY } from "@/lib/evals-dashboard"
 import { fetchSuiteView } from "../../api/eval-views"
 import {
+  isNativeSuiteDetail,
+  isReportedSuiteDetail,
   nativeRunSelector,
   runViewPath,
   suiteSelector,
@@ -55,7 +57,9 @@ function EditorPage() {
     enabled: !!suiteId,
     retry: false,
   })
-  const identity = suite.data?.suite.identity
+  const native = isNativeSuiteDetail(suite.data) ? suite.data : undefined
+  const reported = isReportedSuiteDetail(suite.data)
+  const identity = native?.suite.identity
   const target = suiteId
     ? identity?.target_key
     : (search.target ?? targets.data?.default_target_key)
@@ -140,7 +144,9 @@ function EditorPage() {
         )}
         {suite.data && !authored && (
           <p role="status">
-            Corpus suites are read-only here. Import a revised corpus from Eval settings.
+            {reported
+              ? "Reported series are read-only. Run the source program and publish a new report."
+              : "Corpus suites are read-only here. Import a revised corpus from Eval settings."}
           </p>
         )}
         {unavailable && (

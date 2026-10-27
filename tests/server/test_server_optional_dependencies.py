@@ -26,7 +26,7 @@ def _purge_cached_modules(monkeypatch: pytest.MonkeyPatch, *prefixes: str) -> No
             monkeypatch.delitem(sys.modules, module_name, raising=False)
 
 
-@pytest.mark.parametrize("blocked", ["sse_starlette", "fastapi"])
+@pytest.mark.parametrize("blocked", ["sse_starlette", "fastapi", "starlette"])
 def test_missing_server_dependency_raises_helpful_error(
     monkeypatch: pytest.MonkeyPatch, blocked: str
 ) -> None:
@@ -47,10 +47,12 @@ def test_unrelated_missing_module_is_not_masked(monkeypatch: pytest.MonkeyPatch)
         importlib.import_module("cayu.server")
 
 
+@pytest.mark.parametrize("blocked", ["fastapi", "starlette"])
 def test_serve_reports_missing_server_extra(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    blocked: str,
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(
         '[tool.cayu]\nfactory = "optional_server_project:build_app"\n',
@@ -60,8 +62,8 @@ def test_serve_reports_missing_server_extra(
         "from cayu import CayuApp\n\ndef build_app():\n    return CayuApp(enable_logging=False)\n",
         encoding="utf-8",
     )
-    _purge_cached_modules(monkeypatch, "cayu.server", "fastapi")
-    monkeypatch.setitem(sys.modules, "fastapi", None)
+    _purge_cached_modules(monkeypatch, "cayu.server", blocked)
+    monkeypatch.setitem(sys.modules, blocked, None)
     monkeypatch.chdir(tmp_path)
     sys.modules.pop("optional_server_project", None)
 
@@ -76,3 +78,4 @@ def test_server_imports_cleanly_with_extra_installed() -> None:
     # proves the guard is a no-op when the dependencies are present.
     module = importlib.import_module("cayu.server")
     assert hasattr(module, "create_server")
+    assert hasattr(module, "EvalReportingAccess")

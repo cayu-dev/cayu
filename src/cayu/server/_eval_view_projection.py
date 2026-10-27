@@ -15,6 +15,7 @@ from cayu.evals.published import _published_score
 from cayu.evals.read_views import (
     EvalCaseResultView,
     EvalCaseView,
+    EvalReportedCaseView,
     EvalRunCaseFilter,
     EvalRunViewMetadata,
     EvalRunViewSnapshot,
@@ -34,7 +35,7 @@ from cayu.evals.suite_authoring import EvalCaseDefinition
 from cayu.evals.trial_policy import EvalCaseReliabilityV1
 from cayu.server._eval_view_comparison import EvalViewComparisonData
 
-CaseRow = TypeVar("CaseRow", EvalCaseView, EvalCaseResultView)
+CaseRow = TypeVar("CaseRow", EvalCaseView, EvalCaseResultView, EvalReportedCaseView)
 
 
 @dataclass(frozen=True)

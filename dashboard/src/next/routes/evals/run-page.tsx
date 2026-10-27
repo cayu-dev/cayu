@@ -31,6 +31,9 @@ import {
   comparisonLabel,
   evalCaseFilter,
   evidenceText,
+  isNativeRunDetail,
+  isReportedRun,
+  isReportedRunDetail,
   resultSelector,
   runOrigin,
   runViewPath,
@@ -39,6 +42,7 @@ import {
 } from "../../app/eval-view-model"
 import { NavLink, PageBody, sessionPath, TopBar, useGo } from "../common"
 import { ComparisonSummary } from "./comparison-details"
+import { ReportedRunPage } from "./reported-pages"
 import {
   CaseOutcome,
   DateText,
@@ -252,8 +256,11 @@ export function EvalRunViewPage() {
       ["running", "queued", "cancelling"].includes(q.state.data?.run.status ?? "") ? 1500 : false,
     refetchIntervalInBackground: false,
   })
-  const r = query.data?.run
-  const comparedRevision = query.data?.compared_run?.result_revision
+  const data = query.data
+  const reported = isReportedRunDetail(data) ? data : undefined
+  const detail = isNativeRunDetail(data) ? data : undefined
+  const r = detail?.run
+  const comparedRevision = detail?.compared_run?.result_revision
   const technicalComparison = useQuery({
     queryKey: ["evals", "technical-comparison", comparedRevision, r?.result_revision],
     queryFn: ({ signal }) => compareEvalResults(comparedRevision!, r!.result_revision!, 0, signal),
@@ -356,7 +363,21 @@ export function EvalRunViewPage() {
       setCursor(undefined)
     void go(runViewPath(runId), { ...search, ...patch }, { resetScroll: false })
   }
-  const selected = query.data?.results.items.find((item) => item.case.id === search.case)
+  const selected = detail?.results.items.find((item) => item.case.id === search.case)
+  if (reported)
+    return (
+      <ReportedRunPage
+        detail={reported}
+        cursor={cursor}
+        setCursor={setCursor}
+        busy={query.isFetching}
+        filter={filter}
+        changeSearch={changeSearch}
+        selectedId={search.case}
+        error={query.error}
+        retry={query.refetch}
+      />
+    )
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar
@@ -403,7 +424,7 @@ export function EvalRunViewPage() {
           pending={query.isPending}
           retry={() => (cursor ? setCursor(undefined) : void query.refetch())}
         />
-        {r && query.data && (
+        {r && detail && (
           <>
             {r.placement && (
               <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-border p-3 text-sm">
@@ -424,11 +445,11 @@ export function EvalRunViewPage() {
               canReadDetails &&
               r.origin === "captured_session" &&
               r.result_revision &&
-              query.data.results.items[0] && (
+              detail.results.items[0] && (
                 <div className="mb-3">
                   <EvalSourceLink
                     suite={suiteSelector(r.suite)}
-                    caseId={query.data.results.items[0].case.id}
+                    caseId={detail.results.items[0].case.id}
                     resultRevision={r.result_revision}
                   />
                 </div>
@@ -453,14 +474,14 @@ export function EvalRunViewPage() {
                 {
                   name: "Passing",
                   value: <PassingBar cases={r.cases} />,
-                  baseline: query.data.compared_run?.cases
-                    ? `${query.data.compared_run.cases.passed}/${query.data.compared_run.cases.total}`
+                  baseline: detail.compared_run?.cases
+                    ? `${detail.compared_run.cases.passed}/${detail.compared_run.cases.total}`
                     : null,
                 },
                 {
                   name: "Flaky",
                   value: r.cases?.flaky ?? "Not available",
-                  baseline: query.data.compared_run?.cases?.flaky,
+                  baseline: detail.compared_run?.cases?.flaky,
                 },
                 {
                   name: "Judge score",
@@ -468,14 +489,12 @@ export function EvalRunViewPage() {
                     r.judge_score == null
                       ? r.judge_score_state.replaceAll("_", " ")
                       : r.judge_score.toFixed(2),
-                  baseline: query.data.compared_run?.judge_score,
+                  baseline: detail.compared_run?.judge_score,
                 },
                 {
                   name: "Usage",
                   value: <RunUsage run={r} />,
-                  baseline: query.data.compared_run ? (
-                    <RunUsage run={query.data.compared_run} />
-                  ) : null,
+                  baseline: detail.compared_run ? <RunUsage run={detail.compared_run} /> : null,
                 },
               ].map((stat) => (
                 <div key={stat.name} className="min-w-0 rounded-xl border border-border p-3">
@@ -489,10 +508,9 @@ export function EvalRunViewPage() {
             </div>
             {["queued", "running", "cancelling"].includes(r.status) && (
               <p className="mt-4 text-sm" role="status">
-                {query.data.progress.completed_trials ?? "Unknown"} of{" "}
-                {query.data.progress.total_trials} trials complete ·{" "}
-                {query.data.progress.completed_cases ?? "Unknown"} of{" "}
-                {query.data.progress.total_cases} cases
+                {detail.progress.completed_trials ?? "Unknown"} of {detail.progress.total_trials}{" "}
+                trials complete · {detail.progress.completed_cases ?? "Unknown"} of{" "}
+                {detail.progress.total_cases} cases
               </p>
             )}
             <p className="mt-2 text-xs text-muted-foreground">
@@ -517,7 +535,7 @@ export function EvalRunViewPage() {
                     <option value={search.compare}>Selected run</option>
                   )}
                 {history.data?.runs.items
-                  .filter((item) => item.id !== r.id)
+                  .filter((item) => !isReportedRun(item) && item.id !== r.id)
                   .map((item) => (
                     <option key={item.id} value={item.id}>
                       {new Date(item.created_at).toLocaleString()} · {runOrigin(item)}
@@ -541,15 +559,15 @@ export function EvalRunViewPage() {
             </div>
             <LoadState error={history.error} pending={false} retry={history.refetch} />
             <p className="mt-2 text-xs text-muted-foreground">
-              {comparisonLabel(query.data.comparison)}
-              {query.data.comparison.unavailable_reasons?.length
-                ? ` · ${query.data.comparison.unavailable_reasons.join(" · ").replaceAll("_", " ")}`
+              {comparisonLabel(detail.comparison)}
+              {detail.comparison.unavailable_reasons?.length
+                ? ` · ${detail.comparison.unavailable_reasons.join(" · ").replaceAll("_", " ")}`
                 : ""}
-              {query.data.compared_run && (
+              {detail.compared_run && (
                 <>
                   {" "}
                   ·{" "}
-                  <NavLink to={runViewPath(query.data.compared_run.id)} className="underline">
+                  <NavLink to={runViewPath(detail.compared_run.id)} className="underline">
                     Open compared run
                   </NavLink>
                 </>
@@ -571,7 +589,7 @@ export function EvalRunViewPage() {
               ))}
             </fieldset>
             <div className="mt-3 overflow-hidden rounded-xl border border-border">
-              {query.data.results.items.map((item) => (
+              {detail.results.items.map((item) => (
                 <button
                   type="button"
                   key={item.case.id}
@@ -597,16 +615,16 @@ export function EvalRunViewPage() {
                 </button>
               ))}
             </div>
-            {query.data.results.items.length === 0 && (
+            {detail.results.items.length === 0 && (
               <p className="py-6 text-sm text-muted-foreground">No matching cases.</p>
             )}
             <Pages
               label="Cases"
               cursor={cursor}
               busy={query.isFetching}
-              hasMore={query.data.results.has_more ?? false}
+              hasMore={detail.results.has_more ?? false}
               onFirst={() => setCursor(undefined)}
-              onNext={() => setCursor(query.data.results.next_cursor ?? undefined)}
+              onNext={() => setCursor(detail.results.next_cursor ?? undefined)}
             />
             {canReadDetails && native.data?.scenario_progress && (
               <section
@@ -776,7 +794,7 @@ export function EvalRunViewPage() {
                 )}
                 <details onToggle={(event) => setMetadataOpen(event.currentTarget.open)}>
                   <summary className="cursor-pointer text-sm">Run and comparison metadata</summary>
-                  {metadataOpen && <PayloadViewer value={query.data} />}
+                  {metadataOpen && <PayloadViewer value={detail} />}
                 </details>
               </div>
             </details>

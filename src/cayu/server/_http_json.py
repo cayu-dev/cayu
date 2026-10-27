@@ -12,6 +12,8 @@ from fastapi import HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+from cayu._validation import DURABLE_DOCUMENT_LIMITS, DurableJsonLimits, copy_durable_record
+
 
 def _parse_json_without_duplicate_keys(body: bytes) -> object:
     """Parse one request body while rejecting non-portable JSON spellings."""
@@ -75,6 +77,8 @@ async def _validated_private_json_body(
     model_type: type[_PrivateBodyModel],
     *,
     invalid_detail: str,
+    json_mode: bool = False,
+    json_limits: DurableJsonLimits = DURABLE_DOCUMENT_LIMITS,
 ) -> _PrivateBodyModel:
     content_type = request.headers.get("content-type")
     if content_type is not None:
@@ -87,6 +91,15 @@ async def _validated_private_json_body(
     if not isinstance(parsed_body, _PreparsedPrivateJsonBody):
         raise HTTPException(status_code=422, detail=invalid_detail)
     try:
+        if json_mode:
+
+            def validate_json():
+                document = copy_durable_record(
+                    parsed_body.value, "private JSON body", limits=json_limits
+                )
+                return model_type.model_validate_json(json.dumps(document, ensure_ascii=False))
+
+            return await asyncio.to_thread(validate_json)
         return await asyncio.to_thread(model_type.model_validate, parsed_body.value)
     except (TypeError, ValueError, RecursionError) as exc:
         raise HTTPException(status_code=422, detail=invalid_detail) from exc

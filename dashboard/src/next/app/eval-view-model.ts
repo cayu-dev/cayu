@@ -1,5 +1,10 @@
 import type {
+  EvalReportedRunDetail,
+  EvalReportedRunView,
+  EvalReportedSuiteDetail,
+  EvalRunViewDetail,
   EvalRunViewMetadata,
+  EvalSuiteViewDetail,
   EvalSuiteViewIdentity,
   EvalViewComparison,
 } from "@/lib/generated/server-api"
@@ -27,7 +32,34 @@ export const suiteSelector = (identity: EvalSuiteViewIdentity) =>
   ])
 export const suiteViewPath = (id: string) => `/evals/suites/${encodeURIComponent(id)}`
 export const runViewPath = (id: string) => `/evals/runs/${encodeURIComponent(id)}`
-export function runOrigin(run: Pick<EvalRunViewMetadata, "origin" | "actor">): string {
+export function isReportedRun(value: unknown): value is EvalReportedRunView {
+  return (
+    value !== null && typeof value === "object" && "source" in value && value.source === "reported"
+  )
+}
+export function isReportedRunDetail(
+  value: EvalRunViewDetail | EvalReportedRunDetail | undefined,
+): value is EvalReportedRunDetail {
+  return value !== undefined && isReportedRun(value.run)
+}
+export function isReportedSuiteDetail(
+  value: EvalSuiteViewDetail | EvalReportedSuiteDetail | undefined,
+): value is EvalReportedSuiteDetail {
+  return value?.suite.source === "reported"
+}
+export function runOrigin(
+  run: Pick<EvalRunViewMetadata, "origin" | "actor"> | EvalReportedRunView,
+): string {
+  if (isReportedRun(run))
+    return [
+      `Reported ${run.origin.kind === "ci" ? "CI" : "CLI"}`,
+      run.publisher_id,
+      run.origin.branch,
+      run.origin.commit?.slice(0, 7),
+      run.origin.pull_request == null ? null : `PR #${run.origin.pull_request}`,
+    ]
+      .filter(Boolean)
+      .join(" · ")
   const origins: Record<string, string> = {
     captured_session: "Captured session",
     authored_suite: "Authored suite",
@@ -81,4 +113,17 @@ export function checkLabel(check: unknown): string {
     : typeof value.text === "string"
       ? `${kind}: ${value.text}`
       : kind
+}
+
+export function isNativeRunDetail(
+  value: EvalRunViewDetail | EvalReportedRunDetail | undefined,
+): value is EvalRunViewDetail {
+  return value !== undefined && "progress" in value && typeof value.run.origin === "string"
+}
+export function isNativeSuiteDetail(
+  value: EvalSuiteViewDetail | EvalReportedSuiteDetail | undefined,
+): value is EvalSuiteViewDetail {
+  return (
+    value !== undefined && (value.suite.source === "authored" || value.suite.source === "corpus")
+  )
 }

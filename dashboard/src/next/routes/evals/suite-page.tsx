@@ -14,8 +14,15 @@ import {
   evalTargetCatalogMayBeStale,
 } from "@/lib/evals-dashboard"
 import { fetchSuiteView } from "../../api/eval-views"
-import { checkLabel, nativeRunSelector, runViewPath } from "../../app/eval-view-model"
+import {
+  checkLabel,
+  isNativeSuiteDetail,
+  isReportedSuiteDetail,
+  nativeRunSelector,
+  runViewPath,
+} from "../../app/eval-view-model"
 import { ActionsMenu, NavLink, PageBody, sessionPath, TopBar, useGo } from "../common"
+import { ReportedSuitePage } from "./reported-pages"
 import {
   CaseOutcome,
   DateText,
@@ -59,7 +66,10 @@ export function EvalSuiteViewPage() {
     queryFn: ({ signal }) => fetchEvalTargets(signal),
     enabled: canWrite,
   })
-  const s = query.data?.suite
+  const data = query.data
+  const reported = isReportedSuiteDetail(data) ? data : undefined
+  const detail = isNativeSuiteDetail(data) ? data : undefined
+  const s = detail?.suite
   const target = targets.data?.items.find((t) => t.target_key === s?.identity.target_key)
   const parsedConcurrency = Number(concurrency)
   const validConcurrency =
@@ -123,6 +133,17 @@ export function EvalSuiteViewPage() {
       downloadBlob(file.blob, file.filename)
     },
   })
+  if (reported)
+    return (
+      <ReportedSuitePage
+        detail={reported}
+        cursor={runsCursor}
+        setCursor={setRunsCursor}
+        busy={query.isFetching}
+        error={query.error}
+        retry={query.refetch}
+      />
+    )
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar
@@ -183,7 +204,7 @@ export function EvalSuiteViewPage() {
       </TopBar>
       <PageBody width="max-w-5xl">
         <LoadState error={query.error} pending={query.isPending} retry={query.refetch} />
-        {s && query.data && (
+        {s && detail && (
           <>
             <h1 className="text-xl font-semibold break-words">{s.name}</h1>
             {s.description && (
@@ -228,22 +249,22 @@ export function EvalSuiteViewPage() {
               )}
             </div>
             <Section title="Runs">
-              <RunsTable runs={query.data.runs.items} />
+              <RunsTable runs={detail.runs.items} />
               <Pages
                 label="Runs"
                 cursor={runsCursor}
                 busy={query.isFetching}
-                hasMore={query.data.runs.has_more ?? false}
+                hasMore={detail.runs.has_more ?? false}
                 onFirst={() => setRunsCursor(undefined)}
-                onNext={() => setRunsCursor(query.data.runs.next_cursor ?? undefined)}
+                onNext={() => setRunsCursor(detail.runs.next_cursor ?? undefined)}
               />
             </Section>
             <Section title={`Cases (${s.case_count})`}>
-              {query.data.cases.items.length === 0 && (
+              {detail.cases.items.length === 0 && (
                 <p className="py-3 text-sm text-muted-foreground">No cases in this suite.</p>
               )}
               <div className="overflow-hidden rounded-xl border border-border">
-                {query.data.cases.items.map((c) => (
+                {detail.cases.items.map((c) => (
                   <div
                     key={c.id}
                     className="flex flex-wrap items-start gap-3 border-b border-border px-3 py-2.5 text-sm last:border-0"
@@ -282,9 +303,9 @@ export function EvalSuiteViewPage() {
                 label="Cases"
                 cursor={casesCursor}
                 busy={query.isFetching}
-                hasMore={query.data.cases.has_more ?? false}
+                hasMore={detail.cases.has_more ?? false}
                 onFirst={() => setCasesCursor(undefined)}
-                onNext={() => setCasesCursor(query.data.cases.next_cursor ?? undefined)}
+                onNext={() => setCasesCursor(detail.cases.next_cursor ?? undefined)}
               />
             </Section>
             {canWrite && (

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Upgrade: migrate persistent eval stores to additive revision 132 before starting
+the new runtime. Regenerate HTTP clients and rebuild custom dashboards for server
+contract 67.
+
 Upgrade: a session that a task handler started without its own
 `execution_deadline`, and that pauses for an approval or a question, no longer
 expires while it waits for the person. To keep the old behavior for a run, pass
@@ -15,7 +19,8 @@ renewal after a human wait. Without it, ordinary continuations keep enforcing
 the stored deadline; explicit replacements raise `NotImplementedError`.
 
 Upgrade: refresh optional dependencies and rebuild custom dashboards to pick up
-the patched dependency versions. No storage migration is required.
+the patched dependency versions. These dependency updates need no additional
+storage migration.
 
 ### Breaking changes
 
@@ -34,6 +39,12 @@ the patched dependency versions. No storage migration is required.
   so an agent that uses its own tables no longer fails the import check with
   `SCAFFOLD_IMPORT_SIDE_EFFECT`. Mixins, mapper options and other calls in a model
   body stay unproven.
+- `cayu eval run --report-to` publishes CLI evaluation results, and
+  `cayu eval publish` retries an exact saved envelope. Dedicated reporting
+  credentials grant only publication to configured targets. Reported series
+  retain source metadata and optional declared revisions; native baseline and
+  comparison operations remain unavailable. See
+  [CI eval reporting](recipes/ci-eval-reporting.md).
 - Sessions record how they got their execution deadline:
   `Session.execution_deadline.origin` is `explicit`, `run_default` or
   `enclosing`, stored next to the deadline as `cayu:execution_deadline_origin`.

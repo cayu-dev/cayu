@@ -351,6 +351,10 @@ revision conflict by default, validates the complete result, and atomically
 replaces the destination. `--replace-conflicts` deliberately selects the last
 conflicting definition in command-line order.
 
+For opt-in dashboard publication, scoped CI credentials, saved exact retries and
+GitHub metadata, see [CI eval reporting](recipes/ci-eval-reporting.md). Reporting
+failure preserves completed result output and returns exit 2.
+
 `eval run` and `eval compare` have stable CI exits: `0` means the selected suite
 passed, or a compatible comparison found no regression; `1` means execution
 completed and produced a failed result or a compatible regression; `2` means
@@ -572,8 +576,9 @@ returns a conflict; an existing unparented import cannot be upgraded into truste
 provenance. Saving an unchanged document with its own revision as parent is a
 read-only no-op: the document must already exist and no associations are added.
 New saves without a parent retain ordinary immutable authored-suite behavior.
-Current SQLite and PostgreSQL EvalStore implementations require storage revision
-131 for this atomic parent binding and source preservation. Custom EvalStore
+Atomic parent binding and source preservation were introduced in storage revision
+131; current SQLite and PostgreSQL EvalStore implementations require revision 132,
+which also supports reported evaluation evidence. Custom EvalStore
 adapters remain readable but cannot admit fresh eval work unless they implement
 the fenced terminal-checkpoint contract and declare `trial_checkpointing = True`.
 These authoring contracts

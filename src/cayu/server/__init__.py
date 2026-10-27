@@ -107,6 +107,7 @@ try:
         normalize_dashboard_runtime_config,
     )
     from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
+    from cayu.server.eval_report_auth import EvalReportingAccess
     from cayu.server.inbox import InboxAccess
     from cayu.server.oidc import OidcBearerAuth, OidcSigningKeys, OidcTokenError
     from cayu.server.proxy_identity import ControlPlaneRoles, ProxyIdentityAuth
@@ -166,6 +167,7 @@ __all__ = [
     "DashboardStaticFiles",
     "DevelopmentProductAccess",
     "DocsConfig",
+    "EvalReportingAccess",
     "EvalsConfig",
     "EvaluationPromotionConfig",
     "OidcBearerAuth",
@@ -537,6 +539,7 @@ def create_server(
             evaluation_promotion_pricing=evaluation_promotion_pricing,
             generated_evals_pricing=configured_dashboard_price_book,
             evals=resolved_config.evals,
+            eval_reporting=resolved_config.eval_reporting,
             inbox_access=inbox_access,
             inbox_cursor_key=inbox_cursor_key,
             _project_context=resolved_project_context,
@@ -624,6 +627,7 @@ def mount_cayu(
     dashboard_config: dict[str, Any] | None = None,
     evaluation_promotion: EvaluationPromotionConfig | None = None,
     evals: EvalsConfig | None = None,
+    eval_reporting: EvalReportingAccess | None = None,
     replay_idle_timeout_s: float = DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
     session_follow_heartbeat_s: float = DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS,
     session_follow_max_streams_per_principal: int = (
@@ -797,6 +801,7 @@ def mount_cayu(
             else _configured_dashboard_price_book(resolved_dashboard_config)
         ),
         evals=evals,
+        eval_reporting=eval_reporting,
         continuation_loop_policy_provider=continuation_loop_policy_provider,
         inbox_access=inbox_access,
         inbox_cursor_key=inbox_cursor_key,

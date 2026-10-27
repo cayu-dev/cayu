@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from cayu.evals._report_publication import report_association_key
 from cayu.evals.read_views import EvalViewQuery
+from cayu.evals.reported import EvalReportedSeriesSelector
 
 
 def view_index_sql(query: EvalViewQuery, *, postgres: bool) -> tuple[str, tuple[object, ...]]:
@@ -33,7 +35,26 @@ def view_index_sql(query: EvalViewQuery, *, postgres: bool) -> tuple[str, tuple[
             JOIN cayu_eval_corpora AS corpora ON corpora.revision = suites.corpus_revision
             WHERE {predicate.replace("target_key", "corpora.target_key")}
         """
-        params.extend((*target_params, *target_params))
+        union += f""" UNION ALL
+            SELECT 'reported_suite', selector_json, NULL, created_at, target_key,
+                   'reported_suite:' || selector_json || ':'
+            FROM cayu_eval_report_series WHERE {predicate}
+        """
+        params.extend((*target_params, *target_params, *target_params))
+    elif isinstance(query.suite, EvalReportedSeriesSelector):
+        union = """SELECT 'report' AS source, report_key AS revision, NULL AS suite_id,
+                    created_at, target_key, 'report:' || report_key || ':' AS sort_key
+                   FROM cayu_eval_reports WHERE series_id = ?"""
+        params.append(query.suite.series_id)
+        if query.target_key is not None:
+            union += " AND target_key = ?"
+            params.append(query.target_key)
+        if query.target_keys is not None:
+            if query.target_keys:
+                union += " AND target_key IN (" + ",".join("?" for _ in query.target_keys) + ")"
+                params.extend(query.target_keys)
+            else:
+                union += " AND 1 = 0"
     else:
         scope = query.suite
         if scope.source == "authored":
@@ -74,6 +95,11 @@ def view_index_sql(query: EvalViewQuery, *, postgres: bool) -> tuple[str, tuple[
                               WHERE runs.result_revision = records.revision)
         """
         params.extend((scope.id, scope.target_key))
+        if scope.source == "corpus":
+            union += """ UNION ALL SELECT 'report', report_key, NULL, created_at, target_key,
+                         'report:' || report_key || ':' FROM cayu_eval_reports
+                         WHERE association_key = ? AND target_key = ?"""
+            params.extend((report_association_key(scope.id), scope.target_key))
 
     # Cursor validation uses Python lexical order, independent of DB locale.
     sort_key = 'sort_key COLLATE "C"' if postgres else "sort_key"
