@@ -624,7 +624,7 @@ def _check_selected_plan_source(
             "build_coding_app" if _source_contains_name(app_path, "build_coding_app") else None
         )
         drift("preset", "build_coding_app", observed_factory, "app.py")
-    elif plan.preset in ("agent", "long-running"):
+    elif plan.preset in ("agent", "long-running", "b2b"):
         observed_factory = (
             "register_agents" if _source_contains_name(app_path, "register_agents") else None
         )

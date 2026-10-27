@@ -156,6 +156,7 @@ def test_rendered_capability_owners_are_formatted(preset):
         ("agent", None, ()),
         ("service", None, ()),
         ("long-running", None, ()),
+        ("b2b", None, ()),
         ("coding", None, ()),
         ("coding", "docker", ()),
         ("agent", None, ("app-database",)),

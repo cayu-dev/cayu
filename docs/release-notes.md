@@ -35,6 +35,12 @@ storage migration.
 
 ### Changes
 
+- `cayu new NAME --preset b2b` generates an agent several businesses share on one
+  deployment. Organizations, departments and memberships live in the application's
+  own tables, and a resource-access policy turns each person's current membership
+  into Cayu grants for sessions, tasks and artifacts: personal, department and
+  organization sharing, no access across organizations (a department always with its
+  own organization), and revocation at the next protected step. Generated tests prove each rule, with and without PostgreSQL.
 - `cayu check` accepts the SQLAlchemy models `cayu new --with app-database` generates,
   so an agent that uses its own tables no longer fails the import check with
   `SCAFFOLD_IMPORT_SIDE_EFFECT`. Mixins, mapper options and other calls in a model

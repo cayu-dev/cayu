@@ -2655,8 +2655,9 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         "--preset",
         choices=tuple(spec.name for spec in PRESETS),
         help=(
-            "Coherent application shape: agent (default), service, coding, or "
-            "long-running (approval, waits, timers, spend cap and restart tests)."
+            "Coherent application shape: agent (default), service, coding, "
+            "long-running (approval, waits, timers, spend cap and restart tests), or b2b "
+            "(organizations, departments and members sharing one deployment)."
         ),
     )
     # Deprecated: every project now selects its database at runtime through
@@ -2998,6 +2999,10 @@ def _rendered_preset_files(
                     "__AGENT_NAME__", resolved_agent_name
                 )
                 if plan.preset == "long-running"
+                else "An agent that several businesses share. Organizations, departments and\nmemberships live in the application's own tables (`domain/organizations.py`), and\n`policies/access.py` turns each person's current membership into Cayu resource-access\ngrants, so everyone sees only their own, their department's and their organization's\nconversations. Its registered specialist identity is `__AGENT_NAME__`.".replace(
+                    "__AGENT_NAME__", resolved_agent_name
+                )
+                if plan.preset == "b2b"
                 else "A Cayu application with the standard capability layout. Its registered specialist\nidentity is `__AGENT_NAME__`. The scaffold profile records its selected capabilities.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
@@ -3138,6 +3143,11 @@ def _rendered_preset_files(
         from cayu.cli.scaffold_long_running import long_running_project_files
 
         files.update(long_running_project_files(files=files, render=render, plan=plan))
+        return files
+    if plan.preset == "b2b":
+        from cayu.cli.scaffold_b2b import b2b_project_files
+
+        files.update(b2b_project_files(files=files, plan=plan))
         return files
     files.update(
         {

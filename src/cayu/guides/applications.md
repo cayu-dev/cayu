@@ -323,6 +323,19 @@ the agent layout plus a worked example of approval, a waited-for reply,
 reminder and deadline timers, a spend cap, and restart tests; see
 `cayu guide long-running`.
 
+`--preset b2b` is the agent layout for an application several businesses share
+on one deployment, with one database and one agent. Organizations, departments
+and memberships are application tables (it always includes `app-database`), and
+`policies/access.py` turns each person's current membership into Cayu
+resource-access grants: everyone sees their own conversations, their department's
+and their organization's, and nothing of another organization. Only the owner
+continues or changes a conversation. A department is always matched with its own
+organization. Cayu asks the policy again at every read, listing and background
+step, so a removed member loses access at their next step; changing a membership
+also raises the access revision, so no decision read before it is used again.
+`uv run --no-sync python -m operations.demo_seed` adds two demonstration
+organizations to a development database.
+
 ## Durable data
 
 Every preset selects its database at runtime, not at generation time. The storage
