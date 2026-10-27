@@ -716,6 +716,7 @@ Start with the document that matches the job:
 | Reconstruct service-backed tools with stable identities and scoped knowledge | `cayu guide durable-service-tools` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/durable-service-tools.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/durable_service_tools/)) |
 | Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |
 | Build a browser UI that follows sessions without hot polling | `cayu guide app-ui` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/app-ui.md)) |
+| Share one agent between several businesses, with a web interface for their people | `cayu guide b2b` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/b2b.md)) |
 | Run Claude Code or Codex as Cayu sessions with tokens, cost, deadlines and secret scrubbing | `cayu guide external-agents` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/external-agents.md)) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |

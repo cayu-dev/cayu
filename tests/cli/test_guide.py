@@ -861,7 +861,7 @@ def test_package_shipped_app_ui_guide_states_the_request_rules(capsys) -> None:
     assert main(["guide", "app-ui", "--json"]) == 0
     guide = json.loads(capsys.readouterr().out)
     assert guide["package_source"] == "cayu.guides/app-ui.md"
-    assert guide["related_topics"] == ["anatomy", "human-attention", "references"]
+    assert guide["related_topics"] == ["anatomy", "human-attention", "references", "b2b"]
     content = " ".join(guide["content"].split())
     for rule in (
         'import { connect } from "/cayu/client.js"',
@@ -886,6 +886,28 @@ def test_package_shipped_app_ui_guide_states_the_request_rules(capsys) -> None:
     control_plane = (root / "docs/control-plane.md").read_text()
     bring_your_own_ui = control_plane.split("## Bring your own UI", 1)[1].split("\n## ", 1)[0]
     assert "../src/cayu/guides/app-ui.md" in bring_your_own_ui
+
+
+def test_b2b_guide_runs_the_generated_application(capsys) -> None:
+    assert main(["guide", "b2b", "--json"]) == 0
+    guide = json.loads(capsys.readouterr().out)
+    assert guide["package_source"] == "cayu.guides/b2b.md"
+    content = " ".join(guide["content"].split())
+    for statement in (
+        "cayu new acme-desk --preset b2b",
+        "uv run --no-sync python -m operations.demo_seed",
+        "http://127.0.0.1:8000/app/ui/",
+        "npm --prefix web run build",
+        "`APP_SIGN_IN`",
+        "`OPERATOR_ONLY_AUTH`",
+    ):
+        assert statement in content, statement
+    # Every person the guide demonstrates is one the seed adds.
+    from cayu.cli.scaffold import project_files
+
+    seed = project_files("acme-desk", preset="b2b")["operations/demo_seed.py"]
+    for person in ("alice", "bob", "carol", "dave"):
+        assert f'"{person}"' in seed
 
 
 def test_cost_control_reference_states_spend_cap_behavior(capsys) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -18,6 +19,11 @@ from cayu.cli.scaffold import project_files
 B2B_FILES = (
     "integrations/sign_in.py",
     "integrations/http.py",
+    "integrations/web.py",
+    "web/package.json",
+    "web/package-lock.json",
+    "web/src/app.tsx",
+    "web/static/index.html",
     "migrations/versions/0003_membership_roles.py",
     "tests/test_http_api.py",
     "tests/test_background_revocation.py",
@@ -54,12 +60,38 @@ def test_the_app_is_built_with_the_membership_policy() -> None:
     assert any(item.startswith("alembic") for item in dependencies)
     assert "class Membership(Base)" in files["database/models.py"]
     assert "## Organizations and sharing" in files["AGENTS.md"]
+    # Its routing table sends the people's interface and new members to this preset's own
+    # answers, not to client.js or the service preset.
+    assert "| A web UI for the organizations' people |" in files["AGENTS.md"]
+    assert "`client.js`. Do not poll" not in files["AGENTS.md"]
+    assert "--preset service" not in files["AGENTS.md"]
     serve = tomllib.loads(files["pyproject.toml"])["tool"]["cayu"]["serve"]
     assert serve["routers"] == ["integrations.http:build_router"]
     assert serve["auth"] == "cayu.server.environment_auth:OPERATOR_ONLY_AUTH"
     assert "role: Mapped[str]" in files["database/models.py"]
     # The sharing labels Cayu enforces can't be changed by the people they protect.
     assert "protected_label_keys" in files["policies/access.py"]
+
+
+def test_the_web_interface_is_copied_with_its_source_and_build() -> None:
+    files = project_files("acme-desk", preset="b2b")
+    template = Path(__file__).resolve().parents[2] / "src/cayu/cli/templates/b2b_web"
+    packaged = {
+        f"web/{path.relative_to(template).as_posix()}": path.read_text(encoding="utf-8")
+        for path in template.rglob("*")
+        if path.is_file()
+    }
+
+    assert packaged == {name: text for name, text in files.items() if name.startswith("web/")}
+    # The page names the built files it loads, so they're served as they were built.
+    built = {name for name in packaged if name.startswith("web/static/assets/")}
+    assert {f"web/static/{name}" for name in _page_assets(files["web/static/index.html"])} == built
+    # It starts conversations with the project's agent.
+    assert 'AGENT_NAME = "acme-desk"' in files["integrations/http.py"]
+
+
+def _page_assets(page: str) -> set[str]:
+    return set(re.findall(r'(?:src|href)="\./(assets/[^"]+)"', page))
 
 
 def test_every_default_capability_can_also_be_named() -> None:
@@ -143,7 +175,7 @@ def test_a_generated_project_passes_cayu_check(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert main(["new", "acme-desk", "--preset", "b2b", "--dir", str(tmp_path)]) == 0
-    capsys.readouterr()
+    assert "http://127.0.0.1:8000/app/ui/" in capsys.readouterr().out
     monkeypatch.chdir(tmp_path / "acme-desk")
 
     assert main(["check", "--fail-on", "warning", "--json"]) == 0

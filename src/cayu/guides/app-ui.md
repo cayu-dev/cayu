@@ -75,6 +75,11 @@ starting new work if the previous watch stopped as idle.
 Do not hand-write polling loops for session events or session lists. If
 `client.js` does not fit, use the same endpoints with the rules below.
 
+`client.js` calls Cayu's operator API, so it is for operators and for applications
+whose users may use that API. An interface for an application's own users, who
+reach only what a resource-access policy grants them, calls the application's
+scoped routes instead; `cayu guide b2b` shows one.
+
 ## If you must poll
 
 - Poll only while the tab is visible (`document.visibilityState === "visible"`),

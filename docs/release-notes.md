@@ -60,6 +60,11 @@ storage migration.
   always keeps at least one admin). Generated tests
   prove a removed member's queued task never runs, also after a restart, and that a running
   conversation stops at its next step.
+- The b2b preset gains a web interface at `/app/ui/`: sign-in (a demonstration picker
+  under `cayu serve --dev`), an organization switcher, conversations with their sharing,
+  streamed replies that only a conversation's owner continues, and a Members page for
+  organization admins. Its source is in `web/` and its committed build in `web/static`, so
+  running and deploying it need no Node. `cayu guide b2b` walks through it.
 - Session actions and specialist Start now warn before navigation or closure would
   lose an unconfirmed operation's local recovery. Staying preserves the exact
   task replay, queued-message receipt or run observation; leaving explicitly does

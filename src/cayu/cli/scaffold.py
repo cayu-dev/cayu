@@ -3659,6 +3659,8 @@ def _render_new_receipt(
     else:
         print("  Local Developer dashboard: uv run --no-sync cayu serve --dev")
         print("  Open: http://127.0.0.1:8000/cayu/")
+    if plan.preset == "b2b":
+        print("  Web interface for the organizations' people: http://127.0.0.1:8000/app/ui/")
     if plan.provider == "neutral":
         print("  Live provider: none selected; set CAYU_PROVIDER explicitly before `run.py`.")
     else:

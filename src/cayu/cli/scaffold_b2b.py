@@ -9,6 +9,8 @@ result on every read, listing and background step.
 
 from __future__ import annotations
 
+from importlib.resources import files as package_files
+
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
     ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET,
@@ -1086,7 +1088,9 @@ _HTTP_PY = '''"""The application's HTTP API, which `cayu serve` serves under /ap
   and a default: it never grants anything.
 - /app/organizations/{organization}/members: the members, which an organization's admins
   add, move and remove.
-- /app/dev/sign-in: the demonstration login, served only by `cayu serve --dev`.
+- /app/ui/: the web interface (integrations/web.py).
+- /app/dev/sign-in and /app/dev/people: the demonstration login and sign-out, served
+  only by `cayu serve --dev`.
 """
 
 from __future__ import annotations
@@ -1111,11 +1115,19 @@ from database.memberships import (
 from database.session import session
 from domain.organizations import Membership
 from domain.sharing import Sharing, conversation_labels
-from integrations.sign_in import DEMO_COOKIE, DemoSignIn, build_authenticate
+from integrations.sign_in import (
+    DEMO_COOKIE,
+    DEMO_SUBJECTS,
+    DemoSignIn,
+    build_authenticate,
+)
+from integrations.web import build_web_router
 
 
 # The length of `memberships.subject`.
 MEMBER_SUBJECT_LENGTH = 200
+# The agent the web interface starts conversations with.
+AGENT_NAME = "__AGENT_NAME__"
 
 
 class DemoSignInRequest(BaseModel):
@@ -1136,6 +1148,7 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     authenticate = build_authenticate(development=development)
     router = APIRouter(prefix="/app")
     router.include_router(create_resource_router(app, authenticate=authenticate))
+    router.include_router(build_web_router())
 
     async def signed_in(request: Request) -> str:
         return await authenticate(request)
@@ -1143,7 +1156,11 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     @router.get("/me")
     async def me(subject: str = Depends(signed_in)) -> dict:
         records = await _read(memberships_of, subject)
-        return {"subject": subject, "memberships": [_member(item) for item in records]}
+        return {
+            "subject": subject,
+            "agent_name": AGENT_NAME,
+            "memberships": [_member(item) for item in records],
+        }
 
     @router.post("/conversation-labels")
     async def labels(body: LabelsRequest, subject: str = Depends(signed_in)) -> dict:
@@ -1210,12 +1227,22 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     if isinstance(authenticate, DemoSignIn):
         demo = authenticate
 
+        @router.get("/dev/people")
+        async def demo_people() -> list[str]:
+            return sorted(DEMO_SUBJECTS)
+
         @router.post("/dev/sign-in", status_code=204)
         async def demo_sign_in(body: DemoSignInRequest) -> Response:
             response = Response(status_code=204)
             response.set_cookie(
                 DEMO_COOKIE, demo.cookie(body.subject), httponly=True, samesite="strict"
             )
+            return response
+
+        @router.delete("/dev/sign-in", status_code=204)
+        async def demo_sign_out() -> Response:
+            response = Response(status_code=204)
+            response.delete_cookie(DEMO_COOKIE, httponly=True, samesite="strict")
             return response
 
     return router
@@ -1257,6 +1284,9 @@ def _require_subject(member: str) -> None:
             422,
             f"A member is a non-blank ID of at most {MEMBER_SUBJECT_LENGTH} characters.",
         )
+    # A URL can't carry these segments as they are: clients resolve them first.
+    if {".", ".."} & set(member.split("/")):
+        raise HTTPException(422, "A member ID has no '.' or '..' path segments.")
 
 
 async def _change_members(caller: str, change, **arguments) -> None:
@@ -1281,6 +1311,61 @@ async def _change_members(caller: str, change, **arguments) -> None:
 '''
 
 
+_WEB_PY = """\"\"\"The web interface, served at /app/ui/ from web/static.
+
+`web/` holds its source; `npm --prefix web run build` rebuilds web/static, which is committed,
+so running and deploying the application needs no Node. Only the built files are served: the
+page itself and the files its build names in web/static/assets.
+\"\"\"
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse, RedirectResponse
+
+
+def _static() -> Path:
+    return Path(__file__).resolve().parent.parent / "web" / "static"
+
+
+def build_web_router() -> APIRouter:
+    router = APIRouter(prefix="/ui", include_in_schema=False)
+
+    @router.get("")
+    def root() -> RedirectResponse:
+        return RedirectResponse("ui/")
+
+    @router.get("/")
+    def page() -> FileResponse:
+        # Always checked again: it names the current build's hashed files.
+        return FileResponse(
+            _static() / "index.html",
+            headers={
+                "Cache-Control": "no-cache",
+                # Never inside another site's frame, where its buttons could be clicked
+                # for the signed-in person, and no images from elsewhere, which a reply
+                # could use to send what it read to another site.
+                "Content-Security-Policy": "frame-ancestors 'none'; img-src 'self' data:",
+            },
+        )
+
+    @router.get("/assets/{name}")
+    def asset(name: str) -> FileResponse:
+        assets = _static() / "assets"
+        if name not in {entry.name for entry in assets.iterdir() if entry.is_file()}:
+            raise HTTPException(404, "Not found.")
+        # Each build names its files by their content, so they never change.
+        return FileResponse(
+            assets / name,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+
+    return router
+"""
+
+
 _TEST_HTTP_API_PY = '''"""The application's HTTP API: sign-in, scoped conversations and member management.
 
 The sign-in and conversation tests run without a database; member management reads and
@@ -1288,6 +1373,8 @@ writes the application's tables (`CAYU_TEST_POSTGRES_DSN`).
 """
 
 from __future__ import annotations
+
+import re
 
 from alembic import command
 from fastapi import FastAPI
@@ -1302,7 +1389,7 @@ from database.memberships import DatabaseMembershipDirectory
 from database.session import session
 from domain.organizations import InMemoryMembershipDirectory, Membership
 from domain.sharing import conversation_labels
-from integrations.http import build_router
+from integrations.http import AGENT_NAME, build_router
 from operations.demo_seed import seed
 from policies.access import MembershipAccessPolicy
 
@@ -1379,6 +1466,32 @@ def test_without_development_there_is_no_demonstration_login(monkeypatch) -> Non
         assert client.post("/app/resources/sessions/query", json={}).status_code == 503
 
 
+def test_the_web_interface_is_served_with_only_its_built_files() -> None:
+    app = _app(InMemoryMembershipDirectory({"alice": [ALICE]}))
+    with _client(app) as client:
+        page = client.get("/app/ui/")
+        assert page.status_code == 200
+        assert page.headers["cache-control"] == "no-cache"
+        assert (
+            page.headers["content-security-policy"]
+            == "frame-ancestors 'none'; img-src 'self' data:"
+        )
+        (script,) = re.findall(r'src="\\./(assets/[^"]+\\.js)"', page.text)
+        asset = client.get(f"/app/ui/{script}")
+        assert asset.status_code == 200
+        assert "immutable" in asset.headers["cache-control"]
+        assert client.get("/app/ui/assets/missing.js").status_code == 404
+        assert client.get("/app/ui/assets/..%2Findex.html").status_code == 404
+        # Its demonstration picker lists the seeded people only under `cayu serve --dev`.
+        assert "alice" in client.get("/app/dev/people").json()
+        _sign_in(client, "alice")
+        assert client.delete("/app/dev/sign-in").status_code == 204
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 401
+    with _client(app, development=False) as client:
+        assert client.get("/app/ui/").status_code == 200
+        assert client.get("/app/dev/people").status_code == 404
+
+
 def test_conversations_over_http_show_each_person_only_their_own() -> None:
     directory = InMemoryMembershipDirectory(
         {
@@ -1416,6 +1529,7 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
 
         _sign_in(client, "carol")
         me = client.get("/app/me").json()
+        assert me["agent_name"] == AGENT_NAME
         assert me["memberships"] == [
             {
                 "subject": "carol",
@@ -1457,6 +1571,9 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
             client.delete(f"/app/organizations/acme/members/{too_long}").status_code
             == 422
         )
+        # A '..' segment, which a browser would resolve to another member, is refused.
+        dotted = "/app/organizations/acme/members/staff/%2E%2E/bob"
+        assert client.delete(dotted).status_code == 422
         # Acme's only admin can't leave it without one.
         assert (
             client.put(
@@ -1638,6 +1755,7 @@ who belongs where; Cayu enforces it.
 | `domain/sharing.py` | The labels a new conversation is created with: personal, department or organization |
 | `integrations/sign_in.py` | The one place a request becomes a verified person |
 | `integrations/http.py` | The API `cayu serve` serves under `/app` (`[tool.cayu.serve] routers`) |
+| `web/`, `integrations/web.py` | The web interface at `/app/ui/`: its source and the committed build in `web/static` |
 
 - Start a conversation through `await app.access(subject)` with the labels
   `conversation_labels(...)` returns for the signed-in person. Never take a subject, an
@@ -1652,6 +1770,9 @@ who belongs where; Cayu enforces it.
 - Organization admins (`role = "admin"` on a membership) add, move and remove members
   through `/app/organizations/{organization}/members`. That role is the application's own
   decision and never widens what Cayu lets anyone see.
+- The web interface signs people in with a cookie: Cayu Cloud's sign-in, or the
+  demonstration login. With `APP_SIGN_IN=oidc`, the API is for clients that send their own
+  bearer token, and the interface can't sign anyone in.
 - Sign-in: `cayu serve --dev` offers a demonstration login at `POST /app/dev/sign-in` for
   the people `operations/demo_seed.py` adds, and nobody else. Outside development,
   `APP_SIGN_IN` selects Cayu Cloud's sign-in (`cloud`, the default) or an OIDC bearer token
@@ -1659,11 +1780,69 @@ who belongs where; Cayu enforces it.
   that sign-in gives each person. Until one is configured, the API answers 503.
 - An organization a client shows as active is only a filter and a default for new
   conversations (`POST /app/conversation-labels`); it never grants anything.
-- `uv run --no-sync alembic upgrade head`, then `uv run --no-sync python -m
-  operations.demo_seed`, gives a development database two demonstration organizations.
+- The web interface calls only `/app`. After changing `web/src`, run `npm --prefix web ci`
+  and `npm --prefix web run build`, and commit `web/static`; running and deploying need no
+  Node. `npm --prefix web run dev` reloads it live against `cayu serve --dev`.
+- With `CAYU_DATABASE_URL` set, `uv run --no-sync cayu storage migrate`, `uv run --no-sync
+  alembic upgrade head` and `uv run --no-sync python -m operations.demo_seed` give a
+  development database two demonstration organizations; `uv run --no-sync cayu serve --dev`
+  then serves the interface at http://127.0.0.1:8000/app/ui/. `uv run --no-sync cayu guide
+  b2b` walks through it.
   `tests/test_organizations.py`, `tests/test_http_api.py` and
   `tests/test_background_revocation.py` show each rule.
 """
+
+
+def _web_files() -> dict[str, str]:
+    """The web interface for `web/`: its source, which a project rebuilds with
+    `npm --prefix web run build`, and the built files in `web/static` it serves."""
+
+    found: dict[str, str] = {}
+
+    def walk(node, prefix: str) -> None:
+        for child in sorted(node.iterdir(), key=lambda item: item.name):
+            if child.is_dir():
+                walk(child, f"{prefix}{child.name}/")
+            else:
+                found[f"web/{prefix}{child.name}"] = child.read_text(encoding="utf-8")
+
+    walk(package_files("cayu.cli").joinpath("templates", "b2b_web"), "")
+    return found
+
+
+# The agent preset's routing rows this preset answers differently.
+_AGENTS_ROWS = {
+    "| A web UI that shows progress or live results | `mount_cayu(...)` and `connect()` from "
+    "the served `client.js`. Do not poll on a fixed timer. | `cayu guide app-ui` |": (
+        "| A web UI for the organizations' people | `web/`, served at `/app/ui/`, calling only "
+        "`/app`. Not `client.js`: it calls the operator API, which people signed in as members "
+        "can't use. | `cayu guide b2b` |"
+    ),
+    "| A public or multi-user product | `cayu new NAME --preset service` | "
+    "`cayu guide references#server` |": (
+        "| Another organization, department or member | `add_member` in "
+        "`database/memberships.py`, or an admin on the Members page | `cayu guide b2b` |"
+    ),
+}
+
+
+# This preset is already the multi-user application that paragraph sends people to.
+_MULTI_USER_ADVICE = (
+    "If the requested application is public or multi-user, regenerate with\n"
+    "`cayu new NAME --preset service` or adopt Cayu's maintained service contract;\n"
+    "do not improvise product authorization around raw Cayu routes."
+)
+_B2B_MULTI_USER = (
+    "This application is multi-user: its people reach their data only through `/app`, which\n"
+    "authorizes each request with `app.access(subject)`; do not add product routes over raw\n"
+    "Cayu routes."
+)
+
+
+def _agents_md(agents: str) -> str:
+    for row, replacement in _AGENTS_ROWS.items():
+        agents = agents.replace(row, replacement)
+    return agents.replace(_MULTI_USER_ADVICE, _B2B_MULTI_USER)
 
 
 def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[str, str]:
@@ -1701,8 +1880,12 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
         )
     )
     return {
-        "README.md": files["README.md"] + _GUIDANCE,
-        "AGENTS.md": files["AGENTS.md"] + _GUIDANCE,
+        # The Developer dashboard login the b2b preset uses (see pyproject.toml below).
+        "README.md": files["README.md"].replace(
+            ENVIRONMENT_OPERATOR_AUTH_TARGET, ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET
+        )
+        + _GUIDANCE,
+        "AGENTS.md": _agents_md(files["AGENTS.md"]) + _GUIDANCE,
         "app.py": app,
         "database/models.py": models + _MODELS_APPEND,
         "migrations/versions/0002_organizations.py": _MIGRATION,
@@ -1725,7 +1908,9 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
         "configuration/settings.py": files["configuration/settings.py"] + _SETTINGS_APPEND,
         "migrations/versions/0003_membership_roles.py": _ROLES_MIGRATION,
         "integrations/sign_in.py": _SIGN_IN_PY,
-        "integrations/http.py": _HTTP_PY,
+        "integrations/http.py": _HTTP_PY.replace("__AGENT_NAME__", plan.agent_name),
+        "integrations/web.py": _WEB_PY,
+        **_web_files(),
         "tests/test_http_api.py": _TEST_HTTP_API_PY,
         "tests/test_background_revocation.py": _TEST_BACKGROUND_REVOCATION_PY.replace(
             "__AGENT_NAME__", plan.agent_name

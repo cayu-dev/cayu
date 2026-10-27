@@ -853,6 +853,7 @@ def _run_dashboard(runner: LocalCiRunner) -> None:
         ("Dashboard package build", ("run", "build:package")),
     ):
         runner.run(label, ("npm", *npm_args), cwd=dashboard)
+    runner.run("B2B web interface", ("python3", "scripts/build_b2b_web.py", "--check"))
     # The browser client served by mount_cayu is plain JavaScript outside the
     # dashboard package; its behavior tests need only Node's built-in runner.
     runner.run("Browser client tests", ("node", "--test", "tests/browser_client/*.test.mjs"))

@@ -64,6 +64,7 @@ _SQLITE_EXACT_PATHS = {
 }
 _DASHBOARD_EXACT_PATHS = {
     ".gitattributes",
+    "scripts/build_b2b_web.py",
     "scripts/generate_dashboard_api_types.py",
     "src/cayu/_server_contract_version.py",
     "src/cayu/_validation.py",
@@ -163,6 +164,7 @@ def _affects_dashboard(path: str) -> bool:
         + (
             "dashboard/",
             "src/cayu/artifacts/",
+            "src/cayu/cli/templates/b2b_web/",
             "src/cayu/core/",
             "src/cayu/evals/",
             "src/cayu/runtime/",

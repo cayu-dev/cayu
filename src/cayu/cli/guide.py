@@ -21,6 +21,10 @@ _GUIDES = {
         "app-ui.md",
         "Browser UIs over sessions: client.js, polling rules, and the idle budget.",
     ),
+    "b2b": (
+        "b2b.md",
+        "Several businesses on one agent: organizations, sharing, sign-in and a web interface.",
+    ),
     "applications": (
         "applications.md",
         "Generated application convention, placement, planning, and drift checks.",
@@ -96,7 +100,8 @@ _INCLUDES = {
 _RELATED = {
     "order-support": ("durable-service-tools", "durable-operations", "references"),
     "anatomy": ("applications", "authoring", "diagnostics", "app-ui"),
-    "app-ui": ("anatomy", "human-attention", "references"),
+    "app-ui": ("anatomy", "human-attention", "references", "b2b"),
+    "b2b": ("app-ui", "applications", "references"),
     "applications": ("anatomy", "authoring", "diagnostics", "references"),
     "authoring": (
         "anatomy",
