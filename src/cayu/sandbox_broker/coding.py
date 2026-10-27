@@ -25,7 +25,7 @@ import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.egress._remote_adapter import setup_command_failure_message
@@ -91,6 +91,10 @@ from cayu.sandbox_broker.runner import (
     validate_staged_copies_mode,
 )
 from cayu.workspaces import LocalWorkspace, RunnerWorkspace, Workspace
+
+if TYPE_CHECKING:
+    from cayu.knowledge.base import KnowledgeStore
+    from cayu.knowledge.scopes import KnowledgeAccessScope
 
 __all__ = [
     "BROKERED_SANDBOX_EGRESS_ENV",
@@ -364,6 +368,12 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     read-only support paths exist (it can't prove they are read-only), runs the
     profile's admission probes and probes its executables live. The runner's
     evidence then names the profile, which the tools require.
+
+    ``knowledge_store`` and ``knowledge_access_scope`` go to every session's
+    environment, where ``search_knowledge`` and the other knowledge tools find
+    them; the scope defaults to the one bound to the store. Without a store the
+    sessions have no knowledge. Neither enters the sandbox: the tools run in
+    the Agent process.
     """
 
     @property
@@ -392,9 +402,19 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         toolchain_profile: CodingToolchainProfile | None = None,
         setup_command_timeout_s: int = DEFAULT_BROKERED_SETUP_COMMAND_TIMEOUT_SECONDS,
         staged_copies: StagedCopiesMode = "auto",
+        knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope: KnowledgeAccessScope | None = None,
     ) -> None:
         if not isinstance(broker, SandboxBrokerClient):
             raise TypeError("broker must be a SandboxBrokerClient.")
+        # The concrete environment's validation, once, before any allocation.
+        knowledge = Environment(
+            EnvironmentSpec(name="coding"),
+            knowledge_store=knowledge_store,
+            knowledge_access_scope=knowledge_access_scope,
+        )
+        self._knowledge_store = knowledge.knowledge_store
+        self._knowledge_access_scope = knowledge.knowledge_access_scope
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError(
                 "source_workspace must be a LocalWorkspace: durable storage outside the "
@@ -490,6 +510,21 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         """Identity of what every session's sandbox is built from; it never reconnects."""
 
         return self._profile_identity
+
+    @property
+    def configured_knowledge_store(self) -> KnowledgeStore | None:
+        """The knowledge store every session's environment carries, for the knowledge tools."""
+
+        return self._knowledge_store
+
+    @property
+    def configured_knowledge_access_scope(self) -> KnowledgeAccessScope | None:
+        """A copy of the access scope that goes with ``configured_knowledge_store``."""
+
+        from cayu.knowledge.scopes import copy_knowledge_access_scope
+
+        scope = self._knowledge_access_scope
+        return None if scope is None else copy_knowledge_access_scope(scope)
 
     @classmethod
     def from_env(
@@ -651,6 +686,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 workspace=self._protected_source,
                 runner=runner,
                 binding=self._binding(sandbox),
+                knowledge_store=self._knowledge_store,
+                knowledge_access_scope=self._knowledge_access_scope,
             )
         except BaseException as original:
             await self._discard(sandbox, keeper, runner, original)
@@ -1024,6 +1061,8 @@ def brokered_coding_backend(context: Any) -> Any:
         source_workspace: LocalWorkspace,
         *,
         artifact_store: Any = None,
+        knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope: KnowledgeAccessScope | None = None,
     ) -> BrokeredSandboxCodingEnvironmentFactory:
         # The artifact store is registered with the app; sandboxes never hold it.
         del artifact_store
@@ -1038,6 +1077,8 @@ def brokered_coding_backend(context: Any) -> Any:
             git_baseline=options.git_baseline,
             toolchain_profile=profile,
             staged_copies=options.staged_copies,
+            knowledge_store=knowledge_store,
+            knowledge_access_scope=knowledge_access_scope,
         )
 
     return CodingBackend(

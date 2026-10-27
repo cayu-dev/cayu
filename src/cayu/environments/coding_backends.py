@@ -13,7 +13,8 @@ The parts compose and each works alone:
   the backend a deployment requires by name, otherwise Cayu Cloud when all
   three ``CAYU_CLOUD_*`` sandbox variables are set, Docker otherwise.
 - :func:`register_coding_environment` registers one source workspace's
-  factory with an app, under any name, as often as needed.
+  factory with an app, under any name, as often as needed. Its environments
+  get a knowledge store only when given one, or the app's when asked.
 
 The individual factories stay public; an app that always runs on one backend
 can construct it directly instead.
@@ -40,6 +41,8 @@ from cayu.workspaces.local import LocalWorkspace
 
 if TYPE_CHECKING:
     from cayu.artifacts.base import ArtifactStore
+    from cayu.knowledge.base import KnowledgeStore
+    from cayu.knowledge.scopes import KnowledgeAccessScope
     from cayu.managed_settings import ManagedSetting
 
 #: Names the one backend a deployment requires; startup fails if it can't be used.
@@ -57,11 +60,21 @@ _BACKEND_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 
 
 class _FactoryBuilder(Protocol):
+    """Builds one workspace's factory.
+
+    ``knowledge_store`` and ``knowledge_access_scope`` are passed only when a
+    store is given, so a builder without them keeps working for apps that don't
+    use knowledge. A builder that takes them must give every environment its
+    factory creates that store and scope.
+    """
+
     def __call__(
         self,
         source_workspace: LocalWorkspace,
         *,
         artifact_store: ArtifactStore | None = None,
+        knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope: KnowledgeAccessScope | None = None,
     ) -> EnvironmentFactory: ...
 
 
@@ -100,14 +113,41 @@ class CodingBackend:
         source_workspace: LocalWorkspace,
         *,
         artifact_store: ArtifactStore | None = None,
+        knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope: KnowledgeAccessScope | None = None,
     ) -> EnvironmentFactory:
-        """Return a new factory whose sessions copy in from ``source_workspace``."""
+        """Return a new factory whose sessions copy in from ``source_workspace``.
+
+        Its environments carry ``knowledge_store`` and ``knowledge_access_scope``,
+        which is where ``search_knowledge`` and the other knowledge tools get
+        them. The scope defaults to the one bound to the store; a scope needs a
+        store. Without a store the environments have no knowledge.
+        """
 
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be a LocalWorkspace.")
-        factory = self.build_factory(source_workspace, artifact_store=artifact_store)
+        if knowledge_store is None and knowledge_access_scope is not None:
+            raise ValueError("knowledge_access_scope needs the knowledge_store it applies to.")
+        knowledge: dict[str, Any] = (
+            {}
+            if knowledge_store is None
+            else {
+                "knowledge_store": knowledge_store,
+                "knowledge_access_scope": knowledge_access_scope,
+            }
+        )
+        factory = self.build_factory(source_workspace, artifact_store=artifact_store, **knowledge)
         if not isinstance(factory, EnvironmentFactory):
             raise TypeError(f"The {self.name!r} coding backend returned no EnvironmentFactory.")
+        # A factory that says which store its environments carry must carry this one.
+        if (
+            knowledge_store is not None
+            and getattr(factory, "configured_knowledge_store", knowledge_store)
+            is not knowledge_store
+        ):
+            raise TypeError(
+                f"The {self.name!r} coding backend dropped the knowledge_store it was given."
+            )
         return factory
 
     def execution_requirements(self, **overrides: object) -> ExecutionRequirements:
@@ -319,6 +359,9 @@ def register_coding_environment(
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
     metadata: Mapping[str, object] | None = None,
     settings: Iterable[ManagedSetting] | None = None,
+    knowledge_store: KnowledgeStore | None = None,
+    knowledge_access_scope: KnowledgeAccessScope | None = None,
+    inherit_app_knowledge: bool = False,
 ) -> EnvironmentFactory:
     """Register one source workspace's coding environment under ``name`` and return its factory.
 
@@ -327,11 +370,37 @@ def register_coding_environment(
     spec's metadata records the backend, the toolchain profile's evidence and
     the factory's identity, plus any non-secret ``metadata`` given here. ``settings``
     are the environment's managed settings, passed to ``register_environment_factory``.
+
+    The environments carry the knowledge store that ``search_knowledge`` and
+    the other knowledge tools use. Pass ``knowledge_store`` (and optionally
+    ``knowledge_access_scope``) to choose it, or ``inherit_app_knowledge=True``
+    to use the app's ``knowledge_store`` with exactly its
+    ``knowledge_access_scope``. Otherwise they have no knowledge: the app's
+    scope often spans every tenant, so a workspace never gets it by default.
     """
 
     if type(backend) is not CodingBackend:
         raise TypeError("backend must be a CodingBackend.")
-    factory = backend.factory_for(source_workspace, artifact_store=artifact_store)
+    if type(inherit_app_knowledge) is not bool:
+        raise TypeError("inherit_app_knowledge must be a bool.")
+    if knowledge_store is None and knowledge_access_scope is not None:
+        raise ValueError(
+            "knowledge_access_scope needs the knowledge_store it applies to; "
+            "pass knowledge_store=app.knowledge_store to narrow the app's store."
+        )
+    if inherit_app_knowledge:
+        if knowledge_store is not None:
+            raise ValueError("Pass knowledge_store or inherit_app_knowledge=True, not both.")
+        knowledge_store = getattr(app, "knowledge_store", None)
+        if knowledge_store is None:
+            raise ValueError("inherit_app_knowledge=True needs an app built with knowledge_store=.")
+        knowledge_access_scope = app.knowledge_access_scope
+    factory = backend.factory_for(
+        source_workspace,
+        artifact_store=artifact_store,
+        knowledge_store=knowledge_store,
+        knowledge_access_scope=knowledge_access_scope,
+    )
     factory_identity = factory.execution_profile_identity
     spec_metadata: dict[str, object] = {
         "coding_backend": backend.name,

@@ -18,6 +18,11 @@ from cayu._application_registration import (
     _validate_registered_tool,
     _validate_runtime_hooks,
 )
+from cayu._knowledge_tool_supply import (
+    agent_knowledge_supply,
+    is_knowledge_tool,
+    knowledge_store_unavailable_message,
+)
 from cayu._validation import require_clean_nonblank
 from cayu.agents import AgentSpec
 from cayu.budgets.base import BudgetLedger, InMemoryBudgetLedger, _EffectiveBudgetLimit
@@ -600,7 +605,32 @@ class ApplicationAgentRegistry:
             self._static_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
         for registered_tool in tools_by_name.values():
             self._report_unbounded_tool(registered_tool)
+        self._report_knowledge_tools_without_store(
+            stored_spec.name, tools_by_name, stored_default_environment_name
+        )
         return spec
+
+    def _report_knowledge_tools_without_store(
+        self,
+        agent_name: str,
+        tools_by_name: Mapping[str, runtime_records.RegisteredTool],
+        default_environment_name: str | NoEnvironment | None,
+    ) -> None:
+        """Warn when the agent's knowledge tools will find no knowledge store."""
+
+        knowledge_tools = tuple(
+            name for name, tool in sorted(tools_by_name.items()) if is_knowledge_tool(tool.tool)
+        )
+        if not knowledge_tools or self._environment_registry is None:
+            return
+        supply = agent_knowledge_supply(
+            default_environment_name,
+            environments=self._environment_registry.registrations,
+            app_default_environment=self._environment_registry.default_name,
+            complete=False,
+        )
+        if supply == "missing":
+            logger.warning(knowledge_store_unavailable_message(agent_name, knowledge_tools))
 
     def _report_unbounded_tool(self, registered_tool: runtime_records.RegisteredTool) -> None:
         """Warn once per tool name about a tool that declares no terminal bound."""

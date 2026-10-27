@@ -66,7 +66,7 @@ from cayu.sandbox_broker import (
 from cayu.sandbox_broker import client as client_module
 from cayu.sandbox_broker import runner as runner_module
 from cayu.sandbox_broker.client import MAX_COMMAND_OUTPUT_BYTES
-from cayu.storage import SQLiteSessionStore
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope, SQLiteSessionStore
 from cayu.tools import GitChangesTool
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.workspaces import LocalWorkspace
@@ -567,6 +567,38 @@ def test_factory_release_and_binding_destroy_the_sandbox(tmp_path: Path) -> None
 
     asyncio.run(scenario())
     assert broker.live() == []
+
+
+def test_the_factory_gives_each_session_its_knowledge_store_and_scope(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    store = InMemoryKnowledgeStore()
+    scope = KnowledgeAccessScope.for_namespace("project:app")
+
+    async def scenario():
+        factory = _factory(broker, source, knowledge_store=store, knowledge_access_scope=scope)
+        assert factory.configured_knowledge_store is store
+        assert factory.configured_knowledge_access_scope == scope
+        factory.configured_knowledge_access_scope.allowed_namespaces.append("project:other")
+        assert factory.configured_knowledge_access_scope == scope
+        result = await factory.create(_request())
+        assert result.environment.knowledge_store is store
+        assert result.environment.knowledge_access_scope == scope
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+        plain = _factory(broker, source)
+        assert plain.configured_knowledge_store is None
+        # Knowledge isn't part of the sandbox, so it doesn't change what sessions resume on.
+        assert plain.execution_profile_identity == factory.execution_profile_identity
+        result = await plain.create(_request("plain"))
+        assert result.environment.knowledge_store is None
+        assert result.environment.knowledge_access_scope is None
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    asyncio.run(scenario())
+    assert broker.live() == []
+    with pytest.raises(ValueError, match="configured together"):
+        _factory(broker, source, knowledge_access_scope=scope)
 
 
 def test_completion_recovery_never_copies_back_from_a_replacement(tmp_path: Path) -> None:

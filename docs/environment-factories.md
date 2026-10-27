@@ -577,6 +577,14 @@ Every install's catalog has `coding-python` (Python with `uv`, `git` and
 ripgrep); an install may also offer `coding-agents`, which adds the Claude Code
 and Codex CLIs. Catalog images don't contain your project's dependencies.
 
+Like `DockerCodingEnvironmentFactory`, it takes `knowledge_store=` and
+`knowledge_access_scope=` and gives both to every session's environment, which
+is where `search_knowledge`, `read_knowledge`, `list_knowledge` and
+`remember_knowledge` get them. The scope defaults to the one bound to the
+store. Without a store those tools fail every call with
+`missing_knowledge_store`. The store never enters the sandbox; the knowledge
+tools run in the Agent process.
+
 | Egress | What the sandbox reaches | `deny_by_default_network` |
 |---|---|---|
 | `none` | Nothing: no path out. | Yes, when the record carries the guarantee items behind it. |
@@ -871,7 +879,38 @@ backend refuses `CAYU_CLOUD_SANDBOX_EGRESS` set to anything else and
 
 `register_coding_environment` can be called once per workspace, for example
 for each clone a parallel worker edits; `RunRequest.environment_name` then
-picks the workspace. `named_checks_from_toolchain(profile)` and
+picks the workspace.
+
+A tool call gets its knowledge store and access scope from the environment it
+runs in, not from the app. A coding workspace has no knowledge unless you give
+it some, because the app's scope often spans every tenant and a workspace
+usually serves one. Pass `knowledge_store=` (and `knowledge_access_scope=`
+for a scope narrower than the one bound to the store) to choose what one
+workspace sees. `inherit_app_knowledge=True` uses the app's `knowledge_store`
+with exactly its `knowledge_access_scope`; use it when that scope is what
+every agent in the workspace should see. A scope without a store is refused,
+and so is a store together with `inherit_app_knowledge=True`.
+`CodingBackend.factory_for(...)`, `DockerCodingEnvironmentFactory` and
+`BrokeredSandboxCodingEnvironmentFactory` take the same two parameters and
+never look at the app; without them their environments have no knowledge. A
+backend you register passes them through: its builder gets them only when a
+store is given, and a factory that reports `configured_knowledge_store` must
+report that store.
+
+```python
+register_coding_environment(
+    app,
+    name="docs-worker",
+    backend=backend,
+    source_workspace=docs_checkout,
+    knowledge_store=app.knowledge_store,
+    knowledge_access_scope=KnowledgeAccessScope.for_namespace("project:docs"),
+)
+```
+
+`cayu check` reports `TOOL_KNOWLEDGE_STORE_UNAVAILABLE`, and `register_agent`
+logs a warning, when an agent has a knowledge tool but its default environment
+has no knowledge store. `named_checks_from_toolchain(profile)` and
 `ExactNamedCheckCommandPolicy(checks)` build `RunCheckTool`'s checks and its
 defense-in-depth policy from the profile.
 

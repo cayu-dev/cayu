@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from cayu._knowledge_tool_supply import agent_knowledge_supply, is_knowledge_tool
 from cayu._validation import (
     canonical_durable_json_bytes,
     collision_safe_json_object,
@@ -276,6 +277,9 @@ class ToolManifest(_ManifestModel):
     # declares no terminal payload bound. A manifest loaded from JSON cannot
     # tell and reports nothing.
     _terminal_payload_bound_undeclared: bool = PrivateAttr(default=False)
+    # In-process fact for checks, like the ones above: a knowledge tool whose
+    # agent's default environment supplies no knowledge store.
+    _knowledge_store_unavailable: bool = PrivateAttr(default=False)
 
     @field_validator("adapter_identity", mode="before")
     @classmethod
@@ -662,10 +666,17 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         for tool in agent.tools
         if tool._terminal_payload_bound_undeclared
     }
+    without_knowledge = {
+        (agent.name, tool.name)
+        for agent in agents
+        for tool in agent.tools
+        if tool._knowledge_store_unavailable
+    }
     for agent in manifest.agents:
         for tool in agent.tools:
             tool._policy_allows_explicitly = (agent.name, tool.name) in explicit
             tool._terminal_payload_bound_undeclared = (agent.name, tool.name) in unbounded
+            tool._knowledge_store_unavailable = (agent.name, tool.name) in without_knowledge
     return manifest
 
 
@@ -755,6 +766,15 @@ def _describe_agent(
     else:
         resolved = None
         resolution = "missing"
+    knowledge_store_unavailable = (
+        agent_knowledge_supply(
+            registration.default_environment_name,
+            environments=app._environment_registry.registrations,
+            app_default_environment=app._environment_registry.default_name,
+            complete=True,
+        )
+        == "missing"
+    )
     return AgentManifest(
         name=name,
         model=spec.model,
@@ -782,6 +802,7 @@ def _describe_agent(
                 tool_policy=registration.tool_policy,
                 registration_provenance=registration_provenance,
                 project_root=project_root,
+                knowledge_store_unavailable=knowledge_store_unavailable,
             )
             for tool_name, tool in sorted(registration.tools.items())
         ),
@@ -812,6 +833,7 @@ def _describe_tool(
     tool_policy: ToolPolicy,
     registration_provenance: RegistrationProvenance,
     project_root: Path | None,
+    knowledge_store_unavailable: bool = False,
 ) -> ToolManifest:
     execution_contract = ToolExecutionContract.model_validate(tool.execution_contract)
     manifest = ToolManifest(
@@ -860,6 +882,9 @@ def _describe_tool(
     manifest._policy_allows_explicitly = _policy_allows_explicitly(tool_policy, tool_name)
     manifest._terminal_payload_bound_undeclared = application_tool_declares_no_bound(
         tool.tool, execution_contract.max_terminal_payload_bytes
+    )
+    manifest._knowledge_store_unavailable = knowledge_store_unavailable and is_knowledge_tool(
+        tool.tool
     )
     return manifest
 

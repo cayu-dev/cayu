@@ -161,6 +161,29 @@ storage migration.
   valid decisions fail with an expired deadline.
 - Raise the minimum Pillow, pypdf, Brotli, and OpenTelemetry versions to include
   security fixes, and update the dashboard's Vite and Zod build dependencies.
+- Knowledge tools work in coding environments. `search_knowledge`,
+  `read_knowledge`, `list_knowledge` and `remember_knowledge` get their store
+  from the environment they run in, and none of the coding entry points could
+  pass one, so in Docker coding and brokered sandbox environments every call
+  failed with `missing_knowledge_store`, including in the coding preset
+  generated with the `knowledge` capability. `register_coding_environment`,
+  `CodingBackend.factory_for` (and the built-in backends' factories) and
+  `BrokeredSandboxCodingEnvironmentFactory` now take `knowledge_store=` and
+  `knowledge_access_scope=`, and `register_coding_environment(...,
+  inherit_app_knowledge=True)` uses the app's `knowledge_store` with exactly
+  its `knowledge_access_scope`. Without either a workspace still has no
+  knowledge, since the app's scope can span tenants a workspace shouldn't see,
+  so existing apps gain no access on upgrade. The Docker and brokered coding
+  factories report `configured_knowledge_store` and a copy of
+  `configured_knowledge_access_scope`, and a coding backend whose factory drops
+  a given store is refused. Regenerated coding projects pass the store
+  explicitly and test that `search_knowledge` finds an entry in the registered
+  coding environment.
+- `register_agent` logs a warning, and `cayu check` reports the new
+  `TOOL_KNOWLEDGE_STORE_UNAVAILABLE` warning, when an agent has a knowledge
+  tool but its default environment has no knowledge store. A factory counts
+  when it reports `configured_knowledge_store`; other factories aren't
+  reported.
 
 ## v0.15.0
 

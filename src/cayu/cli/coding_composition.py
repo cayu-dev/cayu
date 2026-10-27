@@ -3984,6 +3984,9 @@ def build_coding_composition(
         backend=backend,
         source_workspace=source_workspace,
         artifact_store=selected_artifact_store,
+        # Knowledge tools get their store and scope from the environment.
+        knowledge_store=selected_knowledge_store,
+        knowledge_access_scope=selected_scope,
         default=True,
         execution_profile_identity=_CODING_ENVIRONMENT_IDENTITY,
         metadata={
@@ -4124,6 +4127,8 @@ def register_workspace_environment(
         backend=composition.backend,
         source_workspace=_source_workspace(root, workspace_id=f"coding-source-{name}"),
         artifact_store=composition.artifact_store,
+        knowledge_store=composition.app.knowledge_store,
+        knowledge_access_scope=composition.app.knowledge_access_scope,
         execution_profile_identity=_CODING_ENVIRONMENT_IDENTITY,
     )
 
@@ -4492,8 +4497,10 @@ from cayu.sessions import InMemorySessionStore
 from cayu.tasks import InMemoryTaskStore
 from cayu.artifacts import LocalArtifactStore
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.storage import KnowledgeChunk, KnowledgeEntry, SQLiteKnowledgeStore
 from cayu.workspaces import RunnerWorkspace
 from cayu.evals import ScriptedModelProvider
+from knowledge.coding import coding_knowledge_scope
 
 _IMAGE_ID = "sha256:" + ("a" * 64)
 
@@ -5311,6 +5318,8 @@ def _install_fake_docker_factory(
             ),
             workspace=factory.source_workspace,
             artifact_store=factory.configured_artifact_store,
+            knowledge_store=factory.configured_knowledge_store,
+            knowledge_access_scope=factory.configured_knowledge_access_scope,
             runner=runner,
             binding=binding,
         )
@@ -5411,6 +5420,87 @@ def test_fake_provider_edit_fail_inspect_repair_pass_and_copy_back(
     )
     assert '"status":"failed"'.replace(" ", "") in request_record.replace(" ", "")
     assert '"status":"passed"'.replace(" ", "") in request_record.replace(" ", "")
+
+
+def test_knowledge_tool_finds_an_entry_in_the_registered_coding_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search_knowledge reaches the app's store from the registered coding environment."""
+
+    _admit_test_image(monkeypatch)
+    source = _repository(tmp_path / "source")
+    target = tmp_path / "target"
+    target.mkdir()
+    created_runners: list[_LocalDockerRunner] = []
+    _install_fake_docker_factory(monkeypatch, target=target, created_runners=created_runners)
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="knowledge_call",
+                    name="search_knowledge",
+                    arguments={"query": "releases"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("Releases are tagged from main."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+
+    async def scenario():
+        knowledge_store = SQLiteKnowledgeStore(
+            tmp_path / "knowledge.db", access_scope=coding_knowledge_scope()
+        )
+        try:
+            await knowledge_store.create_entry(
+                KnowledgeEntry(id="release-guide", text="Tag releases from main only."),
+                [
+                    KnowledgeChunk(
+                        id="release-guide-0",
+                        entry_id="release-guide",
+                        text="Tag releases from main only.",
+                        chunk_index=0,
+                    )
+                ],
+            )
+            app = build_app(
+                provider=provider,
+                session_store=InMemorySessionStore(),
+                task_store=InMemoryTaskStore(),
+                workspace_root=source,
+                knowledge_store=knowledge_store,
+            )
+            factory = app._environment_registry.registrations["coding"].factory
+            assert factory.configured_knowledge_store is knowledge_store
+            return await _collect(
+                app.run(
+                    RunRequest(
+                        agent_name="__AGENT_NAME__",
+                        session_id="generated-docker-knowledge",
+                        messages=[Message.text("user", "How are releases tagged?")],
+                    )
+                )
+            )
+        finally:
+            await knowledge_store.close()
+
+    events = asyncio.run(scenario())
+
+    assert events[-1].type is EventType.SESSION_COMPLETED, events[-1].payload
+    searched = [
+        event
+        for event in events
+        if event.type is EventType.TOOL_CALL_COMPLETED and event.tool_name == "search_knowledge"
+    ]
+    assert len(searched) == 1
+    result = searched[0].payload["result"]
+    assert "missing_knowledge_store" not in str(result)
+    assert "Tag releases from main only." in result["content"]
+    assert created_runners
 
 
 @pytest.mark.parametrize("custom_profile", [False, True])
@@ -5655,6 +5745,10 @@ def test_reduced_docker_profile_matches_the_declared_capabilities(
     assert len(manifest.agents) == (2 if __CODING_DELEGATION_ENABLED__ else 1)
     primary = next(agent for agent in manifest.agents if agent.name == "__AGENT_NAME__")
     assert {tool.name for tool in primary.tools} == set(DOCKER_TOOL_NAMES)
+    # Knowledge tools get their store from the environment, so the factory carries the app's.
+    factory = app._environment_registry.registrations["coding"].factory
+    assert factory.configured_knowledge_store is app.knowledge_store
+    assert (factory.configured_knowledge_store is not None) is __CODING_KNOWLEDGE_ENABLED__
 '''
 
 _SMOKE_TEST_PY = r'''"""Credential-free smoke proof for the maintained coding composition."""

@@ -44,6 +44,7 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED",
     "TOOL_APPROVAL_VALIDITY_RULE",
     "TOOL_TERMINAL_PAYLOAD_UNBOUNDED",
+    "TOOL_KNOWLEDGE_STORE_UNAVAILABLE",
 )
 # Every code `check_public_service_deployment` reports. `cayu serve` refuses to start a
 # production public service while any of them is reported.
@@ -455,6 +456,32 @@ def check_manifest(
                         verification_command=(
                             "cayu inspect --json && cayu check --fail-on warning --json"
                         ),
+                    )
+                )
+            if tool._knowledge_store_unavailable:
+                diagnostics.append(
+                    ProjectDiagnostic(
+                        code="TOOL_KNOWLEDGE_STORE_UNAVAILABLE",
+                        severity=DiagnosticSeverity.WARNING,
+                        subject=f"tool:{agent.name}/{tool.name}",
+                        path=f"agents.{agent.name}.tools.{tool.name}",
+                        message=(
+                            f"Tool '{tool.name}' needs a knowledge store, but agent "
+                            f"'{agent.name}' runs by default in an environment that has none, "
+                            "so every call fails with missing_knowledge_store."
+                        ),
+                        hint=(
+                            "Tools get their knowledge store from the environment they run "
+                            "in. Pass knowledge_store= to the Environment or environment "
+                            "factory, or inherit_app_knowledge=True to "
+                            "register_coding_environment to use the app's store and scope."
+                        ),
+                        tags=("configuration",),
+                        parameters={"agent": agent.name, "tool": tool.name},
+                        documentation_anchor=(
+                            "cayu guide diagnostics#tool-knowledge-store-unavailable"
+                        ),
+                        verification_command="cayu check --json",
                     )
                 )
             if tool._terminal_payload_bound_undeclared:

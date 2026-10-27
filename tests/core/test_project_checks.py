@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 from pydantic import ValidationError
 
 from cayu import AgentSpec, CayuApp, Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.agents import AgentAuthoringState
 from cayu.environments import (
+    NO_ENVIRONMENT,
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
@@ -17,12 +20,15 @@ from cayu.runners import LocalRunner
 from cayu.runtime import ProjectDiagnostic, check_manifest
 from cayu.runtime.checks import BUILTIN_DIAGNOSTIC_CODES, ProjectControlPlaneCheckEvidence
 from cayu.runtime.service_manifest import PublicServiceManifest
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope
 from cayu.tools import (
     AlwaysRequireApprovalToolPolicy,
     ExecCommandTool,
     ParameterConstrainedToolPolicy,
     ProcessCommandPolicy,
+    ReadKnowledgeTool,
     RequiredFieldRule,
+    SearchKnowledgeTool,
     ToolPolicyDecision,
     ToolPolicyResult,
     WriteFileTool,
@@ -133,6 +139,7 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED",
         "TOOL_APPROVAL_VALIDITY_RULE",
         "TOOL_TERMINAL_PAYLOAD_UNBOUNDED",
+        "TOOL_KNOWLEDGE_STORE_UNAVAILABLE",
     )
     assert len(BUILTIN_DIAGNOSTIC_CODES) == len(set(BUILTIN_DIAGNOSTIC_CODES))
 
@@ -555,6 +562,14 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     unbounded = CayuApp(enable_logging=False)
     unbounded.register_agent(AgentSpec(name="unbounded", model="model"), tools=[_UnboundedTool()])
     unbounded_codes = {item.code for item in check_manifest(unbounded.describe()).diagnostics}
+
+    knowledgeless = CayuApp(enable_logging=False)
+    knowledgeless.register_agent(
+        AgentSpec(name="knowledgeless", model="model"), tools=[SearchKnowledgeTool()]
+    )
+    knowledgeless_codes = {
+        item.code for item in check_manifest(knowledgeless.describe()).diagnostics
+    }
     public_service_codes = {
         item.code
         for item in check_manifest(
@@ -613,11 +628,84 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | unfinished_codes
         | unconstrained_codes
         | unbounded_codes
+        | knowledgeless_codes
         | public_service_codes
         | nondurable_task_service_codes
         | project_control_plane_codes
         == set(BUILTIN_DIAGNOSTIC_CODES)
     )
+
+
+def test_knowledge_tools_without_a_store_in_their_environment_are_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = InMemoryKnowledgeStore()
+    scope = KnowledgeAccessScope.for_namespace("project:app")
+    # The app's store alone doesn't reach tool calls; the environment must carry one.
+    app = CayuApp(enable_logging=False, knowledge_store=store, knowledge_access_scope=scope)
+    app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="plain")), default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="stocked"), knowledge_store=store, knowledge_access_scope=scope
+        )
+    )
+    factory = _UncalledEnvironmentFactory()
+    app.register_environment_factory(EnvironmentSpec(name="custom"), factory)
+    knowledge_tools = [SearchKnowledgeTool(), ReadKnowledgeTool()]
+    with caplog.at_level(logging.WARNING, logger="cayu._application_agent_registry"):
+        app.register_agent(AgentSpec(name="plain", model="model"), tools=knowledge_tools)
+        app.register_agent(
+            AgentSpec(name="toolonly", model="model"),
+            tools=knowledge_tools,
+            environment_name=NO_ENVIRONMENT,
+        )
+        app.register_agent(
+            AgentSpec(name="stocked", model="model"),
+            tools=knowledge_tools,
+            environment_name="stocked",
+        )
+        # A factory that doesn't say which store it attaches isn't reported.
+        app.register_agent(
+            AgentSpec(name="custom", model="model"),
+            tools=knowledge_tools,
+            environment_name="custom",
+        )
+        app.register_agent(AgentSpec(name="none", model="model"))
+    warned = sorted(
+        record.getMessage().split()[1]
+        for record in caplog.records
+        if "missing_knowledge_store" in record.getMessage()
+    )
+    assert warned == ["plain", "toolonly"]
+
+    manifest = app.describe()
+    findings = [
+        item
+        for item in check_manifest(manifest).diagnostics
+        if item.code == "TOOL_KNOWLEDGE_STORE_UNAVAILABLE"
+    ]
+    assert [item.subject for item in findings] == [
+        "tool:plain/read_knowledge",
+        "tool:plain/search_knowledge",
+        "tool:toolonly/read_knowledge",
+        "tool:toolonly/search_knowledge",
+    ]
+    finding = findings[0]
+    assert finding.severity == "warning"
+    assert finding.path == "agents.plain.tools.read_knowledge"
+    assert finding.parameters == {"agent": "plain", "tool": "read_knowledge"}
+    assert "missing_knowledge_store" in finding.message
+    assert "knowledge_store=" in finding.hint
+    assert finding.documentation_anchor == (
+        "cayu guide diagnostics#tool-knowledge-store-unavailable"
+    )
+    assert factory.called is False
+    # A manifest read back from JSON cannot tell, so it reports nothing.
+    reloaded = type(manifest).model_validate_json(manifest.model_dump_json())
+    assert "TOOL_KNOWLEDGE_STORE_UNAVAILABLE" not in {
+        item.code for item in check_manifest(reloaded).diagnostics
+    }
 
 
 def test_external_tool_requires_effective_policy_coverage_for_that_tool() -> None:

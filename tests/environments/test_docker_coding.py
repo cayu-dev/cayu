@@ -1309,13 +1309,13 @@ def test_docker_coding_factory_refuses_weakened_privilege_restrictions(
 
 
 @pytest.mark.parametrize(
-    ("with_artifacts", "command_cleanup", "cancel_timeout_s"),
+    ("with_stores", "command_cleanup", "cancel_timeout_s"),
     [(False, None, None), (True, None, None), (False, "command_or_sandbox", 30.0)],
 )
 def test_docker_coding_factory_returns_only_exact_final_evidence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    with_artifacts: bool,
+    with_stores: bool,
     command_cleanup: str | None,
     cancel_timeout_s: float | None,
 ) -> None:
@@ -1323,8 +1323,12 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
     calls: list[list[str]] = []
     artifacts = (
         LocalArtifactStore(tmp_path / "artifacts", store_id="host-artifacts")
-        if with_artifacts
+        if with_stores
         else None
+    )
+    knowledge = InMemoryKnowledgeStore() if with_stores else None
+    knowledge_scope = (
+        KnowledgeAccessScope(allowed_namespaces=["project:app"]) if with_stores else None
     )
 
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
@@ -1347,6 +1351,8 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
         artifact_store=artifacts,
+        knowledge_store=knowledge,
+        knowledge_access_scope=knowledge_scope,
         toolchain_profile=docker_toolchain_profile(
             image_identity=_image_identity(), restrictions=restrictions
         ),
@@ -1382,6 +1388,11 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
         result = await factory.create(request)
         assert factory.configured_artifact_store is artifacts
         assert result.environment.artifact_store is artifacts
+        # The knowledge tools read these from the environment the session runs in.
+        assert factory.configured_knowledge_store is knowledge
+        assert factory.configured_knowledge_access_scope == knowledge_scope
+        assert result.environment.knowledge_store is knowledge
+        assert result.environment.knowledge_access_scope == knowledge_scope
         evidence = result.metadata["execution_capabilities"]
         assert evidence["environment_fingerprint"].startswith("sha256:")
         assert result.metadata["execution_requirements"]["required_executables"] == [

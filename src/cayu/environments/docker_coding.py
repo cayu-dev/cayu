@@ -1248,6 +1248,21 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
 
         return self._artifact_store
 
+    @property
+    def configured_knowledge_store(self) -> KnowledgeStore | None:
+        """The knowledge store every environment carries, for the knowledge tools."""
+
+        return self._knowledge_store
+
+    @property
+    def configured_knowledge_access_scope(self) -> KnowledgeAccessScope | None:
+        """A copy of the access scope that goes with ``configured_knowledge_store``."""
+
+        from cayu.knowledge.scopes import copy_knowledge_access_scope
+
+        scope = self._knowledge_access_scope
+        return None if scope is None else copy_knowledge_access_scope(scope)
+
     def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
         """Return the exact authority every runner from this factory preserves."""
 
@@ -3392,6 +3407,8 @@ def docker_coding_backend(context: Any) -> Any:
         source_workspace: LocalWorkspace,
         *,
         artifact_store: ArtifactStore | None = None,
+        knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope: KnowledgeAccessScope | None = None,
     ) -> DockerCodingEnvironmentFactory:
         return DockerCodingEnvironmentFactory(
             source_workspace=source_workspace,
@@ -3401,6 +3418,8 @@ def docker_coding_backend(context: Any) -> Any:
             restrictions=options.restrictions,
             extra_admission_probes=options.extra_admission_probes,
             artifact_store=artifact_store,
+            knowledge_store=knowledge_store,
+            knowledge_access_scope=knowledge_access_scope,
             transfer_limits=options.transfer_limits,
             docker_path=docker_path,
             cancel_timeout_s=options.cancel_timeout_s,

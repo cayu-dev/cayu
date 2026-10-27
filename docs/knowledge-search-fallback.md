@@ -82,6 +82,15 @@ request = RunRequest(
 )
 ```
 
+The tools read the environment's `knowledge_store` and `knowledge_access_scope`,
+not the app's. Configuring `CayuApp(knowledge_store=...)` alone leaves them
+failing every call with `missing_knowledge_store`; `cayu check` reports that as
+`TOOL_KNOWLEDGE_STORE_UNAVAILABLE`. `register_coding_environment`,
+`DockerCodingEnvironmentFactory` and `BrokeredSandboxCodingEnvironmentFactory`
+take `knowledge_store=` and `knowledge_access_scope=`, and
+`register_coding_environment(..., inherit_app_knowledge=True)` uses the app's
+store and scope (see [environment factories](environment-factories.md#choosing-a-coding-backend)).
+
 `ReadKnowledgeTool` is useful when previews omit necessary context. A search miss
 is not evidence that a particular answer is false. On a lexical-only store,
 reformulation can help; semantic or hybrid retrieval requires a compatible,

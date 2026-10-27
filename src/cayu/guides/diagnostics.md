@@ -160,6 +160,23 @@ reserves 64 KiB. A result larger than the declaration fails as
 caps inside it. Cayu also logs a warning when the tool is registered. Built-in
 tools and MCP tools are not reported.
 
+## tool-knowledge-store-unavailable
+
+`TOOL_KNOWLEDGE_STORE_UNAVAILABLE` means an agent has `list_knowledge`,
+`search_knowledge`, `read_knowledge` or `remember_knowledge`, but the
+environment it runs in by default has no knowledge store, so every call fails
+with `missing_knowledge_store`. A tool call gets its knowledge store and access
+scope from its environment, not from `CayuApp(knowledge_store=...)`. Pass
+`knowledge_store=` (and `knowledge_access_scope=` when the store has no bound
+scope) to the `Environment` or the factory: `DockerCodingEnvironmentFactory`,
+`BrokeredSandboxCodingEnvironmentFactory` and `CodingBackend.factory_for` take
+both, and so does `register_coding_environment`, where
+`inherit_app_knowledge=True` uses the app's store and exactly its scope. The check
+covers concrete environments and factories that report
+`configured_knowledge_store`; an agent registered with `NO_ENVIRONMENT`, or in
+an app with no environment, is reported too. Cayu logs the same warning when
+the agent is registered and its environment is already registered.
+
 ## tool-input-schema-runtime-unsupported
 
 `TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED` means the registered schema is not a

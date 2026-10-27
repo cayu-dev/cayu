@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from pathlib import Path
 
 import pytest
@@ -31,7 +32,7 @@ from cayu.environments import (
 from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
 from cayu.runners import DockerImageIdentity, ExecCommand
-from cayu.runtime import ExecutionProfileMismatchError
+from cayu.runtime import ExecutionProfileMismatchError, check_manifest
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sandbox_broker import (
@@ -43,11 +44,19 @@ from cayu.sandbox_broker.client import (
     BROKER_APPLICATION_ID_ENV,
     BROKER_TOKEN_ENV,
 )
-from cayu.storage import SQLiteSessionStore
+from cayu.storage import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeChunk,
+    KnowledgeEntry,
+    SQLiteKnowledgeStore,
+    SQLiteSessionStore,
+)
 from cayu.tools import (
     CommandPolicyDecision,
     CommandRequest,
     ExactNamedCheckCommandPolicy,
+    SearchKnowledgeTool,
     named_checks_from_toolchain,
 )
 from cayu.workspaces import LocalWorkspace
@@ -409,3 +418,271 @@ def test_a_session_started_on_one_backend_is_not_resumed_on_another(tmp_path: Pa
     assert len(broker.sandboxes) == 1
     # The factories' identities differ, so the execution profile no longer matches.
     assert "execution_environment" in str(refused)
+
+
+def _workspace(tmp_path: Path, name: str) -> LocalWorkspace:
+    root = tmp_path / name
+    root.mkdir()
+    return LocalWorkspace(root, workspace_id=name)
+
+
+def test_coding_environments_get_knowledge_only_when_given_or_asked_for(
+    tmp_path: Path,
+) -> None:
+    backend = select_coding_backend(
+        toolchain_profile=_profile(), options=_docker_options(), environ={}
+    )
+    store = InMemoryKnowledgeStore()
+    scope = KnowledgeAccessScope.for_namespace("project:app")
+    narrower = KnowledgeAccessScope.for_namespace("project:app", required_labels={"team": "a"})
+    app = CayuApp(enable_logging=False, knowledge_store=store, knowledge_access_scope=scope)
+
+    def register(name: str, **options: object):
+        return register_coding_environment(
+            app, name=name, backend=backend, source_workspace=_workspace(tmp_path, name), **options
+        )
+
+    # The app's scope may span every tenant, so a workspace never gets it by default.
+    default = register("default")
+    assert default.configured_knowledge_store is None
+    assert default.configured_knowledge_access_scope is None
+    inherited = register("inherited", inherit_app_knowledge=True)
+    assert inherited.configured_knowledge_store is store
+    assert inherited.configured_knowledge_access_scope == scope
+    own_store = InMemoryKnowledgeStore()
+    own = register("own", knowledge_store=own_store, knowledge_access_scope=narrower)
+    assert own.configured_knowledge_store is own_store
+    assert own.configured_knowledge_access_scope == narrower
+    narrowed = register("narrowed", knowledge_store=store, knowledge_access_scope=narrower)
+    assert narrowed.configured_knowledge_store is store
+    assert narrowed.configured_knowledge_access_scope == narrower
+    with pytest.raises(ValueError, match="needs the knowledge_store"):
+        register("scope-only", knowledge_access_scope=narrower)
+    with pytest.raises(ValueError, match="not both"):
+        register("both", knowledge_store=store, inherit_app_knowledge=True)
+    with pytest.raises(TypeError, match="inherit_app_knowledge"):
+        register("not-a-bool", inherit_app_knowledge="yes")
+    assert set(app._environment_registry.registrations) == {
+        "default",
+        "inherited",
+        "own",
+        "narrowed",
+    }
+
+    # The factory hands out copies, so changing one can't widen later sessions.
+    handed_out = narrowed.configured_knowledge_access_scope
+    handed_out.required_labels.clear()
+    handed_out.allowed_namespaces.append("project:other")
+    assert narrowed.configured_knowledge_access_scope == narrower
+
+    with pytest.raises(ValueError, match="needs an app built with knowledge_store"):
+        register_coding_environment(
+            CayuApp(enable_logging=False),
+            name="plain",
+            backend=backend,
+            source_workspace=_workspace(tmp_path, "plain"),
+            inherit_app_knowledge=True,
+        )
+
+
+def test_factory_for_passes_knowledge_to_each_backends_factory(tmp_path: Path) -> None:
+    store = InMemoryKnowledgeStore()
+    scope = KnowledgeAccessScope.for_namespace("project:app")
+    docker = select_coding_backend(
+        toolchain_profile=_profile(), options=_docker_options(), environ={}
+    )
+    cloud = select_coding_backend(
+        toolchain_profile=CodingToolchainProfile(profile_id="cloud", revision="1"),
+        options={
+            CLOUD_CODING_BACKEND: BrokeredCodingBackendOptions(
+                broker=FakeBroker(tmp_path / "cloud").client()
+            )
+        },
+        environ=_CLOUD,
+    )
+    for backend in (docker, cloud):
+        workspace = _workspace(tmp_path, backend.name)
+        factory = backend.factory_for(
+            workspace, knowledge_store=store, knowledge_access_scope=scope
+        )
+        assert factory.configured_knowledge_store is store
+        assert factory.configured_knowledge_access_scope == scope
+        assert backend.factory_for(workspace).configured_knowledge_store is None
+        with pytest.raises(ValueError, match="needs the knowledge_store"):
+            backend.factory_for(workspace, knowledge_access_scope=scope)
+
+
+def test_a_builder_without_knowledge_keeps_working_and_one_that_drops_it_is_refused(
+    tmp_path: Path,
+) -> None:
+    docker = select_coding_backend(
+        toolchain_profile=_profile(), options=_docker_options(), environ={}
+    )
+
+    def without_knowledge(source_workspace, *, artifact_store=None):
+        return docker.factory_for(source_workspace, artifact_store=artifact_store)
+
+    def dropping_knowledge(source_workspace, *, artifact_store=None, **knowledge):
+        del knowledge
+        return docker.factory_for(source_workspace, artifact_store=artifact_store)
+
+    workspace = _workspace(tmp_path, "source")
+    older = CodingBackend(
+        name="older",
+        candidate="docker",
+        toolchain_profile=_profile(),
+        build_factory=without_knowledge,
+    )
+    assert isinstance(older.factory_for(workspace), DockerCodingEnvironmentFactory)
+    dropping = CodingBackend(
+        name="dropping",
+        candidate="docker",
+        toolchain_profile=_profile(),
+        build_factory=dropping_knowledge,
+    )
+    with pytest.raises(TypeError, match="dropped the knowledge_store"):
+        dropping.factory_for(workspace, knowledge_store=InMemoryKnowledgeStore())
+
+
+def test_registering_an_agent_warns_when_its_knowledge_tools_have_no_store(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    backend = select_coding_backend(
+        toolchain_profile=_profile(), options=_docker_options(), environ={}
+    )
+
+    def app_with(name: str, **options: object) -> CayuApp:
+        app = CayuApp(
+            enable_logging=False,
+            knowledge_store=InMemoryKnowledgeStore(),
+            knowledge_access_scope=KnowledgeAccessScope.for_namespace("project:app"),
+        )
+        app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+        register_coding_environment(
+            app,
+            name="coding",
+            backend=backend,
+            source_workspace=_workspace(tmp_path, name),
+            default=True,
+            **options,
+        )
+        app.register_agent(
+            AgentSpec(name="coder", model="scripted-model"),
+            tools=[SearchKnowledgeTool()],
+            execution_requirements=backend.execution_requirements(),
+        )
+        return app
+
+    with caplog.at_level(logging.WARNING, logger="cayu._application_agent_registry"):
+        without = app_with("without")
+    warnings = [
+        r.getMessage() for r in caplog.records if "missing_knowledge_store" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "Agent coder has search_knowledge" in warnings[0]
+    findings = [
+        item
+        for item in check_manifest(without.describe()).diagnostics
+        if item.code == "TOOL_KNOWLEDGE_STORE_UNAVAILABLE"
+    ]
+    assert [item.subject for item in findings] == ["tool:coder/search_knowledge"]
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cayu._application_agent_registry"):
+        inherited = app_with("inherited", inherit_app_knowledge=True)
+    assert not [r for r in caplog.records if "missing_knowledge_store" in r.getMessage()]
+    assert "TOOL_KNOWLEDGE_STORE_UNAVAILABLE" not in {
+        item.code for item in check_manifest(inherited.describe()).diagnostics
+    }
+
+
+def test_search_knowledge_finds_the_app_entry_in_a_brokered_coding_session(
+    tmp_path: Path,
+) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("project\n", encoding="utf-8")
+    backend = select_coding_backend(
+        toolchain_profile=CodingToolchainProfile(profile_id="knowledge", revision="1"),
+        options={
+            CLOUD_CODING_BACKEND: BrokeredCodingBackendOptions(
+                broker=broker.client(), git_baseline=False
+            )
+        },
+        environ=_CLOUD,
+    )
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="search", name="search_knowledge", arguments={"query": "releases"}
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("Tagged from main."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+
+    async def scenario():
+        store = SQLiteKnowledgeStore(
+            tmp_path / "knowledge.db",
+            access_scope=KnowledgeAccessScope.for_namespace("default"),
+        )
+        try:
+            await store.create_entry(
+                KnowledgeEntry(id="release-guide", text="Tag releases from main only."),
+                [
+                    KnowledgeChunk(
+                        id="release-guide-0",
+                        entry_id="release-guide",
+                        text="Tag releases from main only.",
+                        chunk_index=0,
+                    )
+                ],
+            )
+            # The app's scope is the one bound to the store.
+            app = CayuApp(enable_logging=False, knowledge_store=store)
+            app.register_provider(provider, default=True)
+            register_coding_environment(
+                app,
+                name="coding",
+                backend=backend,
+                source_workspace=LocalWorkspace(
+                    source, workspace_id="source", excluded_directory_names=(".git",)
+                ),
+                default=True,
+                execution_profile_identity=_IDENTITY,
+                inherit_app_knowledge=True,
+            )
+            app.register_agent(
+                AgentSpec(name="coder", model="scripted-model"),
+                tools=[SearchKnowledgeTool()],
+                execution_requirements=backend.execution_requirements(),
+            )
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id="knowledge",
+                        agent_name="coder",
+                        messages=[Message.text("user", "How are releases tagged?")],
+                    )
+                )
+            ]
+        finally:
+            await store.close()
+
+    events = asyncio.run(scenario())
+    assert events[-1].type is EventType.SESSION_COMPLETED, events[-1].payload
+    searched = [
+        event
+        for event in events
+        if event.type is EventType.TOOL_CALL_COMPLETED and event.tool_name == "search_knowledge"
+    ]
+    assert len(searched) == 1
+    assert "Tag releases from main only." in searched[0].payload["result"]["content"]
+    assert len(broker.sandboxes) == 1
