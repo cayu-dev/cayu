@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -479,7 +480,7 @@ def test_sqlite_publication_serializes_independent_processes(tmp_path, same_key)
         assert captured.wait(30)
         # The initial replay/quota read already owns a cross-process write lock.
         with (
-            sqlite3.connect(path, timeout=0) as competing,
+            closing(sqlite3.connect(path, timeout=0)) as competing,
             pytest.raises(sqlite3.OperationalError, match="locked"),
         ):
             competing.execute("BEGIN IMMEDIATE")
@@ -490,7 +491,7 @@ def test_sqlite_publication_serializes_independent_processes(tmp_path, same_key)
             assert outcomes == [("ok", first.manifest_commitment)] * 2
         else:
             assert sorted(item[0] for item in outcomes) == ["OverflowError", "ok"]
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             assert connection.execute("SELECT COUNT(*) FROM cayu_context_views").fetchone()[0] == 1
     finally:
         start_a.set()

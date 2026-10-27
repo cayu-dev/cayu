@@ -72,12 +72,14 @@ def publish_sqlite_report(connection, record: EvalReportRecord) -> EvalReportRec
 
 
 async def publish_postgres_report(cursor, record: EvalReportRecord) -> EvalReportRecord:
-    # Insert fences the stable publisher/operation identity before any secondary write.
+    # Both report_key and (publisher_id, operation_id) are unique. Concurrent
+    # inserts may hit either index, so arbitrate all conflicts before exact
+    # immutable readback; targeting only report_key can leak UniqueViolation.
     await cursor.execute(
         "INSERT INTO cayu_eval_reports "
         "(report_key, publisher_id, operation_id, series_id, target_key, association_key, "
         "record_json, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-        "ON CONFLICT (report_key) DO NOTHING RETURNING report_key",
+        "ON CONFLICT DO NOTHING RETURNING report_key",
         report_values(record, postgres=True),
     )
     if await cursor.fetchone() is None:

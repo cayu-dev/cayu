@@ -285,3 +285,135 @@ def test_report_store_revalidates_trial_summaries_before_mutation(tmp_path, back
                 await reopened.close()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_report_replay_handles_secondary_unique_index_conflict(changed, monkeypatch):
+    """Model PostgreSQL choosing the non-arbiter index during a concurrent insert."""
+    from psycopg.errors import UniqueViolation
+
+    from cayu.evals._report_publication import prepare_report_record
+    from cayu.evals.reported import EvalReport, EvalReportConflict
+    from cayu.storage.evals_postgres import PostgresEvalStore
+
+    async def exercise():
+        report = EvalReport.model_validate(await _payload("ci-target"))
+        winner = prepare_report_record(report, "publisher", redact_json=lambda value: value)
+        replay = report.model_copy(update={"program_key": "conflicting"}) if changed else report
+
+        class ConcurrentWinnerCursor:
+            def __init__(self):
+                self.result = None
+                self.statements = []
+
+            async def execute(self, sql, params):
+                self.statements.append(sql)
+                if sql.startswith("INSERT INTO cayu_eval_reports "):
+                    # Speculative insertion may detect either unique index. An
+                    # explicit arbiter for report_key cannot catch the other one.
+                    if "ON CONFLICT DO NOTHING" not in sql:
+                        raise UniqueViolation("cayu_eval_reports_publisher_id_operation_id_key")
+                    self.result = None
+                elif sql.startswith("SELECT record_json FROM cayu_eval_reports "):
+                    assert params == (winner.receipt.id,)
+                    self.result = (winner.model_dump_json(),)
+                else:
+                    pytest.fail("A losing replay must not publish a secondary series.")
+
+            async def fetchone(self):
+                return self.result
+
+        cursor = ConcurrentWinnerCursor()
+        # Keep the public preparation/revalidation and replay pipeline. Only the
+        # transaction's database delivery is modeled; real ownership/concurrent
+        # connections are exercised by the PostgreSQL conformance case below.
+        store = object.__new__(PostgresEvalStore)
+
+        async def ready():
+            pass
+
+        async def mutation(operation):
+            return await operation(None, cursor)
+
+        monkeypatch.setattr(store, "_ensure_ready", ready)
+        monkeypatch.setattr(store, "_run_owned_mutation", mutation)
+        if changed:
+            with pytest.raises(EvalReportConflict):
+                await store.publish_report(replay, "publisher", redact_json=lambda value: value)
+        else:
+            assert (
+                await store.publish_report(replay, "publisher", redact_json=lambda value: value)
+                == winner
+            )
+        assert len(cursor.statements) == 2
+
+    asyncio.run(exercise())
+
+
+def test_postgres_report_replay_contends_across_independent_stores(postgres_dsn, monkeypatch):
+    from cayu.evals.read_views import EvalViewQuery
+    from cayu.evals.reported import EvalReport, EvalReportConflict, EvalReportRecord
+    from cayu.storage import _eval_report_publication
+    from cayu.storage.evals_postgres import PostgresEvalStore
+    from cayu.storage.migrations import SchemaMode
+
+    async def exercise():
+        left = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        right = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        original_publish = _eval_report_publication.publish_postgres_report
+        barrier = asyncio.Barrier(2)
+
+        async def publish_together(cursor, record):
+            # Both independent owners have checked out physical connections and
+            # reached the INSERT, rather than serializing before dispatch.
+            await asyncio.wait_for(barrier.wait(), timeout=10)
+            return await original_publish(cursor, record)
+
+        try:
+            await left._ensure_ready()
+            await right._ensure_ready()
+            monkeypatch.setattr(
+                _eval_report_publication, "publish_postgres_report", publish_together
+            )
+            for conflicting in (False, True):
+                for index in range(8):
+                    payload = await _payload(f"contention-{conflicting}-{index}")
+                    report = EvalReport.model_validate(payload)
+                    other = (
+                        report.model_copy(update={"program_key": "conflicting-program"})
+                        if conflicting
+                        else report
+                    )
+                    results = await asyncio.gather(
+                        left.publish_report(report, "contended-publisher", redact_json=lambda v: v),
+                        right.publish_report(other, "contended-publisher", redact_json=lambda v: v),
+                        return_exceptions=True,
+                    )
+                    accepted = [
+                        result for result in results if isinstance(result, EvalReportRecord)
+                    ]
+                    if conflicting:
+                        assert len(accepted) == 1
+                        assert sum(isinstance(r, EvalReportConflict) for r in results) == 1
+                    else:
+                        assert len(accepted) == 2 and accepted[0] == accepted[1]
+                    winner = accepted[0]
+                    assert await left.load_report(winner.receipt.id) == winner
+                    assert await right.load_report(winner.receipt.id) == winner
+                    catalog = await left.list_view_index(
+                        EvalViewQuery(target_key=report.target_key)
+                    )
+                    assert len(catalog.items) == 1
+                    assert catalog.items[0].revision == winner.series.id
+                    async with left._connection() as conn, conn.cursor() as cursor:
+                        await cursor.execute(
+                            "SELECT count(*) FROM cayu_eval_reports "
+                            "WHERE publisher_id = %s AND operation_id = %s",
+                            (winner.receipt.publisher_id, winner.receipt.report_id),
+                        )
+                        assert await cursor.fetchone() == (1,)
+        finally:
+            await left.close()
+            await right.close()
+
+    asyncio.run(exercise())

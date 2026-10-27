@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -22,7 +23,7 @@ def test_bound_registry_survives_sqlite_idempotent_migration(tmp_path):
         await store.close()
 
     asyncio.run(seed())
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("DROP TABLE cayu_local_execution_attempts")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 66")
         connection.execute("PRAGMA user_version = 65")
@@ -33,7 +34,7 @@ def test_bound_registry_survives_sqlite_idempotent_migration(tmp_path):
         await store.close()
 
     asyncio.run(migrate())
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone() == (LATEST_REVISION,)
         assert "expected_sha256" in {
             r[1]
@@ -105,7 +106,7 @@ def test_current_bound_registry_still_rejects_invalid_shape(backend, invalid, tm
         if invalid == "wrong_type":
             statements.append(f"ALTER TABLE {table} ADD COLUMN expected_sha256 INTEGER")
         if backend == "sqlite":
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 for statement in statements:
                     connection.execute(statement)
 
