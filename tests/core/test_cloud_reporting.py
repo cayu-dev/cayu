@@ -1617,3 +1617,44 @@ def test_deleting_a_session_in_between_keeps_the_marks_of_the_sessions_above_it(
     assert attention_withheld(quiet) and attention_withheld(trial)
     runs = {run.session_id: run for run in page.runs}
     assert (runs["quiet-c"].eval, runs["trial-c"].eval) == (False, True)
+
+
+def test_a_page_counts_tasks_fenced_after_their_worker_was_lost(tmp_path) -> None:
+    from cayu.storage.sqlite import SQLiteTaskStore
+    from cayu.tasks.creation import TaskCreate
+    from cayu.tasks.queries import TaskQuery
+
+    async def scenario() -> None:
+        assert (await read_cloud_activity(CayuApp(enable_logging=False))).task_health is None
+        clock = {"value": datetime.now(UTC) - timedelta(hours=1)}
+        tasks = SQLiteTaskStore(tmp_path / "tasks.db", ownership_clock=lambda: clock["value"])
+        app = CayuApp(task_store=tasks, enable_logging=False)
+        try:
+            empty = await read_cloud_activity(app)
+            assert empty.task_health is not None
+            assert empty.task_health.fenced_after_worker_loss == 0
+            for task_id in ("scan-1", "scan-2"):
+                await tasks.create_task(TaskCreate(task_id=task_id, type="scan"))
+            claimed = await tasks.claim_task("worker-old", TaskQuery(type="scan"), lease_seconds=30)
+            assert claimed is not None and claimed.lease_expires_at is not None
+            await tasks.mark_claimed_task_execution_started(
+                claimed.id, "worker-old", claimed.lease_expires_at
+            )
+            await tasks.claim_task("worker-live", TaskQuery(type="scan"), lease_seconds=3600)
+            clock["value"] = claimed.lease_expires_at + timedelta(seconds=1)
+            await tasks.reclaim_expired(query=TaskQuery(type="scan"))
+
+            page = await read_cloud_activity(app)
+            assert page.task_health is not None
+            assert page.task_health.fenced_after_worker_loss == 1
+            assert page.task_health.complete is True
+            assert page.model_dump(mode="json")["task_health"] == {
+                "fenced_after_worker_loss": 1,
+                "complete": True,
+            }
+            assert "task_health" in (await read_cloud_contract(app)).features
+        finally:
+            await app.aclose()
+            await tasks.close()
+
+    asyncio.run(scenario())

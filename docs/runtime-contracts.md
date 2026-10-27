@@ -7854,6 +7854,30 @@ cancellation intent wins a concurrent completion or failure. Expired-claim
 reclamation excludes a cancellation-requested task because lease expiry proves
 only owner loss, not handler quiescence or external-effect settlement.
 
+A cancellation-fenced task whose worker's lease has expired is "fenced after
+worker loss": it still lists as `claimed` or `running`, but nothing runs it
+until it is reconciled. `is_fenced_after_worker_loss(task, now=None)` is that
+predicate, and `TaskQuery(fenced_after_worker_loss=True|False)` lists only such
+tasks or leaves them out, deciding expiry by the store's ownership clock
+(PostgreSQL's `clock_timestamp()`). Claim, reclaim, schedule-wakeup and
+task-index queries refuse the filter. `run_task_worker` lists them within its
+`query`'s scope at its reclaim cadence, reading at most 1,000 per scan and
+continuing where it stopped on the next, and logs one warning per task. With
+`reconcile_abandoned_after_s` (or `CAYU_WORKER_RECONCILE_ABANDONED_AFTER_S`,
+which `cayu worker --reconcile-abandoned-after-seconds` sets) it declares itself
+the only worker for that scope and settles each ordinary, unattached fenced
+task held by another worker id once it has listed the task as fenced for at
+least that long, counted on its monotonic clock from the first scan that saw
+it (lease expiry itself is the store's decision), through
+`reconcile_abandoned_task_cancellation` with validator
+`cayu.task-worker.single-worker` version `1`, evidence
+`lease-expired-at:<lease expiry>`, and the declaring worker as the `SYSTEM`
+actor. `reconcile_abandoned_tasks(...)` settles, at once, every such task held
+by a worker outside caller-supplied live worker ids, with the caller's
+validator. Rechecks after a filtered listing only drop tasks without a
+cancellation fence; they never override the store's expiry decision with the
+local clock.
+
 `reconcile_task_cancellation(...)` is the durable operator/application boundary
 for an ordinary cancellation whose owner was lost.
 `reconcile_abandoned_task_cancellation(task_store, task_id, validator_id=...,
@@ -19940,7 +19964,7 @@ authenticate=...)` serves the same routes behind a host's own authentication.
 | Route | Response |
 | --- | --- |
 | `GET {api}/cloud/contract` | `{"contract": "cayu.cloud-agent", "versions": [1], "runtime_version": str, "store_id": str \| null}` |
-| `GET {api}/cloud/v1/activity?cursor=&limit=` | `{"contract": "cayu.cloud-agent/v1", "runs": [run, ...], "touches": [touch, ...], "next_cursor": str, "has_more": bool}` |
+| `GET {api}/cloud/v1/activity?cursor=&limit=` | `{"contract": "cayu.cloud-agent/v1", "runs": [run, ...], "touches": [touch, ...], "next_cursor": str, "has_more": bool, "task_health": {"fenced_after_worker_loss": int, "complete": bool} \| null}` |
 
 Responses carry `Cache-Control: private, no-store`. A missing or wrong token
 answers 401 with `WWW-Authenticate: Bearer`, a cursor the contract did not issue
@@ -19970,6 +19994,13 @@ the same page; a fork's source is not above its fork. A page holds at most
 more. Continue from `next_cursor` while `has_more` is true. When it is false,
 read again later from the same `next_cursor`; it equals the cursor read when
 nothing changed.
+
+`task_health` is the agent's current task state when the page was read, not a
+change since the cursor, and `null` when the agent has no task store. Its
+`fenced_after_worker_loss` counts tasks fenced after their worker's lease
+expired (`TaskQuery(fenced_after_worker_loss=True)`), up to
+`CLOUD_TASK_HEALTH_MAX_COUNT` (100); `complete` is false when the count reached
+it. The contract lists `task_health` in `features` when it serves the field.
 
 Legacy sessions without retained run lineage still refresh their dependent
 ancestors when a foreground-child wait proves both the parent's and child's

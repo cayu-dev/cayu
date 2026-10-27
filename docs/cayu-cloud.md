@@ -943,7 +943,10 @@ The token is not the Developer dashboard login. It reads two routes and nothing 
 - `GET {api}/cloud/contract` names the contract, the versions the Agent
   serves and `store_id`, the identity of the Agent's session store.
 - `GET {api}/cloud/v1/activity?cursor=...` returns the summaries of the runs that
-  changed after the cursor and the human touches that settled in the same range.
+  changed after the cursor and the human touches that settled in the same range,
+  and `task_health`: how many tasks are fenced after their worker was lost, such
+  as by a deploy during a task that can't be restarted, and wait for the Agent
+  to reconcile them.
 
 A run summary has the run's status, including what it waits on, when it started
 and ended, its estimated cost, the Release it ran on, the agent and who started

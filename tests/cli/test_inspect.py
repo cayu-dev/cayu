@@ -158,3 +158,65 @@ def test_inspect_factory_failure_uses_current_manifest_schema_version(
             "message": "Application factory failed (RuntimeError): boot exploded",
         },
     }
+
+
+def test_inspect_lists_fenced_tasks_and_how_to_settle_them(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+
+    from cayu.storage.sqlite import SQLiteTaskStore
+    from cayu.tasks.creation import TaskCreate
+    from cayu.tasks.queries import TaskQuery
+
+    async def fence() -> None:
+        clock = {"value": datetime.now(UTC) - timedelta(hours=1)}
+        store = SQLiteTaskStore(tmp_path / "tasks.db", ownership_clock=lambda: clock["value"])
+        await store.create_task(TaskCreate(task_id="scan-1", type="scan"))
+        await store.create_task(TaskCreate(task_id="scan-2", type="scan"))
+        claimed = await store.claim_task("worker-old", TaskQuery(type="scan"), lease_seconds=30)
+        assert claimed is not None and claimed.lease_expires_at is not None
+        await store.mark_claimed_task_execution_started(
+            claimed.id, "worker-old", claimed.lease_expires_at
+        )
+        clock["value"] = claimed.lease_expires_at + timedelta(seconds=1)
+        await store.reclaim_expired(query=TaskQuery(type="scan"))
+        await store.close()
+
+    asyncio.run(fence())
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.cayu]\nfactory = "fenced_project:build_app"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "fenced_project.py").write_text(
+        """from cayu import CayuApp
+from cayu.storage.sqlite import SQLiteTaskStore
+
+
+def build_app():
+    return CayuApp(task_store=SQLiteTaskStore("tasks.db"), enable_logging=False)
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    sys.modules.pop("fenced_project", None)
+
+    assert main(["inspect", "--fenced-tasks", "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["complete"] is True
+    [task] = output["fenced_tasks"]
+    assert task["task_id"] == "scan-1"
+    assert task["worker_id"] == "worker-old"
+    assert task["status"] == "claimed"
+    assert task["error_code"] == "task_worker_lease_expired_after_dispatch"
+    assert "reconcile_abandoned_task_cancellation" in task["settle"]
+
+    sys.modules.pop("fenced_project", None)
+    assert main(["inspect", "--fenced-tasks", "--table"]) == 0
+    human = capsys.readouterr().out
+    assert "1 fenced task(s)" in human
+    assert "- scan-1 (scan): worker worker-old" in human
+    assert "[task_worker_lease_expired_after_dispatch]" in human

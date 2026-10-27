@@ -30,6 +30,7 @@ from cayu.runtime._process_workers import (
     supervisor_watchdog,
     watch_supervisor,
 )
+from cayu.tasks.abandoned import RECONCILE_ABANDONED_AFTER_ENV
 
 # A worker that used its whole grace still lets the app seal and report.
 _MIN_APP_SHUTDOWN_SECONDS = 0.1
@@ -68,6 +69,17 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
         default=30.0,
         help="Maximum cooperative shutdown time after SIGINT or SIGTERM (default: 30).",
     )
+    parser.add_argument(
+        "--reconcile-abandoned-after-seconds",
+        type=_non_negative_seconds,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Declare this the only worker for its tasks: run_task_worker settles a task "
+            "fenced after another worker's lease expired at least SECONDS ago as cancelled. "
+            "Off by default; can't be combined with --processes."
+        ),
+    )
 
 
 def run_worker(args: argparse.Namespace) -> int:
@@ -79,6 +91,17 @@ def _run_worker(args: argparse.Namespace) -> int:
     try:
         project = _resolve_worker_project(args.name)
         processes = getattr(args, "processes", 1)
+        reconcile_after = getattr(args, "reconcile_abandoned_after_seconds", None)
+        if processes > 1 and (
+            reconcile_after is not None or os.environ.get(RECONCILE_ABANDONED_AFTER_ENV, "").strip()
+        ):
+            raise WorkerError(
+                f"--reconcile-abandoned-after-seconds and {RECONCILE_ABANDONED_AFTER_ENV} "
+                "declare a single worker and can't be combined with --processes."
+            )
+        if reconcile_after is not None:
+            # run_task_worker reads it when the worker doesn't pass the option itself.
+            os.environ[RECONCILE_ABANDONED_AFTER_ENV] = repr(reconcile_after)
         if processes > 1:
             outcome = asyncio.run(
                 supervise_process_workers(
@@ -299,6 +322,16 @@ def _positive_seconds(value: str) -> float:
         raise argparse.ArgumentTypeError("shutdown grace must be a number.") from None
     if not isfinite(seconds) or seconds <= 0:
         raise argparse.ArgumentTypeError("shutdown grace must be finite and positive.")
+    return seconds
+
+
+def _non_negative_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number of seconds.") from None
+    if not isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("must be a finite, non-negative number of seconds.")
     return seconds
 
 

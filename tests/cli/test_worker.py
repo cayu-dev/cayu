@@ -595,3 +595,112 @@ async def ignore_stop(app, stop):
         assert process.returncode == 124, stdout + stderr
         assert "did not stop within 0.1 seconds after SIGTERM" in stderr
         assert shutdown_elapsed < 1
+
+
+def test_worker_passes_the_single_worker_declaration_to_task_workers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from cayu.tasks.abandoned import RECONCILE_ABANDONED_AFTER_ENV
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        """[tool.cayu]
+factory = "declared_worker:build_app"
+
+[tool.cayu.workers]
+once = "declared_worker:run_once"
+""",
+        encoding="utf-8",
+    )
+    (project / "declared_worker.py").write_text(
+        f"""import os
+from pathlib import Path
+
+from cayu import CayuApp
+
+
+def build_app():
+    return CayuApp(enable_logging=False)
+
+
+async def run_once(app, stop):
+    Path("declared.txt").write_text(os.environ["{RECONCILE_ABANDONED_AFTER_ENV}"], encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+    monkeypatch.delenv(RECONCILE_ABANDONED_AFTER_ENV, raising=False)
+    sys.modules.pop("declared_worker", None)
+
+    assert main(["worker", "once", "--reconcile-abandoned-after-seconds", "120"]) == 0
+    assert float((project / "declared.txt").read_text(encoding="utf-8")) == 120.0
+    monkeypatch.delenv(RECONCILE_ABANDONED_AFTER_ENV, raising=False)
+
+
+def test_worker_refuses_a_single_worker_declaration_with_several_processes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        """[tool.cayu]
+factory = "app:build_app"
+
+[tool.cayu.workers]
+once = "app:run_once"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    assert (
+        main(
+            [
+                "worker",
+                "once",
+                "--processes",
+                "2",
+                "--reconcile-abandoned-after-seconds",
+                "60",
+            ]
+        )
+        == 1
+    )
+    assert "can't be combined with --processes" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["nan", "-1", "soon"])
+def test_worker_requires_a_finite_non_negative_declaration(value: str) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["worker", "configured", "--reconcile-abandoned-after-seconds", value])
+
+    assert excinfo.value.code == 2
+
+
+def test_worker_refuses_an_environment_declaration_with_several_processes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from cayu.tasks.abandoned import RECONCILE_ABANDONED_AFTER_ENV
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        """[tool.cayu]
+factory = "app:build_app"
+
+[tool.cayu.workers]
+once = "app:run_once"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+    monkeypatch.setenv(RECONCILE_ABANDONED_AFTER_ENV, "0")
+
+    assert main(["worker", "once", "--processes", "2"]) == 1
+    assert "can't be combined with --processes" in capsys.readouterr().err

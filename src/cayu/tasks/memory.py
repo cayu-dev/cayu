@@ -2599,12 +2599,19 @@ class InMemoryTaskStore(TaskStore):
             _access_bounds = await current_data_bounds("tasks")
         query = copy_task_query(query)
         async with self._lock:
+            from cayu.tasks.abandoned import is_fenced_after_worker_loss
             from cayu.tasks.access import visible
 
+            fenced_now = self._ownership_clock()
             tasks = [
                 task
                 for task in self._tasks.values()
                 if _task_matches(task, query)
+                and (
+                    query.fenced_after_worker_loss is None
+                    or is_fenced_after_worker_loss(task, fenced_now)
+                    is query.fenced_after_worker_loss
+                )
                 and (_access_bounds is None or visible(task, _access_bounds))
             ]
             tasks = _sort_tasks(tasks, query.order_by)

@@ -123,6 +123,7 @@ from cayu.tasks._terminalization import (
     _terminalize_claimed_task_or_detect_peer_winner,
     settle_task_retry_attempt_with_retry,
 )
+from cayu.tasks.abandoned import FencedTaskMonitor, reconcile_abandoned_after_from_environment
 from cayu.tasks.cancellation import (
     _TASK_CANCELLATION_REQUESTED_REASON,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
@@ -466,6 +467,7 @@ async def run_task_worker(
     idle_jitter_ratio: float = 0.1,
     reclaim: bool = True,
     reclaim_every_s: float = 60.0,
+    reconcile_abandoned_after_s: float | None = None,
     recover_interrupted_handoffs: bool = True,
     interrupted_handoff_recovery_every_s: float = (_INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS),
     recovered_interrupted_task_handler: RecoveredInterruptedTaskHandler | None = None,
@@ -502,6 +504,21 @@ async def run_task_worker(
       for ordinary tasks and ``TaskStore.reconcile_task_retry_cancellation`` for
       retry series.
     - ``reclaim_every_s`` controls that cadence independently of task claims.
+      At the same cadence the worker looks for tasks in its ``query``'s scope
+      that are fenced after worker loss (see
+      :func:`cayu.tasks.is_fenced_after_worker_loss`) and logs a warning once
+      for each, naming the task and how to settle it.
+    - ``reconcile_abandoned_after_s`` declares that this is the only worker
+      claiming tasks in its ``query``'s scope. A task the store reports fenced
+      after worker loss, held by another worker id, is then settled once this
+      worker has seen it fenced for this many seconds (counted on its own
+      monotonic clock, so clock skew can't shorten the wait), as cancelled
+      through ``reconcile_abandoned_task_cancellation``, with the
+      declaration (``cayu.task-worker.single-worker``) recorded as the
+      validator. ``None`` (the default) settles nothing, unless ``cayu worker
+      --reconcile-abandoned-after-seconds`` set it for the process. Don't set
+      it when several workers or processes claim the same tasks: a slow worker
+      may still be running a task whose lease expired.
     - ``recover_interrupted_handoffs`` owns bounded recovery of expired attached
       task workers. Elect one such scanner for each shared task store.
     - ``interrupted_handoff_recovery_every_s`` controls the scanner's exhausted
@@ -574,6 +591,9 @@ async def run_task_worker(
         jitter_ratio=idle_jitter_ratio,
     )
     validate_worker_interval(reclaim_every_s, "reclaim_every_s")
+    reconcile_abandoned_after_s = reconcile_abandoned_after_from_environment(
+        reconcile_abandoned_after_s
+    )
     if type(recover_interrupted_handoffs) is not bool:
         raise TypeError("recover_interrupted_handoffs must be a bool.")
     validate_worker_interval(
@@ -657,6 +677,16 @@ async def run_task_worker(
 
     budget = _TaskWorkerBudget(max_tasks) if concurrency > 1 and max_tasks is not None else None
     group_maintenance = TaskGroupMaintenance.for_store(task_store)
+    fenced_monitor = (
+        FencedTaskMonitor(
+            task_store,
+            worker_id=worker_id,
+            query=query,
+            reconcile_abandoned_after_s=reconcile_abandoned_after_s,
+        )
+        if reclaim or reconcile_abandoned_after_s is not None
+        else None
+    )
     infrastructure_stop = asyncio.Event()
     slot_stop = infrastructure_stop if concurrency > 1 else stop
 
@@ -679,6 +709,17 @@ async def run_task_worker(
         if metrics is not None:
             poller.set_metrics(metrics)
         reclaim_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
+        fenced_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
+
+        async def scan_fenced_tasks() -> bool:
+            assert fenced_monitor is not None
+            try:
+                return bool(await fenced_monitor.scan())
+            except Exception:
+                logger.exception(
+                    "Looking for fenced tasks failed; retrying in %g seconds.", reclaim_every_s
+                )
+                return False
 
         async def reclaim_expired_tasks() -> bool:
             if materialized_work_contract_queue_supported:
@@ -809,6 +850,13 @@ async def run_task_worker(
                 if reclaim_ran:
                     poller.metrics.maintenance(reclaim=True)
                 meaningful_activity = meaningful_activity or bool(reclaimed)
+            if owns_maintenance and fenced_monitor is not None:
+                _, settled_fenced = await fenced_cadence.run_if_due(
+                    scan_fenced_tasks,
+                    now=loop.time(),
+                    clock=loop.time,
+                )
+                meaningful_activity = meaningful_activity or bool(settled_fenced)
 
             async def prepare_claim() -> None:
                 # Maintenance is a database poll too. Only the admitted worker may
@@ -876,6 +924,12 @@ async def run_task_worker(
                     wake_deadlines.append(next_interrupted_handoff_recovery_at)
                 if owns_maintenance and reclaim and reclaim_cadence.next_run_at is not None:
                     wake_deadlines.append(reclaim_cadence.next_run_at)
+                if (
+                    owns_maintenance
+                    and fenced_monitor is not None
+                    and fenced_cadence.next_run_at is not None
+                ):
+                    wake_deadlines.append(fenced_cadence.next_run_at)
                 return DurableWorkerStep(
                     handled=handled_this_step,
                     idle=True,

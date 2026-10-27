@@ -44,6 +44,9 @@ class TaskQuery(BaseModel):
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
     has_work_contract: StrictBool | None = None
+    # True lists only tasks fenced after their worker's lease expired (see
+    # ``is_fenced_after_worker_loss``); False leaves them out. Listing only.
+    fenced_after_worker_loss: StrictBool | None = None
     limit: StrictInt = Field(default=100, ge=1, le=1000)
     offset: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC
@@ -155,6 +158,7 @@ def copy_task_query(query: TaskQuery | None) -> TaskQuery:
         parent_task_id=query.parent_task_id,
         assigned_agent_name=query.assigned_agent_name,
         has_work_contract=query.has_work_contract,
+        fenced_after_worker_loss=query.fenced_after_worker_loss,
         limit=query.limit,
         offset=query.offset,
         order_by=query.order_by,
@@ -256,6 +260,8 @@ def _ensure_claim_query_supported(query: TaskQuery) -> None:
         raise ValueError("Task claim queries do not support q.")
     if query.session_id is not None:
         raise ValueError("Task claim queries do not support session_id.")
+    if query.fenced_after_worker_loss is not None:
+        raise ValueError("Task claim queries do not support fenced_after_worker_loss.")
     if query.limit != TaskQuery.model_fields["limit"].default:
         raise ValueError("Task claim queries do not support limit.")
     if query.offset != TaskQuery.model_fields["offset"].default:

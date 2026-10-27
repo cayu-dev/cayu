@@ -263,14 +263,32 @@ the `run_task_worker(...)` coroutine records the same fence and then waits for t
 running handler to finish; it does not interrupt the handler. The worker settles
 the fence once the handler returns.
 
-If the process exits before that, for example because a service manager stopped
-it while a long handler was running, an ordinary (non-retry) task stays `claimed`
-with `status_reason == "cancellation_requested"`. No worker claims or reclaims it
-again. Retry-series tasks use `retry_cancellation_requested` and require
+If the process exits before that, the task stays fenced until something
+reconciles it. A deploy that replaces the worker while a non-restartable task
+runs past the shutdown grace does exactly this. An ordinary (non-retry) task
+stays `claimed` with `status_reason == "cancellation_requested"`, and with
+`status_payload["error"]["code"] == "task_worker_lease_expired_after_dispatch"`
+when reclamation fenced it. No worker claims or reclaims it again. Retry-series
+tasks use `retry_cancellation_requested` and require
 `TaskStore.reconcile_task_retry_cancellation` with retry-specific evidence; the
-helper below does not settle them.
+helpers below do not settle them.
+
+A fenced task looks like a live claim unless you check its lease, so Cayu gives
+you ways to tell them apart:
+
+- `is_fenced_after_worker_loss(task, now=None)` is true for a task held only by
+  a cancellation fence whose worker's lease has expired.
+- `TaskQuery(fenced_after_worker_loss=True)` lists only those tasks, and `False`
+  leaves them out. An "is a run already queued or running?" check should use
+  `TaskQuery(status=TaskStatus.CLAIMED, fenced_after_worker_loss=False)`, or the
+  fenced task blocks new work until it is settled.
+- Every `run_task_worker` that reclaims expired leases logs a warning once for
+  each fenced task in its `query`'s scope, naming the task and how to settle it.
+- `cayu inspect --fenced-tasks` lists them, and the Cayu Cloud activity contract
+  counts them in `task_health`.
+
 Once the application knows the original worker can no longer act and its handler
-left nothing half-done, settle it:
+left nothing half-done, settle the task:
 
 ```python
 from cayu.tasks import reconcile_abandoned_task_cancellation
@@ -291,6 +309,38 @@ may still be draining after expiry. The application must independently establish
 quiescence before calling this helper. This helper does not support session-attached
 tasks. Interrupted-handoff recovery covers attached tasks without pending
 cancellation; cancellation-fenced attached tasks require separate reconciliation.
+
+In a deployment with one worker, a task held by another worker id whose lease
+expired minutes ago has no live owner, and that is enough evidence. Declare it
+and the worker settles such tasks itself:
+
+```python
+await run_task_worker(
+    app,
+    app.task_store,
+    handle_task,
+    worker_id=f"jobs-{socket.gethostname()}-{os.getpid()}",
+    query=TaskQuery(type="domain_job"),
+    reconcile_abandoned_after_s=120,
+    stop=stop,
+)
+```
+
+At its reclaim cadence it settles every fenced task in its `query`'s scope that
+another worker id holds, once it has seen the task fenced for at least 120
+seconds, through `reconcile_abandoned_task_cancellation` with validator
+`cayu.task-worker.single-worker`, and logs a warning for each. It leaves tasks
+under its own worker id, session-attached tasks and retry series alone. `cayu
+worker --reconcile-abandoned-after-seconds 120` sets the same option for a
+project worker. Don't set it when several workers or processes claim the same
+tasks: a worker whose heartbeat is slow can still be running a task whose lease
+expired. The store decides that a lease expired by its own clock, and the
+worker counts the 120 seconds on its own monotonic clock, so skew between the
+two can't shorten the wait. `reconcile_abandoned_tasks(task_store,
+live_worker_ids=..., validator_id=..., validator_version=...)` settles every
+fenced task held by a worker not in `live_worker_ids` at once, for an
+application that knows which workers are live some other way, for example from
+its platform's record of stopped containers.
 
 ## What does *not* trigger a run
 

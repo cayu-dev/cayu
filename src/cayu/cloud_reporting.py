@@ -60,6 +60,8 @@ from cayu.sessions.supervision_events import (
     SupervisionEventKind,
     SupervisionMessageOrigin,
 )
+from cayu.tasks.abandoned import has_cancellation_fence
+from cayu.tasks.queries import TaskQuery
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
@@ -70,6 +72,8 @@ CLOUD_AGENT_CONTRACT = "cayu.cloud-agent"
 CLOUD_AGENT_CONTRACT_VERSIONS: tuple[int, ...] = (1,)
 CLOUD_ACTIVITY_DEFAULT_LIMIT = 100
 CLOUD_ACTIVITY_MAX_LIMIT = 200
+#: The most tasks one ``CloudTaskHealth`` count reads.
+CLOUD_TASK_HEALTH_MAX_COUNT = 100
 _ACTIVITY_CONTRACT = f"{CLOUD_AGENT_CONTRACT}/v1"
 # Events read per store query, and per page, while collecting changes.
 _SCAN_BATCH = 200
@@ -134,7 +138,12 @@ class CloudContract(_ContractModel):
     contract: str = CLOUD_AGENT_CONTRACT
     versions: tuple[int, ...] = CLOUD_AGENT_CONTRACT_VERSIONS
     runtime_version: str = __version__
-    features: tuple[str, ...] = ("activity", "tool_knowledge_registration", "tool_knowledge_usage")
+    features: tuple[str, ...] = (
+        "activity",
+        "tool_knowledge_registration",
+        "tool_knowledge_usage",
+        "task_health",
+    )
     store_id: str | None = None
 
 
@@ -260,11 +269,27 @@ class CloudTouch(_ContractModel):
     release_id: str | None
 
 
+class CloudTaskHealth(_ContractModel):
+    """Current counts of tasks that need the agent's attention, read with the page.
+
+    ``fenced_after_worker_loss`` counts tasks still claimed after their worker
+    stopped renewing its lease with a cancellation pending, as when a deploy
+    replaced the worker during a task that can't be restarted. No worker runs
+    them again until the application reconciles them. The count stops at
+    ``CLOUD_TASK_HEALTH_MAX_COUNT``; ``complete`` is false when it reached it.
+    """
+
+    fenced_after_worker_loss: int
+    complete: bool
+
+
 class CloudActivityPage(_ContractModel):
     """Runs that changed and touches that settled after a cursor, in sequence order.
 
     Continue from ``next_cursor``. ``has_more`` says whether more activity was
     already available; when it is false, read again later from the same cursor.
+    ``task_health`` is the agent's current task state, not a change since the
+    cursor; it is ``None`` when the agent has no task store.
     """
 
     contract: str = _ACTIVITY_CONTRACT
@@ -272,6 +297,7 @@ class CloudActivityPage(_ContractModel):
     touches: tuple[CloudTouch, ...]
     next_cursor: str
     has_more: bool
+    task_health: CloudTaskHealth | None = None
 
 
 async def read_cloud_contract(app: CayuApp) -> CloudContract:
@@ -406,6 +432,27 @@ async def read_cloud_activity(
         touches=tuple(_touch(app, session, event) for session, event in touches),
         next_cursor=_cursor(store_id, position, mark if last is None else _event_mark(last)),
         has_more=has_more,
+        task_health=await read_cloud_task_health(app),
+    )
+
+
+async def read_cloud_task_health(app: CayuApp) -> CloudTaskHealth | None:
+    """Count the agent's tasks that need attention, or ``None`` without a task store."""
+
+    task_store = app.task_store
+    if task_store is None:
+        return None
+    try:
+        tasks = await task_store.list_tasks(
+            TaskQuery(fenced_after_worker_loss=True, limit=CLOUD_TASK_HEALTH_MAX_COUNT)
+        )
+    except NotImplementedError:
+        return None
+    return CloudTaskHealth(
+        # The store decides lease expiry by its own clock; this only guards
+        # against a custom store that doesn't apply the filter.
+        fenced_after_worker_loss=sum(1 for task in tasks if has_cancellation_fence(task)),
+        complete=len(tasks) < CLOUD_TASK_HEALTH_MAX_COUNT,
     )
 
 
@@ -547,6 +594,7 @@ __all__ = [
     "CLOUD_ACTIVITY_MAX_LIMIT",
     "CLOUD_AGENT_CONTRACT",
     "CLOUD_AGENT_CONTRACT_VERSIONS",
+    "CLOUD_TASK_HEALTH_MAX_COUNT",
     "CloudActivityCursorInvalid",
     "CloudActivityCursorStale",
     "CloudActivityPage",
@@ -556,8 +604,10 @@ __all__ = [
     "CloudRun",
     "CloudRunCost",
     "CloudRunStatus",
+    "CloudTaskHealth",
     "CloudTouch",
     "CloudWaitingItem",
     "read_cloud_activity",
     "read_cloud_contract",
+    "read_cloud_task_health",
 ]

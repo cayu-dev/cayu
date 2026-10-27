@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from cayu.budgets.aggregates import AggregateCount
 from cayu.tasks.queries import TaskOrder, TaskQuery, TaskStatusCounts
@@ -23,6 +23,20 @@ class TaskIndexQuery(BaseModel):
     statuses: tuple[TaskStatus, ...] = ()
     prerequisite_task_id: str | None = None
     after: tuple[datetime, str] | None = None
+
+    @field_validator("filters")
+    @classmethod
+    def reject_listing_only_filters(cls, value: TaskQuery) -> TaskQuery:
+        _reject_fenced_filter(value)
+        return value
+
+
+def _reject_fenced_filter(filters: TaskQuery) -> None:
+    # The index counts from one snapshot without the store's ownership clock.
+    if filters.fenced_after_worker_loss is not None:
+        raise ValueError(
+            "Task index queries do not support fenced_after_worker_loss; use list_tasks."
+        )
 
 
 class TaskIndexResult(BaseModel):
@@ -54,6 +68,9 @@ class TaskIndexAccumulator:
     counts: dict[TaskStatus, int] = field(default_factory=lambda: dict.fromkeys(TaskStatus, 0))
     total: int = 0
     has_more: bool = False
+
+    def __post_init__(self) -> None:
+        _reject_fenced_filter(self.query.filters)
 
     def visit(self, task: Task) -> None:
         if not self.query.include_internal and task.type.startswith("cayu."):

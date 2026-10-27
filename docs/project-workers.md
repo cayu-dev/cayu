@@ -124,6 +124,36 @@ boundary, or recovery policy. Configure those in the factory or named
 entrypoint. In particular, `cayu worker` performs no implicit incomplete-session
 recovery.
 
+## A deploy during a long task
+
+Stopping a worker while a non-restartable task is running leaves that task
+fenced. `cayu worker` waits `--shutdown-grace-seconds` (30 by default, the
+same as ECS and Kubernetes) for the handler to return. When the grace runs out
+first, or the process is killed, the task stays `claimed` with
+`status_reason` `cancellation_requested` and no worker runs it again until it
+is reconciled, because Cayu can't prove the old handler stopped. The next
+worker that looks for expired claims logs a warning naming the task, and
+`cayu inspect --fenced-tasks` lists every such task. Restartable tasks are
+requeued only when their handler stops within the grace.
+
+When this is the only worker process for its tasks, say so and it settles them
+itself:
+
+```bash
+cayu worker dispatch --reconcile-abandoned-after-seconds 120
+```
+
+A task fenced under another worker id is then settled as cancelled once the
+worker has seen it fenced for 120 seconds, with the declaration recorded as the
+validator; create a new task if the work should run again. The flag sets
+`CAYU_WORKER_RECONCILE_ABANDONED_AFTER_S`, which `run_task_worker` reads when the
+entrypoint doesn't pass `reconcile_abandoned_after_s` itself. It is off by
+default and refused with `--processes`, because with several workers an expired
+lease can belong to one that is slow rather than gone. Give each process its
+own worker ID (as in the example above), so a restarted worker doesn't share
+the dead one's ID. Otherwise settle fenced tasks yourself once you know the old
+process exited; see [when a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task).
+
 ## Use multiple CPU cores
 
 ```bash

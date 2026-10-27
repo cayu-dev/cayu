@@ -256,6 +256,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "copy_dispatch_handle": ("cayu.tasks.dispatch", "copy_dispatch_handle"),
     "copy_dispatch_request": ("cayu.tasks.dispatch", "copy_dispatch_request"),
     "fail_managed_task": ("cayu.tasks.worker", "fail_managed_task"),
+    "is_fenced_after_worker_loss": ("cayu.tasks.abandoned", "is_fenced_after_worker_loss"),
     "interrupted_task_handoff_request": ("cayu.tasks.handoff", "interrupted_task_handoff_request"),
     "new_interrupted_task_continuation_handoff_id": (
         "cayu.tasks.handoff",
@@ -265,6 +266,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.tasks.worker",
         "reconcile_abandoned_task_cancellation",
     ),
+    "reconcile_abandoned_tasks": ("cayu.tasks.abandoned", "reconcile_abandoned_tasks"),
     "run_task_worker": ("cayu.tasks.worker", "run_task_worker"),
     "settle_task_retry_attempt_with_retry": (
         "cayu.tasks._terminalization",
@@ -527,8 +529,10 @@ PUBLIC_NAMES = [
     "copy_dispatch_request",
     "fail_managed_task",
     "interrupted_task_handoff_request",
+    "is_fenced_after_worker_loss",
     "new_interrupted_task_continuation_handoff_id",
     "reconcile_abandoned_task_cancellation",
+    "reconcile_abandoned_tasks",
     "run_task_worker",
     "settle_task_retry_attempt_with_retry",
     "task_create_with_execution_source",

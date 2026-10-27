@@ -11,6 +11,9 @@ from cayu.cli.project import ProjectError, build_project_app, project_context, r
 from cayu.cli.scaffold_check import check_scaffold_capabilities
 from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION, AppManifest
 
+# The most fenced tasks `cayu inspect --fenced-tasks` lists.
+_FENCED_TASK_LIMIT = 200
+
 
 def add_inspect_parser(subparsers: Any) -> None:
     parser = subparsers.add_parser(
@@ -38,6 +41,14 @@ def add_inspect_parser(subparsers: Any) -> None:
             "attempts, the budget, and whether it gave up."
         ),
     )
+    subjects.add_argument(
+        "--fenced-tasks",
+        action="store_true",
+        help=(
+            "List tasks in the project's task store that are fenced after their worker "
+            "stopped renewing its lease, and how to settle each."
+        ),
+    )
 
 
 def run_inspect(args: argparse.Namespace) -> int:
@@ -56,6 +67,8 @@ def _run_inspect(args: argparse.Namespace) -> int:
             app = build_project_app(project.target, command="Inspect")
             if args.retry_key is not None:
                 return _inspect_retry_key(app, args.retry_key, args.output_format)
+            if args.fenced_tasks:
+                return _inspect_fenced_tasks(app, args.output_format)
             manifest = app.describe(project_root=project.root)
     except Exception as exc:
         if args.output_format == "json":
@@ -171,6 +184,83 @@ def _inspect_retry_key(app: Any, retry_key: str, output_format: str) -> int:
         )
     print("\n".join(lines))
     return 0
+
+
+def _inspect_fenced_tasks(app: Any, output_format: str) -> int:
+    from cayu.tasks.abandoned import abandoned_task_settlement, has_cancellation_fence
+    from cayu.tasks.queries import TaskOrder, TaskQuery
+
+    async def load() -> list[Any]:
+        try:
+            if app.task_store is None:
+                raise ProjectError("The project has no task store.")
+            return await app.task_store.list_tasks(
+                TaskQuery(
+                    fenced_after_worker_loss=True,
+                    limit=_FENCED_TASK_LIMIT,
+                    order_by=TaskOrder.UPDATED_AT_ASC,
+                )
+            )
+        finally:
+            await app.aclose()
+            close = getattr(app.task_store, "close", None)
+            if close is not None:
+                await close()
+
+    # The store decides lease expiry by its own clock; this only guards against
+    # a custom store that doesn't apply the filter.
+    tasks = [task for task in asyncio.run(load()) if has_cancellation_fence(task)]
+    complete = len(tasks) < _FENCED_TASK_LIMIT
+    if output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "schema_version": APP_MANIFEST_SCHEMA_VERSION,
+                    "fenced_tasks": [
+                        {
+                            "task_id": task.id,
+                            "type": task.type,
+                            "status": task.status.value,
+                            "status_reason": task.status_reason,
+                            "worker_id": task.worker_id,
+                            "lease_expires_at": task.lease_expires_at.isoformat(),
+                            "error_code": _fence_error_code(task),
+                            "session_id": task.session_id,
+                            "retry_series": task.retry_series is not None,
+                            "settle": abandoned_task_settlement(task),
+                        }
+                        for task in tasks
+                    ],
+                    "complete": complete,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not tasks:
+        print("No fenced tasks.")
+        return 0
+    lines = [
+        f"{len(tasks)}{'' if complete else '+'} fenced task(s): each stays "
+        "claimed with a pending cancellation until it is reconciled."
+    ]
+    for task in tasks:
+        code = _fence_error_code(task)
+        lines.append(
+            f"- {task.id} ({task.type}): worker {task.worker_id} lease expired "
+            f"{task.lease_expires_at.isoformat()}" + (f" [{code}]" if code else "")
+        )
+        lines.append(f"  To settle: {abandoned_task_settlement(task)}.")
+    print("\n".join(lines))
+    return 0
+
+
+def _fence_error_code(task: Any) -> str | None:
+    payload = task.status_payload
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
 
 
 def _render_human(manifest: AppManifest) -> str:

@@ -116,6 +116,14 @@ to resume.
   (`register_task_type`, `create_task_operation`), an exact task index with
   counts, cancel and dependents, and retry budgets
   (`TaskCreate(retry_key=, retry_budget=)`, `TaskRetryBudgetExhausted`).
+- Tasks fenced after their worker was lost, as when a deploy replaces the
+  worker during a non-restartable task, can be found and settled:
+  `is_fenced_after_worker_loss`, `TaskQuery(fenced_after_worker_loss=)`,
+  `reconcile_abandoned_tasks`, and `run_task_worker(reconcile_abandoned_after_s=)`
+  or `cayu worker --reconcile-abandoned-after-seconds` for a declared
+  single-worker deployment (off by default). Task workers log a warning for
+  each fenced task they find, `cayu inspect --fenced-tasks` lists them, and the
+  Cayu Cloud activity contract counts them in `task_health`.
 - Approvals and watchers: `app.propose_tool_call(...)` asks a person to approve
   an exact tool call without a model turn, and `app.register_event_watcher`
   runs watchers in servers and workers.
