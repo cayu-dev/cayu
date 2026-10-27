@@ -35,7 +35,7 @@ pytest tests, and qualification scripts do **not** ship in the installed package
 ```sh
 REV=<full-cayu-commit-sha>
 RUN=$(mktemp -d)
-git clone https://github.com/cayu-tech/cayu.git "$RUN/checkout"
+git clone https://github.com/cayu-dev/cayu.git "$RUN/checkout"
 git -C "$RUN/checkout" checkout --detach "$REV"
 cd "$RUN/checkout"
 git rev-parse HEAD > "$RUN/fixture-commit.txt"

@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   collection:
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     outputs:
       repetitions: ${{ steps.inputs.outputs.repetitions }}
@@ -47,7 +47,7 @@ jobs:
   benchmark:
     needs: collection
     name: Profile ${{ matrix.lane }} / ${{ matrix.workers }} workers / repeat ${{ matrix.repetition }}
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
     timeout-minutes: 55
     strategy:
       fail-fast: false

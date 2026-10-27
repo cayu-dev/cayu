@@ -49,7 +49,7 @@ def test_workflow_routes_canonical_lanes_and_keeps_release_state_tag_only() -> N
     ):
         assert command in workflow
 
-    assert '["self-hosted","linux","arm64","gcp-ci"]' in workflow
+    assert "vars.CI_RUNNER_ARM64" in workflow
     package_steps = _load_package_steps(_ROOT / "scripts" / "package_ci_steps.yml")
     immutable = next(
         step for step in package_steps if step.name == "Verify immutable release state"

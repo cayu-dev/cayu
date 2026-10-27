@@ -18,7 +18,7 @@ jobs:
   verification-scope:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Verification scope
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
     timeout-minutes: 2
     outputs:
       dashboard: ${{ steps.scope.outputs.dashboard }}
@@ -54,7 +54,7 @@ jobs:
   static:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Static checks
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -72,7 +72,7 @@ jobs:
     name: SQLite cancellation (Python ${{ matrix.python-version }})
     needs: verification-scope
     if: needs.verification-scope.outputs.sqlite_cancellation == 'true'
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     strategy:
       fail-fast: false
@@ -92,7 +92,7 @@ jobs:
   package-build:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Build release archives
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     outputs:
       prerelease: ${{ steps.release-package.outputs.prerelease }}
@@ -137,7 +137,7 @@ jobs:
     # Core verifies the ARM64 sidecar on native ARM. The server journey, its eval
     # boundaries and the layout checks are the longest groups, so they take the
     # larger general workers.
-    runs-on: ${{ fromJSON(github.event.repository.private && (matrix.group == 'core' && '["self-hosted","linux","arm64","gcp-ci"]' || (matrix.group == 'server' || matrix.group == 'evals' || matrix.group == 'layout') && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["self-hosted","linux","x64","gcp-ci","gcp-ci-package"]') || (matrix.group == 'core' && '["ubuntu-24.04-arm"]' || '["ubuntu-latest"]')) }}
+    runs-on: ${{ fromJSON(matrix.group == 'core' && (vars.CI_RUNNER_ARM64 || '["ubuntu-24.04-arm"]') || (matrix.group == 'server' || matrix.group == 'evals' || matrix.group == 'layout') && (vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') || (vars.CI_RUNNER_PACKAGE || '["ubuntu-latest"]')) }}
     # Browser groups install browser system packages on each fresh runner.
     timeout-minutes: ${{ (matrix.group == 'server' || matrix.group == 'evals' || matrix.group == 'dashboard') && 30 || 10 }}
     strategy:
@@ -180,7 +180,7 @@ jobs:
     name: Dashboard
     needs: verification-scope
     if: needs.verification-scope.outputs.dashboard == 'true'
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -220,7 +220,7 @@ jobs:
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
     needs: [static, python-tests, sqlite-cancellation, package-build, package, dashboard, release-qualification]
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     environment:
       name: pypi
@@ -244,7 +244,7 @@ jobs:
     name: Create GitHub release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [publish, package-build]
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     permissions:
       contents: write

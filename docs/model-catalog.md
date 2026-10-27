@@ -252,77 +252,32 @@ verification rather than falling back to another schedule.
 
 Ordinary PR and manual branch CI do not make an unchanged branch fail solely because wall time
 passed. Release-tag verification enforces freshness for published artifacts; maintainers
-run the documented local refresh when that gate reports stale records. Installed releases
+re-verify stale records before a release. Installed releases
 remain offline and deterministic; applications decide when to upgrade or replace either
 snapshot.
 
-## Repository maintenance
+## Release policy
 
-Repository-only automation lives under `maintenance/model_catalog`. A browser-backed
-verification returns a metadata candidate and the corresponding price candidate. The
-refresh validates and diffs both complete resources, then writes them in the same
-reviewed change. A bundled price-only identity must be explicitly documented in
+`python -m maintenance.model_catalog.check` validates both bundled resources: structure,
+provider coverage, matching rules, bounded rates, schedule structure and official-source
+allowlists. Without `--skip-staleness` it also applies the 30-day freshness gate.
+
+A bundled price-only identity must be explicitly documented in
 `BUNDLED_PRICE_ONLY_IDENTITIES`; application-owned books remain independent and can use
 any gateway or negotiated billing identity. Every bundled routable model keeps a
-canonical price so the maintenance verifier can re-check it; that repository invariant
-does not couple application-owned `ModelCatalog` and `PriceBook` values.
+canonical price; that repository invariant does not couple application-owned
+`ModelCatalog` and `PriceBook` values.
 
-Hosted web search is maintained as a model fact. When the verifier independently
-verifies a model page, it reports `hosted_web_search` from that page's supported-tools
-list and quotes the list in its model evidence; a null answer or a pricing-only
-verification keeps the committed value. Only providers with a Cayu hosted-search adapter
-(`HOSTED_WEB_SEARCH_PROVIDERS`, currently `openai`) carry the fact, and catalog policy
-rejects it elsewhere. Newly established support appears in the refresh PR's diff like
-any other capability; an automated `True -> False` change is rejected and flagged,
-because it would make upgraded applications fail preflight. A recommended model that is
-missing from the bundled catalog is still flagged by the recommendation audit and added
-in a reviewed change, after which the verifier maintains its hosted-search fact.
+Hosted web search is a model fact. Only providers with a Cayu hosted-search adapter
+(`HOSTED_WEB_SEARCH_PROVIDERS`, currently `openai`) carry it, and catalog policy rejects
+it elsewhere. A `True -> False` change needs review, because it would make upgraded
+applications fail preflight.
 
-Model-fact freshness and price freshness are evaluated independently. Pricing evidence
-updates only schedule provenance; capability or lifecycle facts require their own
-official model-page URL and quote. When an official page publishes a future rate and
-start date, the verifier preserves the current schedule and creates the future schedule
-at that UTC date instead of treating the discovery date as the transition.
-
-The maintenance agent uses official-host allowlists, bounded browser evidence, strict
-per-session budgets, and a fixed verifier model. Inconclusive or suspicious changes keep
-the committed records and produce review flags. Builds and runtime loading never execute
-the maintenance agent or contact provider sites.
-
-For a local refresh using a signed-in ChatGPT subscription, run:
-
-```bash
-uv run python -m maintenance.model_catalog.local_refresh --all --audit-recommendations
-```
-
-The bootstrapper creates a disposable environment, installs the latest public `cayu` from
-PyPI, and runs Luna at maximum reasoning against the checkout's catalog data. This makes the
-maintenance run exercise the currently published runtime instead of the editable checkout.
-
-The refresh prints progress for each model and recommendation audit and saves an interim
-report before each check, retaining earlier evidence if a later check is interrupted. Each verification has
-a five-minute runtime deadline; inconclusive checks retain the committed record and include
-runtime limit or structured-output diagnostics in `model-catalog-refresh.md`. Browser evidence
-comes from successful tool completion events, including finalized arguments and the effective
-URL after redirects; public start events do not expose arguments or stable cross-event call IDs.
-The verifier uses Cayu's native `WebBridge.sandboxed_browser(interactive=True)` with a
-Docker-backed virtual-egress environment and the runtime's pinned browser image. Docker must
-be running and that image must be installed (see [browser setup](browser-session.md)).
-Credentialless public HTTPS GET/HEAD access supports provider pages and their assets; catalog
-validation still accepts only official provider source URLs. Cayu owns browser effects,
-artifacts, cancellation, and allocation cleanup. There is no host-browser fallback.
-
-While developing against an unreleased runtime change, run the verifier from the checkout
-so it uses that change and its matching pinned browser image:
-
-```bash
-uv run python -m maintenance.model_catalog.refresh --openai-subscription --all --audit-recommendations
-```
-
-The `local_refresh` bootstrap above deliberately uses the latest published package; it does
-not include an unreleased fix merely because the checkout contains that fix. The same applies
-to catalog schema additions such as `hosted_web_search`: until a release containing the field
-is published, the public package rejects the checkout's catalog, so use the checkout command.
+Model-fact freshness and price freshness are evaluated independently. Capability or
+lifecycle facts need their own official model-page source; pricing evidence updates only
+schedule provenance. A published future rate becomes a future schedule starting on its
+UTC date, not on the date it was found. Builds and runtime loading never contact provider
+sites.
 
 ## Pre-v0.1 migration
 

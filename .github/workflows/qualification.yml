@@ -17,7 +17,7 @@ jobs:
   # Runs alongside the shards as the full-suite collection and shard-plan gate.
   test-collection:
     name: Test collection
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     env:
       CAYU_TEST_STORES: all
@@ -28,7 +28,7 @@ jobs:
 
   qualification:
     name: Qualification ${{ matrix.shard }}/12 (Python 3.14)
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
     timeout-minutes: 60
     strategy:
       fail-fast: false

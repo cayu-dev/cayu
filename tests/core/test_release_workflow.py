@@ -386,7 +386,7 @@ def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> No
         in checks
     )
     assert "matrix.group == 'core'" in checks
-    assert '["self-hosted","linux","arm64","gcp-ci"]' in checks
+    assert "vars.CI_RUNNER_ARM64" in checks
     assert "ubuntu-24.04-arm" in checks
     assert "name: release-dist" in checks
     assert "--package-artifacts" in checks

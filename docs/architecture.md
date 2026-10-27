@@ -1407,9 +1407,6 @@ separately locking API would separate authority checks from their mutations.
 Memory operation owners receive current typed state after acquiring the shared
 lock, so a later operation observes indexes replaced during rollback. Native
 owners retain the corresponding connection, snapshot and transaction boundaries.
-The [memory/storage assessment](plans/memory-storage-assessment-2026-10-12/README.md)
-records these stopping points, source cost and combined qualification, including
-creation/fork, context selection and opaque creation-state diagnostics.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 

@@ -260,9 +260,7 @@ def application_database_url(request: pytest.FixtureRequest) -> str | None:
     return request.getfixturevalue("migrated_postgres_url")
 
 
-@pytest.mark.skipif(
-    not _fork_caps_available(), reason="Per-fork caps land with cayu-tech/cayu#2554."
-)
+@pytest.mark.skipif(not _fork_caps_available(), reason="Per-fork caps aren't available.")
 def test_a_capped_forks_reservations_survive_a_restart(
     application_database_url: str | None, tmp_path: Path
 ) -> None:

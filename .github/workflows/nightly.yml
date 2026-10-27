@@ -27,7 +27,7 @@ jobs:
   # nightly instead of on every pull request.
   generated-docker-coding:
     name: Generated Docker coding image (amd64)
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-package"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_PACKAGE || '["ubuntu-latest"]') }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

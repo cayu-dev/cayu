@@ -1,7 +1,8 @@
 """Review policy for Cayu's committed default model catalog.
 
-This module is repository maintenance code. Runtime catalog loading never imports it and
-never performs network access.
+The deterministic checks and candidate-update policy are shared with external catalog
+refresh tooling. Runtime catalog loading never imports this module and never performs
+network access.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from urllib.parse import urlparse
 from cayu.budgets import ModelCatalog, ModelInfo, ModelPrice, PriceBook
 
 CATALOG_MAX_AGE_DAYS = 30
+# External refresh tooling imports this verification age; the schedule keeps a review
+# margin before the release freshness gate expires.
 VERIFY_MAX_AGE_DAYS = 14
 VERIFY_SCHEDULE_DAYS = 7
 if VERIFY_MAX_AGE_DAYS + VERIFY_SCHEDULE_DAYS >= CATALOG_MAX_AGE_DAYS:
@@ -24,7 +27,7 @@ MAX_CATALOG_CONTEXT_WINDOW_TOKENS = 10_000_000
 MAX_AUTOMATED_CONTEXT_WINDOW_CHANGE_FACTOR = Decimal("4")
 REQUIRED_PROVIDERS = frozenset({"openai", "anthropic", "google", "vertex", "azure", "bedrock"})
 # Providers whose ``ModelInfo.hosted_web_search`` fact is consumed by a Cayu hosted-search
-# adapter and therefore verified by the maintenance job. Elsewhere the fact stays False.
+# adapter. Elsewhere the fact stays False.
 HOSTED_WEB_SEARCH_PROVIDERS = frozenset({"openai"})
 # A bundled billing identity that is deliberately not a routable model must be named here
 # and documented in docs/model-catalog.md. Application-owned books do not use this policy.
@@ -213,7 +216,7 @@ def suspicious_price_changes(
     max_factor: Decimal = MAX_AUTOMATED_PRICE_CHANGE_FACTOR,
     effective_on: date | None = None,
 ) -> list[str]:
-    """Changes too risky for the automated verifier to place in a candidate snapshot."""
+    """Flag candidate changes for review by external catalog refresh tooling."""
 
     if effective_on is not None:
         before_schedule = before_price.schedule_on(effective_on)

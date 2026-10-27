@@ -17,7 +17,7 @@ permissions:
 jobs:
   test-collection:
     name: Test collection (${{ inputs.stores }} stores)
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
     # Serial collection can take over four minutes before teardown, shard-plan
     # output and uploads; include headroom for variation on shared runners.
     timeout-minutes: 10
@@ -55,7 +55,7 @@ jobs:
 
   test_shards:
     name: Test shard ${{ matrix.shard }} (Python 3.14, ${{ inputs.stores }} stores)
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
     # Includes setup, collection, and loaded-runner headroom beyond measured calls.
     timeout-minutes: 30
     strategy:
@@ -93,7 +93,7 @@ jobs:
 
   test_specialists:
     name: Test specialist ${{ matrix.lane }} (Python 3.14, ${{ inputs.stores }} stores)
-    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
     # Match general shards: PostgreSQL reconstruction also needs collection,
     # database setup, and loaded-runner headroom beyond measured test calls.
     timeout-minutes: 30
