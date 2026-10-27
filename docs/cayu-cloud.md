@@ -168,6 +168,32 @@ command in `sh -c '...'`; the image has the BusyBox `sh`, not `bash`.
   processes will do it.
 - `idle_timeout_seconds` can't turn sleep off, and no other manifest value does.
 
+### How the worker stops
+
+A deploy, restart or pause stops the worker with `SIGTERM` and kills it 30
+seconds later. A worker that needs longer to finish what it's doing declares its
+own grace, a whole number of seconds from 10 to 120 (ECS's largest stop
+timeout):
+
+```toml
+[worker]
+command = "cayu worker scout"
+stop_grace_seconds = 120
+```
+
+Cloud passes it to the platform and, for a `cayu worker` command that doesn't
+set `--shutdown-grace-seconds` itself, sets that flag to the grace less 5
+seconds, so the worker's cooperative shutdown finishes before it's killed. Any
+other command has to stop within the grace on its own. The web process and
+schedules keep 30 seconds. A longer grace makes a deploy that replaces the
+worker take up to that much longer, because the old worker stops before the new
+one starts. The value is part of the Release; a manifest without it sends the
+same payload as before. A Cayu Cloud release that predates the key refuses it.
+
+A task the worker can't finish or hand back within the grace stays fenced; see
+[a deploy during a long task](project-workers.md#a-deploy-during-a-long-task).
+`cayu cloud service status` reports such tasks (below).
+
 ### Schedules
 
 `expression` uses Amazon EventBridge Scheduler's syntax and is evaluated in UTC:
@@ -329,6 +355,17 @@ start. Its `result.issues` array preserves Cloud's safe structured diagnostics, 
 the affected process, failed-attempt count, stable issue code, and remediation hint. Use
 the hint together with `cayu cloud service logs --application AGENT_SLUG`; credentials and
 raw provider error bodies are never included in the issue payload.
+
+`service status` also returns `result.task_health`, the latest count Cloud read from the
+Agent's [activity contract](#runs-and-human-touches) of tasks fenced after their worker
+was lost, such as by a deploy during a task that can't be restarted:
+`{"fenced_after_worker_loss": 2, "complete": true, "read_at": "..."}`. The count stops at
+100 (`complete` is false then), and `read_at` is when Cloud read it. It is `null` until
+Cloud has read one, and an older Cayu Cloud leaves it out. While the count is above zero
+the output adds a `warnings` entry saying how to list the tasks (`cayu inspect
+--fenced-tasks`) and settle them ([when a worker dies
+mid-task](triggering-runs.md#when-a-worker-dies-mid-task)). The service status itself is
+unchanged: fenced tasks don't make it `degraded`.
 
 By default, `deploy` also waits for a declared Agent service to reach `running`. A
 `degraded` service ends that wait with a nonzero `service_degraded` result. Its

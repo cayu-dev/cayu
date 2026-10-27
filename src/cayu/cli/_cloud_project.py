@@ -118,6 +118,28 @@ def _ready_seconds(value: object, *, name: str, bounds: tuple[int, int]) -> int:
     return value
 
 
+# Cayu Cloud's bounds on a worker's stop grace; keep them identical to Cloud. Omitted, the
+# platform waits 30 seconds after SIGTERM.
+_WORKER_STOP_GRACE_RANGE = (10, 120)
+
+
+def _stop_grace_seconds(value: object) -> int | None:
+    low, high = _WORKER_STOP_GRACE_RANGE
+    if value is not None and (type(value) is not int or not low <= value <= high):
+        raise CloudApiError(
+            "manifest_invalid",
+            f"Runtime worker stop_grace_seconds must be a whole number of seconds from {low} "
+            f"to {high}.",
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class CloudWorkerProcess(CloudProcess):
+    # Seconds the platform waits after SIGTERM before it kills the worker; None: Cloud's 30.
+    stop_grace_seconds: int | None = None
+
+
 @dataclass(frozen=True)
 class CloudWebProcess(CloudProcess):
     port: int
@@ -338,7 +360,7 @@ class CloudProjectManifest:
     compatibility: str
     policy_version: str
     web: CloudWebProcess | None = None
-    worker: CloudProcess | None = None
+    worker: CloudWorkerProcess | None = None
     schedules: tuple[CloudSchedule, ...] = ()
     runtime_environment: dict[str, str] | None = None
     local_files: tuple[CloudLocalFile, ...] = ()
@@ -441,7 +463,7 @@ class CloudProjectManifest:
             schedule_tables = [item for item in schedules if isinstance(item, dict)]
             for table_name, table, model in (
                 ("web", web, CloudWebProcess),
-                ("worker", worker, CloudProcess),
+                ("worker", worker, CloudWorkerProcess),
                 ("sign_in", sign_in, CloudSignIn),
                 ("database", database, CloudDatabase),
                 *(
@@ -502,7 +524,11 @@ class CloudProjectManifest:
                 worker=(
                     None
                     if worker is None
-                    else CloudProcess(command=str(worker["command"]), **_process_resources(worker))
+                    else CloudWorkerProcess(
+                        command=str(worker["command"]),
+                        **_process_resources(worker),
+                        stop_grace_seconds=_stop_grace_seconds(worker.get("stop_grace_seconds")),
+                    )
                 ),
                 schedules=tuple(
                     CloudSchedule(
@@ -576,6 +602,8 @@ class CloudProjectManifest:
             type(self.web.port) is not int or not 1 <= self.web.port <= 65_535
         ):
             raise CloudApiError("manifest_invalid", "Runtime web port is invalid.")
+        if self.worker is not None:
+            _stop_grace_seconds(self.worker.stop_grace_seconds)
         if self.web is not None:
             _ready_path(self.web.ready_path)
             _ready_seconds(
@@ -708,6 +736,12 @@ class CloudProjectManifest:
                     "command": self.worker.command,
                     **_process_resources(
                         {"cpu_millis": self.worker.cpu_millis, "memory_mb": self.worker.memory_mb}
+                    ),
+                    # Omitted without one, so the manifest (and its digest) stays as before.
+                    **(
+                        {}
+                        if self.worker.stop_grace_seconds is None
+                        else {"stop_grace_seconds": self.worker.stop_grace_seconds}
                     ),
                 }
             ),

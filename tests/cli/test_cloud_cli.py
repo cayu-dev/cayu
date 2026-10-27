@@ -509,7 +509,7 @@ mail-agent = "mail_agent.cli:main"
     manifest = cloud_project.CloudProjectManifest.load(tmp_path / "cayu-cloud.toml")
     assert output["result"]["runtime"] == "worker"
     assert manifest.entrypoint == "mail-agent"
-    assert manifest.worker == cloud_project.CloudProcess(command="mail-agent")
+    assert manifest.worker == cloud_project.CloudWorkerProcess(command="mail-agent")
     assert manifest.version == "0.4.0"
 
 
@@ -549,7 +549,7 @@ scout = "operations.scout_runs:run_scout_worker"
     assert manifest.entrypoint == "cayu serve --host 0.0.0.0 --port 8000"
     assert manifest.web is not None
     assert manifest.web.command == "cayu serve --host 0.0.0.0 --port 8000"
-    assert manifest.worker == cloud_project.CloudProcess(command="cayu worker scout")
+    assert manifest.worker == cloud_project.CloudWorkerProcess(command="cayu worker scout")
 
 
 @pytest.mark.parametrize("factory", [True, False])
@@ -577,7 +577,7 @@ def test_cloud_init_generates_the_first_of_several_workers_and_names_the_rest(
 
     result = json.loads(capsys.readouterr().out)["result"]
     manifest = cloud_project.CloudProjectManifest.load(tmp_path / "cayu-cloud.toml")
-    assert manifest.worker == cloud_project.CloudProcess(command="cayu worker scout")
+    assert manifest.worker == cloud_project.CloudWorkerProcess(command="cayu worker scout")
     assert result["notes"][-1] == (
         "Cayu Cloud runs one worker process per Agent, so [worker] runs `scout`, the first "
         "declared worker, and leaves out `digest`, `nightly report`. Combine them into one "
@@ -631,7 +631,7 @@ def test_cloud_init_quotes_a_worker_name_for_the_command(
     assert "worker" not in result
     assert manifest.web is None
     assert manifest.entrypoint == "cayu worker 'mail sync'"
-    assert manifest.worker == cloud_project.CloudProcess(command="cayu worker 'mail sync'")
+    assert manifest.worker == cloud_project.CloudWorkerProcess(command="cayu worker 'mail sync'")
 
 
 def test_cloud_init_refuses_to_replace_existing_manifest_without_force(

@@ -14,10 +14,10 @@ from cayu.cli import cloud
 from cayu.cli._cloud_api import CloudApiError, _plain_api_error_detail
 from cayu.cli._cloud_evidence import EvidenceRecorder
 from cayu.cli._cloud_project import (
-    CloudProcess,
     CloudProjectManifest,
     CloudSchedule,
     CloudWebProcess,
+    CloudWorkerProcess,
     ResolvedCloudProject,
 )
 
@@ -756,7 +756,7 @@ def test_acknowledged_rerun_corrects_an_earlier_acknowledgement(
                     memory_mb=2048,
                 ),
                 "runtime_environment": {"MODE": "worker"},
-                "worker": CloudProcess(command="python -m agent.worker"),
+                "worker": CloudWorkerProcess(command="python -m agent.worker"),
                 "schedules": (
                     CloudSchedule(
                         name="daily", command="python -m agent.daily", expression="rate(1 day)"
@@ -766,7 +766,7 @@ def test_acknowledged_rerun_corrects_an_earlier_acknowledgement(
             "13ca696824528f9331fd0fd6a0a759001b5f5bc1ea4fc82093f4fae73540ee21",
         ),
         (
-            {"worker": CloudProcess(command="python -m agent.worker")},
+            {"worker": CloudWorkerProcess(command="python -m agent.worker")},
             "cd7ebd4790f33482001dcfd8f754e4d76ef026cc4adaf33b726ba015604eaf02",
         ),
         (

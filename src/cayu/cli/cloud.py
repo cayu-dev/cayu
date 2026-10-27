@@ -46,6 +46,7 @@ from cayu.cli._cloud_project import (
     schedule_input_json,
 )
 from cayu.cli._cloud_settings import CloudSettingsError, add_settings_parser, settings_command
+from cayu.cli._cloud_task_health import fenced_tasks_warning
 
 _DEPLOYMENT_FAILURES = {"cancelled", "destroyed", "failed"}
 _DEPLOYMENT_IN_PROGRESS = {
@@ -3168,6 +3169,9 @@ def _service(
     if action == "status":
         result = client.request("GET", path)
         _service_status(result)
+        warning = fenced_tasks_warning(result)
+        if warning is not None:
+            return {"operation": "service.status", "result": result, "warnings": [warning]}
     elif action == "restart":
         result = client.request("POST", f"{path}/restart")
     elif action in {"sleep", "wake"}:

@@ -241,3 +241,41 @@ def test_unknown_schedule_keys_name_the_schedule(schedules, label):
     with pytest.raises(CloudApiError) as raised:
         CloudProjectManifest.loads(_BASE + schedules)
     assert str(raised.value) == f"{label} contains unsupported fields: cpu_milis."
+
+
+_WORKER = '[worker]\ncommand = "cayu worker scout"\n'
+
+
+@pytest.mark.parametrize("seconds", [10, 120])
+def test_worker_stop_grace_is_forwarded_in_the_runtime_payload(seconds):
+    manifest = CloudProjectManifest.loads(_BASE + _WORKER + f"stop_grace_seconds = {seconds}\n")
+    assert manifest.worker is not None and manifest.worker.stop_grace_seconds == seconds
+    runtime = manifest.deployment_payload(
+        repository="https://github.com/example/agent", revision="a" * 40
+    )["manifest"]["runtime"]
+    assert runtime["worker"] == {"command": "cayu worker scout", "stop_grace_seconds": seconds}
+
+
+def test_an_undeclared_worker_stop_grace_is_not_sent():
+    manifest = CloudProjectManifest.loads(_BASE + _WORKER)
+    assert manifest.worker is not None and manifest.worker.stop_grace_seconds is None
+    assert manifest.runtime_payload()["worker"] == {"command": "cayu worker scout"}
+
+
+@pytest.mark.parametrize("value", ["9", "121", "0", "30.0", '"30"', "true"])
+def test_worker_stop_grace_outside_cloud_bounds_is_refused(value):
+    with pytest.raises(CloudApiError, match="stop_grace_seconds must be a whole number") as raised:
+        CloudProjectManifest.loads(_BASE + _WORKER + f"stop_grace_seconds = {value}\n")
+    assert raised.value.category == "manifest_invalid"
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        '[web]\ncommand = "web"\nport = 8000\n',
+        '[[schedules]]\nname = "tick"\ncommand = "tick"\nexpression = "rate(1 hour)"\n',
+    ],
+)
+def test_only_the_worker_takes_a_stop_grace(table):
+    with pytest.raises(CloudApiError, match="unsupported fields: stop_grace_seconds"):
+        CloudProjectManifest.loads(_BASE + table + "stop_grace_seconds = 60\n")

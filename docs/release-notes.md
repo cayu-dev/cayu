@@ -79,6 +79,13 @@ storage migration.
   Agent's managed settings in Cayu Cloud: each setting's effective value, source
   and status, all-or-nothing changes with an operation id, and `--json` for the
   usual envelope. An older Cayu Cloud answers `settings_unsupported`.
+- `cayu cloud deploy` accepts `[worker] stop_grace_seconds` (whole seconds,
+  10-120) in `cayu-cloud.toml` and sends it to Cayu Cloud, which waits that long
+  after `SIGTERM` before it kills the worker (30 seconds without it). A manifest
+  without it sends the same payload as before.
+- `cayu cloud service status` adds a `warnings` entry when Cayu Cloud reports
+  tasks fenced after their worker was lost (`result.task_health`), with how to
+  list and settle them.
 
 ### Fixes
 

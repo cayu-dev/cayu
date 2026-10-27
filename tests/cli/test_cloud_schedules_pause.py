@@ -250,3 +250,53 @@ def test_a_schedule_input_cloud_would_refuse_is_refused_locally(line: str, reaso
         CloudProjectManifest.loads(_MANIFEST + line + "\n")
 
     assert raised.value.category == "manifest_invalid"
+
+
+@pytest.mark.parametrize(
+    ("health", "expected"),
+    [
+        ({"fenced_after_worker_loss": 1, "complete": True}, "1 task stayed claimed"),
+        ({"fenced_after_worker_loss": 100, "complete": False}, "100 tasks or more stayed claimed"),
+    ],
+)
+def test_service_status_warns_about_tasks_held_by_a_stopped_worker(
+    cloud, capsys: pytest.CaptureFixture[str], health: dict[str, Any], expected: str
+) -> None:
+    task_health = {**health, "read_at": "2026-10-27T09:30:00Z"}
+    service = {"status": "running", "task_health": task_health}
+    cloud({("GET", f"{_APP}/service"): httpx.Response(200, json=service)})
+
+    code, output = _run(["service", "status", "--application", "cayu-scout"], capsys)
+
+    assert code == 0
+    assert output["result"]["task_health"] == task_health
+    (warning,) = output["warnings"]
+    assert warning.startswith(expected)
+    assert "`cayu inspect --fenced-tasks`" in warning
+    assert "--reconcile-abandoned-after-seconds" in warning
+
+
+@pytest.mark.parametrize(
+    "task_health",
+    [
+        None,
+        {"fenced_after_worker_loss": 0, "complete": True, "read_at": None},
+        {"fenced_after_worker_loss": "2", "complete": True, "read_at": None},
+        "unexpected",
+    ],
+)
+def test_service_status_says_nothing_without_fenced_tasks(
+    cloud, capsys: pytest.CaptureFixture[str], task_health: object
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_APP}/service"): httpx.Response(
+                200, json={"status": "running", "task_health": task_health}
+            )
+        }
+    )
+
+    code, output = _run(["service", "status", "--application", "cayu-scout"], capsys)
+
+    assert code == 0
+    assert "warnings" not in output

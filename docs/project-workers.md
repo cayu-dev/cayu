@@ -134,7 +134,11 @@ first, or the process is killed, the task stays `claimed` with
 is reconciled, because Cayu can't prove the old handler stopped. The next
 worker that looks for expired claims logs a warning naming the task, and
 `cayu inspect --fenced-tasks` lists every such task. Restartable tasks are
-requeued only when their handler stops within the grace.
+requeued only when their handler stops within the grace. On Cayu Cloud,
+`[worker] stop_grace_seconds` gives the worker up to 120 seconds and raises
+`--shutdown-grace-seconds` to match
+([how the worker stops](cayu-cloud.md#how-the-worker-stops)), and
+`cayu cloud service status` reports fenced tasks.
 
 When this is the only worker process for its tasks, say so and it settles them
 itself:
