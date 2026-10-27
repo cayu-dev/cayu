@@ -1226,7 +1226,7 @@ def test_recovery_handles_repeated_artifact_stores_and_registration_failure(
 
 @pytest.mark.parametrize("second_rebuild_fails", [False, True])
 def test_concurrent_recoveries_never_use_another_jobs_rebuilt_factory(
-    tmp_path: Path, monkeypatch, second_rebuild_fails: bool
+    tmp_path: Path, monkeypatch, caplog, second_rebuild_fails: bool
 ) -> None:
     from contextlib import asynccontextmanager
 
@@ -1309,6 +1309,12 @@ def test_concurrent_recoveries_never_use_another_jobs_rebuilt_factory(
             assert [r.status for r in results] == [SessionStatus.INTERRUPTED] * 2
             assert factories["job-a"].released == [(sessions[0], {"clone": "job-a"})]
             assert serving.get_environment_factory(SLOT) is factories["job-a"]
+            # Waiting for another record's rebuild is expected contention,
+            # not a failed rebuild that should emit an exception warning.
+            assert not any(
+                record.exc_info and isinstance(record.exc_info[1], EnvironmentRebuildMismatch)
+                for record in caplog.records
+            )
             if second_rebuild_fails:
                 assert "job-b" not in factories
                 checkpoint = await serving.session_store.load_checkpoint(sessions[1])

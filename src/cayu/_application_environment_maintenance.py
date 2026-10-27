@@ -540,18 +540,25 @@ class SessionEnvironments:
         app = self._app
         registry = app._environment_registry
         if name not in registry.registrations:
-            if not read_only and registry.rebuilders:
-                try:
-                    await ensure_session_environment(app, session)
-                except Exception:
-                    # Another recovery may have registered this name while
-                    # we waited for its rebuild. Check ownership below.
-                    logger.warning(
-                        "Rebuilding environment %r for session recovery failed.",
-                        name,
-                        exc_info=True,
-                    )
+            if read_only or not registry.rebuilders:
+                return nullcontext()
+            try:
+                await ensure_session_environment(app, session)
+                # Built from this session's record, or found registered from it.
+                return nullcontext()
+            except EnvironmentRebuildMismatch:
+                # Another recovery registered the name from its own record
+                # while this one waited on the rebuild lock: scoped below.
+                pass
+            except Exception:
+                logger.warning(
+                    "Rebuilding environment %r for session recovery failed.",
+                    name,
+                    exc_info=True,
+                )
             if name not in registry.registrations:
+                # No other job's factory is involved: recovery continues as it
+                # would without a registration.
                 return nullcontext()
         registered_record = registry.rebuild_record(name)
         if registered_record is None:

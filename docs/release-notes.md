@@ -192,6 +192,13 @@ showed this, because the in-memory store makes its own key.
   reused name is registered from another record, the fork, resume or recovery
   raises `EnvironmentRebuildMismatch` before any work. The types live in
   `cayu.environments.rebuild`.
+- Concurrent recoveries of sessions from different jobs that share an
+  unregistered per-job environment name no longer recover the later session
+  through the first job's rebuilt factory. When another recovery registers the
+  name from a different record while one waits on its rebuild, the waiting
+  recovery now compares records and rebuilds its own environment in its own
+  scope (or falls back to the call-refusing stand-in), so the first job's
+  factory never receives the other session's allocation.
 - `ForkControllerEnrollment` reports `agent_availability`, whether this process
   can fork each enrolled agent's sessions and why not (a hosted tool outside
   the allowance, or a default environment that is not registered here and
