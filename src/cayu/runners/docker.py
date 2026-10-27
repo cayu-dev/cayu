@@ -308,6 +308,22 @@ class DockerRuntimeConfigurationError(RuntimeError):
         super().__init__(f"Docker runtime configuration verification failed: {self.code}.")
 
 
+def _admission_probe_failure(result: ExecResult) -> DockerRuntimeConfigurationError:
+    """Describe transport evidence without copying guest output or credentials."""
+    code = (
+        "admission_probe_timed_out" if result.timed_out else "admission_probe_completion_unverified"
+    )
+    error = DockerRuntimeConfigurationError(code)
+    error.add_note(
+        "Docker admission probe did not provide an exact completion receipt: "
+        f"exit_code={result.exit_code}, timed_out={result.timed_out}, "
+        f"cancelled={result.cancelled}, stderr_truncated={result.stderr_truncated}. "
+        "Admission remains refused. Wait for allocation cleanup to finish before "
+        "retrying; inspect Docker daemon health and load if it recurs."
+    )
+    return error
+
+
 def _require_docker(docker_path: str | None) -> str:
     candidate = docker_path or shutil.which("docker")
     if not candidate:
@@ -1842,7 +1858,7 @@ async def _run_docker_admission_probe(
             result, completion_token=completion_token
         )
         if completed_result is None:
-            raise DockerRuntimeConfigurationError("admission_probe_completion_unverified")
+            raise _admission_probe_failure(result)
         return completed_result
 
     acquisition = acquire_creation_lease("docker", container_id)
@@ -1905,7 +1921,7 @@ async def _run_docker_admission_probe(
         _attach_docker_probe_settlement(error, settlement)
         raise
     if result.timed_out:
-        error = DockerRuntimeConfigurationError("admission_probe_timed_out")
+        error = _admission_probe_failure(result)
         settlement = _defer_docker_probe_settlement(
             container_id=container_id,
             command_task=command_task,
@@ -1921,7 +1937,7 @@ async def _run_docker_admission_probe(
         completion_token=completion_token,
     )
     if completed_result is None:
-        error = DockerRuntimeConfigurationError("admission_probe_completion_unverified")
+        error = _admission_probe_failure(result)
         settlement = _defer_docker_probe_settlement(
             container_id=container_id,
             command_task=command_task,

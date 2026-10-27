@@ -153,6 +153,24 @@ the environment then reports `guest_privilege_containment` and
 `brokered_egress` from the egress adapter, and `untrusted_code_isolation` as
 unsupported because of the shared kernel.
 
+### Inconclusive admission and upstream failures
+
+`admission_probe_timed_out` means the Docker probe exceeded its observation
+window. `admission_probe_completion_unverified` means Cayu did not receive an
+exact guest completion receipt, for example after a Docker transport failure
+or truncated output. Neither result proves that the host is reachable. Cayu
+refuses the allocation and retains cleanup authority; do not use the runner or
+disable verification. Wait for cleanup to settle before retrying allocation.
+If it recurs under concurrent builds or tests, inspect the engine's load and
+logs. The exception notes report transport status without exposing probe output.
+
+A broker HTTP 502 is a separate upstream failure, not an admission failure.
+Inspect the broker's error code and egress audit events before deciding whether
+to retry. An interrupted upstream request may already have reached its target;
+retry only idempotent operations or ones whose outcome you have reconciled.
+Reducing concurrent setup work can help diagnose engine contention, but Cayu
+does not impose a universal application concurrency limit to hide it.
+
 ## On Cayu Cloud
 
 Cloud gives an Agent's processes `CAYU_CLOUD_API_URL`,

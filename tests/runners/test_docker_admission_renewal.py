@@ -27,6 +27,35 @@ from cayu.tools.base import ToolExecutableRequirement
 _PROBE_COMPLETION_TOKEN = re.compile(r"cayu-admission-probe-complete-[0-9a-f]{32}")
 
 
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_creation_probe_failure_retains_transport_evidence_without_output(monkeypatch, timed_out):
+    async def dispatch(*args, **kwargs):
+        return ExecResult(
+            exit_code=-9 if timed_out else 1,
+            timed_out=timed_out,
+            stderr="credential-that-must-not-appear",
+        )
+
+    monkeypatch.setattr(docker_module, "_run_docker", dispatch)
+    with pytest.raises(DockerRuntimeConfigurationError) as raised:
+        asyncio.run(
+            docker_module._run_docker_admission_probe(
+                "/docker",
+                _CONTAINER_ID,
+                script="true",
+                docker_cli_env_allowlist=(),
+                supervise_guest=False,
+            )
+        )
+    assert raised.value.code == (
+        "admission_probe_timed_out" if timed_out else "admission_probe_completion_unverified"
+    )
+    notes = " ".join(raised.value.__notes__)
+    assert f"timed_out={timed_out}" in notes
+    assert "cleanup" in notes
+    assert "credential-that-must-not-appear" not in notes
+
+
 def _completed_probe_result(
     args: list[str],
     *,
