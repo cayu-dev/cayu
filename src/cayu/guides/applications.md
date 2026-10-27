@@ -113,6 +113,17 @@ the check accepts without executing them:
   annotations and literal values.
 - `@functools.cache`, `@functools.lru_cache` and `@lru_cache(maxsize=...)` with
   literal options.
+- SQLAlchemy declarative models, as `--with app-database` generates them: a
+  `DeclarativeBase` subclass whose body sets at most `metadata = MetaData(...)`, and
+  models whose bodies hold `__tablename__`, `__table_args__` of literal
+  `UniqueConstraint`, `ForeignKeyConstraint`, `Index` or `CheckConstraint` values, and
+  `Mapped[...]` columns built with `mapped_column(...)` from SQLAlchemy column types and
+  `ForeignKey(...)`, with literal options and `server_default=func.now()`. Undecorated
+  methods, `__repr__` and `__str__` are allowed. Decorated methods (a decorator can make a
+  method a descriptor SQLAlchemy runs while it reads the class), other dunder and `_sa_`
+  methods (`__table_cls__`, `__mapper_cls__`), methods named `metadata`, `registry` or
+  `type_annotation_map`, mixins, `__mapper_args__` and any other call in a model body
+  stay unproven.
 
 Environment reads at import (`os.environ[...]`, `os.environ.get(...)`,
 `os.getenv(...)`) are deliberately unsupported, with `reason:

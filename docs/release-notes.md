@@ -30,6 +30,10 @@ the patched dependency versions. No storage migration is required.
 
 ### Changes
 
+- `cayu check` accepts the SQLAlchemy models `cayu new --with app-database` generates,
+  so an agent that uses its own tables no longer fails the import check with
+  `SCAFFOLD_IMPORT_SIDE_EFFECT`. Mixins, mapper options and other calls in a model
+  body stay unproven.
 - Sessions record how they got their execution deadline:
   `Session.execution_deadline.origin` is `explicit`, `run_default` or
   `enclosing`, stored next to the deadline as `cayu:execution_deadline_origin`.

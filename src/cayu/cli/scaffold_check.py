@@ -1499,7 +1499,7 @@ def _assignment_target_binds_name(target: ast.expr, name: str) -> bool:
 @dataclass(frozen=True)
 class _DeclarativeBinding:
     line: int
-    kind: Literal["class", "model", "enum", "literal", "annotation", "function"] = "class"
+    kind: Literal["class", "model", "table", "enum", "literal", "annotation", "function"] = "class"
     enum_members: frozenset[str] | None = None
     metadata_shape: Literal["str", "tuple"] | None = None
     # The value of a numeric literal constant, for bounded arithmetic on it.
@@ -1518,6 +1518,266 @@ def _is_pydantic_base(
         imports.get(base.id) == ("pydantic", "BaseModel")
         or (base.id in bases and bases[base.id].kind == "model")
     )
+
+
+# SQLAlchemy declarative models, the shape `cayu new --with app-database` generates. Declaring
+# one registers its table and mapper in its base's metadata and registry, in memory; nothing
+# connects or reads configuration. Only these shapes are proven: a base whose body sets at most
+# `metadata = MetaData(...)`, and models whose bodies hold `__tablename__`, `__table_args__` of
+# literal constraints, and `Mapped[...]` columns built from the types and helpers below with
+# literal arguments. Mixins, mapper options and any other call stay unproven.
+_SQLALCHEMY_BASE = ("sqlalchemy.orm", "DeclarativeBase")
+_SQLALCHEMY_COLUMN_TYPES = frozenset(
+    ("sqlalchemy", name)
+    for name in (
+        "BigInteger",
+        "Boolean",
+        "Date",
+        "DateTime",
+        "Float",
+        "Integer",
+        "JSON",
+        "LargeBinary",
+        "Numeric",
+        "SmallInteger",
+        "String",
+        "Text",
+        "Time",
+        "Uuid",
+    )
+)
+_SQLALCHEMY_CONSTRAINTS = frozenset(
+    ("sqlalchemy", name)
+    for name in ("CheckConstraint", "ForeignKeyConstraint", "Index", "UniqueConstraint")
+)
+# Methods SQLAlchemy never calls while it declares a class. Any other dunder or `_sa_` name may
+# be a declaration hook (`__table_cls__`, `__mapper_cls__`, `__declare_first__`, ...).
+_SQLALCHEMY_INERT_DUNDERS = frozenset({"__repr__", "__str__"})
+# Class attributes SQLAlchemy reads while it declares a base or model; a method by one of these
+# names could run then.
+_SQLALCHEMY_DECLARATION_ATTRIBUTES = frozenset({"metadata", "registry", "type_annotation_map"})
+# `func.now()` and the like, which the database evaluates for a server default.
+_SQLALCHEMY_SERVER_FUNCTIONS = frozenset({"current_timestamp", "now"})
+
+
+def _is_sqlalchemy_base(
+    base: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    bases: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    return isinstance(base, ast.Name) and (
+        imports.get(base.id) == _SQLALCHEMY_BASE
+        or (base.id in bases and bases[base.id].kind == "table")
+    )
+
+
+def _sqlalchemy_arguments_are_literal(
+    call: ast.Call, proofs: Mapping[str, _DeclarativeBinding]
+) -> bool:
+    return all(_declaration_value_is_inert(argument, proofs) for argument in call.args) and all(
+        keyword.arg is not None and _declaration_value_is_inert(keyword.value, proofs)
+        for keyword in call.keywords
+    )
+
+
+def _sqlalchemy_call_is(
+    call: ast.expr,
+    symbols: frozenset[tuple[str, str]],
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+) -> bool:
+    return (
+        isinstance(call, ast.Call) and _trusted_symbol(call.func, imports, rebound, root) in symbols
+    )
+
+
+def _sqlalchemy_column_is_declarative(
+    value: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+    proofs: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    """`mapped_column(...)` of reviewed column types and foreign keys, with literal options."""
+
+    if not _sqlalchemy_call_is(
+        value, frozenset({("sqlalchemy.orm", "mapped_column")}), imports, rebound, root
+    ):
+        return False
+    assert isinstance(value, ast.Call)
+    for argument in value.args:
+        if _sqlalchemy_call_is(
+            argument, frozenset({("sqlalchemy", "ForeignKey")}), imports, rebound, root
+        ) or _sqlalchemy_call_is(argument, _SQLALCHEMY_COLUMN_TYPES, imports, rebound, root):
+            assert isinstance(argument, ast.Call)
+            if not _sqlalchemy_arguments_are_literal(argument, proofs):
+                return False
+        elif _trusted_symbol(argument, imports, rebound, root) not in _SQLALCHEMY_COLUMN_TYPES:
+            return False
+    for keyword in value.keywords:
+        if keyword.arg is None:
+            return False
+        server_function = keyword.value
+        if (
+            keyword.arg in {"server_default", "server_onupdate"}
+            and isinstance(server_function, ast.Call)
+            and not server_function.args
+            and not server_function.keywords
+            and isinstance(server_function.func, ast.Attribute)
+            and server_function.func.attr in _SQLALCHEMY_SERVER_FUNCTIONS
+            and _trusted_symbol(server_function.func.value, imports, rebound, root)
+            == ("sqlalchemy", "func")
+        ):
+            continue
+        if not _declaration_value_is_inert(keyword.value, proofs):
+            return False
+    return True
+
+
+def _sqlalchemy_table_args_are_declarative(
+    value: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+    proofs: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    """Literal constraints, optionally followed by a literal options dictionary."""
+
+    if isinstance(value, ast.Dict):
+        return _literal_collection_is_data_only(value)
+    if not isinstance(value, ast.Tuple):
+        return False
+    constraints = value.elts
+    if constraints and isinstance(constraints[-1], ast.Dict):
+        if not _literal_collection_is_data_only(constraints[-1]):
+            return False
+        constraints = constraints[:-1]
+    return all(
+        _sqlalchemy_call_is(item, _SQLALCHEMY_CONSTRAINTS, imports, rebound, root)
+        and isinstance(item, ast.Call)
+        and _sqlalchemy_arguments_are_literal(item, proofs)
+        for item in constraints
+    )
+
+
+def _sqlalchemy_model_obstacle(
+    definition: ast.ClassDef,
+    *,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+    rebound_names: frozenset[str],
+    project_root: Path,
+    declarative_bases: Mapping[str, _DeclarativeBinding],
+) -> tuple[ast.expr | ast.stmt | None, frozenset[ast.expr]]:
+    """What keeps a SQLAlchemy model unproven, else the namespace values it declares."""
+
+    for base in definition.bases:
+        if not _is_sqlalchemy_base(base, import_bindings, declarative_bases):
+            return base, frozenset()
+    if definition.keywords:
+        return definition.keywords[0].value, frozenset()
+    declares_base = any(
+        isinstance(base, ast.Name) and import_bindings.get(base.id) == _SQLALCHEMY_BASE
+        for base in definition.bases
+    )
+    class_bindings = _scope_rebound_names(definition.body, include_imports=True)
+    scope = rebound_names | class_bindings
+    proofs = {
+        name: proof for name, proof in declarative_bases.items() if name not in class_bindings
+    }
+    values: set[ast.expr] = set()
+    for statement in definition.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A decorator can turn a method into a descriptor SQLAlchemy runs while it reads
+            # the class, such as `@classmethod` over `@property`.
+            if statement.decorator_list:
+                return statement.decorator_list[0], frozenset()
+            if (
+                (
+                    statement.name.startswith("__")
+                    and statement.name not in _SQLALCHEMY_INERT_DUNDERS
+                )
+                or statement.name.startswith("_sa_")
+                or statement.name in _SQLALCHEMY_DECLARATION_ATTRIBUTES
+            ):
+                return statement, frozenset()
+            continue
+        if isinstance(statement, ast.Pass):
+            continue
+        if (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            continue
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            name, value = statement.targets[0].id, statement.value
+            if name == "__tablename__" and (
+                isinstance(value, ast.Constant) and isinstance(value.value, str)
+            ):
+                continue
+            if name == "__table_args__" and _sqlalchemy_table_args_are_declarative(
+                value, import_bindings, scope, project_root, proofs
+            ):
+                values.add(value)
+                values.update(_evaluated_calls(value))
+                continue
+            if (
+                name == "metadata"
+                and declares_base
+                and _sqlalchemy_call_is(
+                    value,
+                    frozenset({("sqlalchemy", "MetaData")}),
+                    import_bindings,
+                    scope,
+                    project_root,
+                )
+                and isinstance(value, ast.Call)
+                and _sqlalchemy_arguments_are_literal(value, proofs)
+            ):
+                values.add(value)
+                continue
+            return value, frozenset()
+        if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            annotation = statement.annotation
+            if not (
+                isinstance(annotation, ast.Subscript)
+                and _trusted_symbol(annotation.value, import_bindings, scope, project_root)
+                == ("sqlalchemy.orm", "Mapped")
+                and _pydantic_annotation_is_declarative(
+                    annotation.slice,
+                    import_bindings=import_bindings,
+                    rebound_names=scope,
+                    project_root=project_root,
+                    declarative_bases=proofs,
+                )
+            ):
+                return annotation, frozenset()
+            if statement.value is None:
+                continue
+            if not _sqlalchemy_column_is_declarative(
+                statement.value, import_bindings, scope, project_root, proofs
+            ):
+                # Name the call the proof can't follow, such as a computed default.
+                return next(
+                    (
+                        call
+                        for call in _evaluated_calls(statement.value)
+                        if not (
+                            _trusted_symbol(call.func, import_bindings, scope, project_root)
+                            or ("",)
+                        )[0].startswith("sqlalchemy")
+                    ),
+                    statement.value,
+                ), frozenset()
+            values.update(_evaluated_calls(statement.value))
+            continue
+        return statement, frozenset()
+    return None, frozenset(values)
 
 
 def _trusted_symbol(
@@ -2126,6 +2386,20 @@ def _unsafe_import_time_expression(
                 }:
                     return statement
         if any(
+            _is_sqlalchemy_base(base, import_bindings, declarative_bases)
+            for base in definition.bases
+        ):
+            obstacle, values = _sqlalchemy_model_obstacle(
+                definition,
+                import_bindings=import_bindings,
+                rebound_names=rebound_names,
+                project_root=project_root,
+                declarative_bases=declarative_bases,
+            )
+            if obstacle is not None:
+                return obstacle
+            declarative_values.update(values)
+        if any(
             isinstance(base, ast.Name) and base.id in declarative_bases for base in definition.bases
         ):
             # Multiple inheritance can introduce an effectful metaclass even
@@ -2632,6 +2906,8 @@ _INERT_METACLASS_BASE_IMPORTS = frozenset(
         ("cayu", "Tool"),
         ("cayu.tools.base", "Tool"),
         ("pydantic", "BaseModel"),
+        # Its subclass hook maps the class; `_sqlalchemy_model_obstacle` bounds what it maps.
+        _SQLALCHEMY_BASE,
         ("http.server", "ThreadingHTTPServer"),
         ("http.server", "BaseHTTPRequestHandler"),
     }
@@ -2651,7 +2927,7 @@ def _class_base_is_declarative(
     if isinstance(base, ast.Name) and base.id not in class_rebound_names:
         proof = declarative_bases.get(base.id)
         if proof is not None and proof.line < base.lineno:
-            return proof.kind in {"class", "model"}
+            return proof.kind in {"class", "model", "table"}
     name = _expression_root_name(base)
     if name is None or name in rebound_names:
         return False
@@ -3251,9 +3527,16 @@ def _class_binding(
                 for decorator in statement.decorator_list
             )
         )
+    table = any(_is_sqlalchemy_base(base, imports, proven) for base in node.bases)
     return _DeclarativeBinding(
         node.lineno,
-        "model" if pydantic else "enum" if enum_members is not None else "class",
+        "model"
+        if pydantic
+        else "table"
+        if table
+        else "enum"
+        if enum_members is not None
+        else "class",
         enum_members,
         serializer_methods=serializers,
         unproven_method_returns=unproven_returns,
@@ -3498,6 +3781,7 @@ def _imported_class_base_is_declarative(
         ("http.server", "ThreadingHTTPServer"),
         ("http.server", "BaseHTTPRequestHandler"),
         ("pydantic", "BaseModel"),
+        _SQLALCHEMY_BASE,
         ("enum", "Enum"),
         ("enum", "IntEnum"),
         ("enum", "StrEnum"),
@@ -3545,6 +3829,9 @@ def _imported_subscription_is_declarative(
             }
         if binding == ("pydantic", "ModelWrapValidatorHandler"):
             # The typed handler a wrap model validator receives.
+            return not _import_binding_is_project_local(root, binding)
+        if binding == ("sqlalchemy.orm", "Mapped"):
+            # A model column's annotation, evaluated without postponed annotations.
             return not _import_binding_is_project_local(root, binding)
         return module in {
             "collections",
