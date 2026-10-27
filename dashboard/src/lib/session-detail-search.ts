@@ -26,6 +26,14 @@ export function validateSessionDetailSearch(search: Record<string, unknown>): Se
   const history = validateSessionHistorySearch(search)
   const event = text(search.event) ?? history.event_id
   const panel = text(search.panel)
+  const legacyEventFilter = !!(
+    history.event_id ||
+    history.event_type ||
+    history.tool_name ||
+    history.agent_name ||
+    history.environment_name ||
+    history.workflow_name
+  )
   return {
     ...history,
     ...workflowSearchPatch(workflowSearchFromSession(search)),
@@ -34,7 +42,7 @@ export function validateSessionDetailSearch(search: Record<string, unknown>): Se
     view:
       search.view === "conversation"
         ? "conversation"
-        : search.view === "trace" || history.event_id
+        : search.view === "trace" || legacyEventFilter
           ? "trace"
           : undefined,
     workflow: search.workflow === "1" ? "1" : undefined,
@@ -42,7 +50,7 @@ export function validateSessionDetailSearch(search: Record<string, unknown>): Se
     event,
     log:
       search.log === "1" ||
-      (history.event_id && search.view !== "trace" && search.view !== "conversation")
+      (legacyEventFilter && search.view !== "trace" && search.view !== "conversation")
         ? "1"
         : undefined,
   }

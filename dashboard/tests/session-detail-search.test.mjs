@@ -104,3 +104,24 @@ test("tool call links retain the exact session incarnation with their event filt
     undefined,
   )
 })
+
+test("legacy event filter links select Trace and its log without overriding explicit views", () => {
+  for (const field of [
+    "event_type",
+    "tool_name",
+    "agent_name",
+    "environment_name",
+    "workflow_name",
+  ]) {
+    const legacy = validateSessionDetailSearch({ [field]: "failure" })
+    assert.equal(legacy.view, "trace", field)
+    assert.equal(legacy.log, "1", field)
+    assert.equal(
+      validateSessionDetailSearch({ ...legacy, view: "conversation" }).view,
+      "conversation",
+    )
+    assert.equal(validateSessionDetailSearch({ [field]: "failure", view: "trace" }).log, undefined)
+  }
+  assert.equal(validateSessionDetailSearch({ transcript_role: "user" }).view, undefined)
+  assert.equal(validateSessionDetailSearch({ event_type: false }).view, undefined)
+})

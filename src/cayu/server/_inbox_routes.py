@@ -476,6 +476,7 @@ def register_inbox_routes(
         _clean_optional_query_value,
         _knowledge_reviewer_attribution,
         _serialize_pending_action,
+        _serialize_session_base,
         _serialize_session_cursor,
     )
 
@@ -492,7 +493,7 @@ def register_inbox_routes(
             kind=kind,
             attention_id=action.attention_id,
             session_id=locator.public_session_id,
-            agent_name=action.session.agent_name,
+            agent_name=projected["session"]["agent_name"],
             created_at=action.event.event.timestamp,
             title=projected["title"],
             detail=projected["detail"],
@@ -612,7 +613,7 @@ def register_inbox_routes(
                 kind=item.kind,
                 status=status,
                 session_id=public_session_id,
-                agent_name=item.session.agent_name,
+                agent_name=_serialize_session_base(cayu_app, item.session)["agent_name"],
                 settlement=settlement,
             )
 
@@ -1047,9 +1048,9 @@ def register_inbox_routes(
         issues = [
             InboxIssue(
                 code=issue.code.value,
-                detail=issue.detail,
+                detail=cayu_app.redact_json(issue.detail),
                 session_id=cayu_app.project_session_id_for_exposure(issue.session_id),
-                agent_name=issue.agent_name,
+                agent_name=cayu_app.redact_json(issue.agent_name),
             )
             for issue in page.issues
         ]

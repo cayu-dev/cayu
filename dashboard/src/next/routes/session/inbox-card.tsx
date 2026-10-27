@@ -78,6 +78,8 @@ export function InboxCard({
   const [argumentsText, setArgumentsText] = useState("{}")
   const [argumentError, setArgumentError] = useState<string | null>(null)
   const viewer = useViewer()
+  const canOverride = !!prototype || viewer?.full_access === true
+  const overrideSuspended = override && !canOverride
   const refresh = () =>
     Promise.all(
       [
@@ -117,7 +119,7 @@ export function InboxCard({
     if (!available || !item.decisions.includes(decision)) return
     let argumentsValue: Record<string, unknown> | undefined
     if (decision === "approve" && override) {
-      if (!prototype && viewer?.full_access !== true) return
+      if (!canOverride) return
       try {
         const parsed: unknown = JSON.parse(argumentsText)
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
@@ -161,7 +163,7 @@ export function InboxCard({
       <>
         <Button
           size="sm"
-          disabled={busy || !item.decisions.includes("approve")}
+          disabled={busy || overrideSuspended || !item.decisions.includes("approve")}
           onClick={() => decide("approve")}
         >
           Approve
@@ -373,6 +375,25 @@ export function InboxCard({
       </div>
       <div className="space-y-2 px-3.5 py-3 text-sm">
         {body}
+        {item.kind === "approval" && overrideSuspended && !decided && (
+          <div role="status" className="space-y-2 text-xs">
+            <p>
+              Your current role cannot change arguments. Your draft is retained. Choose the original
+              arguments to approve without changes.
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => {
+                setOverride(false)
+                setArgumentError(null)
+              }}
+            >
+              Use original arguments
+            </Button>
+          </div>
+        )}
         {!available && item.kind !== "recovery" && (
           <p role="status">Decisions are unavailable for this deployment.</p>
         )}
@@ -405,39 +426,36 @@ export function InboxCard({
                   Continue an interrupted task with this decision. Active workers remain protected.
                 </label>
               )}
-              {item.kind === "approval" &&
-                !protectedDecision &&
-                (!!prototype || viewer?.full_access === true) &&
-                !decided && (
-                  <div className="space-y-2">
-                    <label className="flex items-center gap-2 text-xs">
-                      <input
-                        type="checkbox"
-                        checked={override}
-                        onChange={(event) => setOverride(event.target.checked)}
+              {item.kind === "approval" && !protectedDecision && canOverride && !decided && (
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={override}
+                      onChange={(event) => setOverride(event.target.checked)}
+                      disabled={busy}
+                    />
+                    Approve with changed arguments
+                  </label>
+                  {override && (
+                    <label className="block text-xs">
+                      Changed arguments
+                      <textarea
+                        aria-label="Changed arguments"
+                        value={argumentsText}
+                        onChange={(event) => setArgumentsText(event.target.value)}
                         disabled={busy}
+                        rows={4}
+                        className="mt-1 block w-full rounded border border-input bg-background px-2 py-1 font-mono"
                       />
-                      Approve with changed arguments
+                      <span>
+                        The proposed arguments remain withheld. This object replaces them.
+                      </span>
                     </label>
-                    {override && (
-                      <label className="block text-xs">
-                        Changed arguments
-                        <textarea
-                          aria-label="Changed arguments"
-                          value={argumentsText}
-                          onChange={(event) => setArgumentsText(event.target.value)}
-                          disabled={busy}
-                          rows={4}
-                          className="mt-1 block w-full rounded border border-input bg-background px-2 py-1 font-mono"
-                        />
-                        <span>
-                          The proposed arguments remain withheld. This object replaces them.
-                        </span>
-                      </label>
-                    )}
-                    {argumentError && <p role="alert">{argumentError}</p>}
-                  </div>
-                )}
+                  )}
+                  {argumentError && <p role="alert">{argumentError}</p>}
+                </div>
+              )}
               {(!protectedDecision || item.kind === "question") && !decided && (
                 <label className="block text-xs">
                   Reason (optional)

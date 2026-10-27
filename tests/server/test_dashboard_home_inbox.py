@@ -898,6 +898,19 @@ def test_home_failure_link_opens_existing_filtered_event_log():
             ]
             await link.click()
             await expect(page).to_have_url(re.compile("event_type=session.failed"))
+            await expect(page.get_by_label("Event type", exact=True)).to_have_value(
+                "session.failed"
+            )
+            await expect(page.get_by_label("Event type", exact=True)).to_be_visible()
+            await expect(
+                page.get_by_role("button").filter(has_text="session.failed")
+            ).to_be_visible()
+            copied_url = page.url
+            await page.goto(copied_url, wait_until="networkidle")
+            await expect(page.get_by_label("Event type", exact=True)).to_be_visible()
+            await expect(page.get_by_label("Event type", exact=True)).to_have_value(
+                "session.failed"
+            )
 
     asyncio.run(scenario())
 
@@ -1404,5 +1417,115 @@ def test_eval_release_acceptance_rejects_failed_source_session(monkeypatch):
         async with _home_browser(failed=True) as (page, base, _requests, _responses):
             with pytest.raises(RuntimeError, match="source session must complete"):
                 await example._start_source_session(page, base)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("surface", ["inbox?kind=approval", "sessions/approval"])
+def test_approval_role_refresh_exposes_retained_override_and_allows_original(surface):
+    async def scenario():
+        async with _home_browser(role="developer", decisions=True) as (page, base, _, _responses):
+            mode = "developer"
+            bodies = []
+
+            async def identity(route):
+                if mode == "temporary":
+                    await route.fulfill(status=503, json={"detail": "temporary"})
+                    return
+                response = await route.fetch()
+                body = await response.json()
+                body.update(role=mode, full_access=mode == "developer")
+                await route.fulfill(response=response, json=body)
+
+            await page.route("**/api/app", identity)
+            page.on(
+                "request",
+                lambda r: (
+                    bodies.append(r.post_data_json)
+                    if r.method == "POST" and urlsplit(r.url).path.endswith("/settle")
+                    else None
+                ),
+            )
+            await page.goto(base + "/cayu/" + surface, wait_until="networkidle")
+            await page.get_by_text("Decision options", exact=True).click()
+            await page.get_by_label("Approve with changed arguments", exact=True).check()
+            await page.get_by_label("Changed arguments", exact=True).fill('{"note":"kept draft"}')
+            await page.get_by_label("Reason (optional)", exact=True).fill("Reviewed original")
+            mode = "temporary"
+            await page.evaluate("window.dispatchEvent(new Event('visibilitychange'))")
+            await expect(page.get_by_test_id("dashboard-identity-refresh-warning")).to_be_visible()
+            await expect(page.get_by_label("Changed arguments", exact=True)).to_have_value(
+                '{"note":"kept draft"}'
+            )
+            mode = "member"
+            await page.evaluate("window.dispatchEvent(new Event('visibilitychange'))")
+            await expect(
+                page.get_by_label("Approve with changed arguments", exact=True)
+            ).to_be_hidden()
+            original = page.get_by_role("button", name="Use original arguments", exact=True)
+            await expect(original).to_be_visible()
+            await expect(page.get_by_role("button", name="Approve", exact=True)).to_be_disabled()
+            assert bodies == []
+            mode = "developer"
+            await page.evaluate("window.dispatchEvent(new Event('visibilitychange'))")
+            await expect(page.get_by_label("Changed arguments", exact=True)).to_have_value(
+                '{"note":"kept draft"}'
+            )
+            mode = "member"
+            await page.evaluate("window.dispatchEvent(new Event('visibilitychange'))")
+            await original.click()
+            await page.get_by_role("button", name="Approve", exact=True).click()
+            await expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)
+            assert bodies == [{"decision": "approve", "reason": "Reviewed original"}]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("surface", ["inbox?kind=approval", "sessions/approval"])
+def test_pending_approval_keeps_dispatched_arguments_during_role_refresh(surface):
+    async def scenario():
+        async with _home_browser(role="developer", decisions=True) as (page, base, _, _responses):
+            member = False
+            dispatched = asyncio.Event()
+            release = asyncio.Event()
+            bodies = []
+
+            async def identity(route):
+                response = await route.fetch()
+                body = await response.json()
+                if member:
+                    body.update(role="member", full_access=False)
+                await route.fulfill(response=response, json=body)
+
+            async def hold_decision(route):
+                bodies.append(route.request.post_data_json)
+                dispatched.set()
+                await release.wait()
+                await route.continue_()
+
+            await page.route("**/api/app", identity)
+            await page.route("**/api/inbox/*/settle", hold_decision)
+            await page.goto(base + "/cayu/" + surface, wait_until="networkidle")
+            await page.get_by_text("Decision options", exact=True).click()
+            await page.get_by_label("Approve with changed arguments", exact=True).check()
+            await page.get_by_label("Changed arguments", exact=True).fill('{"note":"dispatched"}')
+            await page.get_by_role("button", name="Approve", exact=True).click()
+            await asyncio.wait_for(dispatched.wait(), 5)
+            try:
+                member = True
+                await page.evaluate("window.dispatchEvent(new Event('visibilitychange'))")
+                await expect(
+                    page.get_by_role("button", name="Use original arguments", exact=True)
+                ).to_be_disabled()
+                await expect(
+                    page.get_by_role("button", name="Approve", exact=True)
+                ).to_be_disabled()
+                assert bodies == [
+                    {"decision": "approve", "arguments": {"note": "dispatched"}, "reason": None}
+                ]
+            finally:
+                release.set()
+            await expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)
+            assert len(bodies) == 1
 
     asyncio.run(scenario())

@@ -255,7 +255,7 @@ function Row({
   return (
     <NavLink
       to={sessionPath(row.session.id)}
-      search={trace ? { event_type: "session.failed" } : undefined}
+      search={trace ? { view: "trace", log: "1", event_type: "session.failed" } : undefined}
       className="flex items-center gap-3 px-3.5 py-2.5 hover:bg-muted/60"
     >
       <StateDot state={row.overview?.state} attention={needsAttention(row.overview)} />
