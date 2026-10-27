@@ -119,6 +119,8 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     first = capsys.readouterr().out
     assert "# Run your first evaluation" in first
     assert "New suite" in first
+    assert "Run saved revision" in first
+    assert "Edit suite" in first
     assert "Check launch" in first
     assert "Approve as baseline" in first
     assert "cayu eval compare" in first
@@ -130,6 +132,8 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "[tool.cayu.evals.default_judge]" in quality["content"]
     assert "allow_same_model = true" in quality["content"]
     assert "Calibrate before gating" in quality["content"]
+    assert "AI judge with weighted criteria" in quality["content"]
+    assert "Configured evaluator with a rubric" in quality["content"]
 
     assert main(["guide", "evals-production"]) == 0
     production = capsys.readouterr().out

@@ -585,14 +585,15 @@ concurrency one; V1/V2 documents remain readable with that fail-closed policy.
 
 For an ordinary project started with `cayu serve`, users do not need to write an
 Evals-specific Python suite. Select a server-published target on the **Evals**
-page and choose **New suite**. The authoring sheet supports the complete
-deterministic and structured-judge workflow:
+page and choose **New suite**. The full-page editor supports all 20 portable
+check types, including configured model judges and structured judges:
 
 1. name a reusable suite and set trials per case, required passes, maximum
    concurrency, and the per-trial timeout;
 2. add, duplicate, remove, and select cases;
-3. enter one or more ordered user messages for a simple fresh session, or build
-   and save a controlled multi-stage scenario;
+3. use the case’s **Input** tab for ordered user messages or a saved controlled
+   multi-stage scenario; use **Checks** for sentence summaries that expand into
+   typed fields, including distinct text and JSON equality;
 4. define expected behavior with status, output, tool, memory, model-step, usage,
    token, and cost assertions, and optionally add a one-to-eight-criterion AI
    judge rubric using a current trusted server-published profile;
@@ -603,8 +604,15 @@ deterministic and structured-judge workflow:
 6. launch the selected cases and follow the resulting durable run in the normal
    suite run pages.
 
-Saved revisions remain in the authoring catalog and can be loaded, revised into
-a new immutable revision, or run again. A launch freezes an
+Open **Edit suite** or a case’s **Edit case** link to revise an authored suite.
+The original saved revision remains the parent of the next exact save; unchanged
+captured cases retain their server-owned source links. An unconfirmed save locks
+edits until **Retry exact save** confirms that same child and parent request.
+Saving does not launch work. **Run saved revision** opens a separate launch review.
+Drafts stay in memory; leaving a dirty editor asks for confirmation, and switching
+specialists within the new-suite page retains each specialist’s draft.
+Corpus suites remain read-only here; use the existing import tools in Settings.
+A launch freezes an
 `EvalSuiteSelectionV1`, so a subset always records the exact suite and case
 revisions that were reviewed. A completed result can use the existing baseline,
 comparison, JSON-report, and HTML-report workflow.
@@ -3872,3 +3880,11 @@ The child associations commit atomically with the child document and receipt.
 Copying or importing identical diagnostic source fields does not recreate an
 operational link. The existing capture preview, save, export,
 launch, reporting and authoring endpoints remain available.
+
+The suite editor retains the exact reviewed launch request in this browser tab before
+starting work. If the response is lost, reopen the saved suite and choose **Retry exact
+launch** to recover the original run, including its case selection, cost ceiling and
+reviewed profiles. **Abandon launch recovery** deliberately permits a separate new
+launch; it does not cancel an earlier run. Private calibration evidence remains only
+in the open editor. Finish or explicitly discard calibration edits before changing
+cases or suite fields; an unconfirmed paid calibration must be retried before leaving.

@@ -1,4 +1,7 @@
-import { validateStructuredJudgeAssertion } from "./eval-judge-authoring.ts"
+import {
+  validateModelJudgeAssertion,
+  validateStructuredJudgeAssertion,
+} from "./eval-judge-authoring.ts"
 import {
   durableTextLength,
   isPythonBlank,
@@ -25,6 +28,65 @@ import type {
 const SHA256_REVISION_PATTERN = /^sha256:[a-f0-9]{64}$/
 
 export const EVAL_SUITE_MAX_CASES = 1_000
+
+export function authoredCheckSummary(check: EvalCaseDraftV2["assertions"][number]): string {
+  const text = describeAuthoredCheck(check)
+  const characters = Array.from(text)
+  return characters.length > 180 ? `${characters.slice(0, 180).join("")}…` : text
+}
+
+function describeAuthoredCheck(check: EvalCaseDraftV2["assertions"][number]): string {
+  const count = (minimum: number, maximum?: number | null) =>
+    maximum === minimum
+      ? `${minimum} times`
+      : maximum == null
+        ? `at least ${minimum} times`
+        : `${minimum}–${maximum} times`
+  switch (check.kind) {
+    case "root_status":
+      return `Session ${check.expected === "completed" ? "completes" : "fails"}`
+    case "child_status":
+      return `Child sessions are ${check.expected}, ${count(check.min_count ?? 1, check.max_count)}`
+    case "final_output_equals":
+      return `Final answer equals ${check.comparison === "json" ? "JSON " : ""}${check.expected}`
+    case "final_output_contains":
+      return `Final answer contains ${check.expected}`
+    case "tool_called":
+      return `Calls ${check.tool_name} ${count(check.min_count ?? 1, check.max_count)}`
+    case "tool_arguments_contain":
+      return `Call ${check.occurrence ?? 1} to ${check.tool_name} has matching arguments`
+    case "tool_result_contains":
+      return `Call ${check.occurrence ?? 1} to ${check.tool_name} has a matching result`
+    case "tools_called_in_order":
+      return `Calls ${check.tool_names.join(" → ")}`
+    case "process_event":
+      return `${check.event.replaceAll("_", " ")}, ${count(check.min_count ?? 1, check.max_count)}`
+    case "process_events_in_order":
+      return check.events.map((event) => event.replaceAll("_", " ")).join(" → ")
+    case "workspace_file":
+      return `${check.present === false ? "Does not create" : "Creates"} ${check.path}`
+    case "artifact":
+      return `Produces ${check.filename ?? check.content_type ?? "an artifact"} in ${check.scope ?? "session"}`
+    case "memory_attribution":
+      return `Admits at least ${check.min_admitted_items ?? 0} memory items; exposes at least ${check.min_provider_exposures ?? 0} to the provider`
+    case "max_tool_calls":
+      return `Makes at most ${check.maximum} tool calls`
+    case "max_model_steps":
+      return `Uses at most ${check.maximum} model steps`
+    case "usage_recorded":
+      return `Records at least ${check.min_total_tokens ?? 1} tokens`
+    case "max_total_tokens":
+      return `Uses at most ${check.maximum} tokens`
+    case "max_estimated_cost":
+      return `Costs at most ${check.maximum} ${check.currency ?? "USD"}`
+    case "model_judge":
+      return `Judge: ${check.rubric}`
+    case "structured_model_judge":
+      return `Judge: ${check.rubric.criteria.map((criterion) => criterion.name).join("; ")}`
+    default:
+      return "Check"
+  }
+}
 
 export type EvalSuiteDraftValidation =
   | { ok: true; draft: EvalSuiteDraftV3 }
@@ -271,6 +333,8 @@ export function validateEvalSuiteDraft(draft: EvalSuiteDraftV3): EvalSuiteDraftV
         assertionIds.add(assertion.id)
         if (assertion.kind === "structured_model_judge") {
           validateStructuredJudgeAssertion(assertion)
+        } else if (assertion.kind === "model_judge") {
+          validateModelJudgeAssertion(assertion)
         } else {
           deterministic.push(assertion as PromotionAssertion)
         }

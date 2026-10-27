@@ -30,19 +30,21 @@ provider, credential, tool, environment, policy, or store.
 
 ## Create one deterministic suite
 
-1. Choose **New suite**.
-2. Give the suite and first case stable IDs and useful names. IDs identify the
-   logical contract; editing content creates a new immutable revision.
-3. Replace the sample input with a representative user request.
-4. Keep the default completed-root expectation. Add **Final output contains**
-   for one stable fact the answer must include. Prefer domain facts over exact
-   prose when wording may vary.
-5. Leave **Trials per case**, **Required passes**, and **Maximum concurrency**
-   at `1` for the first run.
+1. Open **Evals → New suite** and select the specialist.
+2. Name the suite and first case. **Suite details** and **Case details** contain
+   their stable IDs and optional descriptions. Editing content creates a new
+   immutable revision; the saved suite ID stays fixed.
+3. In the case’s **Input** tab, replace the sample with a representative user request.
+4. Open **Checks** and keep the completed-session check. Choose **Final output
+   contains** in **Check type**, then **Add check**. Expand its sentence to edit
+   the expected fact. Prefer domain facts over exact prose when wording may vary.
+   **Final output equals** also offers exact text or JSON-value comparison.
+5. Expand **Suite settings**. Leave **Trials per case**, **Required passes**,
+   and **Maximum concurrency** at `1` for the first run.
 6. Choose **Check suite**. Review the canonical revision and every readiness
    diagnostic, then choose **Save revision**.
-7. If the target publishes compatible pricing, optionally enter a **Maximum
-   cost per trial**. Choose **Check launch** and review the maximum candidate
+7. Choose **Run saved revision**. If the specialist publishes compatible pricing,
+   optionally enter a **Maximum cost per trial**. Choose **Check launch** and review the maximum candidate
    work, the accepted interruption threshold, and whether cost is hard-bounded
    or observed-only. Choose **Run selected** only when that exposure is
    acceptable.
@@ -57,8 +59,12 @@ case and trial before trusting the aggregate status.
   ID. Change only the stimulus or expected behavior you intend to vary.
 - The checkboxes beside cases define an explicit launch subset. Select every
   case for a full-suite run; clear unrelated cases for a focused run.
-- Editing a loaded suite never mutates the saved revision. Check and save again
-  to create the next immutable revision.
+- Open a suite and choose **Edit suite**, or edit a specific case. Check and save
+  to create the next immutable revision. The old revision stays unchanged.
+  Captured cases retain their protected source-session links only when their
+  case ID and content remain unchanged.
+- Saving does not run the specialist. If the save response is lost, use **Retry
+  exact save** to confirm the original revision before editing again.
 - A repeated-trial policy retains every outcome. Required passes are not a way
   to hide evaluator errors or unavailable evidence; those still fail closed.
 

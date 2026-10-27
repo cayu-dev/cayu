@@ -108,6 +108,13 @@ async def exercise_large_suite_pages(page, base, target, selected):
         opened_response = await opened.value
         assert opened_response.ok, (kind, opened_response.status, opened_response.url)
         await expect(page.get_by_role("heading", name=name, exact=True)).to_be_visible()
+        if kind == "corpus":
+            await page.goto(f"{url}/edit", wait_until="networkidle")
+            await expect(
+                page.get_by_text("Corpus suites are read-only here.", exact=False)
+            ).to_be_visible()
+            await expect(page.get_by_test_id("eval-suite-editor")).to_have_count(0)
+            await page.goto(url, wait_until="networkidle")
         for case in cases[:25]:
             await expect(page.get_by_text(case["name"], exact=True)).to_have_count(1)
         await page.get_by_role("button", name="Next cases", exact=True).click()
@@ -126,9 +133,8 @@ async def exercise_large_suite_pages(page, base, target, selected):
             await page.goto(url, wait_until="networkidle")
             await page.get_by_role("button", name="Run suite", exact=True).click()
             if kind == "authored":
-                sheet = page.get_by_test_id("eval-suite-authoring-sheet")
+                sheet = page.get_by_test_id("eval-suite-editor")
                 await expect(sheet.get_by_test_id("authored-suite-name")).to_have_value(name)
-                await sheet.get_by_test_id("authored-suite-preview").click()
                 await sheet.get_by_test_id("authored-suite-run-preview").click()
                 await expect(sheet.get_by_text("1 durable run ready", exact=True)).to_be_visible()
                 await sheet.get_by_test_id("authored-suite-launch").click()

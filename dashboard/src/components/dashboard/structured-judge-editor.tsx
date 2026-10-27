@@ -1,11 +1,12 @@
 import { ArrowDown, ArrowUp, CheckCircle2, FlaskConical, Plus, Trash2 } from "lucide-react"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import {
+  ApiClientError,
   type EvalJudgeCalibrationPreview,
   type EvalJudgeCalibrationReport,
   previewEvalJudgeCalibration,
@@ -18,7 +19,11 @@ import {
   newJudgeCalibrationDraft,
   validateJudgeCalibrationDraft,
 } from "@/lib/eval-judge-authoring"
-import { evalErrorMessage, shortEvalIdentity } from "@/lib/evals-dashboard"
+import {
+  evalErrorMessage,
+  evalLaunchFailureIsDefinitive,
+  shortEvalIdentity,
+} from "@/lib/evals-dashboard"
 import type {
   EvalJudgeCalibrationDraftV1,
   EvalTargetCatalogEntry,
@@ -38,6 +43,9 @@ export function StructuredJudgeEditor({
   disabled,
   onChange,
   onRemove,
+  canRemove = true,
+  calibrationDisabled = disabled,
+  onCalibrationStateChange,
 }: {
   assertion: StructuredModelJudgeAssertionDraftV1
   target: EvalTargetCatalogEntry | undefined
@@ -46,7 +54,11 @@ export function StructuredJudgeEditor({
   disabled: boolean
   onChange: (assertion: StructuredModelJudgeAssertionDraftV1) => void
   onRemove: () => void
+  calibrationDisabled?: boolean
+  onCalibrationStateChange?: (state: CalibrationState) => void
+  canRemove?: boolean
 }) {
+  const fieldPrefix = useId()
   const profiles = target?.judge_profiles ?? []
   const profile = judgeProfileForAssertion(target, assertion)
   const candidateRouteRelation = judgeRouteForAssertion(target, assertion)
@@ -66,7 +78,7 @@ export function StructuredJudgeEditor({
   const referenceMode = assertion.reference?.kind ?? "none"
 
   return (
-    <Card size="sm" data-testid="structured-judge-editor">
+    <Card size="sm" className="@container/judge" data-testid="structured-judge-editor">
       <CardHeader className="grid-cols-[1fr_auto]">
         <div>
           <CardTitle>AI judge rubric</CardTitle>
@@ -74,24 +86,30 @@ export function StructuredJudgeEditor({
             A trusted server-owned model scores fixed criteria. Cayu computes the weighted result.
           </p>
         </div>
-        <Button type="button" size="icon-xs" variant="ghost" disabled={disabled} onClick={onRemove}>
+        <Button
+          type="button"
+          size="icon-xs"
+          variant="ghost"
+          disabled={disabled || !canRemove}
+          onClick={onRemove}
+        >
           <Trash2 />
           <span className="sr-only">Remove AI judge</span>
         </Button>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Assertion ID" id={`${assertion.id}-judge-id`}>
+        <div className="grid gap-3 @min-[28rem]/judge:grid-cols-2">
+          <Field label="Assertion ID" id={`${fieldPrefix}-judge-id`}>
             <Input
-              id={`${assertion.id}-judge-id`}
+              id={`${fieldPrefix}-judge-id`}
               value={assertion.id}
               disabled={disabled}
               onChange={(event) => edit((next) => (next.id = event.target.value))}
             />
           </Field>
-          <Field label="Trusted judge profile" id={`${assertion.id}-judge-profile`}>
+          <Field label="Trusted judge profile" id={`${fieldPrefix}-judge-profile`}>
             <select
-              id={`${assertion.id}-judge-profile`}
+              id={`${fieldPrefix}-judge-profile`}
               className={SELECT_CLASS}
               value={`${assertion.judge_profile_key}:${assertion.judge_profile_revision}`}
               disabled={disabled || profiles.length === 0}
@@ -127,25 +145,25 @@ export function StructuredJudgeEditor({
               ))}
             </select>
           </Field>
-          <Field label="Description" id={`${assertion.id}-judge-description`} wide>
+          <Field label="Description" id={`${fieldPrefix}-judge-description`} wide>
             <Input
-              id={`${assertion.id}-judge-description`}
+              id={`${fieldPrefix}-judge-description`}
               value={assertion.description ?? ""}
               disabled={disabled}
               onChange={(event) => edit((next) => (next.description = event.target.value || null))}
             />
           </Field>
-          <Field label="Rubric ID" id={`${assertion.id}-rubric-id`}>
+          <Field label="Rubric ID" id={`${fieldPrefix}-rubric-id`}>
             <Input
-              id={`${assertion.id}-rubric-id`}
+              id={`${fieldPrefix}-rubric-id`}
               value={assertion.rubric.id}
               disabled={disabled}
               onChange={(event) => edit((next) => (next.rubric.id = event.target.value))}
             />
           </Field>
-          <Field label="Pass threshold (0–1)" id={`${assertion.id}-threshold`}>
+          <Field label="Pass threshold (0–1)" id={`${fieldPrefix}-threshold`}>
             <Input
-              id={`${assertion.id}-threshold`}
+              id={`${fieldPrefix}-threshold`}
               inputMode="decimal"
               value={assertion.threshold ?? "0.5"}
               disabled={disabled}
@@ -209,7 +227,7 @@ export function StructuredJudgeEditor({
             <div
               // biome-ignore lint/suspicious/noArrayIndexKey: criterion rows do not own local state, and their editable IDs may temporarily collide.
               key={`${index}:${assertion.rubric.criteria.length}`}
-              className="grid gap-2 rounded-md border border-border p-3 sm:grid-cols-[minmax(8rem,0.7fr)_minmax(10rem,1fr)_7rem_auto]"
+              className="grid gap-2 rounded-md border border-border p-3 @min-[36rem]/judge:grid-cols-[minmax(8rem,0.7fr)_minmax(10rem,1fr)_7rem_auto]"
             >
               <Input
                 aria-label={`Criterion ${index + 1} ID`}
@@ -304,10 +322,10 @@ export function StructuredJudgeEditor({
           ))}
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Judge evidence" id={`${assertion.id}-evidence`}>
+        <div className="grid gap-3 @min-[28rem]/judge:grid-cols-2">
+          <Field label="Judge evidence" id={`${fieldPrefix}-evidence`}>
             <select
-              id={`${assertion.id}-evidence`}
+              id={`${fieldPrefix}-evidence`}
               className={SELECT_CLASS}
               value={assertion.evidence?.include_transcript ? "transcript" : "final_output"}
               disabled={disabled || !profile?.allowed_evidence.includes("transcript")}
@@ -327,9 +345,9 @@ export function StructuredJudgeEditor({
               )}
             </select>
           </Field>
-          <Field label="Reference truth" id={`${assertion.id}-reference-mode`}>
+          <Field label="Reference truth" id={`${fieldPrefix}-reference-mode`}>
             <select
-              id={`${assertion.id}-reference-mode`}
+              id={`${fieldPrefix}-reference-mode`}
               className={SELECT_CLASS}
               value={referenceMode}
               disabled={disabled}
@@ -368,10 +386,10 @@ export function StructuredJudgeEditor({
         </div>
 
         {assertion.reference?.kind === "public_reference" && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Public reference ID" id={`${assertion.id}-public-reference-id`}>
+          <div className="grid gap-3 @min-[28rem]/judge:grid-cols-2">
+            <Field label="Public reference ID" id={`${fieldPrefix}-public-reference-id`}>
               <Input
-                id={`${assertion.id}-public-reference-id`}
+                id={`${fieldPrefix}-public-reference-id`}
                 value={assertion.reference.id}
                 disabled={disabled}
                 onChange={(event) =>
@@ -383,9 +401,9 @@ export function StructuredJudgeEditor({
                 }
               />
             </Field>
-            <Field label="Expected answer" id={`${assertion.id}-expected-answer`}>
+            <Field label="Expected answer" id={`${fieldPrefix}-expected-answer`}>
               <Textarea
-                id={`${assertion.id}-expected-answer`}
+                id={`${fieldPrefix}-expected-answer`}
                 rows={3}
                 value={assertion.reference.expected_answer ?? ""}
                 disabled={disabled}
@@ -398,9 +416,9 @@ export function StructuredJudgeEditor({
                 }
               />
             </Field>
-            <Field label="Expected facts (one per line)" id={`${assertion.id}-expected-facts`} wide>
+            <Field label="Expected facts (one per line)" id={`${fieldPrefix}-expected-facts`} wide>
               <Textarea
-                id={`${assertion.id}-expected-facts`}
+                id={`${fieldPrefix}-expected-facts`}
                 rows={3}
                 value={(assertion.reference.expected_facts ?? []).join("\n")}
                 disabled={disabled}
@@ -419,9 +437,9 @@ export function StructuredJudgeEditor({
         )}
 
         {assertion.reference?.kind === "private_reference" && (
-          <Field label="Private reference" id={`${assertion.id}-private-reference`}>
+          <Field label="Private reference" id={`${fieldPrefix}-private-reference`}>
             <select
-              id={`${assertion.id}-private-reference`}
+              id={`${fieldPrefix}-private-reference`}
               className={SELECT_CLASS}
               value={`${assertion.reference.key}:${assertion.reference.revision}`}
               disabled={disabled}
@@ -454,50 +472,67 @@ export function StructuredJudgeEditor({
           targetKey={target?.target_key ?? ""}
           assertion={reviewedAssertion}
           defaultTask={defaultTask}
-          disabled={disabled}
+          disabled={calibrationDisabled}
+          onStateChange={onCalibrationStateChange}
         />
       </CardContent>
     </Card>
   )
 }
 
+export type CalibrationState = { dirty: boolean; locked: boolean }
+
 function JudgeCalibrationPanel({
   targetKey,
   assertion,
   defaultTask,
   disabled,
+  onStateChange,
 }: {
   targetKey: string
   assertion: StructuredModelJudgeAssertionSpec | null
   defaultTask: string
   disabled: boolean
+  onStateChange?: (state: CalibrationState) => void
 }) {
+  const fieldPrefix = useId()
   const [draft, setDraft] = useState<EvalJudgeCalibrationDraftV1 | null>(null)
   const [preview, setPreview] = useState<EvalJudgeCalibrationPreview | null>(null)
   const [previewIdentity, setPreviewIdentity] = useState<string | null>(null)
   const [report, setReport] = useState<EvalJudgeCalibrationReport | null>(null)
   const [runId, setRunId] = useState("")
+  const [touched, setTouched] = useState(false)
+  const [unresolved, setUnresolved] = useState(false)
   const [pending, setPending] = useState<"preview" | "run" | null>(null)
   const [error, setError] = useState<string | null>(null)
   const controllerRef = useRef<AbortController | null>(null)
 
+  const assertionIdentity = JSON.stringify(assertion)
+  useLayoutEffect(() => {
+    onStateChange?.({ dirty: touched, locked: pending !== null || unresolved })
+  }, [onStateChange, pending, touched, unresolved])
+
   useEffect(() => {
     controllerRef.current?.abort()
-    setDraft(assertion ? newJudgeCalibrationDraft(targetKey, assertion, defaultTask) : null)
+    setTouched(false)
+    setUnresolved(false)
+    const reviewed = JSON.parse(assertionIdentity) as StructuredModelJudgeAssertionSpec | null
+    setDraft(reviewed ? newJudgeCalibrationDraft(targetKey, reviewed, defaultTask) : null)
     setPreview(null)
     setPreviewIdentity(null)
     setReport(null)
     setRunId("")
     setPending(null)
     setError(null)
-  }, [assertion, defaultTask, targetKey])
+  }, [assertionIdentity, defaultTask, targetKey])
   useEffect(() => () => controllerRef.current?.abort(), [])
 
   const identity = useMemo(() => (draft ? JSON.stringify(draft) : null), [draft])
   const previewCurrent = preview !== null && previewIdentity === identity
 
   const edit = (mutate: (next: EvalJudgeCalibrationDraftV1) => void) => {
-    if (!draft) return
+    if (!draft || unresolved || pending) return
+    setTouched(true)
     const next = structuredClone(draft)
     mutate(next)
     setDraft(next)
@@ -529,13 +564,14 @@ function JudgeCalibrationPanel({
   }
 
   const check = () => {
-    if (!draft || pending) return
+    if (!draft || pending || unresolved) return
     try {
       validateJudgeCalibrationDraft(draft)
     } catch (validationError) {
       setError(validationError instanceof Error ? validationError.message : "Invalid calibration.")
       return
     }
+    setTouched(true)
     const current = identity
     void runAction("preview", async (signal) => {
       const result = await previewEvalJudgeCalibration({ draft }, signal)
@@ -549,16 +585,32 @@ function JudgeCalibrationPanel({
 
   const run = () => {
     if (!previewCurrent || !preview?.ready || !runId || pending) return
+    setUnresolved(true)
     void runAction("run", async (signal) => {
-      const result = await runEvalJudgeCalibration(
-        {
-          run_id: runId,
-          definition: preview.definition,
-          expected_definition_revision: preview.definition.revision,
-        },
-        signal,
-      )
-      if (!signal.aborted) setReport(result.report)
+      let result: Awaited<ReturnType<typeof runEvalJudgeCalibration>>
+      try {
+        result = await runEvalJudgeCalibration(
+          {
+            run_id: runId,
+            definition: preview.definition,
+            expected_definition_revision: preview.definition.revision,
+          },
+          signal,
+        )
+      } catch (error) {
+        if (
+          !signal.aborted &&
+          error instanceof ApiClientError &&
+          evalLaunchFailureIsDefinitive(error.status)
+        )
+          setUnresolved(false)
+        throw error
+      }
+      if (!signal.aborted) {
+        setReport(result.report)
+        setUnresolved(false)
+        setTouched(false)
+      }
     })
   }
 
@@ -582,65 +634,65 @@ function JudgeCalibrationPanel({
           Compare repeated judge scores with your labels. This never runs the candidate agent.
         </div>
       </div>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="Calibration ID" id={`${assertion.id}-calibration-id`}>
+      <div className="grid gap-3 @min-[28rem]/judge:grid-cols-2">
+        <Field label="Calibration ID" id={`${fieldPrefix}-calibration-id`}>
           <Input
-            id={`${assertion.id}-calibration-id`}
+            id={`${fieldPrefix}-calibration-id`}
             value={draft.id}
-            disabled={disabled || pending !== null}
+            disabled={disabled || pending !== null || unresolved}
             onChange={(event) => edit((next) => (next.id = event.target.value))}
           />
         </Field>
-        <Field label="Repeated judge calls" id={`${assertion.id}-calibration-trials`}>
+        <Field label="Repeated judge calls" id={`${fieldPrefix}-calibration-trials`}>
           <Input
-            id={`${assertion.id}-calibration-trials`}
+            id={`${fieldPrefix}-calibration-trials`}
             type="number"
             min={1}
             max={10}
             value={draft.trials ?? 1}
-            disabled={disabled || pending !== null}
+            disabled={disabled || pending !== null || unresolved}
             onChange={(event) => edit((next) => (next.trials = Number(event.target.value)))}
           />
         </Field>
-        <Field label="Evidence source ID" id={`${assertion.id}-calibration-source`} wide>
+        <Field label="Evidence source ID" id={`${fieldPrefix}-calibration-source`} wide>
           <Input
-            id={`${assertion.id}-calibration-source`}
+            id={`${fieldPrefix}-calibration-source`}
             aria-label="Evidence source ID"
-            aria-describedby={`${assertion.id}-calibration-source-help`}
+            aria-describedby={`${fieldPrefix}-calibration-source-help`}
             value={draft.evidence_source_id}
-            disabled={disabled || pending !== null}
+            disabled={disabled || pending !== null || unresolved}
             onChange={(event) => edit((next) => (next.evidence_source_id = event.target.value))}
           />
           <div
-            id={`${assertion.id}-calibration-source-help`}
+            id={`${fieldPrefix}-calibration-source-help`}
             className="mt-1 text-xs text-muted-foreground"
           >
             An operator-declared link to where this fixed evidence came from; Cayu does not infer or
             verify the source.
           </div>
         </Field>
-        <Field label="Fixed task" id={`${assertion.id}-calibration-task`} wide>
+        <Field label="Fixed task" id={`${fieldPrefix}-calibration-task`} wide>
           <Textarea
-            id={`${assertion.id}-calibration-task`}
+            id={`${fieldPrefix}-calibration-task`}
             aria-label="Fixed task"
             rows={3}
             value={draft.task}
-            disabled={disabled || pending !== null}
+            disabled={disabled || pending !== null || unresolved}
             onChange={(event) => edit((next) => (next.task = event.target.value))}
           />
         </Field>
-        <Field label="Known candidate output" id={`${assertion.id}-calibration-output`} wide>
+        <Field label="Known candidate output" id={`${fieldPrefix}-calibration-output`} wide>
           <Textarea
-            id={`${assertion.id}-calibration-output`}
+            id={`${fieldPrefix}-calibration-output`}
             aria-label="Known candidate output"
-            aria-describedby={`${assertion.id}-calibration-output-help`}
+            aria-describedby={`${fieldPrefix}-calibration-output-help`}
             rows={4}
             value={draft.final_output}
-            disabled={disabled || pending !== null}
+            disabled={disabled || pending !== null || unresolved}
             onChange={(event) => edit((next) => (next.final_output = event.target.value))}
           />
           <div
-            id={`${assertion.id}-calibration-output-help`}
+            id={`${fieldPrefix}-calibration-output-help`}
             className="mt-1 text-xs text-muted-foreground"
           >
             Untrusted candidate evidence only. It is delimited from evaluator instructions and
@@ -648,13 +700,13 @@ function JudgeCalibrationPanel({
           </div>
         </Field>
         {assertion.evidence?.include_transcript && (
-          <Field label="Fixed transcript" id={`${assertion.id}-calibration-transcript`} wide>
+          <Field label="Fixed transcript" id={`${fieldPrefix}-calibration-transcript`} wide>
             <Textarea
-              id={`${assertion.id}-calibration-transcript`}
+              id={`${fieldPrefix}-calibration-transcript`}
               aria-label="Fixed transcript"
               rows={4}
               value={draft.transcript ?? ""}
-              disabled={disabled || pending !== null}
+              disabled={disabled || pending !== null || unresolved}
               onChange={(event) => edit((next) => (next.transcript = event.target.value || null))}
             />
           </Field>
@@ -665,18 +717,18 @@ function JudgeCalibrationPanel({
         {draft.human_criteria.map((label, index) => (
           <label
             key={label.criterion_id}
-            htmlFor={`${assertion.id}-human-${label.criterion_id}`}
-            className="grid items-center gap-2 text-xs sm:grid-cols-[minmax(8rem,1fr)_8rem]"
+            htmlFor={`${fieldPrefix}-human-${label.criterion_id}`}
+            className="grid min-w-0 items-center gap-2 text-xs @min-[28rem]/judge:grid-cols-[minmax(8rem,1fr)_8rem]"
           >
-            <span>
+            <span className="min-w-0 break-words">
               {assertion.rubric.criteria[index]?.name ?? label.criterion_id} ({label.criterion_id})
             </span>
             <Input
-              id={`${assertion.id}-human-${label.criterion_id}`}
+              id={`${fieldPrefix}-human-${label.criterion_id}`}
               aria-label={`Human score for ${label.criterion_id}`}
               inputMode="decimal"
               value={label.score}
-              disabled={disabled || pending !== null}
+              disabled={disabled || pending !== null || unresolved}
               onChange={(event) =>
                 edit((next) => {
                   const current = next.human_criteria[index]
@@ -687,12 +739,39 @@ function JudgeCalibrationPanel({
           </label>
         ))}
       </div>
+      {unresolved && (
+        <p role="status" className="text-xs">
+          The calibration outcome is unconfirmed. Retry this exact run before editing or leaving.
+        </p>
+      )}
+      {touched && (
+        <p className="text-xs text-muted-foreground">
+          Finish or discard this calibration before editing the suite or changing cases.
+        </p>
+      )}
       <div className="flex flex-wrap gap-2">
         <Button
           type="button"
           size="sm"
+          variant="ghost"
+          disabled={disabled || pending !== null || unresolved}
+          onClick={() => {
+            setDraft(newJudgeCalibrationDraft(targetKey, assertion, defaultTask))
+            setTouched(false)
+            setPreview(null)
+            setPreviewIdentity(null)
+            setReport(null)
+            setRunId("")
+            setError(null)
+          }}
+        >
+          Discard calibration
+        </Button>
+        <Button
+          type="button"
+          size="sm"
           variant="outline"
-          disabled={disabled || pending !== null}
+          disabled={disabled || pending !== null || unresolved}
           onClick={check}
         >
           <CheckCircle2 /> {pending === "preview" ? "Checking..." : "Check calibration"}

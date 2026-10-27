@@ -547,8 +547,10 @@ async def main() -> None:
         ToolEffect.NONE,
         "dashboard contract tool must remain mutation-free",
     )
+    from dashboard_eval_authoring import exercise_eval_authoring
     from dashboard_eval_boundaries import exercise_eval_boundaries
 
+    await asyncio.create_task(exercise_eval_authoring())
     await exercise_eval_boundaries()
     app, provider, store, task_store, runtime_directory = await _seed_app()
     price_book = _dashboard_price_book()
@@ -2362,6 +2364,19 @@ async def _exercise_eval_design_states(page: Page, base_url: str) -> None:
     require_equal(failures, [], "final Evals prototype presentation")
 
 
+async def _open_authored_case_details(editor) -> None:
+    details = editor.get_by_text("Case details", exact=True).locator("..")
+    if await details.get_attribute("open") is None:
+        await details.locator("summary").first.click()
+
+
+async def _open_authored_checks(editor) -> None:
+    await editor.get_by_role("tab", name=re.compile(r"^Checks ")).click()
+    for row in await editor.get_by_test_id("authored-check").all():
+        if await row.get_attribute("open") is None:
+            await row.locator("summary").first.click()
+
+
 async def _exercise_captured_evaluation(
     page: Page,
     base_url: str,
@@ -2587,8 +2602,10 @@ async def _exercise_captured_evaluation(
 
     await page.goto(f"{base_url}/cayu/evals", wait_until="networkidle")
     await page.get_by_test_id("new-evaluation").click()
-    authoring = page.get_by_test_id("eval-suite-authoring-sheet")
+    authoring = page.get_by_test_id("eval-suite-editor")
     await expect(authoring).to_be_visible()
+    await authoring.get_by_text("Suite details", exact=True).click()
+    await _open_authored_case_details(authoring)
     await authoring.get_by_test_id("authored-suite-id").fill("authored-dashboard-regressions")
     await authoring.get_by_test_id("authored-suite-name").fill("Authored dashboard regressions")
     await authoring.get_by_test_id("authored-case-id").fill("authored-primary")
@@ -2598,13 +2615,17 @@ async def _exercise_captured_evaluation(
         name="Case input message 1",
         exact=True,
     ).fill("Exercise one fresh Control Plane-authored evaluation.")
-    await authoring.get_by_role("button", name="Add same-model AI judge", exact=True).click()
+    await _open_authored_checks(authoring)
+    await authoring.get_by_label("Check type", exact=True).select_option("structured_model_judge")
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await _open_authored_checks(authoring)
     await expect(authoring.get_by_test_id("judge-profile-summary")).to_contain_text(
         re.compile(r"same model as candidate", re.IGNORECASE)
     )
     memory_authoring = authoring.get_by_test_id("eval-memory-authoring")
     await memory_authoring.get_by_role("button", name="Require memory exposure", exact=True).click()
-    memory_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await _open_authored_checks(authoring)
+    memory_assertion = authoring.get_by_test_id("authored-check").last
     await memory_assertion.get_by_label("Minimum admitted items", exact=True).fill("0")
     await memory_assertion.get_by_label("Maximum admitted items", exact=True).fill("0")
     await memory_assertion.get_by_label("Minimum provider exposures", exact=True).fill("0")
@@ -2612,6 +2633,7 @@ async def _exercise_captured_evaluation(
     await memory_authoring.get_by_role(
         "button", name="Add reference-backed judge", exact=True
     ).click()
+    await _open_authored_checks(authoring)
     memory_judge = authoring.get_by_test_id("structured-judge-editor").last
     await expect(memory_judge.get_by_label("Criterion 1 ID", exact=True)).to_have_value(
         "reference-correctness"
@@ -2627,33 +2649,38 @@ async def _exercise_captured_evaluation(
         )
     ).to_have_count(0)
     await memory_judge.get_by_role("button", name="Remove AI judge", exact=True).click()
-    assertion_kind = authoring.get_by_label("Assertion quick-add type", exact=True)
+    assertion_kind = authoring.get_by_label("Check type", exact=True)
+    await _open_authored_checks(authoring)
     await assertion_kind.select_option("tool_arguments_contain")
-    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
-    argument_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await _open_authored_checks(authoring)
+    argument_assertion = authoring.get_by_test_id("authored-check").last
     await argument_assertion.get_by_label("Tool name", exact=True).fill("dashboard_eval_search")
     await argument_assertion.get_by_label(
         "Expected argument JSON subset",
         exact=True,
     ).fill('{"query":"cayu"}')
     await assertion_kind.select_option("tool_result_contains")
-    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
-    result_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await _open_authored_checks(authoring)
+    result_assertion = authoring.get_by_test_id("authored-check").last
     await result_assertion.get_by_label("Tool name", exact=True).fill("dashboard_eval_search")
     await result_assertion.get_by_label(
         "Expected result JSON subset",
         exact=True,
     ).fill('{"structured":{"status":"ok"}}')
     await assertion_kind.select_option("process_event")
-    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
-    process_count_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await _open_authored_checks(authoring)
+    process_count_assertion = authoring.get_by_test_id("authored-check").last
     await process_count_assertion.get_by_label("Process event", exact=True).select_option(
         "tool_call_started"
     )
     await process_count_assertion.get_by_label("Maximum count", exact=True).fill("1")
     await assertion_kind.select_option("process_events_in_order")
-    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
-    process_order_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await _open_authored_checks(authoring)
+    process_order_assertion = authoring.get_by_test_id("authored-check").last
     await process_order_assertion.get_by_label(
         "Expected process event 1",
         exact=True,
@@ -2673,15 +2700,17 @@ async def _exercise_captured_evaluation(
         exact=True,
     ).select_option("session_completed")
     await assertion_kind.select_option("workspace_file")
-    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
-    workspace_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await _open_authored_checks(authoring)
+    workspace_assertion = authoring.get_by_test_id("authored-check").last
     await workspace_assertion.get_by_label("Relative workspace path", exact=True).fill(
         "dashboard-eval-output.json"
     )
     await workspace_assertion.get_by_label("Minimum bytes", exact=True).fill("1")
     await assertion_kind.select_option("artifact")
-    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
-    artifact_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await _open_authored_checks(authoring)
+    artifact_assertion = authoring.get_by_test_id("authored-check").last
     await artifact_assertion.get_by_label("Filename (optional)", exact=True).fill(
         "dashboard-eval-report.json"
     )
@@ -2695,27 +2724,29 @@ async def _exercise_captured_evaluation(
     case_list = authoring.get_by_test_id("authored-suite-cases")
     case_id_input = authoring.get_by_test_id("authored-case-id")
     case_name_input = authoring.get_by_test_id("authored-case-name")
-    primary_assertion_count = await authoring.get_by_test_id("promotion-assertion").count()
+    primary_assertion_count = await authoring.get_by_test_id("authored-check").count()
     await authoring.get_by_role("button", name="Duplicate", exact=True).click()
+    await _open_authored_case_details(authoring)
+    await _open_authored_checks(authoring)
     await expect(case_id_input).to_have_value("authored-primary-copy")
     await expect(case_name_input).to_have_value("Authored primary behavior copy")
-    await expect(authoring.get_by_test_id("promotion-assertion")).to_have_count(
-        primary_assertion_count
-    )
-    await authoring.get_by_label("Remove case authored-primary-copy", exact=True).click()
+    await expect(authoring.get_by_test_id("authored-check")).to_have_count(primary_assertion_count)
+    await authoring.get_by_label("Remove case Authored primary behavior copy", exact=True).click()
     await expect(case_list.locator('input[type="checkbox"]:checked')).to_have_count(1)
     await authoring.get_by_role("button", name="Add case", exact=True).click()
+    await _open_authored_case_details(authoring)
     await case_id_input.fill("authored-primary")
     await expect(case_name_input).to_have_value("Case 2")
     await expect(case_list.locator('input[type="checkbox"]:checked')).to_have_count(2)
     await case_id_input.fill("authored-scenario")
     await case_list.get_by_role("button").filter(has_text="Authored primary behavior").click()
+    await _open_authored_case_details(authoring)
     await expect(case_id_input).to_have_value("authored-primary")
     await case_list.get_by_role("button").filter(has_text="Case 2").click()
+    await _open_authored_case_details(authoring)
     await expect(case_id_input).to_have_value("authored-scenario")
     await authoring.get_by_role("button", name="Multi-stage scenario", exact=True).click()
     await expect(authoring.get_by_test_id("authored-suite-scenario-lock")).to_be_visible()
-    await expect(authoring.get_by_role("button", name="New", exact=True)).to_be_disabled()
     await expect(authoring.get_by_role("button", name="Add case", exact=True)).to_be_disabled()
     await expect(authoring.get_by_test_id("authored-case-id")).to_be_disabled()
     await authoring.get_by_role("button", name="Discard scenario edits", exact=True).click()
@@ -2741,9 +2772,11 @@ async def _exercise_captured_evaluation(
     await expect(
         authoring.get_by_text(re.compile(r"Saved scenario .+ for authored-scenario\."))
     ).to_be_visible()
+    await _open_authored_checks(authoring)
     await assertion_kind.select_option("tool_arguments_contain")
-    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
-    scenario_argument_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await _open_authored_checks(authoring)
+    scenario_argument_assertion = authoring.get_by_test_id("authored-check").last
     await scenario_argument_assertion.get_by_label("Tool name", exact=True).fill(
         "dashboard_contract_tool"
     )
@@ -2752,8 +2785,9 @@ async def _exercise_captured_evaluation(
         exact=True,
     ).fill('{"operation":"verify-scenario"}')
     await assertion_kind.select_option("tool_result_contains")
-    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
-    scenario_result_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await _open_authored_checks(authoring)
+    scenario_result_assertion = authoring.get_by_test_id("authored-check").last
     await scenario_result_assertion.get_by_label("Tool name", exact=True).fill(
         "dashboard_contract_tool"
     )
@@ -2761,11 +2795,12 @@ async def _exercise_captured_evaluation(
         "Expected result JSON subset",
         exact=True,
     ).fill('{"structured":{"agent":"dashboard-contract-agent"}}')
-    await authoring.get_by_label("Maximum cost per trial", exact=True).fill("0.1")
     await authoring.get_by_label("Select Case 2 for launch", exact=True).uncheck()
     await authoring.get_by_test_id("authored-suite-preview").click()
     await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
     await case_list.get_by_role("button").filter(has_text="Authored primary behavior").click()
+    await _open_authored_case_details(authoring)
+    await _open_authored_checks(authoring)
     calibration = authoring.get_by_test_id("judge-calibration")
     await expect(calibration).to_be_visible()
     await calibration.get_by_label("Evidence source ID", exact=True).fill(
@@ -2817,8 +2852,11 @@ async def _exercise_captured_evaluation(
         runs_before_calibration,
         "fixed-evidence calibration must not admit a candidate eval run",
     )
+    await expect(authoring.get_by_test_id("authored-suite-save")).to_be_enabled()
     await known_output.fill("edited evidence invalidates the completed report")
     await expect(calibration.get_by_text(re.compile(r"Calibration complete"))).to_have_count(0)
+    await expect(authoring.get_by_test_id("authored-suite-save")).to_be_disabled()
+    await calibration.get_by_role("button", name="Discard calibration", exact=True).click()
     suite_save_started = asyncio.Event()
     release_suite_save = asyncio.Event()
 
@@ -2833,10 +2871,15 @@ async def _exercise_captured_evaluation(
     authored_suite_path = "**/api/evals/suites"
     await page.route(authored_suite_path, delay_authored_suite_save)
     try:
+        save_response = asyncio.create_task(
+            page.wait_for_event(
+                "response",
+                predicate=lambda r: r.url.endswith("/evals/suites") and r.request.method == "POST",
+            )
+        )
         await authoring.get_by_test_id("authored-suite-save").click()
         await asyncio.wait_for(suite_save_started.wait(), timeout=5)
         try:
-            await expect(authoring.get_by_role("button", name="New", exact=True)).to_be_disabled()
             await expect(
                 authoring.get_by_role("button", name="Add case", exact=True)
             ).to_be_disabled()
@@ -2851,9 +2894,12 @@ async def _exercise_captured_evaluation(
         await expect(
             authoring.get_by_text(re.compile(r"Saved immutable suite .+\."))
         ).to_be_visible()
+        authored_document = (await (await save_response).json())["suite"]
     finally:
         release_suite_save.set()
         await page.unroute(authored_suite_path, delay_authored_suite_save)
+    await authoring.get_by_role("button", name="Run saved revision", exact=True).click()
+    await authoring.get_by_label("Maximum cost per trial", exact=True).fill("0.1")
     await authoring.get_by_test_id("authored-suite-run-preview").click()
     await expect(authoring.get_by_text("1 durable run ready", exact=True)).to_be_visible()
     await expect(authoring.get_by_test_id("authored-suite-exposure")).to_contain_text("0.1 USD")
@@ -3088,14 +3134,22 @@ async def _exercise_captured_evaluation(
         "HTML must render readable structured evidence without raw judge payload fields",
     )
 
-    await page.goto(f"{base_url}/cayu/evals", wait_until="networkidle")
-    await page.get_by_test_id("new-evaluation").click()
-    authoring = page.get_by_test_id("eval-suite-authoring-sheet")
-    await authoring.get_by_role(
-        "button",
-        name=re.compile(r"^Authored dashboard regressions\b"),
-    ).click()
-    await expect(authoring.get_by_text(re.compile(r"Loaded immutable suite .+\."))).to_be_visible()
+    authored_selector = _eval_view_selector(
+        "suite",
+        {
+            "source": "authored",
+            "target_key": authored_document["target_key"],
+            "revision": authored_document["revision"],
+            "suite_id": None,
+        },
+    )
+    await page.goto(
+        f"{base_url}/cayu/evals/suites/{authored_selector}/edit?run=true", wait_until="networkidle"
+    )
+    authoring = page.get_by_test_id("eval-suite-editor")
+    await expect(authoring.get_by_test_id("authored-suite-name")).to_have_value(
+        "Authored dashboard regressions"
+    )
     await authoring.get_by_test_id("authored-suite-preview").click()
     await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
     await authoring.get_by_test_id("authored-suite-run-preview").click()
@@ -3106,6 +3160,7 @@ async def _exercise_captured_evaluation(
         .filter(has_text="Case 2")
     )
     await scenario_case_button.click()
+    await _open_authored_case_details(authoring)
     revised_scenario = authoring.get_by_test_id("scenario-authoring")
     scenario_preview_started = asyncio.Event()
     release_scenario_preview = asyncio.Event()
@@ -3144,7 +3199,6 @@ async def _exercise_captured_evaluation(
         "Exercise revised Control Plane-authored multi-stage behavior."
     )
     await expect(authoring.get_by_test_id("authored-suite-scenario-lock")).to_be_visible()
-    await expect(authoring.get_by_role("button", name="New", exact=True)).to_be_disabled()
     await expect(authoring.get_by_role("button", name="Add case", exact=True)).to_be_disabled()
     await expect(scenario_case_button).to_be_disabled()
     await expect(authoring.get_by_test_id("authored-case-id")).to_be_disabled()
@@ -3182,12 +3236,10 @@ async def _exercise_captured_evaluation(
         await revised_scenario.get_by_role("button", name="Save scenario", exact=True).click()
         await asyncio.wait_for(scenario_save_started.wait(), timeout=5)
         try:
-            await expect(authoring.get_by_role("button", name="New", exact=True)).to_be_disabled()
             await expect(
                 authoring.get_by_role("button", name="Add case", exact=True)
             ).to_be_disabled()
             await expect(scenario_case_button).to_be_disabled()
-            await expect(authoring.get_by_test_id("authored-suite-name")).to_be_disabled()
             await expect(authoring.get_by_test_id("authored-case-id")).to_be_disabled()
         finally:
             release_scenario_save.set()
@@ -3215,7 +3267,8 @@ async def _exercise_captured_evaluation(
     await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
     await expect(authoring.get_by_test_id("authored-suite-run-preview")).to_be_disabled()
     await expect(authoring.get_by_test_id("authored-suite-launch")).to_be_disabled()
-    await page.keyboard.press("Escape")
+    await page.get_by_role("link", name="Eval settings", exact=True).click()
+    await page.get_by_role("button", name="Leave editor", exact=True).click()
     provider.block_next_promotion_run = True
 
     await page.goto(f"{base_url}/cayu/evals/settings", wait_until="networkidle")

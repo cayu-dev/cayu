@@ -9,6 +9,7 @@ import type {
   EvalJudgeCalibrationDraftV1,
   EvalTargetCatalogEntry,
   JudgeProfileIdentityV1,
+  ModelJudgeAssertionSpec,
   StructuredModelJudgeAssertionDraftV1,
   StructuredModelJudgeAssertionSpec,
 } from "./generated/server-api"
@@ -98,6 +99,32 @@ export function newMemoryUseJudgeAssertion(
     },
     threshold: "0.8",
     evidence: { schema_version: 1, include_final_output: true, include_transcript: false },
+  }
+}
+
+export function validateModelJudgeAssertion(assertion: ModelJudgeAssertionSpec): void {
+  requirePortableId(assertion.id, "Judge assertion ID")
+  requireOptionalCleanText(assertion.description, "Judge assertion description", 2_048)
+  requirePortableId(assertion.evaluator_key, "Evaluator key")
+  const length = durableTextLength(assertion.rubric, "Judge rubric")
+  if (isPythonBlank(assertion.rubric) || length > 16_384) {
+    throw new Error("Judge rubric must contain 1 to 16,384 characters.")
+  }
+  requireBoundedCleanText(assertion.rubric_version, "Rubric version", 256)
+  const threshold = assertion.threshold === undefined ? 0.5 : assertion.threshold
+  if (
+    typeof threshold !== "number" ||
+    !Number.isFinite(threshold) ||
+    threshold < 0 ||
+    threshold > 1
+  ) {
+    throw new Error("Judge threshold must be a number from 0 to 1.")
+  }
+  if (
+    assertion.include_transcript !== undefined &&
+    typeof assertion.include_transcript !== "boolean"
+  ) {
+    throw new Error("Judge transcript selection must be true or false.")
   }
 }
 

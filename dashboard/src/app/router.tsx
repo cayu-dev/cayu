@@ -46,6 +46,10 @@ const EvalSuitePage = lazyRouteComponent(
   () => import("../next/routes/evals/suite-page"),
   "EvalSuiteViewPage",
 )
+const EvalSuiteEditorPage = lazyRouteComponent(
+  () => import("../next/routes/evals/editor-page"),
+  "EvalSuiteEditorPage",
+)
 const EvalRunPage = lazyRouteComponent(
   () => import("../next/routes/evals/run-page"),
   "EvalRunViewPage",
@@ -176,6 +180,31 @@ export function createDashboardRouter(history?: RouterHistory) {
         <EvalSuitePage />
       </CapabilityRoute>
     ),
+  })
+  const editorComponent = () => (
+    <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
+      <EvalSuiteEditorPage />
+    </CapabilityRoute>
+  )
+  const evalSuiteNewRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
+    getParentRoute: () => rootRoute,
+    path: "/evals/suites/new",
+    validateSearch: (s: Record<string, unknown>) => ({
+      target: typeof s.target === "string" ? s.target : undefined,
+    }),
+    component: editorComponent,
+  })
+  const evalSuiteEditRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
+    getParentRoute: () => rootRoute,
+    path: "/evals/suites/$suiteId/edit",
+    remountDeps: ({ params }) => params,
+    validateSearch: (s: Record<string, unknown>) => ({
+      case: typeof s.case === "string" ? s.case : undefined,
+      run: s.run === "true" || s.run === true ? true : undefined,
+    }),
+    component: editorComponent,
   })
   const evalRunRoute = createRoute({
     staticData: { dashboardLayout: "page" },
@@ -359,6 +388,8 @@ export function createDashboardRouter(history?: RouterHistory) {
     sessionsRoute,
     evalsRoute,
     evalSuiteRoute,
+    evalSuiteNewRoute,
+    evalSuiteEditRoute,
     evalRunRoute,
     evalSettingsRoute,
     usageRoute,

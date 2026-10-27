@@ -192,24 +192,29 @@ async def _exercise_eval_boundary(mode: str, selected: str) -> None:
                     )
                     await picker.select_option(a)
                     await page.get_by_test_id("new-evaluation").click()
-                    sheet = page.get_by_test_id("eval-suite-authoring-sheet")
+                    editor = page.get_by_test_id("eval-suite-editor")
+                    await expect(editor).to_be_visible()
+                    picker = page.get_by_label("Specialist", exact=True)
                     if path == "/evals" and selected in ("all", "layout"):
                         from dashboard_eval_editor_layout import exercise_editor_layout
 
-                        await exercise_editor_layout(page, sheet)
-                    await sheet.get_by_test_id("authored-suite-name").fill(
+                        await exercise_editor_layout(page, editor)
+                    await editor.get_by_test_id("authored-suite-name").fill(
                         "Retained specialist A draft"
                     )
-                    await expect(sheet.get_by_test_id("authored-suite-preview")).to_be_enabled()
-                    await page.keyboard.press("Escape")
-                    await expect(sheet).not_to_be_visible()
                     await picker.select_option(b)
-                    await page.get_by_test_id("new-evaluation").click()
-                    await sheet.get_by_test_id("authored-suite-id").fill(
+                    await page.get_by_role("button", name="Keep editing", exact=True).click()
+                    await expect(editor.get_by_test_id("authored-suite-name")).to_have_value(
+                        "Retained specialist A draft"
+                    )
+                    await picker.select_option(b)
+                    await page.get_by_role("button", name="Leave editor", exact=True).click()
+                    await editor.get_by_text("Suite details", exact=True).click()
+                    await editor.get_by_test_id("authored-suite-id").fill(
                         "boundary-" + path.rsplit("/", 1)[-1]
                     )
-                    await sheet.get_by_test_id("authored-suite-name").fill("Specialist B suite")
-                    await sheet.get_by_role(
+                    await editor.get_by_test_id("authored-suite-name").fill("Specialist B suite")
+                    await editor.get_by_role(
                         "textbox", name="Case input message 1", exact=True
                     ).fill("Promote this captured dashboard run.")
                     async with page.expect_response(
@@ -217,33 +222,36 @@ async def _exercise_eval_boundary(mode: str, selected: str) -> None:
                             r.url.endswith("/evals/suites/preview") and r.request.method == "POST"
                         )
                     ) as preview:
-                        await sheet.get_by_test_id("authored-suite-preview").click()
+                        await editor.get_by_test_id("authored-suite-preview").click()
                     document = (await (await preview.value).json())["suite"]
-                    assert document["target_key"] == b, (a, b, document["target_key"])
+                    assert document["target_key"] == b
                     async with page.expect_response(
                         lambda r: r.url.endswith("/evals/suites") and r.request.method == "POST"
                     ) as saved:
-                        await sheet.get_by_test_id("authored-suite-save").click()
+                        await editor.get_by_test_id("authored-suite-save").click()
                     saved_document = (await (await saved.value).json())["suite"]
                     assert saved_document["target_key"] == b
-                    await expect(sheet.get_by_test_id("authored-suite-preview")).to_be_enabled()
-                    await page.keyboard.press("Escape")
-                    await expect(sheet).not_to_be_visible()
+                    await expect(editor.get_by_test_id("authored-suite-preview")).to_be_enabled()
                     await picker.select_option(a)
-                    await page.get_by_test_id("new-evaluation").click()
-                    await expect(sheet.get_by_test_id("authored-suite-name")).to_have_value(
+                    await page.get_by_role("button", name="Leave editor", exact=True).click()
+                    await expect(editor.get_by_test_id("authored-suite-name")).to_have_value(
                         "Retained specialist A draft"
                     )
-                    await expect(sheet.get_by_test_id("authored-suite-preview")).to_be_enabled()
-                    await page.keyboard.press("Escape")
-                    await expect(sheet).not_to_be_visible()
                     await picker.select_option(b)
-                    await page.get_by_test_id("new-evaluation").click()
-                    await sheet.get_by_test_id("authored-suite-run-preview").click()
+                    await page.get_by_role("button", name="Leave editor", exact=True).click()
+                    await expect(editor.get_by_test_id("authored-suite-name")).to_have_value(
+                        "Specialist B suite"
+                    )
+                    await editor.get_by_role(
+                        "button", name="Run saved revision", exact=True
+                    ).click()
+                    await editor.get_by_test_id("authored-suite-run-preview").click()
                     await expect(
-                        sheet.get_by_text("1 durable run ready", exact=True)
+                        editor.get_by_text("1 durable run ready", exact=True)
                     ).to_be_visible()
-                    await sheet.get_by_test_id("authored-suite-launch").click()
+                    await editor.get_by_test_id("authored-suite-launch").click()
+                    # The other specialist still has a dirty draft; navigation is explicit.
+                    await page.get_by_role("button", name="Leave editor", exact=True).click()
                     await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"), timeout=20000)
                     run = await (
                         await page.request.get(
@@ -329,31 +337,22 @@ async def _exercise_reopen(page, base, saved_document, b):
     )
     await page.goto(f"{base}/cayu/evals/suites/{selector}", wait_until="networkidle")
     await _exercise_scroll_owner(page)
-    await page.get_by_test_id("new-evaluation").first.click()
-    sheet = page.get_by_test_id("eval-suite-authoring-sheet")
-    await expect(sheet.get_by_test_id("authored-suite-name")).to_have_value("Specialist B suite")
-    await sheet.get_by_test_id("authored-suite-name").fill("Preserved ordinary edit")
-    await expect(sheet.get_by_test_id("authored-suite-preview")).to_be_enabled()
-    await page.keyboard.press("Escape")
-    await expect(sheet).not_to_be_visible()
-    await page.get_by_test_id("new-evaluation").first.click()
-    await expect(sheet.get_by_test_id("authored-suite-name")).to_have_value(
+    await page.get_by_role("button", name="Edit suite", exact=True).click()
+    editor = page.get_by_test_id("eval-suite-editor")
+    await expect(editor.get_by_test_id("authored-suite-name")).to_have_value("Specialist B suite")
+    await editor.get_by_test_id("authored-suite-name").fill("Preserved ordinary edit")
+    await page.get_by_role("link", name="Back to suite", exact=True).click()
+    await page.get_by_role("button", name="Keep editing", exact=True).click()
+    await expect(editor.get_by_test_id("authored-suite-name")).to_have_value(
         "Preserved ordinary edit"
     )
-    await sheet.get_by_test_id("authored-suite-preview").click()
-    await expect(sheet.get_by_test_id("authored-suite-save")).to_be_enabled()
-    await sheet.get_by_test_id("authored-suite-save").click()
-    await expect(sheet.get_by_text(re.compile(r"Saved immutable suite .+\."))).to_be_visible()
-    await expect(sheet.get_by_test_id("authored-suite-preview")).to_be_enabled()
-    await page.keyboard.press("Escape")
-    await expect(sheet).not_to_be_visible()
-    await page.get_by_test_id("new-evaluation").first.click()
-    await expect(sheet.get_by_test_id("authored-suite-name")).to_have_value(
-        "Preserved ordinary edit"
-    )
-    await expect(sheet.get_by_test_id("authored-suite-run-preview")).to_be_enabled()
-    # A failed initial fetch is retryable until the user chooses to edit the draft.
-    await page.reload(wait_until="networkidle")
+    await editor.get_by_test_id("authored-suite-preview").click()
+    await expect(editor.get_by_test_id("authored-suite-save")).to_be_enabled()
+    await editor.get_by_test_id("authored-suite-save").click()
+    await expect(editor.get_by_text(re.compile(r"Saved immutable suite .+\."))).to_be_visible()
+    await editor.get_by_role("button", name="Run saved revision", exact=True).click()
+    await expect(editor.get_by_test_id("authored-suite-run-preview")).to_be_enabled()
+    # Retry a failed initial exact-document load; never enable a blank draft for it.
     initial_reads = []
 
     async def fail_initial_load(route):
@@ -368,19 +367,22 @@ async def _exercise_reopen(page, base, saved_document, b):
     pattern = "**/api/evals/suites/sha256*"
     await page.route(pattern, fail_initial_load)
     try:
-        await page.get_by_test_id("new-evaluation").first.click()
+        await page.reload(wait_until="networkidle")
         await expect(
-            sheet.get_by_text("Initial suite temporarily unavailable", exact=False)
+            editor.get_by_text("The suite could not be loaded.", exact=True)
         ).to_be_visible()
-        await sheet.get_by_test_id("authored-suite-name").fill("Draft after failed initial load")
-        await page.keyboard.press("Escape")
-        await expect(sheet).not_to_be_visible()
-        await page.get_by_test_id("new-evaluation").first.click()
-        await expect(sheet.get_by_test_id("authored-suite-name")).to_have_value(
-            "Draft after failed initial load"
+        await expect(editor.get_by_test_id("authored-suite-name")).to_be_disabled()
+        await editor.get_by_role("button", name="Retry loading suite", exact=True).click()
+        await expect(editor.get_by_test_id("authored-suite-name")).to_have_value(
+            "Specialist B suite"
         )
-        await page.wait_for_timeout(250)
-        assert len(initial_reads) == 1
+        assert len(initial_reads) == 2
+        await editor.get_by_test_id("authored-suite-name").fill("Draft after successful retry")
+        await page.get_by_role("link", name="Back to suite", exact=True).click()
+        await page.get_by_role("button", name="Keep editing", exact=True).click()
+        await expect(editor.get_by_test_id("authored-suite-name")).to_have_value(
+            "Draft after successful retry"
+        )
     finally:
         await page.unroute(pattern, fail_initial_load)
     print("EDITOR OWNERSHIP PASS", flush=True)

@@ -56,8 +56,10 @@ provider fails configuration instead of silently choosing another route.
 
 ## Author a rubric
 
-Open **Evals → New suite**, select the case, and choose **Add AI judge** or
-**Add same-model AI judge**.
+Open **Evals → New suite**, or **Edit suite** on a saved suite. Select the case,
+open **Checks**, choose **AI judge with weighted criteria**, and **Add check**.
+Expand the judge’s sentence to edit its fields. The trusted profile selector
+labels same-model judges explicitly.
 
 1. Give the assertion and rubric stable IDs.
 2. Define one to eight criteria. Each criterion needs a stable ID, a short name,
@@ -75,6 +77,10 @@ Write criteria that a reviewer could score consistently. Separate factual
 correctness, groundedness, and task completion rather than asking for one vague
 "quality" score. Do not place secrets, credentials, private customer data, or
 instructions for the candidate in a public reference.
+
+A target with an existing keyed evaluator can instead use **Configured evaluator with a rubric**. Set its evaluator key, rubric, version, threshold and transcript
+selection. This does not create a provider or evaluator: **Check suite** must
+confirm the server-owned configuration.
 
 ## Calibrate before gating
 

@@ -370,6 +370,20 @@ function validateAssertion(assertion: PromotionAssertion): void {
       if (durableTextLength(assertion.expected, "Expected final output") > 65_536) {
         throw new Error("Expected final output cannot exceed 65,536 characters.")
       }
+      if (
+        assertion.comparison !== undefined &&
+        assertion.comparison !== "text" &&
+        assertion.comparison !== "json"
+      ) {
+        throw new Error("Final output comparison must use text or JSON.")
+      }
+      if (assertion.comparison === "json") {
+        try {
+          JSON.parse(assertion.expected)
+        } catch {
+          throw new Error("Expected final output must be valid JSON for JSON comparison.")
+        }
+      }
       return
     case "final_output_contains":
       if (
@@ -495,7 +509,7 @@ function validateAssertion(assertion: PromotionAssertion): void {
 
 export function createPromotionAssertion(
   kind: PromotionAssertionKind,
-  existing: readonly PromotionAssertion[],
+  existing: readonly Pick<PromotionAssertion, "id">[],
 ): PromotionAssertion {
   const id = nextAssertionId(kind, existing)
   switch (kind) {
@@ -811,7 +825,7 @@ export function createCapturedEvaluationAssertionDraft(
 
 function nextAssertionId(
   kind: PromotionAssertionKind,
-  assertions: readonly PromotionAssertion[],
+  assertions: readonly Pick<PromotionAssertion, "id">[],
 ): string {
   const used = new Set(assertions.map((assertion) => assertion.id))
   if (!used.has(kind)) return kind

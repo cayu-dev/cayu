@@ -6,13 +6,7 @@ import { EvalSuiteAuthoringAction } from "@/components/dashboard/eval-suite-auth
 import { fetchEvalTargets } from "@/lib/api"
 import { EVAL_TARGET_QUERY_KEY } from "@/lib/evals-dashboard"
 import { fetchSuiteViews, resolveLegacyEvalSuite } from "../../api/eval-views"
-import {
-  nativeRunSelector,
-  runOrigin,
-  runViewPath,
-  suiteSelector,
-  suiteViewPath,
-} from "../../app/eval-view-model"
+import { runOrigin, runViewPath, suiteSelector, suiteViewPath } from "../../app/eval-view-model"
 import { NavLink, PageBody, ROW_CLASS, ROW_LINK_CLASS, TopBar, useGo, useRowClick } from "../common"
 import {
   DateText,
@@ -79,9 +73,6 @@ export function EvalsIndexPage() {
               <EvalSuiteAuthoringAction
                 targetKey={target}
                 disabled={readiness.catalog_write.state !== "ready"}
-                onLaunched={async (ids) => {
-                  if (ids[0]) await go(runViewPath(nativeRunSelector(ids[0])))
-                }}
               />
             )}
           </>

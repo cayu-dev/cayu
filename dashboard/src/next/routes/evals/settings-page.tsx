@@ -7,15 +7,13 @@ import { Button } from "@/components/ui/button"
 import { fetchEvalTargets, importEvalCorpus } from "@/lib/api"
 import { EVAL_TARGET_QUERY_KEY, preflightEvalCorpusFile } from "@/lib/evals-dashboard"
 import { EVALS_READINESS_OPERATIONS, evalsReadinessReasonText } from "@/lib/evals-readiness"
-import { nativeRunSelector, runViewPath } from "../../app/eval-view-model"
-import { NavLink, PageBody, TopBar, useGo } from "../common"
+import { NavLink, PageBody, TopBar } from "../common"
 import { FIELD_CLASS, LoadState, Section, useEvalAccess } from "./shared"
 import { EvalExecutionProfileSummary, ScenarioCatalog } from "./technical-details"
 
 export function EvalSettingsViewPage() {
   const { canWrite, canReadDetails, readiness } = useEvalAccess()
   const client = useQueryClient()
-  const go = useGo()
   const [targetKey, setTargetKey] = useState("")
   const input = useRef<HTMLInputElement>(null)
   const targets = useQuery({
@@ -203,9 +201,6 @@ export function EvalSettingsViewPage() {
                   targetKey={target.target_key}
                   disabled={readiness.catalog_write.state !== "ready"}
                   label="Suites, checks and judges"
-                  onLaunched={async (ids) => {
-                    if (ids[0]) await go(runViewPath(nativeRunSelector(ids[0])))
-                  }}
                 />
               )}
             </div>

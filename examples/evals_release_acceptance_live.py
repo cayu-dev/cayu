@@ -357,8 +357,10 @@ async def _require_declared_judge_profile(page: Page, base_url: str) -> None:
 
 async def _run_authored_judged_evaluation(page: Page, base_url: str) -> Path:
     await page.get_by_test_id("new-evaluation").click()
-    authoring = page.get_by_test_id("eval-suite-authoring-sheet")
+    authoring = page.get_by_test_id("eval-suite-editor")
     await expect(authoring).to_be_visible()
+    await authoring.get_by_text("Suite details", exact=True).click()
+    await authoring.get_by_text("Case details", exact=True).click()
     await authoring.get_by_test_id("authored-suite-id").fill("real-provider-quality")
     await authoring.get_by_test_id("authored-suite-name").fill("Real-provider quality")
     await authoring.get_by_test_id("authored-case-id").fill("exact-release-marker")
@@ -366,7 +368,10 @@ async def _run_authored_judged_evaluation(page: Page, base_url: str) -> Path:
     await authoring.get_by_role("textbox", name="Case input message 1", exact=True).fill(
         f"Reply with exactly {EXPECTED_MARKER} and no other text."
     )
-    await authoring.get_by_role("button", name="Add same-model AI judge", exact=True).click()
+    await authoring.get_by_role("tab", name="Checks (1)", exact=True).click()
+    await authoring.get_by_label("Check type", exact=True).select_option("structured_model_judge")
+    await authoring.get_by_role("button", name="Add check", exact=True).click()
+    await authoring.get_by_test_id("authored-check").last.locator("summary").first.click()
     judge = authoring.get_by_test_id("structured-judge-editor")
     await expect(judge).to_have_count(1)
     await expect(judge.get_by_test_id("judge-profile-summary")).to_contain_text(
@@ -378,28 +383,31 @@ async def _run_authored_judged_evaluation(page: Page, base_url: str) -> Path:
     expected_answer = judge.locator('textarea[id$="-expected-answer"]')
     await expect(expected_answer).to_have_count(1)
     await expected_answer.fill(EXPECTED_MARKER)
-    await authoring.get_by_label("Timeout per trial", exact=True).fill("120")
-    await authoring.get_by_label("Maximum cost per trial", exact=True).fill("0.1")
+    await authoring.get_by_text(re.compile(r"^Suite settings")).click()
+    await authoring.get_by_label("Timeout per trial (seconds)", exact=True).fill("120")
     await authoring.get_by_test_id("authored-suite-preview").click()
     await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible(
         timeout=20_000
     )
     await authoring.get_by_test_id("authored-suite-save").click()
     await expect(authoring.get_by_text(re.compile(r"Saved immutable suite .+\."))).to_be_visible()
+    await authoring.get_by_role("button", name="Run saved revision", exact=True).click()
+    await authoring.get_by_label("Maximum cost per trial", exact=True).fill("0.1")
     await authoring.get_by_test_id("authored-suite-run-preview").click()
     await expect(authoring.get_by_text("1 durable run ready", exact=True)).to_be_visible()
     await expect(authoring.get_by_test_id("authored-suite-exposure")).to_contain_text(
         "candidate cost not hard bounded"
     )
     await expect(authoring.get_by_test_id("authored-suite-exposure")).to_contain_text("0.1 USD")
-    await authoring.get_by_test_id("authored-suite-launch").click()
-    await expect(
-        authoring.get_by_text("Started 1 durable eval run for 1 selected case.", exact=True)
-    ).to_be_visible()
-    run_ids = parse_qs(urlsplit(page.url).query).get("run", [])
-    require_equal(len(run_ids), 1, "the judged launch must select one durable eval run")
-    run_id = run_ids[0]
-    await page.keyboard.press("Escape")
+    async with page.expect_response(
+        lambda response: response.url.endswith("/runs") and response.request.method == "POST"
+    ) as admission:
+        await authoring.get_by_test_id("authored-suite-launch").click()
+    launched = await (await admission.value).json()
+    require_equal(len(launched["runs"]), 1, "the judged launch must select one durable eval run")
+    run_id = launched["runs"][0]["run"]["spec"]["run_id"]
+    await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"))
+    await page.locator("summary", has_text=re.compile(r"^Details$")).first.click()
     status = page.get_by_test_id("eval-run-status-announcement")
     await expect(status).to_have_text("Eval run status: completed.", timeout=330_000)
     await expect(page.get_by_text("same model · explicitly allowed", exact=True)).to_be_visible()

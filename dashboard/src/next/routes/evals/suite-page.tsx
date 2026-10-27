@@ -135,10 +135,8 @@ export function EvalSuiteViewPage() {
                   targetKey={s.identity.target_key}
                   initialRevision={s.identity.revision}
                   label="Run suite"
+                  reviewRun
                   disabled={readiness.catalog_write.state !== "ready"}
-                  onLaunched={async (ids) => {
-                    if (alive.current && ids[0]) await go(runViewPath(nativeRunSelector(ids[0])))
-                  }}
                 />
               ) : (
                 <Button
@@ -264,6 +262,18 @@ export function EvalSuiteViewPage() {
                         Source session
                       </NavLink>
                     )}
+                    {canWrite &&
+                      s.source === "authored" &&
+                      readiness.catalog_write.state === "ready" && (
+                        <NavLink
+                          to={`/evals/suites/${encodeURIComponent(suiteId)}/edit`}
+                          search={{ case: c.id }}
+                          className="text-xs underline"
+                          aria-label={`Edit ${c.name}`}
+                        >
+                          Edit case
+                        </NavLink>
+                      )}
                     <CaseOutcome presentation={c.last ?? null} />
                   </div>
                 ))}
@@ -296,11 +306,8 @@ export function EvalSuiteViewPage() {
                   <EvalSuiteAuthoringAction
                     targetKey={s.identity.target_key}
                     initialRevision={s.source === "authored" ? s.identity.revision : undefined}
-                    label="Edit suites and scenarios"
+                    label={s.source === "authored" ? "Edit suite" : "New suite"}
                     disabled={readiness.catalog_write.state !== "ready"}
-                    onLaunched={async (ids) => {
-                      if (alive.current && ids[0]) await go(runViewPath(nativeRunSelector(ids[0])))
-                    }}
                   />
                 </div>
               </Section>

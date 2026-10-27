@@ -60,7 +60,7 @@ current dependency—not a request to fabricate it in the browser.
 ## Build a controlled multi-stage scenario
 
 Use **Production scenario** from a captured session, or choose **Multi-stage
-scenario** for a case in **New suite**.
+scenario** on a case’s **Input** tab in **New suite** or **Edit suite**.
 
 - The initial event creates one fresh session.
 - **Queue input** delivers ordered follow-up input on the next turn or when the

@@ -1,4 +1,4 @@
-"""Real panel geometry checks for the retained Evals suite editor."""
+"""Real panel geometry checks for the full-page Evals suite editor."""
 
 from playwright.async_api import expect
 
@@ -28,14 +28,14 @@ async def exercise_editor_layout(page, sheet) -> None:
             }""",
             panel,
         )
-        # The sheet animates its transform; inspect its settled geometry.
+        # Wait for responsive layout and browser geometry to settle.
         await page.wait_for_timeout(250)
         bounds = await sheet.bounding_box()
         assert bounds and bounds["width"] <= viewport, (viewport, panel, bounds)
         assert await sheet.evaluate("node => node.scrollWidth <= node.clientWidth + 1"), (
             viewport,
             panel,
-            "sheet content overflows horizontally",
+            "editor content overflows horizontally",
         )
         controls = sheet.locator("input, textarea, select, button")
         for control in await controls.all():

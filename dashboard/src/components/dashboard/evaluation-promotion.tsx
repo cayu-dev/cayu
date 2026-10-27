@@ -13,7 +13,7 @@ import {
   Trash2,
   XCircle,
 } from "lucide-react"
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import { ScenarioAuthoring } from "@/components/dashboard/scenario-authoring"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -1288,7 +1288,7 @@ function AssertionEditor({
           <Trash2 />
         </Button>
       </div>
-      <div className="mt-3">
+      <div className="@container/assertion mt-3">
         <AssertionFields
           assertion={assertion}
           update={update}
@@ -1310,7 +1310,7 @@ function AssertionEditor({
   )
 }
 
-function AssertionFields({
+export function AssertionFields({
   assertion,
   update,
   index,
@@ -1321,7 +1321,8 @@ function AssertionFields({
   index: number
   evidencePolicy?: EvaluationEvidencePolicySpec
 }) {
-  const id = (name: string) => `promotion-assertion-${index}-${name}`
+  const instance = useId()
+  const id = (name: string) => `${instance}-assertion-${index}-${name}`
   switch (assertion.kind) {
     case "root_status":
       return (
@@ -1335,7 +1336,7 @@ function AssertionFields({
       )
     case "child_status":
       return (
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 @min-[36rem]/assertion:grid-cols-3">
           <PromotionField label="Expected child status" id={id("expected")}>
             <ChildTerminalStatusSelect
               id={id("expected")}
@@ -1360,18 +1361,35 @@ function AssertionFields({
     case "final_output_equals":
     case "final_output_contains":
       return (
-        <PromotionField label="Expected output text" id={id("expected")}>
-          <Textarea
-            id={id("expected")}
-            className="min-h-20 font-mono"
-            value={assertion.expected}
-            onChange={(event) => update({ ...assertion, expected: event.target.value })}
-          />
-        </PromotionField>
+        <div className="space-y-3">
+          {assertion.kind === "final_output_equals" && (
+            <PromotionField label="Comparison" id={id("comparison")}>
+              <select
+                id={id("comparison")}
+                className={SELECT_CLASS}
+                value={assertion.comparison ?? "text"}
+                onChange={(event) =>
+                  update({ ...assertion, comparison: event.target.value as "text" | "json" })
+                }
+              >
+                <option value="text">Exact text</option>
+                <option value="json">JSON value</option>
+              </select>
+            </PromotionField>
+          )}
+          <PromotionField label="Expected output text" id={id("expected")}>
+            <Textarea
+              id={id("expected")}
+              className="min-h-20 font-mono"
+              value={assertion.expected}
+              onChange={(event) => update({ ...assertion, expected: event.target.value })}
+            />
+          </PromotionField>
+        </div>
       )
     case "tool_called":
       return (
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 @min-[36rem]/assertion:grid-cols-3">
           <PromotionField label="Tool name" id={id("tool-name")}>
             <Input
               id={id("tool-name")}
@@ -1397,7 +1415,7 @@ function AssertionFields({
     case "tool_result_contains":
       return (
         <div className="space-y-3">
-          <div className="grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-3 @min-[28rem]/assertion:grid-cols-2">
             <PromotionField label="Tool name" id={id("tool-name")}>
               <Input
                 id={id("tool-name")}
@@ -1501,7 +1519,7 @@ function AssertionFields({
     case "process_event":
       return (
         <div className="space-y-3">
-          <div className="grid gap-3 sm:grid-cols-3">
+          <div className="grid gap-3 @min-[36rem]/assertion:grid-cols-3">
             <PromotionField label="Process event" id={id("event")}>
               <ProcessEventSelect
                 id={id("event")}
@@ -1591,7 +1609,7 @@ function AssertionFields({
     case "workspace_file":
       return (
         <div className="space-y-3">
-          <div className="grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-3 @min-[28rem]/assertion:grid-cols-2">
             <PromotionField label="Relative workspace path" id={id("path")}>
               <Input
                 id={id("path")}
@@ -1619,7 +1637,7 @@ function AssertionFields({
           </div>
           {(assertion.present ?? true) && (
             <>
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-3 @min-[28rem]/assertion:grid-cols-2">
                 <NullableIntegerField
                   label="Minimum bytes"
                   id={id("minimum-bytes")}
@@ -1655,7 +1673,7 @@ function AssertionFields({
       const artifactTextLocked = !artifactTextEnabled && assertion.text_contains == null
       return (
         <div className="space-y-3">
-          <div className="grid gap-3 sm:grid-cols-3">
+          <div className="grid gap-3 @min-[36rem]/assertion:grid-cols-3">
             <PromotionField label="Artifact scope" id={id("scope")}>
               <select
                 id={id("scope")}
@@ -1691,7 +1709,7 @@ function AssertionFields({
               />
             </PromotionField>
           </div>
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="grid gap-3 @min-[28rem]/assertion:grid-cols-2 lg:grid-cols-4">
             <NullableIntegerField
               label="Minimum bytes"
               id={id("minimum-bytes")}
@@ -1752,7 +1770,7 @@ function AssertionFields({
     case "memory_attribution":
       return (
         <div className="space-y-3">
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="grid gap-3 @min-[28rem]/assertion:grid-cols-2 lg:grid-cols-4">
             <IntegerField
               label="Minimum admitted items"
               id={id("minimum-admitted-items")}
@@ -1823,7 +1841,7 @@ function AssertionFields({
       )
     case "max_estimated_cost":
       return (
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 @min-[28rem]/assertion:grid-cols-2">
           <PromotionField label="Maximum cost" id={id("maximum")}>
             <Input
               id={id("maximum")}

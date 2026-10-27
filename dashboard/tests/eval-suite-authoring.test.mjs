@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  authoredCheckSummary,
   authoredSuiteCostBudgetContract,
   authoredSuiteRunPreviewIdentity,
   blankEvalScenarioDraft,
@@ -205,5 +206,96 @@ test("suite validation enforces the server's 1,000-case ceiling", () => {
   assert.throws(
     () => duplicateEvalSuiteCase(draft.cases.slice(0, EVAL_SUITE_MAX_CASES), 0),
     /cannot contain more than 1000 cases/,
+  )
+})
+
+test("authored plain model judges retain their typed rubric and evaluator fields", () => {
+  const draft = newEvalSuiteDraft("assistant.default")
+  draft.cases[0].assertions = [
+    {
+      id: "quality",
+      kind: "model_judge",
+      evaluator_key: "answer-quality",
+      rubric: "Explain the answer with evidence.",
+      rubric_version: "v1",
+      threshold: 0.75,
+      include_transcript: true,
+    },
+  ]
+  assert.deepEqual(validateEvalSuiteDraft(draft), { ok: true, draft })
+  const document = authoredDocument()
+  document.cases[0].assertions = structuredClone(draft.cases[0].assertions)
+  assert.deepEqual(
+    evalSuiteDraftFromDocument(document).cases[0].assertions,
+    draft.cases[0].assertions,
+  )
+  for (const patch of [
+    { threshold: true },
+    { threshold: NaN },
+    { threshold: null },
+    { threshold: 1.1 },
+    { include_transcript: "true" },
+    { evaluator_key: "" },
+    { rubric: " " },
+    { rubric_version: "" },
+    { rubric: "x".repeat(16_385) },
+  ]) {
+    const invalid = structuredClone(draft)
+    Object.assign(invalid.cases[0].assertions[0], patch)
+    assert.equal(validateEvalSuiteDraft(invalid).ok, false, JSON.stringify(patch))
+  }
+})
+
+test("JSON equality validates its mode and expected JSON without coercing the draft", () => {
+  const draft = newEvalSuiteDraft("assistant.default")
+  draft.cases[0].assertions = [
+    {
+      id: "json",
+      kind: "final_output_equals",
+      comparison: "json",
+      expected: '{"ok": true, "count": 1}',
+    },
+  ]
+  assert.deepEqual(validateEvalSuiteDraft(draft), { ok: true, draft })
+  for (const patch of [{ expected: "{" }, { comparison: "future" }]) {
+    const invalid = structuredClone(draft)
+    Object.assign(invalid.cases[0].assertions[0], patch)
+    assert.equal(validateEvalSuiteDraft(invalid).ok, false)
+  }
+  draft.cases[0].assertions[0].comparison = "text"
+  draft.cases[0].assertions[0].expected = "{"
+  assert.equal(validateEvalSuiteDraft(draft).ok, true)
+})
+
+test("check sentences preserve zero limits, ordered calls and JSON comparison meaning", () => {
+  assert.equal(
+    authoredCheckSummary({
+      kind: "tool_called",
+      tool_name: "query_ledger",
+      min_count: 0,
+      max_count: 0,
+    }),
+    "Calls query_ledger 0 times",
+  )
+  assert.equal(
+    authoredCheckSummary({ kind: "tools_called_in_order", tool_names: ["read", "write", "read"] }),
+    "Calls read → write → read",
+  )
+  assert.equal(
+    authoredCheckSummary({ kind: "final_output_equals", expected: "true", comparison: "json" }),
+    "Final answer equals JSON true",
+  )
+  assert.equal(
+    authoredCheckSummary({ kind: "max_total_tokens", maximum: 0 }),
+    "Uses at most 0 tokens",
+  )
+  assert.equal(
+    authoredCheckSummary({
+      kind: "model_judge",
+      rubric: "Explains the variance",
+      evaluator_key: "quality",
+      rubric_version: "v1",
+    }),
+    "Judge: Explains the variance",
   )
 })
