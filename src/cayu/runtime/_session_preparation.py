@@ -141,6 +141,8 @@ class _PreparedInitialRun:
     budget_policy: BudgetPolicy | None
     session_identity: SessionIdentity
     policy_evidence: bytes | None
+    # The Cayu Cloud settings revision and values this session starts with.
+    managed_settings_evidence: dict[str, Any] | None = None
 
 
 def _session_identity(
@@ -214,6 +216,8 @@ class SessionPreparation:
         effective_retry_policy: Callable[[RetryPolicy | None], RetryPolicy],
         execution_profile_process_identity: str,
         policy_selection: Callable[[str], PolicySelection | None] | None = None,
+        managed_model: Callable[[str], tuple[bool, str | None]] | None = None,
+        managed_evidence: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
     ) -> None:
         self.session_store = session_store
         self.task_store = task_store
@@ -245,6 +249,8 @@ class SessionPreparation:
             execution_profile_process_identity, "execution_profile_process_identity"
         )
         self._policy_selection = policy_selection
+        self._managed_model = managed_model
+        self._managed_evidence = managed_evidence
 
     def resolve_new_run_environment(
         self,
@@ -265,6 +271,11 @@ class SessionPreparation:
             environment_name = agent_default
         return self._get_registered_environment(environment_name)
 
+    def manages_model(self, agent_name: str) -> bool:
+        """Whether Cayu Cloud's managed settings choose this agent's model."""
+
+        return self._managed_model is not None and self._managed_model(agent_name)[0]
+
     def _resolve_initial_model_target(
         self,
         request: RunRequest,
@@ -273,10 +284,17 @@ class SessionPreparation:
         select_current_policy: bool = True,
     ) -> tuple[runtime_records.RegisteredProvider, str, bytes | None]:
         prepared = runtime_prepared_session_authority(request)
+        managed, managed_model = (
+            (False, None)
+            if self._managed_model is None or not select_current_policy
+            else self._managed_model(request.agent_name)
+        )
         # A queued policy selection belongs to the admitted child, not the
         # worker's current default. Non-policy children still undergo ordinary
         # agent/profile compatibility checks and cannot adopt policy retroactively.
-        if prepared is not None and prepared.policy_evidence is not None:
+        # Likewise a child whose model Cayu Cloud manages keeps the model it was
+        # prepared with, so a later change in Cloud doesn't break its profile.
+        if prepared is not None and (prepared.policy_evidence is not None or managed):
             if request.target is not None and (
                 request.target.provider_name != prepared.provider_name
                 or request.target.model != prepared.model
@@ -304,7 +322,8 @@ class SessionPreparation:
                 selection.target.model,
                 selection.evidence,
             )
-        model = registered_agent.spec.model
+        # Then Cayu Cloud's value for new sessions, then the agent's own model.
+        model = registered_agent.spec.model if managed_model is None else managed_model
         if registered_agent.spec.provider_name is not None:
             return self._get_registered_provider(registered_agent.spec.provider_name), model, None
         return (
@@ -433,6 +452,8 @@ class SessionPreparation:
                 expected_execution_profile.model_dump(mode="json")
             )
 
+        # The caller's own fields: Cloud doesn't control what the request sets itself.
+        explicit_fields = frozenset(request.model_fields_set)
         request = session_request_boundary.prepare_run_request(
             request,
             redactor=self._secret_redactor,
@@ -833,4 +854,36 @@ class SessionPreparation:
             budget_policy=budget_policy,
             session_identity=session_identity,
             policy_evidence=policy_evidence,
+            managed_settings_evidence=(
+                None
+                if self._managed_evidence is None
+                else self._managed_evidence(
+                    registered_agent.spec.name,
+                    {
+                        # What this session actually runs with; only Cloud values that
+                        # match it are recorded (explicit fields, retained models and
+                        # queued children may differ from Cloud's latest values).
+                        # None marks a value the request set itself, which isn't Cloud's.
+                        "config.run.max_steps": (
+                            None if "max_steps" in explicit_fields else request.max_steps
+                        ),
+                        **{
+                            f"config.run.limits.{name}": (
+                                None if "limits" in explicit_fields else value
+                            )
+                            for name, value in request.limits.model_dump().items()
+                        },
+                        "config.run.retry_policy.max_attempts": (
+                            None
+                            if "retry_policy" in explicit_fields
+                            else self._effective_retry_policy(request.retry_policy).max_attempts
+                        ),
+                        f"agent.{registered_agent.spec.name}.model": (
+                            None
+                            if policy_evidence is not None or request.target is not None
+                            else model
+                        ),
+                    },
+                )
+            ),
         )

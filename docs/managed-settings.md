@@ -129,6 +129,66 @@ running, however the application was assembled. If Cloud refuses the schema with
 application on a laptop at deploy fails whenever its dependencies aren't
 installed there.
 
+## How the Agent applies Cloud's values
+
+`ManagedSettings` (in `cayu.managed_settings`) reads the Agent's effective
+values from Cloud and reports what the process applied. It is on only in Cloud:
+`CayuApp` creates it from `CAYU_CLOUD_API_URL`, `CAYU_CLOUD_APPLICATION_ID`,
+`CAYU_CLOUD_REGISTRY_TOKEN` and the Release id (`CAYU_RELEASE_ID` or
+`release_identity`), the same credential the agent registry uses. Without them
+the code's defaults apply and nothing polls. To supply your own channel, pass
+`CayuApp(managed_settings=ManagedSettings(channel))`.
+
+- When the application is built, it reads Cloud's values once (5-second
+  timeout). `restart` settings come from that read for the life of the process:
+  config fields and budget amounts in the `CayuApp` constructor, an agent's
+  thinking and provider options when it registers. An agent's `restart` model
+  is chosen, like a `next_session` one, when a session starts, from the value read
+  at build.
+- `create_server`, `mount_cayu` (so `cayu serve`) and `cayu worker` call
+  `await app.start_managed_settings(role="web" | "worker")`, which reads again
+  and then every 25 seconds. `app.aclose()` stops it. Custom hosts call the same
+  method; one-shot processes such as schedules use the read made at build.
+- `next_session` settings apply when a session starts. Config fields swap the
+  application's effective `CayuConfig` (`app.config`), so
+  `with_application_run_defaults` gives new runs the managed `max_steps`, limits
+  and retries, and their provenance becomes `"managed"`. An agent's `model` is
+  chosen in session preparation.
+- The order is: an explicit `RunRequest` value, then the value from Cloud, then
+  the code's default. An agent with a Gateway model-policy binding keeps the
+  policy's model.
+- Running sessions, and sessions that resume, keep the values they started
+  with: a session records its model, and a resume inherits the run controls the
+  session was admitted with, so its execution profile still matches. A new run
+  resolves its retry policy once, when its defaults are applied (a durable
+  subagent gets it when it is submitted, so a queued child keeps it). A queued durable
+  subagent keeps the model it was prepared with, and a participant session the
+  model and run controls it was created with, as long as the process that runs it
+  applied them.
+- `session.started` records `managed_settings`: the snapshot's `revision` and the
+  values from Cloud the session started with, leaving out any it doesn't use (an
+  explicit request field, or a model or run control it kept from earlier).
+- A value this process can't use is refused, and the code's default applies: it
+  doesn't fit its descriptor, `CayuConfig` rejects it, the agent's provider
+  refuses the model (`preflight_model_target`), or a `secret_ref` names an
+  environment variable that isn't set.
+- The application reads its own settings with
+  `app.managed_setting_value("app.search_key")`: Cloud's value when it is set and
+  usable, else the default. A `restart` setting returns the value read at build.
+
+When Cloud can't be reached, the last good snapshot stays in use. When it never
+got one, the code's defaults apply. When Cloud has no schema for the Release yet
+(409 `settings_schema_missing`), the defaults apply and the next poll tries
+again.
+
+After each read the controller reports to Cloud when what it applied changed,
+and at least every 5 minutes: `applied` with the snapshot's revision, `stale`
+once the snapshot is past `valid_until`, or `unreported` (revision `null`) when
+it never got one. Each declared setting is `adopted`, `default` (no value in
+Cloud), or `refused` with a reason. A `restart` setting whose value changed since
+the process started is refused with "takes effect when the service restarts"
+until Cloud's republish replaces the process. Reports never carry values.
+
 ## Contracts
 
 These are the documents of the `v1` contract between the Runtime and Cloud. All

@@ -119,6 +119,14 @@ storage migration.
   registration publishes it as `settings_schema`
   (`cayu.managed-settings-schema/v1`). `CayuConfigSource` gains `"managed"`. See
   `docs/managed-settings.md`.
+- In Cayu Cloud, the Agent reads its settings' values with its registry
+  credential: once when the app is built, for settings that apply at restart,
+  and every 25 seconds once the server or `cayu worker` starts
+  (`CayuApp.start_managed_settings`). New sessions use the values; running and
+  resumed sessions keep theirs, and `session.started` records them under
+  `managed_settings`. The Agent reports what it applied, keeps the last good
+  snapshot when Cloud can't be reached, and uses the code's defaults outside
+  Cloud.
 
 ### Fixes
 

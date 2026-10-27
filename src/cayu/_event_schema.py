@@ -61,6 +61,9 @@ _MODEL_POLICY_PATHS = frozenset(
 )
 
 
+_MANAGED_SETTINGS_PATHS = frozenset(("managed_settings", key) for key in ("revision", "values"))
+
+
 _RELEASE_PATHS = frozenset(
     (RELEASE_EVENT_PAYLOAD_KEY, field_name) for field_name in ReleaseIdentity.model_fields
 )
@@ -2560,13 +2563,19 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         owned_nested_paths=frozenset(failure_evidence_owned_paths),
     )
     policies[EventType.SESSION_STARTED] = _observed_policy(
-        "agent_name input_contract model_policy parent_session_id prompt_contribution_manifest run_epoch "
+        "agent_name input_contract managed_settings model_policy parent_session_id "
+        "prompt_contribution_manifest run_epoch "
         f"traceparent tracestate {RELEASE_EVENT_PAYLOAD_KEY}",
         owned_nested_paths=(
-            _PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS | _MODEL_POLICY_PATHS | _RELEASE_PATHS
+            _PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS
+            | _MODEL_POLICY_PATHS
+            | _MANAGED_SETTINGS_PATHS
+            | _RELEASE_PATHS
         ),
         authority_keys={"input_contract"},
         internal_authority_keys={"input_contract"},
+        # Setting keys and values from Cloud: ordinary redaction applies inside.
+        untrusted_container_paths={("managed_settings", "values")},
     )
     policies[EventType.SESSION_RESUMED] = _observed_policy(
         "agent_name appended_messages approval_id decision dispatch_id execution_profile_fingerprint expired input_contract input_id "

@@ -330,7 +330,7 @@ from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
 )
-from cayu.managed_settings import ManagedSetting
+from cayu.managed_settings import ManagedSetting, ManagedSettings
 from cayu.mcp.tools import (
     McpToolset,
     McpToolsetRefreshResult,
@@ -369,8 +369,7 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime._application_run_defaults import (
-    _RunConfigurationRequest,
-    with_application_run_defaults,
+    with_resolved_retry_policy,
 )
 from cayu.runtime._assistant_model_publication import AssistantModelPublication
 from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
@@ -984,6 +983,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
         model_policy: ModelPolicy | None = None,
         release_identity: ReleaseIdentity | None = None,
         owned_resources: Iterable[SupportsAsyncClose | SupportsAsyncAclose] = (),
+        managed_settings: ManagedSettings | None = None,
     ) -> None:
         if model_policy is not None and type(model_policy) is not ModelPolicy:
             raise TypeError("model_policy must be ModelPolicy.")
@@ -1679,6 +1679,8 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
             effective_retry_policy=self._effective_retry_policy,
             execution_profile_process_identity=self._execution_profile_process_identity,
             policy_selection=None if model_policy is None else model_policy.selection,
+            managed_model=self._managed_agent_model,
+            managed_evidence=self._managed_session_evidence,
         )
 
         self._session_tasks = SessionTaskLifecycle(
@@ -2079,6 +2081,8 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
             common_root_enabled=self.enable_common_root_budget_binding,
             append_peer=self.append_peer_content,
         )
+        # Reads Cloud's settings once now, for those that apply at restart.
+        self._bind_managed_settings(managed_settings)
         # Last: an application whose construction failed never holds the handoff.
         attention.bind_handoff(self, self.human_attention_handoff)
 
@@ -4555,7 +4559,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
         """Install a complete, validated app budget-policy replacement."""
 
         copied = copy_budget_policy(value)
-        self._budget_policy = copied
+        self._budget_policy = self._managed_budget(copied)
 
     def redact_json(self, value: Any) -> Any:
         """Return a JSON-compatible value with configured secret values redacted."""
@@ -5283,7 +5287,9 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
             await self.close_runtime_timing()
 
         async def model_policy(_budget: float) -> None:
-            # Policy workers call providers in the background; stop them first.
+            # Policy workers call providers in the background; stop them first. The
+            # managed-settings poller is the other Cloud worker; it holds no work.
+            await self.stop_managed_settings()
             await self.stop_model_policy()
 
         async def provider_reconciliations(budget: float) -> bool:
@@ -5932,7 +5938,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
         environment_name: str | NoEnvironment | None = None,
         settings: Iterable[ManagedSetting] | None = None,
     ) -> AgentSpec:
-        declared = self._agent_managed_settings(
+        spec, declared = self._agent_managed_settings(
             spec, settings, default_thinking=self._config.run.thinking
         )
         registered = self._agent_registry.register_agent(
@@ -6545,7 +6551,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
                     "owner": self._config_owners["run.retry_policy"],
                     "source": (
                         "explicit"
-                        if effective_request.retry_policy is not None
+                        if "retry_policy" in explicit_fields
                         else self._config_sources["run.retry_policy"]
                     ),
                 },
@@ -6793,13 +6799,6 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
 
         return copy_cayu_config(self._config)
 
-    def _with_application_run_defaults(
-        self, request: _RunConfigurationRequest, session: Session | None = None
-    ) -> _RunConfigurationRequest:
-        return with_application_run_defaults(
-            request, self._config, self._config_sources["run.max_steps"], session
-        )
-
     @_admitted_entrance
     @runtime_stream_entrance
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
@@ -6984,7 +6983,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
                     )
                 }
             )
-        request = self._with_application_run_defaults(request)
+        request = self._with_application_run_defaults(request, expected=expected_execution_profile)
         request = _validate_run_request(request)
         parent = (
             await self.session_store.load(request.parent_session_id)
@@ -8086,7 +8085,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
         self,
         request: RunRequest,
     ) -> DurableSubagentPreparedRun:
-        request = self._with_application_run_defaults(request)
+        request = self._with_application_run_defaults(request, seeded=True)
         preparation = self._session_preparation.prepare_initial_run(
             request, session_environment=True
         )
@@ -8125,6 +8124,9 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
         spawn_fingerprint: str,
         effective_arguments: dict[str, Any],
     ) -> DispatchHandle:
+        if self._managed_settings_controller is not None:
+            # Seed the child with today's retry policy: Cloud may change it before it runs.
+            request = with_resolved_retry_policy(request, self._config)
         return await self._durable_subagent_coordinator.submit(
             context=context,
             request=request,

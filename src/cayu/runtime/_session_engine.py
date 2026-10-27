@@ -1653,6 +1653,16 @@ class SessionEngine:
                     ),
                     evidence=evidence.encode(),
                 )
+            elif request.target is None and self._session_preparation.manages_model(
+                retained_session.agent_name
+            ):
+                # Created with Cayu Cloud's model for the agent: keep that model.
+                retained_policy_selection = PolicySelection(
+                    target=ModelTarget(
+                        provider_name=retained_session.provider_name, model=retained_session.model
+                    ),
+                    evidence=None,
+                )
         preparation = self._session_preparation.prepare_initial_run(
             request,
             expected_execution_profile=expected_execution_profile,
@@ -1686,6 +1696,7 @@ class SessionEngine:
         budget_policy = prepared.budget_policy
         session_identity = prepared.session_identity
         policy_evidence = prepared.policy_evidence
+        managed_settings_evidence = prepared.managed_settings_evidence
         # ``prepared`` also retains the registered provider, whose repr may contain
         # live credentials. Keep the deliberately scoped provider local below so
         # cancellation cleanup can drop it before a traceback escapes this frame.
@@ -2688,6 +2699,11 @@ class SessionEngine:
                         {}
                         if policy_evidence is None
                         else {"model_policy": decode_policy_evidence(policy_evidence)}
+                    ),
+                    **(
+                        {}
+                        if managed_settings_evidence is None
+                        else {"managed_settings": managed_settings_evidence}
                     ),
                     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: session_input_contract_evidence(
                         request,

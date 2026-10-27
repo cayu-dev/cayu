@@ -61,6 +61,7 @@ GATED_ENTRANCES = frozenset(
         "run_event_watchers",
         "service_clarification",
         "service_producer_disposition",
+        "start_managed_settings",
         "start_model_policy",
         "verify_completion_proposal",
     }
@@ -100,6 +101,7 @@ SHUTDOWN_PARTS = frozenset(
         "drain_event_watchers",
         "drain_verified_completions",
         "flush_runtime_timing",
+        "stop_managed_settings",
         "stop_model_policy",
     }
 )

@@ -256,6 +256,8 @@ async def _invoke_worker(
     signal_wait: asyncio.Task[bool] | None = None
     supervisor_watch = asyncio.create_task(watch_supervisor(request_stop))
     try:
+        # A no-op outside Cayu Cloud; close_project_app stops it.
+        await app.start_managed_settings(role="worker")
         result = target(app, stop)
         if not inspect.isawaitable(result):
             raise WorkerError(f"Worker {name!r} target must return an awaitable.")

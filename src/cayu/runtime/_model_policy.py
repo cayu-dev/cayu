@@ -43,7 +43,8 @@ class PolicyChannel(ABC):
 @dataclass(frozen=True)
 class PolicySelection:
     target: ModelTarget
-    evidence: bytes
+    # None retains a target Cayu Cloud's managed settings chose, without policy evidence.
+    evidence: bytes | None
 
 
 class ModelPolicyController:

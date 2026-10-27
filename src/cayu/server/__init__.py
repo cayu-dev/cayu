@@ -401,8 +401,9 @@ def create_server(
         event_watcher_task: asyncio.Task[None] | None = None
         storage_growth_task: asyncio.Task[None] | None = None
         try:
-            # aclose() owns stopping it, within the shutdown deadline.
+            # aclose() owns stopping them, within the shutdown deadline.
             await app.start_model_policy()
+            await app.start_managed_settings(role="web")
             if browser_recordings is not None:
                 browser_recordings.start()
             follow_up = await recover_startup_state()
@@ -1495,8 +1496,9 @@ def _compose_interruption_drain_lifespan(
             attention_repair_task: asyncio.Task[None] | None = None
             event_watcher_task: asyncio.Task[None] | None = None
             try:
-                # aclose() owns stopping it, within the shutdown deadline.
+                # aclose() owns stopping them, within the shutdown deadline.
                 await app.start_model_policy()
+                await app.start_managed_settings(role="web")
                 await _recover_persisted_event_side_effects_during_startup(
                     app,
                     timeout_s=side_effect_startup_timeout_s,
