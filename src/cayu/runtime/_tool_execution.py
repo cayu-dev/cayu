@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import traceback as traceback_module
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from cayu._exception_groups import exception_cause, exception_tree_contains
@@ -18,7 +20,11 @@ from cayu._validation import (
 )
 from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
 from cayu.environments.admission import ExecutionAdmissionError
-from cayu.failure_evidence import exception_evidence
+from cayu.failure_evidence import (
+    FAILURE_EVIDENCE_MESSAGE_MAX_CHARS,
+    FailureEvidence,
+    exception_evidence,
+)
 from cayu.resource_access import model_data_access
 from cayu.runners._adapter_identity import trusted_runner_adapter_name
 from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError, runner_error_text
@@ -29,6 +35,7 @@ from cayu.runtime._durable_subagents import (
     durable_subagent_unsettled_cancellation_outcome,
     is_durable_subagent_submission_unsettled,
 )
+from cayu.runtime._exception_detail import exception_detail, exception_detail_suffix
 from cayu.runtime._isolated_tool_process import (
     IsolatedToolCleanupUnproven,
     IsolatedToolDeadlineExceeded,
@@ -56,7 +63,11 @@ from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 if TYPE_CHECKING:
     from cayu.runtime._invocation_secrets import InvocationPublicationSnapshot
 
+logger = logging.getLogger(__name__)
+
 _OUTCOME_CONSTRUCTION_TOKEN = object()
+# A logged traceback is not durable, but a deep recursion must not flood logs.
+_LOGGED_TOOL_TRACEBACK_MAX_CHARS = 32 * 1024
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]
 
 
@@ -221,6 +232,9 @@ class ToolExecutionOutcome:
 
     result: ToolResult
     _terminal_payload: FrozenJsonDict
+    # Process-local: the exception the tool body raised, kept until the
+    # invocation's secret scope is final. Never serialized or compared.
+    _raised: BaseException | None = field(compare=False, repr=False)
 
     def __init__(
         self,
@@ -228,6 +242,7 @@ class ToolExecutionOutcome:
         terminal_payload: dict[str, Any],
         *,
         _token: object,
+        _raised: BaseException | None = None,
     ) -> None:
         if _token is not _OUTCOME_CONSTRUCTION_TOKEN:
             raise TypeError("ToolExecutionOutcome is runtime-owned.")
@@ -252,6 +267,7 @@ class ToolExecutionOutcome:
             raise AssertionError("Frozen terminal tool payload must be an object.")
         object.__setattr__(self, "result", validated_result)
         object.__setattr__(self, "_terminal_payload", frozen_payload)
+        object.__setattr__(self, "_raised", _raised)
 
     @property
     def allows_hook_modification(self) -> bool:
@@ -275,19 +291,155 @@ class ToolExecutionOutcome:
 def _execution_outcome(
     result: ToolResult,
     terminal_payload: dict[str, Any] | None = None,
-    *,
-    exception: BaseException | None = None,
 ) -> ToolExecutionOutcome:
-    controls = dict(terminal_payload or {})
-    if exception is not None:
-        # Only the caught invocation exception populates this diagnostic. The
-        # effect remains uncertain; exception type is never settlement evidence.
-        controls["failure_evidence"] = exception_evidence(exception).model_dump(mode="json")
     return ToolExecutionOutcome(
         result,
-        controls,
+        dict(terminal_payload or {}),
         _token=_OUTCOME_CONSTRUCTION_TOKEN,
     )
+
+
+def _exception_outcome(
+    result: ToolResult,
+    terminal_payload: dict[str, Any],
+    *,
+    exception: BaseException,
+) -> ToolExecutionOutcome:
+    """Return the failure outcome for an exception raised by the tool body.
+
+    Only the caught invocation exception populates ``failure_evidence``. The
+    effect remains uncertain; an exception is never settlement evidence. Its
+    message and traceback wait for the final secret scope: see
+    ``_finish_raised_outcome``.
+    """
+
+    return ToolExecutionOutcome(
+        result,
+        {
+            **terminal_payload,
+            "failure_evidence": exception_evidence(exception).model_dump(mode="json"),
+        },
+        _token=_OUTCOME_CONSTRUCTION_TOKEN,
+        _raised=exception,
+    )
+
+
+def _finish_raised_outcome(
+    outcome: ToolExecutionOutcome,
+    *,
+    tool: Tool,
+    ctx: ToolContext,
+    redactor: SecretRedactor,
+) -> ToolExecutionOutcome:
+    """Log the traceback and keep the message once the secret scope is final.
+
+    ``redactor`` is the sealed invocation scope's redactor, so a secret
+    registered after the raise is still masked. An unsafe scope never reaches
+    this: neither text may then leave the process.
+    """
+
+    exception = outcome._raised
+    if exception is None:
+        return outcome
+    _log_tool_exception(exception, tool=tool, ctx=ctx, redactor=redactor)
+    message = _failure_evidence_message(exception, redactor=redactor)
+    if message is None:
+        return outcome
+    payload = outcome.terminal_payload_fields()
+    try:
+        evidence = FailureEvidence.model_validate(payload["failure_evidence"])
+    except Exception:
+        return outcome
+    # The message is already bounded to the field's limit.
+    payload["failure_evidence"] = evidence.model_copy(
+        update={"exception_message": message}
+    ).model_dump(mode="json")
+    return _execution_outcome(outcome.result, payload)
+
+
+def _failure_evidence_message(
+    exception: BaseException,
+    *,
+    redactor: SecretRedactor,
+) -> str | None:
+    """Masked, bounded message with its cause chain or group leaves.
+
+    It is redacted with the invocation's workload redactor, as the tool result
+    transcript is, and again when the sealed scope publishes the event.
+    """
+
+    try:
+        # Exception text often quotes values with repr; match those forms too.
+        detail = exception_detail(exception, redactor=redactor.with_python_repr_forms())
+        message = redactor.redact_text_bounded(
+            (detail.message + exception_detail_suffix(detail)).strip(),
+            # A UTF-8 byte bound is also a character bound.
+            max_bytes=FAILURE_EVIDENCE_MESSAGE_MAX_CHARS,
+        )
+    except BaseException:
+        # The type tree is still retained; never lose the outcome to a message.
+        return None
+    return message or None
+
+
+def _log_tool_exception(
+    exception: BaseException,
+    *,
+    tool: Tool,
+    ctx: ToolContext,
+    redactor: SecretRedactor,
+) -> None:
+    """Log the redacted traceback in the process that ran the tool.
+
+    Logging is diagnostic only: a rendering or handler failure never replaces
+    the tool outcome.
+    """
+
+    try:
+        source_redactor = redactor.with_python_repr_forms()
+        # Group tracebacks prefix every line of a leaf's message with ``|``,
+        # which splits a multiline secret apart. Mask whole secrets first,
+        # then any line of a multiline secret that is still visible.
+        line_redactor = redactor.with_line_forms()
+
+        def mask(text: str) -> str:
+            return line_redactor.redact_text(source_redactor.redact_text(text))
+
+        try:
+            rendered = mask("".join(traceback_module.format_exception(exception))).rstrip()
+        except BaseException:
+            # Rendering runs exception code; keep the type when it fails.
+            rendered = f"{_safe_type_name(exception)} (traceback could not be rendered)"
+        if len(rendered) > _LOGGED_TOOL_TRACEBACK_MAX_CHARS:
+            # Keep the end: it names the raising frame and the exception.
+            rendered = "...[truncated]\n" + rendered[-_LOGGED_TOOL_TRACEBACK_MAX_CHARS:]
+        logger.error(
+            "Tool %s raised in session %s (idempotency key %s):\n%s",
+            mask(_safe_tool_name(tool)),
+            mask(ctx.session_id),
+            mask(ctx.idempotency_key or "none"),
+            rendered,
+        )
+    except Exception:
+        return
+
+
+def _log_suppressed_tool_exception(
+    *, tool: Tool, ctx: ToolContext, redactor: SecretRedactor
+) -> None:
+    """Record that the tool raised, without any of its unsafe text."""
+
+    try:
+        logger.error(
+            "Tool %s raised in session %s (idempotency key %s); its message and "
+            "traceback were omitted because the secret-redaction scope could not "
+            "be finalized safely.",
+            redactor.redact_text(_safe_tool_name(tool)),
+            redactor.redact_text(ctx.session_id),
+            redactor.redact_text(ctx.idempotency_key or "none"),
+        )
+    except Exception:
+        return
 
 
 def terminal_payload_limit_failure(
@@ -477,10 +629,14 @@ async def run_tool(
             finalize_publication()
         raise
     if finalize_publication is None:
-        return outcome
+        return _finish_raised_outcome(
+            outcome, tool=tool, ctx=ctx, redactor=_active_redactor(redactor)
+        )
     publication = finalize_publication()
     if not publication.unsafe_output:
-        return outcome
+        return _finish_raised_outcome(outcome, tool=tool, ctx=ctx, redactor=publication.redactor)
+    if outcome._raised is not None:
+        _log_suppressed_tool_exception(tool=tool, ctx=ctx, redactor=publication.redactor)
     ctx._discard_policy_denials_for(tool)
     result, controls = tool_results.terminal_failure_result(
         terminal_outcome="invalid_tool_output",
@@ -732,7 +888,7 @@ async def _run_tool(
             diagnostic=diagnostic,
             redactor=active_redactor,
         )
-        return _execution_outcome(result, controls, exception=exc)
+        return _exception_outcome(result, controls, exception=exc)
     except BaseExceptionGroup as exc:
         ctx._discard_policy_denials_for(tool)
         if exception_tree_contains(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
@@ -758,7 +914,7 @@ async def _run_tool(
                 message="Tool execution reported multiple failures.",
                 redactor=active_redactor,
             )
-            return _execution_outcome(result, controls, exception=exc)
+            return _exception_outcome(result, controls, exception=exc)
         else:
             current_cancellation = is_current_runner_cancellation_group(exc) or (
                 current_task is not None and current_task.cancelling() > cancellation_baseline
@@ -771,7 +927,7 @@ async def _run_tool(
                     message="Tool execution reported multiple failures.",
                     redactor=active_redactor,
                 )
-                return _execution_outcome(result, controls, exception=exc)
+                return _exception_outcome(result, controls, exception=exc)
             grouped_failure = sanitize_runner_failure_group(
                 exc,
                 caller_cancelled=True,
@@ -784,7 +940,7 @@ async def _run_tool(
             effect=effect,
             redactor=active_redactor,
         )
-        return _execution_outcome(result, controls, exception=exc)
+        return _exception_outcome(result, controls, exception=exc)
     except Exception as exc:
         # Only this invocation's runtime callback proves that Tool.run was
         # never entered. Identical tool-authored errors remain ordinary tool
@@ -882,7 +1038,7 @@ async def _run_tool(
                 diagnostic=diagnostic,
                 redactor=active_redactor,
             )
-            return _execution_outcome(result, controls, exception=exc)
+            return _exception_outcome(result, controls, exception=exc)
 
     if grouped_failure is not None:
         raise grouped_failure
@@ -1060,6 +1216,14 @@ def _active_redactor(redactor: Callable[[], SecretRedactor]) -> SecretRedactor:
     if not isinstance(active, SecretRedactor):
         raise TypeError("redactor must return a SecretRedactor.")
     return active
+
+
+def _safe_tool_name(tool: Tool) -> str:
+    try:
+        name = tool.spec.name
+    except Exception:
+        return _safe_type_name(tool)
+    return name if type(name) is str else _safe_type_name(tool)
 
 
 def _safe_type_name(value: Any) -> str:

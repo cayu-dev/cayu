@@ -79,12 +79,36 @@ _NEXT = {
 
 
 class ToolEffectReconciliationRequired(RuntimeError):
-    """An existing external call needs explicit receipt reconciliation, never replay."""
+    """An existing external call needs explicit receipt reconciliation, never replay.
 
-    def __init__(self) -> None:
+    ``tool_name`` and ``tool_call_id`` name the unresolved call when the raiser
+    knows it, so the session interruption can say which call stopped the run.
+    They are diagnostics, never reconciliation or replay authority.
+    """
+
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+
+    def __init__(
+        self,
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> None:
         super().__init__(
             "An external tool effect is unresolved; explicit receipt reconciliation is required."
         )
+        self.tool_name = tool_name
+        self.tool_call_id = tool_call_id
+
+    def interruption_evidence(self) -> dict[str, object]:
+        """Return the known call identity for the ``session.interrupted`` payload."""
+
+        return {
+            key: value
+            for key, value in (("tool_name", self.tool_name), ("tool_call_id", self.tool_call_id))
+            if type(value) is str and value
+        }
 
 
 class ToolEffectReconciliationCleanupFailure(ToolEffectReconciliationRequired):
@@ -95,7 +119,7 @@ class ToolEffectReconciliationCleanupFailure(ToolEffectReconciliationRequired):
         primary: ToolEffectReconciliationRequired,
         cleanup: Exception,
     ) -> None:
-        super().__init__()
+        super().__init__(tool_name=primary.tool_name, tool_call_id=primary.tool_call_id)
         self.cleanup = cleanup
         self.failures = ExceptionGroup(
             "External tool uncertainty and observation cleanup failure.",

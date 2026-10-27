@@ -1919,8 +1919,21 @@ to `workspace.observation.finalized` when there is no terminal tool event.
 When Runtime catches an invocation exception, the retained
 `tool.effect.outcome_unknown.payload["failure_evidence"]` includes its bounded
 exception-type tree and failure classification, bound to the dispatch session and
-run epoch. Exception messages and tracebacks are omitted. Secret-bearing diagnostic
-fields are redacted or omitted without upgrading settlement evidence. Tool-returned structured
+run epoch. Its optional `exception_message` keeps the exception's message, with its
+cause chain or group leaves, masked by the workload secret redactor the same way the
+tool result transcript is and bounded to 2,048 UTF-8 bytes. The same evidence rides on
+`tool.call.failed` for a tool whose effect is not `EXTERNAL`. Runtime builds the message
+only after the invocation's secret scope is sealed, masks it with that final secret set,
+and masks it again when the event is published. The private runner and
+isolated-process error text is never copied into it. Tracebacks stay out of events:
+Runtime logs the traceback at error level on the `cayu.runtime._tool_execution` logger
+in the process that ran the tool, also after sealing and masked with the final secret
+set. Because exception-group tracebacks prefix each line of a leaf's message, the log
+also masks every line of a multiline secret on its own. When the scope cannot be finalized safely, the result is omitted, the evidence has
+no message, and the log line only records that the tool raised. The
+`session.interrupted` event that follows an unknown outcome names the call with
+`tool_name` and `tool_call_id`. Secret-bearing diagnostic fields are redacted or omitted
+without upgrading settlement evidence. Tool-returned structured
 data and hook rewrites cannot supply this Runtime-owned diagnostic. An observed
 exception does not prove external settlement: the effect remains unknown and
 requires reconciliation before continuation, without automatic tool replay.

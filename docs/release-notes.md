@@ -206,6 +206,16 @@ showed this, because the in-memory store makes its own key.
   deploying without them. `cayu cloud init` writes it for projects generated with
   `--with app-database`. See [Application database
   migration](cayu-cloud.md#application-database-migration).
+- An exception raised by a tool now explains itself. `failure_evidence` on
+  `tool.effect.outcome_unknown` and `tool.call.failed` keeps an optional
+  `exception_message`: the message with its cause chain or group leaves, masked
+  with the call's final secret set like the tool result transcript, and bounded
+  to 2,048 bytes. The `session.interrupted` event after an unknown outcome names
+  the call with `tool_name` and `tool_call_id`, and the process that ran the
+  tool logs the masked traceback at error level on the
+  `cayu.runtime._tool_execution` logger. When the call's secret scope can't be
+  finalized safely, neither the message nor the traceback is kept or logged.
+  Older events without the field still validate.
 - A tool call uses about 15% less runtime CPU with the SQLite store and about
   20% less with the in-memory store. Copying a validated event no longer
   copies its validation stamp or validates a changed payload twice, event

@@ -32,6 +32,7 @@ from cayu.runtime._recovery_ownership import RecoveryOwnership
 from cayu.runtime._run_limits import SessionUsageTracker
 from cayu.runtime._session_control import ActiveSessionRun
 from cayu.runtime._session_finalization import SessionFinalization
+from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
 from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -310,6 +311,7 @@ class SessionInterruptionCleanup:
         *,
         authoritative_failure: BaseException,
         foreground_subagent_pending: ForegroundSubagentRecoveryRequired | None = None,
+        unresolved_tool_effect: ToolEffectReconciliationRequired | None = None,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
@@ -365,6 +367,7 @@ class SessionInterruptionCleanup:
             async for event in self._session_finalization.handle_session_interrupted(
                 session=persisted_session,
                 foreground_subagent_pending=foreground_subagent_pending,
+                unresolved_tool_effect=unresolved_tool_effect,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,

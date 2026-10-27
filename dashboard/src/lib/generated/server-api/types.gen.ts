@@ -10854,6 +10854,10 @@ export type FailureEvidence = {
      */
     deadline_phase?: 'admission' | 'in_flight' | null;
     /**
+     * Exception Message
+     */
+    exception_message?: string | null;
+    /**
      * Exception Types
      */
     exception_types?: Array<string>;
@@ -22163,6 +22167,11 @@ export type WorkspaceStructuralEvidenceV1 = {
  * ``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session
  * events and the existing IncompleteSessionRecoveryResult contract. Missing
  * evidence is unknown, including for old durable events.
+ *
+ * ``exception_message`` is the caught exception's message with its cause
+ * chain or group leaves, redacted with the workload secret redactor and
+ * bounded. Only Runtime's tool-invocation boundary sets it; it is omitted
+ * when absent, including for old durable events.
  */
 export type FailureEvidenceFields = {
     /**
@@ -22174,6 +22183,10 @@ export type FailureEvidenceFields = {
      * Deadline Phase
      */
     deadline_phase?: 'admission' | 'in_flight' | null;
+    /**
+     * Exception Message
+     */
+    exception_message?: string | null;
     /**
      * Exception Types
      */

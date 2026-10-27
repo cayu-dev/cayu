@@ -107,6 +107,12 @@ When a runtime-classified tool timeout becomes an unknown external outcome, the
 `timeout` classification. This diagnostic contains neither tool arguments nor
 result content and does not authorize retry or prove the external operation stopped.
 
+When the tool raises instead, `failure_evidence` lists the exception types and keeps
+`exception_message`: the message with its cause chain or group leaves, masked by the
+workload secret redactor and bounded to 2,048 bytes. The `session.interrupted` event
+names the call with `tool_name` and `tool_call_id`, and the process that ran the tool
+logs the masked traceback at error level.
+
 An invalid tool result is not a reconciliation receipt. Its raw response fields,
 including a field named `receipt_id`, are not copied into the default unknown-effect
 event. Reconcile the retained logical call using the registered adapter's lookup

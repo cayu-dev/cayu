@@ -22604,6 +22604,18 @@
             ],
             "title": "Deadline Phase"
           },
+          "exception_message": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exception Message"
+          },
           "exception_types": {
             "default": [],
             "items": {
@@ -44123,7 +44135,7 @@
       },
       "_FailureEvidenceFields": {
         "additionalProperties": false,
-        "description": "Portable evidence, never a certificate that external effects have stopped.\n\n``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session\nevents and the existing IncompleteSessionRecoveryResult contract. Missing\nevidence is unknown, including for old durable events.",
+        "description": "Portable evidence, never a certificate that external effects have stopped.\n\n``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session\nevents and the existing IncompleteSessionRecoveryResult contract. Missing\nevidence is unknown, including for old durable events.\n\n``exception_message`` is the caught exception's message with its cause\nchain or group leaves, redacted with the workload secret redactor and\nbounded. Only Runtime's tool-invocation boundary sets it; it is omitted\nwhen absent, including for old durable events.",
         "properties": {
           "classification": {
             "default": "unknown",
@@ -44161,6 +44173,18 @@
               }
             ],
             "title": "Deadline Phase"
+          },
+          "exception_message": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exception Message"
           },
           "exception_types": {
             "default": [],

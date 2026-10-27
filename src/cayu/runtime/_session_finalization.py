@@ -200,6 +200,7 @@ from cayu.runtime._terminal_evidence_finalization import (
 from cayu.runtime._terminal_evidence_reader import (
     TerminalEvidenceReader,
 )
+from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
 from cayu.runtime._tool_round_executor import (
     ToolRoundLimitRequest,
     ordered_tool_result_messages,
@@ -4255,6 +4256,7 @@ class SessionFinalization:
         *,
         session: Session,
         foreground_subagent_pending: ForegroundSubagentRecoveryRequired | None = None,
+        unresolved_tool_effect: ToolEffectReconciliationRequired | None = None,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
@@ -4299,6 +4301,11 @@ class SessionFinalization:
             )
             if foreground_subagent_pending is not None:
                 payload.update(foreground_subagent_pending.interruption_evidence())
+            if unresolved_tool_effect is not None:
+                # Name the unknown-outcome call; a pending request's own
+                # fields stay authoritative.
+                for key, value in unresolved_tool_effect.interruption_evidence().items():
+                    payload.setdefault(key, value)
             user_input_supersession_retained = (
                 USER_INPUT_SUPERSESSION_INTENT_KEY in payload
                 or AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY in payload

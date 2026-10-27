@@ -532,7 +532,25 @@ def test_runtime_unknown_external_effect_preserves_round_and_prevents_resume_dis
                 if event.type.value == "session.started"
             )
             assert diagnostic["run_epoch"] == started_epoch
-            assert "private-" not in json.dumps(uncertainty.payload)
+            # The redacted message, with group leaves, names what went wrong.
+            expected_messages = {
+                "failure": ["external acknowledgement lost"],
+                "failure_group": [
+                    "private-group-message",
+                    "AttributeError: private-attribute-message",
+                    "ValueError: private-value-message",
+                ],
+                "raised_timeout": ["private-timeout-message"],
+            }[signal]
+            for expected_message in expected_messages:
+                assert expected_message in diagnostic["exception_message"]
+            interrupted = next(
+                event
+                for event in await store.load_events("effect-unknown")
+                if event.type.value == "session.interrupted"
+            )
+            assert interrupted.payload["tool_name"] == "record"
+            assert interrupted.payload["tool_call_id"] == record.intent.tool_call_id
         assert uncertainty.payload["record_revision"] == record.revision
         assert uncertainty.payload["dispatch_id"] == record.dispatch_id
         assert uncertainty.payload["tool_call_id"] == record.intent.tool_call_id

@@ -8752,6 +8752,11 @@ class SessionEngine:
                     if isinstance(unresolved, ForegroundSubagentRecoveryRequired)
                     else None
                 ),
+                unresolved_tool_effect=(
+                    None
+                    if isinstance(unresolved, ForegroundSubagentRecoveryRequired)
+                    else unresolved
+                ),
                 prepare_interruption=lambda: (
                     self._pending_tool_round_recovery.deliver_pending_tool_effect_uncertainty(
                         outcome_state.session

@@ -3275,6 +3275,7 @@ def test_terminal_failure_evidence_keys_survive_secret_collisions(event_type: Ev
             "source": "private-value",
             "scope": "private-value",
         },
+        "exception_message": "private-value",
         "exception_types": ["private-value"],
         "run_epoch": 7,
         "secondary_failures": False,
@@ -3312,6 +3313,7 @@ def test_terminal_failure_evidence_keys_survive_secret_collisions(event_type: Ev
     for key, value in fixed_controls.items():
         assert actual[key] == value
     assert actual["deadline"]["source"] == REDACTED_SECRET
+    assert actual["exception_message"] == REDACTED_SECRET
     assert actual["run_epoch"] == 7
 
 

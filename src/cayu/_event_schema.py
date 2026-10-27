@@ -2539,6 +2539,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "classification",
             "deadline",
             "deadline_phase",
+            "exception_message",
             "exception_types",
             "run_epoch",
             "secondary_failures",

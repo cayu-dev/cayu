@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from cayu._validation import DurableValueError, safe_durable_value_error_details
-from cayu.failure_evidence import FailureEvidence
+from cayu.failure_evidence import FAILURE_EVIDENCE_MESSAGE_MAX_CHARS, FailureEvidence
 from cayu.tools.base import ToolEffect
 from cayu.vaults.redaction import SecretRedactor
 
@@ -29,7 +29,8 @@ def _redacted_failure_evidence(
     Omit secret-bearing type names and identities rather than inventing their
     replacements. Deadline labels use a fixed schema-valid redaction marker;
     a secret-bearing expiry cannot remain a valid timestamp, so omit that
-    deadline and downgrade its classification to unknown.
+    deadline and downgrade its classification to unknown. An exception message
+    is masked in place, like transcript text, and kept within its bound.
     """
     payload = evidence.model_dump(mode="json")
     if redactor is None or not redactor.has_values:
@@ -39,6 +40,11 @@ def _redacted_failure_evidence(
         return redactor.redact_text(value) != value
 
     for snapshot in (payload, *payload.get("branch_failures", [])):
+        message = snapshot.get("exception_message")
+        if type(message) is str:
+            snapshot["exception_message"] = redactor.redact_text_bounded(
+                message, max_bytes=FAILURE_EVIDENCE_MESSAGE_MAX_CHARS
+            )
         names = snapshot["exception_types"]
         snapshot["exception_types"] = [name for name in names if not contains_secret(name)]
         if len(snapshot["exception_types"]) != len(names):

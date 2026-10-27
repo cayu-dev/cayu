@@ -6,9 +6,15 @@ import asyncio
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded
+
+# A character cap. Producers apply the same number as a UTF-8 byte bound,
+# which is never longer. Text that a later redaction pass lengthens, by
+# swapping a short secret for the longer mask, is cut back to it instead of
+# invalidating the evidence.
+FAILURE_EVIDENCE_MESSAGE_MAX_CHARS = 2048
 
 
 class _FailureEvidenceFields(BaseModel):
@@ -17,6 +23,11 @@ class _FailureEvidenceFields(BaseModel):
     ``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session
     events and the existing IncompleteSessionRecoveryResult contract. Missing
     evidence is unknown, including for old durable events.
+
+    ``exception_message`` is the caught exception's message with its cause
+    chain or group leaves, redacted with the workload secret redactor and
+    bounded. Only Runtime's tool-invocation boundary sets it; it is omitted
+    when absent, including for old durable events.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -33,6 +44,18 @@ class _FailureEvidenceFields(BaseModel):
     run_epoch: int | None = Field(default=None, ge=0)
     terminal_event_id: str | None = Field(default=None, max_length=512)
     settlement: Literal["unknown"] = "unknown"
+    exception_message: str | None = Field(
+        default=None,
+        max_length=FAILURE_EVIDENCE_MESSAGE_MAX_CHARS,
+        exclude_if=lambda value: value is None,
+    )
+
+    @field_validator("exception_message", mode="before")
+    @classmethod
+    def bound_exception_message(cls, value: object) -> object:
+        if type(value) is str and len(value) > FAILURE_EVIDENCE_MESSAGE_MAX_CHARS:
+            return value[:FAILURE_EVIDENCE_MESSAGE_MAX_CHARS]
+        return value
 
     @model_validator(mode="after")
     def validate_deadline_evidence(self) -> _FailureEvidenceFields:

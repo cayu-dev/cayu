@@ -123,6 +123,26 @@ class SecretRedactor:
             return self
         return SecretRedactor._from_values(tuple(sorted(values, key=len, reverse=True)))
 
+    def with_line_forms(self) -> SecretRedactor:
+        """Also match each line of a multiline secret on its own.
+
+        Formatters that indent or prefix continuation lines split a multiline
+        secret apart: an exception-group traceback puts ``|`` before every
+        line of a leaf's message. Each non-blank line of a multiline secret,
+        stripped of surrounding whitespace, is added. This over-redacts text
+        that merely contains such a line, so use it only for diagnostics that
+        must not keep any fragment, after redacting the whole secret first.
+        """
+
+        values = set(self._values)
+        for value in self._values:
+            lines = value.splitlines()
+            if len(lines) > 1:
+                values.update(line.strip() for line in lines if line.strip())
+        if len(values) == len(self._values):
+            return self
+        return SecretRedactor._from_values(tuple(sorted(values, key=len, reverse=True)))
+
     def redact_cut_text(self, value: str, *, cut_head: bool = False, cut_tail: bool = False) -> str:
         """Redact text cut from a longer source, dropping what a cut may have split.
 

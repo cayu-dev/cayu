@@ -720,7 +720,10 @@ class _ToolRoundPublicationCoordinator:
                     )
                 ):
                     self._stage_attempted_event_ids.discard(projected.id)
-                    raise ToolEffectReconciliationRequired()
+                    raise ToolEffectReconciliationRequired(
+                        tool_name=effect_record.intent.tool_name,
+                        tool_call_id=tool_call_id,
+                    )
                 if (
                     effect_record is not None
                     and (
