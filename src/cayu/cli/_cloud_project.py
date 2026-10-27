@@ -598,7 +598,9 @@ class CloudProjectManifest:
         ):
             raise CloudApiError(
                 "manifest_invalid",
-                "Runtime web idle_timeout_seconds is invalid.",
+                "Runtime web idle_timeout_seconds must be an integer from 60 to 86400. It sets "
+                "how long the web process stays idle before it sleeps and can't turn sleep off; "
+                "run work that must keep going without requests in [worker].",
             )
         if len(self.schedules) > SCHEDULES_LIMIT:
             raise CloudApiError(
@@ -803,7 +805,14 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
                 "Combine them into one worker entrypoint, or run the ones that work on a "
                 "timetable as [[schedules]]."
             )
-    elif web_command is None and isinstance(scripts, dict) and len(scripts) == 1:
+    elif web_command is not None:
+        notes.append(
+            "Cayu Cloud lets the web process sleep when it has been idle and wakes it on the "
+            "next request, so work it starts stops while it sleeps. Declare work that must "
+            "keep going without requests, such as polling or task workers, in "
+            "[tool.cayu.workers]; init then writes it as [worker], which Cloud keeps running."
+        )
+    elif isinstance(scripts, dict) and len(scripts) == 1:
         worker_command = str(next(iter(scripts)))
     elif web_command is None:
         worker_command = "python -m " + application.replace("-", "_")

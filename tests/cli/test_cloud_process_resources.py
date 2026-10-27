@@ -190,6 +190,17 @@ def test_web_port_and_idle_timeout_require_integers(field, value):
         CloudProjectManifest.loads(_BASE + web)
 
 
+@pytest.mark.parametrize("value", ["0", "59", "86401"])
+def test_an_idle_timeout_out_of_range_names_the_range_and_the_worker(value):
+    web = f'[web]\ncommand = "web"\nport = 8000\nidle_timeout_seconds = {value}\n'
+    with pytest.raises(CloudApiError) as raised:
+        CloudProjectManifest.loads(_BASE + web)
+    message = str(raised.value)
+    assert "from 60 to 86400" in message
+    assert "can't turn sleep off" in message
+    assert "[worker]" in message
+
+
 def _schedules(count: int) -> str:
     return "".join(
         f'[[schedules]]\nname = "tick-{index}"\ncommand = "tick"\nexpression = "rate(1 hour)"\n'

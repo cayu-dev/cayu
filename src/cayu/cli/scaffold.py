@@ -1043,7 +1043,7 @@ yourself, use the Cayu feature that already does it:
 | Structured data back (JSON, fields, a list) | `RunRequest(structured_output=StructuredOutputSpec(...))`, then `outcome.structured_output.output`. Do not parse JSON out of `final_text`. | `cayu guide structured-output` |
 | A new capability: call an API, read data, compute | A typed tool with a declared `ToolEffect` | `cayu guide references#domain-tool` |
 | A web UI that shows progress or live results | `mount_cayu(...)` and `connect()` from the served `client.js`. Do not poll on a fixed timer. | `cayu guide app-ui` |
-| Work that runs in the background or later | `TaskStore`, dispatcher and worker | `cayu guide references#background-work` |
+| Work that runs in the background or later | `TaskStore`, dispatcher and worker, run as a `[tool.cayu.workers]` entry (`cayu worker NAME`), not only inside the web server | `cayu guide references#background-work` |
 | Reminders, chasing, or expiry ("remind after 24 hours", "expire after a week") | A one-shot task with `available_at` and `TaskSchedulePolicy`, run by `run_task_worker`. Do not write a polling loop over timestamps. | `cayu guide long-running#timers` |
 | Remembering facts across conversations | The knowledge tools (remember, search) | `cayu guide references#knowledge` |
 | Running a fixed command or parsing files in isolation | `cayu new NAME --execution docker` on the agent preset: a hardened per-session sandbox your tools reach with `require_sandbox_runner(ctx)`. Don't switch to the coding preset for this. | `cayu guide references#environments` |
@@ -1064,6 +1064,18 @@ from `uv run --no-sync cayu guide references`.
 __PROVIDER_GUIDE_POINTER__
 
 This scaffold is for local development. Deployment is a separate task.
+
+## Running on Cayu Cloud
+
+`uv run --no-sync cayu cloud init` writes `cayu-cloud.toml` and
+`uv run --no-sync cayu cloud deploy` deploys it. On Cayu Cloud the web process
+sleeps when it has been idle and wakes on the next request, and nothing it
+started runs while it sleeps. Put work that must keep going without requests
+(polling, task workers, timers, watchers) in `[tool.cayu.workers]`, which runs
+as the Agent's `[worker]` and never sleeps, and work on a timetable in
+`[[schedules]]`. Don't try to stop the web process from sleeping in the
+manifest: `idle_timeout_seconds` can't turn sleep off.
+
 If the requested application is public or multi-user, regenerate with
 `cayu new NAME --preset service` or adopt Cayu's maintained service contract;
 do not improvise product authorization around raw Cayu routes.

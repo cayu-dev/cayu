@@ -2829,6 +2829,13 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "uv run --no-sync cayu guide references" in instructions
     assert "github.com" not in instructions
     assert "Deployment is a separate task" in instructions
+    # A deployed web process sleeps; background work has to be a worker.
+    assert "## Running on Cayu Cloud" in instructions
+    assert (
+        "`[tool.cayu.workers]`, which runs\nas the Agent's `[worker]` and never sleeps"
+        in instructions
+    )
+    assert "run as a `[tool.cayu.workers]` entry (`cayu worker NAME`)" in instructions
     assert "Clarify users, jobs, triggers" not in instructions
     assert "cayu generate slice" not in instructions
     assert (

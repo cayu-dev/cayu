@@ -152,6 +152,22 @@ shell splits words (quotes group, nothing is expanded) and starts the program
 directly, so pipes, `&&`, redirects and `$VARIABLE` don't work. Wrap such a
 command in `sh -c '...'`; the image has the BusyBox `sh`, not `bash`.
 
+### What keeps running
+
+- The web process sleeps once it has been idle for its idle timeout: Cayu Cloud's
+  default (15 minutes on Cayu's own Cloud), or `[web] idle_timeout_seconds`
+  (60–86400). The next request wakes it, which takes a minute or more. While it
+  sleeps, nothing it started runs: no background tasks, loops or watchers that
+  it started from its lifespan.
+- The worker never sleeps. Cloud keeps it running and restarts it if it exits.
+- Work that must keep going without requests therefore belongs in `[worker]`:
+  polling an inbox or a queue, task workers (`run_task_worker`), timers, and event
+  watchers. Declare it in `[tool.cayu.workers]` and `cayu cloud init` writes it as
+  `[worker]` (`cayu worker NAME`). Work that runs at fixed times belongs in
+  `[[schedules]]`. Don't also start the same work in the web process, or two
+  processes will do it.
+- `idle_timeout_seconds` can't turn sleep off, and no other manifest value does.
+
 ### Schedules
 
 `expression` uses Amazon EventBridge Scheduler's syntax and is evaluated in UTC:

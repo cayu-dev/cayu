@@ -453,6 +453,12 @@ recovery_inactive_after_seconds = 900
         "application": "research-agent",
         "manifest": str(manifest_path),
         "name": "Research Agent",
+        "notes": [
+            "Cayu Cloud lets the web process sleep when it has been idle and wakes it on the "
+            "next request, so work it starts stops while it sleeps. Declare work that must "
+            "keep going without requests, such as polling or task workers, in "
+            "[tool.cayu.workers]; init then writes it as [worker], which Cloud keeps running."
+        ],
         "runtime": "web",
         "sign_in": "cloud",
     }
@@ -580,6 +586,31 @@ def test_cloud_init_generates_the_first_of_several_workers_and_names_the_rest(
     # `[tool.cayu.serve]` alone also declares the web process.
     assert result["runtime"] == "web"
     assert manifest.web is not None
+
+
+def test_cloud_init_says_the_web_process_sleeps_when_no_worker_is_declared(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "mail-agent"\nversion = "0.1.0"\n'
+        'dependencies = ["cayu[server]>=0.14"]\n\n'
+        '[tool.cayu]\nfactory = "app:build_app"\n\n'
+        '[tool.cayu.serve]\nauth = "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"\n'
+    )
+
+    assert main(["cloud", "init", str(tmp_path)]) == 0
+
+    result = json.loads(capsys.readouterr().out)["result"]
+    manifest = cloud_project.CloudProjectManifest.load(tmp_path / "cayu-cloud.toml")
+    assert result["runtime"] == "web"
+    assert manifest.worker is None
+    assert result["notes"] == [
+        "Cayu Cloud lets the web process sleep when it has been idle and wakes it on the "
+        "next request, so work it starts stops while it sleeps. Declare work that must "
+        "keep going without requests, such as polling or task workers, in "
+        "[tool.cayu.workers]; init then writes it as [worker], which Cloud keeps running."
+    ]
 
 
 def test_cloud_init_quotes_a_worker_name_for_the_command(

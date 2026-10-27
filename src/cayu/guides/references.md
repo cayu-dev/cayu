@@ -279,6 +279,10 @@ Models get the same split through the `list_knowledge`, `search_knowledge` and
 Event watchers react to persisted events with delivery identity and retries.
 Keep enqueue, claim, execution, result recording, and recovery distinct so a
 process crash does not silently duplicate work.
+Run the worker as its own process: a `[tool.cayu.workers]` entry, started with
+`cayu worker NAME`, not only from the web server's lifespan. A deployed web
+process can sleep when it is idle, and on Cayu Cloud it does; a worker keeps
+running. `cayu cloud init` writes the entry as the Agent's `[worker]`.
 Pass `run_task_worker(..., execution_timeout_s=...)` so a handler call that
 hangs or retries forever is cancelled and fails its task instead of holding the
 claim, whether or not its runs are attached; without `run_task_worker`, wrap
