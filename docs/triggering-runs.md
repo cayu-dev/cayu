@@ -158,10 +158,44 @@ the task ID, both settings and the session IDs. A handler that keeps
 running after it is cancelled keeps its lease, and its task gets a durable
 cancellation request with code `task_handler_timeout` that settles when the
 handler returns. The limit also bounds the drain when the worker itself is
-cancelled. It does not change the deadline stored on sessions, so a session
-paused for a person keeps its own. Without `run_task_worker`, wrap a handler
-in `async with HandlerTimeLimit(600, grace_s=30):` from `cayu.deadlines`; it
-raises `ExecutionDeadlineExceeded` when it cancels the block.
+cancelled. Without `run_task_worker`, wrap a handler in `async with
+HandlerTimeLimit(600, grace_s=30):` from `cayu.deadlines`; it raises
+`ExecutionDeadlineExceeded` when it cancels the block.
+
+A session keeps the deadline it started with, and records where it came from
+(`Session.execution_deadline.origin`): `explicit` when the request set
+`execution_deadline`, `run_default` when it took the handler's default, and
+`enclosing` when it started inside an `execution_deadline_scope`. A run started
+in the handler that pauses for an approval or a question returns to the handler,
+and the handler can finish while the person decides. For a top-level session
+whose deadline is `run_default`, the wait doesn't count: settling the approval
+or answering the question gives the session back the time it had left when it
+paused. Child sessions, and deadlines set explicitly or by an enclosing scope,
+keep running while a person decides. The inbox and `GET /api/pending-actions`
+show each pending item's deadline, its origin and whether the wait counts.
+
+Give a run its own deadline when the handler's limit is the wrong bound for it,
+and give a settle or a resume a new one when the stored deadline has passed:
+
+```python
+from cayu.approvals import ToolApprovalRequest
+from cayu.deadlines import ExecutionDeadline, current_handler_time_limit
+
+# A filing run started in a scan handler: it may wait a week for a person.
+RunRequest(..., execution_deadline=ExecutionDeadline.after(7 * 24 * 3600))
+
+# Make a person's wait count against the handler's limit after all.
+RunRequest(..., execution_deadline=current_handler_time_limit().run_deadline())
+
+# Continue a session whose own deadline passed. The new deadline is admitted
+# like a new run's and replaces the stored one.
+app.resolve_tool_approval(ToolApprovalRequest(..., execution_deadline=ExecutionDeadline.after(3600)))
+app.resume(ResumeRequest(..., execution_deadline=ExecutionDeadline.after(3600)))
+```
+
+`UserInputResponse` takes `execution_deadline` the same way. A settle or resume
+after a deadline passed, without a new one, fails with `ExecutionDeadlineExceeded`
+(409 over HTTP), and its message names the deadline's expiry, origin and source.
 
 The limit ends one handler call. An application that retries an event by
 creating a new task for it (a sweeper, a reconciler, a redelivered webhook)

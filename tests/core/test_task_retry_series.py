@@ -1063,10 +1063,15 @@ def test_task_retry_owner_lost_cancellation_reconciliation_is_fenced_and_idempot
     tmp_path: Path,
 ) -> None:
     async def run() -> None:
+        clock = _MutableClock(datetime.now(UTC))
         store = (
-            InMemoryTaskStore()
+            InMemoryTaskStore(clock=clock, ownership_clock=clock)
             if store_kind == "memory"
-            else SQLiteTaskStore(tmp_path / "owner-lost-reconciliation.sqlite")
+            else SQLiteTaskStore(
+                tmp_path / "owner-lost-reconciliation.sqlite",
+                clock=clock,
+                ownership_clock=clock,
+            )
         )
         try:
             await store.create_task(
@@ -1098,7 +1103,9 @@ def test_task_retry_owner_lost_cancellation_reconciliation_is_fenced_and_idempot
             assert replayed_conflict.value.event == live_conflict.value.event
             assert await store.load_task(claimed.id) == requested
 
-            await asyncio.sleep(1.05)
+            # Expire both the lease and retry budget only after the live-owner
+            # assertions, regardless of how long database setup took.
+            clock.value += timedelta(seconds=2)
             expired_but_unreconciled = await store.load_task(claimed.id)
             assert expired_but_unreconciled == requested
             assert expired_but_unreconciled.retry_series is not None

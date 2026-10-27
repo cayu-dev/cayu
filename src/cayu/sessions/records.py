@@ -29,7 +29,7 @@ from cayu.build_provenance import (
     legacy_runtime_build_provenance,
     runtime_build_provenance_identity,
 )
-from cayu.deadlines import ExecutionDeadline, deadline_from_metadata
+from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineReport, deadline_from_metadata
 from cayu.events import Event, EventType, copy_event
 from cayu.execution_profiles import ExecutionProfileIdentity
 from cayu.messages import Message, copy_message
@@ -306,6 +306,7 @@ class PendingActionSession(BaseModel):
     created_at: datetime
     updated_at: datetime
     labels: dict[str, str] = Field(default_factory=dict)
+    execution_deadline: ExecutionDeadlineReport | None = None
 
     @classmethod
     def from_session(cls, session: Session) -> PendingActionSession:
@@ -325,6 +326,9 @@ class PendingActionSession(BaseModel):
             created_at=session.created_at,
             updated_at=session.updated_at,
             labels=session.labels,
+            execution_deadline=ExecutionDeadlineReport.from_metadata(
+                session.metadata, top_level=session.parent_session_id is None
+            ),
         )
 
     @field_validator(

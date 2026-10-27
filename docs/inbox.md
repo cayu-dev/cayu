@@ -38,6 +38,21 @@ alias), `agent_name` and `attention_id`, the same human-attention identity that
 [attention handoff](runtime-contracts.md#human-attention-handoff-receiver-protocol)
 use. A delegated parent waiting on its child is not listed; the child's own item is.
 
+They also carry `execution_deadline`, the paused session's stored execution
+deadline, or `null` when it has none. `expires_at` and `source` say when and who
+set it; `origin` says how the session got it: `explicit` (the request set
+`execution_deadline`), `run_default` (the default for runs started inside a task
+handler, from `run_task_worker(execution_timeout_s=...)`) or `enclosing` (an
+enclosing `execution_deadline_scope`), and `null` for a session started before
+Cayu recorded origins. `waiting_counts` is `false` when settling the item gives
+the session back the time it had left when it paused, which is the case for a
+top-level session whose deadline is `run_default`. Otherwise the deadline keeps
+running while the item waits, and a settle after it passes is refused with 409
+`conflict`, naming the deadline's expiry and origin. To continue such a session,
+settle it from code with a new deadline, for example
+`app.resolve_tool_approval(ToolApprovalRequest(..., execution_deadline=ExecutionDeadline.after(3600)))`.
+`GET /api/pending-actions` returns the same `execution_deadline` on each action.
+
 An `id` names one exact pause or proposal revision. A new question, or a revised
 proposal, is a new item with a new id, so an id never changes meaning under a
 reader. It is a locator, not a credential: every read and settle re-derives the item

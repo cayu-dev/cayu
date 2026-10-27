@@ -9,6 +9,11 @@ from typing import Any
 from uuid import uuid4
 
 from cayu._validation import copy_durable_json_object, copy_label_map
+from cayu.deadlines import (
+    EXECUTION_DEADLINE_METADATA_KEY,
+    EXECUTION_DEADLINE_ORIGIN_METADATA_KEY,
+    ExecutionDeadlineReport,
+)
 from cayu.events import Event
 from cayu.messages import Message
 from cayu.sessions.creation import session_invocation_for_run_request, session_metadata_for_creation
@@ -367,6 +372,19 @@ def pending_action_session_from_row(
         created_at=parse_datetime(row["created_at"]),
         updated_at=parse_datetime(row["updated_at"]),
         labels=copy_label_map(labels, "labels"),
+        execution_deadline=ExecutionDeadlineReport.from_metadata(
+            {
+                **(
+                    {}
+                    if row["execution_deadline_json"] is None
+                    else {
+                        EXECUTION_DEADLINE_METADATA_KEY: json.loads(row["execution_deadline_json"])
+                    }
+                ),
+                EXECUTION_DEADLINE_ORIGIN_METADATA_KEY: row["execution_deadline_origin"],
+            },
+            top_level=row["parent_session_id"] is None,
+        ),
     )
 
 

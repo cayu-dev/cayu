@@ -269,6 +269,11 @@ class WorkAttemptCoordinator:
         automatic verified-work worker consumes this authority separately.
         """
 
+        if type(request) is ResumeRequest and request.execution_deadline is not None:
+            raise ValueError(
+                "A work attempt continues under its session's execution deadline; "
+                "ResumeRequest.execution_deadline is applied by CayuApp.resume."
+            )
         source_request_type = type(request)
         execution_request_type = type(execution)
         source_validation = _copied_public_work_attempt_source_request(

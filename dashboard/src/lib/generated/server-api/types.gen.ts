@@ -1140,6 +1140,10 @@ export type ApiPendingAction = {
     detail?: string | null;
     event: ApiEventRecord;
     /**
+     * The session's stored execution deadline; null when it has none. Settling after it passes is refused unless waiting_counts is false; a settle from code can pass a new execution_deadline.
+     */
+    execution_deadline?: ExecutionDeadlineReport | null;
+    /**
      * Id
      */
     id: string;
@@ -10377,6 +10381,34 @@ export type ExecutionDeadline = {
 };
 
 /**
+ * ExecutionDeadlineReport
+ *
+ * A paused session's stored execution deadline, as the inbox and pending actions show it.
+ */
+export type ExecutionDeadlineReport = {
+    /**
+     * Expires At
+     */
+    expires_at: string;
+    /**
+     * Origin
+     *
+     * How the session got the deadline: explicit (set on the request), run_default (the default for runs started inside a task handler) or enclosing (an enclosing execution scope). Null when the session predates recorded origins.
+     */
+    origin?: 'explicit' | 'run_default' | 'enclosing' | null;
+    /**
+     * Source
+     */
+    source: string;
+    /**
+     * Waiting Counts
+     *
+     * Whether the time this item waits for a person counts against the deadline. False when settling it gives the session back the time it had left when it paused.
+     */
+    waiting_counts: boolean;
+};
+
+/**
  * ExecutionEvidenceOverride
  *
  * A capability-specific minimum that overrides the workload default.
@@ -11356,6 +11388,10 @@ export type InboxItem = {
      * Detail
      */
     detail?: string | null;
+    /**
+     * The paused session's execution deadline, for approvals and questions; null when it has none. Settling after it passes is refused unless waiting_counts is false.
+     */
+    execution_deadline?: ExecutionDeadlineReport | null;
     /**
      * Id
      */

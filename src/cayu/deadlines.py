@@ -9,14 +9,35 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar, get_args
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, field_validator
 
 from cayu._clock import normalize_utc_datetime
 from cayu._exception_groups import iter_exception_tree
 
 EXECUTION_DEADLINE_METADATA_KEY = "cayu:execution_deadline"
+EXECUTION_DEADLINE_ORIGIN_METADATA_KEY = "cayu:execution_deadline_origin"
+EXECUTION_DEADLINE_RENEWAL_METADATA_KEY = "cayu:execution_deadline_renewal"
+# Every runtime-owned session metadata entry that describes the stored deadline.
+EXECUTION_DEADLINE_METADATA_KEYS = (
+    EXECUTION_DEADLINE_METADATA_KEY,
+    EXECUTION_DEADLINE_ORIGIN_METADATA_KEY,
+    EXECUTION_DEADLINE_RENEWAL_METADATA_KEY,
+)
+
+DeadlineOrigin = Literal["explicit", "run_default", "enclosing"]
+"""How a session got its execution deadline.
+
+``explicit``: the request that started (or resumed) the session set
+``execution_deadline``. ``run_default``: the session took the default bound by
+``default_run_deadline``, which ``run_task_worker(execution_timeout_s=...)``
+binds around each handler call. ``enclosing``: the session started inside an
+``execution_deadline_scope``, such as a workflow step or an eval case. A
+deadline recorded before origins existed has origin ``None``.
+"""
+
+_DEADLINE_ORIGINS: frozenset[str] = frozenset(get_args(DeadlineOrigin))
 
 
 class ExecutionDeadlineExceeded(TimeoutError):
@@ -24,7 +45,9 @@ class ExecutionDeadlineExceeded(TimeoutError):
 
     def __init__(self, deadline: ExecutionDeadline, stage: str) -> None:
         self.diagnostics = {**deadline.inspection(), "denied_stage": stage}
-        super().__init__(f"Execution deadline expired before {stage}.")
+        super().__init__(
+            f"Execution deadline expired before {stage}; the deadline was {deadline.describe()}."
+        )
 
 
 class ExecutionDeadline(BaseModel):
@@ -40,6 +63,9 @@ class ExecutionDeadline(BaseModel):
     scope: str = "execution"
     _monotonic_expiry: float | None = PrivateAttr(default=None)
     _expired_observed: bool = PrivateAttr(default=False)
+    # Process-local like the monotonic expiry; sessions store it next to the
+    # deadline (EXECUTION_DEADLINE_ORIGIN_METADATA_KEY), not inside it.
+    _origin: DeadlineOrigin | None = PrivateAttr(default=None)
 
     @field_validator("expires_at")
     @classmethod
@@ -98,6 +124,30 @@ class ExecutionDeadline(BaseModel):
         if self.expired:
             raise ExecutionDeadlineExceeded(self, stage)
 
+    @property
+    def origin(self) -> DeadlineOrigin | None:
+        """How the session got this deadline (see ``DeadlineOrigin``), if recorded."""
+        return self._origin
+
+    def with_origin(self, origin: DeadlineOrigin | None) -> ExecutionDeadline:
+        """A copy with the same expiry (wall clock and monotonic) and this origin."""
+        if origin is not None and origin not in _DEADLINE_ORIGINS:
+            raise ValueError(f"Unknown execution deadline origin: {origin!r}.")
+        copied = self.model_copy()
+        copied._origin = origin
+        return copied
+
+    def describe(self) -> str:
+        """Name the expiry, how the session got the deadline and who set it, for messages."""
+        if self.expires_at is None:
+            return "unbounded"
+        labels = f"source {self.source}" + (
+            "" if self.scope == "execution" else f", scope {self.scope}"
+        )
+        expiry = self.expires_at.isoformat(timespec="seconds").replace("+00:00", "Z")
+        how = _ORIGIN_DESCRIPTIONS.get(self._origin)
+        return f"{expiry}, {how} ({labels})" if how else f"{expiry} ({labels})"
+
     def inspection(self) -> dict[str, Any]:
         """Safe point-in-time evidence; call again for live remaining time."""
         return {**self.model_dump(mode="json"), "remaining_seconds": self.remaining_seconds()}
@@ -114,12 +164,20 @@ class ExecutionDeadline(BaseModel):
         )
 
 
+_ORIGIN_DESCRIPTIONS: dict[str | None, str] = {
+    "explicit": "set explicitly with execution_deadline",
+    "run_default": "the default for runs started inside a task handler",
+    "enclosing": "inherited from an enclosing execution scope",
+}
+
+
 def effective_deadline(*boundaries: ExecutionDeadline) -> ExecutionDeadline:
     """Compose nested scopes by clamping extensions to the earliest expiry."""
     bounded = [boundary for boundary in boundaries if boundary.expires_at is not None]
     if not bounded:
         return ExecutionDeadline()
-    selected = min(bounded, key=lambda value: value.expires_at)
+    # On a tie, keep the first boundary that records how the session got it.
+    selected = min(bounded, key=lambda value: (value.expires_at, value._origin is None))
     local_expiries = [
         boundary._monotonic_expiry for boundary in bounded if boundary._monotonic_expiry is not None
     ]
@@ -166,7 +224,10 @@ _DEFAULT_RUN: ContextVar[ExecutionDeadline | None] = ContextVar(
 def new_run_execution_deadline() -> ExecutionDeadline:
     """Select a new top-level run's default at admission, not deserialization."""
     current = _CURRENT.get()
-    return current if current is not None else _DEFAULT_RUN.get() or ExecutionDeadline()
+    if current is not None:
+        return current.with_origin("enclosing")
+    default = _DEFAULT_RUN.get()
+    return ExecutionDeadline() if default is None else default.with_origin("run_default")
 
 
 @contextmanager
@@ -179,6 +240,13 @@ def default_run_deadline(deadline: ExecutionDeadline) -> Iterator[None]:
     the run starts; constructing or deserializing a request does not apply it. Nested defaults keep
     the earlier expiry. ``run_task_worker(execution_timeout_s=...)`` uses this
     around each handler call.
+
+    A session that took this default records origin ``run_default``. When it is
+    top-level and pauses for an approval or a question, settling the pause
+    gives it back the time it had left when it paused: the wait for a person
+    doesn't count against a default it only inherited. Pass an explicit
+    ``execution_deadline`` (for example ``current_handler_time_limit().run_deadline()``)
+    to make the wait count.
     """
     if type(deadline) is not ExecutionDeadline:
         raise TypeError("default_run_deadline requires an ExecutionDeadline.")
@@ -251,9 +319,12 @@ class HandlerTimeLimit:
     shorter. An explicit ``grace_s`` must be smaller than ``timeout_s`` (or
     zero); otherwise the constructor raises ``ValueError``.
 
-    The limit does not change the deadline stored on sessions, so a session
-    that pauses for a person retains its deadline. A continuation consumed
-    inside another bounded handler is still subject to that handler's limit.
+    The limit does not change the deadline stored on sessions. Runs started in
+    the block without their own deadline take ``run_deadline()`` as their
+    default (see ``default_run_deadline``), and a top-level one that pauses for
+    a person gets back, when the pause is settled, the time it had left when it
+    paused. A continuation consumed inside another bounded handler is still
+    subject to that handler's limit.
     ``session_ids`` lists the sessions started inside the block (the most
     recent ones) and ``sessions_started`` counts all of them.
     ``run_task_worker(execution_timeout_s=..., execution_grace_s=...)`` wraps
@@ -439,7 +510,96 @@ def deadline_from_metadata(metadata: Mapping[str, Any]) -> ExecutionDeadline:
     raw = metadata.get(EXECUTION_DEADLINE_METADATA_KEY)
     if EXECUTION_DEADLINE_METADATA_KEY not in metadata:
         return ExecutionDeadline()
-    return ExecutionDeadline.model_validate(raw)
+    deadline = ExecutionDeadline.model_validate(raw)
+    origin = metadata.get(EXECUTION_DEADLINE_ORIGIN_METADATA_KEY)
+    # An origin this runtime does not know reads as unrecorded, never as an error.
+    return deadline.with_origin(origin) if origin in _DEADLINE_ORIGINS else deadline
+
+
+def waiting_for_a_person_counts(deadline: ExecutionDeadline, *, top_level: bool) -> bool:
+    """Whether a session's pause for an approval or a question uses up this deadline.
+
+    It does unless the session is top-level and took the deadline as the default
+    for runs started inside a task handler (origin ``run_default``). Settling
+    such a pause gives the session back the time it had left when it paused.
+    """
+    return not (top_level and deadline.origin == "run_default")
+
+
+class ExecutionDeadlineReport(BaseModel):
+    """A paused session's stored execution deadline, as the inbox and pending actions show it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    expires_at: datetime
+    source: str
+    origin: DeadlineOrigin | None = Field(
+        default=None,
+        description=(
+            "How the session got the deadline: explicit (set on the request), run_default "
+            "(the default for runs started inside a task handler) or enclosing (an enclosing "
+            "execution scope). Null when the session predates recorded origins."
+        ),
+    )
+    waiting_counts: bool = Field(
+        description=(
+            "Whether the time this item waits for a person counts against the deadline. "
+            "False when settling it gives the session back the time it had left when it paused."
+        )
+    )
+
+    @classmethod
+    def from_metadata(
+        cls, metadata: Mapping[str, Any], *, top_level: bool
+    ) -> ExecutionDeadlineReport | None:
+        """Report a session's stored deadline; ``None`` when it has none or it can't be read."""
+        try:
+            deadline = deadline_from_metadata(metadata)
+        except ValidationError:
+            return None
+        if deadline.expires_at is None:
+            return None
+        return cls(
+            expires_at=deadline.expires_at,
+            source=deadline.source,
+            origin=deadline.origin,
+            waiting_counts=waiting_for_a_person_counts(deadline, top_level=top_level),
+        )
+
+
+class ExecutionDeadlineRenewal(BaseModel):
+    """The time a session had left when it paused for a person, fixed once per pause.
+
+    Stored with a renewed ``run_default`` deadline, so settling the same pause
+    again (a retry, or a concurrent settle) gives back the same time instead of
+    counting the earlier renewal as time left.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    pause_event_id: str = Field(min_length=1, max_length=256)
+    seconds_left: float = Field(ge=0, allow_inf_nan=False)
+
+
+def renewal_from_metadata(metadata: Mapping[str, Any]) -> ExecutionDeadlineRenewal | None:
+    """The stored renewal record, or ``None`` when there is none or it can't be read."""
+    raw = metadata.get(EXECUTION_DEADLINE_RENEWAL_METADATA_KEY)
+    if raw is None:
+        return None
+    try:
+        return ExecutionDeadlineRenewal.model_validate(raw)
+    except ValidationError:
+        return None
+
+
+def deadline_metadata(deadline: ExecutionDeadline) -> dict[str, Any]:
+    """The session metadata entries that store ``deadline``; empty when unbounded."""
+    if deadline.expires_at is None:
+        return {}
+    entries: dict[str, Any] = {EXECUTION_DEADLINE_METADATA_KEY: deadline.model_dump(mode="json")}
+    if deadline.origin is not None:
+        entries[EXECUTION_DEADLINE_ORIGIN_METADATA_KEY] = deadline.origin
+    return entries
 
 
 @asynccontextmanager

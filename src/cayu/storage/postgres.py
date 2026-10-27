@@ -18,9 +18,11 @@ from cayu.collaboration.peer_content import (
     PeerContentExposureRequest,
     PeerContentReceipt,
 )
+from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineRenewal
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.session_metadata import SummaryTone, summary_metadata
+from cayu.sessions import _deadline_replacement as deadline_replacement
 from cayu.sessions import creation_fence
 from cayu.sessions._access_rules import runtime_session_mutation, runtime_session_query
 from cayu.sessions._closure_records import (
@@ -2460,6 +2462,65 @@ class PostgresSessionStore(
                     require_invocation_lifecycle_release_capacity(
                         await self._load_checkpoint(cur, session_id),
                         loaded,
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+            return loaded
+
+    async def replace_execution_deadline(
+        self,
+        session_id: str,
+        deadline: ExecutionDeadline,
+        *,
+        expected_session_instance_id: str | None,
+        expected_run_epoch: int,
+        renewal: ExecutionDeadlineRenewal | None = None,
+    ) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        deadline, renewal = deadline_replacement.require_replacement_deadline(deadline, renewal)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT run_epoch, instance_id, status, metadata FROM cayu_sessions "
+                        "WHERE id = %s FOR UPDATE",
+                        (session_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch_value(session_id, row[0])
+                    deadline_replacement.require_execution_deadline_replacement(
+                        session_id,
+                        status=SessionStatus(row[2]),
+                        session_instance_id=row[1],
+                        run_epoch=row[0],
+                        expected_session_instance_id=expected_session_instance_id,
+                        expected_run_epoch=expected_run_epoch,
+                    )
+                    new_metadata = deadline_replacement.metadata_with_execution_deadline(
+                        pg_support._json_obj(row[3]), deadline, renewal
+                    )
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET metadata = %s, updated_at = %s WHERE id = %s",
+                        (
+                            pg_support._dumps(new_metadata),
+                            await self._session_store_now(cur),
+                            session_id,
+                        ),
+                    )
+                    loaded = await self._load(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    from cayu.sessions._invocation_lifecycle import (
+                        require_invocation_lifecycle_release_capacity,
+                    )
+
+                    require_invocation_lifecycle_release_capacity(
+                        await self._load_checkpoint(cur, session_id), loaded
                     )
                 await conn.commit()
             except Exception:
@@ -6242,7 +6303,10 @@ class PostgresSessionStore(
         )
         session_columns += (
             ", cayu_sessions.metadata -> 'cayu:runtime_build_provenance' "
-            "AS runtime_build_provenance, cayu_sessions.instance_id"
+            "AS runtime_build_provenance, cayu_sessions.instance_id, "
+            "cayu_sessions.metadata -> 'cayu:execution_deadline' AS execution_deadline, "
+            "cayu_sessions.metadata ->> 'cayu:execution_deadline_origin' "
+            "AS execution_deadline_origin"
         )
         candidate_select_sql = cast(
             "LiteralString",

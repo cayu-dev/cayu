@@ -2229,6 +2229,17 @@
           "event": {
             "$ref": "#/components/schemas/ApiEventRecord"
           },
+          "execution_deadline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionDeadlineReport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's stored execution deadline; null when it has none. Settling after it passes is refused unless waiting_counts is false; a settle from code can pass a new execution_deadline."
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -21754,6 +21765,50 @@
         "title": "ExecutionDeadline",
         "type": "object"
       },
+      "ExecutionDeadlineReport": {
+        "additionalProperties": false,
+        "description": "A paused session's stored execution deadline, as the inbox and pending actions show it.",
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "enum": [
+                  "explicit",
+                  "run_default",
+                  "enclosing"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the session got the deadline: explicit (set on the request), run_default (the default for runs started inside a task handler) or enclosing (an enclosing execution scope). Null when the session predates recorded origins.",
+            "title": "Origin"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "waiting_counts": {
+            "description": "Whether the time this item waits for a person counts against the deadline. False when settling it gives the session back the time it had left when it paused.",
+            "title": "Waiting Counts",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "expires_at",
+          "source",
+          "waiting_counts"
+        ],
+        "title": "ExecutionDeadlineReport",
+        "type": "object"
+      },
       "ExecutionEvidenceOverride": {
         "additionalProperties": false,
         "description": "A capability-specific minimum that overrides the workload default.",
@@ -23523,6 +23578,17 @@
               }
             ],
             "title": "Detail"
+          },
+          "execution_deadline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionDeadlineReport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The paused session's execution deadline, for approvals and questions; null when it has none. Settling after it passes is refused unless waiting_counts is false."
           },
           "id": {
             "title": "Id",

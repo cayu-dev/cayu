@@ -49,6 +49,7 @@ from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.configuration import MAX_STEPS
 from cayu.context.structured_output import StructuredOutputSpec, copy_structured_output_spec
 from cayu.context.thinking import ThinkingConfig
+from cayu.deadlines import ExecutionDeadline
 from cayu.events import Event, EventType
 from cayu.execution_units import ToolRoundIdentity
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
@@ -92,6 +93,10 @@ class ToolApprovalRequest(BaseModel):
     to ``None``, which means "inherit the original run's configuration" as
     persisted on the pending approval checkpoint. An explicit value is accepted
     only when it preserves the invocation's frozen execution profile.
+    ``execution_deadline`` gives the session a new execution deadline, admitted
+    like a new run's, before it continues; ``None`` keeps the stored one. A
+    top-level session whose deadline was the default for runs started inside a
+    task handler gets back the time it had left when it paused without it.
     """
 
     model_config = ConfigDict(
@@ -117,6 +122,11 @@ class ToolApprovalRequest(BaseModel):
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     resolved_by: ResolutionActor | None = None
+    # A new execution deadline for the session, admitted before it continues. It
+    # replaces the stored one; ``None`` keeps it (see ``ExecutionDeadlineReport``).
+    execution_deadline: ExecutionDeadline | None = Field(
+        default=None, repr=False, exclude_if=lambda value: value is None
+    )
     max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -985,6 +995,12 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
         decision=request.decision,
         arguments=copy_approved_tool_arguments(request.arguments),
         **_copy_approval_resume_fields(request),
+        # Omitted stays omitted, so the copy's explicit fields match the caller's.
+        **(
+            {}
+            if request.execution_deadline is None
+            else {"execution_deadline": request.execution_deadline}
+        ),
     )
 
 

@@ -12,9 +12,10 @@ from cayu._validation import (
     copy_session_metadata,
 )
 from cayu.deadlines import (
-    EXECUTION_DEADLINE_METADATA_KEY,
+    EXECUTION_DEADLINE_METADATA_KEYS,
     ExecutionDeadline,
     current_execution_deadline,
+    deadline_metadata,
     effective_deadline,
 )
 from cayu.execution_profiles import (
@@ -124,7 +125,7 @@ def session_metadata_for_creation(
     reject_session_display_metadata(copied)
     if prepared_request is not None and prepared_request.title is not None:
         copied[TITLE_METADATA_KEY] = validate_title(prepared_request.title)
-    if EXECUTION_DEADLINE_METADATA_KEY in copied:
+    if any(key in copied for key in EXECUTION_DEADLINE_METADATA_KEYS):
         raise ValueError("Session metadata contains runtime-owned deadline authority.")
     boundary = effective_deadline(
         execution_deadline or ExecutionDeadline(),
@@ -149,8 +150,7 @@ def session_metadata_for_creation(
             raise ValueError("Prepared session creation authority changed.")
     else:
         boundary.require_admission("session_creation")
-    if boundary.expires_at is not None:
-        copied[EXECUTION_DEADLINE_METADATA_KEY] = boundary.model_dump(mode="json")
+    copied.update(deadline_metadata(boundary))
     if EXECUTION_PROFILE_METADATA_KEY in copied:
         raise ValueError("Session metadata contains runtime-owned execution-profile authority.")
     if RUNTIME_BUILD_PROVENANCE_METADATA_KEY in copied:

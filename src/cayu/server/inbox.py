@@ -27,6 +27,7 @@ from cayu.approvals.actors import ResolutionActorSource
 from cayu.approvals.review import HumanReviewReference
 from cayu.approvals.revisions import ApprovalRevision
 from cayu.approvals.tools import copy_approved_tool_arguments
+from cayu.deadlines import ExecutionDeadlineReport
 from cayu.server.auth import AuthContext
 
 InboxItemKind = Literal["approval", "question", "recovery", "knowledge"]
@@ -102,6 +103,14 @@ class InboxItem(_InboxModel):
     knowledge: InboxKnowledgeEntry | None = None
     decisions: list[InboxDecision] = Field(
         description="What this item accepts; empty when it is settled elsewhere."
+    )
+    execution_deadline: ExecutionDeadlineReport | None = Field(
+        default=None,
+        description=(
+            "The paused session's execution deadline, for approvals and questions; null "
+            "when it has none. Settling after it passes is refused unless waiting_counts "
+            "is false."
+        ),
     )
 
 

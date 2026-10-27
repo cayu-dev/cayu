@@ -2588,6 +2588,8 @@ def _serialize_pending_action(
         payload[response_field] = public_event_linkage_id(reference.sequence, event_field)
     payload["session"] = _serialize_session_base(cayu_app, action.session)
     payload["event"] = _serialize_event_record(cayu_app, action.event)
+    deadline = action.session.execution_deadline
+    payload["execution_deadline"] = None if deadline is None else deadline.model_dump(mode="json")
     return payload
 
 

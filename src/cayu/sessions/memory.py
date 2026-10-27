@@ -36,6 +36,7 @@ from cayu.collaboration.peer_content import (
     PeerContentExposureRequest,
     PeerContentReceipt,
 )
+from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineRenewal
 from cayu.events import Event, EventType, copy_event
 from cayu.execution_profiles import (
     ExecutionProfileDecision,
@@ -74,6 +75,7 @@ from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _child_lifecycle_rules as child_lifecycle_rules
 from cayu.sessions import _closure_records as closure_records
 from cayu.sessions import _completion_finalization as completion_finalization
+from cayu.sessions import _deadline_replacement as deadline_replacement
 from cayu.sessions import _execution_profile_rules as session_profile_rules
 from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _interaction_transitions as interaction_rules
@@ -2862,6 +2864,48 @@ class InMemorySessionStore(
             metadata,
             _access_bounds=_access_bounds,
         )
+
+    async def replace_execution_deadline(
+        self,
+        session_id: str,
+        deadline: ExecutionDeadline,
+        *,
+        expected_session_instance_id: str | None,
+        expected_run_epoch: int,
+        renewal: ExecutionDeadlineRenewal | None = None,
+    ) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        deadline, renewal = deadline_replacement.require_replacement_deadline(deadline, renewal)
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            invocation_scope._assert_session_run_epoch(session_id, session)
+            deadline_replacement.require_execution_deadline_replacement(
+                session_id,
+                status=session.status,
+                session_instance_id=session.instance_id,
+                run_epoch=session.run_epoch,
+                expected_session_instance_id=expected_session_instance_id,
+                expected_run_epoch=expected_run_epoch,
+            )
+            updated = session.model_copy(
+                update={
+                    "metadata": deadline_replacement.metadata_with_execution_deadline(
+                        session.metadata, deadline, renewal
+                    ),
+                    "updated_at": self._ownership_clock(),
+                }
+            )
+            from cayu.sessions._invocation_lifecycle import (
+                require_invocation_lifecycle_release_capacity,
+            )
+
+            require_invocation_lifecycle_release_capacity(
+                self._checkpoints.get(session_id), updated
+            )
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
 
     async def _update_display_or_user_metadata(
         self,

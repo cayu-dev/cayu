@@ -2,12 +2,51 @@
 
 ## Unreleased
 
+Upgrade: a session that a task handler started without its own
+`execution_deadline`, and that pauses for an approval or a question, no longer
+expires while it waits for the person. To keep the old behavior for a run, pass
+`execution_deadline=current_handler_time_limit().run_deadline()`. Sessions
+paused before the upgrade have no recorded origin and keep their stored
+deadline; settle them with a new `execution_deadline` from code. Regenerate HTTP
+clients for the new `execution_deadline` field on inbox items and pending
+actions. Out-of-tree `SessionStore` implementations need
+`replace_execution_deadline(...)` for explicit deadline replacements and automatic
+renewal after a human wait. Without it, ordinary continuations keep enforcing
+the stored deadline; explicit replacements raise `NotImplementedError`.
+
 Upgrade: refresh optional dependencies and rebuild custom dashboards to pick up
 the patched dependency versions. No storage migration is required.
 
 ### Breaking changes
 
-None.
+- When a person settles an approval or answers a question on a top-level
+  session whose deadline was the default for runs started inside a task handler
+  (`default_run_deadline`, which `run_task_worker(execution_timeout_s=...)`
+  binds), the session gets back the time it had left when it paused, counted
+  from the decision. Before, the wait counted against the handler's limit, so
+  an approval raised in a handler expired with the handler and lowering
+  `execution_timeout_s` shrank the approval window by the same amount. Explicit
+  deadlines, enclosing-scope deadlines and child sessions are unchanged.
+
+### Changes
+
+- Sessions record how they got their execution deadline:
+  `Session.execution_deadline.origin` is `explicit`, `run_default` or
+  `enclosing`, stored next to the deadline as `cayu:execution_deadline_origin`.
+- `ResumeRequest`, `ToolApprovalRequest` and `UserInputResponse` take
+  `execution_deadline`. It is admitted like a new run's deadline (refused when
+  already expired or longer than an enclosing scope) and replaces the session's
+  stored deadline through the new `SessionStore.replace_execution_deadline`,
+  which the memory, SQLite and PostgreSQL stores implement. Work-attempt
+  admission refuses a `ResumeRequest` that carries one.
+- Inbox items and `GET /api/pending-actions` actions carry `execution_deadline`
+  (`expires_at`, `source`, `origin`, `waiting_counts`), also on
+  `PendingActionSession.execution_deadline`.
+- `ExecutionDeadlineExceeded` names the deadline's expiry, origin and source,
+  for example "Execution deadline expired before execution; the deadline was
+  2026-10-26T22:37:00Z, the default for runs started inside a task handler
+  (source task_worker)." The inbox's 409 for an expired deadline carries this
+  message.
 
 ### Fixes
 

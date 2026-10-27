@@ -5,6 +5,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_label_map
+from cayu.deadlines import (
+    EXECUTION_DEADLINE_METADATA_KEY,
+    EXECUTION_DEADLINE_ORIGIN_METADATA_KEY,
+    ExecutionDeadlineReport,
+)
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
 from cayu.sessions.queries import SessionOrder
 from cayu.sessions.records import (
@@ -152,6 +157,17 @@ def pending_action_session_from_row(
         created_at=to_utc(row[10]),
         updated_at=to_utc(row[11]),
         labels=copy_label_map(labels, "labels"),
+        execution_deadline=ExecutionDeadlineReport.from_metadata(
+            {
+                key: value
+                for key, value in (
+                    (EXECUTION_DEADLINE_METADATA_KEY, row[14]),
+                    (EXECUTION_DEADLINE_ORIGIN_METADATA_KEY, row[15]),
+                )
+                if value is not None
+            },
+            top_level=row[4] is None,
+        ),
     )
 
 

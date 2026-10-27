@@ -379,6 +379,7 @@ from cayu.runtime._checkpoint_store import (
 )
 from cayu.runtime._compaction.automatic import AutomaticCompaction
 from cayu.runtime._compaction.explicit import SessionCompaction
+from cayu.runtime._continuation_deadline import prepare_continuation_deadline
 from cayu.runtime._continuation_task_failure import ApprovalTaskFailureIdentity
 from cayu.runtime._delegated_event_stream import (
     _close_delegated_event_stream as _close_delegated_event_stream,
@@ -6949,14 +6950,16 @@ class CayuApp(WorkflowEntrances):
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
-        if (
-            "execution_deadline" not in request.model_fields_set
-            and request.parent_session_id is None
-        ):
+        if "execution_deadline" in request.model_fields_set:
+            request = request.model_copy(
+                update={"execution_deadline": request.execution_deadline.with_origin("explicit")}
+            )
+        elif request.parent_session_id is None:
             request = request.model_copy(
                 update={
                     "execution_deadline": effective_deadline(
-                        request.execution_deadline, new_run_execution_deadline()
+                        request.execution_deadline.with_origin("enclosing"),
+                        new_run_execution_deadline(),
                     )
                 }
             )
@@ -6967,9 +6970,10 @@ class CayuApp(WorkflowEntrances):
             if request.parent_session_id is not None
             else None
         )
+        enclosing = current_execution_deadline()
         boundary = effective_deadline(
             request.execution_deadline,
-            current_execution_deadline(),
+            enclosing.with_origin("enclosing") if parent is None else enclosing,
             parent.execution_deadline if parent is not None else ExecutionDeadline(),
         )
         boundary.require_admission("child_run" if parent is not None else "run")
@@ -7102,6 +7106,10 @@ class CayuApp(WorkflowEntrances):
         await ensure_session_environment(self, stored)
         request = self._with_application_run_defaults(request, stored)
         request = _validate_resume_request(request)
+        if stored is not None:
+            stored = await prepare_continuation_deadline(
+                self, stored, request, participant_context=participant_context
+            )
         boundary = resumed_execution_deadline(
             stored.execution_deadline if stored is not None else ExecutionDeadline()
         )
@@ -9083,6 +9091,10 @@ class CayuApp(WorkflowEntrances):
                 session, participant_context=participant_context
             ):
                 yield event
+        if session is not None:
+            session = await prepare_continuation_deadline(
+                self, session, response, participant_context=participant_context
+            )
         session_id = response.session_id
         task_worker_id = response.task_worker_id
         task_handoff_id = response.task_handoff_id
@@ -9415,6 +9427,10 @@ class CayuApp(WorkflowEntrances):
                 session, participant_context=participant_context
             ):
                 yield event
+        if session is not None:
+            session = await prepare_continuation_deadline(
+                self, session, request, participant_context=participant_context
+            )
         session_id = request.session_id
         task_worker_id = request.task_worker_id
         task_handoff_id = request.task_handoff_id

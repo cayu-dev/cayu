@@ -10525,7 +10525,7 @@ estimated-cost bound. Add count limits only when the application needs them.
 
 | Setting | Default and meaning |
 | --- | --- |
-| `execution_deadline` | Unbounded unless supplied; cancels in-flight work when its absolute deadline expires. Continuations inherit it, including time spent waiting for a person. An omitted value takes the enclosing `execution_deadline_scope`, or at run admission the default set by `default_run_deadline(...)` (which `run_task_worker(execution_timeout_s=...)` applies to each handler call); an explicit value replaces that default. Inside a `HandlerTimeLimit` (which `run_task_worker(execution_timeout_s=...)` puts around each handler call), a new top-level run is refused once the limit has passed, whatever its own deadline. |
+| `execution_deadline` | Unbounded unless supplied; cancels in-flight work when its absolute deadline expires. Continuations inherit it, including time spent waiting for a person, unless the session is top-level and its deadline was the `default_run_deadline(...)` default (origin `run_default`): settling its approval or question gives it back the time it had left when it paused. An omitted value takes the enclosing `execution_deadline_scope`, or at run admission the default set by `default_run_deadline(...)` (which `run_task_worker(execution_timeout_s=...)` applies to each handler call); an explicit value replaces that default. `ResumeRequest`, `ToolApprovalRequest` and `UserInputResponse` accept `execution_deadline` to replace a stored deadline before continuing. Inside a `HandlerTimeLimit` (which `run_task_worker(execution_timeout_s=...)` puts around each handler call), a new top-level run is refused once the limit has passed, whatever its own deadline. |
 | `budget_limits` | No request budget; estimates cost from recorded usage and the selected price book. Existing policy budgets and reservations still apply. |
 | `max_steps` | 1,000 for interactive SDK runs; no cap for task-backed SDK runs unless explicitly configured. HTTP runs and product services use the application cap (1,000 by default). `None` disables it. |
 | `limits.max_tool_calls` | `None`, meaning no call-count cap. |
@@ -13144,19 +13144,41 @@ for descendant Runtime calls. Model exposure is intentional: append
 boundary from a context policy. This text explicitly reports time **at context
 construction**; it is not a live model-side clock. Rebuild it when fresh context is needed.
 
-The effective expiry is immutable for a session/workflow lifetime. Model retries,
-workflow retries of a failed child, queued continuations, and resumed sessions do not
-receive a fresh duration. A shorter scope cannot be attached transiently to an existing
-session/workflow on resume: that request is rejected; create a new descendant execution
-with the shorter boundary. A longer scope cannot extend the stored expiry. Completed
+The effective expiry is fixed for a session/workflow lifetime unless a caller replaces
+it. Model retries, workflow retries of a failed child, queued continuations, and resumed
+sessions do not receive a fresh duration. A shorter scope cannot be attached transiently
+to an existing session/workflow on resume: that request is rejected; create a new
+descendant execution with the shorter boundary. A longer scope cannot extend the stored
+expiry. Two things replace it between runs. A `ResumeRequest`, `ToolApprovalRequest`
+or `UserInputResponse` with `execution_deadline` stores that deadline (origin
+`explicit`) after the same admission a new run's deadline gets: it is refused when it
+has already passed or when an enclosing scope is shorter. And when a person settles an
+approval or answers a question on a top-level session whose deadline came from
+`default_run_deadline(...)` (origin `run_default`), the Runtime stores a deadline that
+leaves the wait out: the settle time plus what was left when the session paused,
+never later than an enclosing scope. What was left is fixed the first time a pause is
+settled and kept in `cayu:execution_deadline_renewal`, so retrying the same settle
+gives back the same time. Nothing is replaced unless the request matches the session
+as it is now: a resume's `expected_run_epoch` and `expected_session_instance_id`, and
+the exact approval or question a settle names. Only the subject that owns the session
+may replace its deadline. Explicit and `enclosing` deadlines, child
+sessions, and sessions whose origin was not recorded keep their stored expiry. Completed
 workflow step replay remains a read of durable results; unresolved child effects still
 follow the existing recovery path and are never redispatched because time ran out.
 
 The built-in memory, SQLite, and PostgreSQL stores persist the boundary in Runtime-owned
 `cayu:execution_deadline` metadata at session creation, composing the parent inside that
-creation transaction. User metadata updates cannot replace it. `Session.execution_deadline`
-restores the typed value. Store adapters must pass `execution_deadline` and the loaded
-`parent_session` to `session_metadata_for_creation`. Workflow journal adapters must retain
+creation transaction, and how the session got it (`explicit`, `run_default` or
+`enclosing`) in `cayu:execution_deadline_origin`. User metadata updates cannot replace
+either. `Session.execution_deadline` restores the typed value with its `origin`, and
+`ExecutionDeadlineExceeded` names the expiry, origin and source in its message. Store
+adapters must pass `execution_deadline` and the loaded `parent_session` to
+`session_metadata_for_creation`, and implement `replace_execution_deadline(session_id,
+deadline, expected_session_instance_id=..., expected_run_epoch=...)`, which commits only
+while the session is the incarnation and run epoch read and no run is pending, running
+or interrupting. An adapter that cannot replace deadlines raises `NotImplementedError`
+before mutation. Automatic renewal then falls back to the stored deadline, including
+its expiry; an explicit replacement request still raises. Workflow journal adapters must retain
 the anchor's expiry for durable resume; ephemeral custom journals do not establish
 cross-process recovery authority.
 

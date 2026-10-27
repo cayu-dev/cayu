@@ -54,6 +54,7 @@ from cayu.budgets.usage import (
     UsageMetrics,
 )
 from cayu.configuration import MAX_STEPS
+from cayu.deadlines import ExecutionDeadlineReport
 from cayu.environments.lifecycle import EnvironmentLifecyclePolicy
 from cayu.environments.snapshots import ExecutionSnapshotCapability, ExecutionSnapshotInspection
 from cayu.evals.calibration import (
@@ -2654,6 +2655,14 @@ class ApiPendingAction(ApiBaseModel):
     options: list[str] = Field(default_factory=list)
     arguments: dict[str, Any] | None = None
     delegated_action: DelegatedActionReference | None = None
+    execution_deadline: ExecutionDeadlineReport | None = Field(
+        default=None,
+        description=(
+            "The session's stored execution deadline; null when it has none. Settling "
+            "after it passes is refused unless waiting_counts is false; a settle from "
+            "code can pass a new execution_deadline."
+        ),
+    )
 
 
 class ApiPendingActionIssue(ApiBaseModel):

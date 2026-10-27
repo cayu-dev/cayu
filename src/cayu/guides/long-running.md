@@ -219,12 +219,12 @@ Without `execution_timeout_s`, a hung call stays claimed. Which limit ends what:
 A delivery still running at the limit is cancelled and may or may not have
 happened, so make it idempotent. Don't catch `asyncio.CancelledError`: a
 handler that keeps running keeps its task claimed, with a `task_handler_timeout`
-cancellation request, until it returns. A run that pauses for a person returns,
-so the wait does not count; give it an `execution_deadline` that covers the
-wait. Without `run_task_worker`, wrap the handler in `async with
-HandlerTimeLimit(300, grace_s=30):` and fail the task on
-`ExecutionDeadlineExceeded`. The generated timer worker sets no limit, so the
-sessions it continues inline follow their own deadlines.
+cancellation request, until it returns. A run that pauses for a person returns;
+settling gives a run without its own `execution_deadline` back the time it had
+left, while an explicit deadline keeps running (settle with a new one). Without
+`run_task_worker`, wrap the handler in `async with HandlerTimeLimit(300, grace_s=30):`
+and fail the task on `ExecutionDeadlineExceeded`. The generated timer worker sets
+no limit, so the sessions it continues inline follow their own deadlines.
 
 ## Spend cap
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -157,14 +158,47 @@ def test_elapsed_must_be_finite_and_non_negative(elapsed: object) -> None:
         )
 
 
-def test_model_step_stops_rate_limit_retries_when_the_budget_is_spent() -> None:
+@pytest.mark.parametrize(("attempt_elapsed_s", "expected_calls"), [(0.1, 3), (0.3, 1)])
+def test_model_step_stops_rate_limit_retries_when_the_budget_is_spent(
+    monkeypatch, attempt_elapsed_s: float, expected_calls: int
+) -> None:
+    from cayu.runtime import _model_step_executor
+
+    elapsed_s = 0.0
+    waits: list[float] = []
+
+    async def advance_retry_clock(delay: float) -> None:
+        nonlocal elapsed_s
+        waits.append(delay)
+        elapsed_s += delay
+        await asyncio.sleep(0)
+
+    # Control only the executor's retry clock and sleeps, leaving the real event
+    # loop and other runtime timeouts alone. A slow first attempt may legitimately
+    # spend the whole budget before any retry, regardless of machine load.
+    monkeypatch.setattr(
+        _model_step_executor,
+        "asyncio",
+        SimpleNamespace(
+            **(
+                vars(asyncio)
+                | {
+                    "get_running_loop": lambda: SimpleNamespace(time=lambda: elapsed_s),
+                    "sleep": advance_retry_clock,
+                }
+            )
+        ),
+    )
+
     class RateLimitedProvider(ModelProvider):
         name = "fake"
         calls = 0
 
         async def stream(self, request):
             del request
+            nonlocal elapsed_s
             self.calls += 1
+            elapsed_s += attempt_elapsed_s
             raise ModelProviderError("rate limited", provider="fake", status_code=429)
             yield ModelStreamEvent.completed({})  # pragma: no cover
 
@@ -195,9 +229,10 @@ def test_model_step_stops_rate_limit_retries_when_the_budget_is_spent() -> None:
     errors = [event for event in events if event.type is EventType.MODEL_ERROR]
     retries = [event for event in events if event.type is EventType.MODEL_RETRY]
 
-    # Without the budget the step would make all 50 attempts; the budget ends
-    # it after about 0.3 s.
-    assert 2 <= provider.calls < 50
+    # Without the elapsed-time budget the step would make all 50 attempts.
+    assert provider.calls == expected_calls
+    assert len(retries) == expected_calls - 1
+    assert waits == [retry.payload["delay_seconds"] for retry in retries]
     assert errors[-1].payload["retry_disposition"] == "configured_attempt_exhaustion"
     assert errors[-1].payload["effective_max_attempts"] == provider.calls
     assert all(retry.payload["delay_seconds"] > 0 for retry in retries)

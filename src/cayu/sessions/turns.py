@@ -49,7 +49,11 @@ async def send_turn(
     await app._require_participant_execution(session, context)
     if session.agent_name != native.agent_name:
         raise ValueError("agent_name must match the existing session's agent.")
-    creation_only = set(RunRequest.model_fields) - set(ResumeRequest.model_fields) - {"agent_name"}
+    # A turn's deadline bounds a new session only; an existing session keeps its
+    # own, and replacing it is an explicit ResumeRequest.execution_deadline.
+    creation_only = (
+        set(RunRequest.model_fields) - set(ResumeRequest.model_fields) - {"agent_name"}
+    ) | {"execution_deadline"}
     supplied = creation_only & supplied_fields
     if native.labels:
         supplied.add("labels")
@@ -61,7 +65,8 @@ async def send_turn(
         )
     values = {
         name: getattr(native, name)
-        for name in RunRequest.model_fields.keys() & ResumeRequest.model_fields.keys()
+        for name in (RunRequest.model_fields.keys() & ResumeRequest.model_fields.keys())
+        - creation_only
     }
     values["expected_session_instance_id"] = session.instance_id
     values["expected_run_epoch"] = session.run_epoch
@@ -70,7 +75,7 @@ async def send_turn(
     object.__setattr__(
         resume,
         "__pydantic_fields_set__",
-        (supplied_fields & ResumeRequest.model_fields.keys())
+        (supplied_fields & ResumeRequest.model_fields.keys() - creation_only)
         | {"expected_session_instance_id", "expected_run_epoch"},
     )
     return await _run_to_completion(app, resume, context=context, propagate_exceptions=True)

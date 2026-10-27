@@ -175,7 +175,8 @@ def validate_gate_restoration_request(record, request, *, redactor) -> None:
 
 
 def _gate_request_projection(request, redactor):
-    projection = request.model_dump(mode="json", exclude={"review_reference"})
+    # A replacement deadline is applied before the decision; it is not part of it.
+    projection = request.model_dump(mode="json", exclude={"review_reference", "execution_deadline"})
     for field in ("metadata", "reason", "answer", "structured", "artifacts"):
         if field in projection:
             projection[field] = redactor.redact_json_values(projection[field])

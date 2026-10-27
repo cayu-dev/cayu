@@ -4911,9 +4911,9 @@ def test_worker_settles_expired_published_proposal(backend, fault, tmp_path, mon
                             expired.value.exceptions[0] if expiry_stop_failure else expired.value
                         )
                         assert type(primary) is RuntimeError
-                        assert str(primary) == (
+                        assert str(primary).startswith(
                             "ExecutionDeadlineExceeded: Execution deadline expired "
-                            "before completion_decision."
+                            "before completion_decision; the deadline was "
                         )
                         assert decision_writes == []
                     if fault == "live_verifier":

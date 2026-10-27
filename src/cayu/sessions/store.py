@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, overload
 from cayu.session_metadata import SummaryTone
 
 if TYPE_CHECKING:
+    from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineRenewal
     from cayu.sessions._invocation_lifecycle import InvocationLifecycleCommand
 from uuid import uuid4
 
@@ -5425,6 +5426,35 @@ class SessionStore(ABC):
         ``NotImplementedError`` so out-of-tree stores keep working.
         """
         raise NotImplementedError("This SessionStore does not support update_metadata.")
+
+    async def replace_execution_deadline(
+        self,
+        session_id: str,
+        deadline: ExecutionDeadline,
+        *,
+        expected_session_instance_id: str | None,
+        expected_run_epoch: int,
+        renewal: ExecutionDeadlineRenewal | None = None,
+    ) -> Session:
+        """Store a new execution deadline (and its origin) for a session between runs.
+
+        The replacement commits only while the session still has
+        ``expected_session_instance_id`` and ``expected_run_epoch`` (otherwise
+        ``SessionRunFenced``) and no run is pending, running or interrupting
+        (otherwise ``SessionStatusConflict``). An unbounded ``deadline``
+        removes the stored one. ``renewal`` records the pause a renewed
+        ``run_default`` deadline was computed for; any other replacement clears
+        it. The runtime calls this when a resume or a
+        settled approval or question carries ``execution_deadline``, and when a
+        settled pause renews an inherited task-handler deadline, after it has
+        admitted the new deadline.
+
+        Raises ``KeyError`` if the session does not exist. Default raises
+        ``NotImplementedError`` before any mutation when unsupported. The runtime
+        then keeps the stored deadline for automatic renewals; an explicitly
+        requested replacement still raises.
+        """
+        raise NotImplementedError("This SessionStore does not support replace_execution_deadline.")
 
     @abstractmethod
     async def append_transcript_messages(

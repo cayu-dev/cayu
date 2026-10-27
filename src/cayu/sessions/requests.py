@@ -39,7 +39,7 @@ from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.context.structured_output import StructuredOutputSpec, copy_structured_output_spec
 from cayu.context.thinking import ThinkingConfig
 from cayu.deadlines import (
-    EXECUTION_DEADLINE_METADATA_KEY,
+    EXECUTION_DEADLINE_METADATA_KEYS,
     ExecutionDeadline,
     current_execution_deadline,
 )
@@ -341,7 +341,7 @@ class RunRequest(BaseModel):
             (
                 key
                 for key in (
-                    EXECUTION_DEADLINE_METADATA_KEY,
+                    *EXECUTION_DEADLINE_METADATA_KEYS,
                     MODEL_TARGET_PROJECTION_METADATA_KEY,
                     EXECUTION_PROFILE_METADATA_KEY,
                     TOOL_CAPABILITY_CEILING_METADATA_KEY,
@@ -358,7 +358,7 @@ class RunRequest(BaseModel):
         )
         if reserved_key is not None:
             copied.clear()
-            if reserved_key == EXECUTION_DEADLINE_METADATA_KEY:
+            if reserved_key in EXECUTION_DEADLINE_METADATA_KEYS:
                 authority_name = "execution-deadline authority"
             elif reserved_key == MODEL_TARGET_PROJECTION_METADATA_KEY:
                 authority_name = "model-target authority"
@@ -511,6 +511,12 @@ class ResumeRequest(BaseModel):
     read the session advances the epoch, so a caller that inspected a session
     and decided to continue it gets ``SessionRunFenced`` instead of a second
     turn when another process continued it first.
+
+    ``execution_deadline`` gives the session a new execution deadline before it
+    continues, for example after its own passed. It goes through the same
+    admission check as a new run's (refused when already expired or longer
+    than an enclosing ``execution_deadline_scope``) and then replaces the
+    stored deadline for this and later runs. ``None`` keeps the stored one.
     """
 
     model_config = ConfigDict(
@@ -520,6 +526,11 @@ class ResumeRequest(BaseModel):
     )
 
     session_id: str
+    # A new execution deadline for the session, admitted before it continues. It
+    # replaces the stored one, which ``None`` keeps.
+    execution_deadline: ExecutionDeadline | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     # Restrictive optimistic guard: never resume a replacement incarnation.
     expected_session_instance_id: str | None = Field(
         default=None, exclude_if=lambda value: value is None
@@ -599,7 +610,7 @@ class ResumeRequest(BaseModel):
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         copied = copy_durable_metadata(value)
         reject_session_display_metadata(copied)
-        if EXECUTION_DEADLINE_METADATA_KEY in copied:
+        if any(key in copied for key in EXECUTION_DEADLINE_METADATA_KEYS):
             raise ValueError("Session metadata contains runtime-owned deadline authority.")
         return copied
 
@@ -815,7 +826,7 @@ class ForkSessionRequest(BaseModel):
         copied = copy_durable_metadata(value)
         reject_session_display_metadata(copied)
         reserved_authority_kinds = {
-            EXECUTION_DEADLINE_METADATA_KEY: "execution-deadline authority",
+            **dict.fromkeys(EXECUTION_DEADLINE_METADATA_KEYS, "execution-deadline authority"),
             MODEL_TARGET_PROJECTION_METADATA_KEY: "model-target authority",
             EXECUTION_PROFILE_METADATA_KEY: "execution-profile authority",
             TOOL_CAPABILITY_CEILING_METADATA_KEY: "tool-capability-ceiling authority",
@@ -1132,6 +1143,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         raise ValueError("ResumeRequest messages must be a list.")
     copied = ResumeRequest(
         session_id=request.session_id,
+        execution_deadline=request.execution_deadline,
         expected_session_instance_id=request.expected_session_instance_id,
         expected_run_epoch=request.expected_run_epoch,
         task_worker_id=request.task_worker_id,
@@ -1188,6 +1200,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         "structured_output",
         "expected_session_instance_id",
         "expected_run_epoch",
+        "execution_deadline",
     ):
         if field_name not in request.model_fields_set:
             copied_fields_set.discard(field_name)

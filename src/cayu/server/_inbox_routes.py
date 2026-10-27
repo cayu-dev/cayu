@@ -503,6 +503,7 @@ def register_inbox_routes(
             question=projected["question"],
             options=projected["options"],
             decisions=list(INBOX_DECISIONS[kind]),
+            execution_deadline=action.session.execution_deadline,
         )
 
     # ── Approvals, questions and recovery items ──────────────────────────────

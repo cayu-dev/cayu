@@ -289,6 +289,22 @@ non-streaming call, recording the authenticated person:
   and use `recover_user_input`, `recover_tool_approval`, or `recover_tool_round`
   with the corresponding typed recovery request. Never blindly retry the tool.
 
+The paused session's execution deadline is separate from the approval's own
+expiry, and the inbox and pending actions show it as `execution_deadline`. A
+session started in a task handler without its own deadline gets back, when the
+person decides, the time it had left when it paused (`waiting_counts: false`).
+An explicit deadline keeps running while the person decides; once it has passed,
+a settle is refused with `ExecutionDeadlineExceeded` naming the deadline. To
+continue the session anyway, settle from code with a new deadline, admitted like
+a new run's:
+
+```python
+from cayu.deadlines import ExecutionDeadline
+
+app.resolve_tool_approval(ToolApprovalRequest(..., execution_deadline=ExecutionDeadline.after(3600)))
+app.resolve_user_input(UserInputResponse(..., execution_deadline=ExecutionDeadline.after(3600)))
+```
+
 When human review is configured, pass the current review reference; notifications
 cannot replace that authorization/content binding. The CLI demo treats its local
 operator as trusted. It is not an internet-facing authentication handler.
