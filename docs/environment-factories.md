@@ -571,7 +571,7 @@ factory = BrokeredSandboxCodingEnvironmentFactory.from_env(
 | `CAYU_CLOUD_SANDBOX_EGRESS_HOSTS` | With `allowlist`, and only with it: the hosts the sandbox may reach, separated by commas or spaces, for example `pypi.org,files.pythonhosted.org,*.githubusercontent.com`. |
 | `CAYU_CLOUD_SANDBOX_IMAGE` | Catalog image, default `coding-python`. `SandboxBrokerClient.list_images()` lists what the install offers. |
 | `CAYU_CLOUD_SANDBOX_LEASE_SECONDS` | Lease length, 60 to 3600, default 900. |
-| `CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS` | Timeout for one broker request, default 30. |
+| `CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS` | Timeout for one broker request, default 45. A read that waits (`wait_seconds`) gets its wait on top. |
 
 Every install's catalog has `coding-python` (Python with `uv`, `git` and
 ripgrep); an install may also offer `coding-agents`, which adds the Claude Code
@@ -611,8 +611,24 @@ any other change, so put environments elsewhere
 code or the timeout and ends with the last lines of the command's stderr and
 stdout, masked like other setup diagnostics.
 
+On Cayu Cloud a broker request passes the portal (which waits 35 seconds), API
+Gateway (30 seconds) and the broker's own wait for an archive transfer (up to 20
+seconds, inside the gateway's bound). The 45-second default outlasts all of them,
+so the client gets that hop's answer instead of timing out first. A lost or
+retryable answer is retried three times, 0.5, 1 and 2 seconds apart; archive
+reads and writes wait 2, 4 and 8 seconds, so a busy sandbox broker has time to
+catch up. Calls that mustn't be replayed blindly, such as starting a command,
+are still sent once and recovered by the runner.
+
 Each session creates one sandbox. Its lease starts when the sandbox is ready,
-and the factory renews it at a third of the lease length. The factory waits up
+and the factory renews it at a third of the lease length. One renewal call that
+fails outright takes up to about three minutes with the default timeout (four
+attempts and their pauses), so a lease of five minutes or more rides out one
+failed call; the keeper marks the lease lost when it runs out with a renewal
+still unanswered, and the runner stops instead of working past it. When a
+command is abandoned (cancelled, or its start never confirmed), the runner waits
+for a start still in flight, then has 30 seconds to confirm the stop; a cancel
+answered later than that is still read once to confirm it. The factory waits up
 to 330 seconds for the sandbox, since Cloud fails one still provisioning after
 five minutes. Copy-in and copy-back use the broker's archive routes. Copy-in
 uploads the tree in archives of at most 8 MiB. Copy-back reads the changed

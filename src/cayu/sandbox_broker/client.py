@@ -121,7 +121,11 @@ MAX_ARCHIVE_EXCLUDES = 50
 MAX_STDIO_CHUNK_BYTES = 1024 * 1024
 #: The most hosts one ``allowlist`` egress names.
 MAX_EGRESS_HOSTS = 50
-DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
+#: How long one broker request may take. On Cayu Cloud a request crosses the portal
+#: (35 s), API Gateway (30 s) and the broker's own wait (up to 20 s, inside the gateway's
+#: bound), so the client waits longer than the slowest hop and gets that hop's answer
+#: instead of timing out first. The broker contract advertises no wait to derive it from.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 45.0
 #: Worst-case growth of one output byte in the response JSON: a control byte
 #: becomes a six-byte ``\u00XX`` escape. The broker measures each stream's
 #: ``output_limit_bytes`` on that encoded form.
@@ -147,6 +151,11 @@ _SPECIAL_USE_LABELS = frozenset(
     {"alt", "arpa", "home", "internal", "invalid", "local", "localhost", "onion", "test"}
 )
 _RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
+#: The pauses before retrying an archive read or write, which the sandbox's broker
+#: carries out while the request waits (up to 20 s): one that failed may have held that
+#: broker for the whole wait, so the retry gives it time to catch up. Interactive stdio
+#: keeps the quick retries, since a person or an agent waits on each answer.
+_TRANSFER_RETRY_DELAYS_SECONDS = (2.0, 4.0, 8.0)
 #: The pause between attempts once a call retries a broker outage past its quick retries.
 _OUTAGE_RETRY_SECONDS = 1.0
 #: Every code the contract names. A response without one is judged by its status.
@@ -595,7 +604,8 @@ class SandboxBrokerSettings:
 
     ``from_env`` reads ``CAYU_CLOUD_API_URL``, ``CAYU_CLOUD_APPLICATION_ID`` and
     ``CAYU_CLOUD_SANDBOX_TOKEN`` (all required; Cloud injects them into every
-    Agent process) and the optional ``CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS``.
+    Agent process) and the optional ``CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS``
+    (default ``DEFAULT_REQUEST_TIMEOUT_SECONDS``, 45).
     The API URL must be HTTPS; plain HTTP is accepted only for a loopback host.
     """
 
@@ -1190,6 +1200,7 @@ class SandboxBrokerClient:
             params={"path": relative_workspace_path(path) or "."},
             content=data,
             headers={"Content-Type": "application/x-tar"},
+            transfer=True,
         )
         if not isinstance(body, dict):
             raise SandboxBrokerError("Sandbox broker archive upload has an unexpected shape.")
@@ -1229,6 +1240,7 @@ class SandboxBrokerClient:
             url,
             headers={"Accept": "application/x-tar"},
             max_bytes=MAX_ARCHIVE_BYTES + 64 * 1024,
+            transfer=True,
         )
         missing = tuple(
             unquote(item.strip())
@@ -1597,14 +1609,22 @@ class SandboxBrokerClient:
         headers: Mapping[str, str] | None = None,
         timeout_s: float | None = None,
         retry: bool = True,
+        transfer: bool = False,
     ) -> tuple[bytes, httpx.Headers]:
+        """Send one request, retrying a lost or retryable answer unless ``retry`` is false.
+
+        ``transfer`` marks an archive read or write, which the broker carries out
+        while the request waits; it backs off longer between attempts.
+        """
+
         request_headers = {
             "Authorization": f"Bearer {self.settings.token}",
             "Accept": "application/json",
             **(headers or {}),
         }
         timeout = self.settings.request_timeout_s if timeout_s is None else timeout_s
-        attempts = 1 + len(_RETRY_DELAYS_SECONDS) if retry else 1
+        delays = _TRANSFER_RETRY_DELAYS_SECONDS if transfer else _RETRY_DELAYS_SECONDS
+        attempts = 1 + len(delays) if retry else 1
         for attempt in range(attempts):
             try:
                 async with self._http().stream(
@@ -1628,7 +1648,7 @@ class SandboxBrokerClient:
                     response_headers = response.headers
             except httpx.TransportError as exc:
                 if attempt + 1 < attempts:
-                    await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt])
+                    await asyncio.sleep(delays[attempt])
                     continue
                 # A refused connection never reached the broker; anything later might have.
                 raise SandboxBrokerUnavailableError(
@@ -1639,7 +1659,7 @@ class SandboxBrokerClient:
                 return bytes(body), response_headers
             error = _broker_error(status, bytes(body))
             if isinstance(error, SandboxBrokerUnavailableError) and attempt + 1 < attempts:
-                await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt])
+                await asyncio.sleep(delays[attempt])
                 continue
             raise error
         raise AssertionError("unreachable broker retry loop")

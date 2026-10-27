@@ -130,6 +130,17 @@ storage migration.
 
 ### Fixes
 
+- The sandbox broker client waits 45 seconds for a request by default, up from
+  30 (`CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS` still overrides it). On Cayu
+  Cloud a request may take as long as the portal's 35-second wait, so the old
+  default timed out first whenever a request queued, and the `ReadTimeout`s left
+  runners poisoned (`runner_poisoned [missing_final_evidence]`). Archive reads
+  and writes now retry after 2, 4 and 8 seconds instead of 0.5, 1 and 2. The
+  wait for an abandoned command's stop now starts once its in-flight start has
+  answered, and a cancel answered after that window is still read once, so a
+  slow broker no longer poisons the runner by itself. The lease keeper marks a
+  lease lost when it runs out with a renewal still unanswered, instead of
+  waiting for the call to give up.
 - A settle that carries `execution_deadline`, or renews a task-handler default,
   stores the new deadline only once the Runtime admits the decision. Before, a
   decision refused afterwards (for example with a stale human-review reference)

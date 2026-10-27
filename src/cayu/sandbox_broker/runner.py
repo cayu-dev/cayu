@@ -95,6 +95,9 @@ BROKERED_SANDBOX_CANDIDATE = "cayu-cloud-sandbox"
 _BUSY_RETRY_SECONDS = 120.0
 _START_RECOVERY_SECONDS = 120.0
 _POLL_RECOVERY_GRACE_SECONDS = 120.0
+#: How long an abandoned command's stop is confirmed for, counted once its start has
+#: answered. A request still in flight at the end may finish (it is bounded by the
+#: client's request timeout), and a cancel that answers late gets one confirming read.
 _CANCEL_SETTLE_SECONDS = 30.0
 _DEFAULT_TIMEOUT_SECONDS = 300
 # A command without a timeout runs until this long before the sandbox's end of
@@ -642,10 +645,14 @@ class BrokeredSandboxRunner(Runner):
 
     async def _cancel_until_finished(self, command_id: str, deadline: float) -> SandboxCommand:
         command = await self._client.cancel_command(self.sandbox.id, command_id)
-        while not command.finished and asyncio.get_running_loop().time() < deadline:
+        # The cancel may answer after the deadline when the broker is slow; it is
+        # still read once, so the stop it caused can be confirmed.
+        while not command.finished:
             command = await self._client.get_command(
                 self.sandbox.id, command_id, wait_seconds=min(5, self.poll_wait_seconds)
             )
+            if asyncio.get_running_loop().time() >= deadline:
+                break
         return command
 
     async def _settle_cancelled(self, command_id: str, dispatch: _Dispatch) -> bool:
@@ -656,16 +663,21 @@ class BrokeredSandboxRunner(Runner):
 
         async def settle() -> bool:
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + _CANCEL_SETTLE_SECONDS
             attempt = dispatch.attempt
             if attempt is None:
                 return True  # Nothing was ever sent.
             if not attempt.done():
-                # Let the in-flight start finish so its outcome is known.
+                # Let the in-flight start finish so its outcome is known. It is one
+                # request, so the client's request timeout bounds it.
                 with contextlib.suppress(BaseException):
-                    await asyncio.wait_for(asyncio.shield(attempt), _CANCEL_SETTLE_SECONDS)
+                    await asyncio.wait_for(
+                        asyncio.shield(attempt),
+                        self._client.settings.request_timeout_s + _CANCEL_SETTLE_SECONDS,
+                    )
             if dispatch.definitively_refused:
                 return True  # Every start was definitively refused.
+            # The stop gets its whole window however long the start took to answer.
+            deadline = loop.time() + _CANCEL_SETTLE_SECONDS
             while loop.time() < deadline:
                 try:
                     command = await self._cancel_until_finished(command_id, deadline)

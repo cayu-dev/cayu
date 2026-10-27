@@ -32,7 +32,16 @@ class SandboxLeaseKeeper:
     broker destroys the sandbox when the lease lapses. A refused renewal (the
     sandbox is gone or no longer ``ready``) or a lease that runs out while the
     broker is unreachable marks the lease lost; ``check`` then raises
-    ``SandboxLeaseLostError`` and ``on_lost`` is called once.
+    ``SandboxLeaseLostError`` and ``on_lost`` is called once. A scheduled
+    renewal still unanswered when the lease runs out by the Agent's clock is
+    abandoned and the lease marked lost, so a slow broker can't keep the
+    runner working past its lease.
+
+    One renewal call that fails outright takes up to four times the client's
+    request timeout plus its retry pauses (about three minutes with the
+    default 45 s). Renewing at a third of the lease leaves two thirds for
+    that and the keeper's own retries, so a lease of five minutes or more
+    rides out one failed call; a shorter one can lapse inside it.
     """
 
     def __init__(
@@ -114,7 +123,7 @@ class SandboxLeaseKeeper:
         while self._lost is None:
             await asyncio.sleep(delay)
             try:
-                await self.renew_now()
+                await self._renew_within_lease()
                 delay = self.renew_every_s
             except SandboxLeaseLostError:
                 return
@@ -129,6 +138,31 @@ class SandboxLeaseKeeper:
                     return
                 _LOGGER.warning("Sandbox lease renewal failed; retrying (%s).", type(exc).__name__)
                 delay = min(_RETRY_AFTER_FAILURE_SECONDS, self.renew_every_s)
+
+    async def _renew_within_lease(self) -> None:
+        while True:
+            expires_at = self.lease_expires_at
+            remaining = (
+                None
+                if expires_at is None
+                else max(0.0, (expires_at - self._clock()).total_seconds())
+            )
+            bound = asyncio.timeout(remaining)
+            try:
+                async with bound:
+                    await self.renew_now()
+                return
+            except TimeoutError:
+                if not bound.expired():
+                    raise
+            # An explicit renew_now() may have extended the lease meanwhile;
+            # then renew again against the new expiry instead of losing it.
+            current = self.lease_expires_at
+            if current is None or current == expires_at or current <= self._clock():
+                self._mark_lost(
+                    SandboxLeaseLostError("Sandbox lease expired before its renewal was answered.")
+                )
+                self.check()
 
     def _first_delay(self) -> float:
         # Schedule against what is left of the lease, not its full length.

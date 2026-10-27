@@ -110,9 +110,10 @@ async def _ready_runner(
     *,
     egress: str = "none",
     egress_hosts: list[str] | None = None,
+    client_settings: dict | None = None,
     **keeper_options,
 ) -> BrokeredSandboxRunner:
-    client = broker.client()
+    client = broker.client(**(client_settings or {}))
     created = await client.create(
         idempotency_key=f"k-{len(broker.sandboxes)}",
         image="coding-python",
@@ -145,6 +146,127 @@ def test_settings_come_from_the_variables_cloud_injects() -> None:
         SandboxBrokerSettings.from_env({**_ENV, "CAYU_CLOUD_API_URL": "http://cloud.example"})
     # Plain HTTP only for a local broker.
     assert SandboxBrokerSettings.from_env({**_ENV, "CAYU_CLOUD_API_URL": "http://127.0.0.1:8080"})
+
+
+def _sleep_recorder(monkeypatch) -> list[float]:
+    """Record the client's retry pauses without waiting them out."""
+
+    pauses: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay: float, *args, **kwargs):
+        pauses.append(delay)
+        await real_sleep(0)
+
+    patched = type(asyncio)("asyncio")
+    patched.__dict__.update(vars(asyncio))
+    patched.sleep = sleep
+    monkeypatch.setattr(client_module, "asyncio", patched)
+    return pauses
+
+
+def test_the_request_timeout_outlasts_clouds_request_chain() -> None:
+    # The portal waits 35 s for API Gateway, which ends a request after 30 s.
+    assert client_module.DEFAULT_REQUEST_TIMEOUT_SECONDS == 45.0
+    assert SandboxBrokerSettings.from_env(_ENV).request_timeout_s == 45.0
+    overridden = {**_ENV, "CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS": " 60 "}
+    assert SandboxBrokerSettings.from_env(overridden).request_timeout_s == 60.0
+    for value in ("soon", "0", "-1", "inf", "nan"):
+        with pytest.raises(ValueError):
+            SandboxBrokerSettings.from_env(
+                {**_ENV, "CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS": value}
+            )
+
+
+@pytest.mark.parametrize("override", [None, 60.0])
+def test_each_request_carries_the_request_timeout(override: float | None, monkeypatch) -> None:
+    _sleep_recorder(monkeypatch)
+    seen: dict[str, float] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen[request.url.path.rsplit("/", 1)[-1]] = request.extensions["timeout"]["read"]
+        if request.url.path.endswith("/renew"):
+            return httpx.Response(503, text="")
+        return httpx.Response(200, json={"command_id": "c1"})
+
+    settings = {} if override is None else {"request_timeout_s": override}
+    client = SandboxBrokerClient(
+        SandboxBrokerSettings(api_url=API_URL, application_id=APPLICATION, token=TOKEN, **settings),
+        transport=httpx.MockTransport(handler),
+    )
+    expected = 45.0 if override is None else override
+
+    async def scenario():
+        with pytest.raises(client_module.SandboxBrokerError):
+            await client.get_command("sbx_1", "c1", wait_seconds=20)
+        with pytest.raises(SandboxBrokerUnavailableError):
+            await client.renew("sbx_1", lease_seconds=60)
+        await client.aclose()
+
+    asyncio.run(scenario())
+    # A waiting read gets its wait on top of the request timeout.
+    assert seen == {"c1": expected + 20, "renew": expected}
+
+
+def test_archive_transfers_back_off_longer_than_other_retries(monkeypatch) -> None:
+    pauses = _sleep_recorder(monkeypatch)
+    sent: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(f"{request.method} {request.url.path.rsplit('/', 1)[-1]}")
+        # The broker's transfer wait ran out; the contract makes the retry safe.
+        return httpx.Response(503, json={"error": {"code": "operation_timed_out"}})
+
+    client = SandboxBrokerClient(
+        SandboxBrokerSettings(api_url=API_URL, application_id=APPLICATION, token=TOKEN),
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def failing(call) -> list[float]:
+        pauses.clear()
+        with pytest.raises(SandboxBrokerUnavailableError):
+            await call
+        return list(pauses)
+
+    async def scenario():
+        transfer = [2.0, 4.0, 8.0]
+        assert await failing(client.put_archive("sbx_1", _tar({"a": b"1"}))) == transfer
+        assert await failing(client.get_archive("sbx_1", paths=["a"])) == transfer
+        # Other calls, interactive stdio included, keep their quick retries.
+        quick = [0.5, 1.0, 2.0]
+        assert await failing(client.renew("sbx_1", lease_seconds=60)) == quick
+        assert await failing(client.write_command_stdin("sbx_1", "c1", offset=0)) == quick
+        assert await failing(client.read_command_stdout("sbx_1", "c1", offset=0)) == quick
+        # A call that must not be replayed is still sent once.
+        sent.clear()
+        assert await failing(client.start_command("sbx_1", "c1", ["true"], retry=False)) == []
+        assert sent == ["POST commands"]
+        await client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_a_lost_transfer_answer_is_retried_with_the_transfer_backoff(monkeypatch) -> None:
+    pauses = _sleep_recorder(monkeypatch)
+    answers = iter([httpx.ReadTimeout("slow"), httpx.ReadTimeout("slow")])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        answer = next(answers, None)
+        if answer is not None:
+            raise answer
+        return httpx.Response(200, json={"files": 1, "bytes": 1})
+
+    client = SandboxBrokerClient(
+        SandboxBrokerSettings(api_url=API_URL, application_id=APPLICATION, token=TOKEN),
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def scenario():
+        assert await client.put_archive("sbx_1", _tar({"a": b"1"})) == {"files": 1, "bytes": 1}
+        await client.aclose()
+
+    asyncio.run(scenario())
+    assert pauses == [2.0, 4.0]
 
 
 def test_factory_from_env_requires_an_explicit_egress_mode(tmp_path: Path) -> None:
@@ -1395,6 +1517,60 @@ def test_a_cancel_overtaking_its_start_waits_for_the_start(
     asyncio.run(scenario())
 
 
+def test_a_start_slower_than_the_settle_window_is_still_cancelled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(runner_module, "_CANCEL_SETTLE_SECONDS", 0.2)
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        broker.start_delay = 0.5
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await asyncio.sleep(0.05)
+        cancellation = await _cancel(task)
+        broker.start_delay = 0.0
+        # The window to confirm the stop starts once the start has answered.
+        assert len(broker.started) == 1 and broker.running() == []
+        assert runner.lifecycle_state == "reusable"
+        assert _receipts(cancellation) == ["completed"]
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_cancel_answered_after_the_settle_window_is_still_confirmed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(runner_module, "_CANCEL_SETTLE_SECONDS", 0.2)
+    broker = FakeBroker(tmp_path / "cloud")
+    transport = broker.transport
+
+    async def slow_cancel(request: httpx.Request) -> httpx.Response:
+        if not (request.method == "POST" and request.url.path.endswith("/cancel")):
+            return await transport(request)
+        # Slower than the window, though well inside the request timeout, and
+        # answered while the process group is still stopping.
+        await asyncio.sleep(0.4)
+        answer = await transport(request)
+        stopping = {**answer.json(), "status": "running", "exit_code": None, "finished_at": None}
+        return httpx.Response(202, json=stopping)
+
+    monkeypatch.setattr(broker, "transport", slow_cancel)
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await asyncio.sleep(0.3)
+        cancellation = await _cancel(task)
+        assert broker.running() == []
+        assert runner.lifecycle_state == "reusable"
+        assert _receipts(cancellation) == ["completed"]
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
 def _lost_then_refused_start(broker: FakeBroker, *, garbled: bool = False) -> SandboxBrokerClient:
     """A transport where the first start applies but its answer is lost, then a 401.
 
@@ -1912,6 +2088,79 @@ def test_the_first_renewal_follows_the_remaining_lease(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_a_renewal_unanswered_when_the_lease_runs_out_loses_the_lease(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    broker = FakeBroker(tmp_path / "cloud")
+    lost: list[SandboxLeaseLostError] = []
+
+    async def hanging_renewal(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/renew"):
+            await asyncio.sleep(30)
+        return await broker.transport(request)
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        sandbox = runner.sandbox.model_copy(
+            update={"lease_expires_at": datetime.now(UTC) + timedelta(seconds=0.3)}
+        )
+        client = SandboxBrokerClient(
+            SandboxBrokerSettings(api_url=API_URL, application_id=APPLICATION, token=TOKEN),
+            transport=httpx.MockTransport(hanging_renewal),
+        )
+        keeper = SandboxLeaseKeeper(client, sandbox, lease_seconds=60, on_lost=lost.append).start()
+        # The renewal is still in flight, well inside the request timeout, when
+        # the lease runs out: the keeper doesn't wait for it.
+        await asyncio.sleep(0.6)
+        assert keeper.lost is not None and not keeper.running
+        assert "before its renewal was answered" in str(keeper.lost)
+        with pytest.raises(SandboxLeaseLostError):
+            keeper.check()
+        await keeper.stop()
+        await client.aclose()
+        await runner.close()
+
+    asyncio.run(scenario())
+    assert len(lost) == 1
+
+
+def test_a_lease_extended_while_a_renewal_hangs_is_not_lost(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    broker = FakeBroker(tmp_path / "cloud")
+    renewals = {"sent": 0}
+
+    async def first_renewal_hangs(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/renew"):
+            renewals["sent"] += 1
+            if renewals["sent"] == 1:
+                await asyncio.sleep(30)
+        return await broker.transport(request)
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        sandbox = runner.sandbox.model_copy(
+            update={"lease_expires_at": datetime.now(UTC) + timedelta(seconds=0.3)}
+        )
+        client = SandboxBrokerClient(
+            SandboxBrokerSettings(api_url=API_URL, application_id=APPLICATION, token=TOKEN),
+            transport=httpx.MockTransport(first_renewal_hangs),
+        )
+        keeper = SandboxLeaseKeeper(client, sandbox, lease_seconds=60).start()
+        await asyncio.sleep(0.15)
+        # The scheduled renewal hangs; an explicit one extends the lease.
+        await keeper.renew_now()
+        await asyncio.sleep(0.4)
+        # Past the old expiry the keeper renews against the new one instead.
+        assert keeper.lost is None and keeper.running
+        assert renewals["sent"] == 3 and keeper.renewals == 2
+        await keeper.stop()
+        await client.aclose()
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
 def test_the_factory_reserves_its_own_labels(tmp_path: Path) -> None:
     broker = FakeBroker(tmp_path / "cloud")
     eight = {f"k{index}": "v" for index in range(8)}
@@ -2357,7 +2606,8 @@ def test_failed_start_cleanup_observes_late_refusal(tmp_path, monkeypatch, earli
     monkeypatch.setattr(runner_module, "_CANCEL_SETTLE_SECONDS", 0)
 
     async def scenario():
-        runner = await _ready_runner(broker)
+        # The start never answers here, so its wait is the request timeout.
+        runner = await _ready_runner(broker, client_settings={"request_timeout_s": 0.05})
         pending = asyncio.Event()
         release = asyncio.Event()
         attempts = 0
