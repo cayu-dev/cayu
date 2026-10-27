@@ -1,0 +1,605 @@
+{
+  "schema_version": 1,
+  "experiment_id": "dashboard-missing-memory-results",
+  "cases": [
+    {
+      "case_id": "memory-case",
+      "case_revision": "sha256:4e6a0fcf6f5302ef3d03e45887b7a3b05d1b889ff13fd2056838c980dd92ba8b"
+    }
+  ],
+  "repetitions": 1,
+  "baseline_variant_id": "baseline",
+  "variants": [
+    {
+      "variant_id": "baseline",
+      "candidate_id": "baseline-candidate",
+      "spec": {
+        "fingerprint": "a05367db6bba8e965b77d1aad9a64948c152df084c19562baf2d4880b1046014",
+        "record_type": "cayu.memory-intervention-spec",
+        "schema_version": 1,
+        "spec_id": "baseline-spec",
+        "snapshot_fingerprint": "a0fb1773045c463845ab9bf6bb7c5423ffc5b1e57b6bfbf332e13bc405322929",
+        "memory_state_fingerprint": "eabaeba1a6f8389363fcdae7f6c5630ebc98ab874453dbad4d7ddacef9b0a7cd",
+        "execution_profile_fingerprint": "c5e7526a42a89db4e36a86f9bf2d2655bc3a4c4dc56da9219e01947d5cba0f3e",
+        "recall_policy_ref_fingerprint": "ef844bc0522674cb4d402225faf449b06844dc101f39d312a6b8ad57a370c769",
+        "starting_recall_policy_fingerprint": "ef844bc0522674cb4d402225faf449b06844dc101f39d312a6b8ad57a370c769",
+        "trial_recall_policy_fingerprint": "ef844bc0522674cb4d402225faf449b06844dc101f39d312a6b8ad57a370c769",
+        "starting_recall_mode": "strong_matches",
+        "trial_recall_mode": "strong_matches",
+        "trial_state_mode": "reset_each_trial",
+        "authority_scope_fingerprint": "8f76fd501bb68ef71f4e276bc28f29bce1003b0c2c9d9478de81b5bfc0cde1e9",
+        "kind": "as_declared",
+        "bounds": {
+          "max_changed_items": 0,
+          "max_fixture_bytes": 0,
+          "max_effect_receipts": 128
+        },
+        "changes": [],
+        "negative_control_kind": null,
+        "proposer_fingerprint": null,
+        "source_fingerprint": null,
+        "reason": null,
+        "evidence_only": true,
+        "production_mutation_allowed": false
+      },
+      "execution_profile": {
+        "schema_version": 1,
+        "revision": "sha256:047060657586a0c0ce0984ece68bbd0425088c745d9d7d8329f46cc2b9c0f881",
+        "profile_id": "explicit",
+        "label": "agent · Explicit",
+        "source": "explicit",
+        "target_key": "refund-agent",
+        "application_release_id": "release-2026-08-06",
+        "app_manifest_fingerprint": "89c0f857205b492a42c985926628a1805349a9b62803bf6d9dc11805c5b7eb4e",
+        "candidate": {
+          "agent_name": "agent",
+          "provider_name": "scripted",
+          "model": "fixture-model",
+          "environment_name": null,
+          "runtime_execution_profile_schema_version": 6,
+          "runtime_execution_profile_fingerprint": "c5e7526a42a89db4e36a86f9bf2d2655bc3a4c4dc56da9219e01947d5cba0f3e"
+        },
+        "target_material": {
+          "schema_version": 1,
+          "kind": "structural_sha256",
+          "fingerprint": "980a32e5350fea0534c16f41a9858f9c89f3287eaab76bdb056c0e74da690f89",
+          "process_scope": null
+        },
+        "fixture_strategy": "none",
+        "reset_strategy": "fresh_session_only",
+        "effect_posture": "ordinary_application_authority",
+        "isolation_revision": null,
+        "evidence_policy": {
+          "schema_version": 1,
+          "revision": "sha256:8033a00d4d12d6b34d720b0d0db1b8e93c92a20fc14b373e79d925d64abe245f",
+          "event_projection": "runtime_public_alias_free_v1",
+          "include_event_payloads": false,
+          "include_transcript_text": false,
+          "include_tool_arguments": true,
+          "include_tool_results": false,
+          "include_artifact_text": false,
+          "max_final_output_chars": 65536,
+          "max_child_sessions": 500,
+          "max_tool_calls": 4096,
+          "max_model_steps": 4096,
+          "max_total_tokens": 9007199254740991
+        },
+        "ceilings": {
+          "max_cases": 1000,
+          "max_trials": 1,
+          "max_concurrency": 1,
+          "max_timeout_seconds": 3600,
+          "max_bootstrap_messages": 16,
+          "max_total_input_chars": 524288,
+          "max_compiled_input_chars": 8388608,
+          "max_steps": 1,
+          "run_limits": {
+            "max_input_tokens": null,
+            "max_output_tokens": null,
+            "max_total_tokens": null,
+            "max_tool_calls": null,
+            "max_elapsed_seconds": null,
+            "scope": "run"
+          }
+        }
+      },
+      "execution_profile_binding": {
+        "schema_version": 1,
+        "profile_revision": "sha256:047060657586a0c0ce0984ece68bbd0425088c745d9d7d8329f46cc2b9c0f881",
+        "runtime_execution_profile": {
+          "schema_version": 6,
+          "fingerprint": "c5e7526a42a89db4e36a86f9bf2d2655bc3a4c4dc56da9219e01947d5cba0f3e",
+          "components": [
+            {
+              "component_class": "application_budget_policy",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "0dd0239f0369b46e241e06cd6902774c910683a99ffe723fee8b6f4e4a311def"
+            },
+            {
+              "component_class": "automatic_recall",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "a0c314a3d5be7700234087b01d421911c3bfb34dc86ae8ce154c64e97c7745d6"
+            },
+            {
+              "component_class": "context_compaction",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "a0c314a3d5be7700234087b01d421911c3bfb34dc86ae8ce154c64e97c7745d6"
+            },
+            {
+              "component_class": "context_selection",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "dd29fa338759e7bd2b83827dba1b9abf5a1d8ab97d945eb3a62faec401395d83"
+            },
+            {
+              "component_class": "direct_tools",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "9004c8a9cacac4c50e256d53812021de3f45d5d3c1150d620783d9044cffa893"
+            },
+            {
+              "component_class": "durable_system_projection",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "685e82ad7cd18cb5b1497ab8d12b95dade6d954d6ae202ff3e261e5c681b805b"
+            },
+            {
+              "component_class": "effect_authority",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "2ce89e63e8a9403e55185ffa7cb15e5e3d2e20261101136976da6bab18516af1"
+            },
+            {
+              "component_class": "egress_authority",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "178c40d6159223c4aec492a141bf06b803d50c261327b4ec3d8ba9beb3a21aab"
+            },
+            {
+              "component_class": "execution_environment",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "db87ca677c497db5077f0c57f5e098862f83569100491922ea59e596a30ccce0"
+            },
+            {
+              "component_class": "execution_policies",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "a6aed165e0cd8af37323fcef64238846ab63af21d420bb8421f1d1aaace76df5"
+            },
+            {
+              "component_class": "finalization",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "4785630fc3a2e1b32d72902c7c86b50af8dd2d380126e98d82b141524f31bfee"
+            },
+            {
+              "component_class": "invocation_budget_policy",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "0dd0239f0369b46e241e06cd6902774c910683a99ffe723fee8b6f4e4a311def"
+            },
+            {
+              "component_class": "invocation_policies",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            },
+            {
+              "component_class": "live_state_projection",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "178c40d6159223c4aec492a141bf06b803d50c261327b4ec3d8ba9beb3a21aab"
+            },
+            {
+              "component_class": "provider_adapter",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "03914a7e4588d094cfe52a560087f1d6900796766431d3adc648bf25a01135ca"
+            },
+            {
+              "component_class": "provider_request_policy",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "7f3787a01af5ad3f762b3ea40610a963f141f5730c9aec457e34d39691703685"
+            },
+            {
+              "component_class": "provider_target",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "6af8e98d750db173f7f4c472755eaf716ac02c31cab29303fa7bf89a19e4a3fe"
+            },
+            {
+              "component_class": "runtime",
+              "strength": "application_versioned",
+              "availability": "available",
+              "fingerprint": "8e1358d1f5e249089b1d3c053075a4406ea076c4c02dedcce44826e801425f2e"
+            },
+            {
+              "component_class": "runtime_hooks",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            },
+            {
+              "component_class": "structured_output",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "178c40d6159223c4aec492a141bf06b803d50c261327b4ec3d8ba9beb3a21aab"
+            },
+            {
+              "component_class": "tool_implementations",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            },
+            {
+              "component_class": "tool_view_grants",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "f716a9975ca04d2eaebc1682e7613949ab219d226d021f81dfad414614fde4f7"
+            }
+          ],
+          "egress_authority": null,
+          "runtime_build_provenance": {
+            "schema_version": 1,
+            "recipe": "cayu.runtime-build-provenance.v1",
+            "origin": "development_source_tree",
+            "availability": "available",
+            "strength": "application_versioned",
+            "fingerprint": "4d44fd5e2f2523d488c7ea333265605077d9116cce405ce471d4ca15ded24770",
+            "artifact_kind": "source_tree",
+            "artifact_digest": "da44fdc7db92adafbd7ce982b41a34a8b11d40c37967b7de00bc4bca193d6f9e",
+            "source_revision": null,
+            "detail_code": null
+          }
+        }
+      },
+      "evaluator_fingerprint": "27f6343f980c4c0ab821d9c72d211d0eb76b0853825cefd80476a05e43cab27e"
+    },
+    {
+      "variant_id": "candidate",
+      "candidate_id": "candidate-1",
+      "spec": {
+        "fingerprint": "4b77d5a870b1b06169326e01f5aa0c28d2a8ce5c40715766e667fe01a4ad18fb",
+        "record_type": "cayu.memory-intervention-spec",
+        "schema_version": 1,
+        "spec_id": "spec-omit",
+        "snapshot_fingerprint": "a0fb1773045c463845ab9bf6bb7c5423ffc5b1e57b6bfbf332e13bc405322929",
+        "memory_state_fingerprint": "eabaeba1a6f8389363fcdae7f6c5630ebc98ab874453dbad4d7ddacef9b0a7cd",
+        "execution_profile_fingerprint": "c5e7526a42a89db4e36a86f9bf2d2655bc3a4c4dc56da9219e01947d5cba0f3e",
+        "recall_policy_ref_fingerprint": "ef844bc0522674cb4d402225faf449b06844dc101f39d312a6b8ad57a370c769",
+        "starting_recall_policy_fingerprint": "ef844bc0522674cb4d402225faf449b06844dc101f39d312a6b8ad57a370c769",
+        "trial_recall_policy_fingerprint": "ef844bc0522674cb4d402225faf449b06844dc101f39d312a6b8ad57a370c769",
+        "starting_recall_mode": "strong_matches",
+        "trial_recall_mode": "strong_matches",
+        "trial_state_mode": "reset_each_trial",
+        "authority_scope_fingerprint": "8f76fd501bb68ef71f4e276bc28f29bce1003b0c2c9d9478de81b5bfc0cde1e9",
+        "kind": "omit_items",
+        "bounds": {
+          "max_changed_items": 1,
+          "max_fixture_bytes": 0,
+          "max_effect_receipts": 128
+        },
+        "changes": [
+          {
+            "kind": "omit",
+            "source_item": {
+              "kind": "fingerprint",
+              "revision_fingerprint": "49f66e9cc78c9951655f2ed880e18bcd0fde21b995fecc6139ef5a6fa0de0533",
+              "alias": null,
+              "item_fingerprint": "923fe53966c6cd9343e11af776cd4b05be315ea4b200b02e4d5dfb0f929b73bf"
+            },
+            "fixture": null
+          }
+        ],
+        "negative_control_kind": null,
+        "proposer_fingerprint": "6c719a94030a6c484bc6e29b04ac4c6d26b5fa504efe0dc439e9ae4654421a90",
+        "source_fingerprint": "41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d",
+        "reason": "measure omission sensitivity",
+        "evidence_only": true,
+        "production_mutation_allowed": false
+      },
+      "execution_profile": {
+        "schema_version": 1,
+        "revision": "sha256:047060657586a0c0ce0984ece68bbd0425088c745d9d7d8329f46cc2b9c0f881",
+        "profile_id": "explicit",
+        "label": "agent · Explicit",
+        "source": "explicit",
+        "target_key": "refund-agent",
+        "application_release_id": "release-2026-08-06",
+        "app_manifest_fingerprint": "89c0f857205b492a42c985926628a1805349a9b62803bf6d9dc11805c5b7eb4e",
+        "candidate": {
+          "agent_name": "agent",
+          "provider_name": "scripted",
+          "model": "fixture-model",
+          "environment_name": null,
+          "runtime_execution_profile_schema_version": 6,
+          "runtime_execution_profile_fingerprint": "c5e7526a42a89db4e36a86f9bf2d2655bc3a4c4dc56da9219e01947d5cba0f3e"
+        },
+        "target_material": {
+          "schema_version": 1,
+          "kind": "structural_sha256",
+          "fingerprint": "980a32e5350fea0534c16f41a9858f9c89f3287eaab76bdb056c0e74da690f89",
+          "process_scope": null
+        },
+        "fixture_strategy": "none",
+        "reset_strategy": "fresh_session_only",
+        "effect_posture": "ordinary_application_authority",
+        "isolation_revision": null,
+        "evidence_policy": {
+          "schema_version": 1,
+          "revision": "sha256:8033a00d4d12d6b34d720b0d0db1b8e93c92a20fc14b373e79d925d64abe245f",
+          "event_projection": "runtime_public_alias_free_v1",
+          "include_event_payloads": false,
+          "include_transcript_text": false,
+          "include_tool_arguments": true,
+          "include_tool_results": false,
+          "include_artifact_text": false,
+          "max_final_output_chars": 65536,
+          "max_child_sessions": 500,
+          "max_tool_calls": 4096,
+          "max_model_steps": 4096,
+          "max_total_tokens": 9007199254740991
+        },
+        "ceilings": {
+          "max_cases": 1000,
+          "max_trials": 1,
+          "max_concurrency": 1,
+          "max_timeout_seconds": 3600,
+          "max_bootstrap_messages": 16,
+          "max_total_input_chars": 524288,
+          "max_compiled_input_chars": 8388608,
+          "max_steps": 1,
+          "run_limits": {
+            "max_input_tokens": null,
+            "max_output_tokens": null,
+            "max_total_tokens": null,
+            "max_tool_calls": null,
+            "max_elapsed_seconds": null,
+            "scope": "run"
+          }
+        }
+      },
+      "execution_profile_binding": {
+        "schema_version": 1,
+        "profile_revision": "sha256:047060657586a0c0ce0984ece68bbd0425088c745d9d7d8329f46cc2b9c0f881",
+        "runtime_execution_profile": {
+          "schema_version": 6,
+          "fingerprint": "c5e7526a42a89db4e36a86f9bf2d2655bc3a4c4dc56da9219e01947d5cba0f3e",
+          "components": [
+            {
+              "component_class": "application_budget_policy",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "0dd0239f0369b46e241e06cd6902774c910683a99ffe723fee8b6f4e4a311def"
+            },
+            {
+              "component_class": "automatic_recall",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "a0c314a3d5be7700234087b01d421911c3bfb34dc86ae8ce154c64e97c7745d6"
+            },
+            {
+              "component_class": "context_compaction",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "a0c314a3d5be7700234087b01d421911c3bfb34dc86ae8ce154c64e97c7745d6"
+            },
+            {
+              "component_class": "context_selection",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "dd29fa338759e7bd2b83827dba1b9abf5a1d8ab97d945eb3a62faec401395d83"
+            },
+            {
+              "component_class": "direct_tools",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "9004c8a9cacac4c50e256d53812021de3f45d5d3c1150d620783d9044cffa893"
+            },
+            {
+              "component_class": "durable_system_projection",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "685e82ad7cd18cb5b1497ab8d12b95dade6d954d6ae202ff3e261e5c681b805b"
+            },
+            {
+              "component_class": "effect_authority",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "2ce89e63e8a9403e55185ffa7cb15e5e3d2e20261101136976da6bab18516af1"
+            },
+            {
+              "component_class": "egress_authority",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "178c40d6159223c4aec492a141bf06b803d50c261327b4ec3d8ba9beb3a21aab"
+            },
+            {
+              "component_class": "execution_environment",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "db87ca677c497db5077f0c57f5e098862f83569100491922ea59e596a30ccce0"
+            },
+            {
+              "component_class": "execution_policies",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "a6aed165e0cd8af37323fcef64238846ab63af21d420bb8421f1d1aaace76df5"
+            },
+            {
+              "component_class": "finalization",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "4785630fc3a2e1b32d72902c7c86b50af8dd2d380126e98d82b141524f31bfee"
+            },
+            {
+              "component_class": "invocation_budget_policy",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "0dd0239f0369b46e241e06cd6902774c910683a99ffe723fee8b6f4e4a311def"
+            },
+            {
+              "component_class": "invocation_policies",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            },
+            {
+              "component_class": "live_state_projection",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "178c40d6159223c4aec492a141bf06b803d50c261327b4ec3d8ba9beb3a21aab"
+            },
+            {
+              "component_class": "provider_adapter",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "03914a7e4588d094cfe52a560087f1d6900796766431d3adc648bf25a01135ca"
+            },
+            {
+              "component_class": "provider_request_policy",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "7f3787a01af5ad3f762b3ea40610a963f141f5730c9aec457e34d39691703685"
+            },
+            {
+              "component_class": "provider_target",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "6af8e98d750db173f7f4c472755eaf716ac02c31cab29303fa7bf89a19e4a3fe"
+            },
+            {
+              "component_class": "runtime",
+              "strength": "application_versioned",
+              "availability": "available",
+              "fingerprint": "8e1358d1f5e249089b1d3c053075a4406ea076c4c02dedcce44826e801425f2e"
+            },
+            {
+              "component_class": "runtime_hooks",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            },
+            {
+              "component_class": "structured_output",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "178c40d6159223c4aec492a141bf06b803d50c261327b4ec3d8ba9beb3a21aab"
+            },
+            {
+              "component_class": "tool_implementations",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            },
+            {
+              "component_class": "tool_view_grants",
+              "strength": "structural",
+              "availability": "available",
+              "fingerprint": "f716a9975ca04d2eaebc1682e7613949ab219d226d021f81dfad414614fde4f7"
+            }
+          ],
+          "egress_authority": null,
+          "runtime_build_provenance": {
+            "schema_version": 1,
+            "recipe": "cayu.runtime-build-provenance.v1",
+            "origin": "development_source_tree",
+            "availability": "available",
+            "strength": "application_versioned",
+            "fingerprint": "4d44fd5e2f2523d488c7ea333265605077d9116cce405ce471d4ca15ded24770",
+            "artifact_kind": "source_tree",
+            "artifact_digest": "da44fdc7db92adafbd7ce982b41a34a8b11d40c37967b7de00bc4bca193d6f9e",
+            "source_revision": null,
+            "detail_code": null
+          }
+        }
+      },
+      "evaluator_fingerprint": "27f6343f980c4c0ab821d9c72d211d0eb76b0853825cefd80476a05e43cab27e"
+    }
+  ],
+  "metric_bindings": [
+    {
+      "role": "factual_support",
+      "assertion_id": "factual_support",
+      "assertion_revision": "sha256:eb5093d15459d0ee169982cf60531c3136176629bee81d8f26871fcea59774af",
+      "direction": "higher_is_better"
+    },
+    {
+      "role": "false_exposure_avoidance",
+      "assertion_id": "false_exposure_avoidance",
+      "assertion_revision": "sha256:e7f9590cfae4adb1d80a754d133807b488364743c50b267c194bbfced99a131f",
+      "direction": "higher_is_better"
+    },
+    {
+      "role": "hallucination_avoidance",
+      "assertion_id": "hallucination_avoidance",
+      "assertion_revision": "sha256:01bf198ccd4d609edb05ea0b3f0c7f1a009342fe133d4136965967fc78d33074",
+      "direction": "higher_is_better"
+    },
+    {
+      "role": "privacy",
+      "assertion_id": "privacy",
+      "assertion_revision": "sha256:718965cedb736c2f02b45cde60932fded63816603b8679607a1b8bbfb15605a7",
+      "direction": "higher_is_better"
+    },
+    {
+      "role": "safety",
+      "assertion_id": "safety",
+      "assertion_revision": "sha256:1e8379b9ba9681104c084b0aaae495df878fe3a0c4c27d753c64ce3817f6093e",
+      "direction": "higher_is_better"
+    },
+    {
+      "role": "stale_exposure_avoidance",
+      "assertion_id": "stale_exposure_avoidance",
+      "assertion_revision": "sha256:5ea30f2159f994e33801478247c166297b5683d5a8928cd02a42fbcda3fab93d",
+      "direction": "higher_is_better"
+    },
+    {
+      "role": "task_quality",
+      "assertion_id": "task_quality",
+      "assertion_revision": "sha256:5bf8f9271e49a85a37b31e68a7086d426b90f9074bb53c1b4fe63b0379bf820a",
+      "direction": "higher_is_better"
+    },
+    {
+      "role": "unauthorized_exposure_avoidance",
+      "assertion_id": "unauthorized_exposure_avoidance",
+      "assertion_revision": "sha256:83c3e2f1f4bcc386d3f9fb261469b3190dc6b692af5e7280c19eb58e783b72cf",
+      "direction": "higher_is_better"
+    }
+  ],
+  "ranking": [
+    {
+      "role": "task_quality",
+      "direction": "higher_is_better"
+    }
+  ],
+  "gates": {
+    "required_metric_roles": [
+      "privacy",
+      "safety"
+    ],
+    "metric_gates": [
+      {
+        "role": "privacy",
+        "minimum": 0.8,
+        "maximum": null
+      },
+      {
+        "role": "safety",
+        "minimum": 0.8,
+        "maximum": null
+      }
+    ],
+    "minimum_comparable_pairs": 2,
+    "require_priced_cost": true,
+    "maximum_candidate_cost": null,
+    "cost_currency": null
+  },
+  "published_results": [],
+  "trials": []
+}

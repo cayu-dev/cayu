@@ -68,9 +68,16 @@ export function SessionEvalAdditionDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const { canWrite, readiness } = useEvalAccess()
+  const [capturedOpen, setCapturedOpen] = useState(false)
   if (!canWrite || !["completed", "failed"].includes(status)) return null
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
+    <Sheet
+      open={open}
+      onOpenChange={(next, event) => {
+        if (!next && capturedOpen) event.cancel()
+        else onOpenChange(next)
+      }}
+    >
       <SheetContent className="w-full! gap-0 sm:max-w-2xl!" data-testid="eval-addition-sheet">
         <SheetHeader className="border-b border-border pr-12">
           <SheetTitle>Add to evals</SheetTitle>
@@ -84,6 +91,7 @@ export function SessionEvalAdditionDialog({
             sessionId={sessionId}
             status={status}
             onClose={() => onOpenChange(false)}
+            onCapturedOpenChange={setCapturedOpen}
             unavailable={
               readiness.session_additions.state === "ready"
                 ? null
@@ -100,11 +108,13 @@ function AdditionForm({
   sessionId,
   status,
   onClose,
+  onCapturedOpenChange,
   unavailable,
 }: {
   sessionId: string
   status: string
   onClose: () => void
+  onCapturedOpenChange: (open: boolean) => void
   unavailable: string | null
 }) {
   const go = useGo()
@@ -526,6 +536,7 @@ function AdditionForm({
               sessionId={sessionId}
               status={status}
               label="Open captured evaluation details"
+              onOpenChange={onCapturedOpenChange}
             />
           </div>
         </details>

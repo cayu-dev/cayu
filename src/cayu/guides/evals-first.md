@@ -24,7 +24,9 @@ access. A deployed Developer dashboard needs its normal authentication and durab
 store; do not expose `OpenAccess` publicly.
 
 Evals lists your suites and their latest runs. Open **Settings** for readiness,
-execution profiles, judges, limits, corpus import and advanced tools.
+**Execution profiles**, **Judges and calibration**, **Production scenarios**,
+**Memory reports**, and **Import / export**. Settings links reopen the selected
+tool; choose the specialist whose configuration or saved material you need.
 Fix a readiness diagnostic before running. The browser cannot create a missing
 provider, credential, tool, environment, policy, or store.
 

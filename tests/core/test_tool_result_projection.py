@@ -6,6 +6,7 @@ import json
 import threading
 import warnings
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -2901,9 +2902,64 @@ def test_interruption_during_artifact_persistence_does_not_repeat_tool_or_store(
     assert len(listed.artifacts) == 1
 
 
+async def _wait_for_projection_dispatch(started, run_task):
+    # Setup has its own watchdog; it is not the budget for interruption admission.
+    async with asyncio.timeout(120):
+        while not started.is_set():
+            if run_task.done():
+                pytest.fail(f"Run finished before artifact dispatch: {await run_task!r}")
+            await asyncio.sleep(0)
+
+
+def _arm_projection_timeout_after_interruption(monkeypatch, app, session_id, started):
+    """Start the real short timeout once the real interrupt has been admitted."""
+    from cayu.runtime._tool_invocation import terminal as invocation_terminal
+
+    wait = invocation_terminal.await_shielded_task_outcome
+
+    async def observe_interruption(task):
+        # Local filesystem preparation precedes the test's dispatch barrier.
+        # Charging it to the interruption budget races setup against a request
+        # the test cannot issue yet. A completed policy must remain observable.
+        while not started.is_set():
+            if task.done():
+                return False
+            await asyncio.sleep(0)
+        async with asyncio.timeout(30):
+            while True:
+                session = await app.session_store.load(session_id)
+                if session is not None and session.status is SessionStatus.INTERRUPTING:
+                    return True
+                if task.done():
+                    return False
+                await asyncio.sleep(0)
+
+    async def wait_after_interruption(task, **kwargs):
+        # The cancellation-aware owner spans both phases. Preserve real interrupt
+        # cancellation while setup/admission is observed, then deliver it to the
+        # real projection waiter without inventing a timeout or releasing writes.
+        gate = await wait(asyncio.create_task(observe_interruption(task)))
+        assert gate.error is None and not gate.timed_out, (
+            "interruption phase gate failed after artifact dispatch",
+            gate,
+        )
+        assert gate.subsequent_cancellation is None
+        outcome = await wait(task, cancellation=gate.cancellation, **kwargs)
+        return replace(
+            outcome,
+            cancellation_requests_consumed=(
+                gate.cancellation_requests_consumed + outcome.cancellation_requests_consumed
+            ),
+        )
+
+    monkeypatch.setattr(invocation_terminal, "await_shielded_task_outcome", wait_after_interruption)
+
+
+@pytest.mark.parametrize("interruption_delay", [0, 0.05])
 def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
     tmp_path,
     monkeypatch,
+    interruption_delay,
 ) -> None:
     from cayu.runtime._tool_invocation import terminal as invocation_terminal
 
@@ -2947,6 +3003,9 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
             tools=[_ResultTool(ToolResult(content="x" * 10_000))],
         )
         session_id = "sess_projection_timeout"
+        _arm_projection_timeout_after_interruption(
+            monkeypatch, app, session_id, artifact_store.started
+        )
         run_task = asyncio.create_task(
             _collect(
                 app.run(
@@ -2958,7 +3017,8 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
                 )
             )
         )
-        await asyncio.wait_for(artifact_store.started.wait(), timeout=30)
+        await _wait_for_projection_dispatch(artifact_store.started, run_task)
+        await asyncio.sleep(interruption_delay)
         interrupt_events = await asyncio.wait_for(
             _collect(
                 app.interrupt_session(
@@ -2984,9 +3044,16 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
     assert artifact_store.writes == 1
 
 
+@pytest.mark.parametrize(
+    ("interruption_delay", "dispatch_delay"),
+    [(0, 0), (0.05, 0), (0, 31)],
+    ids=["immediate", "delayed-interrupt", "slow-dispatch"],
+)
 def test_projection_timeout_records_active_local_write_without_artifact_authority(
     tmp_path,
     monkeypatch,
+    interruption_delay,
+    dispatch_delay,
 ) -> None:
     from cayu.runtime._tool_invocation import terminal as invocation_terminal
 
@@ -3001,6 +3068,9 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
     rename = local_artifacts._rename_directory_no_replace
 
     def blocked_rename(*args, **kwargs) -> None:
+        # Real filesystem preparation can exceed the later interruption phase budget.
+        if dispatch_delay:
+            threading.Event().wait(dispatch_delay)
         started.set()
         try:
             if not release.wait(timeout=120):
@@ -3045,6 +3115,7 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
             tools=[_ResultTool(ToolResult(content="x" * 10_000))],
         )
         session_id = "sess_active_projection_timeout"
+        _arm_projection_timeout_after_interruption(monkeypatch, app, session_id, started)
         run_task = asyncio.create_task(
             _collect(
                 app.run(
@@ -3057,8 +3128,8 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
             )
         )
         try:
-            while not started.is_set():
-                await asyncio.sleep(0)
+            await _wait_for_projection_dispatch(started, run_task)
+            await asyncio.sleep(interruption_delay)
             interrupt_events = await asyncio.wait_for(
                 _collect(
                     app.interrupt_session(
@@ -3075,6 +3146,17 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
             # extra observation headroom must not let it settle before this check.
             assert not finished.is_set()
             return interrupt_events, run_events
+        except Exception as error:
+            # Release only on the failed-test path so runtime cleanup can publish
+            # the authoritative failure instead of hiding it behind interruption.
+            release.set()
+            try:
+                diagnostic_events = await asyncio.wait_for(asyncio.shield(run_task), timeout=30)
+            except Exception as diagnostic_error:
+                error.add_note(f"Original run raised: {diagnostic_error!r}")
+            else:
+                error.add_note(f"Original run outcome: {diagnostic_events!r}")
+            raise
         finally:
             release.set()
             while not finished.is_set():

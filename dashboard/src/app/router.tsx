@@ -12,6 +12,7 @@ import { CapabilityRoute } from "../components/dashboard/server-contract"
 import { FullAccessRoute } from "../components/dashboard/viewer"
 import { dashboardConfig } from "../lib/config"
 import { DASHBOARD_ROUTE_REQUIREMENTS } from "../lib/dashboard-capabilities"
+import { validateEvalSettingsSearch } from "../lib/eval-settings-search"
 import { validateEvalsSearch } from "../lib/evals-search"
 import { parseDashboardSearch, stringifyDashboardSearch } from "../lib/search-params"
 import { validateSessionDetailSearch, workflowSearchPatch } from "../lib/session-detail-search"
@@ -227,6 +228,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/evals/settings",
+    validateSearch: validateEvalSettingsSearch,
     component: () => (
       <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
         <EvalSettingsPage />

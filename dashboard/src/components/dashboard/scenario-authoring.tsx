@@ -68,7 +68,23 @@ type InputEventKind = "initial" | "queued" | "resumed"
 export type ScenarioAuthoringState = Readonly<{
   dirty: boolean
   pending: boolean
+  edited: boolean
 }>
+
+type ScenarioLaunchAttempt = Readonly<{
+  revision: string
+  request: Parameters<typeof launchEvalScenario>[1]
+  identity: string
+  key: string
+}>
+
+function settingsIdentity(settings: ScenarioSettingsDraft): string {
+  // An automatic display-currency choice is not an edit without a cost bound.
+  return JSON.stringify({
+    ...settings,
+    currency: settings.maxEstimatedCost.trim() ? settings.currency : "",
+  })
+}
 
 function clone<T>(value: T): T {
   return structuredClone(value)
@@ -155,6 +171,7 @@ export function ScenarioAuthoring({
   showLaunch = true,
   showLaunchSettings = true,
   onSaved,
+  onLaunched,
   onAuthoringStateChange,
 }: {
   captured: EvalScenario | EvalScenarioDraft
@@ -163,6 +180,7 @@ export function ScenarioAuthoring({
   showLaunch?: boolean
   showLaunchSettings?: boolean
   onSaved?: (scenario: EvalScenario) => void
+  onLaunched?: (runId: string) => void
   onAuthoringStateChange?: (state: ScenarioAuthoringState) => void
 }) {
   const queryClient = useQueryClient()
@@ -175,6 +193,11 @@ export function ScenarioAuthoring({
   const [preview, setPreview] = useState<EvalScenarioPreview | null>(null)
   const [previewIdentity, setPreviewIdentity] = useState<string | null>(null)
   const [pending, setPending] = useState<string | null>(null)
+  const [launchAttempt, setLaunchAttempt] = useState<ScenarioLaunchAttempt | null>(null)
+  const unresolvedLaunch = launchAttempt !== null
+  const [acceptedSettings, setAcceptedSettings] = useState(() =>
+    settingsIdentity(DEFAULT_SCENARIO_SETTINGS),
+  )
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const capturedRevision = "revision" in captured ? captured.revision : null
@@ -205,11 +228,12 @@ export function ScenarioAuthoring({
     settings.artifactReferences,
     !showLaunchSettings,
   )
-  const dirty =
-    savedDraftIdentity === null ||
-    draftIdentity !== savedDraftIdentity ||
+  const edited =
+    draftIdentity !== (savedDraftIdentity ?? JSON.stringify(draftFromScenario(captured))) ||
     invalidJsonEditors > 0 ||
-    hasUnmaterializedArtifactBindings
+    hasUnmaterializedArtifactBindings ||
+    (showLaunchSettings && settingsIdentity(settings) !== acceptedSettings)
+  const dirty = savedDraftIdentity === null || edited
   const previewCurrent =
     preview !== null && previewIdentity === currentIdentity && invalidJsonEditors === 0
   const settingsValue = scenarioLaunchSettingsContract(settings, selectedTarget)
@@ -219,6 +243,7 @@ export function ScenarioAuthoring({
     const nextDraft = draftFromScenario(captured)
     setDraft(nextDraft)
     setSettings({ ...DEFAULT_SCENARIO_SETTINGS, artifactReferences: {} })
+    setAcceptedSettings(settingsIdentity(DEFAULT_SCENARIO_SETTINGS))
     setPreview(null)
     setPreviewIdentity(null)
     setError(null)
@@ -227,21 +252,19 @@ export function ScenarioAuthoring({
     setSavedDraftIdentity(saved ? JSON.stringify(nextDraft) : null)
   }, [captured, capturedRevision, saved])
   useEffect(() => {
-    if (!selectedTarget) return
+    if (!selectedTarget || unresolvedLaunch) return
     setSettings((current) => {
-      if (!selectedTarget.cost_budget_available) {
-        return current.maxEstimatedCost === "" ? current : { ...current, maxEstimatedCost: "" }
-      }
+      if (!selectedTarget.cost_budget_available || current.maxEstimatedCost.trim()) return current
       if (selectedTarget.cost_budget_currencies.includes(current.currency)) return current
       const currency = selectedTarget.cost_budget_currencies.includes("USD")
         ? "USD"
         : (selectedTarget.cost_budget_currencies[0] ?? current.currency)
       return currency === current.currency ? current : { ...current, currency }
     })
-  }, [selectedTarget])
+  }, [selectedTarget, unresolvedLaunch])
   useEffect(() => {
-    onAuthoringStateChange?.({ dirty, pending: pending !== null })
-  }, [dirty, onAuthoringStateChange, pending])
+    onAuthoringStateChange?.({ dirty, edited, pending: pending !== null || unresolvedLaunch })
+  }, [dirty, edited, onAuthoringStateChange, pending, unresolvedLaunch])
   useEffect(() => () => controllerRef.current?.abort(), [])
 
   const run = async (name: string, action: (signal: AbortSignal) => Promise<void>) => {
@@ -321,6 +344,7 @@ export function ScenarioAuthoring({
       setPreviewIdentity(normalizedIdentity)
       setSavedRevision(saved.scenario.revision)
       setSavedDraftIdentity(JSON.stringify(normalizedDraft))
+      setAcceptedSettings(settingsIdentity(settings))
       setNotice(`Saved scenario ${shortEvalIdentity(saved.entry.revision)}.`)
       onSaved?.(saved.scenario)
       await queryClient.invalidateQueries({ queryKey: ["evals", "scenarios"] })
@@ -328,42 +352,52 @@ export function ScenarioAuthoring({
   }
 
   const launch = () => {
-    const binding = preview?.preflight.binding
-    if (
-      !previewCurrent ||
-      preview === null ||
-      !preview.preflight.ready ||
-      preview.execution_profile_revision === null ||
-      preview.execution_profile_revision === undefined ||
-      binding === null ||
-      binding === undefined ||
-      settingsValue === null ||
-      savedRevision !== preview.scenario.revision
-    ) {
-      return
+    let attempt = launchAttempt
+    if (!attempt) {
+      const binding = preview?.preflight.binding
+      if (
+        !previewCurrent ||
+        !preview?.preflight.ready ||
+        !preview.execution_profile_revision ||
+        !binding ||
+        settingsValue === null ||
+        savedRevision !== preview.scenario.revision
+      )
+        return
+      const identity = scenarioEvalLaunchRequestIdentity(
+        preview.scenario.revision,
+        binding.revision,
+        preview.execution_profile_revision,
+      )
+      // Capture every decision-bearing value before dispatch. Current catalog data
+      // can constrain a new launch, but cannot rewrite an unresolved exact replay.
+      attempt = {
+        revision: preview.scenario.revision,
+        request: clone({
+          expected_binding_revision: binding.revision,
+          expected_execution_profile_revision: preview.execution_profile_revision,
+          settings: settingsValue,
+        }),
+        identity,
+        key: "",
+      }
     }
-    const executionProfileRevision = preview.execution_profile_revision
-    const requestIdentity = scenarioEvalLaunchRequestIdentity(
-      preview.scenario.revision,
-      binding.revision,
-      executionProfileRevision,
-    )
+    const prepared = attempt
     void run("launch", async (signal) => {
       const registry =
         launchRegistryRef.current ??
         new EvalLaunchIdempotencyRegistry(window.sessionStorage, dashboardConfig.apiBaseUrl)
       launchRegistryRef.current = registry
-      const idempotencyKey = registry.keyFor(requestIdentity)
+      const dispatched = prepared.key
+        ? prepared
+        : { ...prepared, key: registry.keyFor(prepared.identity) }
+      setLaunchAttempt(dispatched)
       let launched: EvalRun
       try {
         launched = await launchEvalScenario(
-          preview.scenario.revision,
-          {
-            expected_binding_revision: binding.revision,
-            expected_execution_profile_revision: executionProfileRevision,
-            settings: settingsValue,
-          },
-          idempotencyKey,
+          dispatched.revision,
+          dispatched.request,
+          dispatched.key,
           signal,
         )
       } catch (launchError) {
@@ -374,16 +408,19 @@ export function ScenarioAuthoring({
           launchError instanceof ApiClientError &&
           evalLaunchFailureIsDefinitive(launchError.status)
         ) {
-          registry.resolve(requestIdentity)
+          registry.resolve(dispatched.identity)
+          setLaunchAttempt((current) => (current === dispatched ? null : current))
         }
         throw launchError
       }
       if (signal.aborted) return
+      registry.resolve(dispatched.identity)
+      setLaunchAttempt((current) => (current === dispatched ? null : current))
+      setAcceptedSettings(settingsIdentity(settings))
       queryClient.setQueryData(["evals", "run", launched.spec.run_id], launched)
+      setNotice(evalLaunchNotice(launched))
+      onLaunched?.(launched.spec.run_id)
       await queryClient.invalidateQueries({ queryKey: ["evals", "runs"] })
-      if (signal.aborted) return
-      registry.resolve(requestIdentity)
-      setNotice(`${evalLaunchNotice(launched)} Follow it in the Runs tab.`)
     })
   }
 
@@ -465,7 +502,7 @@ export function ScenarioAuthoring({
         </Badge>
       </CardHeader>
       <CardContent className="space-y-4">
-        <fieldset className="space-y-4" disabled={disabled || pending !== null}>
+        <fieldset className="space-y-4" disabled={disabled || pending !== null || unresolvedLaunch}>
           <div className="grid gap-3 md:grid-cols-2">
             <label htmlFor={`${formId}-name`}>
               <span className={LABEL_CLASS}>Scenario name</span>
@@ -603,6 +640,7 @@ export function ScenarioAuthoring({
                 <span className={LABEL_CLASS}>Environment</span>
                 <select
                   className={SELECT_CLASS}
+                  aria-label="Scenario environment"
                   value={settings.environmentName}
                   onChange={(event) =>
                     setSettings((current) => ({
@@ -685,7 +723,10 @@ export function ScenarioAuthoring({
                     inputMode="decimal"
                     placeholder={selectedTarget?.cost_budget_available ? "Optional" : "No pricing"}
                     value={settings.maxEstimatedCost}
-                    disabled={selectedTarget?.cost_budget_available !== true}
+                    disabled={
+                      selectedTarget?.cost_budget_available !== true &&
+                      settings.maxEstimatedCost === ""
+                    }
                     onChange={(event) =>
                       setSettings((current) => ({
                         ...current,
@@ -697,7 +738,10 @@ export function ScenarioAuthoring({
                     aria-label="Scenario cost budget currency"
                     className={SELECT_CLASS}
                     value={settings.currency}
-                    disabled={selectedTarget?.cost_budget_available !== true}
+                    disabled={
+                      selectedTarget?.cost_budget_available !== true &&
+                      settings.maxEstimatedCost === ""
+                    }
                     onChange={(event) =>
                       setSettings((current) => ({
                         ...current,
@@ -705,6 +749,11 @@ export function ScenarioAuthoring({
                       }))
                     }
                   >
+                    {!selectedTarget?.cost_budget_currencies.includes(settings.currency) && (
+                      <option value={settings.currency} disabled>
+                        {settings.currency} (unavailable)
+                      </option>
+                    )}
                     {(selectedTarget?.cost_budget_currencies ?? []).map((currency) => (
                       <option key={currency} value={currency}>
                         {currency}
@@ -806,7 +855,7 @@ export function ScenarioAuthoring({
           <Button
             type="button"
             variant="outline"
-            disabled={disabled || pending !== null}
+            disabled={disabled || pending !== null || unresolvedLaunch}
             onClick={checkReadiness}
           >
             {pending === "preview" ? <LoaderCircle className="animate-spin" /> : <CheckCircle2 />}
@@ -815,7 +864,11 @@ export function ScenarioAuthoring({
           <Button
             type="button"
             disabled={
-              disabled || pending !== null || !previewCurrent || hasUnmaterializedArtifactBindings
+              disabled ||
+              pending !== null ||
+              unresolvedLaunch ||
+              !previewCurrent ||
+              hasUnmaterializedArtifactBindings
             }
             onClick={save}
           >
@@ -828,10 +881,11 @@ export function ScenarioAuthoring({
               disabled={
                 disabled ||
                 pending !== null ||
-                !previewCurrent ||
-                !preview?.preflight.ready ||
-                preview.preflight.binding == null ||
-                savedRevision !== preview.scenario.revision
+                (!unresolvedLaunch &&
+                  (!previewCurrent ||
+                    !preview?.preflight.ready ||
+                    preview.preflight.binding == null ||
+                    savedRevision !== preview.scenario.revision))
               }
               onClick={launch}
             >
@@ -872,6 +926,7 @@ function ScenarioEventEditor({
         <Badge variant="outline">{index + 1}</Badge>
         <select
           className={`${SELECT_CLASS} w-44`}
+          aria-label={`Event ${index + 1} type`}
           value={kind}
           disabled={index === 0}
           onChange={(change) => {
@@ -1111,6 +1166,7 @@ function ScenarioPartEditor({
     <div className="grid gap-2 sm:grid-cols-[8rem_minmax(0,1fr)_auto]">
       <select
         className={SELECT_CLASS}
+        aria-label="Input part type"
         value={kind}
         onChange={(change) => {
           if (change.target.value === "json") edit({ type: "json", value: {} })
@@ -1128,6 +1184,7 @@ function ScenarioPartEditor({
       {kind === "text" && "text" in part ? (
         <Textarea
           rows={2}
+          aria-label="Input text"
           value={part.text}
           onChange={(change) => edit({ ...part, text: change.target.value })}
         />
@@ -1136,6 +1193,7 @@ function ScenarioPartEditor({
       ) : "artifact_requirement_id" in part ? (
         <select
           className={SELECT_CLASS}
+          aria-label="File requirement"
           value={part.artifact_requirement_id}
           onChange={(change) => edit({ ...part, artifact_requirement_id: change.target.value })}
         >
@@ -1203,6 +1261,7 @@ function JsonPartEditor({
   return (
     <Textarea
       rows={3}
+      aria-label="Input JSON"
       value={text}
       aria-invalid={invalid}
       onChange={(change) => {

@@ -1,244 +1,294 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { useRef, useState } from "react"
-import { EvalSuiteAuthoringAction } from "@/components/dashboard/eval-suite-authoring"
-import { MemoryExperimentReportAction } from "@/components/dashboard/evals-memory"
+import { Dialog } from "@base-ui/react/dialog"
+import { useQuery } from "@tanstack/react-query"
+import { useBlocker, useSearch } from "@tanstack/react-router"
+import { Check, ChevronRight, Minus } from "lucide-react"
+import { useCallback, useEffect, useRef, useState } from "react"
+import { MemoryExperimentReportPanel } from "@/components/dashboard/evals-memory"
 import { PayloadViewer } from "@/components/dashboard/layout"
+import type { CalibrationState } from "@/components/dashboard/structured-judge-editor"
 import { Button } from "@/components/ui/button"
-import { fetchEvalTargets, importEvalCorpus } from "@/lib/api"
-import { EVAL_TARGET_QUERY_KEY, preflightEvalCorpusFile } from "@/lib/evals-dashboard"
+import { type EvalTarget, fetchEvalTargets } from "@/lib/api"
+import { EVAL_SETTINGS_TOOLS, type validateEvalSettingsSearch } from "@/lib/eval-settings-search"
+import { EVAL_TARGET_QUERY_KEY } from "@/lib/evals-dashboard"
 import { EVALS_READINESS_OPERATIONS, evalsReadinessReasonText } from "@/lib/evals-readiness"
-import { NavLink, PageBody, TopBar } from "../common"
+import { NavLink, PageBody, TopBar, useGo } from "../common"
+import { JudgeProfiles, JudgeSettings } from "./settings-judges"
+import { CorpusSettings } from "./settings-portability"
+import { ScenarioSettings } from "./settings-scenarios"
 import { FIELD_CLASS, LoadState, Section, useEvalAccess } from "./shared"
-import { EvalExecutionProfileSummary, ScenarioCatalog } from "./technical-details"
+import { EvalExecutionProfileSummary } from "./technical-details"
 
 export function EvalSettingsViewPage() {
-  const { canWrite, canReadDetails, readiness } = useEvalAccess()
-  const client = useQueryClient()
-  const [targetKey, setTargetKey] = useState("")
-  const input = useRef<HTMLInputElement>(null)
+  const { canReadDetails } = useEvalAccess()
+  return canReadDetails ? (
+    <SettingsTools />
+  ) : (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <SettingsHeader />
+      <PageBody width="max-w-3xl">
+        <p className="mt-4 text-sm text-muted-foreground" role="status">
+          Your role can read eval suites and comparisons. Execution configuration and advanced tools
+          require developer access.
+        </p>
+      </PageBody>
+    </div>
+  )
+}
+
+function SettingsHeader() {
+  return (
+    <TopBar>
+      <span className="flex min-w-0 items-center gap-1">
+        <NavLink to="/evals" className="shrink-0 text-muted-foreground hover:text-foreground">
+          Evals
+        </NavLink>
+        <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+        <span>Settings</span>
+      </span>
+    </TopBar>
+  )
+}
+
+function SettingsTools() {
+  const search = useSearch({ strict: false }) as ReturnType<typeof validateEvalSettingsSearch>
+  const { canWrite, readiness } = useEvalAccess()
+  const go = useGo()
   const targets = useQuery({
     queryKey: EVAL_TARGET_QUERY_KEY,
     queryFn: ({ signal }) => fetchEvalTargets(signal),
-    enabled: canReadDetails,
   })
-  const selected = targetKey || targets.data?.default_target_key
-  const target = targets.data?.items.find((t) => t.target_key === selected)
-  const action = useMutation({
-    mutationFn: async (file: File) => {
-      await preflightEvalCorpusFile(file)
-      return importEvalCorpus(file)
-    },
-    onSuccess: () => client.invalidateQueries({ queryKey: ["evals"] }),
+  const [initialTarget, setInitialTarget] = useState<string>()
+  useEffect(() => {
+    if (initialTarget === undefined && targets.data)
+      setInitialTarget(targets.data.default_target_key ?? "")
+  }, [initialTarget, targets.data])
+  const selected = search.target ?? initialTarget ?? targets.data?.default_target_key ?? ""
+  const liveTarget = targets.data?.items.find((item) => item.target_key === selected)
+  const retainedTarget = useRef<EvalTarget | undefined>(undefined)
+  useEffect(() => {
+    if (liveTarget) retainedTarget.current = liveTarget
+  }, [liveTarget])
+  const scope = JSON.stringify([search.tool, selected])
+  const [owner, setOwner] = useState<{ scope: string; state: CalibrationState }>()
+  const state = owner?.scope === scope ? owner.state : { dirty: false, locked: false }
+  // A catalog refresh cannot discard a private draft or an unresolved operation.
+  const target =
+    liveTarget ??
+    (retainedTarget.current?.target_key === selected ? retainedTarget.current : undefined)
+  const onStateChange = useCallback(
+    (next: CalibrationState) => setOwner({ scope, state: next }),
+    [scope],
+  )
+  const blocker = useBlocker({
+    shouldBlockFn: () => state.dirty || state.locked,
+    enableBeforeUnload: state.dirty || state.locked,
+    withResolver: true,
   })
-  const scenario = useMutation({
-    mutationFn: (task: {
-      name: string
-      run: (signal: AbortSignal) => Promise<string | undefined>
-    }) => task.run(new AbortController().signal),
-  })
+  const catalogWritable = canWrite && readiness.catalog_write.state === "ready"
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <TopBar>
-        <NavLink to="/evals" className="mr-2 text-muted-foreground">
-          Evals /
-        </NavLink>
-        Settings
-      </TopBar>
-      <PageBody width="max-w-3xl">
-        {!canReadDetails && (
-          <p className="mt-4 text-sm text-muted-foreground">
-            Your role can read eval suites and comparisons. Execution configuration and advanced
-            tools require developer access.
+      <SettingsHeader />
+      <PageBody width={search.tool === "scenarios" ? "max-w-6xl" : "max-w-3xl"}>
+        <nav
+          aria-label="Eval settings tools"
+          className="mt-5 flex flex-wrap gap-1 border-b border-border pb-3"
+        >
+          {EVAL_SETTINGS_TOOLS.map(([tool, label]) => (
+            <NavLink
+              key={tool}
+              to="/evals/settings"
+              search={{ tool, target: search.target }}
+              aria-current={search.tool === tool ? "page" : undefined}
+              className={`rounded-lg px-3 py-2 text-sm hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${search.tool === tool ? "bg-muted font-medium" : "text-muted-foreground"}`}
+            >
+              {label}
+            </NavLink>
+          ))}
+        </nav>
+        <LoadState error={targets.error} pending={targets.isPending} retry={targets.refetch} />
+        {targets.data?.items.length === 0 && (
+          <p className="mt-5 text-sm text-muted-foreground">
+            No specialists are configured for evals.
           </p>
         )}
-        {canReadDetails && (
-          <LoadState
-            error={targets.error}
-            pending={canReadDetails && targets.isPending}
-            retry={targets.refetch}
-          />
+        {!!targets.data?.items.length && (
+          <label className="mt-5 flex min-w-0 flex-wrap items-center gap-2 text-sm">
+            Specialist
+            <select
+              aria-label="Settings specialist"
+              className={`${FIELD_CLASS} max-w-full flex-1`}
+              value={selected}
+              disabled={state.dirty || state.locked}
+              onChange={(event) =>
+                void go("/evals/settings", { tool: search.tool, target: event.target.value })
+              }
+            >
+              {!target && <option value={selected}>Specialist unavailable</option>}
+              {targets.data.items.map((item) => (
+                <option key={item.target_key} value={item.target_key}>
+                  {item.target_key}
+                </option>
+              ))}
+            </select>
+          </label>
         )}
-        {canReadDetails && targets.data && (
-          <>
-            <Section title="What trials run with">
-              {targets.data.items.length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  No specialists are configured for evals.
-                </p>
-              )}
-              <div className="overflow-hidden rounded-xl border border-border">
-                {targets.data.items.map((t) => (
-                  <div
-                    key={t.target_key}
-                    className="border-b border-border px-3 py-2 text-sm break-words last:border-0"
-                  >
-                    <p className="font-medium">{t.target_key}</p>
-                    <p className="text-muted-foreground">
-                      {t.execution_profile
-                        ? `${t.execution_profile.candidate.model} via ${t.execution_profile.candidate.provider_name}${t.execution_profile.candidate.environment_name ? ` · ${t.execution_profile.candidate.environment_name}` : ""}`
-                        : "Execution profile unavailable"}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            </Section>
-            {targets.data.items.length > 0 && (
-              <Section title="Specialist">
-                <select
-                  aria-label="Settings specialist"
-                  className={`${FIELD_CLASS} w-full`}
-                  value={selected}
-                  onChange={(e) => setTargetKey(e.target.value)}
-                >
-                  {targets.data.items.map((t) => (
-                    <option key={t.target_key} value={t.target_key}>
-                      {t.target_key}
-                    </option>
-                  ))}
-                </select>
-              </Section>
-            )}
-            {target && (
-              <>
-                <Section title="Judge">
-                  {target.judge_profiles?.length ? (
-                    <div className="space-y-3">
-                      {target.judge_profiles.map((p) => (
-                        <div
-                          key={p.revision}
-                          className="rounded-xl border border-border p-3 text-sm break-words"
-                        >
-                          <p className="font-medium">{p.label || p.key}</p>
-                          <p className="mt-1 text-muted-foreground">
-                            {p.model} via {p.provider_name}
-                          </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {p.same_model_use === "allowed_and_labeled"
-                              ? "Same model allowed and labelled"
-                              : p.same_model_use === "forbidden"
-                                ? "Same model forbidden"
-                                : "Same-model policy unavailable"}
-                          </p>
-                          <details className="mt-3">
-                            <summary className="cursor-pointer text-xs">Judge details</summary>
-                            <PayloadViewer value={p} />
-                          </details>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-sm text-muted-foreground">No judge profile is configured.</p>
-                  )}
-                </Section>
-                <Section title="Limits">
-                  <p className="text-sm">
-                    {target.execution_profile
-                      ? `Up to ${target.execution_profile.ceilings.max_cases} cases, ${target.execution_profile.ceilings.max_trials} trials and ${target.execution_profile.ceilings.max_concurrency} concurrent trials; ${target.execution_profile.ceilings.max_timeout_seconds}s timeout.`
-                      : "Limits unavailable without an execution profile."}
-                  </p>
-                  <details className="mt-4">
-                    <summary className="cursor-pointer text-sm">Execution profile details</summary>
-                    <div className="mt-3">
-                      <EvalExecutionProfileSummary
-                        target={target}
-                        refreshing={targets.isFetching}
-                        refresh={() => void targets.refetch()}
-                      />
-                    </div>
-                    <PayloadViewer value={target} />
-                  </details>
-                </Section>
-              </>
-            )}
-          </>
+        {targets.data && selected && !liveTarget && (
+          <p role="alert" className="mt-3 text-sm">
+            This specialist is not available. Choose a configured specialist.
+          </p>
         )}
-        <Section title="Available in this deployment">
-          <ul className="space-y-3">
-            {EVALS_READINESS_OPERATIONS.map(([key, label]) => (
-              <li key={key} className="text-sm">
-                <span
-                  className={readiness[key].state === "ready" ? "text-success" : "text-warning"}
-                >
-                  {readiness[key].state === "ready" ? "✓" : "–"}
-                </span>{" "}
-                {key === "fresh_launch" ? "Fresh trials" : label}
-                {readiness[key].state !== "ready" && (
-                  <details className="ml-4 mt-1 text-xs text-muted-foreground">
-                    <summary className="cursor-pointer">Why unavailable</summary>
-                    <p className="mt-1 break-words">{evalsReadinessReasonText(readiness[key])}</p>
-                  </details>
-                )}
-              </li>
-            ))}
-          </ul>
-        </Section>
-        {canWrite && (
-          <Section title="Advanced tools">
-            <div className="flex flex-wrap gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={action.isPending || readiness.catalog_write.state !== "ready"}
-                onClick={() => input.current?.click()}
-              >
-                {action.isPending ? "Importing…" : "Import corpus"}
-              </Button>
-              <input
-                ref={input}
-                type="file"
-                accept="application/json,.json"
-                className="hidden"
-                aria-label="Import corpus file"
-                onChange={(e) => {
-                  const file = e.target.files?.[0]
-                  e.target.value = ""
-                  if (file) action.mutate(file)
-                }}
-              />
-              <MemoryExperimentReportAction disabled={false} />
+        {!catalogWritable && (
+          <p className="mt-3 text-sm text-muted-foreground" role="status">
+            {canWrite
+              ? evalsReadinessReasonText(readiness.catalog_write)
+              : "Writing evaluations is not available in this deployment."}
+          </p>
+        )}
+        <div key={scope}>
+          {search.tool === "profiles" && (
+            <>
               {target && (
-                <EvalSuiteAuthoringAction
-                  targetKey={target.target_key}
-                  disabled={readiness.catalog_write.state !== "ready"}
-                  label="Suites, checks and judges"
+                <ProfileSettings
+                  target={target}
+                  refreshing={targets.isFetching}
+                  refresh={() => void targets.refetch()}
                 />
               )}
-            </div>
-            <LoadState
-              error={action.error ?? scenario.error}
-              pending={false}
-              retry={() => {
-                action.reset()
-                scenario.reset()
-              }}
+              <Section title="Available in this deployment">
+                <ul className="space-y-2 text-sm">
+                  {EVALS_READINESS_OPERATIONS.map(([key, label]) => (
+                    <li key={key} className="flex gap-2">
+                      {readiness[key].state === "ready" ? (
+                        <Check
+                          className="mt-0.5 size-4 shrink-0 text-success"
+                          aria-label="Available"
+                        />
+                      ) : (
+                        <Minus
+                          className="mt-0.5 size-4 shrink-0 text-warning"
+                          aria-label="Not available"
+                        />
+                      )}
+                      <span>
+                        {key === "fresh_launch" ? "Fresh trials" : label}
+                        {readiness[key].state !== "ready" && (
+                          <span className="block text-xs text-muted-foreground">
+                            {evalsReadinessReasonText(readiness[key])}
+                          </span>
+                        )}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </Section>
+            </>
+          )}
+          {search.tool === "judges" && target && (
+            <JudgeSettings
+              target={target}
+              disabled={!canWrite || (!liveTarget && !state.locked)}
+              onStateChange={onStateChange}
             />
-            {action.isSuccess && (
-              <p role="status" className="mt-3 text-sm">
-                Corpus imported.{" "}
-                <NavLink to="/evals" className="underline">
-                  Open suites
-                </NavLink>
+          )}
+          {search.tool === "scenarios" && target && (
+            <ScenarioSettings
+              targetKey={target.target_key}
+              disabled={!catalogWritable || (!liveTarget && !state.locked)}
+              onStateChange={onStateChange}
+            />
+          )}
+          {search.tool === "memory" && (
+            <Section title="Memory reports">
+              <p className="mb-4 text-sm text-muted-foreground">
+                Compare paired memory variants using stored results. Upload the campaign request to
+                build a report and download JSON or HTML.
               </p>
-            )}
-            {target && (
-              <details className="mt-5">
-                <summary className="cursor-pointer text-sm">Production scenarios</summary>
-                <div className="mt-3">
-                  <ScenarioCatalog
-                    key={target.target_key}
-                    targetKey={target.target_key}
-                    pendingAction={scenario.isPending ? scenario.variables.name : null}
-                    mutateEnabled={canWrite}
-                    runAction={async (name, run) => {
-                      await scenario.mutateAsync({ name, run })
-                    }}
-                  />
-                </div>
-              </details>
-            )}
-          </Section>
-        )}
+              <MemoryExperimentReportPanel
+                disabled={!canWrite || readiness.reports.state !== "ready"}
+                onStateChange={onStateChange}
+              />
+            </Section>
+          )}
+          {search.tool === "portability" && target && (
+            <CorpusSettings
+              targetKey={target.target_key}
+              disabled={!catalogWritable || (!liveTarget && !state.locked)}
+              onStateChange={onStateChange}
+            />
+          )}
+        </div>
       </PageBody>
+      <Dialog.Root
+        open={blocker.status === "blocked"}
+        onOpenChange={(open) => {
+          if (!open) blocker.reset?.()
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Backdrop className="fixed inset-0 z-50 bg-black/40" />
+          <Dialog.Popup className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 space-y-4 rounded-xl border border-border bg-background p-5 shadow-xl">
+            <Dialog.Title className="font-semibold">Leave this tool?</Dialog.Title>
+            <Dialog.Description className="text-sm text-muted-foreground">
+              {state.locked
+                ? "Finish or retry the current operation before leaving. Its exact recovery is retained here."
+                : "Leaving discards the private evidence or unsaved changes in this tool."}
+            </Dialog.Description>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => blocker.reset?.()}>
+                Keep working
+              </Button>
+              <Button disabled={state.locked} onClick={() => blocker.proceed?.()}>
+                Leave tool
+              </Button>
+            </div>
+          </Dialog.Popup>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
+  )
+}
+
+function ProfileSettings({
+  target,
+  refreshing,
+  refresh,
+}: {
+  target: EvalTarget
+  refreshing: boolean
+  refresh: () => void
+}) {
+  return (
+    <>
+      <Section title="What trials run with">
+        <p className="mb-3 text-sm text-muted-foreground">
+          Each trial starts a fresh session with the specialist as it is configured now.
+        </p>
+        <div className="rounded-xl border border-border px-3 py-2 text-sm break-words">
+          <p className="font-medium">{target.target_key}</p>
+          <p className="text-muted-foreground">
+            {target.execution_profile
+              ? `${target.execution_profile.candidate.model} via ${target.execution_profile.candidate.provider_name}${target.execution_profile.candidate.environment_name ? ` · ${target.execution_profile.candidate.environment_name}` : ""}`
+              : "Execution profile unavailable"}
+          </p>
+        </div>
+      </Section>
+      <Section title="Judge">
+        <JudgeProfiles target={target} />
+      </Section>
+      <Section title="Limits">
+        <p className="text-sm">
+          {target.execution_profile
+            ? `Up to ${target.execution_profile.ceilings.max_cases} cases, ${target.execution_profile.ceilings.max_trials} trials and ${target.execution_profile.ceilings.max_concurrency} concurrent trials; ${target.execution_profile.ceilings.max_timeout_seconds}s timeout.`
+            : "Limits unavailable without an execution profile."}
+        </p>
+      </Section>
+      <details className="mt-5">
+        <summary className="cursor-pointer text-sm">Execution profile details</summary>
+        <div className="mt-3">
+          <EvalExecutionProfileSummary target={target} refreshing={refreshing} refresh={refresh} />
+        </div>
+        <PayloadViewer value={target} />
+      </details>
+    </>
   )
 }

@@ -119,6 +119,7 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     first = capsys.readouterr().out
     assert "# Run your first evaluation" in first
     assert "New suite" in first
+    assert "Import / export" in first
     assert "Run saved revision" in first
     assert "Edit suite" in first
     assert "Check launch" in first
@@ -132,6 +133,8 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "[tool.cayu.evals.default_judge]" in quality["content"]
     assert "allow_same_model = true" in quality["content"]
     assert "Calibrate before gating" in quality["content"]
+    assert "Judges and calibration" in quality["content"]
+    assert "saved suite revision" in quality["content"]
     assert "AI judge with weighted criteria" in quality["content"]
     assert "Configured evaluator with a rubric" in quality["content"]
 
@@ -146,6 +149,8 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "Structural exposure" in production
     assert "Semantic use" in production
     assert "Causal contribution" in production
+    assert "Settings → Production scenarios" in production
+    assert "Settings → Memory reports" in production
 
 
 def test_objectives_guide_examples_parse_as_cloud_compass_reads_them(capsys) -> None:

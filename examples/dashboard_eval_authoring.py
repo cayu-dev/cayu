@@ -112,6 +112,11 @@ async def exercise_eval_authoring(flow: str = "all") -> None:
                 if message.type != "error":
                     return
                 url = message.location.get("url", "")
+                if (
+                    re.search(r"/api/sessions/[^/]+/messages(?:\?|$)", url)
+                    and "403" in message.text
+                ):
+                    return  # This fixture deliberately has no session message access policy.
                 if url in expected_console and "net::ERR_CONNECTION_RESET" in message.text:
                     expected_console.remove(url)
                 else:
@@ -140,11 +145,22 @@ async def exercise_eval_authoring(flow: str = "all") -> None:
                 lambda response: (
                     errors.append(f"HTTP {response.status}: {response.url}")
                     if response.status >= 400
+                    and not (
+                        response.status == 403
+                        and re.search(r"/api/sessions/[^/]+/messages(?:\?|$)", response.url)
+                    )
                     else None
                 ),
             )
             try:
                 provider_requests = len(provider.requests)
+                if flow in {"all", "settings"}:
+                    from dashboard_eval_settings import exercise_eval_settings
+
+                    await exercise_eval_settings(
+                        page, base, provider, expected_aborts, expected_console
+                    )
+                    provider_requests = len(provider.requests)
                 if flow in {"all", "checks", "keyboard"}:
                     await _exercise_all_checks(page, base, hold_refresh=flow in {"all", "keyboard"})
                 if flow in {"all", "scenario"}:
@@ -858,7 +874,8 @@ async def _exercise_navigation_and_access(page, base):
     await page.get_by_role("button", name="Run suite", exact=True).click()
     await expect(editor.get_by_test_id("authored-suite-run-preview")).to_be_enabled()
     await page.get_by_role("link", name="Eval settings", exact=True).click()
-    await page.get_by_role("button", name="Suites, checks and judges", exact=True).click()
+    await page.get_by_role("link", name="Judges and calibration", exact=True).click()
+    await page.get_by_role("link", name="Create a suite with judge checks", exact=True).click()
     await expect(editor).to_be_visible()
     # Resolve a saved suite by server selector; an authored-only editor never converts a corpus.
     edit_url = f"{base}/cayu/evals/suites/{_suite_identity(saved).id}/edit"
@@ -1077,6 +1094,7 @@ if __name__ == "__main__":
             "navigation",
             "late",
             "keyboard",
+            "settings",
         ],
         default="all",
     )

@@ -124,7 +124,9 @@ async def _exercise_eval_boundary(mode: str, selected: str) -> None:
                     return
                 if selected in ("all", "scroll"):
                     await page.goto(f"{base}/cayu/evals/settings", wait_until="networkidle")
-                    await expect(page.get_by_role("heading", name="Advanced tools")).to_be_visible()
+                    await expect(
+                        page.get_by_role("heading", name="What trials run with", exact=True)
+                    ).to_be_visible()
                     await page.locator("main details summary").first.click()
                     await _exercise_scroll_owner(page, require_overflow=True)
                     print("SCROLL OWNERSHIP PASS", flush=True)
@@ -191,7 +193,15 @@ async def _exercise_eval_boundary(mode: str, selected: str) -> None:
                         else page.get_by_label("Settings specialist")
                     )
                     await picker.select_option(a)
-                    await page.get_by_test_id("new-evaluation").click()
+                    if path == "/evals/settings":
+                        await page.get_by_role(
+                            "link", name="Judges and calibration", exact=True
+                        ).click()
+                        await page.get_by_role(
+                            "link", name="Create a suite with judge checks", exact=True
+                        ).click()
+                    else:
+                        await page.get_by_test_id("new-evaluation").click()
                     editor = page.get_by_test_id("eval-suite-editor")
                     await expect(editor).to_be_visible()
                     picker = page.get_by_label("Specialist", exact=True)

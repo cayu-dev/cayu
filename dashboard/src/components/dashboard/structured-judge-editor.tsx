@@ -482,7 +482,7 @@ export function StructuredJudgeEditor({
 
 export type CalibrationState = { dirty: boolean; locked: boolean }
 
-function JudgeCalibrationPanel({
+export function JudgeCalibrationPanel({
   targetKey,
   assertion,
   defaultTask,
@@ -625,7 +625,7 @@ function JudgeCalibrationPanel({
 
   return (
     <div
-      className="space-y-3 rounded-lg border border-border bg-muted/20 p-3"
+      className="@container/judge space-y-3 rounded-lg border border-border bg-muted/20 p-3"
       data-testid="judge-calibration"
     >
       <div>
@@ -754,7 +754,7 @@ function JudgeCalibrationPanel({
           type="button"
           size="sm"
           variant="ghost"
-          disabled={disabled || pending !== null || unresolved}
+          disabled={pending !== null || unresolved}
           onClick={() => {
             setDraft(newJudgeCalibrationDraft(targetKey, assertion, defaultTask))
             setTouched(false)

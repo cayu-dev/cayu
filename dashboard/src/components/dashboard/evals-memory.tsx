@@ -3,14 +3,6 @@ import { useEffect, useRef, useState } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetFooter,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet"
-import {
   buildMemoryExperimentReport,
   downloadMemoryExperimentReportHtml,
   type EvalMemoryExperimentReport,
@@ -28,6 +20,7 @@ import type {
   EvalMemoryAttributionEvidenceV1,
   PublishedMemoryAttributionDetail,
 } from "@/lib/generated/server-api"
+import type { CalibrationState } from "./structured-judge-editor"
 
 export function MemoryEvidencePanel({
   evidence,
@@ -277,21 +270,30 @@ export function MemoryAssertionDetails({
   )
 }
 
-export function MemoryExperimentReportAction({ disabled }: { disabled: boolean }) {
-  const [open, setOpen] = useState(false)
+export function MemoryExperimentReportPanel({
+  disabled,
+  onStateChange,
+}: {
+  disabled: boolean
+  onStateChange: (state: CalibrationState) => void
+}) {
   const [request, setRequest] = useState<EvalMemoryExperimentReportRequest | null>(null)
   const [sourceName, setSourceName] = useState<string | null>(null)
   const [report, setReport] = useState<EvalMemoryExperimentReport | null>(null)
-  const [pending, setPending] = useState<"build" | "html" | null>(null)
+  const [pending, setPending] = useState<"read" | "build" | "html" | null>(null)
   const [error, setError] = useState<string | null>(null)
   const controllerRef = useRef<AbortController | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => () => controllerRef.current?.abort(), [])
 
-  const close = () => {
+  useEffect(
+    () => onStateChange({ dirty: request !== null, locked: pending !== null }),
+    [request, pending, onStateChange],
+  )
+
+  const clear = () => {
     if (pending !== null) return
-    setOpen(false)
     setRequest(null)
     setSourceName(null)
     setReport(null)
@@ -299,14 +301,20 @@ export function MemoryExperimentReportAction({ disabled }: { disabled: boolean }
   }
 
   const selectFile = async (file: File | undefined) => {
-    if (!file || pending !== null) return
+    if (!file || pending !== null || disabled) return
+    controllerRef.current?.abort()
+    const controller = new AbortController()
+    controllerRef.current = controller
+    setPending("read")
     setError(null)
     setReport(null)
     try {
       const parsed = await preflightMemoryExperimentRequestFile(file)
+      if (controller.signal.aborted) return
       setRequest(parsed)
       setSourceName(file.name)
     } catch (fileError) {
+      if (controller.signal.aborted) return
       setRequest(null)
       setSourceName(null)
       setError(
@@ -314,11 +322,16 @@ export function MemoryExperimentReportAction({ disabled }: { disabled: boolean }
           ? fileError.message
           : "The memory experiment request is invalid.",
       )
+    } finally {
+      if (controllerRef.current === controller) {
+        controllerRef.current = null
+        setPending(null)
+      }
     }
   }
 
   const run = async (kind: "build" | "html") => {
-    if (!request || pending !== null) return
+    if (!request || pending !== null || disabled) return
     controllerRef.current?.abort()
     const controller = new AbortController()
     controllerRef.current = controller
@@ -326,10 +339,11 @@ export function MemoryExperimentReportAction({ disabled }: { disabled: boolean }
     setError(null)
     try {
       if (kind === "build") {
-        setReport(await buildMemoryExperimentReport(request, controller.signal))
+        const result = await buildMemoryExperimentReport(request, controller.signal)
+        if (!controller.signal.aborted) setReport(result)
       } else {
         const file = await downloadMemoryExperimentReportHtml(request, controller.signal)
-        downloadBlob(file.blob, file.filename)
+        if (!controller.signal.aborted) downloadBlob(file.blob, file.filename)
       }
     } catch (actionError) {
       if (!controller.signal.aborted) {
@@ -344,109 +358,96 @@ export function MemoryExperimentReportAction({ disabled }: { disabled: boolean }
   }
 
   return (
-    <>
-      <Button type="button" variant="outline" disabled={disabled} onClick={() => setOpen(true)}>
-        <FlaskConical /> Paired memory report
-      </Button>
-      <Sheet open={open} onOpenChange={(next) => (next ? setOpen(true) : close())}>
-        <SheetContent className="w-[min(96vw,52rem)] overflow-y-auto sm:max-w-none">
-          <SheetHeader>
-            <SheetTitle>Paired memory experiment report</SheetTitle>
-            <SheetDescription>
-              Validate an exact campaign request against stored eval results, compare paired
-              variants, and render the causal report. This does not run or invent a campaign.
-            </SheetDescription>
-          </SheetHeader>
-
-          <div className="space-y-4 px-4">
-            <input
-              ref={inputRef}
-              type="file"
-              accept="application/json,.json"
-              className="sr-only"
-              onChange={(event) => {
-                const file = event.target.files?.[0]
-                event.target.value = ""
-                void selectFile(file)
-              }}
-            />
-            <div className="rounded-lg border border-dashed border-border p-4">
-              <Button
-                type="button"
-                variant="outline"
-                disabled={pending !== null}
-                onClick={() => inputRef.current?.click()}
-              >
-                <Upload /> Select campaign request JSON
-              </Button>
-              <div className="mt-2 text-xs text-muted-foreground">
-                {sourceName ?? "Maximum 32 MiB. Server validation remains authoritative."}
-              </div>
-            </div>
-
-            {request && (
-              <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
-                <MemoryFact label="Experiment" value={request.experiment_id} />
-                <MemoryFact label="Cases" value={formatCount(request.cases.length)} />
-                <MemoryFact label="Variants" value={formatCount(request.variants.length)} />
-                <MemoryFact label="Repetitions" value={formatCount(request.repetitions)} />
-              </div>
-            )}
-
-            {error && (
-              <div
-                className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
-                role="alert"
-              >
-                {error}
-              </div>
-            )}
-
-            {report && <MemoryExperimentReportSummary report={report} />}
+    <div className="space-y-4" data-testid="memory-report-tool">
+      <div className="space-y-4">
+        <input
+          ref={inputRef}
+          type="file"
+          accept="application/json,.json"
+          className="sr-only"
+          aria-label="Campaign request JSON"
+          disabled={disabled || pending !== null}
+          onChange={(event) => {
+            const file = event.target.files?.[0]
+            event.target.value = ""
+            void selectFile(file)
+          }}
+        />
+        <div className="rounded-lg border border-dashed border-border p-4">
+          <Button
+            type="button"
+            variant="outline"
+            disabled={disabled || pending !== null}
+            onClick={() => inputRef.current?.click()}
+          >
+            <Upload /> Select campaign request JSON
+          </Button>
+          <div className="mt-2 text-xs text-muted-foreground">
+            {sourceName ?? "Campaign request JSON, up to 32 MiB."}
           </div>
+        </div>
 
-          <SheetFooter>
-            <Button type="button" variant="outline" disabled={pending !== null} onClick={close}>
-              Close
-            </Button>
-            {report && (
-              <Button
-                type="button"
-                variant="outline"
-                disabled={pending !== null}
-                onClick={() =>
-                  downloadBlob(
-                    new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }),
-                    `${safeFilename(report.experiment_id)}.memory-report.json`,
-                  )
-                }
-              >
-                <FileJson /> JSON
-              </Button>
-            )}
-            {report && (
-              <Button
-                type="button"
-                variant="outline"
-                disabled={pending !== null}
-                onClick={() => void run("html")}
-              >
-                {pending === "html" ? <LoaderCircle className="animate-spin" /> : <Download />}
-                HTML
-              </Button>
-            )}
-            <Button
-              type="button"
-              disabled={!request || pending !== null}
-              onClick={() => void run("build")}
-            >
-              {pending === "build" ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}
-              {pending === "build" ? "Building..." : "Build report"}
-            </Button>
-          </SheetFooter>
-        </SheetContent>
-      </Sheet>
-    </>
+        {request && (
+          <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+            <MemoryFact label="Experiment" value={request.experiment_id} />
+            <MemoryFact label="Cases" value={formatCount(request.cases.length)} />
+            <MemoryFact label="Variants" value={formatCount(request.variants.length)} />
+            <MemoryFact label="Repetitions" value={formatCount(request.repetitions)} />
+          </div>
+        )}
+
+        {error && (
+          <div
+            className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
+            role="alert"
+          >
+            {error}
+          </div>
+        )}
+
+        {report && <MemoryExperimentReportSummary report={report} />}
+      </div>
+
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button type="button" variant="outline" disabled={pending !== null} onClick={clear}>
+          Clear report
+        </Button>
+        {report && (
+          <Button
+            type="button"
+            variant="outline"
+            disabled={disabled || pending !== null}
+            onClick={() =>
+              downloadBlob(
+                new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }),
+                `${safeFilename(report.experiment_id)}.memory-report.json`,
+              )
+            }
+          >
+            <FileJson /> JSON
+          </Button>
+        )}
+        {report && (
+          <Button
+            type="button"
+            variant="outline"
+            disabled={disabled || pending !== null}
+            onClick={() => void run("html")}
+          >
+            {pending === "html" ? <LoaderCircle className="animate-spin" /> : <Download />}
+            HTML
+          </Button>
+        )}
+        <Button
+          type="button"
+          disabled={disabled || !request || pending !== null}
+          onClick={() => void run("build")}
+        >
+          {pending === "build" ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}
+          {pending === "build" ? "Building..." : "Build report"}
+        </Button>
+      </div>
+    </div>
   )
 }
 

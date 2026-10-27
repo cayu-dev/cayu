@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from tests.core.test_execution_deadlines import clock as clock
 from tests.core.test_external_agents import ScriptedAdapter, request
 
 from cayu import CayuApp, EventType
 from cayu.approvals import PendingToolApprovalEventView
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
-from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded
+from cayu.deadlines import _TIMERS, ExecutionDeadline, ExecutionDeadlineExceeded
 from cayu.external_agents import (
     ExternalAgentError,
     ExternalAgentEvent,
@@ -189,13 +191,25 @@ def test_concurrent_gateway_request_waits_for_successful_usage_publication(secon
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("startup_delay", [0, 0.4])
 @pytest.mark.parametrize("deadline", [False, True])
-def test_cancellation_during_cleanup_retries_settles_after_quiescence(deadline):
+def test_cancellation_during_cleanup_retries_settles_after_quiescence(
+    deadline, startup_delay, clock
+):
     async def scenario():
         app = CayuApp(task_store=InMemoryTaskStore(), enable_logging=False)
         retrying, release = asyncio.Event(), asyncio.Event()
 
         async def retry():
+            if deadline:
+                # Arm actual timer expiry only after cleanup owns the operation.
+                # A subsecond request deadline can expire during CI startup instead.
+                clock.wall += timedelta(seconds=3600)
+                clock.mono += 3600
+                timers = [timer for timer, _ in _TIMERS.get() if timer.when() is not None]
+                assert timers
+                for timer in timers:
+                    timer.reschedule(asyncio.get_running_loop().time())
             retrying.set()
             await release.wait()
 
@@ -204,15 +218,13 @@ def test_cancellation_during_cleanup_retries_settles_after_quiescence(deadline):
                 raise ExternalCleanupIncomplete(retry)
                 yield
 
-        req = request().model_copy(
-            update={"execution_deadline": ExecutionDeadline.after(0.3 if deadline else 5)}
-        )
+        req = request().model_copy(update={"execution_deadline": ExecutionDeadline.after(60)})
+        await asyncio.sleep(startup_delay)
         running = asyncio.create_task(run_external_agent(app, req, Adapter([]), prompt="test"))
         await asyncio.wait_for(retrying.wait(), 5)
-        if deadline:
-            await asyncio.sleep(max(0, req.execution_deadline.remaining_seconds() or 0) + 0.02)
-        else:
+        if not deadline:
             running.cancel("operator")
+            assert running.cancelling() == 1
         await asyncio.sleep(0.02)
         (task,) = await app.task_store.list_tasks(TaskQuery())
         assert task.status is TaskStatus.RUNNING
@@ -221,6 +233,9 @@ def test_cancellation_during_cleanup_retries_settles_after_quiescence(deadline):
         release.set()
         with pytest.raises(ExecutionDeadlineExceeded if deadline else asyncio.CancelledError):
             await running
+        assert running.cancelled() is not deadline
+        if deadline:
+            assert running.cancelling() == 0
         current = await app.task_store.load_task(task.id)
         assert current.status is (TaskStatus.FAILED if deadline else TaskStatus.CANCELLED)
         session = await app.session_store.load(task.session_id)

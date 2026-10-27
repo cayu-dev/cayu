@@ -61,6 +61,10 @@ current dependency—not a request to fabricate it in the browser.
 
 Use **Production scenario** from a captured session, or choose **Multi-stage
 scenario** on a case’s **Input** tab in **New suite** or **Edit suite**.
+**Evals → Settings → Production scenarios** provides the same editor, a paginated
+library of saved revisions, **New scenario**, and exact-revision downloads.
+Select a saved revision to edit it or run it on its own. Save or discard edits
+before selecting another scenario.
 
 - The initial event creates one fresh session.
 - **Queue input** delivers ordered follow-up input on the next turn or when the
@@ -77,7 +81,9 @@ Choose **Check readiness** before saving. The preview binds the exact current
 target, execution profile, scenario revision, environment, fixtures, secrets,
 effects, evidence policy, limits, trials, concurrency, timeout, and cost bound.
 Prepare retained artifacts only through the displayed server-owned **Prepare
-fixture** action. **Run scenario** admits that exact reviewed binding.
+fixture** action. **Run scenario** admits that exact reviewed binding. If its
+response is lost, retry **Run scenario** here before switching tools; the original
+request identity is retained. Closing the browser does not cancel server work.
 
 During execution, the run page shows queued, running, awaiting-input,
 awaiting-approval, cancelling, and terminal trial phases. Approve or deny only
@@ -115,6 +121,16 @@ Memory evaluation has three different questions:
    cannot answer that. Use the protected paired-intervention report only for a
    validated campaign that controls the memory variant and retains comparable
    trial evidence.
+
+**Evals → Settings → Memory reports** accepts the campaign request JSON (up to
+32 MiB). **Build report** validates it against stored results and shows paired
+comparisons, availability and variant dispositions. Download **JSON** or **HTML**,
+or **Clear report** before choosing another request. This tool builds reports;
+it does not launch a memory campaign or fill in missing trial evidence.
+
+**Evals → Settings → Import / export** imports a portable corpus JSON file (up to
+8 MiB) and lists saved corpora for the selected specialist. **Download** exports
+the exact stored revision, without running trials.
 
 Session-scoped memory aliases are diagnostic labels, not stable case identity
 across fresh runs. Results retain bounded source/lifecycle evidence and safe

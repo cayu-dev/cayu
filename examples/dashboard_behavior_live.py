@@ -1963,15 +1963,17 @@ async def _exercise_eval_role_transition(page: Page, base_url: str) -> None:
             await route.fulfill(response=response, json=body)
 
         async def targets(route):
+            if response_state == "error":
+                # Inject directly: fetching a discarded backend response first lets
+                # role loss cancel the observer before this fault is registered.
+                _expect_eval_fault(page, route.request, status=403)
+                await route.fulfill(status=403, json={"detail": "Private target diagnostic"})
+                return
             response = await route.fetch()
             if response_state == "late":
                 held.set()
                 await release.wait()
-            if response_state == "error":
-                _expect_eval_fault(page, route.request, status=403)
-                await route.fulfill(status=403, json={"detail": "Private target diagnostic"})
-            else:
-                await route.fulfill(response=response)
+            await route.fulfill(response=response)
 
         def observe(request):
             path = urlsplit(request.url).path
@@ -2024,7 +2026,7 @@ async def _exercise_eval_role_transition(page: Page, base_url: str) -> None:
             # A focus event may already have dispatched before identity resolved; only
             # requests after the authoritative member render are forbidden.
             private_reads.clear()
-            await page.get_by_role("link", name="Evals /", exact=True).click()
+            await page.locator("header").get_by_role("link", name="Evals", exact=True).click()
             await expect(page.get_by_role("heading", name="Evals", exact=True)).to_be_visible()
             await expect(page.get_by_text("Private target diagnostic", exact=False)).to_have_count(
                 0
@@ -2145,15 +2147,17 @@ async def _exercise_eval_run_role_transition(page: Page, run_url: str) -> None:
             await route.fulfill(response=response, json=body)
 
         async def private_result(route):
+            if response_state == "error":
+                # Inject directly: fetching a discarded backend response first lets
+                # role loss cancel the observer before this fault is registered.
+                _expect_eval_fault(page, route.request, status=403)
+                await route.fulfill(status=403, json={"detail": "Private result diagnostic"})
+                return
             response = await route.fetch()
             if response_state == "late":
                 held.set()
                 await release.wait()
-            if response_state == "error":
-                _expect_eval_fault(page, route.request, status=403)
-                await route.fulfill(status=403, json={"detail": "Private result diagnostic"})
-            else:
-                await route.fulfill(response=response)
+            await route.fulfill(response=response)
 
         await page.route("**/api/app", identity)
         await page.route("**/api/evals/runs/*/result", private_result)
@@ -2487,7 +2491,7 @@ async def _exercise_captured_evaluation(
     await scenario_editor.get_by_role("button", name="Run scenario", exact=True).click()
     await expect(
         scenario_editor.get_by_text(
-            re.compile(r"Opened eval run .+ \((queued|running)\)\. Follow it in the Runs tab\."),
+            re.compile(r"Opened eval run .+ \((queued|running)\)\."),
         )
     ).to_be_visible()
     scenario_runs_response = await page.request.get(
@@ -3275,10 +3279,10 @@ async def _exercise_captured_evaluation(
     provider.block_next_promotion_run = True
 
     await page.goto(f"{base_url}/cayu/evals/settings", wait_until="networkidle")
-    await page.locator("summary", has_text="Production scenarios").click()
+    await page.get_by_role("link", name="Production scenarios", exact=True).click()
     scenario_row = (
         page.get_by_test_id("scenario-catalog")
-        .get_by_role("row")
+        .get_by_role("listitem")
         .filter(has_text="Captured dashboard regression")
     )
     await expect(scenario_row).to_be_visible()
@@ -3310,6 +3314,7 @@ async def _exercise_captured_evaluation(
     suite_name = corpus["suites"][0]["name"]
     suite_id = corpus["suites"][0]["id"]
 
+    await page.get_by_role("link", name="Import / export", exact=True).click()
     await page.get_by_label("Import corpus file", exact=True).set_input_files(
         {
             "name": "dashboard-browser-contract.eval.json",
@@ -3317,7 +3322,9 @@ async def _exercise_captured_evaluation(
             "buffer": json.dumps(corpus).encode(),
         }
     )
-    await expect(page.get_by_text("Corpus imported.", exact=False)).to_be_visible()
+    await expect(
+        page.get_by_text(f"Corpus imported for {corpus['target_key']}.", exact=False)
+    ).to_be_visible()
     suite_selector = _eval_view_selector(
         "suite",
         {
@@ -6261,7 +6268,20 @@ def _require_expected_eval_faults(page: Page) -> None:
     faults = _EVAL_FAULTS.pop(page, {})
     require(
         all(fault["observed"] for fault in faults.values()),
-        "an injected eval fault was not observed on its exact request",
+        "injected eval faults were not observed on their exact requests: "
+        + repr(
+            [
+                (
+                    request.method,
+                    urlsplit(request.url).path,
+                    fault["status"],
+                    fault["failure"],
+                    request.failure,
+                )
+                for request, fault in faults.items()
+                if not fault["observed"]
+            ]
+        ),
     )
 
 

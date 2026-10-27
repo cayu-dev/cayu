@@ -91,6 +91,11 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
     assert select_pull_request_jobs(["docs/release-notes.md"]) == expected
     assert select_pull_request_jobs(["examples/dashboard_behavior_live.py"]) == expected
     assert select_pull_request_jobs(["examples/dashboard_eval_authoring.py"]) == expected
+    assert select_pull_request_jobs(["examples/dashboard_eval_settings.py"]) == expected
+    assert (
+        select_pull_request_jobs(["examples/fixtures/dashboard-memory-report-request.json"])
+        == expected
+    )
     assert select_pull_request_jobs(["examples/dashboard_eval_boundaries.py"]) == expected
     assert select_pull_request_jobs(["examples/dashboard_eval_editor_layout.py"]) == expected
     assert select_pull_request_jobs(["examples/dashboard_eval_suite_pages.py"]) == expected

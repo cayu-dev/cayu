@@ -1,5 +1,6 @@
+import { Dialog } from "@base-ui/react/dialog"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { Link } from "@tanstack/react-router"
+import { Link, useBlocker } from "@tanstack/react-router"
 import {
   AlertTriangle,
   CheckCircle2,
@@ -14,7 +15,10 @@ import {
   XCircle,
 } from "lucide-react"
 import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
-import { ScenarioAuthoring } from "@/components/dashboard/scenario-authoring"
+import {
+  ScenarioAuthoring,
+  type ScenarioAuthoringState,
+} from "@/components/dashboard/scenario-authoring"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -106,11 +110,13 @@ export function EvaluationPromotionAction({
   status,
   label = "Evaluate",
   compact = false,
+  onOpenChange,
 }: {
   sessionId: string
   status: string
   label?: string
   compact?: boolean
+  onOpenChange?: (open: boolean) => void
 }) {
   const readiness = useServerContract().capabilities.evals_readiness
   const capturedReadiness = readiness.captured_evaluation
@@ -119,6 +125,21 @@ export function EvaluationPromotionAction({
   const scenarioCatalogReady = readiness.catalog_write.state === "ready"
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
+  useEffect(() => onOpenChange?.(open), [onOpenChange, open])
+  useEffect(() => () => onOpenChange?.(false), [onOpenChange])
+  const [scenarioState, setScenarioState] = useState<ScenarioAuthoringState>({
+    dirty: false,
+    edited: false,
+    pending: false,
+  })
+  const [scenarioReset, setScenarioReset] = useState(0)
+  const [transition, setTransition] = useState<"close" | "preview" | null>(null)
+  const scenarioOwned = scenarioState.edited || scenarioState.pending
+  const routeBlocker = useBlocker({
+    shouldBlockFn: () => open && scenarioOwned,
+    enableBeforeUnload: open && scenarioOwned,
+    withResolver: true,
+  })
   const [preview, setPreview] = useState<EvaluationPromotionPreview | null>(null)
   const [draft, setDraft] = useState<EvaluationPromotionCandidateDraft | null>(null)
   const [previewing, setPreviewing] = useState(false)
@@ -212,11 +233,17 @@ export function EvaluationPromotionAction({
     setSavedTargetKey(null)
     setLaunchedRunId(null)
     setBaselineGeneration(null)
+    setScenarioState({ dirty: false, edited: false, pending: false })
+    setTransition(null)
     setOpen(true)
     void loadPreview()
   }
 
   const changeOpen = (nextOpen: boolean) => {
+    if (!nextOpen && scenarioOwned) {
+      setTransition("close")
+      return
+    }
     setOpen(nextOpen)
     if (!nextOpen) {
       cancelRequests()
@@ -226,6 +253,22 @@ export function EvaluationPromotionAction({
       setLaunching(false)
       setBaselining(false)
     }
+  }
+
+  const requestPreview = () => {
+    if (scenarioOwned) setTransition("preview")
+    else if (draft) void loadPreview(draft)
+  }
+  const discardScenario = () => {
+    if (scenarioState.pending) return
+    setScenarioState({ dirty: false, edited: false, pending: false })
+    setScenarioReset((value) => value + 1)
+    if (routeBlocker.status === "blocked") routeBlocker.proceed()
+    else if (transition === "close") {
+      setOpen(false)
+      cancelRequests()
+    } else if (transition === "preview" && draft) void loadPreview(draft)
+    setTransition(null)
   }
 
   const editDraft = (edit: (next: EvaluationPromotionCandidateDraft) => void) => {
@@ -516,6 +559,8 @@ export function EvaluationPromotionAction({
                 )}
                 {preview?.scenario_conversion.available && preview.scenario_conversion.scenario && (
                   <ScenarioAuthoring
+                    key={scenarioReset}
+                    onAuthoringStateChange={setScenarioState}
                     captured={preview.scenario_conversion.scenario}
                     disabled={
                       !scenarioCatalogReady ||
@@ -529,7 +574,14 @@ export function EvaluationPromotionAction({
                 )}
                 <fieldset
                   className="contents"
-                  disabled={previewing || exporting || saving || launching || baselining}
+                  disabled={
+                    scenarioState.pending ||
+                    previewing ||
+                    exporting ||
+                    saving ||
+                    launching ||
+                    baselining
+                  }
                 >
                   <PromotionIdentityEditor draft={draft} editDraft={editDraft} />
                   <ExpectedBehaviorEditor
@@ -593,7 +645,7 @@ export function EvaluationPromotionAction({
                     size="xs"
                     variant="outline"
                     className="ml-2"
-                    disabled={baselining}
+                    disabled={baselining || scenarioOwned}
                     onClick={() => void approveBaseline()}
                   >
                     {baselining ? <LoaderCircle className="animate-spin" /> : <CheckCircle2 />}
@@ -620,13 +672,14 @@ export function EvaluationPromotionAction({
               data-testid="promotion-preview"
               disabled={
                 draft === null ||
+                scenarioState.pending ||
                 previewing ||
                 exporting ||
                 saving ||
                 launching ||
                 validation?.ok !== true
               }
-              onClick={() => draft && void loadPreview(draft)}
+              onClick={requestPreview}
             >
               {previewing ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}
               {previewing ? "Scoring..." : "Preview score"}
@@ -634,7 +687,13 @@ export function EvaluationPromotionAction({
             <Button
               data-testid="promotion-export"
               disabled={
-                !previewIsCurrent || previewing || exporting || saving || launching || baselining
+                scenarioOwned ||
+                !previewIsCurrent ||
+                previewing ||
+                exporting ||
+                saving ||
+                launching ||
+                baselining
               }
               onClick={() => void exportCandidate()}
             >
@@ -644,6 +703,7 @@ export function EvaluationPromotionAction({
             <Button
               data-testid="promotion-save"
               disabled={
+                scenarioOwned ||
                 !previewIsCurrent ||
                 persistenceReadiness.state !== "ready" ||
                 previewing ||
@@ -661,6 +721,7 @@ export function EvaluationPromotionAction({
             <Button
               data-testid="promotion-launch"
               disabled={
+                scenarioOwned ||
                 !previewIsCurrent ||
                 preview?.runnable_conversion.available !== true ||
                 persistenceReadiness.state !== "ready" ||
@@ -681,6 +742,41 @@ export function EvaluationPromotionAction({
           </SheetFooter>
         </SheetContent>
       </Sheet>
+      <Dialog.Root
+        open={transition !== null || routeBlocker.status === "blocked"}
+        onOpenChange={(next) => {
+          if (!next) {
+            setTransition(null)
+            routeBlocker.reset?.()
+          }
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Backdrop className="fixed inset-0 z-50 bg-black/40" />
+          <Dialog.Popup className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 space-y-4 rounded-xl border border-border bg-background p-5 shadow-xl">
+            <Dialog.Title className="font-semibold">Keep this scenario?</Dialog.Title>
+            <Dialog.Description className="text-sm text-muted-foreground">
+              {scenarioState.pending
+                ? "Finish or retry the scenario operation before leaving. Its exact recovery is retained here."
+                : "Continuing discards the unsaved scenario edits and launch selections."}
+            </Dialog.Description>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setTransition(null)
+                  routeBlocker.reset?.()
+                }}
+              >
+                Keep working
+              </Button>
+              <Button disabled={scenarioState.pending} onClick={discardScenario}>
+                Discard scenario edits
+              </Button>
+            </div>
+          </Dialog.Popup>
+        </Dialog.Portal>
+      </Dialog.Root>
     </>
   )
 }

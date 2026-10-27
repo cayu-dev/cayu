@@ -86,12 +86,20 @@ confirm the server-owned configuration.
 
 Choose **Check suite** so the server compiles the exact rubric, reference,
 profile, and evidence selection. The calibration panel then uses that reviewed
-assertion.
+assertion without leaving the case editor. For an already saved check, open
+**Evals → Settings → Judges and calibration**, then select the saved suite revision,
+case, and structured check. Both entrances use the same calibration workbench.
+Settings shows configured profiles and their details; private reference content
+stays on the server.
 
 Enter a fixed candidate output, the task it answered, and human scores for each
 criterion. **Check calibration** shows the exact judge work and cost exposure;
 **Run calibration** may repeat judge calls over the same retained evidence. It
-does not rerun candidate tools or sessions.
+does not rerun candidate tools or sessions. While a paid request is unresolved,
+retry it here before switching checks or leaving the tool; the retry keeps its
+original run identity. After a report arrives, it remains visible until you
+choose another check or leave. **Discard calibration** clears edited fixed
+evidence; private evidence is not stored in the URL or browser storage.
 
 Use clearly good, clearly bad, and difficult boundary examples. If repeated
 judge scores move materially on identical evidence, refine the rubric or use a
