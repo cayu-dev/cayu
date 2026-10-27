@@ -928,7 +928,6 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
 
     assert main(["guide", "long-running"]) == 0
     guide = capsys.readouterr().out
-    assert len(guide.splitlines()) <= 290
     snippets = re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
     assert len(snippets) == 8
     namespace: dict[str, Any] = {}

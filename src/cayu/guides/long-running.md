@@ -213,8 +213,13 @@ Without `execution_timeout_s`, a hung call stays claimed. Which limit ends what:
   next is refused with `TaskRetryBudgetExhausted` and the key stays given up, as
   `cayu inspect --retry-key KEY` shows. Raise it with `retry_budget=`.
 - `RetryPolicy` ends a model call that keeps hitting rate limits or outages:
-  5 attempts and under 10 seconds of backoff by default, short for a usage
-  limit. Widen it before retrying sessions; see `cayu guide providers#provider-retries`.
+  by default, at most 5 attempts. Rate limits and overloads have a 300-second
+  retry budget (`max_retry_elapsed_s`), counted from the first attempt, with
+  each delay capped at 60 seconds (`max_delay_s`). Other retryable failures use
+  7.5 to 9.5 seconds of ordinary backoff in total; `Retry-After` can extend it.
+  These are configurable retry limits, not a deadline that cancels a model call.
+  Choose them for the provider and workload before retrying whole sessions;
+  see `cayu guide providers#provider-retries`.
 
 A delivery still running at the limit is cancelled and may or may not have
 happened, so make it idempotent. Don't catch `asyncio.CancelledError`: a
