@@ -994,6 +994,13 @@ or multi-user services, credential sharing, resale, or bypassing plan limits.
 For production, use the OpenAI Platform API or another officially supported
 provider. Run `uv run --no-sync cayu guide providers#openai-subscription` for the local
 support boundary.
+
+Deployed to Cayu Cloud, the starter agent's model is an Agent setting
+(`agent.<name>.model`, declared in `agents/registration.py`), with run limits and
+retries next to it: change them on the Agent's Settings page and new sessions use
+them. `CAYU_MODEL` still sets the default model for one more release; set it in
+`agents/agent.py` instead. See `docs/managed-settings.md` in the Cayu repository.
+
 `--agent` is optional while this is the only registered specialist. The checked-in
 `AGENTS.md` is the local instruction surface for coding agents.
 """

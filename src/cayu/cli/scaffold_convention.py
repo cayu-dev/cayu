@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 
 from cayu.cli.scaffold_app_database import APP_DATABASE, APP_DATABASE_TABLES
@@ -13,6 +14,7 @@ from cayu.cli.scaffold_plan import (
     preset_spec,
     removed_capability_files,
 )
+from cayu.managed_settings import MAX_KEY_LENGTH
 
 # Packages every project declares; a home whose capability `--without`
 # removed is left out of the generated architecture test.
@@ -361,6 +363,13 @@ def resolve_configured_agent(agent: AgentSpec) -> AgentSpec:
 
 
 def configured_model_override() -> str:
+    """Return CAYU_MODEL, a fallback default kept for one release.
+
+    The starter agent declares its model as a managed setting, so a deployed
+    Agent's model is set in Cayu Cloud's Agent settings, which override this
+    default. Locally, set the model in agents/agent.py.
+    """
+
     return (os.environ.get("CAYU_MODEL") or "").strip()
 
 
@@ -743,11 +752,29 @@ def _request_footprint_config() -> RequestFootprintConfig:
     )
 '''
 
+_MODEL_SETTING_IMPORT = "from cayu.managed_settings import model_setting\n"
+_MODEL_SETTING_ARGUMENT = """        # In Cayu Cloud the model is an Agent setting (agent.<name>.model) that new
+        # sessions read; the agent's own model is its default.
+        settings=[model_setting()],
+"""
+
+
+def _registration_with_model_setting(source: str, agent_name: str) -> str:
+    """Leave the model setting out for an agent whose name can't be part of a setting key."""
+
+    key = f"agent.{agent_name}.model"
+    if re.fullmatch(r"[a-z0-9_-]+", agent_name) and len(key) <= MAX_KEY_LENGTH:
+        return source
+    source = _replace_once(source, _MODEL_SETTING_IMPORT, "")
+    return _replace_once(source, _MODEL_SETTING_ARGUMENT, "")
+
+
 _AGENT_REGISTRATION_PY = '''"""Explicit agent, tool, policy, and runtime registration seam."""
 
 from cayu import AgentSpec, CayuApp
 from cayu.providers import ModelProvider
 from cayu.context import ContextPolicy
+from cayu.managed_settings import model_setting
 
 from agents.agent import AGENT
 from configuration import resolve_configured_agent
@@ -791,6 +818,9 @@ def register_agents(
             tuple(tool.spec.name for tool in starter_tools)
         ),
         tool_policy=build_tool_policy(tuple(starter_external_tool_names)),
+        # In Cayu Cloud the model is an Agent setting (agent.<name>.model) that new
+        # sessions read; the agent's own model is its default.
+        settings=[model_setting()],
     )
     # <cayu:generated-registrations>
     # </cayu:generated-registrations>
@@ -1952,7 +1982,9 @@ def convention_files(
             "configuration/storage.py": configured(_STORAGE_PY),
             "configuration/runtime.py": configured(_RUNTIME_PY),
             "agents/agent.py": configured(_AGENT_PY),
-            "agents/registration.py": configured(_AGENT_REGISTRATION_PY),
+            "agents/registration.py": _registration_with_model_setting(
+                configured(_AGENT_REGISTRATION_PY), plan.agent_name
+            ),
             "prompts/agent.py": configured(_PROMPT_PY),
             "tools/registration.py": configured(_TOOLS_REGISTRATION_PY),
             "policies/tools.py": configured(_TOOL_POLICY_PY),

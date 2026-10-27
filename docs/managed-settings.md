@@ -103,6 +103,18 @@ that can't be part of a key, is left out. Budget amounts apply at `restart`.
   its own settings live; use it only for settings that are safe to change while a
   session runs.
 
+### Scaffolded projects
+
+`cayu new` registers the starter agent with `settings=[model_setting()]` in
+`agents/registration.py`, so a deployed Agent's model is an Agent setting whose
+default is the model in `agents/agent.py`. It leaves the setting out when the
+agent's name has an uppercase letter, which a key can't hold. The coding preset
+doesn't declare it yet. The run limits and retries come with
+every application. `configuration/settings.py` still reads `CAYU_MODEL` as a
+fallback default for one release; a value set in Cloud overrides it. Add a
+project's own settings in `build_app` with `app.declare_settings([...])`, and
+pass `settings=` when registering further agents.
+
 ## The Release's schema
 
 `app.managed_settings_schema()` returns the assembled

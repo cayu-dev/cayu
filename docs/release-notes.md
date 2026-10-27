@@ -18,6 +18,16 @@ actions. Out-of-tree `SessionStore` implementations need
 renewal after a human wait. Without it, ordinary continuations keep enforcing
 the stored deadline; explicit replacements raise `NotImplementedError`.
 
+Upgrade: projects from `cayu new` (not the coding preset) now declare the
+starter agent's model as a managed setting when its name is lowercase
+(`agents/registration.py` passes `settings=[model_setting()]`). To get the same
+in an existing project, add that argument to its `register_agent` call. `CAYU_MODEL` still sets the scaffold's default model in
+this release and will stop doing so in the next one: set the model in
+`agents/agent.py`, or for a deployed Agent in Cayu Cloud's Agent settings. The
+agent registry registration gains an optional `settings_schema` field; a Cloud
+that doesn't accept it yet answers 422, and the Runtime registers again without
+it.
+
 Upgrade: refresh optional dependencies and rebuild custom dashboards to pick up
 the patched dependency versions. These dependency updates need no additional
 storage migration.
@@ -127,6 +137,9 @@ storage migration.
   `managed_settings`. The Agent reports what it applied, keeps the last good
   snapshot when Cloud can't be reached, and uses the code's defaults outside
   Cloud.
+- `cayu new` (not yet the coding preset) declares the starter agent's model as
+  a managed setting, so a deployed Agent's model can be changed in Cayu Cloud;
+  `CAYU_MODEL` remains a fallback default for one release.
 
 ### Fixes
 

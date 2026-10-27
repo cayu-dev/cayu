@@ -3292,3 +3292,45 @@ def test_a_project_without_evals_gets_no_objectives() -> None:
 
     assert "cayu-objectives.toml" not in files
     assert "improvement" not in tomllib.loads(files["pyproject.toml"])["tool"]["cayu"]
+
+
+def test_scaffold_declares_the_starter_model_as_a_managed_setting(tmp_path, monkeypatch):
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "anthropic"]) == 0
+    project = tmp_path / "myproj"
+    monkeypatch.setenv("CAYU_PROVIDER", "anthropic")
+    monkeypatch.delenv("CAYU_MODEL", raising=False)
+    with project_context(project):
+        module = importlib.import_module("app")
+        app = module.build_app(
+            provider=ScriptedModelProvider([], name="anthropic"),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        agent = app.describe().agents[0]
+        settings = {item["key"]: item for item in app.managed_settings_schema()["settings"]}
+        model = settings[f"agent.{agent.name}.model"]
+        assert model["default"] == agent.model == "claude-sonnet-4-6"
+        assert model["applies"] == "next_session"
+        assert "config.run.max_steps" in settings
+
+
+@pytest.mark.parametrize(
+    ("project_name", "agent_name"), [("MyProj", "MyProj"), ("longproj", "a" * 130)]
+)
+def test_scaffold_with_an_agent_name_a_key_cant_hold_builds_without_the_model_setting(
+    tmp_path, monkeypatch, project_name, agent_name
+):
+    arguments = ["new", project_name, "--dir", str(tmp_path), "--provider", "anthropic"]
+    assert main([*arguments, "--agent-name", agent_name]) == 0
+    project = tmp_path / project_name
+    assert "model_setting" not in (project / "agents/registration.py").read_text()
+    monkeypatch.setenv("CAYU_PROVIDER", "anthropic")
+    with project_context(project):
+        module = importlib.import_module("app")
+        app = module.build_app(
+            provider=ScriptedModelProvider([], name="anthropic"),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        assert app.describe().agents[0].name == agent_name
+        assert not any(key.startswith("agent.") for key in (s.key for s in app.managed_settings()))
