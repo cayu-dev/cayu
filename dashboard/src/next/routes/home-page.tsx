@@ -35,18 +35,27 @@ export function HomePage() {
   const { prototype } = useServices()
   const search = useSearch({ strict: false }) as { start?: string }
   const [starting, setStarting] = useState(search.start === "1")
+  const [startPending, setStartPending] = useState(false)
   useEffect(() => {
     if (search.start === "1") setStarting(true)
   }, [search.start])
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar
-        actions={<StartSessionButton open={starting} onToggle={() => setStarting(!starting)} />}
+        actions={
+          <StartSessionButton
+            pending={startPending}
+            open={starting}
+            onToggle={() => setStarting(!starting)}
+          />
+        }
       >
         Home
       </TopBar>
       <PageBody width="max-w-3xl">
-        {starting && <StartSession onClose={() => setStarting(false)} />}
+        {starting && (
+          <StartSession onPendingChange={setStartPending} onClose={() => setStarting(false)} />
+        )}
         {prototype ? (
           <HomeOverview />
         ) : (

@@ -4,6 +4,7 @@
  * picks the task up and runs its orchestration. It needs the app to declare task types.
  */
 import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useRouter } from "@tanstack/react-router"
 import { Play, X } from "lucide-react"
 import { useEffect, useRef, useState, useSyncExternalStore } from "react"
 import { MutationTransportStatus } from "@/components/dashboard/mutation-transport-status"
@@ -20,6 +21,7 @@ import { cn } from "@/lib/utils"
 import type { Api, TaskType } from "../api/types"
 import { useSpecialists, useTaskTypes } from "../app/queries"
 import { useApi, useServices } from "../app/services"
+import { useSessionActionGuard } from "../app/session-action-guard"
 import { TaskOperation } from "../app/task-operation"
 import { ErrorState, sessionPath, taskPath, useGo } from "./common"
 
@@ -36,11 +38,19 @@ function useStartUnavailableReason(mode?: "task" | "specialist"): string | null 
 }
 
 /** The button that opens the form, for a page's top bar. */
-export function StartSessionButton({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+export function StartSessionButton({
+  open,
+  onToggle,
+  pending = false,
+}: {
+  open: boolean
+  onToggle: () => void
+  pending?: boolean
+}) {
   const unavailable = useStartUnavailableReason()
   if (unavailable) return <span className="text-xs text-muted-foreground">{unavailable}</span>
   return (
-    <Button variant="outline" size="sm" onClick={onToggle} aria-expanded={open}>
+    <Button variant="outline" size="sm" onClick={onToggle} aria-expanded={open} disabled={pending}>
       <Play />
       Start a session
     </Button>
@@ -101,8 +111,10 @@ function inputFrom(fields: Field[], values: Record<string, string>): Record<stri
   return input
 }
 
-function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initialMode?: Mode }) {
+function StartSessionForm({ onClose, initialMode, onPendingChange }: StartSessionProps) {
   const api = useApi()
+  const router = useRouter()
+  const origin = router.state.location.pathname
   const taskOperation =
     taskOperations.get(api) ?? new TaskOperation((body, id) => api.createTask(body, id))
   taskOperations.set(api, taskOperation)
@@ -146,10 +158,11 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
 
   // A new session opens; a new task opens its task page, where its session shows up.
   const done = (path: string) => {
+    if (!mounted.current || router.state.location.pathname !== origin) return
     void queryClient.invalidateQueries({ queryKey: ["sessions"] })
     void queryClient.invalidateQueries({ queryKey: ["session-list"] })
     void queryClient.invalidateQueries({ queryKey: ["tasks"] })
-    go(path)
+    void guard.complete(() => go(path))
   }
   const start = useMutation({
     mutationFn: async () => {
@@ -198,6 +211,16 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
       if (path) done(path)
     },
   })
+  const pending =
+    current === "specialist" &&
+    (start.isPending ||
+      (snapshot !== null &&
+        !["terminal", "runtime_failed", "request_failed"].includes(snapshot.phase)))
+  const guard = useSessionActionGuard(pending)
+  useEffect(() => {
+    onPendingChange?.(pending)
+    return () => onPendingChange?.(false)
+  }, [pending, onPendingChange])
   const outcomeBlocksSubmission = snapshot !== null && snapshot.phase !== "request_failed"
   const ready =
     current === "specialist" ? !!(prompt.trim() && agent) : !!taskType && missing.length === 0
@@ -282,7 +305,8 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
                 aria-selected={current === value}
                 aria-disabled={unavailable || undefined}
                 aria-describedby={unavailable ? "start-no-task-types" : undefined}
-                onClick={() => !unavailable && setMode(value)}
+                disabled={pending}
+                onClick={() => !unavailable && !pending && setMode(value)}
                 className={cn(
                   "rounded-md px-2.5 py-1 text-[13px]",
                   current === value
@@ -309,7 +333,13 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
             )
           })}
         </div>
-        <Button type="button" variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose}>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Close"
+          onClick={() => guard.confirmClose(onClose)}
+        >
           <X />
         </Button>
       </div>
@@ -434,6 +464,12 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
         </>
       )}
 
+      {guard.dialog}
+      {pending && (
+        <p role="status">
+          This action is unconfirmed. Keep this form open to recover its original result.
+        </p>
+      )}
       {start.error && <ErrorState error={start.error} />}
       {taskSnapshot.phase === "rejected" && taskSnapshot.error != null && (
         <ErrorState error={taskSnapshot.error} />
@@ -457,6 +493,7 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
                 void transport.current
                   ?.reobserve(abort.current?.signal)
                   .then((next) => {
+                    if (!mounted.current || router.state.location.pathname !== origin) return
                     setSnapshot(next)
                     if (["terminal", "runtime_failed"].includes(next.phase) && next.sessionId)
                       done(sessionPath(next.sessionId))
@@ -480,7 +517,13 @@ function StartSessionForm({ onClose, initialMode }: { onClose: () => void; initi
   )
 }
 
-export function StartSession(props: { onClose: () => void; initialMode?: Mode }) {
+type StartSessionProps = {
+  onClose: () => void
+  initialMode?: Mode
+  onPendingChange?: (pending: boolean) => void
+}
+
+export function StartSession(props: StartSessionProps) {
   useEffect(() => {
     const previous = document.activeElement
     return () => {

@@ -50,6 +50,12 @@ storage migration.
   always keeps at least one admin). Generated tests
   prove a removed member's queued task never runs, also after a restart, and that a running
   conversation stops at its next step.
+- Session actions and specialist Start now warn before navigation or closure would
+  lose an unconfirmed operation's local recovery. Staying preserves the exact
+  task replay, queued-message receipt or run observation; leaving explicitly does
+  not cancel server work. Trace and Conversation now handle recovered run results
+  and reply drafts consistently.
+
 - `cayu new NAME --preset b2b` generates an agent several businesses share on one
   deployment. Organizations, departments and memberships live in the application's
   own tables, and a resource-access policy turns each person's current membership

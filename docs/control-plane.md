@@ -84,6 +84,13 @@ authenticated identity and a `SessionMessageAccessPolicy` granting the operation
 otherwise the composer explains its unavailability. Queue withdrawal uses the
 record's current incarnation and revision. Unconfirmed writes retain their exact
 request for observation or receipt reconciliation instead of enabling another write.
+While a Session action or specialist Start is unconfirmed, route navigation and
+form closure ask the operator to stay and recover it. Conversation and Trace share
+the same observation recovery and result handling. Explicitly leaving discards the
+mounted recovery handle; it does not cancel accepted server work. Inspect the
+resulting session or task before submitting new work. Reloading the tab also loses
+this local handle. These guards do not identify account switches; each recovery
+request is authorized again by the server.
 Run again creates a new direct session from a supported first text prompt; task-origin
 sessions instead use declared task replay and navigate to the returned task, whose
 worker may attach a session later. Member decisions retain protected human review

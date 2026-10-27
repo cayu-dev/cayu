@@ -56,9 +56,9 @@ export function useSessionMessageQueue(sessionId: string, enabled: boolean) {
     }
   }
   const submit = async (content?: string): Promise<string | null> => {
-    if (abort.current) return null
+    if (!enabled || abort.current) return null
     if (!pending.current) {
-      if (!enabled || !inspection.data || !content?.trim()) return null
+      if (!inspection.data || !content?.trim()) return null
       pending.current = {
         owner: new SessionMessageAcceptance(sessionId, content, createMutationId()),
         content,

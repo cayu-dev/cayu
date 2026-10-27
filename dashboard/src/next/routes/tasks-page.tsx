@@ -69,6 +69,7 @@ export function TasksPage() {
   const specialists = useSpecialists()
   const catalog = useTaskTypes()
   const [creating, setCreating] = useState(false)
+  const [startPending, setStartPending] = useState(false)
   const [draft, setDraft] = useState(search.q ?? "")
   useEffect(() => setDraft(search.q ?? ""), [search.q])
   useEffect(() => {
@@ -123,6 +124,7 @@ export function TasksPage() {
               size="sm"
               onClick={() => setCreating(!creating)}
               aria-expanded={creating}
+              disabled={startPending}
             >
               <Plus />
               Create a task
@@ -133,7 +135,13 @@ export function TasksPage() {
         Tasks
       </TopBar>
       <PageBody width="max-w-6xl">
-        {creating && <StartSession initialMode="task" onClose={() => setCreating(false)} />}
+        {creating && (
+          <StartSession
+            initialMode="task"
+            onClose={() => setCreating(false)}
+            onPendingChange={setStartPending}
+          />
+        )}
         <fieldset className="flex min-w-0 flex-wrap gap-1.5">
           <legend className="sr-only">Filter by status</legend>
           {[{ id: undefined, label: "All" }, ...TASK_GROUPS].map((g) => {

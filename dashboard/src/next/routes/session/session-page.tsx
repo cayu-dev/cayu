@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { useParams, useSearch } from "@tanstack/react-router"
+import { useParams, useRouter, useSearch } from "@tanstack/react-router"
 import {
   ChevronRight,
   Copy,
@@ -20,6 +20,7 @@ import { TranscriptPart } from "@/components/dashboard/transcript-part"
 import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
 import { executeResolveProviderOperationMutation } from "@/lib/mutation-browser"
+import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
 import {
   historySearchPatch,
   type SessionDetailSearch,
@@ -49,6 +50,7 @@ import {
   useTranscript,
 } from "../../app/queries"
 import { useApi, useNow, useServices } from "../../app/services"
+import { useSessionActionGuard } from "../../app/session-action-guard"
 import { useSessionMessageQueue } from "../../app/session-message-queue"
 import {
   buildBlocks,
@@ -59,7 +61,7 @@ import {
   sessionDisplayTitle,
   sessionToolDisplays,
 } from "../../app/session-model"
-import { useSessionMutation } from "../../app/session-mutation"
+import { type SessionMutationKind, useSessionMutation } from "../../app/session-mutation"
 import { useSessionProgress } from "../../app/session-progress"
 import { useSessionRelations } from "../../app/session-relations"
 import { toolSpanId } from "../../app/trace-model"
@@ -107,6 +109,8 @@ export function SessionPage({
   const { sessionId } = useParams({ strict: false }) as { sessionId: string }
   const search = useSearch({ strict: false }) as SessionDetailSearch
   const go = useGo()
+  const router = useRouter()
+  const origin = router.state.location.pathname
   const api = useApi()
   const viewer = useViewer()
   const { canWrite: canAddEvals, readiness: evalReadiness } = useEvalAccess()
@@ -290,9 +294,10 @@ export function SessionPage({
       return { session_id: destination, snapshot }
     },
     onSuccess: (result) => {
+      if (router.state.location.pathname !== origin) return
       if (result && "task_id" in result && result.task_id) {
         setMenuOpen(false)
-        go("/tasks", { task_id: result.task_id })
+        void actionGuard.complete(() => go("/tasks", { task_id: result.task_id }))
         return
       }
       if (
@@ -302,9 +307,16 @@ export function SessionPage({
         return
       setMenuOpen(false)
       refresh()
-      go(`/sessions/${encodeURIComponent(result.session_id)}`)
+      void actionGuard.complete(() => go(sessionPath(result.session_id!)))
     },
   })
+  const actionPending =
+    mutation.fenced ||
+    interruptMutation.fenced ||
+    queue.fenced ||
+    runAgain.isPending ||
+    replayAcceptance?.phase === "unknown"
+  const actionGuard = useSessionActionGuard(actionPending)
   const [confirmingStop, setConfirmingStop] = useState(false)
   const resolveProvider = useMutation({
     mutationFn: ({ action, reason }: { action: "fallback_retry" | "fail"; reason: string }) => {
@@ -351,6 +363,35 @@ export function SessionPage({
     },
   })
 
+  const finishObservation = (
+    result: MutationTransportSnapshot | null,
+    kind: SessionMutationKind | null,
+  ) => {
+    if (!result || router.state.location.pathname !== origin) return
+    if (kind === "rerun" && ["terminal", "runtime_failed"].includes(result.phase))
+      void actionGuard.complete(() => go(sessionPath(result.sessionId)))
+    if (result.phase === "terminal") {
+      if (kind === "reply")
+        setDraft((current) => (current.trim() === submittedDraft.current ? "" : current))
+      if (kind === "interrupt") setConfirmingStop(false)
+    }
+    refresh()
+  }
+  const canObserve =
+    mutation.kind === "provider"
+      ? canResolveProvider
+      : mutation.kind === "recovery"
+        ? canRecover
+        : canExecute
+  const retryObservation = () => {
+    if (!canObserve) return
+    void mutation.reobserve().then((result) => finishObservation(result, mutation.kind))
+  }
+  const retryInterruptionObservation = () => {
+    if (!canInterrupt) return
+    void interruptMutation.reobserve().then((result) => finishObservation(result, "interrupt"))
+  }
+
   useEffect(() => {
     if (!trace && transcriptPosition && transcript.data)
       document
@@ -375,8 +416,23 @@ export function SessionPage({
     return (
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <TopBar>Session</TopBar>
-        <div className="p-6">
+        {actionGuard.dialog}
+        <div className="space-y-3 p-6">
           <ErrorState error={detail.error} />
+          {actionPending && (
+            <p className="text-sm text-muted-foreground">
+              An action is still unconfirmed. Retry loading this session to recover the original
+              action, or confirm leaving without local recovery. Leaving does not cancel server
+              work.
+            </p>
+          )}
+          <Button
+            variant="outline"
+            disabled={detail.isFetching}
+            onClick={() => void detail.refetch()}
+          >
+            Retry session details
+          </Button>
         </div>
       </div>
     )
@@ -559,6 +615,12 @@ export function SessionPage({
             </span>
           </span>
         </TopBar>
+        {actionGuard.dialog}
+        {actionPending && (
+          <p role="status" className="px-4 py-2 text-sm">
+            An action is unconfirmed. Keep this session open to recover the original outcome.
+          </p>
+        )}
         {!!progress.error && (
           <div role="status" className="px-4 py-2 text-sm">
             Live updates are unavailable.{" "}
@@ -605,17 +667,13 @@ export function SessionPage({
               {
                 label: "Session action",
                 snapshot: mutation.snapshot,
-                retryObservation: () => {
-                  void mutation.reobserve().then(refresh)
-                },
+                retryObservation: canObserve ? retryObservation : undefined,
                 retrying: mutation.busy,
               },
               {
                 label: "Interruption",
                 snapshot: interruptMutation.snapshot,
-                retryObservation: () => {
-                  void interruptMutation.reobserve().then(refresh)
-                },
+                retryObservation: canInterrupt ? retryInterruptionObservation : undefined,
                 retrying: interruptMutation.busy,
               },
             ]}
@@ -988,32 +1046,12 @@ export function SessionPage({
               <MutationTransportStatus
                 snapshot={mutation.snapshot}
                 retryingObservation={mutation.busy}
-                onRetryObservation={() => {
-                  void mutation.reobserve().then((result) => {
-                    if (!result) return
-                    if (
-                      mutation.kind === "rerun" &&
-                      ["terminal", "runtime_failed"].includes(result.phase)
-                    )
-                      go(`/sessions/${encodeURIComponent(result.sessionId)}`)
-                    if (result.phase === "terminal" && mutation.kind === "reply")
-                      setDraft((current) =>
-                        current.trim() === submittedDraft.current ? "" : current,
-                      )
-                    refresh()
-                  })
-                }}
+                onRetryObservation={canObserve ? retryObservation : undefined}
               />
               <MutationTransportStatus
                 snapshot={interruptMutation.snapshot}
                 retryingObservation={interruptMutation.busy}
-                onRetryObservation={() => {
-                  void interruptMutation.reobserve().then((result) => {
-                    if (!result) return
-                    if (result.phase === "terminal") setConfirmingStop(false)
-                    refresh()
-                  })
-                }}
+                onRetryObservation={canInterrupt ? retryInterruptionObservation : undefined}
               />
               {interruptMutation.error != null && <ErrorState error={interruptMutation.error} />}
               {canExecute && !services.prototype && (

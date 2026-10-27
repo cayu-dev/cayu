@@ -60,6 +60,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
   const sessions = useSessionList(search)
   const [searchReset, setSearchReset] = useState(0)
   const [starting, setStarting] = useState(false)
+  const [startPending, setStartPending] = useState(false)
   const set = useCallback(
     (patch: SessionIndexFilterPatch) =>
       go("/sessions", sessionIndexSearchWithFilters(search, patch)),
@@ -77,14 +78,20 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
       <TopBar
         actions={
           canStart ? (
-            <StartSessionButton open={starting} onToggle={() => setStarting(!starting)} />
+            <StartSessionButton
+              pending={startPending}
+              open={starting}
+              onToggle={() => setStarting(!starting)}
+            />
           ) : undefined
         }
       >
         Sessions
       </TopBar>
       <PageBody width="max-w-6xl">
-        {canStart && starting && <StartSession onClose={() => setStarting(false)} />}
+        {canStart && starting && (
+          <StartSession onPendingChange={setStartPending} onClose={() => setStarting(false)} />
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <SessionSearchInput
             value={search.q ?? ""}
