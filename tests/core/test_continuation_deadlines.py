@@ -474,8 +474,13 @@ def test_store_replaces_a_deadline_only_between_runs_of_the_session_read(
             assert replaced.execution_deadline.origin == "explicit"
             assert (await store.load(session_id)).execution_deadline.source == "operator"
 
-            running = await store.transition_status(
-                session_id, from_statuses={SessionStatus.COMPLETED}, to_status=SessionStatus.RUNNING
+            # Another owner starts a run; its epoch fence stays in its own task.
+            running = await asyncio.create_task(
+                store.transition_status(
+                    session_id,
+                    from_statuses={SessionStatus.COMPLETED},
+                    to_status=SessionStatus.RUNNING,
+                )
             )
             with pytest.raises(SessionStatusConflict, match="only between runs"):
                 await store.replace_execution_deadline(
@@ -517,7 +522,7 @@ def test_work_attempts_refuse_a_resume_deadline_they_would_ignore() -> None:
 
 
 def test_renewing_the_same_pause_twice_gives_back_the_same_time(skip_ahead) -> None:
-    from cayu.runtime._continuation_deadline import prepare_continuation_deadline
+    from cayu.runtime._continuation_deadline import plan_continuation_deadline
 
     async def scenario() -> None:
         app = _app(InMemorySessionStore())
@@ -538,17 +543,28 @@ def test_renewing_the_same_pause_twice_gives_back_the_same_time(skip_ahead) -> N
                 tool_call_id=pending["tool_call_id"],
                 decision=ToolApprovalDecision.APPROVE,
             )
-            # The renewal is stored, then the process stops before the decision runs.
+            # A renewal for this pause is stored (as an admitted settle does) ...
             skip_ahead(3600)
-            await prepare_continuation_deadline(app, paused, settle, participant_context=None)
-            # A retry an hour later must not count the first renewal as time left.
+            first = await plan_continuation_deadline(app, paused, settle, participant_context=None)
+            assert first is not None and first.deadline is not None
+            await app.session_store.replace_execution_deadline(
+                "filing",
+                first.deadline,
+                expected_session_instance_id=paused.instance_id,
+                expected_run_epoch=paused.run_epoch,
+                renewal=first.renewal,
+            )
+            # ... and settling the same pause an hour later must not count it as time left.
             skip_ahead(3600)
             retried_at = skip_ahead.now()
-            renewed = await prepare_continuation_deadline(
+            retried = await plan_continuation_deadline(
                 app, paused, settle, participant_context=None
             )
+            assert retried is not None and retried.deadline is not None
             expected = retried_at + timedelta(seconds=left)
-            assert abs((renewed.execution_deadline.expires_at - expected).total_seconds()) < 5
+            assert abs((retried.deadline.expires_at - expected).total_seconds()) < 5
+            # The plan carries the session as stored now, not the caller's stale copy.
+            assert retried.session.execution_deadline.expires_at == first.deadline.expires_at
             events = await _settle(app, "filing", "approval")
             assert events[-1].type is EventType.SESSION_COMPLETED
         finally:
@@ -803,6 +819,68 @@ def test_store_without_deadline_replacement_keeps_ordinary_continuations(
             after = await app.session_store.load("chat")
             assert after.execution_deadline.expires_at == before.execution_deadline.expires_at
             assert after.execution_deadline.origin == before.execution_deadline.origin
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_a_store_that_replaces_only_between_runs_stores_before_admission(
+    skip_ahead, monkeypatch
+) -> None:
+    from cayu.sessions._deadline_replacement import RUN_IN_PROGRESS_STATUSES
+
+    def between_runs_only(store: InMemorySessionStore, statuses: list) -> None:
+        # An external store written to the "between runs only" contract.
+        replace = store.replace_execution_deadline
+
+        async def replace_between_runs(session_id, deadline, **fences):
+            session = await store.load(session_id)
+            assert session is not None
+            statuses.append(session.status)
+            if session.status in RUN_IN_PROGRESS_STATUSES:
+                raise SessionStatusConflict("Replace only between runs.")
+            return await replace(session_id, deadline, **fences)
+
+        monkeypatch.setattr(store, "replaces_execution_deadline_in_admitted_run", False)
+        monkeypatch.setattr(store, "replace_execution_deadline", replace_between_runs)
+
+    def unsupported(store: InMemorySessionStore) -> None:
+        async def refuse(session_id, deadline, **fences):
+            raise NotImplementedError("This adapter's backend can't replace deadlines.")
+
+        monkeypatch.setattr(store, "replaces_execution_deadline_in_admitted_run", False)
+        monkeypatch.setattr(store, "replace_execution_deadline", refuse)
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        statuses: list = []
+        between_runs_only(store, statuses)
+        app = _app(store)
+        try:
+            await _pause_in_handler(app, "filing", "approval")
+            skip_ahead(3600)
+            events = await _settle(app, "filing", "approval", ExecutionDeadline.after(600))
+            assert events[-1].type is EventType.SESSION_COMPLETED
+            assert statuses == [SessionStatus.INTERRUPTED]
+        finally:
+            await app.aclose()
+
+        store = InMemorySessionStore()
+        unsupported(store)
+        app = _app(store)
+        try:
+            await _pause_in_handler(app, "filing", "approval")
+            before = await app.session_store.load("filing")
+            # An explicit replacement fails before the decision is claimed ...
+            with pytest.raises(NotImplementedError):
+                await _settle(app, "filing", "approval", ExecutionDeadline.after(600))
+            assert await _pending_report(app, "filing") is not None
+            # ... and a renewal it can't store leaves the live stored deadline in force.
+            events = await _settle(app, "filing", "approval")
+            assert events[-1].type is EventType.SESSION_COMPLETED
+            after = await app.session_store.load("filing")
+            assert after.execution_deadline.expires_at == before.execution_deadline.expires_at
         finally:
             await app.aclose()
 

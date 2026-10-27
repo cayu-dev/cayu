@@ -2469,6 +2469,8 @@ class PostgresSessionStore(
                 raise
             return loaded
 
+    replaces_execution_deadline_in_admitted_run: ClassVar[bool] = True
+
     async def replace_execution_deadline(
         self,
         session_id: str,

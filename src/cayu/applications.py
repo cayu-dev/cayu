@@ -379,7 +379,11 @@ from cayu.runtime._checkpoint_store import (
 )
 from cayu.runtime._compaction.automatic import AutomaticCompaction
 from cayu.runtime._compaction.explicit import SessionCompaction
-from cayu.runtime._continuation_deadline import prepare_continuation_deadline
+from cayu.runtime._continuation_deadline import (
+    after_settle_admission,
+    plan_continuation_deadline,
+    prepare_continuation_deadline,
+)
 from cayu.runtime._continuation_task_failure import ApprovalTaskFailureIdentity
 from cayu.runtime._delegated_event_stream import (
     _close_delegated_event_stream as _close_delegated_event_stream,
@@ -9091,10 +9095,13 @@ class CayuApp(WorkflowEntrances):
                 session, participant_context=participant_context
             ):
                 yield event
-        if session is not None:
-            session = await prepare_continuation_deadline(
+        deadline_plan = (
+            None
+            if session is None
+            else await plan_continuation_deadline(
                 self, session, response, participant_context=participant_context
             )
+        )
         session_id = response.session_id
         task_worker_id = response.task_worker_id
         task_handoff_id = response.task_handoff_id
@@ -9112,7 +9119,10 @@ class CayuApp(WorkflowEntrances):
                 task_handoff_id=task_handoff_id,
                 admit_session=True,
             ),
-            after_admission=(
+            after_admission=after_settle_admission(
+                self.session_store,
+                deadline_plan,
+                admission,
                 None
                 if task_id is None
                 else lambda: self._session_tasks.require_continuation_task_authority(
@@ -9121,13 +9131,15 @@ class CayuApp(WorkflowEntrances):
                     task_id=task_id,
                     task_worker_id=task_worker_id,
                     task_handoff_id=task_handoff_id,
-                )
+                ),
             ),
         )
         del response
         stream = await self._resource_session_stream.restore(stream, session_id)
+        # Time the continuation under the planned deadline; it is stored at admission.
+        timed = session if deadline_plan is None else deadline_plan.timed_session()
         stream = continuation_deadline_outcome(
-            stream, self.session_store, session, admission=admission
+            stream, self.session_store, timed, admission=admission
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -9427,10 +9439,13 @@ class CayuApp(WorkflowEntrances):
                 session, participant_context=participant_context
             ):
                 yield event
-        if session is not None:
-            session = await prepare_continuation_deadline(
+        deadline_plan = (
+            None
+            if session is None
+            else await plan_continuation_deadline(
                 self, session, request, participant_context=participant_context
             )
+        )
         session_id = request.session_id
         task_worker_id = request.task_worker_id
         task_handoff_id = request.task_handoff_id
@@ -9450,7 +9465,10 @@ class CayuApp(WorkflowEntrances):
                 admit_session=True,
                 approval_failure_identity=approval_failure_identity,
             ),
-            after_admission=(
+            after_admission=after_settle_admission(
+                self.session_store,
+                deadline_plan,
+                admission,
                 None
                 if task_id is None
                 else lambda: self._session_tasks.require_continuation_task_authority(
@@ -9460,13 +9478,15 @@ class CayuApp(WorkflowEntrances):
                     task_worker_id=task_worker_id,
                     task_handoff_id=task_handoff_id,
                     approval_failure_identity=approval_failure_identity,
-                )
+                ),
             ),
         )
         del request
         stream = await self._resource_session_stream.restore(stream, session_id)
+        # Time the continuation under the planned deadline; it is stored at admission.
+        timed = session if deadline_plan is None else deadline_plan.timed_session()
         stream = continuation_deadline_outcome(
-            stream, self.session_store, session, admission=admission
+            stream, self.session_store, timed, admission=admission
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:

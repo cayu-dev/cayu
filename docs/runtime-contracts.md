@@ -13161,7 +13161,16 @@ settled and kept in `cayu:execution_deadline_renewal`, so retrying the same sett
 gives back the same time. Nothing is replaced unless the request matches the session
 as it is now: a resume's `expected_run_epoch` and `expected_session_instance_id`, and
 the exact approval or question a settle names. Only the subject that owns the session
-may replace its deadline. Explicit and `enclosing` deadlines, child
+may replace its deadline. A settle stores its deadline only after its decision was
+admitted, from inside the admitted run, so a decision the Runtime refuses (a stale
+human-review reference, an expired approval, a conflicting claim) leaves the stored
+deadline as it was; until then the continuation is timed against the planned one. This
+needs a store that sets `replaces_execution_deadline_in_admitted_run`, which the
+built-in stores do: it then also accepts a RUNNING session at the expected epoch from
+the caller holding that epoch's run fence. Other stores keep the between-runs contract
+and get the replacement before admission, and an adapter that raises
+`NotImplementedError` does so before the decision is claimed. A resume stores its
+deadline just before admission, once its own fences match. Explicit and `enclosing` deadlines, child
 sessions, and sessions whose origin was not recorded keep their stored expiry. Completed
 workflow step replay remains a read of durable results; unresolved child effects still
 follow the existing recovery path and are never redispatched because time ran out.

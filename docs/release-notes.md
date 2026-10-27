@@ -89,6 +89,11 @@ storage migration.
 
 ### Fixes
 
+- A settle that carries `execution_deadline`, or renews a task-handler default,
+  stores the new deadline only once the Runtime admits the decision. Before, a
+  decision refused afterwards (for example with a stale human-review reference)
+  still replaced the stored deadline, so a short replacement could make later
+  valid decisions fail with an expired deadline.
 - Raise the minimum Pillow, pypdf, Brotli, and OpenTelemetry versions to include
   security fixes, and update the dashboard's Vite and Zod build dependencies.
 

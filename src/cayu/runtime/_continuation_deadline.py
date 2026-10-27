@@ -15,6 +15,8 @@ Explicit and enclosing-scope deadlines are never extended without a request.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from cayu.approvals.tools import ToolApprovalRequest
@@ -28,7 +30,12 @@ from cayu.deadlines import (
     waiting_for_a_person_counts,
 )
 from cayu.events import Event, EventType
-from cayu.sessions._deadline_replacement import RUN_IN_PROGRESS_STATUSES
+from cayu.runtime._recovery_admission import RecoveryAdmissionHook
+from cayu.runtime._run_limit_stream import DeadlineOutcomeAdmission
+from cayu.sessions._deadline_replacement import (
+    RUN_IN_PROGRESS_STATUSES,
+    metadata_with_execution_deadline,
+)
 from cayu.sessions._pending_approval_reader import PENDING_TOOL_APPROVAL_CHECKPOINT_KEY
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import Session
@@ -178,25 +185,126 @@ async def _continues_the_session_as_it_is(
     return isinstance(pending, dict) and pending.get("input_id") == request.input_id
 
 
-async def prepare_continuation_deadline(
+@dataclass(frozen=True)
+class ContinuationDeadlinePlan:
+    """The session as loaded for a continuation, and the deadline to store at admission.
+
+    ``deadline`` is ``None`` when nothing is left to store at admission: the
+    stored deadline stays, or a store without in-run replacement already
+    stored it (see ``plan_continuation_deadline``).
+    """
+
+    session: Session
+    deadline: ExecutionDeadline | None = None
+    renewal: ExecutionDeadlineRenewal | None = None
+
+    def timed_session(self) -> Session:
+        """The session as it will be stored, for timing the continuation before admission."""
+        if self.deadline is None:
+            return self.session
+        return self.session.model_copy(
+            update={
+                "metadata": metadata_with_execution_deadline(
+                    self.session.metadata, self.deadline, self.renewal
+                )
+            }
+        )
+
+    async def commit(self, store: SessionStore, admission: DeadlineOutcomeAdmission) -> Session:
+        """Store the deadline from inside the run its decision was admitted as."""
+        if (
+            self.deadline is None
+            or admission.session_id != self.session.id
+            or admission.run_epoch is None
+        ):
+            raise RuntimeError("A settle's deadline can be stored only by its admitted run.")
+        return await store.replace_execution_deadline(
+            self.session.id,
+            self.deadline,
+            expected_session_instance_id=admission.session_instance_id,
+            expected_run_epoch=admission.run_epoch,
+            renewal=self.renewal,
+        )
+
+
+def after_settle_admission(
+    store: SessionStore,
+    plan: ContinuationDeadlinePlan | None,
+    admission: DeadlineOutcomeAdmission,
+    authority: Callable[[], Awaitable[None]] | None,
+) -> RecoveryAdmissionHook | None:
+    """The hook a settle runs once its decision is admitted: authority, then the deadline.
+
+    Storing the deadline here, after every decision check passed and inside
+    the admitted run, means a refused or stale decision never changes it.
+    """
+
+    if plan is None or plan.deadline is None:
+        return authority
+
+    async def admitted() -> Session:
+        if authority is not None:
+            await authority()
+        return await plan.commit(store, admission)
+
+    return admitted
+
+
+def _replaces_deadlines(store: SessionStore) -> bool:
+    from cayu.sessions.store import SessionStore as BaseSessionStore
+
+    # The bound method, so an instance-level override counts too.
+    method = getattr(store.replace_execution_deadline, "__func__", None)
+    return method is not BaseSessionStore.replace_execution_deadline
+
+
+async def _store_before_admission(
+    store: SessionStore,
+    current: Session,
+    deadline: ExecutionDeadline,
+    renewal: ExecutionDeadlineRenewal | None,
+    *,
+    explicit: bool,
+) -> Session:
+    try:
+        return await store.replace_execution_deadline(
+            current.id,
+            deadline,
+            expected_session_instance_id=current.instance_id,
+            expected_run_epoch=current.run_epoch,
+            renewal=renewal,
+        )
+    except NotImplementedError:
+        if explicit:
+            raise
+        # Automatic renewal is optional for external stores. Keep enforcing
+        # their stored deadline when the adapter cannot replace it.
+        return current
+
+
+async def plan_continuation_deadline(
     app: CayuApp,
     session: Session,
     request: ContinuationRequest,
     *,
     participant_context: CollaborationAccessContext | None,
-) -> Session:
-    """Authorize and store the deadline a session continues under; return it as stored.
+) -> ContinuationDeadlinePlan | None:
+    """Check a settle's deadline replacement and plan it for admission.
 
-    ``request`` is the resume, approval or answer about to continue the
-    session, with private session and action identities. The replacement is
-    stored only when the request matches the session as it is now (its
-    fences and the pause it names), so a stale or mistaken request doesn't
-    change the deadline, and only with the same authority as continuing it.
+    ``request`` is the approval or answer about to continue the session, with
+    private session and action identities. A replacement is planned only when
+    the request names the pause the session waits on now and the caller has
+    the authority to continue it; the plan always carries the session as
+    loaded now. Stores that set ``replaces_execution_deadline_in_admitted_run``
+    (the built-in ones) store it after admission. Other stores keep the
+    "between runs only" contract, so their replacement is stored here, before
+    admission, as it was before; an adapter that raises
+    ``NotImplementedError`` does so before the decision is claimed.
     """
 
     current = await app.session_store.load(session.id)
     if current is None:
-        return session
+        return None
     replacement = await continuation_deadline_replacement(
         app.session_store,
         current,
@@ -206,7 +314,14 @@ async def prepare_continuation_deadline(
     if replacement is None or not await _continues_the_session_as_it_is(
         app.session_store, current, request
     ):
-        return current
+        return ContinuationDeadlinePlan(session=current)
+    explicit = request.execution_deadline is not None
+    if not _replaces_deadlines(app.session_store):
+        if explicit:
+            raise NotImplementedError(
+                "This SessionStore does not support replace_execution_deadline."
+            )
+        return ContinuationDeadlinePlan(session=current)
     from cayu.resource_access import current_binding
 
     binding = current_binding()
@@ -218,17 +333,32 @@ async def prepare_continuation_deadline(
     # Changing the deadline needs the same authority as continuing the session.
     await app._require_participant_execution(current, participant_context)
     deadline, renewal = replacement
-    try:
-        return await app.session_store.replace_execution_deadline(
-            current.id,
-            deadline,
-            expected_session_instance_id=current.instance_id,
-            expected_run_epoch=current.run_epoch,
-            renewal=renewal,
+    if type(request) is ResumeRequest or not getattr(
+        app.session_store, "replaces_execution_deadline_in_admitted_run", False
+    ):
+        stored = await _store_before_admission(
+            app.session_store, current, deadline, renewal, explicit=explicit
         )
-    except NotImplementedError:
-        if request.execution_deadline is not None:
-            raise
-        # Automatic renewal is optional for external stores. Keep enforcing
-        # their stored deadline when the adapter cannot replace it.
-        return current
+        return ContinuationDeadlinePlan(session=stored)
+    return ContinuationDeadlinePlan(session=current, deadline=deadline, renewal=renewal)
+
+
+async def prepare_continuation_deadline(
+    app: CayuApp,
+    session: Session,
+    request: ResumeRequest,
+    *,
+    participant_context: CollaborationAccessContext | None,
+) -> Session:
+    """Store a resume's new deadline before it is admitted; return the session as stored.
+
+    A resume's own preconditions (its fences, no pending approval or
+    question, the caller's authority) are checked first. Settles store their
+    deadline only once their decision is admitted; see
+    ``plan_continuation_deadline``.
+    """
+
+    plan = await plan_continuation_deadline(
+        app, session, request, participant_context=participant_context
+    )
+    return session if plan is None else plan.session

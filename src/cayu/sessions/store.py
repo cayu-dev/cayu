@@ -5427,6 +5427,14 @@ class SessionStore(ABC):
         """
         raise NotImplementedError("This SessionStore does not support update_metadata.")
 
+    # True when replace_execution_deadline also accepts a RUNNING session at the
+    # expected epoch from the caller that holds that epoch's run fence (the run
+    # a settle was just admitted as). Settles then store their new deadline only
+    # after the decision is admitted; otherwise they store it before admission.
+    # A subclass that overrides replace_execution_deadline must keep this true
+    # only if its override accepts that in-run replacement.
+    replaces_execution_deadline_in_admitted_run: ClassVar[bool] = False
+
     async def replace_execution_deadline(
         self,
         session_id: str,
@@ -5441,8 +5449,10 @@ class SessionStore(ABC):
         The replacement commits only while the session still has
         ``expected_session_instance_id`` and ``expected_run_epoch`` (otherwise
         ``SessionRunFenced``) and no run is pending, running or interrupting
-        (otherwise ``SessionStatusConflict``). An unbounded ``deadline``
-        removes the stored one. ``renewal`` records the pause a renewed
+        (otherwise ``SessionStatusConflict``). A store that sets
+        ``replaces_execution_deadline_in_admitted_run`` also accepts a RUNNING
+        session at that epoch from the caller holding its run fence. An
+        unbounded ``deadline`` removes the stored one. ``renewal`` records the pause a renewed
         ``run_default`` deadline was computed for; any other replacement clears
         it. The runtime calls this when a resume or a
         settled approval or question carries ``execution_deadline``, and when a

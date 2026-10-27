@@ -127,6 +127,10 @@ class _RecoveryInvocationSemantics:
 
 
 RecoveryMutationHook = Callable[[], Awaitable[None]]
+# Runs inside the admitted run. It may return the session as it stored it
+# afterwards (for example with a replaced execution deadline), which the
+# continuation then uses instead of the admission's copy.
+RecoveryAdmissionHook = Callable[[], Awaitable["Session | None"]]
 
 RecoveryExecutionAdmissionHook = Callable[[Session], Awaitable[bool]]
 
@@ -325,7 +329,7 @@ class RecoveryAdmission:
         preserve_open_interaction_on_failure: bool = False,
         before_mutation: RecoveryMutationHook | None = None,
         before_resume: RecoveryExecutionAdmissionHook | None = None,
-        after_admission: RecoveryMutationHook | None = None,
+        after_admission: RecoveryAdmissionHook | None = None,
         on_admitted: Callable[[Session], None] | None = None,
         invocation_context: InvocationContext | None = None,
     ) -> tuple[Session, Event | None]:
@@ -518,8 +522,16 @@ class RecoveryAdmission:
             if cancellation is not None:
                 raise cancellation
             if after_admission is not None:
-                await after_admission()
+                admitted = await after_admission()
                 post_admission_authority_confirmed = True
+                if (
+                    admitted is not None
+                    and admitted.id == session.id
+                    and admitted.instance_id == session.instance_id
+                    and admitted.run_epoch == session.run_epoch
+                ):
+                    # Invocation authority carries no metadata, so it stays bound.
+                    session = admitted
             # Continuations can execute accepted tools before entering the model
             # loop. Publish this epoch's owner before dispatching any such work.
             await self._session_control.execution_presence.ensure(session)

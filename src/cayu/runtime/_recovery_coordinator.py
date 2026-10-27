@@ -216,6 +216,7 @@ from cayu.runtime._provider_disposition_recovery import (
 )
 from cayu.runtime._recovery_admission import (
     RecoveryAdmission,
+    RecoveryAdmissionHook,
     RecoveryMutationHook,
     _completed_tool_round_model_step,
     _continued_tool_exposure_profile_id,
@@ -1174,7 +1175,7 @@ class RecoveryCoordinator:
         response: UserInputResponse | UserInputRecoveryRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
-        after_admission: RecoveryMutationHook | None = None,
+        after_admission: RecoveryAdmissionHook | None = None,
         on_admitted: Callable[[Session], None] | None = None,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
         participant_context: CollaborationAccessContext | None = None,
@@ -1204,7 +1205,7 @@ class RecoveryCoordinator:
         response: UserInputResponse | UserInputRecoveryRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
-        after_admission: RecoveryMutationHook | None = None,
+        after_admission: RecoveryAdmissionHook | None = None,
         on_admitted: Callable[[Session], None] | None = None,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
         foreground_gate: GateReplay | None = None,
@@ -1903,7 +1904,7 @@ class RecoveryCoordinator:
         *,
         task_id: str | None = None,
         before_mutation: RecoveryMutationHook | None = None,
-        after_admission: RecoveryMutationHook | None = None,
+        after_admission: RecoveryAdmissionHook | None = None,
         on_admitted: Callable[[Session], None] | None = None,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
@@ -1927,7 +1928,7 @@ class RecoveryCoordinator:
         *,
         task_id: str | None = None,
         before_mutation: RecoveryMutationHook | None = None,
-        after_admission: RecoveryMutationHook | None = None,
+        after_admission: RecoveryAdmissionHook | None = None,
         on_admitted: Callable[[Session], None] | None = None,
         foreground_gate: GateReplay | None = None,
         participant_context: CollaborationAccessContext | None = None,
