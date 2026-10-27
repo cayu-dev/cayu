@@ -46,8 +46,8 @@ def test_session_task_lifecycle_attaches_and_completes_without_engine(
             lifecycle = app._session_tasks
             registered_agent = app._get_registered_agent("task-agent")
             monkeypatch.delattr(app, "_session_engine")
-            # Replacing the public attribute does not replace composed task authority.
-            app.task_store = InMemoryTaskStore()
+            # Replacing the store behind app.task_store does not replace composed task authority.
+            app._task_store = InMemoryTaskStore()
             task = await tasks.create_task(TaskCreate(task_id="independent-task", type="job"))
             if worker_owned:
                 task = await tasks.claim_task("worker", lease_seconds=300)

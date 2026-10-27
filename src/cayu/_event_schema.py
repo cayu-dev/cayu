@@ -2710,6 +2710,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             public_authority_keys=SESSION_EXPORT_EVENT_FIELDS,
         )
     policies[EventType.SESSION_FORKED] = _policy(
+        "environment_rebuild",
         "agent_name",
         "causal_budget_id",
         "copy_checkpoint",
@@ -2767,6 +2768,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "source_profile_fingerprint",
         },
         internal_keys={"source_environment_allocation_owners"},
+        untrusted_container_keys={"environment_rebuild"},
         public_authority_keys={
             "fork_overlay_controller",
             "fork_overlay_fingerprint",
@@ -3183,7 +3185,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         policies[event_type] = binding_policy
     factory_policy = _observed_policy(
         "allocation_id causal_budget_id durable_value_error_code durable_value_error_path "
-        "environment_factory_release environment_name error error_type execution_profile_fingerprint factory_type labels "
+        "environment_factory_release environment_name environment_rebuild error error_type "
+        "execution_profile_fingerprint factory_type labels "
         "parent_session_id reconnect_metadata requested_environment_name result_metadata",
         owned_nested_paths={
             ("reconnect_metadata", "allocation_fingerprint"),
@@ -3192,6 +3195,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={
             "environment_factory_release",
+            "environment_rebuild",
             "labels",
             "reconnect_metadata",
             "result_metadata",

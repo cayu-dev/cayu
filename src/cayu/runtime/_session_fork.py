@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import traceback as traceback_module
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, NoReturn
@@ -34,6 +34,7 @@ from cayu.deadlines import (
     effective_deadline,
 )
 from cayu.egress.transitions import require_forkable_egress_authority_transition
+from cayu.environments.rebuild import EnvironmentRebuildRecord
 from cayu.events import (
     Event,
     EventType,
@@ -777,6 +778,10 @@ class SessionFork:
         effective_retry_policy: Callable[[RetryPolicy | None], RetryPolicy],
         application_run_defaults: RunDefaults,
         execution_profile_process_identity: str,
+        ensure_session_environment: Callable[[Session, str | None], Awaitable[None]],
+        fork_environment_rebuild_record: Callable[
+            [Session, str | None], Awaitable[EnvironmentRebuildRecord | None]
+        ],
     ) -> None:
         self.session_store = session_store
         self._task_store = task_store
@@ -797,6 +802,8 @@ class SessionFork:
         self._get_registered_agent = get_registered_agent
         self._get_registered_provider = get_registered_provider
         self._get_registered_environment_for_session = get_registered_environment_for_session
+        self._ensure_session_environment = ensure_session_environment
+        self._fork_environment_rebuild_record = fork_environment_rebuild_record
         self._effective_retry_policy = effective_retry_policy
         if type(application_run_defaults) is not RunDefaults:
             raise TypeError("application_run_defaults must be a RunDefaults.")
@@ -1378,6 +1385,10 @@ class SessionFork:
         registered_provider = self._get_registered_provider(
             registered_agent_provider_name or source_session.provider_name
         )
+        # Only after the controller and source checks above: an environment
+        # registered per job elsewhere is recreated from the source's record,
+        # and a registration built from another record is refused.
+        await self._ensure_session_environment(source_session, environment_name)
         registered_environment = self._get_registered_environment_for_session(environment_name)
         prompt_workflow = await _ForkPromptWorkflow.prepare(
             request=request,
@@ -2100,7 +2111,11 @@ class SessionFork:
             and source_model_selection is not None
             else 0
         )
+        rebuild_record = await self._fork_environment_rebuild_record(
+            source_session, environment_name
+        )
         fork_event_payload: dict[str, Any] = {
+            "environment_rebuild": None if rebuild_record is None else rebuild_record.to_payload(),
             "source_session_id": source_session.id,
             "source_status": source_session.status.value,
             "parent_session_id": fork_session.parent_session_id,

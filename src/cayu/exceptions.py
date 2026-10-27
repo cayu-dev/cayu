@@ -10,12 +10,27 @@ from cayu.events import Event, copy_event
 
 __all__ = [
     "DurableValueError",
+    "EnvironmentInUse",
     "ExecutionDeadlineExceeded",
     "InteractionLifecyclePublicationRejected",
     "ResourceAccessDenied",
     "TerminalEventPublicationUncertain",
     "extract_durable_value_error",
 ]
+
+
+class EnvironmentInUse(RuntimeError):
+    """``CayuApp.unregister_environment`` refused because something may still need it.
+
+    ``reason`` is one of ``default_environment``, ``agent_default``,
+    ``in_process_work``, ``unfinished_session`` or ``pending_cleanup``. Nothing
+    was changed; retry once the named work has finished.
+    """
+
+    def __init__(self, environment_name: str, reason: str, detail: str) -> None:
+        self.environment_name = environment_name
+        self.reason = reason
+        super().__init__(f"Environment {environment_name!r} cannot be unregistered: {detail}.")
 
 
 class InteractionLifecyclePublicationRejected(RuntimeError):

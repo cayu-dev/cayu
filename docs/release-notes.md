@@ -156,9 +156,38 @@ showed this, because the in-memory store makes its own key.
 - `BrokeredSandboxCodingEnvironmentFactory` without explicit `transfer_limits`
   allows each file up to the sandbox's staged-copy `max_bytes` less 64 KiB
   when the sandbox offers staged copies (was one 8 MiB archive less 64 KiB).
+- `CayuApp.task_store` and `CayuApp.knowledge_store` are now read-only
+  properties. Reading them works as before; assigning to them raises
+  `AttributeError`. Replacing a store after construction never reached the
+  components the app had already composed with it.
 
 ### Changes
 
+- `CayuApp.unregister_environment(name)` removes a registered environment, for
+  example one a long-lived worker registered for a single job. It raises
+  `cayu.exceptions.EnvironmentInUse` and changes nothing while the environment
+  is the application's or an agent's default, while this process still owns
+  setup or cleanup for a session in it, while a stored session in it is not
+  completed or failed, or while a completed or failed one still owes it cleanup.
+  A later resume or fork of a finished session in that environment fails before
+  any work, as in a process that never registered it. See
+  [Per-job environments](environment-factories.md#per-job-environments).
+- An `EnvironmentFactory` can declare `rebuild_record`, a kind and a small
+  secret-free payload such as a clone source and revision. Cayu records it in
+  the session's `environment.factory.completed` event. A process that registers
+  `CayuApp.register_environment_rebuilder(kind, rebuilder)` recreates the
+  factory under the session's environment name when it forks, resumes or
+  recovers a session whose environment it does not register, so a serving
+  process can fork sessions that ran in a worker's per-job environments. A
+  session never runs in a registration built from a different record: when a
+  reused name is registered from another record, the fork, resume or recovery
+  raises `EnvironmentRebuildMismatch` before any work. The types live in
+  `cayu.environments.rebuild`.
+- `ForkControllerEnrollment` reports `agent_availability`, whether this process
+  can fork each enrolled agent's sessions and why not (a hosted tool outside
+  the allowance, or a default environment that is not registered here and
+  cannot be rebuilt), and `rebuildable_environment_kinds`, so a controller
+  learns this up front instead of from a failed fork.
 - Docker coding containers no longer outlive a process that exits without
   `await app.aclose()` when Cayu had already decided to release them, or when
   nothing could ever reconnect to them. At normal interpreter exit, a container

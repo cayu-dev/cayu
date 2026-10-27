@@ -4018,12 +4018,12 @@ def test_acknowledged_recovery_ownership_is_runtime_bound_and_not_serializable()
             await replacement._recover_claimed_work_attempt(ownership.admission)
         with pytest.raises(WorkAttemptExecutionClaimLost, match="another runtime"):
             await source._recover_claimed_work_attempt(ownership)
-        replacement.task_store = InMemoryTaskStore()
+        replacement._task_store = InMemoryTaskStore()
         try:
             with pytest.raises(WorkAttemptExecutionClaimLost, match="another runtime"):
                 await replacement._recover_claimed_work_attempt(ownership)
         finally:
-            replacement.task_store = tasks
+            replacement._task_store = tasks
         with pytest.raises(TypeError, match="no serialization form"):
             pickle.dumps(ownership)
         with pytest.raises(FrozenInstanceError):

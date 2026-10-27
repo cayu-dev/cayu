@@ -339,7 +339,8 @@ def test_slow_drip_lookup_returns_within_total_budget(monkeypatch, tmp_path) -> 
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     stopped = threading.Event()
-    connected = threading.Event()
+    # Request path -> when its response started dripping.
+    dripping: dict[str, float] = {}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -350,7 +351,7 @@ def test_slow_drip_lookup_returns_within_total_budget(monkeypatch, tmp_path) -> 
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", "10000")
             self.end_headers()
-            connected.set()
+            dripping.setdefault(self.path, time.monotonic())
             try:
                 # Each read succeeds before the per-read timeout. Only the
                 # overall deadline can bound this response.
@@ -363,18 +364,33 @@ def test_slow_drip_lookup_returns_within_total_budget(monkeypatch, tmp_path) -> 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    monkeypatch.setattr(
-        release_check, "_PYPI_PROJECT_URL", f"http://127.0.0.1:{server.server_port}/"
-    )
-    monkeypatch.setattr(release_check, "_FETCH_TIMEOUT_S", 0.4)
-    cache = tmp_path / "release-cache.json"
+    budget = 0.4
+    monkeypatch.setattr(release_check, "_FETCH_TIMEOUT_S", budget)
     try:
-        start = time.monotonic()
-        assert release_check.latest_release(fetch=_fetch_latest_release, cache_path=cache) is None
-        elapsed = time.monotonic() - start
-        assert connected.is_set()
-        assert elapsed < 0.9
-        assert json.loads(cache.read_text())["latest"] is None
+        # A loaded runner can spend the whole budget before the lookup even
+        # reaches the server, which proves nothing about slow bodies. Every
+        # attempt must still return within the budget; retry (each with its
+        # own path, so a late connection from an earlier attempt can't count)
+        # until one returned while its response was dripping.
+        for attempt in range(5):
+            path = f"/attempt-{attempt}/"
+            monkeypatch.setattr(
+                release_check,
+                "_PYPI_PROJECT_URL",
+                f"http://127.0.0.1:{server.server_port}{path}",
+            )
+            cache = tmp_path / f"release-cache-{attempt}.json"
+            start = time.monotonic()
+            assert (
+                release_check.latest_release(fetch=_fetch_latest_release, cache_path=cache) is None
+            )
+            returned = time.monotonic()
+            assert returned - start < budget + 0.5
+            assert json.loads(cache.read_text())["latest"] is None
+            if dripping.get(path, float("inf")) < returned:
+                break
+        else:
+            pytest.fail("No lookup reached the server within its budget.")
         # A timed-out lookup is cached; another scaffold does not launch it again.
         assert (
             release_check.latest_release(

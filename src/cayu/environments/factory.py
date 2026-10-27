@@ -33,6 +33,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 if TYPE_CHECKING:
     from cayu.egress.authority import EgressAuthorityIdentity
+    from cayu.environments.rebuild import EnvironmentRebuildRecord
 
 DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS = 15.0
 ENVIRONMENT_ALLOCATION_INTENT_SCHEMA_VERSION = 1
@@ -759,6 +760,22 @@ class EnvironmentFactory(ABC):
     @property
     def egress_authority_identity(self) -> EgressAuthorityIdentity | None:
         """Return the immutable egress authority proposed for future invocations."""
+
+        return None
+
+    @property
+    def rebuild_record(self) -> EnvironmentRebuildRecord | None:
+        """Opt in to being recreated in another process of the same application.
+
+        Return a ``cayu.environments.rebuild.EnvironmentRebuildRecord`` that
+        describes this factory's configuration, such as a clone source and
+        revision. Cayu reads it at registration (refusing a payload with a
+        known secret) and records it in each session's durable
+        ``environment.factory.completed`` event, so a process that registers a
+        rebuilder for its kind can recreate this factory to fork or resume the
+        session. The default ``None`` keeps the factory process-local. Wrappers
+        should forward the inner factory's record.
+        """
 
         return None
 

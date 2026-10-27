@@ -293,6 +293,7 @@ _UNREPLAYABLE_TOOL_ROUND_ARCHIVE_SESSION_STATUSES = frozenset(
 
 
 if TYPE_CHECKING:
+    from cayu._application_environment_maintenance import SessionEnvironments
     from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 
 
@@ -503,6 +504,7 @@ class IncompleteSessionRecovery:
         resolve_budget_policy: Callable[[], BudgetPolicy | None],
         resolve_registered_agent: RegisteredAgentResolver,
         resolve_registered_environment: RegisteredEnvironmentResolver,
+        session_environments: SessionEnvironments,
         resolve_registered_provider: Callable[[str], runtime_records.RegisteredProvider],
         runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         secret_redactor: SecretRedactor,
@@ -533,6 +535,7 @@ class IncompleteSessionRecovery:
         self._resolve_budget_policy = resolve_budget_policy
         self._resolve_registered_agent = resolve_registered_agent
         self._resolve_registered_environment = resolve_registered_environment
+        self._session_environments = session_environments
         self._resolve_registered_provider = resolve_registered_provider
         self._runtime_hooks = runtime_hooks
         self._secret_redactor = secret_redactor
@@ -1115,6 +1118,11 @@ class IncompleteSessionRecovery:
             message="Terminalized proven zero work without reconstructing an executable profile.",
         )
 
+    async def environment_rebuild_required(self, session: Session) -> str | None:
+        """The rebuild kind recovery would need for ``session``; calls nothing."""
+
+        return await self._session_environments.rebuild_required(session)
+
     async def preflight_incomplete_session(
         self,
         *,
@@ -1148,6 +1156,8 @@ class IncompleteSessionRecovery:
                 metadata={"source": "registered_application_recovery_plan"},
                 before_mutation=prevent_mutation,
                 record_profile_rejection=False,
+                # Planning never calls a rebuilder or creates anything.
+                read_only_environment=True,
                 participant_context=participant_context,
             )
         except _RecoveryPreflightMutationRequired:
@@ -1261,6 +1271,7 @@ class IncompleteSessionRecovery:
         execution_to_wait: _ExternalExecutionToWait | None = None,
         recover_abandoned_model: AbandonedModelRecoveryHook | None = None,
         abandon_unknown_tool_effects: bool = False,
+        read_only_environment: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         from cayu.runtime._abandoned_session_recovery import require_abandoned_execution_matches
 
@@ -1299,28 +1310,34 @@ class IncompleteSessionRecovery:
                     ),
                 )
 
-        return await self._recover_incomplete_session_owned(
-            recover_abandoned_model=recover_abandoned_model,
-            abandon_unknown_tool_effects=abandon_unknown_tool_effects,
-            execution_to_wait=execution_to_wait,
-            _work_attempt=_work_attempt,
-            preserve_interaction_id=preserve_interaction_id,
-            session=session,
-            inactive_for_seconds=inactive_for_seconds,
-            reason=reason,
-            metadata=metadata,
-            previous_status=previous_status,
-            before_mutation=before_mutation,
-            record_profile_rejection=record_profile_rejection,
-            retain_open_interaction_invocation=retain_open_interaction_invocation,
-            retain_invocation_context=retain_invocation_context,
-            provider_disposition_task_id=provider_disposition_task_id,
-            provider_disposition_task_worker_id=provider_disposition_task_worker_id,
-            provider_disposition_task_handoff_id=provider_disposition_task_handoff_id,
-            provider_disposition_after_admission=provider_disposition_after_admission,
-            participant_context=participant_context,
-            interrupt_for_manual_tool_recovery=interrupt_for_manual_tool_recovery,
-        )
+        # Every recovery path (single, batch, task and work attempts) comes
+        # here: resolve the environment built from the session's own record,
+        # rebuilt separately when its slot name now holds another job's.
+        async with self._session_environments.recovery_scope(
+            session, read_only=read_only_environment
+        ):
+            return await self._recover_incomplete_session_owned(
+                recover_abandoned_model=recover_abandoned_model,
+                abandon_unknown_tool_effects=abandon_unknown_tool_effects,
+                execution_to_wait=execution_to_wait,
+                _work_attempt=_work_attempt,
+                preserve_interaction_id=preserve_interaction_id,
+                session=session,
+                inactive_for_seconds=inactive_for_seconds,
+                reason=reason,
+                metadata=metadata,
+                previous_status=previous_status,
+                before_mutation=before_mutation,
+                record_profile_rejection=record_profile_rejection,
+                retain_open_interaction_invocation=retain_open_interaction_invocation,
+                retain_invocation_context=retain_invocation_context,
+                provider_disposition_task_id=provider_disposition_task_id,
+                provider_disposition_task_worker_id=provider_disposition_task_worker_id,
+                provider_disposition_task_handoff_id=provider_disposition_task_handoff_id,
+                provider_disposition_after_admission=provider_disposition_after_admission,
+                participant_context=participant_context,
+                interrupt_for_manual_tool_recovery=interrupt_for_manual_tool_recovery,
+            )
 
     async def _recover_incomplete_session_owned(
         self,

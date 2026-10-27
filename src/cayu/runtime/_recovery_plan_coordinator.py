@@ -16,6 +16,7 @@ from uuid import uuid4
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
 from cayu.approvals.tools import ToolApprovalRecoveryOutcome
 from cayu.collaboration.access import CollaborationAccessContext
+from cayu.environments.rebuild import EnvironmentRebuildMismatch
 from cayu.events import (
     Event,
     EventType,
@@ -704,7 +705,20 @@ class RecoveryPlanCoordinator:
                 registration_status = RecoveryRegistrationStatus.MISSING_ENVIRONMENT
 
         preflight: IncompleteSessionRecoveryResult | None = None
-        if registration_status is RecoveryRegistrationStatus.READY:
+        rebuild_kind: str | None = None
+        if registration_status in {
+            RecoveryRegistrationStatus.READY,
+            RecoveryRegistrationStatus.MISSING_ENVIRONMENT,
+        }:
+            # Recovery would rebuild the session's own environment. Planning
+            # never rebuilds, so environment compatibility is checked by that
+            # recovery, not against a registration that belongs to another job.
+            rebuild_kind = await self._incomplete_recovery.environment_rebuild_required(session)
+            if rebuild_kind is not None:
+                registration_status = RecoveryRegistrationStatus.READY
+                code = f"environment_rebuild_required:{rebuild_kind}"
+                registration_reason = code if len(code) <= 128 else "environment_rebuild_required"
+        if registration_status is RecoveryRegistrationStatus.READY and rebuild_kind is None:
             try:
                 preflight = await self._incomplete_recovery.preflight_incomplete_session(
                     session=session,
@@ -714,7 +728,10 @@ class RecoveryPlanCoordinator:
             except ModelCompletionManualRecoveryRequired:
                 registration_reason = "model_completion_manual_recovery_required"
             except Exception as exc:
-                if startup_preflight and not isinstance(exc, ExecutionProfileMismatchError):
+                # Both are per-session registration incompatibilities, not startup faults.
+                if startup_preflight and not isinstance(
+                    exc, (ExecutionProfileMismatchError, EnvironmentRebuildMismatch)
+                ):
                     raise
                 registration_status = RecoveryRegistrationStatus.INCOMPATIBLE
                 registration_reason = type(exc).__name__

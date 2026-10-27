@@ -558,6 +558,15 @@ def test_reload_detects_python_file_creation_and_deletion(tmp_path):
         "from added_module import VALUE\n" + _source("files", False)
     )
     dependency = tmp_path / "added_module.py"
+
+    def write_dependency(text: str) -> None:
+        # One atomic rename, so the watcher sees one added file. A plain write
+        # can reach it as separate create and modify batches on a loaded
+        # runner, and each batch restarts the worker.
+        staged = tmp_path / "added_module.staged"
+        staged.write_text(text)
+        os.replace(staged, dependency)
+
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -574,22 +583,24 @@ def test_reload_detects_python_file_creation_and_deletion(tmp_path):
         )
         try:
             _wait(process, log_path, lambda: "ModuleNotFoundError" in log_path.read_text())
-            dependency.write_text('VALUE = "created"\n')
+            write_dependency('VALUE = "created"\n')
             with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=2) as client:
                 _wait(process, log_path, lambda: client.get("/api/agents").status_code == 200)
                 first_pid = int((tmp_path / "builds.log").read_text().split(":")[0])
-                warning_count = log_path.read_text().count("WARNING: cayu serve --reload")
+                missing_count = log_path.read_text().count("ModuleNotFoundError")
                 dependency.unlink()
+                # The startup warning precedes the import. Wait until the
+                # replacement worker has observed the deletion before recreating
+                # the module, or that worker can build an extra application.
                 _wait(
                     process,
                     log_path,
-                    lambda: (
-                        log_path.read_text().count("WARNING: cayu serve --reload") > warning_count
-                    ),
+                    lambda: log_path.read_text().count("ModuleNotFoundError") > missing_count,
                 )
                 with pytest.raises(ProcessLookupError):
                     os.kill(first_pid, 0)
-                dependency.write_text('VALUE = "recreated"\n')
+                assert len((tmp_path / "builds.log").read_text().splitlines()) == 1
+                write_dependency('VALUE = "recreated"\n')
                 _wait(process, log_path, lambda: client.get("/api/agents").status_code == 200)
                 assert len((tmp_path / "builds.log").read_text().splitlines()) == 2
         finally:

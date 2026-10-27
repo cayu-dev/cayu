@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import datetime
+from functools import partial
 from hashlib import sha256
 from math import isfinite
 from pathlib import Path
@@ -23,6 +24,13 @@ from cayu import _application_context_views as context_views
 from cayu import _application_event_batches as event_batches
 from cayu import _application_task_creation as task_creation
 from cayu._application_agent_registry import ApplicationAgentRegistry
+from cayu._application_environment_maintenance import (
+    SessionEnvironments,
+    ensure_session_environment,
+    fork_environment_rebuild_record,
+    release_idle_environment_resources,
+    unregister_application_environment,
+)
 from cayu._application_environment_registry import ApplicationEnvironmentRegistry
 from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import _registration_site, _validate_runtime_hooks
@@ -288,6 +296,7 @@ from cayu.egress.transitions import (
 from cayu.environments.admission import ExecutionRequirements
 from cayu.environments.base import Environment, EnvironmentSpec, NoEnvironment
 from cayu.environments.factory import EnvironmentFactory
+from cayu.environments.rebuild import EnvironmentRebuilder
 from cayu.environments.snapshot_lifecycle import ExecutionSnapshots
 from cayu.environments.snapshots import (
     ExecutionSnapshotError,
@@ -917,39 +926,6 @@ class _ParticipantExecutionSettlementReader(PermitSettlementReader):
 _PROVIDER_RECONCILIATION_BUDGET_SHARE = 0.5
 
 
-async def _release_after(
-    previous: asyncio.Task[None], release: Callable[[], Awaitable[None]]
-) -> None:
-    """Run ``release`` once ``previous`` settled, then report ``previous`` too.
-
-    The later release runs whatever the earlier one's outcome. If the earlier
-    one failed, this task fails as well (chained to that error), so the caller
-    that replaced it in the ownership map still reports it.
-    """
-
-    earlier: BaseException | None = None
-    try:
-        await asyncio.shield(previous)
-    except asyncio.CancelledError:
-        if not previous.cancelled():
-            raise  # This chained release itself was cancelled.
-        earlier = RuntimeError("An earlier idle-resource release was cancelled.")
-    except Exception as error:
-        earlier = error
-    await release()
-    if earlier is not None:
-        raise RuntimeError(
-            "An earlier idle-resource release failed before this one ran."
-        ) from earlier
-
-
-def _retrieve_idle_release_outcome(task: asyncio.Task[None]) -> None:
-    # A release that settles after its caller stopped waiting must not be
-    # logged as an unretrieved task exception; the next drain or close reports it.
-    if not task.cancelled():
-        task.exception()
-
-
 class CayuApp(WorkflowEntrances):
     """Application runtime for registered specialists, providers, and session state."""
 
@@ -1240,9 +1216,9 @@ class CayuApp(WorkflowEntrances):
         for closure_store in closure_stores:
             if not isinstance(getattr(closure_store, "store_id", None), str):
                 raise TypeError("session_closure_stores must expose a string store_id.")
-        self.task_store = task_store
+        self._task_store = task_store
         self._recovery_task_store = task_store
-        self.knowledge_store = knowledge_store
+        self._knowledge_store = knowledge_store
         owned_store_ids = list(closure_stores)
         if self.task_store is not None:
             owned_store_ids.append(TaskSessionClosureStore(self.task_store))
@@ -1668,6 +1644,8 @@ class CayuApp(WorkflowEntrances):
             get_registered_agent=self._get_registered_agent,
             get_registered_provider=self._get_registered_provider,
             get_registered_environment_for_session=self._get_registered_environment_for_session,
+            ensure_session_environment=partial(ensure_session_environment, self),
+            fork_environment_rebuild_record=partial(fork_environment_rebuild_record, self),
             effective_retry_policy=self._effective_retry_policy,
             application_run_defaults=resolved_config.run,
             execution_profile_process_identity=self._execution_profile_process_identity,
@@ -1851,6 +1829,7 @@ class CayuApp(WorkflowEntrances):
             resolve_budget_policy=lambda: self.budget_policy,
             resolve_registered_agent=self._get_registered_agent,
             resolve_registered_environment=self._get_registered_environment_for_session,
+            session_environments=SessionEnvironments(self),
             resolve_registered_provider=self._get_registered_provider,
             runtime_hooks=self._runtime_hooks,
             secret_redactor=self._secret_redactor,
@@ -1864,6 +1843,7 @@ class CayuApp(WorkflowEntrances):
         )
 
         self._recovery_coordinator = RecoveryCoordinator(
+            ensure_session_environment=partial(ensure_session_environment, self),
             recovery_admission=self._recovery_admission,
             provider_disposition=self._provider_disposition,
             incomplete_recovery=self._incomplete_recovery,
@@ -5597,8 +5577,11 @@ class CayuApp(WorkflowEntrances):
             retained_drained = await self._environment_lifecycle.drain_retained_cleanups(
                 timeout_s=remaining,
             )
-            idle_released = await self._release_idle_environment_resources(
-                close=False, deadline=deadline
+            idle_released = await release_idle_environment_resources(
+                self._environment_registry,
+                self._idle_resource_releases,
+                close=False,
+                deadline=deadline,
             )
             # Isolated tool processes whose cleanup outlived their call. An
             # exhausted budget still reports settled when none is pending.
@@ -5652,66 +5635,6 @@ class CayuApp(WorkflowEntrances):
             *late_artifact_writes(self._admission),
         }
 
-    async def _release_idle_environment_resources(self, *, close: bool, deadline: float) -> bool:
-        """Trim (or close) factories' idle resources, such as warm spares, by ``deadline``.
-
-        Each factory's release runs as an owned task that is never cancelled:
-        one still running at the deadline stays owned (the result is False),
-        and a later call waits for that same task instead of starting another.
-        A close requested while a trim is still running runs after it.
-        """
-
-        loop = asyncio.get_running_loop()
-        registrations = tuple(self._environment_registry.registrations.items())
-        if not any(registration.factory is not None for _, registration in registrations):
-            return True
-        if deadline - loop.time() <= 0:
-            return False
-        owned: list[tuple[str, asyncio.Task[None]]] = []
-        released = True
-        for name, registration in registrations:
-            factory = registration.factory
-            if factory is None:
-                continue
-            release = factory.close_idle_resources if close else factory.release_idle_resources
-            previous = self._idle_resource_releases.pop(name, None)
-            if previous is not None and previous[1].done():
-                # Settled after an earlier caller stopped waiting: report it once.
-                if previous[1].cancelled() or previous[1].exception() is not None:
-                    released = False
-                previous = None
-            if previous is not None:
-                previous_close, previous_task = previous
-                if previous_close or not close:
-                    # The same release, or a close that already covers a trim.
-                    self._idle_resource_releases[name] = previous
-                    owned.append((name, previous_task))
-                    continue
-                task = loop.create_task(
-                    _release_after(previous_task, release),
-                    name=f"cayu-idle-environment-release:{name}",
-                )
-            else:
-                task = loop.create_task(release(), name=f"cayu-idle-environment-release:{name}")
-            task.add_done_callback(_retrieve_idle_release_outcome)
-            self._idle_resource_releases[name] = (close, task)
-            owned.append((name, task))
-        if not owned:
-            return released
-        remaining = deadline - loop.time()
-        if remaining > 0:
-            await asyncio.wait([task for _, task in owned], timeout=remaining)
-        for name, task in owned:
-            if not task.done():
-                released = False  # Still owned; a later drain observes its settlement.
-                continue
-            current = self._idle_resource_releases.get(name)
-            if current is not None and current[1] is task:
-                del self._idle_resource_releases[name]
-            if task.cancelled() or task.exception() is not None:
-                released = False
-        return released
-
     async def close_idle_environment_resources(self, *, timeout_s: float = 10.0) -> bool:
         """Close factory-held idle resources, such as warm spares, at shutdown.
 
@@ -5727,7 +5650,12 @@ class CayuApp(WorkflowEntrances):
         if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s must be a finite positive number.")
         deadline = asyncio.get_running_loop().time() + float(timeout_s)
-        return await self._release_idle_environment_resources(close=True, deadline=deadline)
+        return await release_idle_environment_resources(
+            self._environment_registry,
+            self._idle_resource_releases,
+            close=True,
+            deadline=deadline,
+        )
 
     def seal_knowledge_publications(self) -> None:
         """Refuse this application's new knowledge publications before shutdown drains.
@@ -6383,6 +6311,41 @@ class CayuApp(WorkflowEntrances):
         """Return the application default environment; an agent's own default overrides it."""
 
         return self._environment_registry.default_name
+
+    @property
+    def task_store(self) -> TaskStore | None:
+        """The task store this app was built with, for example for ``run_task_worker``."""
+
+        return self._task_store
+
+    @property
+    def knowledge_store(self) -> KnowledgeStore | None:
+        """The knowledge store this app was built with, or ``None``."""
+
+        return self._knowledge_store
+
+    @_tracked_entrance
+    async def unregister_environment(self, name: str) -> None:
+        """Remove a registered environment once no session can still need it here.
+
+        Raises ``cayu.exceptions.EnvironmentInUse``, changing nothing, while it
+        is the default (the app's or an agent's), while this process owns setup
+        or cleanup for a session in it, while a stored session in it is not
+        completed or failed, or while a terminal one still owes it cleanup.
+        Its artifact store stays in the deletion inventory.
+        """
+
+        await unregister_application_environment(self, name)
+
+    def register_environment_rebuilder(
+        self, kind: str, rebuilder: EnvironmentRebuilder
+    ) -> EnvironmentRebuilder:
+        """Recreate unregistered environments whose sessions' rebuild record names ``kind``.
+
+        Forks, resumes and recoveries rebuild first; see ``cayu.environments.rebuild``.
+        """
+
+        return self._environment_registry.register_rebuilder(kind, rebuilder)
 
     @_tracked_entrance
     async def inspect_candidate_execution_profile(
@@ -7136,6 +7099,7 @@ class CayuApp(WorkflowEntrances):
             raise TypeError("Runtime resume requires a ResumeRequest.")
         stored = await self.session_store.load(request.session_id)
         require_native_session(stored, "resume")
+        await ensure_session_environment(self, stored)
         request = self._with_application_run_defaults(request, stored)
         request = _validate_resume_request(request)
         boundary = resumed_execution_deadline(

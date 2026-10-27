@@ -279,6 +279,11 @@ from cayu.environments.local_workspace import (
 from cayu.environments.process_ownership import (
     process_local_owner_exited as process_local_owner_exited,
 )
+from cayu.environments.rebuild import EnvironmentRebuild as EnvironmentRebuild
+from cayu.environments.rebuild import EnvironmentRebuilder as EnvironmentRebuilder
+from cayu.environments.rebuild import EnvironmentRebuildMismatch as EnvironmentRebuildMismatch
+from cayu.environments.rebuild import EnvironmentRebuildRecord as EnvironmentRebuildRecord
+from cayu.environments.rebuild import EnvironmentRebuildRequest as EnvironmentRebuildRequest
 from cayu.environments.snapshot_lifecycle import ExecutionSnapshots as ExecutionSnapshots
 from cayu.environments.snapshot_lifecycle import (
     inspect_execution_snapshots as inspect_execution_snapshots,

@@ -2034,7 +2034,11 @@ def test_observe_mode_controller_has_no_trunk_write_path() -> None:
 
 
 def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
-    from cayu.fork_controllers import ForkControllerEnrollment, ForkControllerMode
+    from cayu.fork_controllers import (
+        ForkAgentAvailability,
+        ForkControllerEnrollment,
+        ForkControllerMode,
+    )
 
     async def scenario():
         toolset, _server = _controller_toolset(
@@ -2092,6 +2096,7 @@ def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
         served_tools=(LOOKUP, "mcp__compass__search"),
         allow_model_runs=True,
         fork_budget_limit=ForkBudgetLimitView(max_estimated_cost=Decimal("100"), currency="USD"),
+        agent_availability=(ForkAgentAvailability(agent=HOST_AGENT, forkable=True),),
     )
     with pytest.raises(ValueError):
         sdk.__setattr__("subject", "svc:other")
@@ -2110,6 +2115,8 @@ def test_enrollment_describes_only_the_callers_own_enrollment() -> None:
         "allow_model_runs": False,
         "fork_budget_limit": None,
         "total_budget_limit": None,
+        "agent_availability": [{"agent": "payroll", "forkable": True, "reason": None}],
+        "rebuildable_environment_kinds": [],
     }
     assert unknown.status_code == 403
     assert anonymous.status_code == 401

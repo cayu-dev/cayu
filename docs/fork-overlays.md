@@ -182,6 +182,18 @@ describes only the caller's own enrollment. Other controllers,
 other subjects of the same controller and agents outside the enrollment never
 appear.
 
+The enrollment also says what this process can fork before any fork is tried.
+`agent_availability` has one entry per enrolled agent, in enrollment order,
+with `forkable` and, when it is False, a `reason`: `hosted_tools_not_allowed`
+when the agent carries a provider-hosted tool the `host_tools` allowance
+doesn't name, or `environment_not_registered` when the agent's default
+environment is not registered in this process and the process registers no
+environment rebuilders. `rebuildable_environment_kinds` lists the rebuild kinds
+this process can recreate. A session that ran in an environment this process
+doesn't register, such as one a worker registered for a single job, is
+forkable only when its rebuild record names one of those kinds; see
+[Per-job environments](environment-factories.md#per-job-environments).
+
 Hosts that expose the entrance over HTTP mount
 `cayu.server.fork_controller.create_fork_controller_router(app,
 authenticate=...)`, which serves `GET /fork-controller/enrollment`,

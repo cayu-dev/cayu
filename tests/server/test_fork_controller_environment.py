@@ -272,6 +272,8 @@ def test_mount_cayu_serves_the_environment_controller_with_its_own_bearer(enviro
             "allow_model_runs": False,
             "fork_budget_limit": None,
             "total_budget_limit": None,
+            "agent_availability": [{"agent": AGENT, "forkable": True, "reason": None}],
+            "rebuildable_environment_kinds": [],
         }
     assert client.get(path, headers=_bearer(OPERATOR)).status_code == 401
     assert client.get(path, headers=_bearer("x" * 48)).status_code == 401

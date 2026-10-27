@@ -184,7 +184,7 @@ def test_worker_binding_rejects_unsupported_graph(deployment, monkeypatch, inval
         )
         monkeypatch.setattr(original.app, "get_environment_factory", lambda: factory)
     elif invalid == "store":
-        monkeypatch.setattr(original.app, "task_store", None)
+        monkeypatch.setattr(original.app, "_task_store", None)
     else:
         agent = "not-registered"
     with pytest.raises((ValueError, KeyError)):

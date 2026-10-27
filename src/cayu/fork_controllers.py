@@ -15,7 +15,7 @@ from contextlib import aclosing
 from dataclasses import KW_ONLY, dataclass
 from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -267,6 +267,27 @@ def _budget_limit_view(limit: BudgetLimit | None) -> ForkBudgetLimitView | None:
     return ForkBudgetLimitView(max_estimated_cost=limit.max_estimated_cost, currency=limit.currency)
 
 
+class ForkAgentAvailability(BaseModel):
+    """Whether this process can fork one enrolled agent's sessions, known before any fork.
+
+    ``forkable`` is False when something known up front prevents it, named by
+    ``reason``: ``hosted_tools_not_allowed`` when the agent carries a
+    provider-hosted tool the controller's ``host_tools`` don't name, or
+    ``environment_not_registered`` when the agent's default environment is not
+    registered in this process and nothing here can rebuild environments. A
+    session that ran in an environment this process does not register, such
+    as one an application registers per job in a worker, is forkable only when
+    its durable rebuild record names a kind in the enrollment's
+    ``rebuildable_environment_kinds``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    agent: str
+    forkable: bool
+    reason: Literal["hosted_tools_not_allowed", "environment_not_registered"] | None = None
+
+
 class ForkControllerEnrollment(BaseModel):
     """What one authenticated controller subject is allowed to do.
 
@@ -285,6 +306,8 @@ class ForkControllerEnrollment(BaseModel):
     allow_model_runs: bool
     fork_budget_limit: ForkBudgetLimitView | None = None
     total_budget_limit: ForkBudgetLimitView | None = None
+    agent_availability: tuple[ForkAgentAvailability, ...] = ()
+    rebuildable_environment_kinds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -353,7 +376,36 @@ class ForkControllerAccess:
             allow_model_runs=controller.allow_model_runs,
             fork_budget_limit=_budget_limit_view(controller.fork_budget_limit),
             total_budget_limit=_budget_limit_view(controller.total_budget_limit),
+            agent_availability=tuple(
+                self._agent_availability(agent) for agent in controller.agents
+            ),
+            rebuildable_environment_kinds=tuple(
+                sorted(self.__app._environment_registry.rebuilders)
+            ),
         )
+
+    def _agent_availability(self, agent_name: str) -> ForkAgentAvailability:
+        registered_agent = self.__app._get_registered_agent(agent_name)
+        try:
+            require_fork_controller_hosted_tools(self.__verified.controller, registered_agent)
+        except ForkControllerDenied:
+            return ForkAgentAvailability(
+                agent=agent_name, forkable=False, reason="hosted_tools_not_allowed"
+            )
+        environments = self.__app._environment_registry
+        # NO_ENVIRONMENT is not a name: the agent's sessions need no environment.
+        default = registered_agent.default_environment_name
+        if default is None:
+            default = environments.default_name
+        if (
+            isinstance(default, str)
+            and default not in environments.registrations
+            and not environments.rebuilders
+        ):
+            return ForkAgentAvailability(
+                agent=agent_name, forkable=False, reason="environment_not_registered"
+            )
+        return ForkAgentAvailability(agent=agent_name, forkable=True)
 
     async def fork(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
         """Fork one host session with this controller's overlay."""

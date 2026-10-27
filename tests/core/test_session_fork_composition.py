@@ -167,8 +167,8 @@ def test_fork_snapshot_keeps_its_composed_task_admission_store() -> None:
         session_id = events[-1].session_id
         configured.lookups.clear()
         # The operation retains the store it was composed with, just as creation
-        # and publication do; changing an app attribute must not split admission.
-        app.task_store = replacement
+        # and publication do; changing the store behind app.task_store must not split admission.
+        app._task_store = replacement
         await app.snapshot_fork_source(session_id)
         assert configured.lookups == [session_id]
         assert replacement.lookups == []

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import asyncio
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -15,6 +18,11 @@ from cayu.artifacts import ArtifactStore
 from cayu.environments.base import Environment, EnvironmentSpec, copy_environment
 from cayu.environments.bindings import copy_bound_workspace
 from cayu.environments.factory import EnvironmentFactory
+from cayu.environments.rebuild import (
+    EnvironmentRebuilder,
+    EnvironmentRebuildRecord,
+    declared_rebuild_record,
+)
 from cayu.knowledge.base import KnowledgeStore
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._execution_profile_identity_validation import (
@@ -30,6 +38,12 @@ from cayu.runtime.session_closure import (
 )
 from cayu.sessions.store import SessionStore
 from cayu.vaults.redaction import SecretRedactor
+
+# Registrations visible only to one session's recovery and the work it starts,
+# keyed by registry so another application in the process never sees them.
+_SCOPED_REGISTRATIONS: ContextVar[
+    tuple[tuple[object, str, runtime_records.RegisteredEnvironment], ...]
+] = ContextVar("cayu_scoped_environment_registrations", default=())
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +78,14 @@ class ApplicationEnvironmentRegistry:
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
         self._default_environment_name: str | None = None
+        self._rebuilders: dict[str, EnvironmentRebuilder] = {}
+        self._rebuild_locks: dict[str, asyncio.Lock] = {}
+        # Each factory's declared rebuild record, read once at registration.
+        self._rebuild_records: dict[str, EnvironmentRebuildRecord] = {}
+        # Factories recoveries rebuilt for themselves, kept until a drain or
+        # close has closed their idle resources.
+        self._retired_scoped: dict[str, runtime_records.RegisteredEnvironment] = {}
+        self._retired_scoped_count = 0
         self._session_closure = self._build_session_closure()
         self._agent_registrations: (
             Callable[[], Mapping[str, runtime_records.RegisteredAgentState]] | None
@@ -164,23 +186,59 @@ class ApplicationEnvironmentRegistry:
         default: bool = False,
         registration_site: tuple[str | None, str | None] = (None, None),
     ) -> EnvironmentFactory:
+        if not isinstance(default, bool):
+            raise TypeError("Environment factory default flag must be a bool.")
+        registered_environment, artifact_store_registration, rebuild_record = (
+            self._prepare_factory_registration(
+                spec, factory, artifact_store=artifact_store, registration_site=registration_site
+            )
+        )
+        name = registered_environment.spec.name
+        if name in self._environments:
+            raise ValueError(f"Environment already registered: {name}")
+        self._publish(registered_environment, artifact_store_registration, default=default)
+        if rebuild_record is not None:
+            self._rebuild_records[name] = rebuild_record
+        return factory
+
+    def _prepare_factory_registration(
+        self,
+        spec: EnvironmentSpec,
+        factory: EnvironmentFactory,
+        *,
+        artifact_store: ArtifactStore | None,
+        registration_site: tuple[str | None, str | None],
+    ) -> tuple[
+        runtime_records.RegisteredEnvironment,
+        _ArtifactStoreRegistration | None,
+        EnvironmentRebuildRecord | None,
+    ]:
+        """Validate one factory registration without publishing it."""
+
         if not isinstance(spec, EnvironmentSpec):
             raise TypeError("Environment factory registration requires an EnvironmentSpec.")
         if not isinstance(factory, EnvironmentFactory):
             raise TypeError("Environment factory registration requires an EnvironmentFactory.")
-        if not isinstance(default, bool):
-            raise TypeError("Environment factory default flag must be a bool.")
         stored_spec = _validate_environment_spec(
             spec,
             redactor=self._secret_redactor,
         )
-        if stored_spec.name in self._environments:
-            raise ValueError(f"Environment already registered: {stored_spec.name}")
         factory_secret_resolution_scope = factory.secret_resolution_scope
         if factory_secret_resolution_scope not in ("static", "dynamic"):
             raise ValueError(
                 "Environment factory secret_resolution_scope must be static or dynamic."
             )
+        rebuild_record = declared_rebuild_record(factory)
+        if rebuild_record is not None:
+            self._secret_redactor.require_no_secret_keys(
+                rebuild_record.payload,
+                field_name="environment_factory.rebuild_record.payload",
+                match_short_substrings=True,
+            )
+            if self._secret_redactor.redact_json_values(rebuild_record.payload) != (
+                rebuild_record.payload
+            ):
+                raise ValueError("Environment factory rebuild_record contains a secret.")
         stored_environment = Environment(stored_spec, artifact_store=artifact_store)
         artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
 
@@ -199,8 +257,123 @@ class ApplicationEnvironmentRegistry:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
-        self._publish(registered_environment, artifact_store_registration, default=default)
-        return factory
+        return registered_environment, artifact_store_registration, rebuild_record
+
+    def scoped_factory_registration(
+        self,
+        spec: EnvironmentSpec,
+        factory: EnvironmentFactory,
+        *,
+        artifact_store: ArtifactStore | None = None,
+        registration_site: tuple[str | None, str | None] = (None, None),
+        retain_idle_resources: bool = False,
+    ) -> AbstractContextManager[None]:
+        """Resolve ``spec.name`` to this factory only inside the current context.
+
+        The shared registration under that name, if any, is untouched and stays
+        what every other caller sees. Tasks started inside the scope keep the
+        scoped registration, so cleanup they own uses the same factory. An
+        artifact store joins the deletion inventory for good, like any other.
+        """
+
+        registered_environment, artifact_store_registration, _ = self._prepare_factory_registration(
+            spec, factory, artifact_store=artifact_store, registration_site=registration_site
+        )
+        if artifact_store_registration is not None:
+            closure = self._build_session_closure(
+                artifact_store_registration=artifact_store_registration
+            )
+            self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
+                artifact_store_registration
+            )
+            self._session_closure = closure
+        return self._factory_registration_scope(registered_environment, retain_idle_resources)
+
+    @contextmanager
+    def _factory_registration_scope(
+        self,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        retain_idle_resources: bool,
+    ) -> Iterator[None]:
+        token = _SCOPED_REGISTRATIONS.set(
+            (
+                *_SCOPED_REGISTRATIONS.get(),
+                (self, registered_environment.spec.name, registered_environment),
+            )
+        )
+        try:
+            yield
+        finally:
+            _SCOPED_REGISTRATIONS.reset(token)
+            if retain_idle_resources:
+                # The next drain or close closes what the factory still holds.
+                self._retired_scoped_count += 1
+                key = f"{registered_environment.spec.name}#recovery-{self._retired_scoped_count}"
+                self._retired_scoped[key] = registered_environment
+
+    @property
+    def retired_scoped_registrations(self) -> Mapping[str, runtime_records.RegisteredEnvironment]:
+        """Scoped factories whose idle resources are not yet closed, read-only."""
+
+        return MappingProxyType(self._retired_scoped)
+
+    def forget_retired_scoped_registration(self, key: str) -> None:
+        self._retired_scoped.pop(key, None)
+
+    def unregister(self, name: str) -> None:
+        """Remove one declaration; the caller has already proven nothing needs it.
+
+        The default environment cannot be removed. Artifact stores stay in the
+        closure inventory: deleting a session must still reach artifacts it
+        wrote through an environment that is no longer registered.
+        """
+
+        environment_name = require_clean_nonblank(name, "environment.name")
+        registration = self._environments.get(environment_name)
+        if registration is None:
+            raise KeyError(f"Environment not registered: {environment_name}")
+        if environment_name == self._default_environment_name:
+            raise ValueError(f"The default environment cannot be unregistered: {environment_name}")
+        del self._environments[environment_name]
+        self._rebuild_records.pop(environment_name, None)
+        lock = self._rebuild_locks.get(environment_name)
+        if lock is not None and not lock.locked():
+            del self._rebuild_locks[environment_name]
+
+    def register_rebuilder(
+        self, kind: str, rebuilder: EnvironmentRebuilder
+    ) -> EnvironmentRebuilder:
+        """Recreate environments whose durable rebuild record names ``kind``."""
+
+        kind = require_clean_nonblank(kind, "rebuild kind")
+        if not callable(rebuilder):
+            raise TypeError("Environment rebuilder must be callable.")
+        if kind in self._rebuilders:
+            raise ValueError(f"Environment rebuilder already registered: {kind}")
+        self._rebuilders[kind] = rebuilder
+        return rebuilder
+
+    @property
+    def rebuilders(self) -> Mapping[str, EnvironmentRebuilder]:
+        """Registered rebuilders by kind, read-only."""
+
+        return MappingProxyType(self._rebuilders)
+
+    def rebuild_record(self, name: str) -> EnvironmentRebuildRecord | None:
+        """The rebuild record the factory registered under ``name`` declared, if any."""
+
+        return self._rebuild_records.get(name)
+
+    @property
+    def has_rebuild_records(self) -> bool:
+        """Whether any registered factory declares a rebuild record."""
+
+        return bool(self._rebuild_records)
+
+    def rebuild_lock(self, name: str) -> asyncio.Lock:
+        """Serialize rebuilding one environment name in this process."""
+
+        return self._rebuild_locks.setdefault(name, asyncio.Lock())
 
     def registered_artifact_stores(self) -> tuple[ArtifactStore, ...]:
         """Every distinct artifact store registered with an environment."""
@@ -208,6 +381,17 @@ class ApplicationEnvironmentRegistry:
         return tuple(
             registration.store for registration in self._artifact_store_registrations_by_id.values()
         )
+
+    def artifact_store_for_rebuild(self, store: ArtifactStore | None) -> ArtifactStore | None:
+        """Reuse the existing deletion-inventory store for a rebuilt store's stable id."""
+
+        if store is None:
+            return None
+        store_id = require_unicode_scalar_text(
+            require_clean_nonblank(store.id, "artifact_store.id"), "artifact_store.id"
+        )
+        registered = self._artifact_store_registrations_by_id.get(store_id)
+        return store if registered is None else registered.store
 
     def _validate_artifact_store_registration(
         self,
@@ -396,6 +580,9 @@ class ApplicationEnvironmentRegistry:
             environment_name = self._default_environment_name
         if environment_name is None:
             return None
+        for registry, scoped_name, scoped in reversed(_SCOPED_REGISTRATIONS.get()):
+            if registry is self and scoped_name == environment_name:
+                return scoped
         try:
             return self._environments[environment_name]
         except KeyError as exc:

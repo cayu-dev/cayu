@@ -97,6 +97,28 @@ async def run_fresh_tasks(app: CayuApp, stop) -> None:
     )
 ```
 
+`app.task_store` and `app.knowledge_store` are read-only properties holding the
+stores the factory built the app with, so a worker target needs only the app.
+
+A handler that returns without settling its task fails it with "Task handler
+returned without completing or failing the task." A run bound to the task, as
+in the comment above, settles it when its session ends. A handler that runs several sessions,
+or does its work without one, settles the task itself:
+
+```python
+from cayu import run_to_completion
+from cayu.tasks import complete_managed_task, fail_managed_task
+
+
+async def handle_hunt(app: CayuApp, task: Task, claimed_by: str) -> None:
+    outcomes = [await run_to_completion(app, request) for request in hunt_requests(task)]
+    if all(outcome.ok for outcome in outcomes):
+        sessions = [outcome.session_id for outcome in outcomes]
+        await complete_managed_task(app.task_store, task, claimed_by, {"sessions": sessions})
+    else:
+        await fail_managed_task(app.task_store, task, claimed_by, {"error": "a hunt failed"})
+```
+
 The CLI does not infer a handler, query, task store, abandoned-session
 boundary, or recovery policy. Configure those in the factory or named
 entrypoint. In particular, `cayu worker` performs no implicit incomplete-session

@@ -625,6 +625,7 @@ class RecoveryCoordinator:
     def __init__(
         self,
         *,
+        ensure_session_environment: Callable[[Session], Awaitable[None]],
         recovery_admission: RecoveryAdmission,
         provider_disposition: ProviderDispositionRecovery,
         incomplete_recovery: IncompleteSessionRecovery,
@@ -661,6 +662,7 @@ class RecoveryCoordinator:
         runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...] = (),
         loop_policies: tuple[LoopPolicy, ...] = (),
     ) -> None:
+        self._ensure_session_environment = ensure_session_environment
         self._human_review_policy = human_review_policy
         self._recovery_admission = recovery_admission
         self._provider_disposition = provider_disposition
@@ -1128,6 +1130,7 @@ class RecoveryCoordinator:
         Keep the validated checkpoint profile separate from the context's rebound
         profile. Callers retain their exact claim, receipt and resolution checks.
         """
+        await self._ensure_session_environment(session)
         registered_agent = self._resolve_registered_agent(session.agent_name)
         registered_provider = self._resolve_registered_provider(session.provider_name)
         budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
@@ -2007,6 +2010,7 @@ class RecoveryCoordinator:
                 )
             )
             if task_failure_durable:
+                await self._ensure_session_environment(current_session)
                 yield closure_event
                 registered_agent = self._resolve_registered_agent(current_session.agent_name)
                 registered_environment = self._resolve_registered_environment(
@@ -3101,6 +3105,7 @@ class RecoveryCoordinator:
             pending_calls=pending_round.tool_calls,
             tool_call_id=request.tool_call_id,
         )
+        await self._ensure_session_environment(loaded_session)
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         if pending_round.agent_name != registered_agent.spec.name:
             raise RuntimeError(

@@ -117,7 +117,7 @@ def test_manual_recovery_keeps_captured_task_admission_before_settlement(monkeyp
                 reservation_ids=(),
             )
             monkeypatch.delattr(app, "_session_engine")
-            app.task_store = InMemoryTaskStore()
+            app._task_store = InMemoryTaskStore()
             before = await store.load(session.id)
             with pytest.raises(RuntimeError, match="task authority unavailable"):
                 await app.recover_model_completion_stage(

@@ -12,6 +12,7 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
 )
 from cayu.collaboration.access import CollaborationAccessContext
+from cayu.environments.rebuild import EnvironmentRebuildMismatch
 from cayu.events import (
     Event,
     EventType,
@@ -468,7 +469,7 @@ class SessionRecovery:
                                         ),
                                         before_mutation=admit_before_recovery_mutation,
                                     )
-                            except ExecutionProfileMismatchError:
+                            except (ExecutionProfileMismatchError, EnvironmentRebuildMismatch):
                                 # A registration can change after read-only planning. Isolate
                                 # this typed per-session rejection; store and unknown failures propagate.
                                 record_blocked(

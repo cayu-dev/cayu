@@ -905,6 +905,175 @@ child environment is part of the spawn fingerprint: recovery reconnects the same
 allocation, and a spec whose `environment_name` changed since the spawn fails
 with an identity conflict instead of moving the child.
 
+### Per-job environments
+
+Some applications register an environment for each job, for example a factory
+over that job's clone registered as `<job_id>-slot-0` in a long-lived worker.
+Two parts keep that working: unregistering the environment when the job is
+done, and letting another process of the application recreate it for a fork.
+Each part works on its own.
+
+#### Unregistering an environment
+
+```python
+await app.unregister_environment(f"{job_id}-slot-0")
+```
+
+It raises `cayu.exceptions.EnvironmentInUse` and changes nothing while
+something may still need the registration. Its `reason` names which rule
+applied:
+
+- `default_environment` or `agent_default`: it is the application's default or
+  a registered agent's default.
+- `in_process_work`: this process still owns environment setup or cleanup for
+  a session in it (a run in progress, a retained cleanup, a deferred factory
+  release), or an idle-resource release for its factory is still running. Let
+  the runs finish, or call `drain_environment_cleanups()`, and retry.
+- `unfinished_session`: a stored session in it is pending, running,
+  interrupting or interrupted. Such a session can still run, resume or be
+  recovered here, and that needs the factory to reconnect to or dispose of its
+  allocation. This applies to sessions running in other processes too.
+- `pending_cleanup`: a completed or failed session in it still has unfinished
+  environment cleanup in its checkpoint (a pending completion finalization, a
+  pending allocation disposal or an allocation intent that was never reaped).
+  Run `recover_incomplete_session` for it first.
+
+Completed and failed sessions with nothing pending don't block. Resuming or
+forking one of them later in this process fails with `Environment not
+registered` before any work, as it would in a process that never registered
+the name, unless a rebuilder recreates it (below). Registering the same name
+again later is allowed; those sessions then resume into the new registration,
+just as they would after a restart with a different registration, and the
+execution-profile check still applies.
+
+The environment's artifact store stays in the app's deletion inventory, so
+deleting a session still erases the artifacts it wrote there. The factory's
+idle resources (such as warm spares) are no longer reached by
+`close_idle_environment_resources()`; close them yourself with
+`await factory.close_idle_resources()` when the factory isn't shared. Stop
+starting new runs in an environment before unregistering it: a run that
+already resolved the environment when the call began keeps the registration it
+resolved.
+
+#### Rebuilding an environment in another process
+
+A fork runs in the process that serves it, which never registered the worker's
+per-job names. A factory that can be recreated from a small description opts
+in by declaring `rebuild_record`:
+
+```python
+from cayu.environments.rebuild import EnvironmentRebuild, EnvironmentRebuildRecord
+
+
+class CloneFactory(BrokeredSandboxCodingEnvironmentFactory):
+    def __init__(self, source: str, revision: str, **options) -> None:
+        super().__init__(**options)
+        self.source, self.revision = source, revision
+
+    @property
+    def rebuild_record(self) -> EnvironmentRebuildRecord:
+        payload = {"source": self.source, "revision": self.revision}
+        return EnvironmentRebuildRecord("scout.clone", payload)
+```
+
+Registration reads the record and refuses a payload that contains a secret the
+app's redactor knows; it is stored in session events that operators and fork
+controllers can read, and it must stay under 16 KiB. Cayu records it in the
+`environment_rebuild` field of each `environment.factory.completed` event the
+factory produces.
+
+The process that should recreate such environments registers a rebuilder for
+the kind:
+
+```python
+ALLOWED_SOURCES = {"https://example.com/org/repo"}
+
+
+def slot_spec(name: str) -> EnvironmentSpec:  # The spec the worker registers, too.
+    return EnvironmentSpec(name=name, execution_profile_identity=SLOT_IDENTITY)
+
+
+async def rebuild_clone(request):
+    source = request.record.payload["source"]
+    if source not in ALLOWED_SOURCES:  # The payload is data, not authority.
+        raise ValueError("Unknown clone source.")
+    factory = CloneFactory(source, request.record.payload["revision"])
+    return EnvironmentRebuild(spec=slot_spec(request.environment_name), factory=factory)
+
+
+app.register_environment_rebuilder("scout.clone", rebuild_clone)
+```
+
+When that process forks a session (after the fork's controller and source
+checks), resumes one, answers a paused interaction, or recovers an incomplete one (on every recovery path,
+batch sweeps included), and the session's environment is not registered, it
+reads the record of the latest factory event for that environment (started,
+completed or failed, so a worker that crashed during allocation still left
+one) from the session's events, or from the session it was forked or spawned
+from when it never invoked the factory itself. New forks store the selected
+record in their own `session.forked` event, so deleting the source does not
+lose the unrun fork's rebuild identity. It calls the rebuilder for the
+record's kind once per name and registers the result under the session's
+environment name. The rebuilt spec must have that name and the rebuilt factory
+must declare the same record, so a fork of the fork rebuilds the same way. A
+session without a record, or with a kind no rebuilder handles, fails as
+before. Rebuilt registrations are ordinary ones; drop them with
+`unregister_environment` when they are no longer needed. If a rebuild returns
+an artifact store whose stable ID is already registered, Cayu reuses that
+registered store; the rebuilder need not retain the same Python object.
+
+A session only ever runs in an environment built from its own record. Per-job
+names get reused, so when the name is already registered by a factory that
+declares a record, and the session's environment was built from a different
+one, the fork, resume or paused continuation raises
+`cayu.environments.rebuild.EnvironmentRebuildMismatch` before any work. This
+holds in the worker too: after it registers a slot name for the next job, a
+resume of the previous job's session in that slot is refused instead of
+running in the new clone. Run the session where the name matches, or
+unregister the name once nothing uses it so it can be rebuilt from this
+session's record. A factory or session without a record makes no claim and is
+not checked.
+
+Recovery is never stranded by that refusal. When a crashed session's slot now
+holds another job's registration, recovery of the crashed session rebuilds its
+own environment from its record, separately: the rebuilt factory is visible
+only to that recovery and the cleanup it starts, so it settles the session and
+releases what the session allocated while the slot's registration and its
+sessions stay untouched. The next `drain_environment_cleanups()` or shutdown
+closes that factory's idle resources. Without a rebuilder for the record's
+kind, or when the rebuilder fails, the name
+resolves during that recovery to a stand-in that refuses every factory call.
+Recovery still settles the session when that needs no environment (the
+execution-profile check still applies), and the registered factory never sees
+the crashed session's allocation; cleanup that needs the factory stays
+recorded for a process that can rebuild it. The stand-in carries the session's
+own record, so factory events from a refused call never erase which
+environment the session belongs to. If the session's record can't be read
+while the name is registered from a record, recovery raises
+`EnvironmentRebuildMismatch` with `verified=False` instead of trusting the
+registration; retry once the store answers. `unregister_environment` doesn't
+count sessions built from another record than the registered one, since they
+can never run under it, so the slot can still be freed.
+
+Recovery planning and its preflight (`plan_recovery`, startup recovery
+checks) never call a rebuilder or a factory and register nothing. A plan item
+whose recovery would rebuild reports
+`registration.reason_code == "environment_rebuild_required:<kind>"` with a
+`ready` registration, and planning skips the environment preflight for it:
+the slot's current registration may belong to another job, so environment
+compatibility is checked by the recovery that rebuilds, not by planning.
+
+Keep the rebuilder cheap: like registration, it should construct the factory
+without allocating anything, since the factory allocates on `create`. Declare
+`execution_profile_identity` on both the spec and the factory, with the same
+values in every process, so forks and resumes keep their execution profile
+across processes.
+
+Fork controllers see this up front: `ForkControllerEnrollment.agent_availability`
+says, per enrolled agent, whether this process can fork its sessions, and
+`rebuildable_environment_kinds` lists the kinds it can rebuild. See
+[Session fork overlays](fork-overlays.md#forking-with-an-overlay).
+
 ### Process-external allocation
 
 A factory whose `CREATE` path mutates a remote provider must not use ordinary

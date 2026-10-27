@@ -127,6 +127,7 @@ from cayu.environments.lifecycle import (
     environment_lifecycle_progress_from_event,
 )
 from cayu.environments.process_ownership import current_process_local_owner
+from cayu.environments.rebuild import declared_rebuild_record
 from cayu.events import (
     Event,
     EventType,
@@ -6220,6 +6221,31 @@ class EnvironmentLifecycle:
         if decision.status == "refused":
             raise ExecutionAdmissionError(decision)
 
+    def sessions_with_environment_work(
+        self, environment_name: str
+    ) -> tuple[frozenset[str], frozenset[str]]:
+        """Return sessions whose environment setup or cleanup this process still owns.
+
+        The first set holds sessions known to use ``environment_name``. The
+        second holds sessions with retained cleanup whose environment this
+        owner does not record (deferred factory cleanups, run-fence releases
+        and pending owner admissions); callers decide them from the session.
+        """
+
+        named = frozenset(
+            session_id
+            for session_id, owner in self._active_environment_setups.items()
+            if owner.registered_environment.spec.name == environment_name
+        )
+        unattributed = frozenset(
+            {
+                *self._pending_environment_owner_admissions,
+                *self._deferred_factory_cleanup_tasks,
+                *(session_id for session_id, _ in self._deferred_run_fence_release_tasks),
+            }
+        ).difference(self._active_environment_setups)
+        return named, unattributed
+
     async def drain_retained_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Settle retained cleanup owners without cancelling dispatched work."""
 
@@ -8832,12 +8858,16 @@ def _environment_factory_base_payload(
     if factory is None:
         raise AssertionError("Environment factory payload requires a registered factory.")
     environment_name = registered_environment.spec.name
+    rebuild_record = declared_rebuild_record(factory)
     return {
         "factory_type": type(factory).__name__,
         "requested_environment_name": environment_name,
         "parent_session_id": environment_allocation_parent_session_id(session),
         "causal_budget_id": session.causal_budget_id,
         "labels": copy_label_map(session.labels, "labels"),
+        # A factory's opt-in description of itself, so another process of the
+        # application can recreate it (cayu.environments.rebuild).
+        **({} if rebuild_record is None else {"environment_rebuild": rebuild_record.to_payload()}),
     }
 
 

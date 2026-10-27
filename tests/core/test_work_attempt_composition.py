@@ -189,7 +189,7 @@ def test_preparation_keeps_its_composed_task_authority_store(monkeypatch) -> Non
             redactor=SecretRedactor(),
         )
         configured.reads.clear()
-        app.task_store = replacement
+        app._task_store = replacement
         monkeypatch.delattr(app, "_session_engine")
         # The configured task is governed: ordinary preparation must reject it.
         # Looking through the mutable app attribute would instead see no task.
