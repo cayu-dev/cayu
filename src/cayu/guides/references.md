@@ -409,13 +409,22 @@ inspection run `uv run cayu serve --dev` and open
 `[tool.cayu.serve].auth` target; generated agent and coding projects set it to
 `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`, which reads
 `CAYU_OPERATOR_USERNAME` and `CAYU_OPERATOR_PASSWORD` at startup and refuses to
-start without them (on Cayu Cloud, `cayu cloud service credentials --application
+start without them; `OPERATOR_ONLY_AUTH` in the same module is the same login without
+Developer dashboard access for people a sign-in proxy signs in as members, for an
+application whose own users sign in through that proxy (the b2b preset uses it) (on Cayu Cloud, `cayu cloud service credentials --application
 APP` shows them). The target may be any request-to-`AuthContext` dependency, such
 as `BasicAuth.from_environment(...)` with other variables or, with
 `cayu[oidc]`, `OidcBearerAuth.from_environment()` for bearer tokens from your
 identity provider; it guards access to the Developer dashboard,
 not end-user product login, which belongs in the service preset's
-`AuthenticatedProductAccess`. Use `mount_cayu(..., path="/cayu")` when an
+`AuthenticatedProductAccess`. A project served by its factory can add its own routes
+with `[tool.cayu.serve] routers = ["module:function"]`: `cayu serve` calls each function
+with the app and `development=` (whether `--dev` is set) and serves the
+`fastapi.APIRouter` it returns next to Cayu's routes. Those routes authenticate their own
+callers, since the Developer dashboard's target doesn't cover them. Each route must start
+with a fixed path segment that isn't one of Cayu's own (such as `/api` or `/cayu`), so a
+parameter or catch-all can't answer for Cayu's paths; the b2b preset serves its API under
+`/app` this way. Use `mount_cayu(..., path="/cayu")` when an
 existing FastAPI product owns the host server; that mount requires
 `AuthenticatedAccess(...)` on any public listener. Do not substitute client-IP
 or forwarded-header checks for authentication. Put authentication/authorization

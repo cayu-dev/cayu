@@ -42,6 +42,9 @@ class _ServeSettings:
     auth_target: str | None = None
     startup_recovery_statuses: frozenset[SessionStatus] | None = None
     recovery_inactive_after_seconds: int = 300
+    # The project's own routes: `module:function` targets, each called with the app and
+    # `development=` and returning a FastAPI router served next to Cayu's routes.
+    routers: tuple[str, ...] = ()
 
 
 def add_serve_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -123,6 +126,11 @@ def _resolve_serve_project(
     project = resolve_project(command="cayu serve", suggest_explicit_target=False, start=start)
     settings = _serve_settings(project.root)
     auth_target = serve_auth_target(args, settings.auth_target)
+    if project.service_target is not None and settings.routers:
+        raise ServeError(
+            "[tool.cayu.serve].routers is for projects served by their factory; a "
+            "maintained public service declares its product routes in its service_factory."
+        )
     if project.service_target is None and not args.dev and auth_target is None:
         raise ServeError(
             "Refusing to start an unauthenticated server. Pass --dev only for "
@@ -204,11 +212,58 @@ def _build_serve_app(
             config=config,
             project_context=project_control_plane,
         )
+        _include_project_routers(server, app, settings.routers, development=args.dev)
         print(
             "Cayu Developer dashboard: "
             f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"
         )
+        if settings.routers:
+            print("Project routes: " + ", ".join(settings.routers))
     return server
+
+
+def _include_project_routers(
+    server: Any, app: Any, targets: tuple[str, ...], *, development: bool
+) -> None:
+    """Serve the project's own routes next to Cayu's, never in place of one.
+
+    They authenticate their own callers: the Developer dashboard's access policy doesn't
+    cover them.
+    """
+
+    from fastapi import APIRouter
+
+    reserved = {
+        "/" + path.split("/")[1]
+        for path in (getattr(route, "path", "") for route in server.routes)
+        if path.startswith("/")
+    }
+    for target in targets:
+        try:
+            build = load_target(target, label="Serve router target", normalize_errors=True)
+        except TargetResolutionError as exc:
+            raise ServeError(str(exc)) from exc
+        if not callable(build):
+            raise ServeError(f"Serve router target {target} must be callable.")
+        router = build(app, development=development)
+        if not isinstance(router, APIRouter):
+            raise ServeError(f"Serve router target {target} must return a fastapi.APIRouter.")
+        for route in router.routes:
+            path = getattr(route, "path", "")
+            first = path.split("/")[1] if path.startswith("/") else ""
+            # A parameter or an empty first segment would also match Cayu's own paths.
+            if not first or "{" in first:
+                raise ServeError(
+                    f"Serve router target {target}: {path or '/'} must start with a fixed "
+                    "path segment, such as /app."
+                )
+            prefix = "/" + first
+            if prefix in reserved:
+                raise ServeError(
+                    f"Serve router target {target}: {path} collides with Cayu's own "
+                    f"{prefix} routes; serve the project's routes under another prefix."
+                )
+        server.include_router(router)
 
 
 def run_serve(args: argparse.Namespace) -> int:
@@ -288,6 +343,7 @@ def _serve_settings(root: Path) -> _ServeSettings:
         "auth",
         "startup_recovery_statuses",
         "recovery_inactive_after_seconds",
+        "routers",
     }
     if unexpected:
         raise ServeError(
@@ -340,10 +396,21 @@ def _serve_settings(root: Path) -> _ServeSettings:
             "[tool.cayu.serve].startup_recovery_statuses requires "
             "recovery_inactive_after_seconds."
         )
+    routers = configured.get("routers")
+    if routers is not None and (
+        not isinstance(routers, list)
+        or not routers
+        or any(not isinstance(target, str) or not target.strip() for target in routers)
+    ):
+        raise ServeError(
+            f"{discovered.pyproject}: [tool.cayu.serve].routers must be a non-empty array "
+            "of MODULE:FUNCTION strings."
+        )
     return _ServeSettings(
         auth_target=None if auth is None else auth.strip(),
         startup_recovery_statuses=statuses,
         recovery_inactive_after_seconds=inactivity,
+        routers=tuple(target.strip() for target in routers or ()),
     )
 
 

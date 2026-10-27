@@ -35,6 +35,21 @@ storage migration.
 
 ### Changes
 
+- `cayu.server.environment_auth:OPERATOR_ONLY_AUTH` is the ready-made Developer dashboard
+  login without dashboard access for people a sign-in proxy signs in as `member`, for an
+  application whose own users sign in through that proxy. `cayu cloud init` gives it Cloud
+  sign-in like `OPERATOR_BASIC_AUTH`, and the b2b preset uses it.
+- `[tool.cayu.serve] routers = ["module:function"]` serves a project's own FastAPI routes
+  next to Cayu's under `cayu serve`. Each function gets the app and `development=`, the
+  routes authenticate their own callers, and each must start with a fixed path segment that
+  isn't one of Cayu's (such as `/api` or `/cayu`).
+- The b2b preset gains sign-in and an HTTP API under `/app`: a demonstration login only
+  under `cayu serve --dev`, Cayu Cloud's sign-in or OIDC otherwise (503 until one is
+  configured), Cayu's scoped routes for conversations, tasks and runs, and organization
+  admins who add, move and remove members (a new `role` on memberships; an organization
+  always keeps at least one admin). Generated tests
+  prove a removed member's queued task never runs, also after a restart, and that a running
+  conversation stops at its next step.
 - `cayu new NAME --preset b2b` generates an agent several businesses share on one
   deployment. Organizations, departments and memberships live in the application's
   own tables, and a resource-access policy turns each person's current membership

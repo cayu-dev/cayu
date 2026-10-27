@@ -9,6 +9,10 @@ result on every read, listing and background step.
 
 from __future__ import annotations
 
+from cayu._operator_credentials import (
+    ENVIRONMENT_OPERATOR_AUTH_TARGET,
+    ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET,
+)
 from cayu.cli.scaffold_plan import ApplicationPlan
 
 _MODELS_APPEND = '''
@@ -56,6 +60,7 @@ class Membership(Base):
             ["organization_id", "department_id"],
             [f"{SCHEMA}.departments.organization_id", f"{SCHEMA}.departments.id"],
         ),
+        CheckConstraint("role in ('member', 'admin')"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -64,6 +69,9 @@ class Membership(Base):
         ForeignKey(f"{SCHEMA}.organizations.id", ondelete="CASCADE")
     )
     department_id: Mapped[str | None] = mapped_column(String(64))
+    # `admin` may add, move and remove the organization's members. It is this application's
+    # decision only: it never widens what Cayu lets anyone see.
+    role: Mapped[str] = mapped_column(String(16), server_default="member")
 
 
 class AccessRevision(Base):
@@ -206,6 +214,7 @@ Cayu refuses any decision read before the change.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
@@ -250,23 +259,76 @@ class DatabaseMembershipDirectory:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class MemberRecord:
+    subject: str
+    organization: str
+    department: str | None
+    role: str
+
+
 def add_member(
-    db: Session, *, subject: str, organization: str, department: str | None = None
+    db: Session,
+    *,
+    subject: str,
+    organization: str,
+    department: str | None = None,
+    role: str = "member",
 ) -> None:
-    """Add `subject` to `organization`, or move them to `department` if already a member."""
+    """Add `subject` to `organization`, or move them to `department` and `role` if already
+    a member."""
 
     db.execute(
         insert(models.Membership)
-        .values(subject=subject, organization_id=organization, department_id=department)
+        .values(
+            subject=subject,
+            organization_id=organization,
+            department_id=department,
+            role=role,
+        )
         .on_conflict_do_update(
             index_elements=[
                 models.Membership.subject,
                 models.Membership.organization_id,
             ],
-            set_={"department_id": department},
+            set_={"department_id": department, "role": role},
         )
     )
     _raise_revision(db)
+
+
+def admins_of(db: Session, organization: str, *, lock: bool = False) -> set[str]:
+    """The organization's admins; `lock=True` holds their rows until the transaction ends."""
+
+    query = select(models.Membership.subject).where(
+        models.Membership.organization_id == organization,
+        models.Membership.role == "admin",
+    )
+    if lock:
+        query = query.with_for_update()
+    return set(db.scalars(query))
+
+
+def memberships_of(db: Session, subject: str) -> list[MemberRecord]:
+    return _records(db, models.Membership.subject == subject)
+
+
+def members_of(db: Session, organization: str) -> list[MemberRecord]:
+    return _records(db, models.Membership.organization_id == organization)
+
+
+def _records(db: Session, condition) -> list[MemberRecord]:
+    rows = db.execute(
+        select(
+            models.Membership.subject,
+            models.Membership.organization_id,
+            models.Membership.department_id,
+            models.Membership.role,
+        )
+        .where(condition)
+        .order_by(models.Membership.organization_id, models.Membership.subject)
+    ).all()
+    return [MemberRecord(*row) for row in rows]
 
 
 def remove_member(db: Session, *, subject: str, organization: str) -> None:
@@ -461,12 +523,12 @@ DEMO_DEPARTMENTS = {
     "acme/legal": ("acme", "Legal"),
     "globex/support": ("globex", "Support"),
 }
-# (subject, organization, department)
+# (subject, organization, department, role)
 DEMO_MEMBERS = (
-    ("alice", "acme", "acme/finance"),
-    ("carol", "acme", "acme/finance"),
-    ("bob", "acme", "acme/legal"),
-    ("dave", "globex", "globex/support"),
+    ("alice", "acme", "acme/finance", "admin"),
+    ("carol", "acme", "acme/finance", "member"),
+    ("bob", "acme", "acme/legal", "member"),
+    ("dave", "globex", "globex/support", "admin"),
 )
 
 
@@ -492,9 +554,13 @@ def seed(db: Session) -> None:
             .values(id=identifier, organization_id=organization, name=name)
             .on_conflict_do_nothing()
         )
-    for subject, organization, department in DEMO_MEMBERS:
+    for subject, organization, department, role in DEMO_MEMBERS:
         add_member(
-            db, subject=subject, organization=organization, department=department
+            db,
+            subject=subject,
+            organization=organization,
+            department=department,
+            role=role,
         )
 
 
@@ -857,6 +923,707 @@ def test_a_membership_cant_name_another_organizations_department(database) -> No
 '''
 
 
+_ROLES_MIGRATION = '''"""Membership roles: `member` or `admin`.
+
+Revision ID: 0003
+Revises: 0002
+"""
+
+from __future__ import annotations
+
+import sqlalchemy as sa
+from alembic import op
+
+revision = "0003"
+down_revision = "0002"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.add_column(
+        "memberships",
+        sa.Column(
+            "role", sa.String(length=16), server_default="member", nullable=False
+        ),
+        schema="app",
+    )
+    op.create_check_constraint(
+        "memberships_role_check",
+        "memberships",
+        "role in ('member', 'admin')",
+        schema="app",
+    )
+
+
+def downgrade() -> None:
+    op.drop_constraint(
+        "memberships_role_check", "memberships", schema="app", type_="check"
+    )
+    op.drop_column("memberships", "role", schema="app")
+'''
+
+_SETTINGS_APPEND = """
+
+
+def configured_sign_in() -> str:
+    \"\"\"How people sign in to the application's routes outside `cayu serve --dev`: `cloud`,
+    Cayu Cloud's sign-in (the default), or `oidc`, a bearer token your identity provider
+    issues (CAYU_OIDC_ISSUER and CAYU_OIDC_AUDIENCE).\"\"\"
+
+    value = (os.environ.get("APP_SIGN_IN") or "cloud").strip()
+    if value not in {"cloud", "oidc"}:
+        raise ValueError("APP_SIGN_IN must be `cloud` or `oidc`.")
+    return value
+"""
+
+_SIGN_IN_PY = '''"""How a request becomes a verified person: the one sign-in seam every route uses.
+
+`build_authenticate` returns `authenticate(request) -> subject`.
+
+- `cayu serve --dev` signs in the demonstration people of `operations/demo_seed.py` with a
+  signed cookie, and nobody else. Nothing else serves it.
+- Otherwise `APP_SIGN_IN` selects Cayu Cloud's sign-in (`cloud`) or a bearer token from your
+  identity provider (`oidc`). The subject is that provider's ID for the person, so memberships
+  are keyed on it. An organization claim is never trusted: membership comes from this
+  application's tables.
+
+Until a production sign-in is configured, every route answers 503 and lets nobody in.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import logging
+import secrets
+from collections.abc import Awaitable, Callable
+
+from fastapi import HTTPException, Request
+
+from cayu.server.auth import AuthConfigurationError
+from cayu.server.oidc import OidcBearerAuth
+from cayu.server.proxy_identity import ProxyIdentityAuth
+from configuration.settings import configured_sign_in
+from operations.demo_seed import DEMO_MEMBERS
+
+logger = logging.getLogger(__name__)
+
+Authenticate = Callable[[Request], Awaitable[str]]
+DEMO_COOKIE = "demo_session"
+DEMO_SUBJECTS = frozenset(member[0] for member in DEMO_MEMBERS)
+
+
+class DemoSignIn:
+    """Development only: a signed cookie naming one demonstration person. Its key lives in
+    this process alone, so a restart signs everyone out."""
+
+    def __init__(self) -> None:
+        self._key = secrets.token_bytes(32)
+
+    def cookie(self, subject: str) -> str:
+        if subject not in DEMO_SUBJECTS:
+            raise HTTPException(404, "No such demonstration person.")
+        return f"{subject}.{self._signature(subject)}"
+
+    async def __call__(self, request: Request) -> str:
+        subject, _, signature = request.cookies.get(DEMO_COOKIE, "").partition(".")
+        if subject in DEMO_SUBJECTS and hmac.compare_digest(
+            signature, self._signature(subject)
+        ):
+            return subject
+        raise HTTPException(401, "Sign in first.")
+
+    def _signature(self, subject: str) -> str:
+        return hmac.new(self._key, subject.encode(), hashlib.sha256).hexdigest()
+
+
+def build_authenticate(*, development: bool) -> Authenticate:
+    if development:
+        return DemoSignIn()
+    try:
+        if configured_sign_in() == "oidc":
+            return _oidc(OidcBearerAuth.from_environment())
+        return _cloud(ProxyIdentityAuth.from_environment())
+    except AuthConfigurationError as exc:
+        return _unavailable(str(exc))
+
+
+def _oidc(verifier: OidcBearerAuth) -> Authenticate:
+    async def authenticate(request: Request) -> str:
+        return (await verifier(request)).subject
+
+    return authenticate
+
+
+def _cloud(proxy: ProxyIdentityAuth) -> Authenticate:
+    # Only the identity Cayu Cloud's router signed, never its operator fallback.
+    person = proxy.product_dependency()
+
+    async def authenticate(request: Request) -> str:
+        return (await person(request)).subject_id
+
+    return authenticate
+
+
+def _unavailable(reason: str) -> Authenticate:
+    # The reason names settings, so it goes to the log, not to whoever is calling.
+    logger.warning("The application's sign-in isn't configured: %s", reason)
+
+    async def authenticate(request: Request) -> str:
+        raise HTTPException(503, "Sign-in isn't configured.")
+
+    return authenticate
+'''
+
+_HTTP_PY = '''"""The application's HTTP API, which `cayu serve` serves under /app
+([tool.cayu.serve] routers in pyproject.toml).
+
+- /app/resources/...: Cayu's scoped routes for conversations, tasks and runs. Each answers
+  only what the signed-in person may see; a foreign ID looks missing.
+- /app/me and /app/conversation-labels: who is signed in, their memberships, and the labels a
+  new conversation they share takes. The active organization a client shows is only a filter
+  and a default: it never grants anything.
+- /app/organizations/{organization}/members: the members, which an organization's admins
+  add, move and remove.
+- /app/dev/sign-in: the demonstration login, served only by `cayu serve --dev`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
+
+from cayu import CayuApp
+from cayu.server.resource_access import create_resource_router
+from database.memberships import (
+    MemberRecord,
+    add_member,
+    admins_of,
+    members_of,
+    memberships_of,
+    remove_member,
+)
+from database.session import session
+from domain.organizations import Membership
+from domain.sharing import Sharing, conversation_labels
+from integrations.sign_in import DEMO_COOKIE, DemoSignIn, build_authenticate
+
+
+# The length of `memberships.subject`.
+MEMBER_SUBJECT_LENGTH = 200
+
+
+class DemoSignInRequest(BaseModel):
+    subject: str
+
+
+class LabelsRequest(BaseModel):
+    organization: str
+    sharing: Sharing
+
+
+class MemberRequest(BaseModel):
+    department: str | None = None
+    role: Literal["member", "admin"] = "member"
+
+
+def build_router(app: CayuApp, *, development: bool) -> APIRouter:
+    authenticate = build_authenticate(development=development)
+    router = APIRouter(prefix="/app")
+    router.include_router(create_resource_router(app, authenticate=authenticate))
+
+    async def signed_in(request: Request) -> str:
+        return await authenticate(request)
+
+    @router.get("/me")
+    async def me(subject: str = Depends(signed_in)) -> dict:
+        records = await _read(memberships_of, subject)
+        return {"subject": subject, "memberships": [_member(item) for item in records]}
+
+    @router.post("/conversation-labels")
+    async def labels(body: LabelsRequest, subject: str = Depends(signed_in)) -> dict:
+        record = await _membership(subject, body.organization)
+        if record is None:
+            raise HTTPException(403, "You aren't a member of that organization.")
+        membership = Membership(record.organization, record.department)
+        try:
+            return conversation_labels(
+                subject=subject, membership=membership, sharing=body.sharing
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @router.get("/organizations/{organization}/members")
+    async def members(
+        organization: str, subject: str = Depends(signed_in)
+    ) -> list[dict]:
+        if await _membership(subject, organization) is None:
+            raise HTTPException(404, "Organization unavailable.")
+        return [_member(item) for item in await _read(members_of, organization)]
+
+    # A member ID is the identity provider's opaque subject, which may contain '/'.
+    @router.put("/organizations/{organization}/members/{member:path}")
+    async def put_member(
+        organization: str,
+        member: str,
+        body: MemberRequest,
+        subject: str = Depends(signed_in),
+    ) -> dict:
+        await _require_admin(subject, organization)
+        _require_subject(member)
+        try:
+            await _change_members(
+                subject,
+                add_member,
+                subject=member,
+                organization=organization,
+                department=body.department,
+                role=body.role,
+            )
+        except IntegrityError:
+            raise HTTPException(
+                422, "The department must be one of this organization's."
+            ) from None
+        return {"subject": member, "organization": organization, **body.model_dump()}
+
+    @router.delete(
+        "/organizations/{organization}/members/{member:path}", status_code=204
+    )
+    async def delete_member(
+        organization: str, member: str, subject: str = Depends(signed_in)
+    ) -> Response:
+        await _require_admin(subject, organization)
+        _require_subject(member)
+        await _change_members(
+            subject,
+            remove_member,
+            subject=member,
+            organization=organization,
+        )
+        return Response(status_code=204)
+
+    if isinstance(authenticate, DemoSignIn):
+        demo = authenticate
+
+        @router.post("/dev/sign-in", status_code=204)
+        async def demo_sign_in(body: DemoSignInRequest) -> Response:
+            response = Response(status_code=204)
+            response.set_cookie(
+                DEMO_COOKIE, demo.cookie(body.subject), httponly=True, samesite="strict"
+            )
+            return response
+
+    return router
+
+
+def _member(record: MemberRecord) -> dict:
+    return {
+        "subject": record.subject,
+        "organization": record.organization,
+        "department": record.department,
+        "role": record.role,
+    }
+
+
+async def _membership(subject: str, organization: str) -> MemberRecord | None:
+    records = await _read(memberships_of, subject)
+    return next((item for item in records if item.organization == organization), None)
+
+
+async def _require_admin(subject: str, organization: str) -> None:
+    record = await _membership(subject, organization)
+    if record is None:
+        raise HTTPException(404, "Organization unavailable.")
+    if record.role != "admin":
+        raise HTTPException(403, "Only the organization's admins manage its members.")
+
+
+async def _read(query, value):
+    def read():
+        with session() as db:
+            return query(db, value)
+
+    return await asyncio.to_thread(read)
+
+
+def _require_subject(member: str) -> None:
+    if not member or member != member.strip() or len(member) > MEMBER_SUBJECT_LENGTH:
+        raise HTTPException(
+            422,
+            f"A member is a non-blank ID of at most {MEMBER_SUBJECT_LENGTH} characters.",
+        )
+
+
+async def _change_members(caller: str, change, **arguments) -> None:
+    """Change the organization's members while its admins' rows are locked, so the caller
+    is still an admin when it happens and at least one admin remains afterwards."""
+
+    organization = arguments["organization"]
+
+    def write() -> None:
+        with session() as db:
+            if caller not in admins_of(db, organization, lock=True):
+                raise HTTPException(
+                    403, "Only the organization's admins manage its members."
+                )
+            change(db, **arguments)
+            if not admins_of(db, organization):
+                db.rollback()
+                raise HTTPException(409, "An organization keeps at least one admin.")
+            db.commit()
+
+    await asyncio.to_thread(write)
+'''
+
+
+_TEST_HTTP_API_PY = '''"""The application's HTTP API: sign-in, scoped conversations and member management.
+
+The sign-in and conversation tests run without a database; member management reads and
+writes the application's tables (`CAYU_TEST_POSTGRES_DSN`).
+"""
+
+from __future__ import annotations
+
+from alembic import command
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from test_app_database import ALEMBIC, requires_postgres
+
+from cayu import CayuApp
+from cayu.sessions import InMemorySessionStore
+from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
+from database.memberships import DatabaseMembershipDirectory
+from database.session import session
+from domain.organizations import InMemoryMembershipDirectory, Membership
+from domain.sharing import conversation_labels
+from integrations.http import build_router
+from operations.demo_seed import seed
+from policies.access import MembershipAccessPolicy
+
+ALICE = Membership("acme", "acme/finance")
+IDENTITY = SessionIdentity(provider_name="fake", model="fake")
+
+
+def _client(app: CayuApp, *, development: bool = True) -> TestClient:
+    server = FastAPI()
+    server.include_router(build_router(app, development=development))
+    return TestClient(server)
+
+
+def _app(directory) -> CayuApp:
+    return CayuApp(
+        session_store=InMemorySessionStore(),
+        resource_access_policy=MembershipAccessPolicy(directory),
+    )
+
+
+def _sign_in(client: TestClient, subject: str) -> None:
+    client.cookies.clear()
+    assert client.post("/app/dev/sign-in", json={"subject": subject}).status_code == 204
+
+
+def _start(client: TestClient, app: CayuApp, sharing: str) -> str:
+    async def create() -> str:
+        access = await app.access("alice")
+        labels = conversation_labels(subject="alice", membership=ALICE, sharing=sharing)
+        created = await access.sessions.create(
+            RunRequest(agent_name="assistant", messages=[], labels=labels),
+            identity=IDENTITY,
+        )
+        return created.id
+
+    return client.portal.call(create)
+
+
+def _listed(client: TestClient) -> set[str]:
+    response = client.post("/app/resources/sessions/query", json={})
+    assert response.status_code == 200, response.text
+    return {item["id"] for item in response.json()["sessions"]}
+
+
+def test_the_demonstration_login_signs_in_only_its_people() -> None:
+    app = _app(InMemoryMembershipDirectory({"alice": [ALICE]}))
+    with _client(app) as client:
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 401
+        assert (
+            client.post("/app/dev/sign-in", json={"subject": "mallory"}).status_code
+            == 404
+        )
+        client.cookies.set("demo_session", "alice.forged")
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 401
+        _sign_in(client, "alice")
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 200
+
+
+def test_without_development_there_is_no_demonstration_login(monkeypatch) -> None:
+    for name in (
+        "APP_SIGN_IN",
+        "CAYU_PROXY_IDENTITY_ISSUER",
+        "CAYU_PROXY_IDENTITY_AUDIENCE",
+        "CAYU_PROXY_IDENTITY_JWKS_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    app = _app(InMemoryMembershipDirectory({"alice": [ALICE]}))
+    with _client(app, development=False) as client:
+        assert (
+            client.post("/app/dev/sign-in", json={"subject": "alice"}).status_code
+            == 404
+        )
+        # Until a production sign-in is configured, nobody gets in.
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 503
+
+
+def test_conversations_over_http_show_each_person_only_their_own() -> None:
+    directory = InMemoryMembershipDirectory(
+        {
+            "alice": [ALICE],
+            "carol": [Membership("acme", "acme/finance")],
+            "bob": [Membership("acme", "acme/legal")],
+            "dave": [Membership("globex", "globex/support")],
+        }
+    )
+    app = _app(directory)
+    with _client(app) as client:
+        personal = _start(client, app, "personal")
+        department = _start(client, app, "department")
+        _sign_in(client, "carol")
+        assert _listed(client) == {department}
+        _sign_in(client, "bob")
+        assert _listed(client) == set()
+        _sign_in(client, "dave")
+        assert client.get(f"/app/resources/sessions/{department}").status_code == 404
+        _sign_in(client, "alice")
+        assert _listed(client) == {personal, department}
+
+
+@requires_postgres
+def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
+    database,
+) -> None:
+    command.upgrade(ALEMBIC, "head")
+    with session() as db:
+        seed(db)
+        db.commit()
+    app = _app(DatabaseMembershipDirectory())
+    with _client(app) as client:
+        shared = _start(client, app, "department")
+
+        _sign_in(client, "carol")
+        me = client.get("/app/me").json()
+        assert me["memberships"] == [
+            {
+                "subject": "carol",
+                "organization": "acme",
+                "department": "acme/finance",
+                "role": "member",
+            }
+        ]
+        labels = client.post(
+            "/app/conversation-labels",
+            json={"organization": "acme", "sharing": "department"},
+        ).json()
+        assert labels["department"] == "acme/finance"
+        assert labels["owner"] == "carol"
+        assert (
+            client.post(
+                "/app/conversation-labels",
+                json={"organization": "globex", "sharing": "organization"},
+            ).status_code
+            == 403
+        )
+        assert client.get(f"/app/resources/sessions/{shared}").status_code == 200
+        # A member reads the member list but doesn't change it.
+        assert len(client.get("/app/organizations/acme/members").json()) == 3
+        assert client.delete("/app/organizations/acme/members/bob").status_code == 403
+
+        _sign_in(client, "dave")
+        assert client.get("/app/organizations/acme/members").status_code == 404
+        assert client.delete("/app/organizations/acme/members/carol").status_code == 404
+
+        _sign_in(client, "alice")
+        moved = client.put(
+            "/app/organizations/acme/members/bob",
+            json={"department": "globex/support"},
+        )
+        assert moved.status_code == 422
+        too_long = "x" * 201
+        assert (
+            client.delete(f"/app/organizations/acme/members/{too_long}").status_code
+            == 422
+        )
+        # Acme's only admin can't leave it without one.
+        assert (
+            client.put(
+                "/app/organizations/acme/members/alice",
+                json={"department": "acme/finance", "role": "member"},
+            ).status_code
+            == 409
+        )
+        assert client.delete("/app/organizations/acme/members/alice").status_code == 409
+        # An identity provider's subject may contain '/'.
+        assert (
+            client.put(
+                "/app/organizations/acme/members/staff/erin",
+                json={"department": "acme/legal"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.delete("/app/organizations/acme/members/staff/erin").status_code
+            == 204
+        )
+        assert client.delete("/app/organizations/acme/members/carol").status_code == 204
+
+        _sign_in(client, "carol")
+        assert client.get(f"/app/resources/sessions/{shared}").status_code == 404
+'''
+
+_TEST_BACKGROUND_REVOCATION_PY = '''"""Removing a member stops their background work at its next step, also after a restart."""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from cayu import CayuApp, Message
+from cayu.evals import ScriptedModelProvider
+from cayu.providers import ModelStreamEvent
+from cayu.resource_access import ResourceAccessDenied
+from cayu.sessions import InMemorySessionStore
+from cayu.sessions.access import SessionAccessDenied
+from cayu.sessions.requests import RunRequest
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.worker import run_task_worker
+from app import build_app
+from domain.organizations import InMemoryMembershipDirectory, Membership
+from domain.sharing import conversation_labels
+from policies.access import MembershipAccessPolicy
+
+ALICE = Membership("acme", "acme/finance")
+
+
+async def _queue_report(app: CayuApp) -> str:
+    access = await app.access("alice")
+    labels = conversation_labels(
+        subject="alice", membership=ALICE, sharing="department"
+    )
+    task = await access.tasks.create(
+        TaskCreate(type="report", title="Quarterly report"), labels=labels
+    )
+    return task.id
+
+
+async def _work(app: CayuApp, store) -> list[str]:
+    handled: list[str] = []
+
+    async def handler(app, task, worker_id) -> None:
+        handled.append(task.id)
+
+    await run_task_worker(app, store, handler, worker_id="worker", max_tasks=1)
+    return handled
+
+
+def test_a_removed_members_queued_task_never_runs() -> None:
+    async def run() -> None:
+        directory = InMemoryMembershipDirectory({"alice": [ALICE]})
+        store = InMemoryTaskStore()
+        app = CayuApp(
+            task_store=store, resource_access_policy=MembershipAccessPolicy(directory)
+        )
+        task_id = await _queue_report(app)
+
+        directory.set_memberships("alice", [])
+
+        assert await _work(app, store) == []
+        assert (await store.load_task(task_id)).status == "failed"
+
+    asyncio.run(run())
+
+
+def test_the_task_stays_refused_after_a_restart(tmp_path) -> None:
+    directory = InMemoryMembershipDirectory({"alice": [ALICE]})
+    path = tmp_path / "tasks.db"
+
+    async def before_restart() -> str:
+        store = SQLiteTaskStore(path)
+        try:
+            app = CayuApp(
+                task_store=store,
+                resource_access_policy=MembershipAccessPolicy(directory),
+            )
+            return await _queue_report(app)
+        finally:
+            await store.close()
+
+    async def after_restart(task_id: str) -> None:
+        store = SQLiteTaskStore(path)
+        try:
+            app = CayuApp(
+                task_store=store,
+                resource_access_policy=MembershipAccessPolicy(directory),
+            )
+            assert await _work(app, store) == []
+            assert (await store.load_task(task_id)).status == "failed"
+        finally:
+            await store.close()
+
+    task_id = asyncio.run(before_restart())
+    directory.set_memberships("alice", [])
+    asyncio.run(after_restart(task_id))
+
+
+def test_a_running_conversation_stops_at_its_next_step() -> None:
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("Working on it."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+
+    async def run() -> None:
+        directory = InMemoryMembershipDirectory({"alice": [ALICE]})
+        async with build_app(
+            provider=provider,
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+            access_policy=MembershipAccessPolicy(directory),
+        ) as app:
+            access = await app.access("alice")
+            labels = conversation_labels(
+                subject="alice", membership=ALICE, sharing="department"
+            )
+            events = access.run(
+                RunRequest(
+                    agent_name="__AGENT_NAME__",
+                    messages=[Message.text("user", "Draft the report")],
+                    labels=labels,
+                )
+            )
+            await anext(events)
+
+            directory.set_memberships("alice", [])
+
+            with pytest.raises((ResourceAccessDenied, SessionAccessDenied)):
+                async for _ in events:
+                    pass
+        # The model was never asked: the next step was refused first.
+        assert provider.requests == []
+
+    asyncio.run(run())
+'''
+
+
 _GUIDANCE = """
 ## Organizations and sharing
 
@@ -869,6 +1636,8 @@ who belongs where; Cayu enforces it.
 | `database/memberships.py` | Reading memberships for Cayu; `add_member` and `remove_member`, the only way to change them |
 | `policies/access.py` | Turning a person's current memberships into Cayu resource-access grants |
 | `domain/sharing.py` | The labels a new conversation is created with: personal, department or organization |
+| `integrations/sign_in.py` | The one place a request becomes a verified person |
+| `integrations/http.py` | The API `cayu serve` serves under `/app` (`[tool.cayu.serve] routers`) |
 
 - Start a conversation through `await app.access(subject)` with the labels
   `conversation_labels(...)` returns for the signed-in person. Never take a subject, an
@@ -877,9 +1646,23 @@ who belongs where; Cayu enforces it.
   nothing of another organization. Only the owner continues, changes or deletes one.
 - Cayu asks the policy again at every protected step, so removing a member takes effect at
   their next step, in background work too.
+- The Developer dashboard reads every conversation, so it is for operators only:
+  `[tool.cayu.serve].auth` is `OPERATOR_ONLY_AUTH`, which refuses the people Cayu Cloud signs
+  in as members. They reach their data only through `/app`.
+- Organization admins (`role = "admin"` on a membership) add, move and remove members
+  through `/app/organizations/{organization}/members`. That role is the application's own
+  decision and never widens what Cayu lets anyone see.
+- Sign-in: `cayu serve --dev` offers a demonstration login at `POST /app/dev/sign-in` for
+  the people `operations/demo_seed.py` adds, and nobody else. Outside development,
+  `APP_SIGN_IN` selects Cayu Cloud's sign-in (`cloud`, the default) or an OIDC bearer token
+  (`oidc`, with CAYU_OIDC_ISSUER and CAYU_OIDC_AUDIENCE); memberships are keyed on the ID
+  that sign-in gives each person. Until one is configured, the API answers 503.
+- An organization a client shows as active is only a filter and a default for new
+  conversations (`POST /app/conversation-labels`); it never grants anything.
 - `uv run --no-sync alembic upgrade head`, then `uv run --no-sync python -m
   operations.demo_seed`, gives a development database two demonstration organizations.
-  `tests/test_organizations.py` shows each rule.
+  `tests/test_organizations.py`, `tests/test_http_api.py` and
+  `tests/test_background_revocation.py` show each rule.
 """
 
 
@@ -930,6 +1713,21 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
         "operations/demo_seed.py": _DEMO_SEED_PY,
         "tests/conftest.py": _CONFTEST_PY,
         "tests/test_organizations.py": _TEST_ORGANIZATIONS_PY.replace(
+            "__AGENT_NAME__", plan.agent_name
+        ),
+        # The application's own users sign in through the same proxy as members, so the
+        # Developer dashboard (which reads every conversation) is for operators only.
+        "pyproject.toml": files["pyproject.toml"].replace(
+            f'[tool.cayu.serve]\nauth = "{ENVIRONMENT_OPERATOR_AUTH_TARGET}"\n',
+            f'[tool.cayu.serve]\nauth = "{ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET}"\n'
+            'routers = ["integrations.http:build_router"]\n',
+        ),
+        "configuration/settings.py": files["configuration/settings.py"] + _SETTINGS_APPEND,
+        "migrations/versions/0003_membership_roles.py": _ROLES_MIGRATION,
+        "integrations/sign_in.py": _SIGN_IN_PY,
+        "integrations/http.py": _HTTP_PY,
+        "tests/test_http_api.py": _TEST_HTTP_API_PY,
+        "tests/test_background_revocation.py": _TEST_BACKGROUND_REVOCATION_PY.replace(
             "__AGENT_NAME__", plan.agent_name
         ),
     }

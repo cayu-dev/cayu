@@ -22,6 +22,7 @@ from urllib.parse import quote, unquote, urlsplit
 import httpx
 
 from cayu._operator_credentials import (
+    ENVIRONMENT_AUTH_TARGETS,
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
     LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH,
     OPERATOR_PASSWORD_VARIABLE,
@@ -915,7 +916,7 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
 
 
 def _init_sign_in_mode(setup: ServeSetupPlan) -> str:
-    """`cloud` only when `cayu serve` uses the ready-made target, which accepts Cloud's identity.
+    """`cloud` only when `cayu serve` uses a ready-made target, which accepts Cloud's identity.
 
     A `service_factory` project owns its product and Developer dashboard access,
     and any other auth target (including the generated `server_auth.py`) does not
@@ -923,7 +924,7 @@ def _init_sign_in_mode(setup: ServeSetupPlan) -> str:
     """
 
     target = setup.auth_target if setup.auth.status == "missing" else setup.auth.target
-    return "cloud" if target == ENVIRONMENT_OPERATOR_AUTH_TARGET else "own"
+    return "cloud" if target in ENVIRONMENT_AUTH_TARGETS else "own"
 
 
 def _plan_init_serve_setup(pyproject_path: Path) -> ServeSetupPlan:
@@ -1038,7 +1039,7 @@ def _serve_setup_report(setup: ServeSetupPlan, *, created_auth_module: bool) -> 
             + " ".join(setup.environment_auth_upgrade)
             + " Then run `uv lock`."
         )
-    elif setup.auth.target == ENVIRONMENT_OPERATOR_AUTH_TARGET:
+    elif setup.auth.target in ENVIRONMENT_AUTH_TARGETS:
         notes.append(
             f"[tool.cayu.serve].auth already reads {OPERATOR_USERNAME_VARIABLE} and "
             f"{OPERATOR_PASSWORD_VARIABLE}, which Cayu Cloud provides to each Agent; read "

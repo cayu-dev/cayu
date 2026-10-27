@@ -461,6 +461,8 @@ def _write_project_files(root: Path, files: dict[str, str]) -> None:
         ("agent", "cloud"),
         # A public service's own bearer tokens and Developer dashboard auth decide access.
         ("service", "own"),
+        # Its users sign in through Cloud; members don't get the Developer dashboard.
+        ("b2b", "cloud"),
     ],
 )
 def test_init_declares_cloud_sign_in_only_when_cayu_serve_accepts_it(

@@ -932,3 +932,32 @@ def test_member_cannot_declare_approval_revision_in_metadata(jwks, signing_key, 
     assert (
         client.post("/api/tool-approvals/resolve", json=payload, headers=headers).status_code == 404
     )
+
+
+def test_operator_only_auth_keeps_cloud_members_out_of_the_developer_dashboard(
+    monkeypatch, jwks, signing_key
+) -> None:
+    module = _import_environment_auth(monkeypatch, _environment(**_PROXY_ENVIRONMENT))
+    roles = module.OPERATOR_ONLY_AUTH.control_plane_roles
+
+    assert type(module.OPERATOR_ONLY_AUTH) is ProxyIdentityAuth
+    assert type(module.OPERATOR_ONLY_AUTH.fallback) is BasicAuth
+    assert (roles.full_access, roles.read_and_decide) == (("admin", "developer"), ())
+    client = _server(
+        _auth(
+            jwks,
+            control_plane_roles=roles,
+            fallback=BasicAuth(username=OPERATOR[0], password=OPERATOR[1]),
+        )
+    )
+    # An application's own users sign in through the same proxy as members.
+    member = _as(_token(signing_key, role="member"))
+    assert client.get("/api/sessions", headers=member).status_code == 403
+    assert client.get("/api/sessions", headers=_as(_token(signing_key))).status_code == 200
+    assert client.get("/api/sessions", auth=OPERATOR).status_code == 200
+
+
+def test_operator_only_auth_without_proxy_variables_is_the_operator_login(monkeypatch) -> None:
+    module = _import_environment_auth(monkeypatch, _environment())
+
+    assert type(module.OPERATOR_ONLY_AUTH) is BasicAuth

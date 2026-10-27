@@ -16,6 +16,11 @@ from cayu.cli import main
 from cayu.cli.scaffold import project_files
 
 B2B_FILES = (
+    "integrations/sign_in.py",
+    "integrations/http.py",
+    "migrations/versions/0003_membership_roles.py",
+    "tests/test_http_api.py",
+    "tests/test_background_revocation.py",
     "domain/organizations.py",
     "database/memberships.py",
     "domain/sharing.py",
@@ -49,6 +54,10 @@ def test_the_app_is_built_with_the_membership_policy() -> None:
     assert any(item.startswith("alembic") for item in dependencies)
     assert "class Membership(Base)" in files["database/models.py"]
     assert "## Organizations and sharing" in files["AGENTS.md"]
+    serve = tomllib.loads(files["pyproject.toml"])["tool"]["cayu"]["serve"]
+    assert serve["routers"] == ["integrations.http:build_router"]
+    assert serve["auth"] == "cayu.server.environment_auth:OPERATOR_ONLY_AUTH"
+    assert "role: Mapped[str]" in files["database/models.py"]
     # The sharing labels Cayu enforces can't be changed by the people they protect.
     assert "protected_label_keys" in files["policies/access.py"]
 
@@ -108,6 +117,8 @@ def test_generated_suite_runs_without_a_database_and_against_postgres(
                 "-p",
                 "no:cacheprovider",
                 "tests/test_organizations.py",
+                "tests/test_http_api.py",
+                "tests/test_background_revocation.py",
                 "tests/test_app_database.py",
             ],
             cwd=project,
