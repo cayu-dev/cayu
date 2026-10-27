@@ -1,5 +1,19 @@
 # Release notes
 
+## Unreleased
+
+Upgrade: refresh optional dependencies and rebuild custom dashboards to pick up
+the patched dependency versions. No storage migration is required.
+
+### Breaking changes
+
+None.
+
+### Fixes
+
+- Raise the minimum Pillow, pypdf, Brotli, and OpenTelemetry versions to include
+  security fixes, and update the dashboard's Vite and Zod build dependencies.
+
 ## v0.15.0
 
 Upgrade: stop every 0.14.x process that writes to or claims from the store, back

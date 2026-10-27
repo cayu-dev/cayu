@@ -57,9 +57,16 @@ export default defineConfig(({ command }) => ({
             // before its class exports are initialized.
             strictExecutionOrder: true,
             chunkFileNames: (chunk) => {
-              const name = chunk.name.startsWith("shared~") ? "shared" : chunk.name;
+              // Rolldown can name the application chunk after the source
+              // directory, which changes when users eject the dashboard.
+              const name = chunk.moduleIds.includes(path.resolve(__dirname, "src/main.tsx"))
+                ? "dashboard"
+                : chunk.name.startsWith("shared~") ? "shared" : chunk.name;
               return `assets/${name}-[hash].js`;
             },
+            assetFileNames: (asset) => asset.names.some((name) => name.endsWith(".css"))
+              ? "assets/dashboard-[hash][extname]"
+              : "assets/[name]-[hash][extname]",
             codeSplitting: {
               groups: [
                 {

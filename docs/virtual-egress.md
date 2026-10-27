@@ -479,7 +479,7 @@ overshoot is bounded by one block of under 32 KiB. The returned response
 contains the decoded body without `Content-Encoding`, and the proxy writes a
 `Content-Length` equal to the decoded length. `gzip`, `x-gzip`, and `deflate`
 (zlib-wrapped or raw) are always available; `br` requires the optional
-`brotli>=1.2` package and `zstd` requires Python 3.14's `compression.zstd`,
+`brotli>=1.2.1` package and `zstd` requires Python 3.14's `compression.zstd`,
 because only those decoders can cap their output per call. An unknown,
 stacked, or unavailable coding is still rejected with `unsupported_content`
 before the body is read, and a malformed or truncated encoded body fails with

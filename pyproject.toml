@@ -63,20 +63,20 @@ dev = [
   # generated project depends on these, Cayu itself does not.
   "alembic>=1.13,<2",
   # Exercises the bounded Brotli decoder in egress; not a runtime dependency.
-  "brotli>=1.2,<2",
+  "brotli>=1.2.1,<2",
   "cryptography>=42",
   "fastapi>=0.115,<0.137",
   "httpx2>=2.12,<3",
   "hypothesis>=6,<7",
   # Official SDK fixture verifies the pinned 2026-07-28 stdio wire contract.
   "mcp==2.2.0",
-  "opentelemetry-api>=1.20",
-  "opentelemetry-sdk>=1.20",
+  "opentelemetry-api>=1.45.1",
+  "opentelemetry-sdk>=1.45.1",
   "packaging>=24",
-  "pillow>=10",
+  "pillow>=13.0.0",
   "psycopg[binary]>=3.2",
   "psycopg_pool>=3.2",
-  "pypdf>=6.19.0",
+  "pypdf>=6.21.2",
   "pytest>=8.0",
   "pytest-split>=0.11,<1",
   "pytest-xdist>=3.8,<4",
@@ -95,7 +95,7 @@ console = [
   "ipython>=9,<10",
 ]
 recording = [
-  "pillow>=10",
+  "pillow>=13.0.0",
   "websockets>=17.0.1,<17.1",
 ]
 browser = [
@@ -110,8 +110,8 @@ postgres = [
   "psycopg_pool>=3.2",
 ]
 files = [
-  "pillow>=10",
-  "pypdf>=6.19.0",
+  "pillow>=13.0.0",
+  "pypdf>=6.21.2",
 ]
 e2b = [
   "e2b>=2.45.1,<3",
@@ -125,8 +125,8 @@ microsandbox = [
   "microsandbox==0.6.6",
 ]
 otel = [
-  "opentelemetry-api>=1.20",
-  "opentelemetry-sdk>=1.20",
+  "opentelemetry-api>=1.45.1",
+  "opentelemetry-sdk>=1.45.1",
 ]
 vertex = [
   "google-auth[requests]>=2,<3",
@@ -166,12 +166,12 @@ all = [
   "google-auth[requests]>=2,<3",
   "ipython>=9,<10",
   "microsandbox==0.6.6",
-  "opentelemetry-api>=1.20",
-  "opentelemetry-sdk>=1.20",
-  "pillow>=10",
+  "opentelemetry-api>=1.45.1",
+  "opentelemetry-sdk>=1.45.1",
+  "pillow>=13.0.0",
   "psycopg[binary]>=3.2",
   "psycopg_pool>=3.2",
-  "pypdf>=6.19.0",
+  "pypdf>=6.21.2",
   "pydantic-settings>=2.7,<3",
   "pyjwt[crypto]>=2.15.0,<3",
   "uvicorn>=0.30",

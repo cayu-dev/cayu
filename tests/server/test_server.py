@@ -78,7 +78,6 @@ def test_dashboard_serves_lazy_route_chunks_under_nested_asgi_mount() -> None:
 
     pending_assets = list(entry_scripts)
     visited_assets: set[str] = set()
-    entry_chunks: set[str] | None = None
 
     while pending_assets:
         asset_path = pending_assets.pop()
@@ -91,14 +90,12 @@ def test_dashboard_serves_lazy_route_chunks_under_nested_asgi_mount() -> None:
         assert "javascript" in response.headers["content-type"], asset_path
 
         chunks = set(re.findall(r'["`]\./([^"`]+\.js)["`]', response.text))
-        if asset_path == entry_scripts[0]:
-            entry_chunks = chunks
         pending_assets.extend(f"assets/{chunk}" for chunk in chunks)
 
-    assert entry_chunks is not None
-    assert any(chunk.startswith("session-entry-") for chunk in entry_chunks)
-    assert any(chunk.startswith("sessions-entry-") for chunk in entry_chunks)
-    assert any(chunk.startswith("artifacts-") for chunk in entry_chunks)
+    # The entry script may delegate to an application chunk before loading routes.
+    assert any(chunk.startswith("assets/session-entry-") for chunk in visited_assets)
+    assert any(chunk.startswith("assets/sessions-entry-") for chunk in visited_assets)
+    assert any(chunk.startswith("assets/artifacts-") for chunk in visited_assets)
 
 
 def test_dashboard_path_can_be_disabled_or_customized() -> None:
