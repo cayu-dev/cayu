@@ -1222,3 +1222,109 @@ def test_recovery_handles_repeated_artifact_stores_and_registration_failure(
             await stop_first()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("second_rebuild_fails", [False, True])
+def test_concurrent_recoveries_never_use_another_jobs_rebuilt_factory(
+    tmp_path: Path, monkeypatch, second_rebuild_fails: bool
+) -> None:
+    from contextlib import asynccontextmanager
+
+    async def scenario() -> None:
+        database = tmp_path / "concurrent.sqlite"
+        crashed_apps = []
+        runs = []
+        sessions = []
+        serving, _ = _crashing_app(SQLiteSessionStore(database))
+        first_build_started = asyncio.Event()
+        second_waiting = asyncio.Event()
+        finish_first_build = asyncio.Event()
+        factories: dict[str, DeferredCloneFactory] = {}
+        recoveries = []
+
+        async def run_job(app, events):
+            async for event in app.run(
+                RunRequest(
+                    agent_name="hunter",
+                    environment_name=SLOT,
+                    messages=[Message.text("user", "go")],
+                )
+            ):
+                events.append(event)
+
+        async def rebuild(request: EnvironmentRebuildRequest) -> EnvironmentRebuild:
+            revision = request.record.payload["revision"]
+            if revision == "job-a":
+                first_build_started.set()
+                await finish_first_build.wait()
+            elif second_rebuild_fails:
+                raise ValueError("Job B cannot be rebuilt here.")
+            factory = DeferredCloneFactory(revision)
+            factories[revision] = factory
+            return EnvironmentRebuild(spec=_slot_spec(), factory=factory)
+
+        registry = serving._environment_registry
+        original_lock = registry.rebuild_lock
+
+        @asynccontextmanager
+        async def observed_lock(name):
+            lock = original_lock(name)
+            if lock.locked():
+                second_waiting.set()
+            async with lock:
+                yield
+
+        monkeypatch.setattr(registry, "rebuild_lock", observed_lock)
+        serving.register_environment_rebuilder("scout.clone", rebuild)
+        try:
+            for revision in ("job-a", "job-b"):
+                crashed, tool = _crashing_app(SQLiteSessionStore(database))
+                crashed_apps.append(crashed)
+                crashed.register_environment_factory(_slot_spec(), DeferredCloneFactory(revision))
+                events: list[Event] = []
+                runs.append(asyncio.create_task(run_job(crashed, events)))
+                await tool.started.wait()
+                sessions.append(events[0].session_id)
+
+            recoveries.append(
+                asyncio.create_task(
+                    serving.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(session_id=sessions[0])
+                    )
+                )
+            )
+            await asyncio.wait_for(first_build_started.wait(), timeout=10)
+            recoveries.append(
+                asyncio.create_task(
+                    serving.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(session_id=sessions[1])
+                    )
+                )
+            )
+            # Both recoveries saw an unregistered slot. The second now waits
+            # behind A's rebuild while A still holds the per-name lock.
+            await asyncio.wait_for(second_waiting.wait(), timeout=10)
+            finish_first_build.set()
+            results = await asyncio.gather(*recoveries)
+            assert [r.status for r in results] == [SessionStatus.INTERRUPTED] * 2
+            assert factories["job-a"].released == [(sessions[0], {"clone": "job-a"})]
+            assert serving.get_environment_factory(SLOT) is factories["job-a"]
+            if second_rebuild_fails:
+                assert "job-b" not in factories
+                checkpoint = await serving.session_store.load_checkpoint(sessions[1])
+                assert checkpoint is not None
+                assert checkpoint["environment_factory_reconnect"][SLOT] == {"clone": "job-b"}
+                assert checkpoint["environment_factory_allocation_owner"][SLOT] == sessions[1]
+            else:
+                assert factories["job-b"].released == [(sessions[1], {"clone": "job-b"})]
+        finally:
+            finish_first_build.set()
+            for task in (*recoveries, *runs):
+                task.cancel()
+            await asyncio.gather(*recoveries, *runs, return_exceptions=True)
+            await serving.aclose()
+            for app in crashed_apps:
+                with suppress(BaseException):
+                    await app.aclose()
+
+    asyncio.run(scenario())

@@ -544,14 +544,15 @@ class SessionEnvironments:
                 try:
                     await ensure_session_environment(app, session)
                 except Exception:
-                    # No other job's factory is involved: recovery continues
-                    # as it would without a registration.
+                    # Another recovery may have registered this name while
+                    # we waited for its rebuild. Check ownership below.
                     logger.warning(
                         "Rebuilding environment %r for session recovery failed.",
                         name,
                         exc_info=True,
                     )
-            return nullcontext()
+            if name not in registry.registrations:
+                return nullcontext()
         registered_record = registry.rebuild_record(name)
         if registered_record is None:
             return nullcontext()  # The registration makes no claim.

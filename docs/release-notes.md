@@ -163,6 +163,15 @@ showed this, because the in-memory store makes its own key.
 
 ### Changes
 
+- `SandboxBrokerClient.capacity()` reads Cayu Cloud's
+  `GET /v1/applications/{agent}/sandboxes/capacity`: how many sandboxes the
+  Agent can get now under its own, its Organization's and the install's limit,
+  as a frozen `SandboxCapacity` (`available`, `limited_by`, `agent`,
+  `organization`, `install`, `queue`). A hosting Agent passes `organization=`
+  for an Organization it works for; anyone else is refused with
+  `on_behalf_of_not_allowed`, which the client now recognizes as a contract
+  code. A malformed answer raises `SandboxBrokerError`. The factory's `broker`
+  and `BrokeredSandboxRunner.broker` reach it; nothing calls it for you.
 - `CayuApp.unregister_environment(name)` removes a registered environment, for
   example one a long-lived worker registered for a single job. It raises
   `cayu.exceptions.EnvironmentInUse` and changes nothing while the environment

@@ -713,6 +713,22 @@ A broker answer without a contract code (from authentication, a proxy or the
 ingress) is retried only for 408, 429 and 5xx. Any other 4xx, such as a 401
 for a revoked credential, is final.
 
+Each sandbox holds a place under the Agent's limit, its Organization's and,
+where the install sets one, the install's. A create over any of them is
+refused with `SandboxQuotaExceededError`, whose `scope` names the limit. To
+see what is free before asking, call `await broker.capacity()` on the client
+(the factory's `broker`, or `BrokeredSandboxRunner.broker`). It returns a
+frozen `SandboxCapacity`: `agent`, `organization` and `install` (`None` when
+the install sets no install-wide limit) each report `limit`, `in_use`,
+`queued` and `available`; the top-level `available` is the fewest free places
+under any of them and `limited_by` names that limit; `queue` says how many
+more creates the Agent may queue and the longest wait. A hosting Agent passes
+`organization="org_…"` for an Organization it works for. It is a snapshot,
+not a reservation, so a create can still be refused. The client refuses an
+answer that doesn't hold together (a missing field, a count that isn't a
+non-negative integer, an `available` that isn't the tightest limit's) with
+`SandboxBrokerError`, and maps errors and retries as for every other call.
+
 Final admission uses the sandbox record's versioned `guarantees`. A capability
 such as `untrusted_code_isolation`, `real_credential_non_possession`,
 `guest_privilege_containment` or `deny_by_default_network` is available only

@@ -23,12 +23,19 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import isfinite
-from typing import Any, BinaryIO, Literal
+from typing import Annotated, Any, BinaryIO, Literal
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import certifi
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 __all__ = [
     "BROKER_API_URL_ENV",
@@ -56,6 +63,8 @@ __all__ = [
     "SandboxBrokerSettings",
     "SandboxBrokerUnavailableError",
     "SandboxBusyError",
+    "SandboxCapacity",
+    "SandboxCapacityScope",
     "SandboxCommand",
     "SandboxCopy",
     "SandboxCopyFailedError",
@@ -65,8 +74,11 @@ __all__ = [
     "SandboxGuarantees",
     "SandboxImage",
     "SandboxLeaseLostError",
+    "SandboxLimitCapacity",
     "SandboxNotFoundError",
     "SandboxNotReadyError",
+    "SandboxOrganizationCapacity",
+    "SandboxQueueCapacity",
     "SandboxQuotaExceededError",
     "SandboxRecord",
     "SandboxSignedTransfer",
@@ -117,6 +129,10 @@ JSON_OUTPUT_EXPANSION = 6
 # Each stream's limit is measured as it appears in the JSON, so two full
 # streams plus the command's other fields bound a response.
 _MAX_RESPONSE_BYTES = 2 * MAX_COMMAND_OUTPUT_BYTES + 64 * 1024
+#: A capacity answer is a few small numbers and one Organization id.
+_MAX_CAPACITY_RESPONSE_BYTES = 64 * 1024
+#: Cloud's bound on an Organization id a hosting Agent names (``on_behalf_of``).
+_MAX_ORGANIZATION_ID = 200
 _MAX_ERROR_TEXT = 300
 _LABEL_KEY = re.compile(r"[a-z0-9_.-]{1,63}")
 _COMMAND_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
@@ -142,6 +158,7 @@ _KNOWN_CODES = frozenset(
         "image_unknown",
         "egress_mode_unsupported",
         "sandbox_quota_exceeded",
+        "on_behalf_of_not_allowed",
         "sandboxes_unavailable",
         "sandbox_not_ready",
         "sandbox_busy",
@@ -161,6 +178,10 @@ _EGRESS_MODES = ("none", "public_web", "allowlist")
 SandboxStatus = Literal["provisioning", "ready", "destroying", "destroyed", "failed"]
 CommandStatus = Literal["running", "exited", "timed_out", "cancelled", "failed"]
 CopyStatus = Literal["awaiting_upload", "pending", "running", "done", "failed", "expired"]
+#: The limits a sandbox holds a place under, in the order a create checks them.
+SandboxCapacityScope = Literal["agent", "organization", "install"]
+# A count in a capacity answer: a JSON integer, never a bool, float or string.
+_Count = Annotated[int, Field(strict=True, ge=0)]
 _STAGED_CHUNK_BYTES = 1024 * 1024
 #: A staged copy waits at least this long, plus a second per MiB, to finish.
 _COPY_TIMEOUT_FLOOR_SECONDS = 600.0
@@ -455,6 +476,91 @@ class SandboxCopy(BaseModel):
     @property
     def finished(self) -> bool:
         return self.status in {"done", "failed", "expired"}
+
+
+class SandboxLimitCapacity(BaseModel):
+    """One concurrency limit as ``GET .../sandboxes/capacity`` reports it.
+
+    ``limit`` is the most sandboxes it allows, ``in_use`` the sandboxes holding a
+    place under it, ``queued`` the creates waiting in the queue for one, and
+    ``available`` the places free (never below 0).
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    limit: _Count
+    in_use: _Count
+    queued: _Count
+    available: _Count
+
+    @model_validator(mode="after")
+    def _free_places_fit_the_limit(self) -> SandboxLimitCapacity:
+        if self.available > max(0, self.limit - self.in_use):
+            raise ValueError("available exceeds the limit's free places")
+        return self
+
+
+class SandboxOrganizationCapacity(SandboxLimitCapacity):
+    """The Organization limit, with the id of the Organization the numbers are for."""
+
+    id: str = Field(strict=True, min_length=1, max_length=_MAX_ORGANIZATION_ID)
+
+
+class SandboxQueueCapacity(BaseModel):
+    """How many more creates the Agent may queue, and the longest ``queue_seconds``."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    available: _Count
+    max_seconds: _Count
+
+
+class SandboxCapacity(BaseModel):
+    """What one more of the Agent's sandboxes would find under each limit right now.
+
+    ``available`` is the fewest free places under any limit: how many creates
+    are admitted now without queueing, if nothing else changes. ``limited_by``
+    names that limit, the ``scope`` a create over it is refused with
+    (``SandboxQuotaExceededError.scope``). ``install`` is ``None`` when the
+    install sets no install-wide limit. It is a snapshot, not a reservation:
+    another Agent may take a free place first.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    available: _Count
+    limited_by: SandboxCapacityScope
+    agent: SandboxLimitCapacity
+    organization: SandboxOrganizationCapacity
+    install: SandboxLimitCapacity | None
+    queue: SandboxQueueCapacity
+
+    def scope(self, name: SandboxCapacityScope) -> SandboxLimitCapacity | None:
+        """The named limit; ``None`` only for ``install`` when the install sets none."""
+
+        if name == "agent":
+            return self.agent
+        if name == "organization":
+            return self.organization
+        if name == "install":
+            return self.install
+        raise ValueError("Sandbox capacity scope must be 'agent', 'organization' or 'install'.")
+
+    @model_validator(mode="after")
+    def _consistent(self) -> SandboxCapacity:
+        tightest = self.scope(self.limited_by)
+        if tightest is None:
+            raise ValueError("limited_by names a limit the install doesn't set")
+        scopes = [self.agent, self.organization]
+        if self.install is not None:
+            scopes.append(self.install)
+        if self.available != tightest.available or any(
+            self.available > scope.available for scope in scopes
+        ):
+            raise ValueError("available isn't the fewest free places under any limit")
+        if self.queue.available > self.agent.limit:
+            raise ValueError("queue.available exceeds the Agent's limit")
+        return self
 
 
 @dataclass(frozen=True)
@@ -811,6 +917,42 @@ class SandboxBrokerClient:
             [self._model(SandboxRecord, item) for item in body["items"]],
             next_cursor if type(next_cursor) is str else None,
         )
+
+    async def capacity(self, *, organization: str | None = None) -> SandboxCapacity:
+        """Read how many sandboxes the Agent can get now under each limit.
+
+        Read it before a create to learn whether the create would be admitted
+        or refused for a limit. A hosting Agent names the ``organization`` it
+        would create for; from anyone else the broker refuses that with
+        ``on_behalf_of_not_allowed``. Without it the numbers are for the
+        caller's own Organization. An answer that doesn't hold together raises
+        ``SandboxBrokerError``.
+        """
+
+        params: dict[str, str] | None = None
+        if organization is not None:
+            if (
+                type(organization) is not str
+                or not 1 <= len(organization) <= _MAX_ORGANIZATION_ID
+                or not organization.isprintable()
+            ):
+                raise ValueError(
+                    f"Sandbox capacity organization must be 1 to {_MAX_ORGANIZATION_ID} "
+                    "printable characters."
+                )
+            params = {"organization": organization}
+        body, _ = await self._json(
+            "GET",
+            f"{self._base}/capacity",
+            params=params,
+            max_bytes=_MAX_CAPACITY_RESPONSE_BYTES,
+        )
+        capacity: SandboxCapacity = self._model(SandboxCapacity, body)
+        if organization is not None and capacity.organization.id != organization:
+            raise SandboxBrokerError(
+                "Sandbox broker returned capacity for another Organization than the one asked."
+            )
+        return capacity
 
     async def events(self, sandbox_id: str) -> list[dict[str, Any]]:
         body, _ = await self._json("GET", self._sandbox_url(sandbox_id) + "/events")
@@ -1431,8 +1573,10 @@ class SandboxBrokerClient:
                 f"Sandbox broker returned an invalid {model.__name__}."
             ) from None
 
-    async def _json(self, method: str, url: str, **kwargs: Any) -> tuple[Any, httpx.Headers]:
-        raw, headers = await self._request(method, url, max_bytes=_MAX_RESPONSE_BYTES, **kwargs)
+    async def _json(
+        self, method: str, url: str, *, max_bytes: int = _MAX_RESPONSE_BYTES, **kwargs: Any
+    ) -> tuple[Any, httpx.Headers]:
+        raw, headers = await self._request(method, url, max_bytes=max_bytes, **kwargs)
         try:
             return json.loads(raw), headers
         except ValueError:

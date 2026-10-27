@@ -1107,6 +1107,11 @@ those variables are set, and Docker when they aren't
 Set `CAYU_CODING_BACKEND=cayu-cloud` on the Agent to make a missing sandbox
 credential fail at startup instead.
 
+Cloud limits how many sandboxes run at once, per Agent, per Organization and
+optionally per install. `SandboxBrokerClient.capacity()` reads what is free
+under each limit right now, from Cloud's `GET .../sandboxes/capacity`
+([limits and capacity](environment-factories.md#coding-in-a-sandbox-brokered-by-cayu-cloud)).
+
 ## Fixed process resources
 
 `cpu_millis` and `memory_mb` at the top of `cayu-cloud.toml` apply to all Agent

@@ -11,6 +11,8 @@ in canonical form as Cloud does.
 ``guest_paths`` maps further guest path prefixes (an image's ``/opt/...`` toolchain)
 to host directories the same way, and ``image_identities`` gives a catalog image
 the identity a broker reports for an image it built.
+``GET /sandboxes/capacity`` answers in Cloud's shape from ``agent_limit``,
+``organization_limit``, ``install_limit`` and the sandboxes not yet destroyed.
 """
 
 from __future__ import annotations
@@ -184,6 +186,18 @@ class FakeBroker:
         self.guest_paths: dict[str, Path] = {}
         # The image identity reported for sandboxes of each image name.
         self.image_identities: dict[str, dict[str, Any]] = {}
+        # Concurrency limits ``/capacity`` reports, as Cloud's defaults; no install
+        # limit unless set. The fake never queues a create, so ``queued`` stays 0.
+        self.agent_limit = 8
+        self.organization_limit = 32
+        self.install_limit: int | None = None
+        self.organization_id = "org_test"
+        # Organizations a hosting Agent may read capacity for with ``?organization=``.
+        self.hosted_organizations: set[str] = set()
+        # Sandboxes of other Agents holding places under the install limit.
+        self.install_in_use_elsewhere = 0
+        # A body ``/capacity`` returns as is, in place of the computed one.
+        self.capacity_body: Any = None
 
     def client(self, **settings: Any) -> SandboxBrokerClient:
         return SandboxBrokerClient(
@@ -254,6 +268,9 @@ class FakeBroker:
         if not path.startswith(prefix):
             return httpx.Response(404, json={"error": {"code": "x", "message": "", "detail": {}}})
         parts = path.removeprefix(prefix).strip("/").split("/") if path != prefix else []
+        # Before the read by id, as Cloud routes it.
+        if parts == ["capacity"] and request.method == "GET":
+            return self._capacity(request)
         if not parts or parts == [""]:
             if request.method == "POST":
                 return self._create(json.loads(request.content))
@@ -341,6 +358,47 @@ class FakeBroker:
         if action[:1] == ["copies"]:
             return self._copy(sandbox, request, action[1:])
         return httpx.Response(404, json={"error": {"code": "x", "message": "", "detail": {}}})
+
+    def _capacity(self, request: httpx.Request) -> httpx.Response:
+        """``GET /sandboxes/capacity`` in Cloud's shape (``SandboxOccupancy.capacity``)."""
+
+        if self.capacity_body is not None:
+            return httpx.Response(200, json=self.capacity_body)
+        organization = request.url.params.get("organization")
+        if organization is not None and organization not in self.hosted_organizations:
+            return _error(403, "on_behalf_of_not_allowed")
+        # Every sandbox not yet destroyed or failed holds a place under each limit.
+        in_use = sum(
+            1
+            for sandbox in self.sandboxes.values()
+            if sandbox.status not in {"destroyed", "failed"}
+        )
+
+        def scope(limit: int, used: int) -> dict[str, int]:
+            return {"limit": limit, "in_use": used, "queued": 0, "available": max(0, limit - used)}
+
+        scopes: dict[str, dict[str, Any]] = {
+            "agent": scope(self.agent_limit, in_use),
+            "organization": {
+                "id": organization or self.organization_id,
+                **scope(self.organization_limit, in_use),
+            },
+        }
+        if self.install_limit is not None:
+            scopes["install"] = scope(self.install_limit, in_use + self.install_in_use_elsewhere)
+        # The first of the tightest, in the order a create checks them.
+        limited_by = min(scopes, key=lambda name: scopes[name]["available"])
+        return httpx.Response(
+            200,
+            json={
+                "available": scopes[limited_by]["available"],
+                "limited_by": limited_by,
+                "agent": scopes["agent"],
+                "organization": scopes["organization"],
+                "install": scopes.get("install"),
+                "queue": {"available": self.agent_limit, "max_seconds": 3600},
+            },
+        )
 
     def _create(self, body: dict[str, Any]) -> httpx.Response:
         if self.refuse_create is not None:
