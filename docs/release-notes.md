@@ -1,686 +1,149 @@
 # Release notes
 
-## Unreleased
+## v0.15.0
 
-Upgrade: run `cayu storage migrate` against each SQLite or PostgreSQL store and
-confirm revision 129. SQLite and PostgreSQL session stores require revision 129
-and refuse an older database until it is migrated. The additive revision adds a
-`message_bytes` column to `cayu_transcript_messages`, backfills it in one
-statement (on large PostgreSQL transcript tables this rewrites every row inside
-the migration transaction), fills it for writers that omit it, and builds an
-index on each session's root session id (concurrently on existing PostgreSQL
-databases). The compatibility floor stays at 127, so older workers keep running
-during the migration. Revision 128 adds the `cayu_task_retry_keys` table for
-retry budgets.
-
-If you set `run_task_worker(execution_timeout_s=...)`, the grace period now comes
-out of that limit instead of being added after it (see the breaking change
-below).
-
-`cayu[claude-agent-sdk]` now accepts newer
-`claude-agent-sdk` releases below 0.3; pin the SDK in your own requirements to
-keep 0.2.170.
-
-`cayu new` may ask PyPI for the latest release; set `CAYU_NO_VERSION_CHECK=1`
-to keep it offline.
-
-Several runtime limits have new defaults (see the breaking changes below), and
-sessions created before this release may not resume after the upgrade.
-
-The Knowledge page now combines proposal review with scoped kept entries, recorded
-attribution and usage, and full-access revision-fenced Remove. Ejected dashboard
-owners should replace the former `src/routes/knowledge.tsx` route with the new
-Knowledge entry/page and regenerate their build.
-
-Tools can declare optional `ToolDisplay(verb=..., noun=..., plural=...)` metadata
-through `ToolSpec.display`. Built-ins ship labels and `/api/agents` returns their
-redacted declaration; tools without labels retain the name fallback. Labels do
-not affect execution or approval.
-
-If your app uses `SQLiteSessionStore` or `PostgresSessionStore` without a public
-authority alias keyring, registers an environment factory that doesn't declare
-`secret_resolution_scope = "static"` (or an environment with a vault or
-credential proxy), and gives an agent `write_file`, `exec_command` or another
-workspace-mutating tool, sessions now fail when the factory creates a fresh
-environment with a workspace, before the first model call, with a message naming
-the tool, environment and fixes (see the breaking change below). Before, every
-call to such a tool failed the session after the model had already run. A factory
-whose environments have no workspace is unaffected, and reconnecting an existing
-allocation is never refused. Declare the factory static when it never returns a
-vault or credential proxy, or configure a persistent keyring on the
-store and the app. Tests that use `CayuApp()` with no `session_store` never
-showed this, because the in-memory store makes its own key.
+Upgrade: stop every 0.14.x process that writes to or claims from the store, back
+the store up, and run `cayu storage migrate --acknowledge-breaking 126
+--acknowledge-breaking 127` before starting 0.15.0. Regenerate HTTP clients and
+rebuild custom dashboards together with the server, and check the breaking
+changes below for new runtime defaults. Storage revision 131 (was 125),
+compatibility floor 127 (was 124), server contract 66 (was 49), manifest schema
+17 (unchanged). Revision 129 backfills a new column on every transcript row in
+one statement, so on a large PostgreSQL store the migration can take a while;
+plan the maintenance window for it. Sessions started on 0.14.x with a built-in
+streaming provider need an `ExecutionProfilePolicy` that adopts the new profile
+to resume.
 
 ### Breaking changes
 
-- With a session store that has no public authority alias codec, Cayu now
-  refuses a pairing whose workspace observations it could never record: an
-  agent with a workspace-mutating tool (`WriteFileTool`, `EditFileTool`,
-  `DeleteFileTool`, `ApplyPatchTool`, `ExecCommandTool`, `RunCommandTool`,
-  `RunCheckTool`, `MaterializeSharedArtifactTool`) and an environment with a
-  workspace that resolves secrets dynamically. For a concrete environment with
-  a vault or credential proxy, `register_agent` or `register_environment`
-  raises. For a factory that doesn't declare a static scope, the session fails
-  when the factory creates a fresh environment with a workspace, before the
-  first model call, unless the session's tool ceiling excludes those tools.
-  Reconnecting an existing allocation (resume, recovery, finalization cleanup)
-  is never refused. The `RuntimeError` names the tool, the agent, the environment and
-  the fixes.
-  0.14.0 accepted the setup and failed the session on the tool's first call with
-  "Dynamic workspace observation authority requires a configured public
-  authority alias keyring." If such a call still happens (for example through
-  registrations that bypass `CayuApp`), only that call fails, as
-  `tool.call.failed` with `reason="workspace_observation_keyring_unavailable"`
-  and a message naming the tool and environment, before any workspace state is
-  written; the session goes on.
-
-- `run_task_worker(execution_timeout_s=...)` now includes the grace period. The
-  last `execution_grace_s` seconds of the limit are the grace period (30 seconds
-  by default, or half the limit when that is shorter). With 600 and 30, new runs
-  in the handler call are refused from 570 seconds, and at 600 seconds the
-  handler is cancelled and a task it did not settle fails with
-  `ExecutionDeadlineExceeded`. 0.14.0 cancelled at the limit plus the grace
-  period (630 seconds), so a handler now has to deliver or retry within the
-  limit itself. An explicit `execution_grace_s` (or
-  `HandlerTimeLimit(grace_s=...)`) that is not smaller than the limit raises
-  `ValueError`. `HandlerTimeLimit`'s `grace_s` default is now `None`, which
-  applies the rule above.
-- A `read_file` `image_region` of one pixel or less, such as `[0, 0, 1, 1]` or
-  `[0, 0, 0, 0]`, now counts as left out, so on an image it reads the whole
-  image. 0.14.0 returned a one-pixel crop or failed.
-- The default `max_steps` is 1,000 (was 64) for SDK runs, HTTP runs, resumes,
-  subagents and product services. Task-backed runs still have no default cap.
-  Pass `max_steps=64` to keep the old bound; `RunLimits` is the budget tool.
-- The absolute model-stream deadline (600 seconds) now counts from the model's
-  last output instead of from dispatch, so a stream that is still producing
-  output is no longer cut off and its session no longer fenced. It still ends a
-  stream that sends only keep-alives or stalls. A stream that trickles output
-  forever is bounded only by `execution_deadline`, `RunLimits` or the task
-  worker's `execution_timeout_s`.
-- A tool that declares no `ToolSpec.max_terminal_payload_bytes` (every MCP
-  tool, application tools without a declaration, and `subagent` with a
-  foreground child) no longer takes the whole staged-terminal pool and runs its
-  round alone across every session in the process. Each such call reserves the
-  largest terminal the 2 MiB event limit allows (1,984 KiB plus 64 KiB of
-  runtime headroom) and shares the pool. Only a round or invocation family
-  larger than the pool is still admitted exclusively. A foreground subagent's
-  child round, which used to be guaranteed admission by its parent's exclusive
-  lease, is now refused only when the pool can't fit it beside other sessions'
-  reservations. The pool is 512 MiB (was 128 MiB); set
-  `ToolExecutionConfig(tool_terminal_staged_capacity_bytes=...)`.
-- `DockerCodingEnvironmentFactory` and `DockerCodingBackendOptions` default
-  `cancel_timeout_s` to 30 seconds (was 5), so a slow `docker rm -f` on a loaded
-  host no longer fails a session that finished its work. A `DockerRunner` built
-  directly keeps 5 seconds.
-- Docker and sandbox coding transfer limits default to 100,000 files, 256 MiB
-  per file, 4 GiB in total and an 8 GiB archive (were 10,000, 8 MiB, 64 MiB and
-  128 MiB), and `SyncBinding` defaults to 100,000 files, 4 GiB and an 8 GiB
-  archive. The generated Docker coding scaffold uses the library defaults
-  instead of writing the old numbers. A tree that a `SyncBinding` copies back
-  is still limited by its completion record, which saves every path and
-  revision in a checkpoint marker of at most 4 MiB, roughly 20,000 files with
-  typical paths. Such a tree is now refused when it binds instead of failing
-  when the session completes.
-- The process-wide `SyncBinding` staging domain allows 16 transfers and 4 GiB
-  (was 4 and 512 MiB). It covers both the on-disk archive spool and the file
-  buffers held in memory while files are copied.
-- MCP calls time out after 300 seconds by default (were 30 seconds over stdio
-  and 120 seconds over HTTP). `GitChangesTool` waits 120 seconds for git (was a
-  fixed 30) and accepts `timeout_seconds=`.
-- `RetryPolicy` now has a 300-second time budget for rate-limit and overload
-  failures (HTTP 429, 503 and 529, or a rate-limit message) by default, and
-  `max_delay_s` defaults to 60 seconds (was 30), which also caps a provider's
-  `Retry-After`. The first such retry uses ordinary backoff; each later one
-  waits its share of the time left, spread over the attempts left and growing
-  by `backoff_multiplier`, and retries stop when the budget is spent. With the
-  defaults the four retries of a sustained rate limit wait about 1, 43, 60 and
-  60 seconds instead of 7.5 to 9.5 seconds in all. `max_attempts` still bounds
-  the attempts, a zero `initial_delay_s` never waits, and
-  `RetryPolicy(max_retry_elapsed_s=None, max_delay_s=30.0)` restores the old
-  behavior. The budget applies to agent model steps and automatic compaction.
-- Lambda MicroVM endpoint calls time out after 120 seconds (was 30) and a
-  sandbox has 180 seconds to become ready (was 60). Suspend and terminate waits
-  use the new `lifecycle_timeout_s` (120 seconds) instead of the request
-  timeout. All three are typed options on `LambdaMicroVMEgressAdapter`;
-  `runner_options` still works, and setting an option in both places raises
-  `ValueError`.
-- Egress: a session broker runs 64 concurrent upstream requests (was 16; the
-  maximum is 512, was 64), an upstream operation may take 3,600 seconds (was
-  600), and the Docker egress proxy accepts 64 connections (was 16; maximum 512,
-  was 64). A request over the broker's capacity is still refused with 503.
+- Storage revisions 126 and 127 are breaking writer boundaries (continuation
+  claim bindings and declared task creation receipts). 0.14.x writers must not
+  run against a migrated store, and rolling back needs a database restore.
+  Revisions 128 to 131 are additive; task stores require 128, session stores
+  129 and eval stores 131.
+- Server contract 66 (was 49). Browser clients, generated API clients and
+  custom dashboards built for 0.14.x refuse this server. Custom dashboards: the
+  `src/Layout.tsx` shell and the `agents`, `dashboard`, `evals`, `knowledge`,
+  `pending-actions`, `run`, `session-detail`, `sessions` and `tasks` modules in
+  `src/routes/` were removed; port your changes to `src/app/` and
+  `src/next/routes/`.
+- Provider stream defaults changed (see below), so built-in streaming providers
+  have a new execution profile. `CayuApp.resume` refuses a 0.14.x session with
+  `ExecutionProfileMismatchError` unless an `ExecutionProfilePolicy` adopts it.
+- New defaults: `max_steps` 1,000 (was 64) for SDK, HTTP, resume, subagent and
+  product-service runs; the 600-second model-stream deadline counts from the
+  last output; `ProviderStreamDeadlines(max_concurrent_streams=)` 1,000 (was
+  100); `RetryPolicy` spends up to 300 seconds on rate limits and overloads and
+  `max_delay_s` is 60 (`RetryPolicy(max_retry_elapsed_s=None, max_delay_s=30.0)`
+  restores the old behavior); MCP calls time out after 300 seconds; Docker
+  coding `cancel_timeout_s` is 30 seconds; Docker and sandbox transfer limits
+  are 100,000 files, 256 MiB per file, 4 GiB in total and an 8 GiB archive;
+  the `SyncBinding` staging domain allows 16 transfers and 4 GiB; Lambda
+  MicroVM requests time out after 120 seconds and sandboxes have 180 seconds to
+  become ready, and suspend and terminate wait `lifecycle_timeout_s` (120
+  seconds); egress brokers and the Docker egress proxy allow 64 concurrent
+  operations (maximum 512, was 64) and an upstream operation may take 3,600
+  seconds (was 600); `GitChangesTool` waits 120 seconds for git (was 30); and
+  `BrokeredSandboxCodingEnvironmentFactory` without `transfer_limits` allows
+  each file up to the sandbox's staged-copy `max_bytes` less 64 KiB. The
+  `RetryPolicy` budget also applies to automatic compaction.
+- A foreground subagent's child round is no longer guaranteed admission by its
+  parent's lease; it is refused when the shared terminal pool can't fit it.
+- A `SyncBinding` whose copy-back tree is too large for its completion record
+  (about 20,000 files) is refused when it binds instead of when the session
+  completes.
 - A brokered command without a timeout asks for the sandbox's remaining
-  lifetime less 60 seconds, by the Agent's clock, instead of all of it. When
-  the broker still refuses a timeout past the remaining lifetime it names, the
-  command is retried once with the broker's number. This fixes sessions failing
-  at setup with `422 sandbox_invalid`.
-- `BrokeredSandboxCodingEnvironmentFactory` without explicit `transfer_limits`
-  allows each file up to the sandbox's staged-copy `max_bytes` less 64 KiB
-  when the sandbox offers staged copies (was one 8 MiB archive less 64 KiB).
-- `CayuApp.task_store` and `CayuApp.knowledge_store` are now read-only
-  properties. Reading them works as before; assigning to them raises
-  `AttributeError`. Replacing a store after construction never reached the
-  components the app had already composed with it.
+  lifetime less 60 seconds, and retries once with the broker's limit when
+  refused.
+- Setting a `LambdaMicroVMEgressAdapter` option both as an argument and in
+  `runner_options` raises `ValueError`.
+- A tool without `ToolSpec.max_terminal_payload_bytes` reserves 1,984 KiB of a
+  shared 512 MiB terminal pool per call instead of taking the whole pool.
+  Registering such an application tool logs a warning and `cayu check` reports
+  `TOOL_TERMINAL_PAYLOAD_UNBOUNDED`, so `cayu check --fail-on warning` fails on
+  tools generated by 0.14.x until they declare a bound.
+- `run_task_worker(execution_timeout_s=...)` now includes the grace period:
+  with 600 and 30, new runs are refused from 570 seconds, runs without their
+  own deadline end at 570, and the handler is cancelled at 600 (was 630). An
+  `execution_grace_s` not smaller than the limit raises `ValueError`.
+- With a session store that has no public authority alias keyring, an agent
+  with a workspace-mutating tool and an environment that resolves secrets
+  dynamically is refused at registration or before the first model call,
+  instead of failing on the tool's first call.
+- `GET /api/sessions` and `POST /api/sessions/summary` with `q` or an overview
+  filter return `total_count: null`, refuse `offset` and may return an empty
+  page with a `next_cursor`.
+- Run, resume and fork request `metadata` refuse the `cayu:title`,
+  `cayu:summary` and `cayu:summary_tone` keys; use `title=` and
+  `SessionStore.set_summary`.
+- A validated structured answer adds a `structured_output` part to its
+  transcript message.
+- With `ControlPlaneRoles` on a custom auth dependency, roles without full
+  access can no longer change arguments or approval revisions when deciding.
+- A `read_file` `image_region` of one pixel or less reads the whole image.
+- A closed runner whose sandbox is gone is refused with
+  `reason_code="runner_lost"` (was `runner_closed` or `runner_poisoned`).
+- `CayuApp.task_store` and `CayuApp.knowledge_store` are read-only
+  properties; assigning to them raises `AttributeError`.
+- Custom stores: `EvalStore.save_authored_suite` takes
+  `parent_suite_revision=`, and `TaskStore` gains `create_task_operation` and
+  `task_replay_sources_for_session` for declared tasks.
 
 ### Changes
 
-- `SandboxBrokerClient.capacity()` reads Cayu Cloud's
-  `GET /v1/applications/{agent}/sandboxes/capacity`: how many sandboxes the
-  Agent can get now under its own, its Organization's and the install's limit,
-  as a frozen `SandboxCapacity` (`available`, `limited_by`, `agent`,
-  `organization`, `install`, `queue`). A hosting Agent passes `organization=`
-  for an Organization it works for; anyone else is refused with
-  `on_behalf_of_not_allowed`, which the client now recognizes as a contract
-  code. A malformed answer raises `SandboxBrokerError`. The factory's `broker`
-  and `BrokeredSandboxRunner.broker` reach it; nothing calls it for you.
-- `CayuApp.unregister_environment(name)` removes a registered environment, for
-  example one a long-lived worker registered for a single job. It raises
-  `cayu.exceptions.EnvironmentInUse` and changes nothing while the environment
-  is the application's or an agent's default, while this process still owns
-  setup or cleanup for a session in it, while a stored session in it is not
-  completed or failed, or while a completed or failed one still owes it cleanup.
-  A later resume or fork of a finished session in that environment fails before
-  any work, as in a process that never registered it. See
-  [Per-job environments](environment-factories.md#per-job-environments).
-- An `EnvironmentFactory` can declare `rebuild_record`, a kind and a small
-  secret-free payload such as a clone source and revision. Cayu records it in
-  the session's `environment.factory.completed` event. A process that registers
-  `CayuApp.register_environment_rebuilder(kind, rebuilder)` recreates the
-  factory under the session's environment name when it forks, resumes or
-  recovers a session whose environment it does not register, so a serving
-  process can fork sessions that ran in a worker's per-job environments. A
-  session never runs in a registration built from a different record: when a
-  reused name is registered from another record, the fork, resume or recovery
-  raises `EnvironmentRebuildMismatch` before any work. The types live in
-  `cayu.environments.rebuild`.
-- Concurrent recoveries of sessions from different jobs that share an
-  unregistered per-job environment name no longer recover the later session
-  through the first job's rebuilt factory. When another recovery registers the
-  name from a different record while one waits on its rebuild, the waiting
-  recovery now compares records and rebuilds its own environment in its own
-  scope (or falls back to the call-refusing stand-in), so the first job's
-  factory never receives the other session's allocation.
-- `ForkControllerEnrollment` reports `agent_availability`, whether this process
-  can fork each enrolled agent's sessions and why not (a hosted tool outside
-  the allowance, or a default environment that is not registered here and
-  cannot be rebuilt), and `rebuildable_environment_kinds`, so a controller
-  learns this up front instead of from a failed fork.
-- Docker coding containers no longer outlive a process that exits without
-  `await app.aclose()` when Cayu had already decided to release them, or when
-  nothing could ever reconnect to them. At normal interpreter exit, a container
-  whose removal started but never settled (the close deadline passed, or the
-  event loop stopped mid-removal) is removed with one bounded `docker rm -f`,
-  and an app whose session store does not outlive the process (the in-memory
-  store or SQLite `:memory:`) also removes the containers its sessions still
-  hold, such as after a failed release. Containers of durable stores whose
-  sessions can still be resumed or recovered are left for
-  `recover_incomplete_sessions`, as before. Containers created for a
-  process-local store now carry an `io.cayu.process-local-owner` label, and
-  `cayu.environments.reap_orphaned_docker_coding_containers()` removes those
-  whose owner process has provably exited (for example one killed by a signal).
-  The label names the kernel boot, PID namespace, PID and process start time,
-  and anything the reaper cannot prove, such as an owner in another PID
-  namespace sharing the daemon, keeps the container; it never touches
-  containers of durable stores. Wrapped `LaunchedRunner` and deferred runners
-  take part in the exit cleanup too. Factories can read the same owner token
-  from `EnvironmentFactoryRequest.process_local_owner` and check it with
-  `cayu.environments.process_local_owner_exited()`.
-- Runtime now matches the limits Cayu Cloud raised. A brokered sandbox command
-  may add up to 1,000 environment variables and 256 KiB of environment in all
-  (was 50 and 64 KiB), counted like the broker as the UTF-8 bytes of each
-  `NAME=value`; one `NAME=value` over 131,071 bytes is refused before it is
-  sent, as Cloud refuses it. `cayu cloud` accepts up to 100 `[[schedules]]` per
-  Agent (was 20).
-- When a sandbox disappears mid-session, the admission refusal that ends the
-  session now says so. A closed or poisoned runner whose execution resource is
-  gone is refused with `reason_code="runner_lost"` instead of `runner_closed` or
-  `runner_poisoned`, plus a classified `cause_code` and a reference to the event
-  after which the runner was closed (`cause_event_seq`, `cause_event_id`), in
-  both `execution_admission.refusals` and the message, for example
-  "admission evidence (runner_lost: container_missing, closed after event seq
-  4171) [missing_final_evidence]". After a command fails, `DockerRunner` runs one
-  bounded `docker container inspect` before cleanup and records
-  `container_missing`, `container_not_running` or `docker_daemon_unavailable`;
-  a sandbox removed by command cleanup is `container_removed`, and a brokered
-  sandbox whose lease lapsed is `lease_lost`. Docker's error text is still kept
-  out of events. Custom runners can report a reason with `Runner._record_loss`,
-  and anyone can read it from `Runner.loss_reason`.
-- `cayu-cloud.toml` can declare the command that migrates an Agent's own tables,
-  `[database] migrate = "alembic upgrade head"`, so Cayu Cloud can run it on deploy.
-  `cayu cloud deploy` sends it only when declared, and names a Cayu Cloud that
-  doesn't run application migrations (`database_migration_unsupported`) instead of
-  deploying without them. `cayu cloud init` writes it for projects generated with
-  `--with app-database`. See [Application database
-  migration](cayu-cloud.md#application-database-migration).
-- An exception raised by a tool now explains itself. `failure_evidence` on
-  `tool.effect.outcome_unknown` and `tool.call.failed` keeps an optional
-  `exception_message`: the message with its cause chain or group leaves, masked
-  with the call's final secret set like the tool result transcript, and bounded
-  to 2,048 bytes. The `session.interrupted` event after an unknown outcome names
-  the call with `tool_name` and `tool_call_id`, and the process that ran the
-  tool logs the masked traceback at error level on the
-  `cayu.runtime._tool_execution` logger. When the call's secret scope can't be
-  finalized safely, neither the message nor the traceback is kept or logged.
-  Older events without the field still validate.
-- A tool call uses about 15% less runtime CPU with the SQLite store and about
-  20% less with the in-memory store. Copying a validated event no longer
-  copies its validation stamp or validates a changed payload twice, event
-  projection looks up policy paths by hash, the Cayu package version is read
-  once per process, `read_file` and context estimates classify ASCII text in C,
-  and the SQLite checkpoint cache and checkpoint writes skip redundant copies.
-  Validation, durable formats and recovery are unchanged.
-- `register_agent(..., environment_name=...)` sets the environment a new run of
-  that agent uses when its request names none. Pass a registered environment
-  name, or the new `cayu.environments.NO_ENVIRONMENT` to run the agent without
-  any environment even when the application has a default. A request's own
-  `environment_name` still wins, stored sessions keep the environment they
-  started with, and a subagent child of a parent that ran without an
-  environment now runs without one instead of getting the application default.
-  `cayu inspect --json` shows an agent's own default, and `cayu check` reports
-  `AGENT_ENVIRONMENT_NOT_FOUND` for a name that is not registered.
-  `cayu execution-profile candidates` now resolves each agent with its own
-  default.
-- `cayu generate slice` registers the new agent with
-  `environment_name=NO_ENVIRONMENT`, because its generated tool needs no
-  workspace. In a coding project the slice no longer gets the Docker coding
-  sandbox and a copy of the project. Pass `--environment default` to keep the
-  application default, or `--environment NAME` to use a registered
-  environment.
-- `BrokeredSandboxCodingEnvironmentFactory(egress="allowlist", egress_hosts=[...])`
-  asks Cayu Cloud for a sandbox that reaches only the listed HTTPS hosts
-  through Cloud's logging proxy, with no credential added
-  (`CAYU_CLOUD_SANDBOX_EGRESS=allowlist` with `CAYU_CLOUD_SANDBOX_EGRESS_HOSTS`
-  for `from_env`). The hosts are checked as Cloud does: 1 to 50 DNS names,
-  exact or `*.name`, no addresses. `SandboxBrokerClient.create` takes
-  `egress_hosts`, and `SandboxRecord.egress.hosts` reports them. Admission
-  reads guarantees version 2: `deny_by_default_network` is backed by the
-  record's `egress_deny_by_default` item, so `ExecutionRequirements.untrusted()`
-  is admitted on an allowlist sandbox as on a `none` one. Version 1 records
-  keep today's rule (`none` only), `public_web` never backs it, and no brokered
-  sandbox backs `brokered_egress`. Toolchain profiles still require
-  `egress="none"`. Cayu Cloud offers `allowlist` once an install turns it on;
-  until then the create is refused with `egress_mode_unsupported`.
-- `cayu.runners.LaunchedRunner` sends every command of a runner through your
-  own launcher, such as `sudo -u sandbox` or bubblewrap: pass an argv prefix or
-  a function from `ExecCommand` to `ExecCommand`. It wraps any runner, and
-  covers `exec`, `exec_redacted`, `exec_stream`, interactive processes,
-  `preflight_exec` and the executable probes of admission, so overriding the
-  private `LocalRunner._exec` is no longer needed. Admission keeps the wrapped
-  runner's negative claims, reports each positive claim as `unverified`
-  (reason `launcher_unverified`) unless you pass it in `preserve_claims`, and
-  accepts your own declarations in `claims`. A command's `env` is applied
-  inside the launcher, never to the launcher's own process, so a command
-  can't swap the launcher through `PATH` or `LD_PRELOAD`. `exec_system` stays
-  on the wrapped runner, unlaunched. See
-  [Send commands through your own launcher](build-a-runner.md#send-commands-through-your-own-launcher).
-- `cayu new NAME --with app-database` gives an application its own tables, for
-  every preset: SQLAlchemy 2 models in the `app` PostgreSQL schema beside Cayu's
-  `cayu_*` tables, and an Alembic setup that migrates only that schema (so it can't
-  alter or drop Cayu's tables), keeps its version table there, prefers
-  `CAYU_DATABASE_DIRECT_URL`, and never changes `search_path`. The application
-  connects on first use and never migrates itself. The generated project depends on
-  `sqlalchemy` and `alembic`; Cayu's own runtime dependencies don't change. See
-  `cayu guide applications#application-tables`.
-- Workflow code can ask a person to approve an exact tool call without a model
-  turn: `await app.propose_tool_call(agent_name, tool_name, arguments, ...)`.
-  The call goes through the agent's tool policy and guards like a model-raised
-  call and pauses as an ordinary approval, so the Pending page,
-  `resolve_tool_approval`, task attachment and restart recovery all work
-  unchanged; approval runs the tool and a denial is recorded. No provider is
-  needed and the two control steps are priced at zero. It returns a
-  `ToolCallProposalOutcome`; `ToolCallProposalOutcome.from_events(...)` reads
-  the state later, and `cayu.approvals.tool_call_proposal_request(...)` builds
-  the `RunRequest` to run yourself. The provider name `cayu-tool-proposal` is
-  now reserved.
-- `app.register_event_watcher(watcher)` declares an event watcher, and servers
-  from `create_server` and `mount_control_plane`, including `cayu serve`, run
-  registered watchers while they serve.
-  `cayu.observability.serve_event_watchers(app, stop)` runs them from a worker.
-  `cayu guide long-running` shows a watcher that reacts to approved and denied
-  calls, and the scaffold's `operations/watchers.py` has the same example
-  commented out, with a `SQLiteEventWatcherStore` in the project's SQLite
-  database so a restart does not redeliver old events.
-- A retry budget now bounds an event that the application retries by creating
-  new tasks. Pass the same `TaskCreate(retry_key=...)`, such as the event's ID,
-  for every task of that event. Tasks with one key share a budget of 3 tasks
-  created within 30 minutes of the first; set `retry_budget=TaskRetryBudget(...)`
-  to change it, or `TaskRetryBudget.unlimited()` to only count. Past the budget
-  the store creates no task, `create_task` raises `TaskRetryBudgetExhausted`, and
-  the key's state stays `given_up`. Read it with
-  `TaskStore.load_task_retry_key(key)` or `cayu inspect --retry-key KEY`. Tasks
-  without a key are unchanged. The memory, SQLite and PostgreSQL task stores
-  support it; a custom store without it refuses keyed tasks through
-  `CayuApp.create_task`.
-- The task worker now logs a warning when a handler passes its time limit, and
-  another when it records the task's timeout failure. Both name the task and
-  session IDs (redacted) and the limit and grace settings; the second also says
-  whether the handler was cancelled.
-- `read_file` ignores `image_region` and `pages` on a single text read instead
-  of failing, as batched reads already did, and says so with `ignored_arguments`
-  and a note. A malformed region is only rejected on an image or PDF read.
-- Hardened Docker egress works on Docker Engine 27. The adapter no longer
-  refuses a network because `docker network inspect` lists an IPAM gateway,
-  which Docker 27 does even when it keeps the host off the bridge; the probe
-  decides. The probe also targets a listed gateway and fails with
-  `host_address_present` when a target has a completed ARP entry in the guest's
-  network namespace. Supported engines are Docker Engine 27.5 or later, on Linux
-  or in Docker Desktop.
-- The hardened Docker egress probe now raises `egress_host_reachable` only when
-  it finds a way to the host. A probe that ends without a verdict (no output,
-  unexpected output, a timeout, or a check it could not decide) raises
-  `egress_host_isolation_unverified` with the reason, the exit code and the last
-  stderr lines, masked like Docker setup diagnostics. A probe that prints
-  nothing runs once more in a new container before the runner is refused.
-- Fix: `VirtualEgressEnvironmentFactory` wrote the session CA file with the
-  host process's umask. Under `umask 077` only the host user could read it, so
-  a guest running as another UID failed TLS verification on every connection
-  through the broker. The file is now always written with mode 0644. The
-  certificate is public; the CA's private key stays in the host process.
-- `help()` on `DockerRunner`, `DockerEgressAdapter`,
-  `VirtualEgressEnvironmentFactory`, the Claude and Codex agent adapters,
-  `run_external_agent`, `local_agent_launch`, `CayuApp.delete_session` and
-  `LocalWorkspaceEnvironmentFactory` now names the guide to read:
-  `untrusted-code`, `external-agents` or `anatomy`. The Cayu Map's sandbox row
-  now points at `cayu guide untrusted-code`.
-- `cayu new` warns when PyPI has a newer final Cayu release than the installed
-  one, printing both versions and the `uvx --from 'cayu==X.Y.Z' cayu new ...`
-  command with the same arguments. In a terminal it asks
-  `Continue with <installed> anyway? [y/N]` and stops by default; without one it
-  warns on stderr and continues, and `--json` output adds `newer_release`. The
-  check gives up after about two seconds, is cached for a day in the user's cache
-  directory, and is silent on failure. Pre-releases and dev builds never count as
-  newer, and a source checkout skips the check.
-- `cayu[claude-agent-sdk]` accepts `claude-agent-sdk>=0.2.168,<0.3` again;
-  0.14.0 pinned exactly 0.2.170. Package CI installs the built wheel with the
-  extra, which resolves to the newest SDK in the range, and runs the adapter
-  against it, so a breaking SDK release fails CI. `cayu[codex]` still pins
-  `openai-codex==0.163.0`, because the Codex adapter's bounded transport depends
-  on that SDK's internals.
-- `ExternalCleanupIncomplete` is exported from `cayu.external_agents`, so code can
-  catch it without importing a private module.
-- Registering an application tool that declares no
-  `ToolSpec.max_terminal_payload_bytes` logs a warning, once per tool name, and
-  `cayu check` reports `TOOL_TERMINAL_PAYLOAD_UNBOUNDED` for it. Each round that
-  calls such a tool takes all terminal publication capacity in the process, so
-  those rounds run one at a time and every other session's tool rounds wait for
-  them. Application-owned process-isolated tools are reported too. Built-in
-  tools and MCP tools are not reported. Tools from `cayu generate` and the
-  long-running scaffold now declare 64 KiB. Generated echo tools accept at most
-  8,192 input characters so their escaped output stays within that bound. The
-  payment scaffold rejects invoice IDs over 256 characters before paying.
-- A tool round that waits for terminal publication capacity now says why:
-  `ToolRoundAdmissionTimeoutError` names the waiting round's own application
-  tools without bounds and the fix. Holders' session IDs and active tool names
-  may belong to another tenant, so they appear only in the process log: the
-  60-second warning and a warning logged when the round fails.
-  An undeclared tool still takes the exclusive lease, because it may await child
-  rounds that only that lease always admits; see
-  [Tool terminal publication capacity](runtime-contracts.md#tool-terminal-publication-capacity).
-- New read-only tools `ListSessionsTool` (`list_sessions`) and `ReadSessionTool`
-  (`read_session`) let a model page through earlier sessions and read bounded,
-  secret-redacted transcript windows. Each requires a `SessionReadAccess` policy
-  evaluated per call: `OwnTreeSessionAccess` for the caller's root session tree,
-  `MatchingSessionAccess` for agent names and labels with label exclusions, or
-  your own. A session outside the policy reads like a missing one. The tools
-  refuse to run without a resource-access scope unless constructed with
-  `unscoped=True` for a single-tenant store, and always apply the run's scope.
-  Applications register the tools explicitly; no preset adds them. Session ids
-  in their results are opaque aliases scoped to the calling session, and the
-  tools need a store with a public authority alias keyring. A parent id appears
-  only when the parent is itself readable. `SessionQuery` gains
-  `root_session_id` (indexed) and `agent_names` filters on every built-in store,
-  and `SessionStore.load_bounded_transcript_window` reads transcript windows
-  within per-message and total byte bounds using each message's stored size,
-  without loading oversized messages. See
-  [session inspection](session-inspection.md#let-agents-read-earlier-sessions).
-- Generated projects read `OPENAI_BASE_URL` for the `openai` provider and pass
-  it to `OpenAIProvider(base_url=...)`, as the OpenAI SDK does; 0.14.0 projects
-  ignored it and sent every request to `https://api.openai.com`. Plain `http://`
-  is accepted only for localhost. `OpenAIProvider` itself still doesn't read the
-  variable.
-- The generated `.gitignore` excludes `.env` and `.env.*` (but not
-  `.env.example`), so `git add .` no longer commits credentials kept there. The
-  generated README says that the project reads provider variables from the
-  process environment and doesn't load `.env` itself, and shows
-  `uv run --env-file .env ...` for loading one.
-- The generated coding-preset `app.py` no longer imports six names it doesn't
-  use, so a fresh coding project passes `ruff check`.
-- On the coding preset, the generated `AGENTS.md` now points "approval before
-  the agent acts" at `cayu generate slice NAME --tool TOOL --effect external`.
-  It named `cayu generate tool ... --effect external`, which that preset
-  refuses. A dashed slice or tool name, such as `issue-filer`, is still refused,
-  but the error now names the snake_case form to use.
-- `cayu session events --type` accepts comma-separated types, such as
-  `--type tool.call.failed,tool.call.blocked`, as well as repeated `--type`
-  options. An unknown type is refused as unknown before the store is opened;
-  0.14.0 read the comma-joined value as one type and failed with an error about
-  the `custom.` namespace. `--help` now describes `--type` and
-  `--include-payload`, and `cayu session tools --help` shows how to read why
-  calls failed or were blocked.
-- When a run started by a generated project's `run.py` fails because a model
-  call ran out of retries, it now prints the number of attempts and the total
-  backoff, and names `RetryPolicy` and where to set it. The default policy is
-  unchanged (5 attempts, 7.5 to 9.5 seconds of backoff). The new
-  `cayu guide providers#provider-retries` section explains what is retried and
-  how to widen the policy for every run (`CayuConfig(run=RunDefaults(...))`) or
-  one run (`RunRequest(retry_policy=...)`); `cayu guide long-running`,
-  `cayu guide references#background-work` and the generated
-  `policies/retries.py` point to it.
-- A `run_command` result that did not succeed now says why in its first line,
-  which is all most providers send the model. A read-only selector whose passing
-  test wrote a file used to read only "Command selector 'target-test' failed."
-  over a passing pytest summary; it now gives the exit code, says the selector is
-  read-only, and names up to five changed workspace paths. The structured result
-  still keeps only path counts and identities.
-- A denial from a built-in argument rule (`RequiredFieldRule`, `AllowlistRule`,
-  `RequiredAllowlistRule`, `DenyPatternRule`) no longer reaches the model as a
-  bare "Tool call denied by policy." when the tool's arguments are unpublished
-  or its secret scope is dynamic, as for `run_command` with a `base_policy`
-  selector allowlist. The model is told which declared argument failed and why,
-  for example "argument 'selector' is not one of the values this policy allows",
-  in runtime-owned text. Rejected values and allowlists are never published, and
-  the parameter must be declared in the tool's input schema. These rules'
-  denial metadata now includes a `violation` category.
-- `DockerCodingEnvironmentFactory(cancel_timeout_s=...)` sets how long a command
-  cleanup or container removal waits for Docker, for every runner the factory
-  creates, reconnects or disposes. It was fixed at five seconds, so on a heavily
-  loaded host a completed session could fail at its final container close with
-  "Runner finalization has not settled within its deadline." The default is
-  unchanged, and the value stays out of the factory's configuration fingerprint,
-  so raising it does not strand sessions waiting to retry cleanup.
-  `DockerRunner.reconnect_strict()` accepts the same parameter.
-- `cayu check` accepts `Decimal(<string or int literal>)` at import time, as a
-  module constant, dataclass default or Pydantic model default, and accepts
-  `Decimal` and `ZoneInfo` model annotations. `Decimal` values were reported as
-  `SCAFFOLD_IMPORT_SIDE_EFFECT`, which also stopped every check that needs the
-  loaded application. `ZoneInfo(...)` construction at import stays unsupported,
-  because a zone missing from the system database is loaded from the `tzdata`
-  package; build zones lazily. The applications guide now lists these forms,
-  `timedelta(...)` and `Path(...)`, and says that every module in the
-  application packages is checked, including ones the factory does not import at
-  module level.
-- `cayu guide verified-work` no longer says provider verifiers are rejected.
-  Provider-backed completion verifiers have shipped since 0.10.0; the guide now
-  shows how to register a `ProviderCompletionVerifier`, what the provider, task
-  store and identity must support, and how its budget works.
-- `cayu guide references#knowledge` now shows how application code writes an
-  entry, reads it back, lists entries by labels and kinds with
-  `list_entries(KnowledgeListQuery(...))`, and searches, and explains bound and
-  per-call access scopes. A store call without a scope now says to pass
-  `access_scope=` or construct the store with one, and a `KnowledgeQuery` with
-  only filters points to `list_entries(KnowledgeListQuery(...))` and the
-  `list_knowledge` tool.
-- One coding toolchain now runs on Docker locally and in a sandbox brokered by
-  Cayu Cloud. `CodingToolchainProfile` is the backend-neutral part of
-  `DockerCodingToolchainProfile`, which now extends it; a Docker profile's
-  fields, dump and fingerprint are unchanged. `RunCommandTool`,
-  `StructuredCommandToolPolicy` and `RunCheckTool` accept either profile type
-  (exactly those two classes). `DockerCodingEnvironmentFactory` takes a neutral
-  profile with `image_identity`, and `BrokeredSandboxCodingEnvironmentFactory`
-  takes one with `toolchain_profile=` (requires `egress="none"`). Until Cayu
-  Cloud builds an Agent's own coding image, a catalog image without the
-  project's dependencies fails admission with `toolchain_image_unverified`.
-- `select_coding_backend` picks the `docker` or `cayu-cloud` coding backend:
-  the one `CAYU_CODING_BACKEND` (or `required=`) names, otherwise Cayu Cloud when
-  all three `CAYU_CLOUD_*` sandbox variables are set and Docker otherwise.
-  Other backends register on a `CodingBackendRegistry`. `register_coding_environment`
-  registers one workspace's environment, once per clone if needed, and
-  `named_checks_from_toolchain` and `ExactNamedCheckCommandPolicy` build
-  `RunCheckTool`'s checks and policy from a profile.
-- New `cayu new --preset coding` projects use those parts: the generated
-  composition selects its backend, so the same project deploys to Cayu Cloud
-  without code changes; `register_workspace_environment` registers another clone
-  in a few lines; `docker-coding-build.json` v2 lists extra build inputs and
-  probe executables instead of two hard-coded lists; the project's top-level
-  `data/` (runtime files) stays out of the sandbox copy, while nested
-  directories such as `tests/data/` are copied as usual; and generated tests
-  close the app. Existing
-  generated projects keep their shape.
-- The coding image's Dockerfile and `resolve_pins` now add the
-  `debian-security` and `-updates` snapshot lines, so `Dockerfile.coding`
-  builds again when the base image carries security updates.
-- A Docker coding toolchain failure now publishes a stable `code` with
-  `path_count` and `paths_fingerprint` in its failure event, and profile
-  validation errors name the selector or probe. A git-ignored source path that
-  publication would omit is now caught when the sandbox is bound, before the
-  first model call, as well as at finalization.
-- `cayu new` reports `TARGET_NOT_EMPTY` for a non-empty target it can't take
-  over on a real run too, not only with `--dry-run`.
-- `BrokeredSandboxCodingEnvironmentFactory(workspace_setup_commands=...)` runs
-  commands in `/workspace` after copy-in, for example to install locked
-  dependencies; `setup_commands` still run before copy-in. The sandbox record's
-  optional `image_identity` names what a broker-built image was built from.
-- `DockerCodingBackendOptions(cancel_timeout_s=...)` passes the cleanup
-  deadline to every factory the Docker backend builds.
-- A session whose binding finalization fails only after its workspace output
-  was copied back, for example on a slow container close, now reports
-  `workspace_output_committed: true` on `session.failed` and on the task error,
-  and `binding_finalize_error` carries the same flag. The session still ends
-  `failed`.
-- `ToolExecutionConfig(tool_round_admission_timeout_seconds=...)` sets how long a
-  tool round waits for terminal publication capacity (600 seconds by default;
-  `None` waits). `ToolSpec.max_terminal_payload_bytes` accepts any positive
-  value; below 64 KiB the runtime reserves and enforces 64 KiB.
-- Built-in tool maximums: `exec_command` output per stream follows the tool's
-  terminal bound (1 MiB by default, was 200,000; the 50 KB default stays); the
-  command timeout ceiling is 12 hours (was 1 hour), with the default still 1
-  hour, raised through `ExecCommandTool(max_timeout_seconds=...)` or
-  `ProcessCommandPolicy(max_timeout_s=...)`; `write_file` and `edit_file`
-  `max_bytes` up to 64 MiB (was 4 MiB); `ApplyPatchTool` up to 64 MiB per file
-  and 128 MiB per patch; `RunCheckTool` model output up to the terminal bound
-  (was 50,000); `SharedArtifactPolicy.max_bytes` up to 1 GiB (was 64 MiB).
-  Defaults are unchanged.
-- The provider stream capacity error names the limit and
-  `ProviderStreamDeadlines(max_concurrent_streams=...)`, whose default is now
-  1,000 (was 100). A stream over the limit still fails at once.
-- `SyncBinding` reserves staging capacity for the file sizes it measures
-  (`LocalWorkspace` and `RunnerWorkspace` measure) instead of its declared
-  limits, so raising the limits no longer fails a small tree with "transfer peak
-  exceeds staged byte capacity". With `source_conflict_policy="require_revision"`
-  the source revision checks also reserve the largest measured file instead of
-  `max_file_bytes`, so a brokered sandbox whose staged copies allow 8 GiB (and
-  so a 4 GiB file limit) still finalizes a small workspace. The limits remain
-  ceilings, and a file that grows after it was measured fails the transfer.
-- `run_command` and `run_check` capture the workspace manifest within the new
-  `RunnerWorkspace(manifest_limits=WorkspaceManifestLimits(...))`, which the
-  Docker and sandbox coding factories set from their transfer limits, instead
-  of a fixed 10,000 paths, 8 MiB per file and 64 MiB. The path count is capped
-  at 40,000 by the command journal. `DockerCodingEnvironmentFactory` also takes
-  `staging_capacity=`, and its `warm_spares` is no longer capped at 8.
-- Brokered sandboxes take `staged_copies="auto" | "never" | "always"`. `auto`,
-  the default, chooses as before and now falls back to split archives when a
-  staged copy-in fails while the sandbox is still usable.
-- Setup commands take `setup_command_timeout_s=` on
-  `VirtualEgressEnvironmentFactory`, `SandboxCodingEnvironmentFactory` and
-  `BrokeredSandboxCodingEnvironmentFactory` (300 seconds by default, 600 on
-  brokered sandboxes, as before), and a failed or timed-out setup command's
-  error ends with a masked tail of its stderr and stdout.
-- Egress factories take `max_active_upstream_operations=`,
-  `upstream_total_timeout_s=` and `upstream_max_response_bytes=` (256 MiB by
-  default, because responses are held in memory to scrub credentials), and
-  `DockerEgressAdapter` takes `proxy_max_connections=`.
-- `cayu serve` now logs one warning at startup when a SQLite or PostgreSQL
-  session store holds at least 1 GiB or a terminal session older than 30 days
-  and no session retention apply is recorded in the last 7 days. Retention
-  stays off by default; the warning names `cayu storage prune` and
-  `run_storage_retention_worker`. The parts are public:
-  `SessionStore.inspect_storage_growth()` returns a read-only
-  `StorageGrowthReport`, `storage_growth_warning(report, ...)` applies the
-  thresholds, and `report_storage_growth(session_store)` in `cayu.runtime` logs
-  the hint from any entry point. The guides that set up a persistent session
-  store now point at retention and its worker.
-- Session compaction can now bound the transcript copy of large tool results.
-  `SessionRetentionPolicy(compaction_level=SessionCompactionLevel.TRANSCRIPT)`
-  (`cayu storage prune --compaction-level transcript`) also replaces each
-  transcript tool-result body of at least `compact_tool_output_min_bytes` with
-  the marker the event copy already gets (size and SHA-256), keeping the tool
-  name, call id, structured result and artifacts. The default level, `events`,
-  leaves the transcript as before. A continued session's model sees the
-  marker. `docs/storage-retention.md` now lists what `cayu_session_operations`
-  holds and why compaction keeps it.
-- Fixed: compacting a session's tool events made its tool-round
-  runtime-publication receipts fail verification ("referenced event content
-  conflicts with its receipt"), so recovery, the inbox and output readers could
-  no longer load them. Compaction now verifies each affected receipt first and
-  stores an attestation with the compacted digests in the same transaction;
-  receipt loads accept the compacted material only through that attestation.
-  It also no longer deletes delta events that a receipt binds. Sessions
-  compacted by 0.14.0 or earlier keep failing for those receipts.
-- `cayu storage migrate` on SQLite now reports the retained backup's path and
-  size (`backup` in JSON, a `backup:` line in text). `--backup-dir DIR` writes
-  the backup into another directory, and `--keep-backups N` deletes all but
-  the newest `N` automatically named backups of that database after a
-  successful migration. Backups in a backup directory carry a digest of the
-  database path, so same-named databases sharing one directory never delete
-  each other's backups, and backups at an explicit `--backup` path are never
-  deleted.
-- `cayu storage prune --apply --vacuum` runs SQLite `VACUUM` after the apply
-  and reports the file size before and after; it first checks that the
-  temporary directory and the database's directory have room for the
-  temporary copy and the rewrite. On PostgreSQL the flag is rejected: autovacuum reuses the freed
-  space, and `docs/storage-retention.md` describes `VACUUM (FULL)` and
-  `pg_repack` for returning it to the operating system.
-- `cayu new --without CAPABILITY` now leaves out the files only that capability
-  uses (its package, capability card and tests) instead of keeping its home;
-  `--explain` lists them. Turning off all nine `agent` defaults now gives 41
-  files instead of 65. The dry-run lists the capabilities and groups the files
-  by the `--without` flag that removes them, and `--json` adds the same groups
-  as `plan.file_groups`. `cayu check` no longer requires the removed files.
-  Presets still keep the homes of capabilities they don't turn on by default.
-  With `--without tasks`, the generated `tests/test_agent.py` no longer fails
-  ruff with an unused import.
-- New `cayu generate preset PRESET` converts an existing `cayu new` project to
-  another preset or capability set, for example `cayu generate preset coding
-  --execution docker` for an agent project that needs to edit files and run
-  tests. It renders the declared and requested plans with the same templates as
-  `cayu new`, creates and replaces files that still match what was generated,
-  removes generated files the new plan drops, and leaves files you added alone.
-  A file you changed is reported as a conflict and nothing is written.
-  `--dry-run` shows the plan; `--execution` and `--provider` default to the
-  declared values, and `--with`, `--without` and `--agent-name` work as in
-  `cayu new`. The plan notes when the local database path changes. Generated
-  `AGENTS.md` and `README.md` point to it.
-- `docker-coding-build.json` (schema version 2) takes `extra_uv_projects`, for
-  example `[{"path": "targets/my-service", "extras": ["dev"]}]`, for a target
-  project the coding agent works on. Its `pyproject.toml` and `uv.lock` become
-  build inputs recorded in the image receipt and `trusted_build_context_sha256`,
-  and a fixed `Dockerfile.coding` step installs its locked dependencies in
-  `/opt/targets/<name>/.venv`, so the Dockerfile stays unmodified (Cayu Cloud
-  builds only the unmodified file). A build file without the key declares
-  none. The generated README shows a `target-test` selector that runs the
-  target's tests from that environment.
-- The generated `Dockerfile.coding` installs dependencies (the project's
-  `uv sync`, the optional reviewed wheel and each `extra_uv_projects` sync) as
-  a temporary unprivileged build user instead of root, matching Cayu Cloud's
-  image builds. Root installs only the system packages and `uv`, then takes
-  ownership of the environments, clears setuid and setgid bits, deletes the
-  build user, and fails the build if any file it owned remains.
-  `docs/docker-coding-toolchains.md` lists the exact steps.
-- The nightly workflow now builds a freshly scaffolded `Dockerfile.coding` with
-  a wheel of the commit on an amd64 runner and runs
-  `tests/cli/test_scaffold_docker_live.py`, so a coding image that stops
-  building is caught within a day instead of at release. It is the
-  `docker-live-generated-coding-image` check in
-  `scripts/nightly_verification.py`.
+- Dashboard: a new shell with session search and themes; Home, Inbox,
+  Sessions, Session (Conversation and Trace), Tasks, Specialists, Tools,
+  Knowledge and Evals pages. Members can read them; actions need full access.
+- Sessions: titles (`RunRequest(title=)`), summaries, overview lists and
+  counts, follow-up turns that reuse the session's settings, `GET
+  /api/sessions/{id}/trace`, and the `ListSessionsTool` and `ReadSessionTool`
+  tools.
+- Tasks: declared task types with idempotent create and replay
+  (`register_task_type`, `create_task_operation`), an exact task index with
+  counts, cancel and dependents, and retry budgets
+  (`TaskCreate(retry_key=, retry_budget=)`, `TaskRetryBudgetExhausted`).
+- Approvals and watchers: `app.propose_tool_call(...)` asks a person to approve
+  an exact tool call without a model turn, and `app.register_event_watcher`
+  runs watchers in servers and workers.
+- Tools: optional `ToolSpec.display` labels, per-tool usage and recent calls
+  (`GET /api/tools/usage`, `GET /api/tools/calls`), masked exception messages
+  in tool failure events, clearer `run_command` failures and policy denials,
+  and `read_file` ignores image and PDF options on text reads.
+- Evals: suite views, run comparisons, adding a finished session to a suite,
+  and `parent_suite_revision` on suite saves.
+- Knowledge: `GET /api/knowledge` and `POST /api/knowledge/{id}/retire`.
+- Environments and runners: per-agent `register_agent(environment_name=)` and
+  `NO_ENVIRONMENT`, `LaunchedRunner` for your own command launcher, HTTPS
+  allowlist egress for Cayu Cloud sandboxes, one coding toolchain for Docker
+  and Cayu Cloud (`select_coding_backend`), cleanup of abandoned process-local
+  Docker containers, `runner_lost` diagnostics, and Lambda MicroVM HTTP 429
+  retries.
+- Environments can be removed with `CayuApp.unregister_environment` and
+  rebuilt in another process from a recorded `rebuild_record` with
+  `register_environment_rebuilder`, and `ForkControllerEnrollment` reports
+  which agents this process can fork.
+- Egress fixes: the guest CA file is always mode 0644, hardened Docker egress
+  works on Docker Engine 27.5 or later and reports an inconclusive probe as
+  `egress_host_isolation_unverified`, and root helpers run `python3 -I`.
+- Storage: `cayu storage migrate --backup-dir/--keep-backups`, `cayu storage
+  prune --apply --vacuum` on SQLite, transcript-level compaction, a startup
+  warning when a store grows without retention, and a fix for receipts broken
+  by compaction.
+- CLI and scaffolds: `cayu serve --reload`, `cayu new --with app-database`,
+  `cayu generate preset`, `--without` drops the capability's files, `cayu new`
+  warns about a newer release (`CAYU_NO_VERSION_CHECK=1` keeps it offline),
+  comma-separated `cayu session events --type`, and generated projects read
+  `OPENAI_BASE_URL` and ignore `.env`.
+- `SandboxBrokerClient.capacity()` reports how many Cayu Cloud sandboxes an
+  Agent can get now and which limit applies.
+- Cayu Cloud: `[database] migrate` in `cayu-cloud.toml`, `cayu cloud service
+  pause|resume`, `cayu cloud schedule run`, schedule `input`, up to 100
+  schedules, `cayu cloud compass`, and deploys of a sleeping service finish.
+- Extras: `cayu[claude-agent-sdk]` accepts `claude-agent-sdk>=0.2.168,<0.3`,
+  and `ExternalCleanupIncomplete` is exported from `cayu.external_agents`.
+- About 15 to 20% less runtime CPU per tool call.
+- The bundled model catalog adds `gpt-6.1-terra` and is re-verified for this
+  release.
 
 ## v0.14.0
 
@@ -689,25 +152,11 @@ Upgrade: rebuild Lambda MicroVM images from this release's sidecar
 protocol 7 and refuses an image built from an earlier release at readiness.
 
 Upgrade: run `cayu storage migrate` against each SQLite or PostgreSQL store and
-confirm revision 127. Task adapters require revision 127: exact declared task
-creation receipts and deletion-surviving identity fences are now persisted. Bound continuation
-claims now persist their expected attachment and selected-operation digest in the
-existing claim registry. The compatibility floor is 127; stop older workers before
-migration. Revision 125's `cayu_store_identity` table remains the owner of Cloud
-store identity. Server contract 63 adds member-readable suite-centred eval catalogs,
-paged suite/run views, authoritative comparisons and truthful checkpoint progress.
-Server contract 62 adds scoped kept-knowledge reads, exact activation
-attribution, retained lookup totals and revision-fenced native retirement.
-Server contract 61 adds uncapped local tool declarations with shared Cloud
-source/approval classification, retained per-tool usage totals and bounded exact recent-call links.
-Server contract 60 adds exact task index counts, filter-bound paging, graph
-relations and general cancellation, with member-readable schedule history.
-Contract 59 added exact, paged session trace reads and read-only
-`session_trace` capability. Contract 58 added declared task catalog/create/replay, including exact
-session-origin replay selection. Contract 57 added session follow-ups alongside exact daily
-accounting in overview counts, public-projection Inbox search, durable decision
-reasons, and explicit controlled continuation claims. Regenerate API clients and use the matching browser client
-and dashboard assets. Manifest schema 17 is unchanged.
+confirm revision 125. Revision 125 is additive: it adds the `cayu_store_identity`
+table that Cayu Cloud reporting needs. The compatibility floor stays 124, so this
+build still starts on a revision 124 store, but until the store is migrated
+`GET {api}/cloud/contract` returns `store_id: null` and `GET {api}/cloud/v1/activity`
+answers 501. Server contract 49 and manifest schema 17 are unchanged.
 
 Upgrade: brokered coding sandbox images now need `git`, or their factory must
 set `git_baseline=False`. Direct binding users must also check the workspace
@@ -768,48 +217,6 @@ a sign-in proxy identity header when the `CAYU_PROXY_IDENTITY_*` variables are s
   Alternatively, start a new session.
 
 ### Changes
-
-- Pending-action recovery reads now expose the exact sibling tool-call reference when the interruption event itself cannot name it unambiguously. References come from matching durable start evidence, retain the same attention identity, and reconstruct after store reopen; recovery authorization is unchanged.
-
-The Developer dashboard Session detail now opens on a bounded Conversation with
-collapsed tool work, structured outputs, inline decisions, and the existing execution
-and browser controls. Trace includes filtered events and the former Workflow tree;
-old Workflow links redirect to it. Custom dashboard owners should port
-`src/next/routes/session/session-entry.tsx` and its shared components;
-`src/routes/session-detail.tsx` has been removed. This page activation does not
-change the runtime contract or authorization policy.
-
-The Developer dashboard Home and Inbox now use the shared session overview and
-unified runtime Inbox. Home shows exact daily usage and attention; Inbox supports
-server filters, counts, protected inline decisions and explicit task continuation.
-`/run` and `/pending-actions` redirect to their new homes. Custom dashboard owners
-should port `src/next/routes/home-page.tsx` and `inbox-page.tsx`; the old Dashboard,
-Run and Pending route modules have been removed. Runtime contract56 is unchanged.
-
-The Developer dashboard Sessions page now leads with agent-authored titles and
-summaries, canonical merged state, and usage. It preserves existing filters and cursor
-links, excludes eval trials and forks by default, and lets readers include them.
-Custom dashboard owners should port Sessions changes from `src/next/routes/sessions-page.tsx`;
-`src/routes/sessions.tsx` has been removed. Other page ports remain independent.
-
-- Ordinary completed/failed session follow-ups inherit omitted structured-output
-  and loop settings from profile-verified durable admission, including when the
-  initial provider request failed. Explicit overrides retain profile checks;
-  tool-completion policy remains explicit per turn. Contract 57 advertises
-  `session_followups` and preserves the public `role_forbidden` queue error.
-  Regenerate clients and rebuild dashboards; storage stays at revision 126.
-
-- Validated structured answers now have a `structured_output` transcript part
-  with the spec name and JSON output, for native and tool-based strategies.
-  Original tool calls remain available in the trace. Custom transcript readers
-  should handle the new part; regenerate clients and use the matching dashboard
-  contract. See [session inspection](session-inspection.md#validated-structured-output-in-transcripts).
-
-- `cayu serve --reload` watches project Python source and starts a fresh worker
-  after edits. Reload is opt-in and preserves normal authentication and service
-  checks. Each worker warns that in-memory state is lost and active runs may be
-  interrupted; persistent stores retain saved data. See
-  [development reload](project-server.md#reload-python-code-during-development).
 
 - A Claude Code or Codex run through `runner_agent_launch` can now reach the model
   through `ExternalAgentGateway` without a public gateway URL or any route from the
@@ -1179,12 +586,6 @@ Custom dashboard owners should port Sessions changes from `src/next/routes/sessi
   the object it found. Both paths now flush the object, its shard, the objects
   directory and the store root before returning, and an interrupted object
   directory creation is recovered.
-
-The dashboard Tasks list and task-detail pages now use exact server counts and
-cursor-based filters, graph and retry relations, schedule history and task Debug.
-Authorized operators can create declared tasks, recover uncertain creation/replay
-responses, hold/resume work and cancel through the native lifecycle owners.
-Members retain read-only task and schedule access.
 
 ## v0.13.0
 

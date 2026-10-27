@@ -216,11 +216,18 @@ def test_without_acknowledgment_original_idle_failure_reproduces(monkeypatch):
 def test_already_buffered_trailing_events_still_fail(tail, separate_chunks):
     chunks = [frame(terminal()), frame(tail)]
     body = Body(chunks if separate_chunks else [b"".join(chunks)])
-    events, error = asyncio.run(consume(body))
-    assert sum(e.type is ModelStreamEventType.COMPLETED for e in events) == 1
+    # Give buffered protocol validation room for scheduling delays on busy CI.
+    deadlines = ProviderStreamDeadlines(
+        semantic_progress_timeout_s=5,
+        transport_idle_timeout_s=5,
+        protocol_idle_timeout_s=5,
+        absolute_stream_timeout_s=10,
+    )
+    events, error = asyncio.run(consume(body, deadlines=deadlines))
     assert isinstance(error, ModelProviderError)
     assert "OpenAIProtocolError" in str(error)
     assert error.retryable is False
+    assert sum(e.type is ModelStreamEventType.COMPLETED for e in events) == 1
     assert body.closed and not body.tail_read
 
 

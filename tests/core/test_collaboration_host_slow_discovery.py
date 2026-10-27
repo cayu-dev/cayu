@@ -237,7 +237,9 @@ async def test_saturated_discovery_preserves_producer_cleanup(
             ),
             discovery_slots=1 if saturation == "slots" else 4,
             discovery_bytes=131072 if saturation == "bytes" else 512 * 1024,
-            observation_timeout_s=0.05,
+            # Qualify cleanup under saturated discovery, not CPU throughput in
+            # a 50 ms pass. The blocked source stays gated until cleanup ends.
+            observation_timeout_s=1,
             shutdown_timeout_s=0.01,
         ),
     )
