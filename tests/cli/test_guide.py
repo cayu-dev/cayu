@@ -1173,6 +1173,7 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
         )
         for attempt in (1, 2, 3):
             assert await namespace["retry_job"](app, "INV-11", attempt, "Pay INV-11.") is None
+            await app.task_store.fail_task(f"invoice-INV-11-{attempt}", {"code": "failed"})
         given_up = await namespace["retry_job"](app, "INV-11", 4, "Pay INV-11.")
         assert given_up.status is TaskRetryKeyStatus.GIVEN_UP
         assert await app.task_store.load_task("invoice-INV-11-4") is None

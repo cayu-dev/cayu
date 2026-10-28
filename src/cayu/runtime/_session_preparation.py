@@ -24,7 +24,9 @@ from cayu.context.structured_output import (
 from cayu.deadlines import (
     ExecutionDeadline,
     current_execution_deadline,
+    current_task_event_id,
     effective_deadline,
+    independent_event_deadline,
 )
 from cayu.environments.base import NO_ENVIRONMENT, WorkspaceInstructions
 from cayu.execution_profiles import (
@@ -465,6 +467,14 @@ class SessionPreparation:
             if request.parent_session_id is not None
             else None
         )
+        if current_task_event_id() is not None:
+            request._runtime_event_base_deadline = effective_deadline(
+                request._runtime_event_base_deadline
+                or independent_event_deadline(
+                    request.execution_deadline, explicit="execution_deadline" in explicit_fields
+                ),
+                parent.execution_deadline if parent is not None else ExecutionDeadline(),
+            )
         boundary = effective_deadline(
             current_execution_deadline(),
             request.execution_deadline,

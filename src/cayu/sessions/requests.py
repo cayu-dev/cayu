@@ -311,6 +311,7 @@ class RunRequest(BaseModel):
     _runtime_session_instance_authority: object | None = PrivateAttr(default=None)
     _runtime_initial_transcript_authority: object | None = PrivateAttr(default=None)
     _runtime_work_attempt_creation: object | None = PrivateAttr(default=None)
+    _runtime_event_base_deadline: ExecutionDeadline | None = PrivateAttr(default=None)
     _input_redactions_applied: bool = PrivateAttr(default=False)
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: SessionExecutionSource | None = PrivateAttr(default=None)
@@ -1084,6 +1085,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
             copied_fields_set.discard(field_name)
     object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)
     copied._runtime_generated_authority = request._runtime_generated_authority
+    copied._runtime_event_base_deadline = request._runtime_event_base_deadline
     prepared_creation = request._runtime_work_attempt_creation
     copied._runtime_work_attempt_creation = (
         prepared_creation
@@ -1770,3 +1772,14 @@ def _fork_initial_invocation_request_sha256(request: ResumeRequest) -> str:
             "fork_initial_invocation",
         )
     ).hexdigest()
+
+
+def with_event_base_deadline(request: RunRequest) -> RunRequest:
+    """Capture the independent run bound before the event tightens it."""
+    from cayu.deadlines import independent_event_deadline
+
+    copied = request.model_copy()
+    copied._runtime_event_base_deadline = independent_event_deadline(
+        request.execution_deadline, explicit="execution_deadline" in request.model_fields_set
+    )
+    return copied

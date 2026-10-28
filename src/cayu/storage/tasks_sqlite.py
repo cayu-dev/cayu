@@ -323,10 +323,13 @@ from cayu.tasks.retry import (
     prepare_task_retry_settlement,
 )
 from cayu.tasks.retry_budgets import (
-    TaskRetryBudgetExhausted,
     TaskRetryKeyState,
     admit_task_retry_key,
+    expire_task_retry_key,
+    observe_task_retry_key_transition,
+    raise_task_retry_key_closed,
     stored_task_retry_key_state,
+    task_event_retry_refusal,
     task_retry_key_request,
     unscoped_task_retry_key,
 )
@@ -378,7 +381,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 128
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 133
 
 
 @model_store_surface("tasks")
@@ -513,6 +516,7 @@ class SQLiteTaskStore(TaskStore):
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_task_retry_keys: ClassVar[bool] = True
+    supports_task_event_execution: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
     supports_completion_evaluations: ClassVar[bool] = True
@@ -3692,6 +3696,7 @@ class SQLiteTaskStore(TaskStore):
                     parent_task=parent,
                     retry_started_at=admission_now,
                     supports_verified_work_contracts=True,
+                    event_budget=True,
                 )
                 refused = self._admit_task_retry_key_unlocked(request, task)
                 if refused is None:
@@ -3706,7 +3711,7 @@ class SQLiteTaskStore(TaskStore):
                     created = task.model_copy(deep=True)
         if refused is not None:
             # Raised after commit so the given-up state is durable.
-            raise TaskRetryBudgetExhausted(refused)
+            raise_task_retry_key_closed(refused)
         self._publish_task_admission_wakeup(task, now=admission_now)
         return created
 
@@ -3714,7 +3719,7 @@ class SQLiteTaskStore(TaskStore):
         self, request: TaskCreate, task: Task
     ) -> TaskRetryKeyState | None:
         """Count a keyed task inside its insert transaction; return the state if refused."""
-        keyed = task_retry_key_request(request)
+        keyed = task_retry_key_request(request, task)
         if keyed is None:
             return None
         if self._task_exists_unlocked(task.id):
@@ -3722,7 +3727,12 @@ class SQLiteTaskStore(TaskStore):
         prior = self._load_task_retry_key_unlocked(keyed[0])
         # Store time read after the key state, right before the decision.
         state, admitted = admit_task_retry_key(
-            prior, retry_key=keyed[0], budget=keyed[1], task_id=task.id, now=self._clock()
+            prior,
+            retry_key=keyed[0],
+            budget=keyed[1],
+            task_id=task.id,
+            now=self._clock(),
+            budget_is_explicit=request.retry_budget is not None,
         )
         if state is not prior:
             self._connection.execute(
@@ -3738,6 +3748,53 @@ class SQLiteTaskStore(TaskStore):
         ).fetchone()
         return None if row is None else stored_task_retry_key_state(row[0], retry_key)
 
+    async def task_event_remaining_seconds(self, retry_key: str) -> float | None:
+        retry_key = await unscoped_task_retry_key(retry_key)
+        async with self._lock:
+            state = self._load_task_retry_key_unlocked(retry_key)
+            if state is None:
+                raise RuntimeError("Task event association has no durable budget record.")
+            if state.status.value != "active":
+                return 0.0
+            deadline = state.elapsed_deadline
+            return (
+                None if deadline is None else max(0.0, (deadline - self._clock()).total_seconds())
+            )
+
+    async def refresh_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
+        retry_key = await unscoped_task_retry_key(retry_key)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                state = self._load_task_retry_key_unlocked(retry_key)
+                if state is None:
+                    return None
+                updated = expire_task_retry_key(state, now=self._clock())
+                if updated is not state:
+                    self._connection.execute(
+                        "UPDATE cayu_task_retry_keys SET state_json = ? WHERE retry_key = ?",
+                        (updated.model_dump_json(), retry_key),
+                    )
+                return updated
+
+    async def expired_task_event_ids(self, *, limit: int = 100) -> list[str]:
+        await unscoped_task_retry_key("maintenance")
+        limit = _validate_task_positive_int(limit, "limit")
+        async with self._lock:
+            rows = self._connection.execute(
+                """SELECT t.id FROM cayu_tasks t JOIN cayu_task_retry_keys k
+                   ON json_extract(t.invocation_json, '$.event_retry_key') = k.retry_key
+                   WHERE t.status NOT IN ('completed', 'failed', 'cancelled')
+                   AND (t.status_reason IS NULL OR t.status_reason NOT IN
+                       ('cancellation_requested', 'retry_cancellation_requested'))
+                   AND (json_extract(k.state_json, '$.status') != 'active' OR
+                       julianday(json_extract(k.state_json, '$.first_attempt_at')) +
+                       json_extract(k.state_json, '$.budget.max_elapsed_seconds') / 86400.0
+                       <= julianday(?))
+                   ORDER BY t.created_at, t.id LIMIT ?""",
+                (sqlite_records.format_datetime(self._clock()), limit),
+            ).fetchall()
+            return [row[0] for row in rows]
+
     async def load_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
         retry_key = await unscoped_task_retry_key(retry_key)
         async with self._lock:
@@ -3748,11 +3805,28 @@ class SQLiteTaskStore(TaskStore):
         prior: Task | None,
         current: Task,
         *,
+        event_admission: bool = False,
+        event_now: datetime | None = None,
         operation_id: str | None = None,
         settled_execution: tuple[str, str, datetime] | None = None,
     ) -> None:
         from cayu.storage._sqlite_task_graphs import record_transition
 
+        event_key = current.invocation.event_retry_key
+        if event_key is not None:
+            state = self._load_task_retry_key_unlocked(event_key)
+            if state is not None:
+                updated = observe_task_retry_key_transition(
+                    state,
+                    None if event_admission else prior,
+                    current,
+                    now=self._clock() if event_now is None else event_now,
+                )
+                if updated is not state:
+                    self._connection.execute(
+                        "UPDATE cayu_task_retry_keys SET state_json = ? WHERE retry_key = ?",
+                        (updated.model_dump_json(), event_key),
+                    )
         record_transition(self, prior, current, settled_execution=settled_execution)
         self._record_schedule_transition_unlocked(prior, current, operation_id=operation_id)
 
@@ -5807,6 +5881,12 @@ class SQLiteTaskStore(TaskStore):
                     request,
                     now=now,
                     series_now=series_now,
+                    event_refusal=task_event_retry_refusal(
+                        None
+                        if task.invocation.event_retry_key is None
+                        else self._load_task_retry_key_unlocked(task.invocation.event_retry_key),
+                        now=series_now,
+                    ),
                 )
                 assert settled.retry_series is not None
                 cursor = self._connection.execute(
@@ -5878,10 +5958,13 @@ class SQLiteTaskStore(TaskStore):
                     from cayu.storage._sqlite_task_graphs import register_retry_successor
 
                     register_retry_successor(self, settled, successor)
-                self._record_task_transition_unlocked(task, settled)
+                self._record_task_transition_unlocked(task, settled, event_now=series_now)
                 if successor is not None:
                     self._record_task_transition_unlocked(
-                        successor, self._require_task_unlocked(successor.id)
+                        successor,
+                        self._require_task_unlocked(successor.id),
+                        event_admission=True,
+                        event_now=series_now,
                     )
                 self._connection.execute(
                     "INSERT INTO cayu_task_retry_settlements "

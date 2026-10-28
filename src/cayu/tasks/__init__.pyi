@@ -254,6 +254,7 @@ from cayu.tasks.retry import TaskRetryEventType as TaskRetryEventType
 from cayu.tasks.retry import TaskRetrySettlementRequest as TaskRetrySettlementRequest
 from cayu.tasks.retry import TaskRetrySettlementResult as TaskRetrySettlementResult
 from cayu.tasks.retry_budgets import DEFAULT_TASK_RETRY_BUDGET as DEFAULT_TASK_RETRY_BUDGET
+from cayu.tasks.retry_budgets import TaskEventAlreadyCompleted as TaskEventAlreadyCompleted
 from cayu.tasks.retry_budgets import TaskRetryBudget as TaskRetryBudget
 from cayu.tasks.retry_budgets import TaskRetryBudgetExhausted as TaskRetryBudgetExhausted
 from cayu.tasks.retry_budgets import TaskRetryKeyState as TaskRetryKeyState

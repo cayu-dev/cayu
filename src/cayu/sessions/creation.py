@@ -13,6 +13,7 @@ from cayu._validation import (
 )
 from cayu.deadlines import (
     EXECUTION_DEADLINE_METADATA_KEYS,
+    TASK_EVENT_BINDING_METADATA_KEY,
     ExecutionDeadline,
     current_execution_deadline,
     deadline_metadata,
@@ -151,6 +152,12 @@ def session_metadata_for_creation(
     else:
         boundary.require_admission("session_creation")
     copied.update(deadline_metadata(boundary))
+    if prepared_request is not None and TASK_EVENT_BINDING_METADATA_KEY in copied:
+        base = prepared_request._runtime_event_base_deadline
+        if base is not None:
+            copied[TASK_EVENT_BINDING_METADATA_KEY].update(
+                base_deadline=base.model_dump(mode="json"), base_origin=base.origin
+            )
     if EXECUTION_PROFILE_METADATA_KEY in copied:
         raise ValueError("Session metadata contains runtime-owned execution-profile authority.")
     if RUNTIME_BUILD_PROVENANCE_METADATA_KEY in copied:

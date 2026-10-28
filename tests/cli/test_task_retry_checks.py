@@ -33,7 +33,7 @@ def test_check_warns_about_event_resubmission_without_changing_runtime_policy(tm
     assert finding.severity.value == "warning"
     assert finding.path == "submit.py:3"
     assert "unlimited()" in finding.hint
-    assert "only this task" in finding.message
+    assert "Independent roots get separate budgets" in finding.message
     assert check_declared_scaffold_source(tmp_path, deploy_only=True) == ()
 
 
@@ -41,6 +41,9 @@ def test_check_warns_about_event_resubmission_without_changing_runtime_policy(tm
     "creation",
     [
         'TaskCreate(type="event", retry_key=event_id)',
+        'TaskCreate(type="event", event_id=event_id)',
+        'TaskCreate(type="event", input={"event_id": event_id})',
+        'TaskCreate(type="event", retry_budget=budget)',
         'TaskCreate(type="event", retry_policy=policy)',
         'TaskCreate(type="different")',
         "TaskCreate(type=dynamic_type)",

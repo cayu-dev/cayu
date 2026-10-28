@@ -227,36 +227,43 @@ async def _run_coding_product(config: dict[str, Any], *, task_store=None) -> dic
             environment_name="coding",
             messages=[Message.text("user", "repair the bounded fixture")],
         )
-        profile = await app.inspect_run_execution_profile(run_request)
-        request = await admit_coding_product_request(
-            product_run_id=config["product_run_id"],
-            session_id=config["session_id"],
-            agent_name="coder",
-            task_id="coding-process-task",
-            messages=run_request.messages,
-            source_workspace=workspace,
-            source_origin_id="fixture-origin",
-            source_destination_id="fixture-destination",
-            source_git_baseline=CodingGitBaselineAuthority(
-                head_revision="a" * 40,
-                staged_entries_sha256=_digest("index"),
-                tracked_flags_sha256=_digest("flags"),
-                status_sha256=_digest("status"),
-                diff_sha256=_digest("diff"),
-            ),
-            runtime=CodingRuntimeAuthority(
-                toolchain_profile_id="fixture",
-                toolchain_profile_revision="1",
-                toolchain_profile_fingerprint=_digest("toolchain"),
-                image_fingerprint=_digest("image"),
-                dependency_identity=_digest("dependencies"),
-                execution_profile_fingerprint=profile,
-                tool_manifest_fingerprint=_digest("tools"),
-                tool_policy_fingerprint=_digest("policy"),
-                approval_policy_fingerprint=_digest("approval"),
-                redaction_profile_fingerprint=_digest("redaction"),
-            ),
-        )
+        if config["action"] == "start":
+            profile = await app.inspect_run_execution_profile(run_request)
+            request = await admit_coding_product_request(
+                product_run_id=config["product_run_id"],
+                session_id=config["session_id"],
+                agent_name="coder",
+                task_id="coding-process-task",
+                messages=run_request.messages,
+                source_workspace=workspace,
+                source_origin_id="fixture-origin",
+                source_destination_id="fixture-destination",
+                source_git_baseline=CodingGitBaselineAuthority(
+                    head_revision="a" * 40,
+                    staged_entries_sha256=_digest("index"),
+                    tracked_flags_sha256=_digest("flags"),
+                    status_sha256=_digest("status"),
+                    diff_sha256=_digest("diff"),
+                ),
+                runtime=CodingRuntimeAuthority(
+                    toolchain_profile_id="fixture",
+                    toolchain_profile_revision="1",
+                    toolchain_profile_fingerprint=_digest("toolchain"),
+                    image_fingerprint=_digest("image"),
+                    dependency_identity=_digest("dependencies"),
+                    execution_profile_fingerprint=profile,
+                    tool_manifest_fingerprint=_digest("tools"),
+                    tool_policy_fingerprint=_digest("policy"),
+                    approval_policy_fingerprint=_digest("approval"),
+                    redaction_profile_fingerprint=_digest("redaction"),
+                ),
+            )
+        else:
+            # Recover the exact admitted authority. Recomputing a new profile
+            # outside the original task would drop its persisted event deadline.
+            request = await repository.load_request(
+                config["product_run_id"], session_id=config["session_id"]
+            )
 
         async def validate_fixture_git(expected: CodingGitBaselineAuthority) -> None:
             assert expected == request.source.git_baseline

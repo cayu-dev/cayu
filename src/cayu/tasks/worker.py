@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -165,6 +166,7 @@ from cayu.tasks.retry import (
     _task_retry_requested_cancellation_settlement,
     _task_retry_runtime_terminal_request,
 )
+from cayu.tasks.retry_budgets import enforce_task_event_deadline, reconcile_task_event_deadlines
 from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
@@ -862,6 +864,7 @@ async def run_task_worker(
                 # Maintenance is a database poll too. Only the admitted worker may
                 # scan; otherwise an idle cohort fans out before claim admission.
                 await group_maintenance.step(task_store, app._secret_redactor, now=loop.time())
+                await reconcile_task_event_deadlines(task_store)
 
             async def claim_next_task() -> Task | None:
                 if materialized_work_contract_queue_supported:
@@ -1145,6 +1148,38 @@ async def _handle_with_heartbeat_owned(
     execution_timeout_s: float | None,
     execution_grace_s: float | None,
 ) -> None:
+    # The task timeout may be shorter, but it can never extend its event.
+    event_key = task.invocation.event_retry_key
+    event_limit = False
+    event_deadline = None
+    event_dispatch_deadline = None
+    if event_key is not None and task_store.supports_task_event_execution:
+        observed_at = monotonic()
+        state = await task_store.load_task_retry_key(event_key)
+        if state is None:
+            raise RuntimeError("Task event association has no durable budget record.")
+        event_deadline = ExecutionDeadline(expires_at=state.elapsed_deadline, source="task_event")
+        remaining = await task_store.task_event_remaining_seconds(event_key)
+        if remaining is not None:
+            remaining = max(remaining - (monotonic() - observed_at), 0.0)
+            event_dispatch_deadline = monotonic() + remaining
+            if execution_timeout_s is None or remaining <= execution_timeout_s:
+                # HandlerTimeLimit cancels the owned handler context; the existing
+                # quiescence protocol still retains ownership through cleanup.
+                execution_timeout_s = max(remaining, math.nextafter(0.0, 1.0))
+                execution_grace_s = 0.0
+                event_limit = True
+    time_limit = (
+        None
+        if execution_timeout_s is None
+        else HandlerTimeLimit(
+            execution_timeout_s,
+            grace_s=execution_grace_s,
+            source="task_event" if event_limit else "task_worker",
+        )
+    )
+    # Budget reads precede execution entry. Slow or failed reads leave a
+    # provably undispatched claim that ordinary lease reclamation can retry.
     (
         task,
         claim_deadline_monotonic,
@@ -1184,12 +1219,6 @@ async def _handle_with_heartbeat_owned(
             ),
         )
     )
-    # Fixed when the handler starts; one per handler call.
-    time_limit = (
-        None
-        if execution_timeout_s is None
-        else HandlerTimeLimit(execution_timeout_s, grace_s=execution_grace_s, source="task_worker")
-    )
     handler_error: Exception | None = None
     pending_runtime_task_failure: RuntimeTaskFailureTerminalizationPending | None = None
     handler_outcome: TaskHandlerOutcome | TaskRetryAttemptReport | None = None
@@ -1218,6 +1247,8 @@ async def _handle_with_heartbeat_owned(
                     lease_authority=lease_authority,
                     settlement=settlement,
                     time_limit=time_limit,
+                    event_deadline=event_deadline,
+                    event_dispatch_deadline=event_dispatch_deadline,
                 )
             except _TaskRetryElapsed as exc:
                 retry_elapsed = True
@@ -1541,6 +1572,8 @@ async def _renew_task_claim_before_dispatch(
                     "Task post-deadline heartbeat acknowledgement consumed the renewed "
                     "lease before dispatch."
                 )
+    if not retry_deadline_elapsed:
+        renewed = await enforce_task_event_deadline(task_store, renewed)
     cancellation_requested = _task_retry_cancellation_requested(
         renewed
     ) or _task_cancellation_requested(renewed)
@@ -1599,6 +1632,8 @@ async def _await_task_handler(
     lease_authority: _TaskLeaseAuthority,
     settlement: TaskExecutionSettlement,
     time_limit: HandlerTimeLimit | None,
+    event_deadline: ExecutionDeadline | None,
+    event_dispatch_deadline: float | None,
 ) -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
     # The callback may mutate its view. Settlement must remain bound to the
     # exact execution entered by this worker, not callback-authored authority.
@@ -1608,27 +1643,45 @@ async def _await_task_handler(
     callback_done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     async def invoke_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
+        from cayu.deadlines import task_event_deadline_scope
         from cayu.resource_access import execution_access
 
         if task.invocation.access_labels and task.invocation.resource_access is None:
             from cayu._resource_access_errors import ResourceAccessDenied
 
             raise ResourceAccessDenied()
+        if event_dispatch_deadline is not None and time_limit is not None:
+            # Task scheduling and access admission consume the existing budget;
+            # entering the cancellation owner must not start that duration again.
+            remaining = max(event_dispatch_deadline - monotonic(), math.nextafter(0.0, 1.0))
+            if remaining <= time_limit.timeout_s:
+                time_limit.timeout_s = remaining
+                time_limit.grace_s = 0.0
+                time_limit.source = "task_event"
         # Fixed at handler start, so retries within this call share it. The run
         # default comes from the entered limit, so the two cannot disagree.
         async with (
+            contextlib.nullcontext() if time_limit is None else time_limit,
+            contextlib.nullcontext()
+            if event_deadline is None
+            else task_event_deadline_scope(
+                event_deadline, event_id=task.invocation.event_retry_key
+            ),
             execution_access(
                 task.invocation.resource_access,
                 app.resource_access_policy,
                 task.invocation.access_labels,
                 kind="tasks",
             ),
-            contextlib.nullcontext() if time_limit is None else time_limit,
         ):
             with default_run_deadline(
                 ExecutionDeadline.after(None, source="task_worker")
                 if time_limit is None
-                else time_limit.run_deadline()
+                else (
+                    event_deadline
+                    if time_limit.source == "task_event" and event_deadline is not None
+                    else time_limit.run_deadline()
+                )
             ):
                 result = await handler(app, handler_view, worker_id)
         return result
@@ -1968,6 +2021,8 @@ async def _fail_task_for_handler_time_limit(
     """Fail a task whose handler outlived its time limit; log it if the failure landed."""
 
     payload = _handler_time_limit_failure_payload(app, time_limit, handler_error)
+    if time_limit.source == "task_event":
+        payload["code"] = "event_elapsed_exhausted"
     del handler_error  # Not held across the store await.
     if not await _safe_fail_payload(
         task_store,
@@ -4249,6 +4304,19 @@ async def _heartbeat_until(
         return updated
 
     async def inspect_heartbeat(updated: Task | None) -> _TaskHeartbeatOutcome | None:
+        if updated is not None and not lease_authority.keep_renewing_on_cancellation:
+            inspection = asyncio.create_task(enforce_task_event_deadline(task_store, updated))
+            try:
+                completed, _pending = await asyncio.wait(
+                    {inspection}, timeout=max(0.0, current_deadline() - monotonic())
+                )
+            except asyncio.CancelledError:
+                _retain_abandoned_task_lease_operation(inspection)
+                raise
+            if inspection not in completed:
+                _retain_abandoned_task_lease_operation(inspection)
+                raise expired_lease()
+            updated = inspection.result()
         if (
             updated is not None
             and not lease_authority.keep_renewing_on_cancellation
@@ -4659,6 +4727,8 @@ def _task_failure_payload(app: CayuApp, exc: Exception) -> dict[str, Any]:
         "error": diagnostic.error_type,
         "message": diagnostic.message,
     }
+    if isinstance(exc, ExecutionDeadlineExceeded) and exc.diagnostics.get("source") == "task_event":
+        payload["code"] = "event_elapsed_exhausted"
     if diagnostic.durable_value_error_code is not None:
         payload["durable_value_error_code"] = diagnostic.durable_value_error_code
         payload["durable_value_error_path"] = diagnostic.durable_value_error_path

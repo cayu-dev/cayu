@@ -19,11 +19,15 @@ from cayu._exception_groups import iter_exception_tree
 EXECUTION_DEADLINE_METADATA_KEY = "cayu:execution_deadline"
 EXECUTION_DEADLINE_ORIGIN_METADATA_KEY = "cayu:execution_deadline_origin"
 EXECUTION_DEADLINE_RENEWAL_METADATA_KEY = "cayu:execution_deadline_renewal"
+TASK_EVENT_DEADLINE_METADATA_KEY = "cayu:task_event_deadline"
+TASK_EVENT_BINDING_METADATA_KEY = "cayu:task_event_binding"
 # Every runtime-owned session metadata entry that describes the stored deadline.
 EXECUTION_DEADLINE_METADATA_KEYS = (
     EXECUTION_DEADLINE_METADATA_KEY,
     EXECUTION_DEADLINE_ORIGIN_METADATA_KEY,
     EXECUTION_DEADLINE_RENEWAL_METADATA_KEY,
+    TASK_EVENT_DEADLINE_METADATA_KEY,
+    TASK_EVENT_BINDING_METADATA_KEY,
 )
 
 DeadlineOrigin = Literal["explicit", "run_default", "enclosing"]
@@ -66,6 +70,8 @@ class ExecutionDeadline(BaseModel):
     # Process-local like the monotonic expiry; sessions store it next to the
     # deadline (EXECUTION_DEADLINE_ORIGIN_METADATA_KEY), not inside it.
     _origin: DeadlineOrigin | None = PrivateAttr(default=None)
+    # Continuation planning proves the fenced turn has no pending human wait.
+    _event_rebinding_allowed: bool = PrivateAttr(default=False)
 
     @field_validator("expires_at")
     @classmethod
@@ -216,6 +222,54 @@ def current_execution_deadline() -> ExecutionDeadline:
     return _CURRENT.get() or ExecutionDeadline()
 
 
+_TASK_EVENT: ContextVar[ExecutionDeadline | None] = ContextVar(
+    "cayu_task_event_deadline", default=None
+)
+
+
+_TASK_EVENT_BASE: ContextVar[ExecutionDeadline | None] = ContextVar(
+    "cayu_task_event_base", default=None
+)
+
+
+_TASK_EVENT_ID: ContextVar[str | None] = ContextVar("cayu_task_event_id", default=None)
+
+
+def independent_event_deadline(
+    requested: ExecutionDeadline, *, explicit: bool
+) -> ExecutionDeadline:
+    """Retain session/outer-scope bounds independently of the current task event."""
+    event = current_task_event_deadline()
+    current = current_execution_deadline()
+    independent_current = (
+        current
+        if event.expires_at is None
+        or (current.expires_at is not None and current.expires_at < event.expires_at)
+        else ExecutionDeadline()
+    )
+    default = _DEFAULT_RUN.get()
+    independent_default = (
+        default.with_origin("run_default")
+        if not explicit and default is not None and default.expires_at != event.expires_at
+        else ExecutionDeadline()
+    )
+    return effective_deadline(
+        _TASK_EVENT_BASE.get() or ExecutionDeadline(),
+        independent_default,
+        independent_current,
+        requested if explicit or requested.expires_at != event.expires_at else ExecutionDeadline(),
+    )
+
+
+def current_task_event_id() -> str | None:
+    return _TASK_EVENT_ID.get()
+
+
+def current_task_event_deadline() -> ExecutionDeadline:
+    """The immutable event bound to retain when a task admits a continuation."""
+    return _TASK_EVENT.get() or ExecutionDeadline()
+
+
 _DEFAULT_RUN: ContextVar[ExecutionDeadline | None] = ContextVar(
     "cayu_default_run_deadline", default=None
 )
@@ -224,9 +278,13 @@ _DEFAULT_RUN: ContextVar[ExecutionDeadline | None] = ContextVar(
 def new_run_execution_deadline() -> ExecutionDeadline:
     """Select a new top-level run's default at admission, not deserialization."""
     current = _CURRENT.get()
-    if current is not None:
-        return current.with_origin("enclosing")
     default = _DEFAULT_RUN.get()
+    if current is not None:
+        if _TASK_EVENT.get() is not None and default is not None:
+            return effective_deadline(
+                default.with_origin("run_default"), current.with_origin("enclosing")
+            )
+        return current.with_origin("enclosing")
     return ExecutionDeadline() if default is None else default.with_origin("run_default")
 
 
@@ -509,11 +567,22 @@ def admit_handler_run() -> HandlerTimeLimit | None:
 def deadline_from_metadata(metadata: Mapping[str, Any]) -> ExecutionDeadline:
     raw = metadata.get(EXECUTION_DEADLINE_METADATA_KEY)
     if EXECUTION_DEADLINE_METADATA_KEY not in metadata:
-        return ExecutionDeadline()
+        return task_event_deadline_from_metadata(metadata)
     deadline = ExecutionDeadline.model_validate(raw)
     origin = metadata.get(EXECUTION_DEADLINE_ORIGIN_METADATA_KEY)
     # An origin this runtime does not know reads as unrecorded, never as an error.
-    return deadline.with_origin(origin) if origin in _DEADLINE_ORIGINS else deadline
+    deadline = deadline.with_origin(origin) if origin in _DEADLINE_ORIGINS else deadline
+    return effective_deadline(deadline, task_event_deadline_from_metadata(metadata))
+
+
+def task_event_deadline_from_metadata(metadata: Mapping[str, Any]) -> ExecutionDeadline:
+    """A task event's immutable outer bound, retained across human-wait renewal."""
+    raw = metadata.get(TASK_EVENT_DEADLINE_METADATA_KEY)
+    return (
+        ExecutionDeadline()
+        if raw is None
+        else ExecutionDeadline.model_validate(raw).with_origin("enclosing")
+    )
 
 
 def waiting_for_a_person_counts(deadline: ExecutionDeadline, *, top_level: bool) -> bool:
@@ -599,6 +668,15 @@ def deadline_metadata(deadline: ExecutionDeadline) -> dict[str, Any]:
     entries: dict[str, Any] = {EXECUTION_DEADLINE_METADATA_KEY: deadline.model_dump(mode="json")}
     if deadline.origin is not None:
         entries[EXECUTION_DEADLINE_ORIGIN_METADATA_KEY] = deadline.origin
+    event = _TASK_EVENT.get()
+    if event is not None and event.expires_at is not None:
+        entries[TASK_EVENT_DEADLINE_METADATA_KEY] = event.model_dump(mode="json")
+        base = deadline  # Creation replaces this with the separately retained session bound.
+        entries[TASK_EVENT_BINDING_METADATA_KEY] = {
+            "event_id": current_task_event_id(),
+            "base_deadline": base.model_dump(mode="json"),
+            "base_origin": base.origin,
+        }
     return entries
 
 
@@ -731,6 +809,7 @@ def resumed_execution_deadline(stored: ExecutionDeadline) -> ExecutionDeadline:
 
     A new, shorter external scope cannot silently become transient authority on
     an existing session: create a child with the shorter boundary instead.
+    A task event must already be stored on the session before it can bound recovery.
     """
     enclosing = current_execution_deadline()
     if enclosing.expires_at is not None and (
@@ -750,3 +829,50 @@ def bind_execution_deadline(deadline: ExecutionDeadline) -> Iterator[None]:
         yield
     finally:
         _CURRENT.reset(token)
+
+
+@asynccontextmanager
+async def task_event_deadline_scope(
+    deadline: ExecutionDeadline, *, event_id: str | None = None
+) -> AsyncIterator[None]:
+    """Carry a task's outer event deadline into owned sessions and their continuations."""
+    parent = _TASK_EVENT.get()
+    selected = deadline if parent is None else effective_deadline(parent, deadline)
+    base_token = _TASK_EVENT_BASE.set(
+        _TASK_EVENT_BASE.get() if parent is not None else current_execution_deadline()
+    )
+    token = _TASK_EVENT.set(selected)
+    identity_token = _TASK_EVENT_ID.set(
+        _TASK_EVENT_ID.get() if parent is not None else event_id or str(deadline.expires_at)
+    )
+    try:
+        enclosing = current_execution_deadline()
+        limit = current_handler_time_limit()
+        if (
+            limit is None
+            or limit.source != "task_event"
+            or limit.grace_s != 0
+            or limit._timer is None
+            or (
+                enclosing.expires_at is not None
+                and (selected.expires_at is None or enclosing.expires_at < selected.expires_at)
+            )
+        ):
+            async with execution_deadline_scope(selected):
+                yield
+        else:
+            # The handler's event timer is the only cancellation owner. Keep
+            # that same live timer visible during session/effect settlement;
+            # a passive nested timeout cannot provide expiry evidence.
+            with bind_execution_deadline(selected):
+                owner_token = _OWNER.set(asyncio.current_task())
+                timer_token = _TIMERS.set((*_TIMERS.get(), (limit._timer, selected)))
+                try:
+                    yield
+                finally:
+                    _TIMERS.reset(timer_token)
+                    _OWNER.reset(owner_token)
+    finally:
+        _TASK_EVENT_BASE.reset(base_token)
+        _TASK_EVENT_ID.reset(identity_token)
+        _TASK_EVENT.reset(token)

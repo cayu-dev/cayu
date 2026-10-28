@@ -320,6 +320,14 @@ async def create_task(
             raise NotImplementedError(
                 f"{type(task_store).__name__} does not support task retry keys."
             )
+        from cayu.tasks.retry_budgets import task_event_applies
+
+        event_execution = task_event_applies(request)
+        if event_execution and not task_store.supports_task_event_execution:
+            del request
+            raise NotImplementedError(
+                f"{type(task_store).__name__} does not support task event execution."
+            )
         if request.work_contract is None:
             if creation_operation is not None:
                 return await task_store.create_task_operation(request, creation_operation)

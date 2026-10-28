@@ -2837,6 +2837,7 @@ def test_sqlite_revision_thirty_nine_rejects_populated_store_before_receipt_migr
     connection = sqlite3.connect(db_path)
     try:
         connection.execute("DROP TABLE cayu_task_terminalization_receipts")
+        connection.execute("DROP INDEX IF EXISTS idx_cayu_tasks_event_retry_key")
         connection.execute("ALTER TABLE cayu_tasks DROP COLUMN invocation_json")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 38")
         connection.execute("PRAGMA user_version = 37")
@@ -3136,6 +3137,7 @@ def test_sqlite_revision_thirty_eight_rejects_conflicting_table_before_recording
     connection = sqlite3.connect(db_path)
     try:
         connection.execute("DROP TABLE cayu_task_terminalization_receipts")
+        connection.execute("DROP INDEX IF EXISTS idx_cayu_tasks_event_retry_key")
         connection.execute("ALTER TABLE cayu_tasks DROP COLUMN invocation_json")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 38")
         connection.execute("PRAGMA user_version = 37")

@@ -307,9 +307,12 @@ from cayu.tasks.retry import (
     prepare_task_retry_settlement,
 )
 from cayu.tasks.retry_budgets import (
-    TaskRetryBudgetExhausted,
     TaskRetryKeyState,
     admit_task_retry_key,
+    expire_task_retry_key,
+    observe_task_retry_key_transition,
+    raise_task_retry_key_closed,
+    task_event_retry_refusal,
     task_retry_key_request,
 )
 from cayu.tasks.retry_budgets import unscoped_task_retry_key as _unscoped_task_retry_key
@@ -473,6 +476,7 @@ class InMemoryTaskStore(TaskStore):
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_task_retry_keys: ClassVar[bool] = True
+    supports_task_event_execution: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
     supports_completion_evaluations: ClassVar[bool] = True
@@ -2302,31 +2306,81 @@ class InMemoryTaskStore(TaskStore):
                 parent_task=parent,
                 retry_started_at=admission_now,
                 supports_verified_work_contracts=True,
+                event_budget=True,
             )
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
-            keyed = task_retry_key_request(request)
+            keyed = task_retry_key_request(request, task)
             key_state = None
             if keyed is not None:
                 key_state, admitted = admit_task_retry_key(
                     self._task_retry_keys.get(keyed[0]),
                     retry_key=keyed[0],
                     budget=keyed[1],
+                    budget_is_explicit=request.retry_budget is not None,
                     task_id=task.id,
                     now=self._clock(),  # Read right before the decision.
                 )
                 if not admitted:
                     self._task_retry_keys[keyed[0]] = key_state
-                    raise TaskRetryBudgetExhausted(key_state)
-            self._store_task(task)
+                    raise_task_retry_key_closed(key_state)
+            prepared = self._prepare_task_write(task)
             if key_state is not None:
                 self._task_retry_keys[key_state.retry_key] = key_state
+            self._publish_prepared_task_write(prepared, event_now=admission_now)
             if operation is not None:
                 assert digest is not None
                 self._creation_operation_receipts[task_id] = digest
             created = task.model_copy(deep=True)
         self._publish_task_admission_wakeup(task, now=admission_now)
         return created
+
+    async def task_event_remaining_seconds(self, retry_key: str) -> float | None:
+        retry_key = await _unscoped_task_retry_key(retry_key)
+        async with self._lock:
+            state = self._task_retry_keys.get(retry_key)
+            if state is None:
+                raise RuntimeError("Task event association has no durable budget record.")
+            if state.status.value != "active":
+                return 0.0
+            deadline = state.elapsed_deadline
+            return (
+                None if deadline is None else max(0.0, (deadline - self._clock()).total_seconds())
+            )
+
+    async def refresh_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
+        retry_key = await _unscoped_task_retry_key(retry_key)
+        async with self._lock:
+            state = self._task_retry_keys.get(retry_key)
+            if state is None:
+                return None
+            state = expire_task_retry_key(state, now=self._clock())
+            self._task_retry_keys[retry_key] = state
+            return state.model_copy(deep=True)
+
+    async def expired_task_event_ids(self, *, limit: int = 100) -> list[str]:
+        await _unscoped_task_retry_key("maintenance")
+        limit = _validate_positive_int(limit, "limit")
+        async with self._lock:
+            now = self._clock()
+            result = []
+            for task in self._tasks.values():
+                state = self._task_retry_keys.get(task.invocation.event_retry_key or "")
+                if (
+                    state is None
+                    or task.status
+                    in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                    or task.status_reason
+                    in {"cancellation_requested", "retry_cancellation_requested"}
+                ):
+                    continue
+                if state.status.value != "active" or (
+                    state.elapsed_deadline is not None and now >= state.elapsed_deadline
+                ):
+                    result.append(task.id)
+                    if len(result) == limit:
+                        break
+            return result
 
     async def load_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
         retry_key = await _unscoped_task_retry_key(retry_key)
@@ -3741,6 +3795,10 @@ class InMemoryTaskStore(TaskStore):
                 request,
                 now=now,
                 series_now=series_now,
+                event_refusal=task_event_retry_refusal(
+                    self._task_retry_keys.get(task.invocation.event_retry_key or ""),
+                    now=series_now,
+                ),
             )
             if successor is not None and (
                 successor.id in self._tasks
@@ -3770,7 +3828,7 @@ class InMemoryTaskStore(TaskStore):
                     if item is not None
                 )
                 for write in writes:
-                    self._publish_prepared_task_write(write)
+                    self._publish_prepared_task_write(write, event_now=series_now)
             self._retry_settlements[receipt_key] = receipt
             committed = receipt.model_copy(deep=True)
         if successor is not None:
@@ -5078,9 +5136,19 @@ class InMemoryTaskStore(TaskStore):
                 )
         return _PreparedMemoryTaskWrite(task, prior, tuple(events))
 
-    def _publish_prepared_task_write(self, prepared: _PreparedMemoryTaskWrite) -> None:
+    def _publish_prepared_task_write(
+        self, prepared: _PreparedMemoryTaskWrite, *, event_now: datetime | None = None
+    ) -> None:
         """Publish prevalidated state while retaining the preparation lock."""
         task, prior, events = prepared
+        event_key = task.invocation.event_retry_key
+        if event_key is not None and event_key in self._task_retry_keys:
+            self._task_retry_keys[event_key] = observe_task_retry_key_transition(
+                self._task_retry_keys[event_key],
+                prior,
+                task,
+                now=self._clock() if event_now is None else event_now,
+            )
         prior_handoff_id = None if prior is None else prior.interrupted_handoff_id
         next_handoff_id = task.interrupted_handoff_id
         if prior_handoff_id != next_handoff_id:

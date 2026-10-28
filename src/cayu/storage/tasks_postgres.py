@@ -209,10 +209,13 @@ from cayu.tasks.retry import (
     prepare_task_retry_settlement,
 )
 from cayu.tasks.retry_budgets import (
-    TaskRetryBudgetExhausted,
     TaskRetryKeyState,
     admit_task_retry_key,
+    expire_task_retry_key,
+    observe_task_retry_key_transition,
+    raise_task_retry_key_closed,
     stored_task_retry_key_state,
+    task_event_retry_refusal,
     task_retry_key_request,
     unscoped_task_retry_key,
 )
@@ -257,7 +260,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 128
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 133
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -400,6 +403,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_task_retry_keys: ClassVar[bool] = True
+    supports_task_event_execution: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
     supports_completion_evaluations: ClassVar[bool] = True
@@ -1187,6 +1191,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     parent_task=parent,
                     retry_started_at=retry_started_at,
                     supports_verified_work_contracts=True,
+                    event_budget=True,
                 )
             refused = await self._admit_task_retry_key(cur, selected_request, task)
             if refused is not None:
@@ -1234,7 +1239,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 raise ValueError(f"Task already exists: {task_id}") from exc
             raise
         if isinstance(outcome, TaskRetryKeyState):
-            raise TaskRetryBudgetExhausted(outcome)
+            raise_task_retry_key_closed(outcome)
         task = outcome
         if publish_admission_wakeup:
             self._publish_task_admission_wakeup(
@@ -1247,7 +1252,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         self, cur: Any, request: TaskCreate, task: Task
     ) -> TaskRetryKeyState | None:
         """Count a keyed task inside its insert transaction; return the state if refused."""
-        keyed = task_retry_key_request(request)
+        keyed = task_retry_key_request(request, task)
         if keyed is None:
             return None
         # The caller holds the task identity lock, so this check is exact.
@@ -1259,7 +1264,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         # Store time sampled after the key lock wait, right before the decision.
         now = await self._verified_evidence_now(cur)
         state, admitted = admit_task_retry_key(
-            prior, retry_key=keyed[0], budget=keyed[1], task_id=task.id, now=now
+            prior,
+            retry_key=keyed[0],
+            budget=keyed[1],
+            task_id=task.id,
+            now=now,
+            budget_is_explicit=request.retry_budget is not None,
         )
         if state is not prior:
             await cur.execute(
@@ -1276,6 +1286,57 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         row = await cur.fetchone()
         return None if row is None else stored_task_retry_key_state(row[0], retry_key)
 
+    async def task_event_remaining_seconds(self, retry_key: str) -> float | None:
+        retry_key = await unscoped_task_retry_key(retry_key)
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            state = await self._load_task_retry_key_row(cur, retry_key)
+            if state is None:
+                raise RuntimeError("Task event association has no durable budget record.")
+            if state.status.value != "active":
+                return 0.0
+            deadline = state.elapsed_deadline
+            now = await self._verified_evidence_now(cur)
+            return None if deadline is None else max(0.0, (deadline - now).total_seconds())
+
+    async def refresh_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
+        retry_key = await unscoped_task_retry_key(retry_key)
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            await self._lock_verified_work_identity(cur, "retry-key", retry_key)
+            state = await self._load_task_retry_key_row(cur, retry_key)
+            if state is None:
+                return None
+            updated = expire_task_retry_key(state, now=await self._verified_evidence_now(cur))
+            if updated is not state:
+                await cur.execute(
+                    "UPDATE cayu_task_retry_keys SET state_json = %s WHERE retry_key = %s",
+                    (updated.model_dump_json(), retry_key),
+                )
+            await conn.commit()
+            return updated
+
+    async def expired_task_event_ids(self, *, limit: int = 100) -> list[str]:
+        await unscoped_task_retry_key("maintenance")
+        limit = _validate_task_positive_int(limit, "limit")
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            now = await self._verified_evidence_now(cur)
+            await cur.execute(
+                """SELECT t.id FROM cayu_tasks t JOIN cayu_task_retry_keys k
+                   ON t.invocation->>'event_retry_key' = k.retry_key
+                   WHERE t.status NOT IN ('completed', 'failed', 'cancelled')
+                   AND (t.status_reason IS NULL OR t.status_reason NOT IN
+                       ('cancellation_requested', 'retry_cancellation_requested'))
+                   AND (k.state_json::jsonb->>'status' != 'active' OR
+                       (k.state_json::jsonb->>'first_attempt_at')::timestamptz +
+                       (k.state_json::jsonb->'budget'->>'max_elapsed_seconds')::double precision
+                       * interval '1 second' <= %s)
+                   ORDER BY t.created_at, t.id LIMIT %s""",
+                (now, limit),
+            )
+            return [row[0] for row in await cur.fetchall()]
+
     async def load_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
         retry_key = await unscoped_task_retry_key(retry_key)
         await self._ensure_ready()
@@ -1288,11 +1349,29 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         prior: Task | None,
         current: Task,
         *,
+        event_admission: bool = False,
+        event_now: datetime | None = None,
         operation_id: str | None = None,
         settled_execution: tuple[str, str, datetime] | None = None,
     ) -> None:
         from cayu.storage._postgres_task_graphs import record_transition
 
+        event_key = current.invocation.event_retry_key
+        if event_key is not None:
+            await self._lock_verified_work_identity(cur, "retry-key", event_key)
+            state = await self._load_task_retry_key_row(cur, event_key)
+            if state is not None:
+                updated = observe_task_retry_key_transition(
+                    state,
+                    None if event_admission else prior,
+                    current,
+                    now=await self._verified_evidence_now(cur) if event_now is None else event_now,
+                )
+                if updated is not state:
+                    await cur.execute(
+                        "UPDATE cayu_task_retry_keys SET state_json = %s WHERE retry_key = %s",
+                        (updated.model_dump_json(), event_key),
+                    )
         await record_transition(self, cur, prior, current, settled_execution=settled_execution)
         await self._record_schedule_transition(cur, prior, current, operation_id=operation_id)
 
@@ -3538,6 +3617,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         await conn.commit()
                         return replayed
 
+                    event_state = None
+                    if task.invocation.event_retry_key is not None:
+                        await self._lock_verified_work_identity(
+                            cur, "retry-key", task.invocation.event_retry_key
+                        )
+                        event_state = await self._load_task_retry_key_row(
+                            cur, task.invocation.event_retry_key
+                        )
                     now = await self._database_now(cur)
                     series_now = self._clock() if self._clock_is_injected else now
                     if request.lease_expires_at is None:
@@ -3555,6 +3642,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         request,
                         now=now,
                         series_now=series_now,
+                        event_refusal=task_event_retry_refusal(event_state, now=series_now),
                     )
                     assert settled.retry_series is not None
                     await cur.execute(
@@ -3620,11 +3708,19 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                                 "SELECT pg_notify(%s, %s)",
                                 (_TASK_ADMISSION_NOTIFY_CHANNEL, ""),
                             )
-                    await self._record_task_transition(cur, task, durable_task)
+                    await self._record_task_transition(
+                        cur, task, durable_task, event_now=series_now
+                    )
                     if successor is not None:
                         current_successor = await self._load_task(cur, successor.id)
                         assert current_successor is not None
-                        await self._record_task_transition(cur, successor, current_successor)
+                        await self._record_task_transition(
+                            cur,
+                            successor,
+                            current_successor,
+                            event_admission=True,
+                            event_now=series_now,
+                        )
                     receipt = TaskRetrySettlementResult(
                         task_id=request.task_id,
                         idempotency_key=request.idempotency_key,

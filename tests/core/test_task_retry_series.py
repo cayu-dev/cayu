@@ -45,6 +45,7 @@ from cayu.tasks.retry import (
     _task_retry_settlement_request_matches_sha256,
     prepare_task_retry_settlement,
 )
+from cayu.tasks.retry_budgets import TaskRetryBudget
 from cayu.tasks.terminalization import TaskTerminalizationConflict
 from cayu.tasks.worker import run_task_worker
 from cayu.vaults.redaction import SecretRedactor
@@ -1603,6 +1604,8 @@ def test_task_retry_deadline_drain_honors_late_operator_cancellation(
         await store.create_task(
             TaskCreate(
                 task_id="deadline-cancellation-race",
+                # Exercise the series-only drain contract independently of event cancellation.
+                retry_budget=TaskRetryBudget.unlimited(),
                 type="job",
                 retry_policy=TaskRetryPolicy(max_attempts=2, max_elapsed_seconds=1),
             )
@@ -2624,6 +2627,8 @@ def test_task_worker_retains_active_handler_at_series_deadline_until_quiescent(
             created = await store.create_task(
                 TaskCreate(
                     task_id="task-worker-elapsed",
+                    # Exercise the series-only drain contract independently of event cancellation.
+                    retry_budget=TaskRetryBudget.unlimited(),
                     type="job",
                     retry_policy=TaskRetryPolicy(
                         max_attempts=2,
@@ -2811,6 +2816,7 @@ def test_task_worker_bounds_noncooperative_deadline_cancellation() -> None:
             TaskCreate(
                 task_id="noncooperative-deadline-handler",
                 type="job",
+                retry_budget=TaskRetryBudget.unlimited(),
                 retry_policy=TaskRetryPolicy(
                     max_attempts=2,
                     max_elapsed_seconds=0.1,
@@ -2882,6 +2888,7 @@ def test_task_worker_cancellation_during_deadline_drain_preserves_claim_until_qu
             TaskCreate(
                 task_id="cancelled-deadline-drain",
                 type="job",
+                retry_budget=TaskRetryBudget.unlimited(),
                 retry_policy=TaskRetryPolicy(
                     max_attempts=2,
                     max_elapsed_seconds=0.1,
@@ -2950,6 +2957,7 @@ def test_task_worker_defers_cancellation_during_deadline_terminalization() -> No
             TaskCreate(
                 task_id="cancelled-deadline-terminalization",
                 type="job",
+                retry_budget=TaskRetryBudget.unlimited(),
                 retry_policy=TaskRetryPolicy(
                     max_attempts=2,
                     max_elapsed_seconds=0.1,
@@ -3021,6 +3029,7 @@ def test_task_worker_reconciles_lost_deadline_enforcement_acknowledgement() -> N
             TaskCreate(
                 task_id="deadline-ack-lost",
                 type="job",
+                retry_budget=TaskRetryBudget.unlimited(),
                 retry_policy=TaskRetryPolicy(
                     max_attempts=2,
                     max_elapsed_seconds=0.1,
@@ -3086,6 +3095,7 @@ def test_task_worker_retries_indeterminate_deadline_enforcement() -> None:
             TaskCreate(
                 task_id="deadline-transient-failure",
                 type="job",
+                retry_budget=TaskRetryBudget.unlimited(),
                 retry_policy=TaskRetryPolicy(
                     max_attempts=2,
                     max_elapsed_seconds=0.1,

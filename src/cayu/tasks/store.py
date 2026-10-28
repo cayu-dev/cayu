@@ -279,6 +279,10 @@ class TaskStore(ABC):
     # True only when create_task admits ``TaskCreate.retry_key`` atomically with
     # the insert and load_task_retry_key reads the result.
     supports_task_retry_keys: ClassVar[bool] = False
+    # Requires automatic event association before invocation fingerprinting,
+    # atomic admission of roots and native successors, terminal transition
+    # accounting, and the store-clock maintenance/remaining-time methods below.
+    supports_task_event_execution: ClassVar[bool] = False
     supports_verified_work_contracts: ClassVar[bool] = False
     supports_completion_verifier_dispatches: ClassVar[bool] = False
     supports_completion_evaluations: ClassVar[bool] = False
@@ -1254,14 +1258,31 @@ class TaskStore(ABC):
 
         raise NotImplementedError("This TaskStore does not support task retry series.")
 
+    async def task_event_remaining_seconds(self, retry_key: str) -> float | None:
+        """Return the event's remaining wall time from the store's clock."""
+        raise NotImplementedError("This TaskStore does not enforce event execution budgets.")
+
+    async def refresh_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
+        """Persist deadline exhaustion using authoritative store time, without a submission."""
+        raise NotImplementedError("This TaskStore does not enforce event execution budgets.")
+
+    async def expired_task_event_ids(self, *, limit: int = 100) -> list[str]:
+        """Select nonterminal tasks whose event is closed or past its deadline.
+
+        This is a host-only maintenance query. Exclude tasks with a durable
+        cancellation request so draining owners cannot starve later events.
+        The limit batches reconciliation; it does not cap accepted events.
+        """
+        raise NotImplementedError("This TaskStore does not enforce event execution budgets.")
+
     async def load_task_retry_key(self, retry_key: str) -> TaskRetryKeyState | None:
         """Load one retry key's durable budget state, or ``None`` if it was never used.
 
         A store that sets ``supports_task_retry_keys`` must, inside the
         transaction that inserts a task with ``TaskCreate.retry_key``, rule out a
         duplicate task ID, call ``admit_task_retry_key`` with store time, persist
-        the returned state, and raise ``TaskRetryBudgetExhausted`` after
-        committing a refusal. The state survives deletion of the key's tasks.
+        the returned state, and raise ``TaskRetryBudgetExhausted`` (or
+        ``TaskEventAlreadyCompleted`` for success) after committing a refusal. The state survives deletion of the key's tasks.
         """
 
         raise NotImplementedError("This TaskStore does not support task retry keys.")

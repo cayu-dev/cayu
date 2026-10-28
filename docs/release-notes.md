@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+Upgrade: migrate task stores to revision 133 before starting event-aware workers.
+This semantic revision fences older binaries. Newly admitted ordinary root tasks
+receive a shared event budget (three attempts and 1,800 seconds by default).
+Declare `TaskCreate.event_id` or a stable `input["event_id"]` for resubmissions;
+independent roots get separate identities. The first admission fixes policy and
+deadline. Choose workload-specific limits with `TaskRetryBudget`, or explicitly
+use `TaskRetryBudget.unlimited()`. Existing tasks without an event association
+are not assigned a retroactive deadline. Custom task stores must implement the
+`supports_task_event_execution` contract before accepting ordinary root tasks.
+
+Event deadlines include human waits and cancel active handlers while retaining
+ownership through cleanup. This event bound remains in force when a shorter
+handler default is renewed after an approval. Resuming an existing session from
+a task durably installs the event bound before continuation, so subsequent
+processes and human-wait decisions retain it. Keep workers running for pending
+and paused event maintenance. Successful events reject duplicate submissions;
+attempt exhaustion becomes durable when the last admitted attempt fails.
+
 Upgrade: migrate persistent eval stores to additive revision 132 before starting
 the new runtime. Regenerate HTTP clients and rebuild custom dashboards for server
 contract 67.

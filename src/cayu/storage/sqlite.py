@@ -3082,7 +3082,10 @@ class SQLiteSessionStore(
                     expected_run_epoch=expected_run_epoch,
                 )
                 new_metadata = deadline_replacement.metadata_with_execution_deadline(
-                    json.loads(row["metadata_json"]), deadline, renewal
+                    json.loads(row["metadata_json"]),
+                    deadline,
+                    renewal,
+                    status=SessionStatus(row["status"]),
                 )
                 self._connection.execute(
                     "UPDATE cayu_sessions SET metadata_json = ?, updated_at = ? WHERE id = ?",

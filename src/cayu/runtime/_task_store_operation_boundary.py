@@ -41,7 +41,11 @@ from cayu.tasks.groups import (
     TaskGroupUnavailable,
 )
 from cayu.tasks.records import TaskClaimLost
-from cayu.tasks.retry_budgets import TaskRetryBudgetExhausted, TaskRetryKeyState
+from cayu.tasks.retry_budgets import (
+    TaskEventAlreadyCompleted,
+    TaskRetryBudgetExhausted,
+    TaskRetryKeyState,
+)
 from cayu.tasks.scheduling import TaskScheduleConflict
 from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
@@ -551,7 +555,7 @@ def _detached_retry_budget_exhaustion(
     error: BaseException,
     *,
     redactor: SecretRedactor,
-) -> TaskRetryBudgetExhausted | None:
+) -> TaskRetryBudgetExhausted | TaskEventAlreadyCompleted | None:
     """Rebuild a refused retry key with a detached copy of its validated state.
 
     The state is the caller's contract (it says the key gave up for good), so it
@@ -559,7 +563,8 @@ def _detached_retry_budget_exhaustion(
     otherwise the ordinary classification applies.
     """
 
-    if type(error) is not TaskRetryBudgetExhausted:
+    error_type = type(error)
+    if error_type is not TaskRetryBudgetExhausted and error_type is not TaskEventAlreadyCompleted:
         return None
     state = getattr(error, "state", None)
     if type(state) is not TaskRetryKeyState:
@@ -568,7 +573,7 @@ def _detached_retry_budget_exhaustion(
         detached = TaskRetryKeyState.model_validate(state.model_dump(mode="python"))
     except Exception:
         return None
-    rebuilt = TaskRetryBudgetExhausted(detached)
+    rebuilt = error_type(detached)
     # Check decoded values too: JSON escaping can hide a secret from text matching.
     document = detached.model_dump_json()
     payload = detached.model_dump(mode="json")

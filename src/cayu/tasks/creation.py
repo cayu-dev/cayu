@@ -59,6 +59,7 @@ from cayu.tasks.retry import _task_retry_series_id, _task_retry_series_snapshot
 from cayu.tasks.retry_budgets import (
     TaskRetryBudget,
     copy_task_retry_budget,
+    task_event_key,
     validate_task_retry_key,
 )
 from cayu.tasks.scheduling import (
@@ -124,6 +125,7 @@ class TaskCreate(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     retry_policy: TaskRetryPolicy | None = None
+    event_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     retry_key: str | None = Field(default=None, exclude_if=lambda value: value is None)
     retry_budget: TaskRetryBudget | None = Field(
         default=None, exclude_if=lambda value: value is None
@@ -158,6 +160,11 @@ class TaskCreate(BaseModel):
     def copy_schedule_policy(cls, value: object) -> object:
         return revalidate_model_input(value, TaskSchedulePolicy)
 
+    @field_validator("event_id")
+    @classmethod
+    def validate_event_id(cls, value: str | None) -> str | None:
+        return None if value is None else require_clean_nonblank(value, "event_id")
+
     @field_validator("retry_key")
     @classmethod
     def validate_retry_key(cls, value: str | None) -> str | None:
@@ -170,12 +177,16 @@ class TaskCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_retry_key_shape(self) -> TaskCreate:
-        if self.retry_key is None:
-            if self.retry_budget is not None:
-                raise ValueError("retry_budget requires a retry_key.")
+        if self.retry_key is None and self.event_id is None and self.retry_budget is None:
             return self
         if self.session_id is not None or self.work_contract is not None:
             raise ValueError("Retry-keyed tasks must start as unattached queue work.")
+        if self.retry_key is None and (
+            self.parent_task_id is not None or self.schedule_policy is not None
+        ):
+            raise ValueError(
+                "Event budgets on child or scheduled tasks require an explicit retry_key."
+            )
         return self
 
     @model_validator(mode="after")
@@ -293,6 +304,7 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
                 request.retry_policy.model_dump(mode="python", warnings=False)
             )
         ),
+        event_id=request.event_id,
         retry_key=request.retry_key,
         retry_budget=copy_task_retry_budget(request.retry_budget),
         work_contract=copy_work_contract_ref(request.work_contract),
@@ -585,6 +597,7 @@ def _task_from_create(
     session_invocation: SessionInvocationBinding | None = None,
     retry_started_at: datetime | None = None,
     supports_verified_work_contracts: bool = False,
+    event_budget: bool = False,
 ) -> Task:
     if request.work_contract is not None and not supports_verified_work_contracts:
         raise NotImplementedError(
@@ -604,6 +617,10 @@ def _task_from_create(
         parent_task=parent_task,
         session_invocation=session_invocation,
     )
+    if event_budget:
+        event_key = task_event_key(request, task_id=task_id, invocation=invocation)
+        if event_key is not None:
+            invocation = invocation.model_copy(update={"event_retry_key": event_key})
     effective_session_binding = (
         session_invocation if session_invocation is not None else request._runtime_session_binding
     )

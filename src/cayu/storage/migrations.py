@@ -559,6 +559,8 @@ REVISIONS: tuple[Revision, ...] = (
     # Bind authored child publication to its exact parent independently of portable content.
     Revision(revision=131, kind=RevisionKind.ADDITIVE, compatible_from=127),
     Revision(revision=132, kind=RevisionKind.ADDITIVE, compatible_from=127),
+    # Every worker must preserve and enforce the durable event execution budget.
+    Revision(revision=133, kind=RevisionKind.BREAKING, compatible_from=133),
 )
 
 #: The revision an empty database is initialized to.

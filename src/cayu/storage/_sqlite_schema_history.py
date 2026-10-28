@@ -731,6 +731,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
             json_extract(invocation_json, '$."root_session_id"'), created_at DESC, id
         );
     """,
+    133: """CREATE INDEX IF NOT EXISTS idx_cayu_tasks_event_retry_key
+        ON cayu_tasks(json_extract(invocation_json, '$.event_retry_key'), status);""",
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

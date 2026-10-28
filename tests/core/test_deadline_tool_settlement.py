@@ -53,7 +53,15 @@ from cayu.tools.user_input import UserInputTool
     ],
 )
 def test_deadline_failure_retains_exact_settlement_authority(
-    backend, worker, gate, manual_attempt, tmp_path, expiry, monkeypatch, structured=False
+    backend,
+    worker,
+    gate,
+    manual_attempt,
+    tmp_path,
+    expiry,
+    monkeypatch,
+    structured=False,
+    event_owned=False,
 ):
     import cayu.deadlines as deadline_module
 
@@ -164,8 +172,23 @@ def test_deadline_failure_retains_exact_settlement_authority(
             events = []
             input_response = None
             boundary = ExecutionDeadline.after(600)
+
+            async def run_owned(request):
+                from contextlib import AsyncExitStack
+
+                from cayu.deadlines import HandlerTimeLimit, task_event_deadline_scope
+
+                async with AsyncExitStack() as stack:
+                    if event_owned:
+                        await stack.enter_async_context(
+                            HandlerTimeLimit(600, grace_s=0, source="task_event")
+                        )
+                        await stack.enter_async_context(task_event_deadline_scope(boundary))
+                    async for event in app.run(request):
+                        yield event
+
             try:
-                async for event in app.run(
+                async for event in run_owned(
                     RunRequest(
                         session_id="deadline-settlement",
                         structured_output=structured_spec("tool") if structured else None,

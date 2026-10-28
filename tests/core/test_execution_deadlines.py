@@ -1197,13 +1197,21 @@ def test_task_worker_execution_timeout_is_validated():
 @pytest.mark.parametrize("copied", [False, True])
 def test_task_worker_execution_timeout_defaults_runs_and_keeps_explicit_deadlines(copied):
     from cayu.sessions.requests import copy_run_request
-    from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus, run_task_worker
+    from cayu.tasks import (
+        InMemoryTaskStore,
+        TaskCreate,
+        TaskRetryBudget,
+        TaskStatus,
+        run_task_worker,
+    )
     from cayu.tasks.worker import complete_managed_task
 
     async def scenario():
         store = InMemoryTaskStore()
         app = CayuApp(task_store=store, enable_logging=False)
-        task = await store.create_task(TaskCreate(type="deadline-test"))
+        task = await store.create_task(
+            TaskCreate(type="deadline-test", retry_budget=TaskRetryBudget.unlimited())
+        )
         explicit = ExecutionDeadline.after(3600, source="application")
         app.register_provider(
             ScriptedModelProvider(
@@ -1255,6 +1263,7 @@ def test_task_worker_execution_timeout_ends_hung_run_and_releases_task(attached,
         InMemoryTaskStore,
         TaskCreate,
         TaskHandlerOutcome,
+        TaskRetryBudget,
         TaskStatus,
         run_task_worker,
     )
@@ -1277,7 +1286,9 @@ def test_task_worker_execution_timeout_ends_hung_run_and_releases_task(attached,
         app = CayuApp(task_store=store, enable_logging=False)
         app.register_provider(StalledProvider([]), default=True)
         app.register_agent(AgentSpec(name="worker", model="scripted"))
-        task = await store.create_task(TaskCreate(type="deadline-test"))
+        task = await store.create_task(
+            TaskCreate(type="deadline-test", retry_budget=TaskRetryBudget.unlimited())
+        )
         outcomes = []
 
         async def handler(app, task, worker_id):

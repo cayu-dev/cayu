@@ -692,6 +692,7 @@ from cayu.sessions.requests import (
     copy_fork_session_request,
     copy_resume_request,
     run_request_with_runtime_generated_authority,
+    with_event_base_deadline,
 )
 from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import system_prompt_messages_sha256
@@ -6975,6 +6976,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
+        request = with_event_base_deadline(request)
         if "execution_deadline" in request.model_fields_set:
             request = request.model_copy(
                 update={"execution_deadline": request.execution_deadline.with_origin("explicit")}

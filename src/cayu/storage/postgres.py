@@ -2504,7 +2504,10 @@ class PostgresSessionStore(
                         expected_run_epoch=expected_run_epoch,
                     )
                     new_metadata = deadline_replacement.metadata_with_execution_deadline(
-                        pg_support._json_obj(row[3]), deadline, renewal
+                        pg_support._json_obj(row[3]),
+                        deadline,
+                        renewal,
+                        status=SessionStatus(row[2]),
                     )
                     await cur.execute(
                         "UPDATE cayu_sessions SET metadata = %s, updated_at = %s WHERE id = %s",

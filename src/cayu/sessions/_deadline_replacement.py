@@ -10,11 +10,20 @@ from typing import Any
 
 from cayu._validation import copy_session_metadata
 from cayu.deadlines import (
+    EXECUTION_DEADLINE_METADATA_KEY,
     EXECUTION_DEADLINE_METADATA_KEYS,
+    EXECUTION_DEADLINE_ORIGIN_METADATA_KEY,
     EXECUTION_DEADLINE_RENEWAL_METADATA_KEY,
+    TASK_EVENT_BINDING_METADATA_KEY,
+    TASK_EVENT_DEADLINE_METADATA_KEY,
     ExecutionDeadline,
     ExecutionDeadlineRenewal,
+    current_task_event_deadline,
+    current_task_event_id,
+    deadline_from_metadata,
     deadline_metadata,
+    effective_deadline,
+    task_event_deadline_from_metadata,
 )
 from cayu.sessions._invocation_scope import _current_session_run_epoch
 from cayu.sessions.authority import SessionRunFenced
@@ -66,17 +75,70 @@ def require_replacement_deadline(
     return deadline, renewal
 
 
+def continuation_event_metadata(
+    metadata: dict[str, Any],
+    status: SessionStatus | None,
+    *,
+    explicit: bool,
+    allow_rebind: bool = False,
+) -> dict[str, Any]:
+    """A settled turn can accept a new event; pending human waits keep their bound."""
+    binding = metadata.get(TASK_EVENT_BINDING_METADATA_KEY)
+    event_id = current_task_event_id()
+    if (
+        status is not SessionStatus.COMPLETED
+        and not (allow_rebind and status in {SessionStatus.FAILED, SessionStatus.INTERRUPTED})
+    ) or not isinstance(binding, dict):
+        return metadata
+    if not (
+        (event_id is not None and event_id != binding["event_id"])
+        or (event_id is None and explicit)
+    ):
+        return metadata
+    restored = {k: v for k, v in metadata.items() if k not in EXECUTION_DEADLINE_METADATA_KEYS}
+    restored[EXECUTION_DEADLINE_METADATA_KEY] = binding["base_deadline"]
+    if binding.get("base_origin") is not None:
+        restored[EXECUTION_DEADLINE_ORIGIN_METADATA_KEY] = binding["base_origin"]
+    return restored
+
+
 def metadata_with_execution_deadline(
     metadata: dict[str, Any],
     deadline: ExecutionDeadline,
     renewal: ExecutionDeadlineRenewal | None = None,
+    *,
+    status: SessionStatus | None = None,
 ) -> dict[str, Any]:
     """Session metadata with ``deadline``, its origin and renewal in place of the stored ones."""
 
+    metadata = continuation_event_metadata(
+        metadata,
+        status,
+        explicit=deadline.origin == "explicit",
+        allow_rebind=deadline._event_rebinding_allowed,
+    )
+    binding = metadata.get(TASK_EVENT_BINDING_METADATA_KEY)
+    explicit = deadline.origin == "explicit"
+    base = deadline if deadline.origin == "explicit" else deadline_from_metadata(metadata)
     replaced = {
         key: value for key, value in metadata.items() if key not in EXECUTION_DEADLINE_METADATA_KEYS
     }
+    event = effective_deadline(
+        task_event_deadline_from_metadata(metadata),
+        current_task_event_deadline(),
+    )
+    deadline = effective_deadline(deadline, event)
     replaced.update(deadline_metadata(deadline))
+    if event.expires_at is not None:
+        replaced[TASK_EVENT_DEADLINE_METADATA_KEY] = event.model_dump(mode="json")
+        if binding is not None and not explicit:
+            replaced[TASK_EVENT_BINDING_METADATA_KEY] = binding
+        else:
+            replaced[TASK_EVENT_BINDING_METADATA_KEY] = {
+                "event_id": binding["event_id"] if binding is not None else current_task_event_id(),
+                "base_deadline": base.model_dump(mode="json"),
+                "base_origin": base.origin,
+            }
     if renewal is not None and deadline.expires_at is not None:
         replaced[EXECUTION_DEADLINE_RENEWAL_METADATA_KEY] = renewal.model_dump(mode="json")
     return copy_session_metadata(replaced)

@@ -1167,6 +1167,7 @@ def _settled_task_retry_attempt(
     *,
     now: datetime,
     series_now: datetime,
+    event_refusal: TaskRetrySeriesDisposition | None = None,
 ) -> tuple[Task, Task | None]:
     series = task.retry_series
     if series is None:
@@ -1214,7 +1215,9 @@ def _settled_task_retry_attempt(
     if requested_cancellation is not None:
         status = TaskStatus.CANCELLED
         disposition = TaskRetrySeriesDisposition.CANCELLED
-    elif elapsed_deadline is not None and series_now >= elapsed_deadline:
+    elif event_refusal is TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED or (
+        elapsed_deadline is not None and series_now >= elapsed_deadline
+    ):
         status = TaskStatus.FAILED
         disposition = TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED
         outcome_result = None
@@ -1246,7 +1249,9 @@ def _settled_task_retry_attempt(
             request.retry_after_seconds or 0.0,
         )
         next_eligible_at = series_now + timedelta(seconds=backoff_seconds)
-        if series.attempt >= policy.max_attempts:
+        if event_refusal is not None:
+            disposition = event_refusal
+        elif series.attempt >= policy.max_attempts:
             disposition = TaskRetrySeriesDisposition.ATTEMPTS_EXHAUSTED
         elif elapsed_deadline is not None and next_eligible_at >= elapsed_deadline:
             disposition = TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED

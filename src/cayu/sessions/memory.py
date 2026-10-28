@@ -2894,7 +2894,7 @@ class InMemorySessionStore(
             updated = session.model_copy(
                 update={
                     "metadata": deadline_replacement.metadata_with_execution_deadline(
-                        session.metadata, deadline, renewal
+                        session.metadata, deadline, renewal, status=session.status
                     ),
                     "updated_at": self._ownership_clock(),
                 }

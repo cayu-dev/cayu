@@ -743,6 +743,10 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "UPDATE cayu_transcript_messages SET message_bytes = octet_length(message::text) "
         "WHERE message_bytes IS NULL",
     ),
+    133: (
+        "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_event_retry_key "
+        "ON cayu_tasks ((invocation->>'event_retry_key'), status)",
+    ),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

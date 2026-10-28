@@ -153,8 +153,18 @@ Deep guide: [task scheduling](https://github.com/cayu-dev/cayu/blob/main/docs/ta
 Choose the event's completion contract before setting timeouts. A service that
 must eventually deliver a result may intentionally retry for hours or days.
 A service with a deadline must instead expose a terminal failure when it gives
-up. Cayu does not infer event identity from equal inputs or impose a universal
-event deadline. Two identical jobs can be independent work.
+up. Ordinary root tasks receive a bounded event automatically: three attempts
+and 1,800 seconds by default. An explicit `retry_budget` selects the workload's
+limits; otherwise `retry_policy` supplies them when present. There is no universal
+ten-minute cap. Two identical jobs can be independent work.
+
+`TaskCreate.event_id` identifies a logical event within its task type and access
+scope. A nonblank string `input["event_id"]` supplies that identity when the explicit
+field is absent; `retry_key` overrides it. With neither identity, each root is an
+independent event. Resubmission must preserve identity: Cayu does not infer it
+from equal payloads. Managed schedules, session continuations, child work and
+verified-work contracts retain their own contracts; explicit retry keys can
+associate scheduled or child queue work with an event.
 
 Prefer submitting an event once and letting `TaskRetryPolicy` own its failed
 attempts. Its elapsed budget spans the retry series and the worker enforces it
@@ -204,11 +214,24 @@ must report failed attempts through the task retry APIs (or let the worker
 handle their exceptions), not complete failed work as successful.
 
 If the application needs to own resubmission, pass a stable `retry_key` and an
-explicit `TaskRetryBudget` on every submission. That budget only decides whether
-another task may be created: its elapsed limit does not cancel an already-running
-handler. Carry the event's remaining execution deadline into attempts as well.
-`TaskRetryBudget.unlimited()` explicitly opts out of admission limits for an
-event that must keep retrying. A handler timeout alone does not bound resubmission.
+explicit `TaskRetryBudget` on every submission, or use `event_id`. The first
+admission fixes policy and deadline. Native successors and resubmissions consume
+the same attempt budget; restarting a worker cannot reset the clock. Workers
+cancel active handlers when the shared deadline expires, including time spent
+waiting for human input. Pending and paused tasks expire during worker maintenance.
+Keep a worker running for maintenance; a stopped process cannot enforce a deadline.
+
+Attempt exhaustion becomes durable when the final admitted attempt fails.
+Using all slots blocks new submissions without cancelling admitted attempts.
+Success closes the event and refuses duplicate submissions with
+`TaskEventAlreadyCompleted`. Inspect `task.invocation.event_retry_key` with
+`cayu inspect --retry-key KEY` for the policy, deadline, counts and terminal reason.
+
+`TaskRetryBudget.unlimited()` explicitly opts out of attempt and elapsed limits;
+success deduplication still applies. Cancellation requests do not prove cleanup:
+a handler that resists cancellation retains its owner until it finishes. Handler
+cleanup must await its owned operations; returning while detached work runs does
+not make that work safe. External effects still require idempotency.
 
 `cayu check` warns with `TASK_EVENT_RETRY_POLICY_UNDECLARED` when source declares
 a bounded worker and unkeyed, policy-free task creation for the same literal
@@ -255,18 +278,18 @@ async def run_jobs(app, stop=None):
 
 
 async def retry_job(app, event_id, attempt, request):  # Your sweeper, after a failed task.
-    try:  # Same retry_key for every task of this event; TaskRetryBudget(...) changes the cap.
+    try:  # Choose TaskRetryBudget(...) on the first admission and keep it on every retry.
         await app.create_task(TaskCreate(task_id=f"invoice-{event_id}-{attempt}",
             type="invoice-job", input={"request": request}, retry_key=f"invoice-{event_id}"))
     except TaskRetryBudgetExhausted as exhausted:
-        return exhausted.state  # Given up for good: record it and stop retrying.
+        return exhausted.state  # Stop submitting; already-admitted attempts may still be active.
 ```
 
 Runs are unattached (`RunRequest.task_id` is absent). An interruption completes
 this launch task with a durable session reference; resolve that session's pending
 action, if any, and deliver the result in its continuation owner. Never retry a
 pause as a new payment session. Successful runs deliver before completing the task.
-Without `execution_timeout_s`, a hung call stays claimed. Which limit ends what:
+Without `execution_timeout_s`, the event deadline still bounds a hung call. Which limit ends what:
 
 - `execution_timeout_s` is the whole call, grace included: at 270 of 300 seconds
   new runs are refused and `current_handler_time_limit().expired` is true; at 300
@@ -277,8 +300,10 @@ Without `execution_timeout_s`, a hung call stays claimed. Which limit ends what:
   without one end when new runs are refused.
 - `retry_key` ends the event: tasks with one key (the event's ID, not the
   task's) share a `TaskRetryBudget`, by default 3 tasks within 30 minutes. The
-  next is refused with `TaskRetryBudgetExhausted` and the key stays given up, as
-  `cayu inspect --retry-key KEY` shows. Raise it with `retry_budget=`.
+  next is refused with `TaskRetryBudgetExhausted`; the key gives up after the
+  last admitted failure or when the shared deadline expires. Choose a different
+  budget with `retry_budget=` on the first admission. Inspect the durable reason
+  with `cayu inspect --retry-key KEY`.
 - `RetryPolicy` ends a model call that keeps hitting rate limits or outages:
   by default, at most 5 attempts. Rate limits and overloads have a 300-second
   retry budget (`max_retry_elapsed_s`), counted from the first attempt, with
@@ -293,7 +318,8 @@ happened, so make it idempotent. Don't catch `asyncio.CancelledError`: a
 handler that keeps running keeps its task claimed, with a `task_handler_timeout`
 cancellation request, until it returns. A run that pauses for a person returns;
 settling gives a run without its own `execution_deadline` back the time it had
-left, while an explicit deadline keeps running (settle with a new one). Without
+left, within its original event deadline. An explicit session deadline can be
+replaced, but replacement cannot extend the enclosing event deadline. Without
 `run_task_worker`, wrap the handler in `async with HandlerTimeLimit(300, grace_s=30):`
 and fail the task on `ExecutionDeadlineExceeded`. The generated timer worker sets
 no limit, so the sessions it continues inline follow their own deadlines.

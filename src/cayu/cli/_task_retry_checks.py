@@ -93,7 +93,18 @@ def task_retry_policy_diagnostics(
                 if any(
                     (value := keywords.get(key)) is not None
                     and not (isinstance(value, ast.Constant) and value.value is None)
-                    for key in ("retry_key", "retry_policy")
+                    for key in ("event_id", "retry_key", "retry_policy", "retry_budget")
+                ):
+                    continue
+                payload = keywords.get("input")
+                if isinstance(payload, ast.Dict) and any(
+                    isinstance(key, ast.Constant)
+                    and key.value == "event_id"
+                    and (
+                        not isinstance(value, ast.Constant)
+                        or (isinstance(value.value, str) and bool(value.value.strip()))
+                    )
+                    for key, value in zip(payload.keys, payload.values, strict=True)
                 ):
                     continue
                 kind = _literal(keywords.get("type"), constants)
@@ -106,8 +117,8 @@ def task_retry_policy_diagnostics(
             subject="task",
             path=path,
             message=(
-                f"Task type {kind!r} has a bounded worker but this creation has no event "
-                "retry policy. The handler timeout ends only this task."
+                f"Task type {kind!r} has a bounded worker but this creation has no explicit "
+                "event identity or retry policy. Independent roots get separate budgets."
             ),
             hint=(
                 "If the application resubmits failed events, choose an event retry policy: "

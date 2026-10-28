@@ -195,10 +195,21 @@ class TaskInvocation(BaseModel):
     )
     root_session_id: str | None = None
     source: TaskExecutionSource
+    event_retry_key: str | None = Field(default=None, exclude_if=lambda value: value is None)
     resource_access: ResourceExecutionBinding | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
     access_labels: Mapping[str, str] = Field(default_factory=dict, exclude_if=lambda v: not v)
+
+    @field_validator("event_retry_key")
+    @classmethod
+    def validate_event_retry_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = require_durable_clean_nonblank(value, "event_retry_key")
+        if len(value.encode("utf-8")) > 256:
+            raise ValueError("event_retry_key must be at most 256 UTF-8 bytes.")
+        return value
 
     @field_validator("access_labels", mode="before")
     @classmethod
@@ -273,6 +284,7 @@ def copy_task_invocation(value: TaskInvocation) -> TaskInvocation:
         raise TypeError("Task invocation provenance must be a TaskInvocation instance.")
     return TaskInvocation(
         access_labels=value.access_labels,
+        event_retry_key=value.event_retry_key,
         schema_version=value.schema_version,
         resource_access=value.resource_access,
         origin=copy_invocation_origin(value.origin),

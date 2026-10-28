@@ -80,10 +80,13 @@ def test_default_budget_refuses_the_fourth_task_for_a_key_and_stays_given_up(
 
             with pytest.raises(TaskRetryBudgetExhausted) as refused:
                 await app.create_task(_attempt("e1", 4))
-            given_up = refused.value.state
+            assert refused.value.state.status is TaskRetryKeyStatus.ACTIVE
+            for attempt in (1, 2, 3):
+                await store.fail_task(f"evt-e1-{attempt}", {"code": "failed"})
+            given_up = await store.load_task_retry_key("event:e1")
             assert given_up.status is TaskRetryKeyStatus.GIVEN_UP
             assert given_up.given_up_reason is TaskRetrySeriesDisposition.ATTEMPTS_EXHAUSTED
-            assert given_up.refused_task_id == "evt-e1-4"
+            assert given_up.refused_task_id is None
             assert given_up.attempts == 3
             assert await store.load_task("evt-e1-4") is None
             # Durable and terminal: a later, larger budget does not reopen the key.
@@ -93,9 +96,9 @@ def test_default_budget_refuses_the_fourth_task_for_a_key_and_stays_given_up(
                     _attempt("e1", 5, retry_budget=TaskRetryBudget(max_attempts=50))
                 )
             assert await store.load_task("evt-e1-5") is None
-            assert (await store.load_task_retry_key("event:e1")).refused_task_id == "evt-e1-4"
+            assert (await store.load_task_retry_key("event:e1")).refused_task_id is None
 
-            # Keys are independent, and unkeyed tasks are not counted.
+            # Separate keys and independent unkeyed jobs have separate event budgets.
             await app.create_task(_attempt("e2", 1))
             await app.create_task(TaskCreate(task_id="plain", type="support.webhook_event"))
             assert (await store.load_task_retry_key("event:e2")).attempts == 1
@@ -127,11 +130,12 @@ def test_authors_can_raise_or_disable_the_budget(backend, tmp_path, request):
         assert state.attempts == 11
         assert state.attempts_remaining is None and state.elapsed_deadline is None
 
-        # Raising the cap in code applies to a key that has not given up yet.
+        # The first admission fixes policy; later submissions cannot reset its budget.
         for attempt in (1, 2, 3):
             await store.create_task(_attempt("later", attempt))
-        await store.create_task(_attempt("later", 4, retry_budget=raised))
-        assert (await store.load_task_retry_key("event:later")).attempts == 4
+        with pytest.raises(ValueError, match="fixed by its first admission"):
+            await store.create_task(_attempt("later", 4, retry_budget=raised))
+        assert (await store.load_task_retry_key("event:later")).attempts == 3
         await _close(store)
 
     asyncio.run(scenario())
@@ -158,8 +162,9 @@ def test_elapsed_budget_is_measured_from_the_first_task_with_store_time():
 
 
 def test_retry_key_shape_is_validated():
-    with pytest.raises(ValueError, match="requires a retry_key"):
-        TaskCreate(type="job", retry_budget=TaskRetryBudget())
+    assert TaskCreate(type="job", retry_budget=TaskRetryBudget()).retry_key is None
+    with pytest.raises(ValueError, match="unattached queue work"):
+        TaskCreate(type="job", session_id="s1", retry_budget=TaskRetryBudget())
     with pytest.raises(ValueError, match="unattached queue work"):
         TaskCreate(type="job", session_id="s1", retry_key="k")
     with pytest.raises(ValueError, match="at most"):
@@ -245,9 +250,8 @@ def test_cayu_inspect_shows_a_given_up_retry_key(tmp_path: Path, monkeypatch, ca
     async def give_up():
         store = SQLiteTaskStore(database)
         for attempt in (1, 2, 3):
-            await store.create_task(_attempt("seen", attempt))
-        with pytest.raises(TaskRetryBudgetExhausted):
-            await store.create_task(_attempt("seen", 4))
+            task = await store.create_task(_attempt("seen", attempt))
+            await store.fail_task(task.id, {"code": "failed"})
         await store.close()
 
     asyncio.run(give_up())
@@ -273,7 +277,7 @@ def build_app():
     assert shown["given_up_reason"] == "attempts_exhausted"
     assert shown["attempts"] == 3 and shown["attempts_remaining"] == 0
     assert shown["latest_task_id"] == "evt-seen-3"
-    assert shown["refused_task_id"] == "evt-seen-4"
+    assert shown["refused_task_id"] is None
 
     assert main(["inspect", "--retry-key", "event:seen", "--table"]) == 0
     text = capsys.readouterr().out
@@ -312,9 +316,9 @@ def test_scheduled_keyed_task_past_the_budget_keeps_the_exception_and_state(
                 with pytest.raises(TaskRetryBudgetExhausted) as refused:
                     await app.create_task(scheduled)
             state = refused.value.state
-            assert state.status is TaskRetryKeyStatus.GIVEN_UP
-            assert state.given_up_reason is TaskRetrySeriesDisposition.ATTEMPTS_EXHAUSTED
-            assert state.refused_task_id == "evt-later-3"
+            assert state.status is TaskRetryKeyStatus.ACTIVE
+            assert state.given_up_reason is None
+            assert state.refused_task_id is None
             assert await store.load_task_retry_key("event:later") == state
         finally:
             await app.aclose()

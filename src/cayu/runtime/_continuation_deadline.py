@@ -1,6 +1,6 @@
 """Pick and store the execution deadline a stored session continues under.
 
-A session keeps the deadline it started with, with two exceptions applied here
+A session keeps the deadline it started with, with these changes applied here
 before it continues:
 
 - the resume, approval or answer carries ``execution_deadline``: that deadline
@@ -8,7 +8,9 @@ before it continues:
 - a person settles an approval or answers a question on a top-level session
   whose deadline was only the default for runs started inside a task handler
   (origin ``run_default``): the session gets back the time it had left when it
-  paused, so the wait for the person doesn't count.
+  paused, so the wait for the person doesn't count;
+- a task event durably bounds any existing session it continues, including
+  approvals and answers, before work runs under that bound.
 
 Explicit and enclosing-scope deadlines are never extended without a request.
 """
@@ -25,8 +27,11 @@ from cayu.deadlines import (
     ExecutionDeadline,
     ExecutionDeadlineRenewal,
     current_execution_deadline,
+    current_task_event_deadline,
+    effective_deadline,
     renewal_from_metadata,
     resumed_execution_deadline,
+    task_event_deadline_from_metadata,
     waiting_for_a_person_counts,
 )
 from cayu.events import Event, EventType
@@ -34,6 +39,7 @@ from cayu.runtime._recovery_admission import RecoveryAdmissionHook
 from cayu.runtime._run_limit_stream import DeadlineOutcomeAdmission
 from cayu.sessions._deadline_replacement import (
     RUN_IN_PROGRESS_STATUSES,
+    continuation_event_metadata,
     metadata_with_execution_deadline,
 )
 from cayu.sessions._pending_approval_reader import PENDING_TOOL_APPROVAL_CHECKPOINT_KEY
@@ -112,9 +118,10 @@ async def renewed_human_wait_deadline(
     if enclosing.expires_at is not None and enclosing.expires_at < renewed.expires_at:
         # Never outlive the scope the decision is settled in.
         renewed = enclosing.model_copy(update={"source": stored.source, "scope": stored.scope})
-    return renewed.with_origin("run_default"), ExecutionDeadlineRenewal(
-        pause_event_id=pause.id, seconds_left=left_at_pause
+    renewed = effective_deadline(
+        renewed.with_origin("run_default"), task_event_deadline_from_metadata(session.metadata)
     )
+    return renewed, ExecutionDeadlineRenewal(pause_event_id=pause.id, seconds_left=left_at_pause)
 
 
 async def continuation_deadline_replacement(
@@ -135,23 +142,56 @@ async def continuation_deadline_replacement(
 
     if session.status in RUN_IN_PROGRESS_STATUSES:
         return None
+    checkpoint = await store.load_checkpoint(session.id) or {}
+    allow_rebind = not human_decision and not (
+        checkpoint.get(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY) or checkpoint.get("pending_user_input")
+    )
+    metadata = continuation_event_metadata(
+        session.metadata, session.status, explicit=requested is not None, allow_rebind=allow_rebind
+    )
+    event_rebound = metadata is not session.metadata
+    if event_rebound:
+        session = session.model_copy(update={"metadata": metadata})
+    event = current_task_event_deadline()
+    stored_event = task_event_deadline_from_metadata(session.metadata)
+    event_changed = event_rebound or (
+        event.expires_at is not None
+        and (stored_event.expires_at is None or event.expires_at < stored_event.expires_at)
+    )
     renewal: ExecutionDeadlineRenewal | None = None
     if requested is not None:
         replacement = requested.with_origin("explicit")
     elif human_decision:
         renewed = await renewed_human_wait_deadline(store, session)
         if renewed is None:
-            return None
-        replacement, renewal = renewed
+            if not event_changed:
+                return None
+            replacement = session.execution_deadline
+        else:
+            replacement, renewal = renewed
+    elif event_changed:
+        replacement = session.execution_deadline
     else:
         return None
-    # The same admission a new run gets: refused when already expired or when
-    # an enclosing scope is shorter, before anything is stored.
+    # An event may admit a pre-existing session, but its outer bound must be
+    # durable before any resumed work runs. Ordinary transient scopes still
+    # cannot silently tighten a stored execution.
+    replacement = effective_deadline(replacement, stored_event, event)
     resumed_execution_deadline(replacement).require_admission("resume")
     stored = session.execution_deadline
-    if stored.expires_at == replacement.expires_at and stored.origin == replacement.origin:
+    if (
+        requested is None
+        and not event_changed
+        and stored.expires_at == replacement.expires_at
+        and stored.origin == replacement.origin
+    ):
         return None
-    return replacement, renewal
+    # Stores apply the event bound atomically. Preserve an explicit independent
+    # deadline too, so the next event cannot discard that session-level limit.
+    retained = requested.with_origin("explicit") if requested is not None else replacement
+    retained = retained.model_copy()
+    retained._event_rebinding_allowed = event_rebound and allow_rebind
+    return retained, renewal
 
 
 async def _continues_the_session_as_it_is(
@@ -205,7 +245,7 @@ class ContinuationDeadlinePlan:
         return self.session.model_copy(
             update={
                 "metadata": metadata_with_execution_deadline(
-                    self.session.metadata, self.deadline, self.renewal
+                    self.session.metadata, self.deadline, self.renewal, status=self.session.status
                 )
             }
         )

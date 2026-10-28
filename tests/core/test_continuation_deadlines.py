@@ -885,3 +885,53 @@ def test_a_store_that_replaces_only_between_runs_stores_before_admission(
             await app.aclose()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("gate", ["approval", "user_input"])
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_human_wait_renewal_cannot_extend_task_event_deadline(
+    gate, backend, tmp_path, request, skip_ahead
+):
+    from cayu.deadlines import task_event_deadline_from_metadata, task_event_deadline_scope
+    from cayu.runtime._continuation_deadline import continuation_deadline_replacement
+
+    async def scenario():
+        store = _store(backend, tmp_path, request)
+        app = _app(store)
+        session_id = f"event-wait-{uuid4().hex}"
+        event = ExecutionDeadline.after(180, source="task_event")
+        try:
+            async with task_event_deadline_scope(event):
+                await _pause_in_handler(app, session_id, gate)
+            session = await store.load(session_id)
+            # The shorter handler default remains renewable, with its outer event
+            # bound stored independently so a new process preserves both rules.
+            assert session.execution_deadline.origin == "run_default"
+            assert (
+                task_event_deadline_from_metadata(session.metadata).expires_at == event.expires_at
+            )
+            skip_ahead(150)
+            replacement, _ = await continuation_deadline_replacement(
+                store,
+                session,
+                None,
+                human_decision=True,
+            )
+            assert replacement.expires_at == event.expires_at
+            assert replacement.origin == "enclosing"
+            with pytest.raises(ExecutionDeadlineExceeded):
+                skip_ahead(31)
+                await continuation_deadline_replacement(
+                    store,
+                    session,
+                    ExecutionDeadline.after(3600),
+                    human_decision=True,
+                )
+            # The actual public approval/input operation also refuses work after
+            # the event expires, even when asked for a fresh longer run deadline.
+            with pytest.raises(ExecutionDeadlineExceeded):
+                await _settle(app, session_id, gate, ExecutionDeadline.after(3600))
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
