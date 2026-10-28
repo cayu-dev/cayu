@@ -117,6 +117,10 @@ the check accepts without executing them:
 - `Decimal("3")` or `Decimal(3)` with one string or integer literal, as a module
   constant, dataclass default or model default. Model fields may be annotated
   `Decimal` or `ZoneInfo`.
+- Cayu's configuration models `TaskRetryBudget(...)`, `TaskRetryPolicy(...)`,
+  `RunLimits(...)` and `RetryPolicy(...)` as module constants, imported from
+  `cayu.tasks`, `cayu.budgets` or `cayu.providers`, with keyword arguments that
+  are literals or a literal `Decimal(...)`, and `TaskRetryBudget.unlimited()`.
 - `Path(...)` and `Path(...).resolve()`, for example `Path(__file__).resolve()`.
 - Type aliases such as `Callable[..., AbstractContextManager[T]]` built from
   `typing`, `collections.abc` and the `contextlib` context-manager ABCs.

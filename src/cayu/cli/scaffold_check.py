@@ -1957,6 +1957,63 @@ _STDLIB_VALUE_CONSTRUCTORS = frozenset(
 )
 
 
+_RETRY_POLICY_FIELDS = frozenset(
+    {
+        "max_attempts",
+        "max_unknown_attempts",
+        "initial_delay_s",
+        "max_delay_s",
+        "max_retry_elapsed_s",
+        "backoff_multiplier",
+        "jitter_s",
+        "retry_on_status_codes",
+        "retry_on_timeout",
+        "retry_on_connection_error",
+        "retry_on_rate_limit",
+    }
+)
+_TASK_RETRY_BUDGET_FIELDS = frozenset({"max_attempts", "max_elapsed_seconds"})
+_TASK_RETRY_POLICY_FIELDS = frozenset(
+    {
+        "max_attempts",
+        "max_elapsed_seconds",
+        "max_total_tokens",
+        "max_estimated_cost",
+        "cost_currency",
+        "initial_backoff_seconds",
+        "backoff_multiplier",
+        "max_backoff_seconds",
+    }
+)
+_RUN_LIMITS_FIELDS = frozenset(
+    {
+        "max_input_tokens",
+        "max_output_tokens",
+        "max_total_tokens",
+        "max_tool_calls",
+        "max_elapsed_seconds",
+        "scope",
+        "on_limit",
+        "finish_reserve_seconds",
+    }
+)
+_TASK_RETRY_BUDGET_IMPORTS = frozenset(
+    {("cayu.tasks", "TaskRetryBudget"), ("cayu.tasks.retry_budgets", "TaskRetryBudget")}
+)
+# Cayu's own configuration models, by public import path. Validating literal
+# keyword values runs only their pure validators. A field added to one of these
+# models has to be reviewed here before the check admits it.
+_CAYU_CONFIGURATION_MODELS: Mapping[tuple[str, str | None], frozenset[str]] = {
+    ("cayu.providers", "RetryPolicy"): _RETRY_POLICY_FIELDS,
+    ("cayu.providers.retry_policy", "RetryPolicy"): _RETRY_POLICY_FIELDS,
+    **dict.fromkeys(_TASK_RETRY_BUDGET_IMPORTS, _TASK_RETRY_BUDGET_FIELDS),
+    ("cayu.tasks", "TaskRetryPolicy"): _TASK_RETRY_POLICY_FIELDS,
+    ("cayu.tasks.records", "TaskRetryPolicy"): _TASK_RETRY_POLICY_FIELDS,
+    ("cayu.budgets", "RunLimits"): _RUN_LIMITS_FIELDS,
+    ("cayu.budgets.run_limits", "RunLimits"): _RUN_LIMITS_FIELDS,
+}
+
+
 def _stdlib_value_is_inert(
     call: ast.Call,
     imports: Mapping[str, tuple[str, str | None]],
@@ -2054,28 +2111,26 @@ def _stdlib_declaration_is_inert(
         )
     if binding in _STDLIB_VALUE_CONSTRUCTORS:
         return _stdlib_value_is_inert(call, imports, rebound, root)
-    if binding in {
-        ("cayu.providers", "RetryPolicy"),
-        ("cayu.providers.retry_policy", "RetryPolicy"),
-    }:
+    if binding is not None and (fields := _CAYU_CONFIGURATION_MODELS.get(binding)) is not None:
         return not call.args and all(
-            keyword.arg
-            in {
-                "max_attempts",
-                "max_unknown_attempts",
-                "initial_delay_s",
-                "max_delay_s",
-                "max_retry_elapsed_s",
-                "backoff_multiplier",
-                "jitter_s",
-                "retry_on_status_codes",
-                "retry_on_timeout",
-                "retry_on_connection_error",
-                "retry_on_rate_limit",
-            }
-            and _literal_collection_is_data_only(keyword.value)
+            keyword.arg in fields
+            and (
+                _literal_collection_is_data_only(keyword.value)
+                or (
+                    isinstance(keyword.value, ast.Call)
+                    and _trusted_symbol(keyword.value.func, imports, rebound, root)
+                    == ("decimal", "Decimal")
+                    and _stdlib_value_is_inert(keyword.value, imports, rebound, root)
+                )
+            )
             for keyword in call.keywords
         )
+    if (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "unlimited"
+        and _trusted_symbol(call.func.value, imports, rebound, root) in _TASK_RETRY_BUDGET_IMPORTS
+    ):
+        return not call.args and not call.keywords
     if binding not in {
         ("typing", "TypeVar"),
         ("typing", "ParamSpec"),
