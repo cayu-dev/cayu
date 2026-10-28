@@ -98,6 +98,7 @@ class _SettlementProbeOwner:
     task: asyncio.Task[_SettlementProbeOutcome] | None = None
     active_waiters: int = 0
     process_signal_claimed: bool = False
+    retired: bool = False
 
 
 class WorkspaceMutationProcessFence:
@@ -135,6 +136,36 @@ class WorkspaceMutationProcessFence:
                 probe=settlement_probe,
             )
         )
+
+    def has_uncertain_mutations(self) -> bool:
+        """Whether this scope still holds a mutation that has not proved quiescence."""
+
+        return bool(self._selected_owners())
+
+    def retire_scope(self) -> int:
+        """Lift this child scope's quarantine once its environment is gone for good.
+
+        Only a child fence's scope can be retired: the caller must hold positive
+        evidence that every mutation fenced for that one environment can no
+        longer change anything, for example because the sandbox it ran in was
+        destroyed. Waiters joined on a retired settlement probe stop waiting for
+        it. The fenced tasks themselves are left alone. Returns how many
+        uncertain mutations were retired.
+        """
+
+        if self is self._root:
+            raise RuntimeError("Only a child workspace mutation fence scope can be retired.")
+        owners = self._root._owners
+        retired = self._selected_owners()
+        for owner in retired:
+            owners.remove(owner)
+            owner.retired = True
+            task = owner.task
+            if task is not None and not task.done():
+                # The probe shields the fenced task, so cancelling it only
+                # releases the waiters joined on this probe generation.
+                task.get_loop().call_soon_threadsafe(task.cancel)
+        return len(retired)
 
     async def wait_until_available(self) -> None:
         """Wait for retained positive evidence before admitting environment reuse."""
@@ -204,6 +235,13 @@ class WorkspaceMutationProcessFence:
                         asyncio.gather(*(task for _owner, task in joined))
                     )
                 except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    if (current_task is None or current_task.cancelling() == 0) and any(
+                        owner.retired for owner, _task in joined
+                    ):
+                        # retire_scope() cancelled a probe this waiter joined; rejoin
+                        # whatever is still fenced.
+                        continue
                     raise
                 except Exception:
                     raise _workspace_mutation_quarantine_error() from None
@@ -276,6 +314,8 @@ class WorkspaceMutationProcessFence:
         task: asyncio.Task[_SettlementProbeOutcome],
         outcome: _SettlementProbeOutcome,
     ) -> bool:
+        if owner.retired:
+            return True
         owners = self._root._owners
         if owner not in owners:
             return outcome.settled

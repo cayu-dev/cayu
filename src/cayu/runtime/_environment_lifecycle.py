@@ -205,6 +205,10 @@ from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
     _release_invocation_command_with_cleanup_authority,
 )
+from cayu.runtime._retained_environment_end import (
+    RetainedEnvironmentEndWatches,
+    release_is_retained,
+)
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
 from cayu.runtime._workspace_observation_keyring import (
     require_materialized_workspace_observation_keyring,
@@ -708,6 +712,8 @@ class _ActiveEnvironmentSetup:
     cleanup_settlement_started: bool = False
     cleanup_settlement_deferred: bool = False
     cleanup_requires_finalize_retry: bool = False
+    # Set once the binding proved the environment is gone for good.
+    environment_end_reason: str | None = None
     pending_completion_marker_clear: dict[str, Any] | None = field(default=None, repr=False)
     cleanup_retry_outcome: str | None = None
     cleanup_retry_metadata: dict[str, Any] | None = None
@@ -896,6 +902,20 @@ class EnvironmentLifecycle:
         self._deferred_factory_cleanup_profiles: dict[str, ExecutionProfileIdentity] = {}
         self._deferred_run_fence_release_events: dict[_RunFenceReleaseKey, asyncio.Event] = {}
         self._deferred_run_fence_release_tasks: dict[_RunFenceReleaseKey, asyncio.Task[None]] = {}
+        # A retained owner whose environment is proven gone can never settle by
+        # itself; release its workspace reservation and mutation fence then.
+        self._retained_environment_ends = RetainedEnvironmentEndWatches(
+            self._active_environment_setups,
+            owner_type=_ActiveEnvironmentSetup,
+            settle=lambda session_id, owner: self.abort_environment_setup(
+                session_id=session_id,
+                original_error=None,
+                allow_deferred_settlement=True,
+                execution_profile=owner.execution_profile,
+                invocation_context=owner.invocation_context,
+            ),
+            clear_completion_marker=self._clear_abandoned_completion_finalization,
+        )
         self._final_workspace_observation_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS
         )
@@ -2290,6 +2310,9 @@ class EnvironmentLifecycle:
         )
 
     def _signal_environment_cleanup_state_changed(self, session_id: str) -> None:
+        retained_ends = getattr(self, "_retained_environment_ends", None)
+        if retained_ends is not None:
+            retained_ends.observe(session_id)
         events = getattr(self, "_deferred_run_fence_release_events", None)
         if events is None:
             return
@@ -4594,6 +4617,12 @@ class EnvironmentLifecycle:
             {completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: marker}
         )
         return marker
+
+    async def _clear_abandoned_completion_finalization(self, session_id: str) -> None:
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        marker = completion_finalization.pending_completion_finalization_from_checkpoint(checkpoint)
+        if marker is not None:
+            await self.clear_completion_finalization(session_id=session_id, expected_marker=marker)
 
     async def clear_completion_finalization(
         self,
@@ -7356,6 +7385,17 @@ class EnvironmentLifecycle:
         if setup_owner.cleanup_started:
             if binding is None or bound_workspace is None:
                 self._active_environment_setups.pop(session_id, None)
+                return
+            if setup_owner.environment_end_reason is not None and release_is_retained(
+                setup_owner, claimed=True
+            ):
+                # No retry can succeed and nothing can still change the bound
+                # copy: retire the owner instead of retrying its cleanup.
+                try:
+                    await self._retained_environment_ends.retire(session_id, setup_owner)
+                finally:
+                    if self._active_environment_setups.get(session_id) is setup_owner:
+                        setup_owner.cleanup_settlement_started = False
                 return
             if (
                 setup_owner.cleanup_error is not None

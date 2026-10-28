@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from cayu.sandbox_broker.client import (
     SandboxBrokerClient,
@@ -66,6 +66,10 @@ class SandboxLeaseKeeper:
             raise ValueError("renew_every_s must be positive and shorter than the lease.")
         self.renew_every_s = float(interval)
         self.lease_expires_at = sandbox.lease_expires_at
+        # The furthest a renewal sent so far could have pushed the lease, whether
+        # or not its answer arrived: a renewal that was cancelled or lost may
+        # still have reached the broker.
+        self.latest_possible_expiry = sandbox.lease_expires_at
         self.renewals = 0
         self._on_lost = on_lost
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -102,6 +106,7 @@ class SandboxLeaseKeeper:
         """Renew once, outside the schedule. Raises ``SandboxLeaseLostError`` on refusal."""
 
         self.check()
+        self._extend_possible_expiry()
         try:
             record = await self._client.renew(self.sandbox_id, lease_seconds=self.lease_seconds)
         except SandboxBrokerRefusedError as exc:
@@ -114,9 +119,17 @@ class SandboxLeaseKeeper:
             )
             self.check()
             raise AssertionError("unreachable") from None
+        finally:
+            # The client may have retried, so any request it sent went out by now.
+            self._extend_possible_expiry()
         self.lease_expires_at = record.lease_expires_at
         self.renewals += 1
         return record
+
+    def _extend_possible_expiry(self) -> None:
+        possible = self._clock() + timedelta(seconds=self.lease_seconds)
+        if self.latest_possible_expiry is None or possible > self.latest_possible_expiry:
+            self.latest_possible_expiry = possible
 
     async def _run(self) -> None:
         delay = self._first_delay()

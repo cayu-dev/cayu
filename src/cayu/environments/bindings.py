@@ -788,6 +788,25 @@ class WorkspaceBinding(ABC):
         if type(bound) is not BoundWorkspace:
             raise TypeError("WorkspaceBinding deferred release requires a BoundWorkspace.")
 
+    def _retained_release_end(self, bound: BoundWorkspace) -> Awaitable[str] | None:
+        """Return an awaitable that ends once ``bound``'s environment is gone for good.
+
+        The runtime asks this when it has to keep ``bound`` after a release
+        that failed or was blocked: a finalize retry is pending, or a workspace
+        mutation never proved it stopped. The awaitable resolves to a short
+        reason only on positive evidence that the bound execution environment
+        no longer exists, so no ``finalize`` retry can succeed and nothing
+        still in flight can change the bound workspace (a destroyed remote
+        sandbox, for example). The runtime then abandons ``bound`` and lifts
+        the mutation fence of that one environment. It may stop keeping the
+        environment alive, since only a cleanup retry still needs it. The
+        default, ``None``, keeps ``bound`` until ordinary settlement.
+        """
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("WorkspaceBinding retained release requires a BoundWorkspace.")
+        return None
+
     def _requires_mutation_quiescence(self, bound: BoundWorkspace) -> bool:
         """Whether releasing ``bound`` requires positive external mutation quiescence."""
 

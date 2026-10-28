@@ -22,7 +22,7 @@ import contextlib
 import logging
 import os
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
@@ -274,6 +274,27 @@ class BrokeredSandboxCodingBinding(SyncBinding):
         # The sandbox belongs to this binding even when nothing is published.
         super()._completion_requires_successful_finalization(bound)
         return True
+
+    def _retained_release_end(self, bound: BoundWorkspace) -> Awaitable[str] | None:
+        """End a retained release when the sandbox is gone.
+
+        A finalize retry needs this exact sandbox, since completion recovery is
+        refused, so once the sandbox is destroyed nothing can publish or change
+        the bound copy. Renewal stops, so a retry has until the lease lapses.
+        That holds only for a target inside the sandbox; a target anywhere else
+        outlives it, so its release keeps waiting for ordinary settlement.
+        """
+
+        super()._retained_release_end(bound)
+        runner = bound.runner
+        target = bound.workspace
+        if not (
+            isinstance(runner, BrokeredSandboxRunner)
+            and isinstance(target, RunnerWorkspace)
+            and target.is_bound_to_runner(runner)
+        ):
+            return None
+        return runner._await_destroyed()
 
     async def _recover_completion_finalization(
         self,

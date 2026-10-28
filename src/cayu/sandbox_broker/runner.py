@@ -99,6 +99,10 @@ _POLL_RECOVERY_GRACE_SECONDS = 120.0
 #: answered. A request still in flight at the end may finish (it is bounded by the
 #: client's request timeout), and a cancel that answers late gets one confirming read.
 _CANCEL_SETTLE_SECONDS = 30.0
+# How often a retained sandbox is looked up while waiting for it to be destroyed,
+# and how long past its lease an unanswered lookup still waits for the broker.
+_DESTROYED_POLL_SECONDS = 30.0
+_LAPSE_CLOCK_GRACE_SECONDS = 300.0
 _DEFAULT_TIMEOUT_SECONDS = 300
 # A command without a timeout runs until this long before the sandbox's end of
 # life by the Agent's clock. The broker checks the timeout against its own,
@@ -557,6 +561,53 @@ class BrokeredSandboxRunner(Runner):
                 self.sandbox = await self._client.destroy(self.sandbox.id)
             self._destroyed = True
         self._closed = True
+
+    async def _await_destroyed(self) -> str:
+        """Stop renewing, then return once the sandbox is gone for good, and why.
+
+        Proof is the broker reporting the sandbox ``destroyed`` or ``failed``,
+        or not knowing it. While the broker can't be asked, the lease counts
+        as lapsed only once the furthest any renewal ever sent could have
+        pushed it (an unanswered one included) is past by more than a clock
+        margin. Nothing else destroys the sandbox: its lease lapses.
+        """
+
+        keeper = self.lease_keeper
+        if keeper is not None:
+            await keeper.stop()
+        while True:
+            try:
+                record = await self._client.get(self.sandbox.id)
+            except SandboxNotFoundError:
+                return f"brokered sandbox {self.sandbox.id} no longer exists"
+            except SandboxBrokerError:
+                record = None
+            else:
+                self.sandbox = record
+                if record.status in {"destroyed", "failed"}:
+                    detail = record.destroy_reason or record.status
+                    return f"brokered sandbox {record.id} is {record.status} ({detail})"
+            expires_at = self._last_lease_expiry()
+            now = datetime.now(UTC)
+            if (
+                record is None
+                and expires_at is not None
+                and now >= expires_at + timedelta(seconds=_LAPSE_CLOCK_GRACE_SECONDS)
+            ):
+                return f"brokered sandbox {self.sandbox.id}'s lease lapsed unrenewed"
+            delay = _DESTROYED_POLL_SECONDS
+            if expires_at is not None and expires_at > now:
+                # Look again just after the lease runs out, when the broker destroys it.
+                delay = min(delay, (expires_at - now).total_seconds() + 1.0)
+            await asyncio.sleep(delay)
+
+    def _last_lease_expiry(self) -> datetime | None:
+        expiries = [self.sandbox.lease_expires_at]
+        if self.lease_keeper is not None:
+            expiries.append(self.lease_keeper.lease_expires_at)
+            expiries.append(self.lease_keeper.latest_possible_expiry)
+        known = [expiry for expiry in expiries if expiry is not None]
+        return max(known) if known else None
 
     async def _run(
         self, command_id: str, argv: list[str], dispatch: _Dispatch, **options: Any

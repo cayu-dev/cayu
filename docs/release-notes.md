@@ -175,6 +175,17 @@ storage migration.
   valid decisions fail with an expired deadline.
 - Raise the minimum Pillow, pypdf, Brotli, and OpenTelemetry versions to include
   security fixes, and update the dashboard's Vite and Zod build dependencies.
+- A brokered (Cayu Cloud) session whose release can't finish no longer holds its
+  source workspace for the rest of the process. When copy-back fails, or a final
+  workspace observation or mutating tool call never settles, the sandbox stops
+  being renewed and stays available for a cleanup retry until its lease lapses.
+  Once Cloud reports it destroyed, the session's workspace reservation and its
+  environment's mutation fence are released, and a warning from
+  `cayu.runtime._retained_environment_end` says why. Before, every later session
+  on that workspace failed with "already bound by an active session" or
+  `WorkspaceMutationSettlementError`, and the failed session couldn't run again.
+  Work the sandbox never published is lost, as before. Bindings can take part through the private
+  `WorkspaceBinding._retained_release_end` hook.
 - Knowledge tools work in coding environments. `search_knowledge`,
   `read_knowledge`, `list_knowledge` and `remember_knowledge` get their store
   from the environment they run in, and none of the coding entry points could

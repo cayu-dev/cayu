@@ -686,7 +686,14 @@ any size the install allows, and `copy_out(sink, max_bytes=..., paths=[...])`
 reads one back and checks its digest. A failed copy raises
 `SandboxCopyFailedError` with the broker's error code. The sandbox is destroyed when the session's
 binding finalizes, or when setup fails. If copy-back fails, the factory keeps
-the sandbox for a retry but stops renewing it. If the Agent process dies,
+the sandbox for a retry but stops renewing it. The same happens when a final
+workspace observation or a mutating tool call never settles, since copy-back
+can't run until it does. While the sandbox lives, the source workspace stays
+reserved for that retry, so another session on it is refused. Once Cloud
+reports the sandbox destroyed (normally when its lease lapses), the retry can
+never succeed: the reservation and the environment's mutation fence are
+released, a warning names the session and the reason, and whatever the
+sandbox never published is lost. If the Agent process dies,
 nothing renews the lease, and Cloud destroys the sandbox once the lease lapses.
 Each turn of a session gets a new sandbox, copied in from the source
 workspace. Completion recovery after a crash is refused, because it would run
