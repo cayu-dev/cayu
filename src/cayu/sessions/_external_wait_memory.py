@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from cayu.sessions._external_wait_records import (
+    ExternalWaitScheduleObservation,
     external_wait_session_identity,
 )
 from cayu.sessions._external_wait_transition import ExternalWaitMutation, transition
@@ -278,3 +279,42 @@ class MemoryExternalWaitMixin:
                 if key > after and record.correlation.request.source == source
             )[:limit]
             return tuple(records[key].model_copy(deep=True) for key in keys)
+
+    async def _list_session_external_wait_handoffs(
+        self, session_ids: tuple[str, ...]
+    ) -> tuple[ExternalWaitRecord, ...]:
+        wanted = frozenset(session_ids)
+        async with self._lock:
+            self._external_wait_initialize()
+            return tuple(
+                record.model_copy(deep=True)
+                for records in self._external_wait_records.values()
+                for record in records.values()
+                if record.handoff == "pending"
+                and external_wait_session_identity(record)[0] in wanted
+            )
+
+    async def _observe_external_wait_schedule(self) -> ExternalWaitScheduleObservation:
+        async with self._lock:
+            self._external_wait_initialize()
+            records = [
+                record
+                for scoped in self._external_wait_records.values()
+                for record in scoped.values()
+            ]
+            return ExternalWaitScheduleObservation(
+                as_of=self._ownership_clock(),
+                next_deadline_at=min(
+                    (
+                        record.correlation.request.deadline
+                        for record in records
+                        if record.registration is not None
+                        and record.outcome is None
+                        and record.correlation.request.deadline is not None
+                    ),
+                    default=None,
+                ),
+                awaiting_service=sum(
+                    1 for record in records if record.pending_handoff and record.outcome is not None
+                ),
+            )

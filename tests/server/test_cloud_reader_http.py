@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -11,8 +12,8 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request as StarletteRequest
 from tests.core.test_cloud_reporting import ARGUMENT, _app, _start
 
-from cayu import __version__
-from cayu.cloud_reporting import CloudActivityPage, read_cloud_activity
+from cayu import CayuApp, __version__
+from cayu.cloud_reporting import CloudActivityPage, CloudSchedule, read_cloud_activity
 from cayu.server import (
     AuthenticatedAccess,
     DashboardConfig,
@@ -29,6 +30,9 @@ from cayu.server.cloud_reporting import (
     CloudReaderBearerAuth,
 )
 from cayu.server.fork_controller import ForkControllerBearerAuth
+from cayu.tasks import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
+from cayu.tasks.scheduling import TaskSchedulePolicy
 
 TOKEN = "cloud-reader-" + "a" * 40
 ROTATED = "cloud-reader-" + "b" * 40
@@ -103,6 +107,8 @@ def test_the_reader_token_reads_the_contract_and_nothing_else(reader) -> None:
                 "tool_knowledge_registration",
                 "tool_knowledge_usage",
                 "task_health",
+                "schedule",
+                "external_event_waits",
             ],
             "store_id": store_id,
         }
@@ -113,7 +119,7 @@ def test_the_reader_token_reads_the_contract_and_nothing_else(reader) -> None:
         {"Authorization": f"Basic {TOKEN}"},
         {"Authorization": f"Bearer {TOKEN} extra"},
     ):
-        for route in (path, "/cayu/api/cloud/v1/activity"):
+        for route in (path, "/cayu/api/cloud/v1/activity", "/cayu/api/cloud/v1/schedule"):
             response = client.get(route, headers=headers)
             assert response.status_code == 401
             assert response.headers["www-authenticate"] == "Bearer"
@@ -163,6 +169,41 @@ def test_activity_pages_over_http_carry_no_content(reader) -> None:
             assert invalid.headers["cache-control"] == NO_STORE
         for params in ({"cursor": "1" * 83}, {"limit": 0}, {"limit": 201}):
             assert client.get(path, params=params, headers=_bearer(TOKEN)).status_code == 422
+
+
+def test_the_schedule_names_the_next_scheduled_work_over_http(reader) -> None:
+    reader(_digest(TOKEN))
+    available_at = datetime.now(UTC) + timedelta(hours=1)
+    app = CayuApp(task_store=InMemoryTaskStore(), enable_logging=False)
+    server = create_server(
+        app, config=ServerConfig.protected(_operator, dashboard=DashboardConfig(enabled=False))
+    )
+    with TestClient(server) as client:
+        portal = client.portal
+        assert portal is not None
+        portal.call(
+            app.create_task,
+            TaskCreate(
+                task_id="follow-up",
+                type="email",
+                available_at=available_at,
+                schedule_policy=TaskSchedulePolicy(),
+            ),
+        )
+        path = "/api/cloud/v1/schedule"
+
+        response = client.get(path, headers=_bearer(TOKEN))
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == NO_STORE
+        schedule = CloudSchedule.model_validate(response.json())
+        assert schedule.contract == "cayu.cloud-agent/v1"
+        assert schedule.tasks is not None
+        assert schedule.tasks.next_available_at == available_at
+        assert (schedule.tasks.scheduled, schedule.tasks.due) == (1, 0)
+        assert schedule.external_waits is not None
+        assert schedule.external_waits.next_deadline_at is None
+        assert schedule.external_waits.awaiting_service == 0
+        assert client.get(path, headers=_bearer(OPERATOR)).status_code == 401
 
 
 def test_a_cursor_the_store_cannot_continue_answers_410(reader) -> None:

@@ -100,6 +100,27 @@ Missing a notification can delay discovery, but cannot lose or prematurely admit
 work. Work remains FIFO by creation order among eligible candidates, not by
 scheduled timestamp.
 
+To learn when scheduled work next needs a worker without claiming it, call
+`TaskStore.next_task_schedule_wakeup(query=None)`. It returns a
+`TaskScheduleWakeup` (`from cayu.tasks import TaskScheduleWakeup`):
+
+| Field | Meaning |
+| --- | --- |
+| `as_of` | The store clock when it observed (PostgreSQL's transaction clock; the Memory and SQLite store clock). |
+| `next_available_at` | When the earliest matching pending task whose time has not come becomes claimable, or `None`. |
+| `next_expiry_at` | When the earliest matching unadmitted scheduled task's `expires_at` passes, or `None`. |
+| `maintenance_required` | Whether a matching unadmitted scheduled task already expired or is past its `skip` grace, so a worker's sweep must settle it now. |
+
+`query` applies the worker's claim filters, such as a task type; `None` observes
+every unattached task. Times are UTC. Measure them from `as_of` rather than from
+the caller's clock. `run_task_worker` reads this observation between polls, and
+Cayu Cloud's [schedule route](runtime-contracts.md#schedule) serves it for every
+task to a host that wakes a sleeping application. The result is a hint and
+grants no claim authority: a task it names may be claimed, rescheduled or
+cancelled by the time the caller acts, and the store still decides eligibility
+atomically when a worker claims. Stores that do not support scheduling raise
+`NotImplementedError`.
+
 `app.list_task_schedule_events(task_id, after_sequence=0, limit=100)` returns
 task-owned evidence, including before a session is attached. Pages are ordered by
 sequence; pass the last sequence to read the next page. The limit is 1–1,000.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Any
+from typing import Any, NamedTuple
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.collaboration._contracts import ObjectRef, OwnerRef
@@ -150,3 +150,17 @@ def external_wait_session_identity(record: ExternalWaitRecord) -> tuple[Any, Any
     if record.execution is not None:
         return record.execution.intent.session_id, record.execution.session_instance_id
     return None, None
+
+
+class ExternalWaitScheduleObservation(NamedTuple):
+    """When open external waits need their application, as one store read observed.
+
+    ``next_deadline_at`` is the earliest deadline of a registered wait without
+    an elected outcome. ``awaiting_service`` counts waits with an elected
+    outcome whose runtime handoff is still pending: a continuation not
+    settled yet, or a retirement not acknowledged yet.
+    """
+
+    as_of: datetime
+    next_deadline_at: datetime | None
+    awaiting_service: int

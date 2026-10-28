@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from cayu.sessions._external_wait_records import (
+    ExternalWaitScheduleObservation,
     external_wait_session_identity,
     validate_external_wait_row,
 )
@@ -426,3 +427,38 @@ class PostgresExternalWaitMixin:
                 (scope.application_scope, scope.generation, source, after, limit),
             )
             return tuple(validate_external_wait_row(row) for row in await cursor.fetchall())
+
+    async def _list_session_external_wait_handoffs(
+        self, session_ids: tuple[str, ...]
+    ) -> tuple[ExternalWaitRecord, ...]:
+        from psycopg.rows import dict_row
+
+        if not session_ids:
+            return ()
+        await self._ensure_ready()
+        async with (
+            self._connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            await cursor.execute(
+                "SELECT * FROM cayu_external_waits WHERE session_id = ANY(%s) AND handoff='pending'",
+                (list(session_ids),),
+            )
+            return tuple(validate_external_wait_row(row) for row in await cursor.fetchall())
+
+    async def _observe_external_wait_schedule(self) -> ExternalWaitScheduleObservation:
+        await self._ensure_ready()
+        async with self._connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT statement_timestamp(), "
+                "MIN((record_json::jsonb #>> '{correlation,request,deadline}')::timestamptz) "
+                "FILTER (WHERE record_json::jsonb ->> 'registration' IS NOT NULL "
+                "AND record_json::jsonb ->> 'outcome' IS NULL), "
+                "COUNT(*) FILTER (WHERE pending_handoff = 1 "
+                "AND record_json::jsonb ->> 'outcome' IS NOT NULL) "
+                "FROM cayu_external_waits"
+            )
+            as_of, deadline, awaiting = await cursor.fetchone()
+            return ExternalWaitScheduleObservation(
+                as_of=as_of, next_deadline_at=deadline, awaiting_service=awaiting
+            )

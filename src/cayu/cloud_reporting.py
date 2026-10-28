@@ -24,7 +24,7 @@ values they do not know.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from functools import cache
 from hashlib import sha256
@@ -48,6 +48,7 @@ from cayu.sessions._supervision_projection import (
     SUPERVISION_ANCHOR_EVENT_TYPES,
     classify_supervision_anchors,
 )
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.overview import SessionOverviewFacts, SessionOverviewReader
 from cayu.sessions.overview import SessionOverviewStatus as CloudRunStatus
@@ -65,6 +66,7 @@ from cayu.tasks.queries import TaskQuery
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
+    from cayu.sessions.external_waits import ExternalWaitRecord
     from cayu.sessions.records import EventRecord
 
 CLOUD_AGENT_CONTRACT = "cayu.cloud-agent"
@@ -143,6 +145,8 @@ class CloudContract(_ContractModel):
         "tool_knowledge_registration",
         "tool_knowledge_usage",
         "task_health",
+        "schedule",
+        "external_event_waits",
     )
     store_id: str | None = None
 
@@ -182,13 +186,30 @@ class CloudRunCost(_ContractModel):
     complete: bool
 
 
-class CloudWaitingItem(_ContractModel):
-    """One pending action a run waits on, without its question or arguments.
+class CloudExternalWait(_ContractModel):
+    """The outside event a parked run waits for, without its correlation key or payload.
 
-    ``kind`` is ``tool_approval``, ``user_input``, ``manual_recovery`` or
-    ``delegated_action``. A delegated action points at the child session whose
-    own item a person settles; it has no ``attention_id``. ``requested_at`` is
-    when the run began waiting on it.
+    ``scope`` and ``generation`` name the application's correlation scope and
+    ``source`` the system the event comes from. ``deadline`` is when the wait
+    times out, or ``None`` for a wait without one.
+    """
+
+    scope: str
+    generation: int
+    source: str
+    deadline: datetime | None
+
+
+class CloudWaitingItem(_ContractModel):
+    """One item a run waits on, without its question, arguments or payload.
+
+    ``kind`` is ``tool_approval``, ``user_input``, ``manual_recovery``,
+    ``delegated_action`` or ``external_event``. A delegated action points at
+    the child session whose own item a person settles; it has no
+    ``attention_id``. An external event is a run parked until an outside
+    system answers or its deadline passes; ``external_wait`` describes it and
+    is ``None`` for every other kind. ``requested_at`` is when the run began
+    waiting on it.
     """
 
     kind: str
@@ -197,6 +218,7 @@ class CloudWaitingItem(_ContractModel):
     requested_at: datetime
     child_session_id: str | None
     child_run_id: str | None
+    external_wait: CloudExternalWait | None = None
 
 
 class CloudRun(_ContractModel):
@@ -281,6 +303,55 @@ class CloudTaskHealth(_ContractModel):
 
     fenced_after_worker_loss: int
     complete: bool
+
+
+class CloudTaskSchedule(_ContractModel):
+    """When the agent's delayed tasks need it, as its task store observed at ``as_of``.
+
+    ``next_available_at`` is when the next scheduled task becomes claimable and
+    ``next_expiry_at`` when the next unclaimed one expires; either is ``None``
+    when nothing is scheduled. ``maintenance_required`` says expired or
+    skipped work needs a worker's sweep now. ``scheduled`` counts pending tasks
+    that become claimable later and ``due`` the unclaimed ones claimable now;
+    both are ``None`` when the store cannot count them. Every task in the store
+    counts, whichever worker serves its type. The observation grants no claim
+    authority.
+    """
+
+    as_of: datetime
+    next_available_at: datetime | None
+    next_expiry_at: datetime | None
+    maintenance_required: bool
+    scheduled: int | None
+    due: int | None
+
+
+class CloudExternalWaitSchedule(_ContractModel):
+    """When the agent's external-event waits need it, as its session store observed at ``as_of``.
+
+    ``next_deadline_at`` is the earliest deadline of a registered wait whose
+    outcome is still open. ``awaiting_service`` counts waits whose event or
+    timeout was elected while the runtime still owes their handoff, such as a
+    session that has not continued yet or a retirement not acknowledged yet:
+    their application must run to service them.
+    """
+
+    as_of: datetime
+    next_deadline_at: datetime | None
+    awaiting_service: int
+
+
+class CloudSchedule(_ContractModel):
+    """When the agent next has work it scheduled, without its content.
+
+    ``tasks`` is ``None`` when the agent has no task store or the store cannot
+    schedule tasks; ``external_waits`` is ``None`` when the session store keeps
+    no external waits.
+    """
+
+    contract: str = _ACTIVITY_CONTRACT
+    tasks: CloudTaskSchedule | None
+    external_waits: CloudExternalWaitSchedule | None
 
 
 class CloudActivityPage(_ContractModel):
@@ -427,8 +498,14 @@ async def read_cloud_activity(
         if has_more or len(batch) < batch_limit:
             break
     touches = await classify_supervision_anchors(store, anchors)
+    summaries = await reader.read(tuple(changed))
+    parked, gone = await _parked_external_waits(app, summaries)
     return CloudActivityPage(
-        runs=tuple(_project_run(app, facts) for facts in await reader.read(tuple(changed))),
+        runs=tuple(
+            _project_run(app, facts, parked.get(facts.session.id, ()))
+            for facts in summaries
+            if facts.session.id not in gone
+        ),
         touches=tuple(_touch(app, session, event) for session, event in touches),
         next_cursor=_cursor(store_id, position, mark if last is None else _event_mark(last)),
         has_more=has_more,
@@ -456,12 +533,112 @@ async def read_cloud_task_health(app: CayuApp) -> CloudTaskHealth | None:
     )
 
 
+async def read_cloud_schedule(app: CayuApp) -> CloudSchedule:
+    """When the agent next has scheduled work: its delayed tasks and external-wait deadlines."""
+
+    return CloudSchedule(
+        tasks=await _task_schedule(app), external_waits=await _external_wait_schedule(app)
+    )
+
+
+async def _task_schedule(app: CayuApp) -> CloudTaskSchedule | None:
+    task_store = app.task_store
+    if task_store is None or not task_store.supports_task_scheduling:
+        return None
+    try:
+        wakeup = await task_store.next_task_schedule_wakeup()
+    except NotImplementedError:
+        return None
+    try:
+        snapshot = await task_store.aggregate_operational_snapshot()
+    except NotImplementedError:
+        snapshot = None
+    return CloudTaskSchedule(
+        as_of=wakeup.as_of,
+        next_available_at=wakeup.next_available_at,
+        next_expiry_at=wakeup.next_expiry_at,
+        maintenance_required=wakeup.maintenance_required,
+        scheduled=None if snapshot is None else snapshot.scheduled_pending_count,
+        due=None if snapshot is None else snapshot.claimable_pending_count,
+    )
+
+
+async def _external_wait_schedule(app: CayuApp) -> CloudExternalWaitSchedule | None:
+    store = app.session_store
+    if not store.supports_external_waits():
+        return None
+    try:
+        observed = await store._observe_external_wait_schedule()
+    except NotImplementedError:
+        return None
+    deadline = observed.next_deadline_at
+    return CloudExternalWaitSchedule(
+        as_of=observed.as_of.astimezone(UTC),
+        next_deadline_at=None if deadline is None else deadline.astimezone(UTC),
+        awaiting_service=observed.awaiting_service,
+    )
+
+
+async def _parked_external_waits(
+    app: CayuApp, summaries: tuple[SessionOverviewFacts, ...]
+) -> tuple[dict[str, tuple[CloudWaitingItem, ...]], frozenset[str]]:
+    """The external events summarized sessions are parked on, by internal session id.
+
+    A session is parked while its continuation ticket waits: from the
+    whole-turn boundary, where it was interrupted, until servicing admits the
+    event or timeout. Also returns the sessions deleted or replaced during the
+    read, whose summarized incarnation the page omits.
+    """
+
+    from cayu.runtime._external_wait_binding import load_prepared_continuation
+
+    store = app.session_store
+    interrupted = {
+        facts.session.id: (facts.session.instance_id, facts.ended_at)
+        for facts in summaries
+        if facts.ended_at is not None
+    }
+    if not interrupted or not store.supports_external_waits():
+        return {}, frozenset()
+    try:
+        handoffs = await store._list_session_external_wait_handoffs(tuple(interrupted))
+    except NotImplementedError:
+        return {}, frozenset()
+    parked: dict[str, tuple[CloudWaitingItem, ...]] = {}
+    gone: set[str] = set()
+    for record in handoffs:
+        continuation = record.continuation
+        assert continuation is not None  # A pending handoff is bound to its continuation.
+        ticket = continuation.intent
+        entry = interrupted.get(ticket.session_id)
+        if entry is None or entry[0] != ticket.session_instance_id or ticket.session_id in gone:
+            continue
+        parked_at = entry[1]
+        try:
+            native = await load_prepared_continuation(store, continuation)
+        except (KeyError, SessionRunFenced):
+            # Only a confirmed missing or replaced incarnation explains the
+            # error; an unrelated store failure must propagate.
+            current = await store.load(ticket.session_id)
+            if current is None or current.instance_id != ticket.session_instance_id:
+                gone.add(ticket.session_id)
+                parked.pop(ticket.session_id, None)
+                continue
+            raise
+        if native is not None and native.ticket.state == "WAITING":
+            item = _external_waiting_item(app, record, parked_at)
+            parked[ticket.session_id] = (*parked.get(ticket.session_id, ()), item)
+    return parked, frozenset(gone)
+
+
 @cache
 def _bundled_price_book() -> PriceBook:
     return default_price_book()
 
 
-def _project_run(app: CayuApp, facts: SessionOverviewFacts) -> CloudRun:
+def _project_run(
+    app: CayuApp, facts: SessionOverviewFacts, parked: tuple[CloudWaitingItem, ...]
+) -> CloudRun:
     session, outcome, status = facts.session, facts.outcome, facts.status
     usage, cost, release_id = facts.usage, facts.cost, facts.release_id
     origin = session.invocation.origin
@@ -499,7 +676,10 @@ def _project_run(app: CayuApp, facts: SessionOverviewFacts) -> CloudRun:
         model_steps=0 if usage is None else usage.model_steps,
         tool_calls=0 if usage is None else usage.tool_calls,
         cost=_cost(cost),
-        waiting_for=tuple(_waiting_item(app, action, child) for action, child in facts.waiting),
+        waiting_for=(
+            *(_waiting_item(app, action, child) for action, child in facts.waiting),
+            *parked,
+        ),
     )
 
 
@@ -527,6 +707,26 @@ def _waiting_item(
             None
             if reference is None
             else app.project_session_id_for_exposure(reference.child_session_id)
+        ),
+    )
+
+
+def _external_waiting_item(
+    app: CayuApp, record: ExternalWaitRecord, parked_at: datetime
+) -> CloudWaitingItem:
+    request = record.correlation.request
+    return CloudWaitingItem(
+        kind="external_event",
+        attention_id=None,
+        tool_name=None,
+        requested_at=parked_at,
+        child_session_id=None,
+        child_run_id=None,
+        external_wait=CloudExternalWait(
+            scope=_redacted(app, request.scope.application_scope),
+            generation=request.scope.generation,
+            source=_redacted(app, request.source),
+            deadline=None if request.deadline is None else request.deadline.astimezone(UTC),
         ),
     )
 
@@ -600,14 +800,19 @@ __all__ = [
     "CloudActivityPage",
     "CloudActor",
     "CloudContract",
+    "CloudExternalWait",
+    "CloudExternalWaitSchedule",
     "CloudPrincipal",
     "CloudRun",
     "CloudRunCost",
     "CloudRunStatus",
+    "CloudSchedule",
     "CloudTaskHealth",
+    "CloudTaskSchedule",
     "CloudTouch",
     "CloudWaitingItem",
     "read_cloud_activity",
     "read_cloud_contract",
+    "read_cloud_schedule",
     "read_cloud_task_health",
 ]

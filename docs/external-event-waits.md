@@ -289,9 +289,10 @@ retirement tombstone and task identity; missing records alone are not proof.
 `notify()` returns `None` for this case, without publishing another outcome.
 
 This shares the native continuation ticket/checkpoint owner and managed
-[task scheduler](task-scheduling.md) with the one-shot self-wake design.
-Self-wake owns model-facing timer waits. External-event waits add correlation, early input
-and event/timeout arbitration, not a second scheduling system.
+[task scheduler](task-scheduling.md) with the planned one-shot self-wake design,
+which would own model-facing timer waits; it is not built yet. External-event
+waits add correlation, early input and event/timeout arbitration, not a second
+scheduling system.
 
 `observe_page(scope=..., source=..., context=..., after=..., limit=...)` advances
 due outcomes in bounded pages using native time. Each item commits separately;

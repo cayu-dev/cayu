@@ -20004,8 +20004,9 @@ authenticate=...)` serves the same routes behind a host's own authentication.
 
 | Route | Response |
 | --- | --- |
-| `GET {api}/cloud/contract` | `{"contract": "cayu.cloud-agent", "versions": [1], "runtime_version": str, "store_id": str \| null}` |
+| `GET {api}/cloud/contract` | `{"contract": "cayu.cloud-agent", "versions": [1], "runtime_version": str, "features": [str, ...], "store_id": str \| null}` |
 | `GET {api}/cloud/v1/activity?cursor=&limit=` | `{"contract": "cayu.cloud-agent/v1", "runs": [run, ...], "touches": [touch, ...], "next_cursor": str, "has_more": bool, "task_health": {"fenced_after_worker_loss": int, "complete": bool} \| null}` |
+| `GET {api}/cloud/v1/schedule` | `{"contract": "cayu.cloud-agent/v1", "tasks": {"as_of": str, "next_available_at": str \| null, "next_expiry_at": str \| null, "maintenance_required": bool, "scheduled": int \| null, "due": int \| null} \| null, "external_waits": {"as_of": str, "next_deadline_at": str \| null, "awaiting_service": int} \| null}` |
 
 Responses carry `Cache-Control: private, no-store`. A missing or wrong token
 answers 401 with `WWW-Authenticate: Bearer`, a cursor the contract did not issue
@@ -20042,6 +20043,60 @@ change since the cursor, and `null` when the agent has no task store. Its
 expired (`TaskQuery(fenced_after_worker_loss=True)`), up to
 `CLOUD_TASK_HEALTH_MAX_COUNT` (100); `complete` is false when the count reached
 it. The contract lists `task_health` in `features` when it serves the field.
+
+### Schedule
+
+`GET {api}/cloud/v1/schedule`, or `cayu.cloud_reporting.read_cloud_schedule(app)`
+in process, says when the agent next has work it scheduled, without its
+content. A sleeping application cannot answer a read, and only code running in
+it creates tasks and waits, so a host reads the schedule right before putting
+the application to sleep, and on each activity read, and wakes it at the
+earliest time it names. The contract lists `schedule` in `features` when it
+serves the route. Reading it changes nothing in the application.
+
+`tasks` is the task store's current observation, `null` when the agent has no
+task store or the store does not support [task scheduling](task-scheduling.md).
+Every task in the store counts, whichever task types the application's workers
+serve, because the web process that answers does not know them.
+
+| Field | Meaning |
+| --- | --- |
+| `as_of` | The task store's clock when it observed the schedule (the PostgreSQL transaction clock, the SQLite and memory store clock). Measure the other times from it rather than from the reader's clock. |
+| `next_available_at` | When the earliest pending task whose time has not come becomes claimable, as `TaskStore.next_task_schedule_wakeup()` reports it, or `null`. |
+| `next_expiry_at` | When the earliest unadmitted scheduled task's `expires_at` passes, or `null`. |
+| `maintenance_required` | Whether an unadmitted scheduled task already expired, or is past its `skip` grace, and waits for a worker's sweep to settle it. |
+| `scheduled` | Pending tasks that become claimable after `as_of` (the operational snapshot's `scheduled_pending_count`). |
+| `due` | Unattached pending tasks claimable now (`claimable_pending_count`), including expired ones a sweep has not settled yet. |
+
+The counts come from a second store read right after the observation, so a
+task created between the two can appear in one and not the other. They are
+`null`, with the times still reported, when the store cannot count tasks.
+
+`external_waits` is `null` when the session store keeps no
+[external-event waits](external-event-waits.md). Otherwise:
+
+| Field | Meaning |
+| --- | --- |
+| `as_of` | The session store's clock when it observed the waits (PostgreSQL's statement clock; the SQLite and memory ownership clock). |
+| `next_deadline_at` | The earliest deadline, in UTC, of a registered wait whose outcome is still open, or `null`. A wait without a deadline, an unregistered reservation and a wait whose event or timeout was already elected add none. |
+| `awaiting_service` | Waits whose event or timeout was elected while their session has not continued yet. `deliver()` only records an event; the session continues when the application services it (`ExternalWaitHost`, `SessionExternalWaitAdapter.service_wait`), so the application must run. It counts every elected wait the runtime still owes a handoff: one not serviced yet, a continuation running now until it settles, and a retirement (`retire_execution`) whose acknowledgement has not completed, which the next servicing finishes. |
+
+A timeout is elected only when something observes the wait after its
+deadline, such as `ExternalWaitHost` or the `TaskStoreWaitScheduler` handler,
+whose delayed task also counts in `tasks`.
+
+A host wakes the application at the earliest of `next_available_at`,
+`next_expiry_at` and `next_deadline_at`, and right away when
+`maintenance_required` is true or `due` or `awaiting_service` is above zero. A
+time at or before its section's `as_of` means now. These signals cover the
+whole store, not what the application's workers and hosts actually serve: a
+task type no worker claims keeps `due` above zero, an expired task no worker
+sweeps keeps `maintenance_required` true, and a deadline nobody observes stays
+in the past. So a host that woke the application for a signal and then reads
+the same signal unchanged must back off (for example, double the time before it
+wakes for that reason again) instead of waking it on every check. The schedule
+is a hint, like the worker's own: it grants no claim authority, and the stores
+still decide eligibility when work is claimed.
 
 Legacy sessions without retained run lineage still refresh their dependent
 ancestors when a foreground-child wait proves both the parent's and child's
@@ -20126,7 +20181,23 @@ carries its source's status, no `ended_at`, and only its own counts and cost.
 | `release_id` | The [Release](#release-identity) the session's latest event that begins work recorded, or `null`. |
 | `model_steps`, `tool_calls` | The session's own counts, as usage accounting reports them. |
 | `cost` | `{"amount", "currency", "complete"}`: the session's own estimated cost with Cayu's bundled price book, as `get_session_cost` computes it. `amount` is a decimal string. `complete` is false when a model step or auxiliary attempt could not be priced, so the amount is low. |
-| `waiting_for` | The session's pending actions: `{"kind", "attention_id", "tool_name", "requested_at", "child_session_id", "child_run_id"}`, `kind` being `tool_approval`, `user_input`, `manual_recovery` or `delegated_action`. `attention_id` is the identity pending-action reads, `get_human_attention_state` and touches use. A delegated action has none and names in `child_session_id` the child whose own item a person settles. `child_run_id` is set only when the retained wait proves that exact child incarnation; a missing or replacement child is not followed. |
+| `waiting_for` | The session's pending actions: `{"kind", "attention_id", "tool_name", "requested_at", "child_session_id", "child_run_id", "external_wait"}`, `kind` being `tool_approval`, `user_input`, `manual_recovery`, `delegated_action` or `external_event`. `attention_id` is the identity pending-action reads, `get_human_attention_state` and touches use. A delegated action has none and names in `child_session_id` the child whose own item a person settles. `child_run_id` is set only when the retained wait proves that exact child incarnation; a missing or replacement child is not followed. An `external_event` item is a session parked on an [external-event wait](external-event-waits.md); see below. `external_wait` is `null` for every other kind. |
+
+A session parked on an external-event wait (`SessionExternalWaitAdapter.run_to_wait`
+or `resume_to_wait`) is `interrupted`, with an `external_event` item in
+`waiting_for` from the moment it parks until servicing admits the event or
+timeout and the session continues. An event that arrived but was not serviced
+yet leaves the session parked. The item has no `attention_id`, since no person
+settles it, `requested_at` is when the session parked (its `ended_at`), and
+`external_wait` is `{"scope", "generation", "source", "deadline"}`: the
+correlation scope and its generation, the source the event comes from, and the
+deadline in UTC or `null`. It carries neither the correlation key nor any event
+payload. The contract lists `external_event_waits` in `features` when it
+reports these items; a reader that predates them ignores the kind. Only the
+application's session store is read, so waits kept in another store are not
+reported. Like every summary field, the item is read when the session changes:
+a wait excluded or retired without a new session event leaves the last
+summary showing it until the session's next change.
 
 Runtime records incarnation lineage in runtime-owned session metadata at the
 atomic create boundary and in the fenced fork snapshot. No storage-schema

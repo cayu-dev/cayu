@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 from cayu.sessions._external_wait_records import (
+    ExternalWaitScheduleObservation,
     external_wait_session_identity,
     validate_external_wait_row,
 )
@@ -331,3 +332,38 @@ class SQLiteExternalWaitMixin:
                 (scope.application_scope, scope.generation, source, after, limit),
             ).fetchall()
             return tuple(validate_external_wait_row(row) for row in rows)
+
+    async def _list_session_external_wait_handoffs(
+        self, session_ids: tuple[str, ...]
+    ) -> tuple[ExternalWaitRecord, ...]:
+        if not session_ids:
+            return ()
+        placeholders = ",".join("?" * len(session_ids))
+        async with self._lock:
+            rows = self._connection.execute(
+                f"SELECT * FROM cayu_external_waits WHERE session_id IN ({placeholders}) "
+                "AND handoff='pending'",
+                session_ids,
+            ).fetchall()
+            return tuple(validate_external_wait_row(row) for row in rows)
+
+    async def _observe_external_wait_schedule(self) -> ExternalWaitScheduleObservation:
+        async with self._lock:
+            as_of = self._ownership_clock()
+            rows = self._connection.execute(
+                "SELECT json_extract(record_json, '$.correlation.request.deadline') "
+                "FROM cayu_external_waits "
+                "WHERE json_extract(record_json, '$.registration') IS NOT NULL "
+                "AND json_extract(record_json, '$.outcome') IS NULL "
+                "AND json_extract(record_json, '$.correlation.request.deadline') IS NOT NULL"
+            ).fetchall()
+            (awaiting,) = self._connection.execute(
+                "SELECT COUNT(*) FROM cayu_external_waits WHERE pending_handoff=1 "
+                "AND json_extract(record_json, '$.outcome') IS NOT NULL"
+            ).fetchone()
+        return ExternalWaitScheduleObservation(
+            as_of=as_of,
+            # Deadlines keep the offset they were given, so compare them as instants.
+            next_deadline_at=min((datetime.fromisoformat(row[0]) for row in rows), default=None),
+            awaiting_service=awaiting,
+        )

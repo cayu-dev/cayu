@@ -1000,7 +1000,7 @@ process serves the contract at `{api}/cloud`: `/cayu/api/cloud` when the
 application mounts the control plane with `mount_cayu`, `/api/cloud` under
 `cayu serve`. The Agent holds only the digest.
 
-The token is not the Developer dashboard login. It reads two routes and nothing else:
+The token is not the Developer dashboard login. It reads three routes and nothing else:
 
 - `GET {api}/cloud/contract` names the contract, the versions the Agent
   serves and `store_id`, the identity of the Agent's session store.
@@ -1009,8 +1009,15 @@ The token is not the Developer dashboard login. It reads two routes and nothing 
   and `task_health`: how many tasks are fenced after their worker was lost, such
   as by a deploy during a task that can't be restarted, and wait for the Agent
   to reconcile them.
+- `GET {api}/cloud/v1/schedule` returns when the Agent next has work it
+  scheduled: when its next delayed task becomes claimable or expires, how many
+  tasks are scheduled or due, the earliest deadline of an external-event wait,
+  and how many delivered events still wait for the Agent to service them. A
+  host reads it before putting the Agent to sleep, to wake it in time, and
+  backs off when a wake leaves a signal unchanged.
 
-A run summary has the run's status, including what it waits on, when it started
+A run summary has the run's status, including what it waits on (a person, a
+subagent, or an outside event with its source and deadline), when it started
 and ended, its estimated cost, the Release it ran on, the agent and who started
 it. A touch is an approval, edit, denial, expiry, answer, recovery, interruption
 or steering message, with who made it, the reason they gave and whether a person

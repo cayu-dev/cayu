@@ -67,7 +67,9 @@ for `EnvironmentSpec.execution_profile_identity`.
 Cayu does not currently ship a recurring scheduler, and web tools do not own
 recurrence or wake a sleeping worker. Use platform cron, Kubernetes CronJob,
 GitHub Actions, or another external scheduler to make the tick. Durable
-future-eligibility and self-wake scheduling are separate future capabilities.
+future eligibility already exists: create a task with `available_at` (see
+[task scheduling](../../docs/task-scheduling.md)) and a worker claims it once it
+is due. Self-wake scheduling is a separate future capability.
 
 For sandboxed execution, construct the bridge directly from the same
 factory/store pair that the app registers. No session resource is allocated at

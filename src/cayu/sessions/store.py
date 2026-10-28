@@ -216,6 +216,7 @@ if TYPE_CHECKING:
         CompletedTurnSnapshot,
         ContextViewPublicationSource,
     )
+    from cayu.sessions._external_wait_records import ExternalWaitScheduleObservation
     from cayu.sessions._external_wait_transition import ExternalWaitMutation
     from cayu.sessions._invocation_lifecycle import (
         AdmitInvocationCommand,
@@ -2348,6 +2349,16 @@ class SessionStore(ABC):
         self, scope: ExternalWaitScope, *, source: str, after: str, limit: int
     ) -> tuple[ExternalWaitRecord, ...]:
         raise NotImplementedError("Store does not qualify external waits.")
+
+    async def _list_session_external_wait_handoffs(
+        self, session_ids: tuple[str, ...]
+    ) -> tuple[ExternalWaitRecord, ...]:
+        """Waits bound to one of these sessions whose continuation is not settled yet."""
+        raise NotImplementedError("Store does not report external waits by session.")
+
+    async def _observe_external_wait_schedule(self) -> ExternalWaitScheduleObservation:
+        """The earliest open deadline and the elected outcomes still awaiting service."""
+        raise NotImplementedError("Store does not report external wait schedules.")
 
     def _supports_producer_attachment_protocol(self) -> bool:
         return (

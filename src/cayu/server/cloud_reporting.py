@@ -25,8 +25,10 @@ from cayu.cloud_reporting import (
     CloudActivityCursorStale,
     CloudActivityPage,
     CloudContract,
+    CloudSchedule,
     read_cloud_activity,
     read_cloud_contract,
+    read_cloud_schedule,
 )
 from cayu.server._bearer_digests import TOKEN_SHA256_HEX, presented_bearer_digest
 from cayu.server.auth import AuthConfigurationError
@@ -114,7 +116,9 @@ def create_cloud_reporting_router(
     ``GET {prefix}/contract`` names the contract, the versions served and the
     session store; ``GET {prefix}/v1/activity`` returns one ``CloudActivityPage``,
     or 410 with code ``activity_cursor_stale`` for a cursor the store cannot
-    continue. A request ``authenticate`` does not accept gets 401.
+    continue; ``GET {prefix}/v1/schedule`` returns the ``CloudSchedule`` of the
+    agent's next scheduled work. A request ``authenticate`` does not accept
+    gets 401.
     """
 
     if not callable(authenticate):
@@ -168,6 +172,11 @@ def create_cloud_reporting_router(
             ) from None
         response.headers.update(_NO_STORE)
         return page
+
+    @router.get("/v1/schedule", response_model=CloudSchedule)
+    async def schedule(response: Response) -> CloudSchedule:
+        response.headers.update(_NO_STORE)
+        return await read_cloud_schedule(app)
 
     return router
 
