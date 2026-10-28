@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from cayu._import_migration import import_replacement, replacement_import
+from cayu.cli._scaffold_test_tools import extra_only_dev_requirements
 from cayu.cli._task_retry_checks import task_retry_policy_diagnostics
 from cayu.cli.scaffold_convention import local_database_path
 from cayu.cli.scaffold_plan import (
@@ -469,6 +470,7 @@ def _source_diagnostics(
 
     diagnostics.extend(_check_selected_plan_source(root, document, plan))
     diagnostics.extend(_check_composition_root(root))
+    diagnostics.extend(_check_test_tool_layout(document))
     diagnostics.extend(_check_import_inertness(root, entry_targets))
     return tuple(diagnostics), True
 
@@ -846,6 +848,39 @@ def _check_composition_root(root: Path) -> tuple[ProjectDiagnostic, ...]:
             )
         )
     return tuple(diagnostics)
+
+
+def _check_test_tool_layout(document: Mapping[str, object]) -> tuple[ProjectDiagnostic, ...]:
+    """Report test tools that only the optional ``dev`` extra installs.
+
+    Projects generated before Cayu moved them to ``[dependency-groups].dev`` list
+    them as an extra, which a plain ``uv sync`` removes.
+    """
+
+    missing = list(extra_only_dev_requirements(document))
+    if not missing:
+        return ()
+    return (
+        _diagnostic(
+            code="SCAFFOLD_TEST_TOOLS_IN_EXTRA",
+            path="pyproject.toml:[project.optional-dependencies].dev",
+            message=(
+                f"The optional dev extra lists {missing!r}, which a plain `uv sync` "
+                "removes, so `uv run --no-sync pytest` can then run a pytest from "
+                "outside the project that fails with \"No module named 'cayu'\"."
+            ),
+            hint=(
+                "Move these requirements to a `dev` list under [dependency-groups], which "
+                "`uv sync` installs by default, and leave `dev = []` under "
+                "[project.optional-dependencies] so `uv sync --extra dev` still works. "
+                "Then run `uv lock` and `uv sync`."
+            ),
+            parameters={"extra_only_requirements": missing},
+            # The extra still works with `uv sync --extra dev`, so this never
+            # fails --fail-on warning.
+            severity=DiagnosticSeverity.INFO,
+        ),
+    )
 
 
 def _check_import_inertness(

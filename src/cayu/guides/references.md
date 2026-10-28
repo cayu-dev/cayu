@@ -415,8 +415,8 @@ deployment verification.
 ## server
 
 The server extra provides an HTTP API and the Developer dashboard over the same application and
-durable stores. A generated project's `dev` extra installs it; for trusted local
-inspection run `uv run cayu serve --dev` and open
+durable stores. A generated project's `cayu[postgres,server]` dependency installs it; for
+trusted local inspection run `uv run cayu serve --dev` and open
 `http://127.0.0.1:8000/cayu/`. Without `--dev`, `cayu serve` requires the
 `[tool.cayu.serve].auth` target; generated agent and coding projects set it to
 `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`, which reads

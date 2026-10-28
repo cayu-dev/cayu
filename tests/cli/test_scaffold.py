@@ -280,7 +280,8 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "uv run --no-sync cayu guide anatomy" in readme
     assert readme.index("## Application structure") < readme.index("## Setup and prove the project")
     assert "pip install -e" not in readme
-    assert "uv sync --extra dev" in readme
+    assert "```bash\nuv sync\n" in readme
+    assert "--extra dev" not in readme
     assert "uv run --no-sync cayu eval run" in readme
     assert "Run setup and proof commands in the listed order" in readme
     assert "Do not parallelize application-" in (proj / "AGENTS.md").read_text(encoding="utf-8")
@@ -312,7 +313,8 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert 'uv run --no-sync python run.py --message "YOUR REQUEST"' in readme
     assert "cayu generate slice" not in readme
     output = capsys.readouterr().out
-    assert "uv sync --extra dev" in output
+    assert "uv sync\n" in output
+    assert "--extra dev" not in output
     assert "uv run --no-sync cayu check --fail-on warning --json" in output
     assert "uv run --no-sync cayu serve --dev" in output
     assert "http://127.0.0.1:8000/cayu/" in output
@@ -3256,9 +3258,58 @@ def test_scaffold_from_a_release_install_keeps_the_pypi_pin(
 
     document = tomllib.loads((tmp_path / "fromrelease" / "pyproject.toml").read_text())
     assert document["project"]["dependencies"] == ["cayu[postgres,server]==1.2.3"]
-    assert document["project"]["optional-dependencies"]["dev"] == ["pytest"]
+    # The test tools are in the dev group, which a plain `uv sync` installs; the
+    # empty extra keeps `uv sync --extra dev` working.
+    assert document["dependency-groups"]["dev"] == ["pytest"]
+    assert document["project"]["optional-dependencies"]["dev"] == []
     assert document["tool"]["uv"] == {"cache-dir": ".cayu/uv-cache"}
     assert "Cayu source:" not in receipt
+
+
+def _pytest_without_cayu(project: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    # A pytest whose Python can't find cayu, like one from elsewhere on PATH.
+    script = (
+        "import sys\n"
+        "sys.modules['cayu'] = None\n"
+        "import pytest\n"
+        "raise SystemExit(pytest.main(sys.argv[1:]))\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script, "-q", "-p", "no:cacheprovider", *arguments],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+# The Docker agent preset also writes a tests/conftest.py that imports cayu.
+@pytest.mark.parametrize("options", ((), ("--execution", "docker")))
+def test_generated_conftest_names_the_missing_test_environment(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    options: tuple[str, ...],
+) -> None:
+    assert main(["new", "guarded", "--dir", str(tmp_path), *options]) == 0
+    capsys.readouterr()
+    project = tmp_path / "guarded"
+    assert (project / "tests" / "conftest.py").is_file() == bool(options)
+
+    for arguments in ((), ("tests",), ("tests/test_agent.py",), ("-k", "agent")):
+        result = _pytest_without_cayu(project, *arguments)
+        assert result.returncode == pytest.ExitCode.USAGE_ERROR, result.stdout + result.stderr
+        assert "Cayu isn't installed for" in result.stderr
+        assert "Run `uv sync`" in result.stderr
+        assert "No module named 'cayu'" not in result.stdout + result.stderr
+
+    # A nested project with its own environment, such as a coding target, runs.
+    target = project / "targets" / "sample"
+    target.mkdir(parents=True)
+    (target / "test_sample.py").write_text("def test_sample():\n    pass\n", encoding="utf-8")
+    result = _pytest_without_cayu(project, "targets/sample")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _pytest_without_cayu(target).returncode == 0
 
 
 def test_generated_agent_test_closes_the_app_it_builds(tmp_path: Path) -> None:

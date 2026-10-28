@@ -478,17 +478,17 @@ class ApplicationPlan:
         }[self.preset]
         if self.execution == "docker" and self.preset == "agent":
             setup: tuple[str, ...] = (
-                "uv sync --extra dev",
+                "uv sync",
                 "uv run --no-sync python sandbox_image.py --resolve",
             )
         elif self.execution == "docker":
             setup = (
                 "uv lock",
-                "uv sync --extra dev",
+                "uv sync",
                 "uv run --no-sync python build_coding_image.py",
             )
         else:
-            setup = ("uv sync --extra dev",)
+            setup = ("uv sync",)
         commands = (
             *setup,
             "uv run --no-sync cayu inspect --json",

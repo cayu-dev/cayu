@@ -351,7 +351,9 @@ mounted read-only at `/opt/cayu-wheel` and the build context at
 3. Run each of the following as the build user, with `setpriv --reuid=10001
    --regid=10001 --clear-groups --no-new-privs` and the environment
    `HOME=/tmp/cayu-build-home UV_CACHE_DIR=/tmp/cayu-build-home/uv-cache`:
-   - in `/opt/cayu-project`: `uv sync --frozen --extra dev --no-install-project`;
+   - in `/opt/cayu-project`: `uv sync --frozen --extra dev --no-install-project`
+     (the test tools come from the project's `dev` dependency group, which uv
+     installs by default; the `dev` extra is empty in newly generated projects);
    - if the wheel context holds a `*.whl` file: `uv pip install --python
      /opt/cayu-project/.venv/bin/python --no-deps <wheel>`;
    - for each `extra_uv_projects` entry, in order: create `/opt/targets/<name>`

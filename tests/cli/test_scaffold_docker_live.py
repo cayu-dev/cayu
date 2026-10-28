@@ -115,10 +115,10 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
         metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
     project_file = project / "pyproject.toml"
     project_text = project_file.read_text(encoding="utf-8")
-    project_metadata = tomllib.loads(project_text)["project"]
+    project_document = tomllib.loads(project_text)
     for value in (
-        *project_metadata["dependencies"],
-        *project_metadata["optional-dependencies"]["dev"],
+        *project_document["project"]["dependencies"],
+        *project_document["dependency-groups"]["dev"],
     ):
         dependency = Requirement(value)
         if dependency.name != "cayu":

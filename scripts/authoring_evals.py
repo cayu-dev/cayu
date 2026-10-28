@@ -315,6 +315,8 @@ def scaffold(directory: Path, cayu_source: Path) -> Path:
             pyproject.read_text()
             + f'\n[tool.uv.sources]\ncayu = {{ path = "{cayu_source}", editable = true }}\n'
         )
+    # Older generators put the test tools in the `dev` extra; newer ones put them in
+    # the default `dev` group and keep an empty extra, so this installs them for both.
     subprocess.run(["uv", "sync", "--extra", "dev", "--quiet"], cwd=project, check=True)
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
     subprocess.run(["git", "add", "-A"], cwd=project, check=True)

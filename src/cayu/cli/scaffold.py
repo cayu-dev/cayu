@@ -773,7 +773,13 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = __RUNTIME_DEPENDENCIES__
 
+# The test tools are in [dependency-groups].dev, which `uv sync` and `uv run`
+# install by default. This empty extra keeps `uv sync --extra dev` working for
+# tools that still run it.
 [project.optional-dependencies]
+dev = []
+
+[dependency-groups]
 dev = __DEV_DEPENDENCIES__
 
 [tool.cayu]
@@ -872,7 +878,7 @@ package-shipped offline references.
 ## Setup and prove the project
 
 ```bash
-uv sync --extra dev
+uv sync
 uv run --no-sync cayu guide anatomy
 uv run --no-sync cayu inspect --json
 uv run --no-sync cayu check --fail-on warning --json
@@ -1089,7 +1095,7 @@ do not improvise product authorization around raw Cayu routes.
 
 ## Project commands
 
-- Setup: `uv sync --extra dev`.
+- Setup: `uv sync` (it installs the test tools in the `dev` dependency group).
 __DATABASE_AGENTS_PROOF_GUIDANCE__
 - Application contract: `uv run --no-sync cayu guide anatomy`.
 - Authoring details: `uv run --no-sync cayu guide authoring`.
@@ -2618,6 +2624,43 @@ _GITIGNORE = (
     ".cayu/\ndata/\n__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n.env\n.env.*\n!.env.example\n"
 )
 
+# pytest loads the root conftest.py before it imports any test module.
+_ROOT_CONFTEST_PY = '''"""Stop early when pytest runs without Cayu installed.
+
+When the project's own pytest is missing from .venv, a pytest from elsewhere on
+PATH can run instead, and every test then fails with "No module named 'cayu'".
+"""
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+
+_TESTS = Path(__file__).resolve().parent / "tests"
+
+
+def pytest_plugin_registered(plugin: object) -> None:
+    # pytest calls this as soon as it registers this file, once for each plugin
+    # registered so far, which includes its configuration. That is before it
+    # imports tests/conftest.py, which can import cayu itself.
+    if not isinstance(plugin, pytest.Config) or importlib.util.find_spec("cayu"):
+        return
+    namespace = getattr(plugin, "known_args_namespace", None)
+    arguments = getattr(namespace, "file_or_dir", None) or ["."]
+    for argument in arguments:
+        path = (plugin.invocation_params.dir / argument.split("::")[0]).resolve()
+        # Only runs that collect this project's tests. A nested project with its
+        # own environment, such as a coding target, is left alone.
+        if path.is_relative_to(_TESTS) or _TESTS.is_relative_to(path):
+            raise pytest.UsageError(
+                f"Cayu isn't installed for {sys.executable}, the Python running "
+                "pytest, so this pytest probably comes from outside the project. "
+                "Run `uv sync` to install the project's test tools (its `dev` "
+                "dependency group), then `uv run --no-sync pytest`."
+            )
+'''
+
 
 def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
@@ -3090,6 +3133,7 @@ def _rendered_preset_files(
 
     files = {
         "run.py": _RUN_PY,
+        "conftest.py": _ROOT_CONFTEST_PY,
         "agents/__init__.py": "",
         "tests/test_agent.py": render(_TEST_PY),
         "evals/__init__.py": "",

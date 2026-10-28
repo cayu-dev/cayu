@@ -495,7 +495,8 @@ def test_served_plans_protect_cayu_serve_with_environment_operator_auth(preset: 
     assert pyproject["tool"]["cayu"]["serve"] == {
         "auth": "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"
     }
-    assert pyproject["project"]["optional-dependencies"]["dev"][0] == "pytest"
+    assert pyproject["dependency-groups"]["dev"][0] == "pytest"
+    assert pyproject["project"]["optional-dependencies"]["dev"] == []
     payload = plan.as_dict()
     assert {"CAYU_OPERATOR_USERNAME", "CAYU_OPERATOR_PASSWORD"} <= set(payload["environment"])
     assert payload["dependencies"][0] == "cayu[postgres,server]"
@@ -520,7 +521,7 @@ def test_docker_plan_puts_image_construction_before_runtime_verification() -> No
     commands = plan.verification_commands()
     assert commands[:3] == (
         "uv lock",
-        "uv sync --extra dev",
+        "uv sync",
         "uv run --no-sync python build_coding_image.py",
     )
     assert commands.index("uv run --no-sync python build_coding_image.py") < commands.index(
@@ -538,7 +539,7 @@ def test_agent_docker_plan_pins_the_sandbox_image_before_verification() -> None:
 
     commands = plan.verification_commands()
     assert commands[:2] == (
-        "uv sync --extra dev",
+        "uv sync",
         "uv run --no-sync python sandbox_image.py --resolve",
     )
     assert plan.coding_toolchain is None

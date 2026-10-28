@@ -82,9 +82,9 @@ server, or multi-agent topology. The package-shipped `cayu guide references`
 topic is the offline index for optional capabilities.
 
 The local Developer dashboard is a standard inspection surface,
-not part of the agent's domain behavior. Fresh generated projects install the
-server extra through their `dev` extra; run `uv run cayu serve --dev` and open
-`http://127.0.0.1:8000/cayu/`. The explicit `--dev` flag is for trusted local
+not part of the agent's domain behavior. Fresh generated projects depend on
+`cayu[postgres,server]`, which installs the server extra; run
+`uv run cayu serve --dev` and open `http://127.0.0.1:8000/cayu/`. The explicit `--dev` flag is for trusted local
 use. A deployed Developer dashboard still requires configured authentication, and an
 application that already owns FastAPI embeds Cayu explicitly with
 `mount_cayu(..., path="/cayu")`. Never use `OpenAccess()` on a public listener.

@@ -105,6 +105,60 @@ def test_async_implementation_in_the_composition_root_is_reported(
     assert finding.parameters["unexpected_functions"] == ("hidden_worker",)
 
 
+def test_test_tools_left_in_the_dev_extra_get_a_migration_hint(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    pyproject = project / "pyproject.toml"
+    current = pyproject.read_text(encoding="utf-8")
+    assert not [
+        item
+        for item in check_declared_scaffold_source(project)
+        if item.code == "SCAFFOLD_TEST_TOOLS_IN_EXTRA"
+    ]
+    # The layout of projects generated before the dev dependency group.
+    layout = 'dev = []\n\n[dependency-groups]\ndev = ["pytest"]\n'
+    assert layout in current
+    pyproject.write_text(current.replace(layout, 'dev = ["pytest"]\n'), encoding="utf-8")
+
+    finding = next(
+        item
+        for item in check_declared_scaffold_source(project)
+        if item.code == "SCAFFOLD_TEST_TOOLS_IN_EXTRA"
+    )
+
+    assert finding.severity is DiagnosticSeverity.INFO
+    assert finding.parameters["extra_only_requirements"] == ("pytest",)
+    assert "[dependency-groups]" in finding.hint
+    assert "uv sync --extra dev" in finding.hint
+
+    def extra_only(groups: str) -> list[object]:
+        pyproject.write_text(
+            current.replace(
+                layout, 'dev = ["pytest", "Ruff>=0.15"]\n\n[dependency-groups]\n' + groups
+            ),
+            encoding="utf-8",
+        )
+        return [
+            item.parameters["extra_only_requirements"]
+            for item in check_declared_scaffold_source(project)
+            if item.code == "SCAFFOLD_TEST_TOOLS_IN_EXTRA"
+        ]
+
+    # Groups are compared by package name, through any groups they include.
+    assert extra_only('dev = [{include-group = "lint"}]\nlint = ["ruff"]\n') == [("pytest",)]
+    assert (
+        extra_only(
+            'dev = [{include-group = "test"}, "ruff<1"]\nTest = ["PyTest>=8", '
+            '{include-group = "dev"}]\n'
+        )
+        == []
+    )
+
+
 def test_registration_provenance_drift_is_actionable(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

@@ -14,7 +14,7 @@ PostgreSQL storage for suites, runs, results, and baselines.
 For trusted local development:
 
 ```console
-uv sync --extra dev
+uv sync
 uv run --no-sync cayu check --fail-on warning --json
 uv run --no-sync cayu serve --dev
 ```

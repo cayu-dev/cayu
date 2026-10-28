@@ -58,6 +58,17 @@ composition work, and agent registration that no longer originates from the
 explicit registration module. Removing the contract is an intentional custom
 layout migration, not a supported way to silence a finding.
 
+Generated projects list their test tools (pytest, and ruff where the preset
+uses it) under `[dependency-groups].dev`, which `uv sync` and `uv run` install
+by default; `uv sync --no-dev` leaves them out. `[project.optional-dependencies]`
+keeps an empty `dev` extra so `uv sync --extra dev` still works. The generated
+root `conftest.py` stops a pytest that can't import `cayu`, usually one from
+outside the project, with a message that says to run `uv sync`, instead of
+letting every test fail with "No module named 'cayu'". Projects generated
+earlier keep the tools in the `dev` extra, which a plain `uv sync` removes;
+`cayu check` reports that as the informational `SCAFFOLD_TEST_TOOLS_IN_EXTRA`
+with the move to make.
+
 `cayu check` never imports application code that failed the import-safety check
 (or whose scaffold contract is too invalid for that check to run). It still lists
 every source finding and adds `SCAFFOLD_APPLICATION_NOT_IMPORTED`, which names
