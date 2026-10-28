@@ -278,15 +278,37 @@ A generated project builds its stores with
   unpadded base64url encoding of 32 random bytes, for example
   `{"primary": "<43 characters>"}`.
 
-One way to make a key:
+`cayu new` doesn't set them, because a store that has used a keyring keeps
+requiring it (see below). To make a keyring, run `cayu keys generate`:
 
 ```bash
-python -c "import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))"
+uv run --no-sync cayu keys generate --env-file .env
+uv run --no-sync --env-file .env python run.py --message "YOUR REQUEST"
 ```
 
+`--env-file` adds both variables to the file, creating it with owner-only
+permissions if it doesn't exist, and prints only a confirmation. It refuses
+when the file already sets either variable, because a store that has used those
+keys needs them to open; `--replace` overwrites them, which is safe only when
+no database depends on the old keys. A generated project doesn't load `.env` by
+itself, so pass `--env-file .env` to `uv run` as above. Without `--env-file`
+the command prints the two `.env` lines, and `--keys-only` prints only the
+`CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS` JSON value, for a secret manager such as
+`cayu cloud env set CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS --secret --value-file -`.
+`--key-id` picks the key ID (default `primary`).
+
 Keep the keys secret, and give every process that opens the same database the
-same keys. Outside a generated project, pass the codec to the store and its
-keyring to the app:
+same keys. A deployed app gets its own keyring from its secret manager rather
+than a copy of the local one. To rotate, add a new key under a new ID to
+`CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS`, keep the old ones (at most four keys in
+all) so aliases they signed still resolve, and then set
+`CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID` to the new ID. Never give an
+existing key ID new material. The
+[runtime contract](runtime-contracts.md#conversation-interactions) has the
+details.
+
+Outside a generated project, pass the codec to the store and its keyring to the
+app:
 
 ```python
 from cayu.runtime import public_authority_alias_codec_from_environment

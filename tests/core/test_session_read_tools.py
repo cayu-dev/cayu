@@ -153,6 +153,7 @@ def test_tools_name_the_keyring_variables_when_the_store_has_no_keyring(tmp_path
                 assert "CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS" in message
                 assert "base64url encoding of 32 random bytes" in message
                 assert "public_authority_alias_codec_from_environment()" in message
+                assert "cayu keys generate" in message
         finally:
             await store.close()
 

@@ -2029,7 +2029,8 @@ Raw session and interaction identities remain private when they collide with a c
 CLI commands and generated server scaffolds load that deployment keyring from
 `CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID` and
 `CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS`. The latter is a JSON object from key ID to a
-canonical unpadded base64url encoding of exactly 32 random bytes. Keep the
+canonical unpadded base64url encoding of exactly 32 random bytes;
+`cayu keys generate` makes a new one-key keyring in that format. Keep the
 active key and every retained verification key in the deployment secret
 manager, inject the same values into all workers and administrative commands,
 and do not reuse a key ID with different material.

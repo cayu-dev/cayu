@@ -3637,14 +3637,25 @@ def test_cancellation_resistant_after_observer_fences_finalization_and_reuse(
     tmp_path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        workspace_capture_module,
-        "_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS",
-        0.01,
-    )
-
     async def run():
         binding = _CancellationResistantAfterObserverBinding()
+        await_outcome = workspace_capture_module.await_shielded_task_outcome
+        observation_calls = 0
+
+        async def timeout_after_dispatch(task, **kwargs):
+            nonlocal observation_calls
+            observation_calls += 1
+            if observation_calls == 2:
+                # Only the dispatched after-observer should time out. A short
+                # before-observer budget races ordinary loaded-runner setup.
+                async with asyncio.timeout(30):
+                    await binding.after_observation_started.wait()
+                kwargs["timeout_s"] = 0.01
+            return await await_outcome(task, **kwargs)
+
+        monkeypatch.setattr(
+            workspace_capture_module, "await_shielded_task_outcome", timeout_after_dispatch
+        )
         provider = _SingleToolProvider(
             tool_name="noop_workspace_mutation",
             arguments={},
@@ -3675,43 +3686,49 @@ def test_cancellation_resistant_after_observer_fences_finalization_and_reuse(
                 ),
             )
         )
-        await binding.after_observation_started.wait()
-        for _ in range(100):
-            durable = await store.query_events(
-                EventQuery(session_id="session-after-observer-first")
+        contender = None
+        try:
+            async with asyncio.timeout(30):
+                await binding.after_observation_started.wait()
+                while True:
+                    durable = await store.query_events(
+                        EventQuery(session_id="session-after-observer-first")
+                    )
+                    if any(record.event.type is EventType.SESSION_COMPLETED for record in durable):
+                        break
+                    await asyncio.sleep(0.01)
+
+            assert first.done() is False
+            assert binding.after_observation_finished.is_set() is False
+            assert binding.finalize_calls == 0
+            assert not any(
+                record.event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
+                for record in durable
             )
-            if any(record.event.type is EventType.SESSION_COMPLETED for record in durable):
-                break
-            await asyncio.sleep(0.001)
-        else:
-            raise AssertionError("First run did not publish its terminal event.")
 
-        assert first.done() is False
-        assert binding.after_observation_finished.is_set() is False
-        assert binding.finalize_calls == 0
-        assert not any(
-            record.event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
-            for record in durable
-        )
-
-        contender = asyncio.create_task(
-            collect_events(
-                app,
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="session-after-observer-second",
-                    messages=[Message.text("user", "reuse")],
-                ),
+            contender = asyncio.create_task(
+                collect_events(
+                    app,
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="session-after-observer-second",
+                        messages=[Message.text("user", "reuse")],
+                    ),
+                )
             )
-        )
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        assert contender.done() is False
-        assert provider.requests == 2
-        assert binding.finalize_calls == 0
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert contender.done() is False
+            assert provider.requests == 2
+            assert binding.finalize_calls == 0
 
-        binding.release_after_observation.set()
-        first_events, second_events = await asyncio.gather(first, contender)
+        finally:
+            # A failing assertion must not strand a cancellation-resistant
+            # observer during asyncio.run's shutdown.
+            binding.release_after_observation.set()
+            async with asyncio.timeout(30):
+                completed = await asyncio.gather(first, *([contender] if contender else []))
+        first_events, second_events = completed
         first_durable = await store.query_events(
             EventQuery(session_id="session-after-observer-first")
         )

@@ -411,7 +411,8 @@ def _public_authority_alias_environment_hint() -> str:
         f"{PUBLIC_AUTHORITY_ALIAS_KEYS_ENV} to a JSON object mapping each key ID to the "
         "unpadded base64url encoding of 32 random bytes, for example "
         '{"primary": "<43 characters>"}; public_authority_alias_codec_from_environment() '
-        "reads both"
+        "reads both. For a store that has not used a keyring yet, `cayu keys generate "
+        "--env-file .env` writes a new pair, and `cayu keys generate` prints one"
     )
 
 

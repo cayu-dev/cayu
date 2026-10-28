@@ -1001,6 +1001,25 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
                 return [event async for event in app.reconcile_tool_effect(request)]
 
             owner = app._recovery_coordinator._effect_reconciliation_owner
+            reconciliation_timers = []
+            if fault_phase == "deadline":
+                from types import SimpleNamespace
+
+                import cayu.runtime._tool_effect_reconciliation as reconciliation_module
+
+                def controlled_timeout(seconds):
+                    assert seconds == 0.1
+                    timer = asyncio.timeout(30)
+                    reconciliation_timers.append(timer)
+                    return timer
+
+                # Keep setup and SQLite reads outside the deadline race. Trigger
+                # the real owner timer only after the callback has entered.
+                monkeypatch.setattr(
+                    reconciliation_module,
+                    "asyncio",
+                    SimpleNamespace(**{**vars(asyncio), "timeout": controlled_timeout}),
+                )
             task = asyncio.create_task(collect())
             try:
                 entered = asyncio.create_task(callback_entered.wait())
@@ -1016,6 +1035,8 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
                     await asyncio.gather(entered, return_exceptions=True)
                 assert (await store.load("receipt-public")).status.value == "running"
                 if fault_phase == "deadline":
+                    assert len(reconciliation_timers) == 1
+                    reconciliation_timers[0].reschedule(asyncio.get_running_loop().time())
                     with pytest.raises(ToolEffectReconciliationTimeout):
                         await task
                     assert not task.cancelled()
