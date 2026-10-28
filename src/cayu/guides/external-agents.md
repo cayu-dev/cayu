@@ -97,7 +97,9 @@ async def confined_launch(context):
 Use this launcher with the same adapters and `run_external_agent` as any
 other launcher. Stdio stays interactive, so approvals and usage observations
 continue to work. Descendants inherit confinement and cannot escape cleanup
-with `setsid` or signal the supervisor. Closing confirms no process in the
+with `setsid`, signal the supervisor, or change another process's resource
+limits or scheduling. TCP Fast Open is refused, so granted ports are the
+only TCP destinations. Closing confirms no process in the
 owned group can still execute, including when container PID 1 retains zombies.
 File mode, ownership, timestamp and extended-attribute changes are blocked,
 even inside writable grants. Filesystem ioctls are blocked too; only terminal

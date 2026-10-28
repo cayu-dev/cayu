@@ -43,20 +43,21 @@ class _Program(ctypes.Structure):
 
 
 # Native ABI only; alternate syscall ABIs are refused rather than normalized.
+# Deny listen too: an unbound socket can autobind without Landlock checking bind.
 _SYSCALLS = {
     "x86_64": (
         0xC000003E,
         41,
         56,
         126,
-        (101, 109, 112, 155, 165, 166, 272, 308, 310, 311, 321, 425, 426, 427, 438),
+        (50, 101, 109, 112, 155, 165, 166, 272, 308, 310, 311, 321, 425, 426, 427, 438),
     ),
     "aarch64": (
         0xC00000B7,
         198,
         220,
         91,
-        (117, 154, 157, 41, 40, 39, 97, 268, 270, 271, 280, 425, 426, 427, 438),
+        (201, 117, 154, 157, 41, 40, 39, 97, 268, 270, 271, 280, 425, 426, 427, 438),
     ),
 }
 # Landlock ABI 6 does not mediate ownership, mode, timestamps or xattrs.
@@ -87,6 +88,38 @@ _METADATA_WRITES = {
     ),
     "aarch64": (5, 6, 7, 14, 15, 16, 52, 53, 54, 55, 88, 452, 463, 466, 469),
 }
+# Landlock does not mediate resource limits, scheduling or I/O priority, so a
+# guest could change them on any same-UID process, the supervisor included.
+# Allow these only when they target the caller: (syscall, required arguments).
+_SELF_ONLY = {
+    "x86_64": (
+        (302, ((0, 0),)),  # prlimit64(pid=0): getrlimit/setrlimit in libc
+        (141, ((0, 0), (1, 0))),  # setpriority(PRIO_PROCESS, 0)
+        (142, ((0, 0),)),  # sched_setparam
+        (144, ((0, 0),)),  # sched_setscheduler
+        (203, ((0, 0),)),  # sched_setaffinity
+        (314, ((0, 0),)),  # sched_setattr
+        (251, ((0, 1), (1, 0))),  # ioprio_set(IOPRIO_WHO_PROCESS, 0)
+    ),
+    "aarch64": (
+        (261, ((0, 0),)),
+        (140, ((0, 0), (1, 0))),
+        (118, ((0, 0),)),
+        (119, ((0, 0),)),
+        (122, ((0, 0),)),
+        (274, ((0, 0),)),
+        (30, ((0, 1), (1, 0))),
+    ),
+}
+# TCP Fast Open connects inside sendto/sendmsg/sendmmsg without Landlock's
+# connect hook, so it would reach ungranted ports: (syscall, flags argument).
+_FASTOPEN_SENDS = {
+    "x86_64": ((44, 3), (46, 2), (307, 3)),
+    "aarch64": ((206, 3), (211, 2), (269, 3)),
+}
+_SETSOCKOPT = {"x86_64": 54, "aarch64": 208}
+_MSG_FASTOPEN = 0x20000000
+_IPPROTO_TCP, _TCP_FASTOPEN_CONNECT = 6, 30
 _FS_READ = (1 << 0) | (1 << 2) | (1 << 3)  # execute, read file, read directory
 _FS_FILE = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 14) | (1 << 15)
 
@@ -166,6 +199,36 @@ def confine(config: dict) -> None:
     ]
     if arch == 0xC000003E:
         ins += [_Filter(0x45, 0, 1, 0x40000000), _Filter(0x06, 0, 0, deny)]
+    # Each block below runs only for its syscall and always returns, so the
+    # accumulator still holds the syscall number for the next block. Argument
+    # checks read the low 32 bits: these arguments are C ints and the kernel
+    # ignores the upper half.
+    for nr, required in _SELF_ONLY[platform.machine()]:
+        ins.append(_Filter(0x15, 0, 2 * len(required) + 2, nr))
+        for index, (argument, value) in enumerate(required):
+            remaining = len(required) - index - 1
+            ins += [
+                _Filter(0x20, 0, 0, 16 + 8 * argument),
+                _Filter(0x15, 0, 2 * remaining + 1, value),
+            ]
+        ins += [_Filter(0x06, 0, 0, allow), _Filter(0x06, 0, 0, deny)]
+    for nr, flags in _FASTOPEN_SENDS[platform.machine()]:
+        ins += [
+            _Filter(0x15, 0, 4, nr),
+            _Filter(0x20, 0, 0, 16 + 8 * flags),
+            _Filter(0x45, 0, 1, _MSG_FASTOPEN),
+            _Filter(0x06, 0, 0, deny),
+            _Filter(0x06, 0, 0, allow),
+        ]
+    ins += [
+        _Filter(0x15, 0, 6, _SETSOCKOPT[platform.machine()]),
+        _Filter(0x20, 0, 0, 24),
+        _Filter(0x15, 0, 3, _IPPROTO_TCP),
+        _Filter(0x20, 0, 0, 32),
+        _Filter(0x15, 0, 1, _TCP_FASTOPEN_CONNECT),
+        _Filter(0x06, 0, 0, deny),
+        _Filter(0x06, 0, 0, allow),
+    ]
     for nr in (*denied, *_METADATA_WRITES[platform.machine()]):
         ins += [_Filter(0x15, 0, 1, nr), _Filter(0x06, 0, 0, deny)]
     # Filesystem ioctls can also mutate metadata through read-only descriptors.

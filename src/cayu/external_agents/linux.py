@@ -57,7 +57,8 @@ async def linux_agent_launch(
     stdin/stdout and child processes work. A gateway on an explicitly granted
     port can hold the real model credentials outside the guest.
 
-    Descendants cannot leave their process group or signal the supervisor.
+    Descendants cannot leave their process group, signal the supervisor, or
+    change another process's resource limits or scheduling.
     ``close`` confirms that group is empty. No CPU, memory, attempt or execution
     deadline is imposed by the launcher; the run owns those policies. Missing
     confinement support fails before yielding a launcher, with no local fallback.

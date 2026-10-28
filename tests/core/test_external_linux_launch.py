@@ -176,6 +176,90 @@ with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as s:
     asyncio.run(scenario())
 
 
+def test_linux_launch_denies_fast_open_and_other_process_limits(tmp_path):
+    cli = _cli(
+        tmp_path / "vendor",
+        """
+import json, os, resource, socket, sys
+result = {}
+def denied(name, operation):
+    try:
+        operation()
+    except PermissionError:
+        result[name] = True
+    else:
+        result[name] = False
+port = int(sys.argv[1])
+def fastopen_sendto():
+    with socket.socket() as s:
+        s.sendto(b"leak", socket.MSG_FASTOPEN, ("127.0.0.1", port))
+def fastopen_sendmsg():
+    with socket.socket() as s:
+        s.sendmsg([b"leak"], [], socket.MSG_FASTOPEN, ("127.0.0.1", port))
+def fastopen_connect():
+    with socket.socket() as s:
+        s.setsockopt(socket.IPPROTO_TCP, 30, 1)  # TCP_FASTOPEN_CONNECT
+denied("fastopen_sendto", fastopen_sendto)
+denied("fastopen_sendmsg", fastopen_sendmsg)
+denied("fastopen_connect", fastopen_connect)
+def listen_unbound():
+    with socket.socket() as s:
+        s.listen()
+denied("listen_unbound", listen_unbound)
+denied("prlimit_parent", lambda: resource.prlimit(os.getppid(), resource.RLIMIT_CORE, (0, 0)))
+denied("setpriority_user", lambda: os.setpriority(os.PRIO_USER, 0, 1))
+resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+os.setpriority(os.PRIO_PROCESS, 0, os.getpriority(os.PRIO_PROCESS, 0))
+os.sched_setaffinity(0, os.sched_getaffinity(0))
+print(json.dumps(result), flush=True)
+""",
+    )
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    async def scenario():
+        received: list[bytes] = []
+
+        async def accept(reader, writer):
+            received.append(await reader.read(16))
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(accept, "127.0.0.1", 0)
+        try:
+            listener = server.sockets[0]
+            listener.setsockopt(socket.IPPROTO_TCP, socket.TCP_FASTOPEN, 5)
+            port = listener.getsockname()[1]
+            async with linux_agent_launch(
+                cli=str(cli), cwd=checkout, read_only_paths=[sys.base_prefix, sys.prefix]
+            ) as launch:
+                process = await asyncio.create_subprocess_exec(
+                    launch.executable,
+                    str(port),
+                    env=dict(launch.environment),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                output, error = await asyncio.wait_for(process.communicate(), 10)
+                assert process.returncode == 0, error.decode()
+                assert json.loads(output) == {
+                    "fastopen_sendto": True,
+                    "fastopen_sendmsg": True,
+                    "fastopen_connect": True,
+                    "listen_unbound": True,
+                    "prlimit_parent": True,
+                    "setpriority_user": True,
+                }
+            await asyncio.sleep(0.2)
+            assert received == []
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
 def test_guest_pythonpath_cannot_run_before_confinement(tmp_path):
     checkout = tmp_path / "checkout"
     checkout.mkdir()
