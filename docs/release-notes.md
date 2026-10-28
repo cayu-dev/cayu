@@ -8,6 +8,16 @@ Upgrade: No storage migration is required. Review the changes below before upgra
 
 None.
 
+### Changes
+
+- Brokered sandboxes can fetch private repositories without their token:
+  `BrokeredSandboxCodingEnvironmentFactory(git_repositories=...)`,
+  `SandboxBrokerClient.create(git_repositories=...)` and
+  `CAYU_CLOUD_SANDBOX_GIT_REPOSITORIES` ask Cayu Cloud to add the Agent's bound
+  git credential to the sandbox's fetches of exactly those repositories.
+  `SandboxRecord.git` reports them, and `validate_git_repositories` checks them
+  as Cloud does.
+
 ### Fixes
 
 - A failed staged copy's `SandboxCopyFailedError` now carries Cayu Cloud's message

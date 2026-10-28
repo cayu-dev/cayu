@@ -49,6 +49,7 @@ __all__ = [
     "MAX_COMMAND_OUTPUT_BYTES",
     "MAX_COMMAND_STDIN_BYTES",
     "MAX_EGRESS_HOSTS",
+    "MAX_GIT_REPOSITORIES",
     "MAX_LEASE_SECONDS",
     "MAX_STDIO_CHUNK_BYTES",
     "MAX_WAIT_SECONDS",
@@ -71,6 +72,7 @@ __all__ = [
     "SandboxEgress",
     "SandboxEgressMode",
     "SandboxFailure",
+    "SandboxGit",
     "SandboxGuarantees",
     "SandboxImage",
     "SandboxLeaseLostError",
@@ -87,6 +89,8 @@ __all__ = [
     "SandboxStdoutChunk",
     "validate_egress",
     "validate_egress_hosts",
+    "validate_git_egress",
+    "validate_git_repositories",
 ]
 
 #: Base URL of the Cloud API, for example ``https://cloud.cayu.dev``. Cloud injects it.
@@ -121,6 +125,8 @@ MAX_ARCHIVE_EXCLUDES = 50
 MAX_STDIO_CHUNK_BYTES = 1024 * 1024
 #: The most hosts one ``allowlist`` egress names.
 MAX_EGRESS_HOSTS = 50
+#: The most repositories one sandbox fetches with the Agent's brokered git credentials.
+MAX_GIT_REPOSITORIES = 50
 #: How long one broker request may take. On Cayu Cloud a request crosses the portal
 #: (35 s), API Gateway (30 s) and the broker's own wait (up to 20 s, inside the gateway's
 #: bound), so the client waits longer than the slowest hop and gets that hop's answer
@@ -150,6 +156,8 @@ _EGRESS_HOST_NAME = re.compile(rf"{_EGRESS_HOST_LABEL}(?:\.{_EGRESS_HOST_LABEL})
 _SPECIAL_USE_LABELS = frozenset(
     {"alt", "arpa", "home", "internal", "invalid", "local", "localhost", "onion", "test"}
 )
+_GIT_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]{1,100}")
+_MAX_GIT_PATH_SEGMENTS = 10
 _RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 #: The pauses before retrying an archive read or write, which the sandbox's broker
 #: carries out while the request waits (up to 20 s): one that failed may have held that
@@ -179,6 +187,8 @@ _KNOWN_CODES = frozenset(
         "command_not_interactive",
         "stdin_offset_mismatch",
         "stdout_offset_mismatch",
+        "git_credentials_unsupported",
+        "git_repositories_unbound",
     }
 )
 
@@ -311,6 +321,24 @@ class SandboxEgress(BaseModel):
         return None
 
 
+class SandboxGit(BaseModel):
+    """The repositories a sandbox fetches with the Agent's brokered git credentials, as its
+    record reports them (``host/path``, the host lowercased, the path exactly as named)."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    repositories: tuple[str, ...] = ()
+
+    @field_validator("repositories", mode="before")
+    @classmethod
+    def _repositories(cls, value: Any) -> Any:
+        # A shape this client doesn't understand reports none rather than invalidating
+        # the record.
+        if isinstance(value, list | tuple) and all(type(item) is str for item in value):
+            return tuple(value)
+        return ()
+
+
 class SandboxGuarantees(BaseModel):
     """What Cloud enforces for a sandbox, as a versioned list of items."""
 
@@ -387,6 +415,16 @@ class SandboxRecord(BaseModel):
     interactive_commands: bool = False
     guarantees: SandboxGuarantees | None = None
     image_identity: SandboxImageIdentity | None = None
+    #: The repositories the sandbox fetches with brokered git credentials; ``None`` without
+    #: them, and from a broker that predates them.
+    git: SandboxGit | None = None
+
+    @field_validator("git", mode="before")
+    @classmethod
+    def _git_or_none(cls, value: Any) -> Any:
+        if isinstance(value, SandboxGit) or value is None:
+            return value
+        return SandboxGit.model_validate(dict(value)) if isinstance(value, Mapping) else None
 
     @field_validator("image_identity", mode="before")
     @classmethod
@@ -740,6 +778,66 @@ def validate_egress(
     return ("none" if egress_mode == "none" else "public_web"), None
 
 
+def validate_git_repositories(repositories: Sequence[str]) -> tuple[str, ...]:
+    """Check the repositories a sandbox fetches with brokered git credentials, as Cloud does,
+    and return their canonical form.
+
+    1 to ``MAX_GIT_REPOSITORIES`` entries, each ``host/path`` without a scheme
+    (``github.com/cayu-tech/cayu.git``): one public DNS host, no wildcard, and 2 to 10
+    path segments of letters, digits, ``.``, ``_`` and ``-``. The host is lowercased; the
+    path is kept exactly, case and a trailing ``.git`` included, apart from leading and
+    trailing slashes, because only the git host knows which spellings name the same
+    repository. Name each one as the sandbox's clone URL spells it. The result is
+    deduplicated and sorted, which is how Cloud's record returns it.
+    """
+
+    if isinstance(repositories, str | bytes) or not isinstance(repositories, Sequence):
+        raise TypeError("Sandbox git repositories must be a sequence, not one string.")
+    if not 1 <= len(repositories) <= MAX_GIT_REPOSITORIES:
+        raise ValueError(
+            f"Sandbox git repositories must name 1 to {MAX_GIT_REPOSITORIES} repositories."
+        )
+    canonical: set[str] = set()
+    for item in repositories:
+        if type(item) is not str:
+            raise TypeError("Each sandbox git repository must be a string such as host/owner/name.")
+        host, _, path = item.strip().partition("/")
+        segments = path.strip("/").split("/")
+        if (
+            "://" in item
+            or host.strip().startswith("*.")
+            or not 2 <= len(segments) <= _MAX_GIT_PATH_SEGMENTS
+            or not all(_GIT_PATH_SEGMENT.fullmatch(segment) for segment in segments)
+            or any(segment in {".", ".."} for segment in segments)
+        ):
+            raise ValueError(
+                f"{item!r} isn't a sandbox git repository: name it as host/owner/name, such as "
+                "github.com/cayu-tech/cayu.git, without a scheme."
+            )
+        canonical.add(f"{_egress_host(host)}/{'/'.join(segments)}")
+    return tuple(sorted(canonical))
+
+
+def validate_git_egress(
+    repositories: tuple[str, ...], egress_mode: str, egress_hosts: tuple[str, ...] | None
+) -> None:
+    """Git needs a way to its hosts: ``public_web``, or an ``allowlist`` naming each exactly."""
+
+    if egress_mode not in {"public_web", "allowlist"}:
+        raise ValueError(
+            "Sandbox git repositories need egress 'allowlist' (or 'public_web') to reach their "
+            "host."
+        )
+    if egress_mode == "allowlist":
+        unlisted = sorted(
+            {item.split("/", 1)[0] for item in repositories} - set(egress_hosts or ())
+        )
+        if unlisted:
+            raise ValueError(
+                f"Sandbox egress hosts must name each git host exactly: add {unlisted[0]}."
+            )
+
+
 def validate_lease_seconds(lease_seconds: int) -> int:
     if (
         type(lease_seconds) is not int
@@ -873,12 +971,20 @@ class SandboxBrokerClient:
         lease_seconds: int,
         labels: Mapping[str, str] | None = None,
         egress_hosts: Sequence[str] | None = None,
+        git_repositories: Sequence[str] | None = None,
     ) -> SandboxRecord:
         """Create a sandbox; ``egress_hosts`` names an ``allowlist`` egress's hosts.
 
         The request's egress is ``{"mode": "none"}``, ``{"mode": "public_web"}``
         or ``{"mode": "allowlist", "hosts": [...]}`` with the hosts in canonical
         form (see ``validate_egress_hosts``).
+
+        ``git_repositories`` asks Cayu Cloud to authenticate the sandbox's git
+        fetches of those repositories with the Agent's bound git credential,
+        which never enters the sandbox (see ``validate_git_repositories``). Each
+        must be covered by one of the Agent's bindings, or the broker refuses the
+        create with ``git_repositories_unbound``; an install that doesn't broker
+        git credentials refuses it with ``git_credentials_unsupported``.
         """
 
         if (
@@ -893,13 +999,17 @@ class SandboxBrokerClient:
         egress: dict[str, Any] = {"mode": mode}
         if hosts is not None:
             egress["hosts"] = list(hosts)
-        payload = {
+        payload: dict[str, Any] = {
             "idempotency_key": idempotency_key,
             "image": image,
             "egress": egress,
             "lease_seconds": validate_lease_seconds(lease_seconds),
             "labels": validate_labels(labels or {}),
         }
+        if git_repositories is not None:
+            repositories = validate_git_repositories(git_repositories)
+            validate_git_egress(repositories, mode, hosts)
+            payload["git"] = {"repositories": list(repositories)}
         body, _ = await self._json("POST", self._base, payload=payload)
         return self._model(SandboxRecord, body)
 

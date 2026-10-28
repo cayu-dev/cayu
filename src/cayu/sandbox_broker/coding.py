@@ -76,6 +76,8 @@ from cayu.sandbox_broker.client import (
     SandboxEgressMode,
     SandboxRecord,
     validate_egress,
+    validate_git_egress,
+    validate_git_repositories,
     validate_labels,
     validate_lease_seconds,
 )
@@ -99,6 +101,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BROKERED_SANDBOX_EGRESS_ENV",
     "BROKERED_SANDBOX_EGRESS_HOSTS_ENV",
+    "BROKERED_SANDBOX_GIT_REPOSITORIES_ENV",
     "BROKERED_SANDBOX_IMAGE_ENV",
     "BROKERED_SANDBOX_LEASE_ENV",
     "BrokeredCodingBackendOptions",
@@ -115,6 +118,9 @@ BROKERED_SANDBOX_EGRESS_ENV = "CAYU_CLOUD_SANDBOX_EGRESS"
 #: With ``allowlist`` egress, and only with it: the hosts the sandbox may reach, separated by
 #: commas or whitespace (``pypi.org,files.pythonhosted.org,*.githubusercontent.com``).
 BROKERED_SANDBOX_EGRESS_HOSTS_ENV = "CAYU_CLOUD_SANDBOX_EGRESS_HOSTS"
+#: Optional: repositories the sandbox's git fetches with the Agent's brokered git credentials,
+#: ``host/path`` separated by commas or whitespace (``github.com/cayu-tech/cayu.git``).
+BROKERED_SANDBOX_GIT_REPOSITORIES_ENV = "CAYU_CLOUD_SANDBOX_GIT_REPOSITORIES"
 #: Lease length in seconds, 60 to 3600 (default 900).
 BROKERED_SANDBOX_LEASE_ENV = "CAYU_CLOUD_SANDBOX_LEASE_SECONDS"
 
@@ -342,8 +348,16 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     outbound network, ``egress="public_web"`` the open internet through Cloud's
     logging proxy, and ``egress="allowlist"`` with ``egress_hosts`` only the
     HTTPS hosts listed (1 to 50 DNS names, each exact or ``*.name``), through
-    the same proxy. No credential ever enters the sandbox, and the proxy adds
-    none. The choice is explicit; there is no default.
+    the same proxy. No credential ever enters the sandbox. The choice is
+    explicit; there is no default.
+
+    ``git_repositories`` (``host/path``, such as
+    ``github.com/cayu-tech/cayu.git``) asks Cayu Cloud to authenticate the
+    sandbox's git fetches of those repositories with the Agent's git credential
+    bound to them in Cloud; the token stays in Cloud's broker, and only fetches
+    of exactly those repositories are let through on their hosts. It needs
+    ``egress="allowlist"`` naming each host, or ``"public_web"``; name each
+    repository the way the clone URL spells it.
 
     ``none`` and ``allowlist`` sandboxes can be admitted for
     ``ExecutionRequirements.untrusted()`` (``network_access="deny_by_default"``)
@@ -408,6 +422,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         source_workspace: LocalWorkspace,
         egress: SandboxEgressMode,
         egress_hosts: Sequence[str] | None = None,
+        git_repositories: Sequence[str] | None = None,
         image: str = DEFAULT_IMAGE,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         labels: Mapping[str, str] | None = None,
@@ -442,6 +457,10 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 "sandbox whose protected paths can be excluded before traversal."
             )
         egress, owned_hosts = validate_egress(egress, egress_hosts)
+        owned_repositories = None
+        if git_repositories is not None:
+            owned_repositories = validate_git_repositories(git_repositories)
+            validate_git_egress(owned_repositories, egress, owned_hosts)
         if type(image) is not str or not image.strip():
             raise ValueError("image must name a sandbox catalog entry.")
         owned_staged_copies = validate_staged_copies_mode(staged_copies)
@@ -480,6 +499,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         self.egress: SandboxEgressMode = egress
         #: The canonical hosts of an ``allowlist`` egress; ``None`` for the other modes.
         self.egress_hosts: tuple[str, ...] | None = owned_hosts
+        #: The canonical repositories fetched with brokered git credentials, or ``None``.
+        self.git_repositories: tuple[str, ...] | None = owned_repositories
         self.image = image
         self.lease_seconds = validate_lease_seconds(lease_seconds)
         self.labels = validate_labels(labels or {})
@@ -569,7 +590,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             raise ValueError(
                 f"{BROKERED_SANDBOX_EGRESS_ENV} must be set to 'none', 'public_web' or 'allowlist'."
             )
-        hosts = _egress_hosts_from_env(env)
+        hosts = _env_list(env, BROKERED_SANDBOX_EGRESS_HOSTS_ENV)
         if mode == "allowlist" and hosts is None:
             raise ValueError(
                 f"{BROKERED_SANDBOX_EGRESS_ENV}=allowlist needs {BROKERED_SANDBOX_EGRESS_HOSTS_ENV}."
@@ -589,6 +610,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             source_workspace=source_workspace,
             egress=mode,
             egress_hosts=hosts,
+            git_repositories=_env_list(env, BROKERED_SANDBOX_GIT_REPOSITORIES_ENV),
             image=env.get(BROKERED_SANDBOX_IMAGE_ENV, "").strip() or DEFAULT_IMAGE,
             lease_seconds=lease_seconds,
             **options,
@@ -627,6 +649,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                         self.egress,
                         # Only allowlist names hosts; the other modes keep their fingerprint.
                         *(() if self.egress_hosts is None else self.egress_hosts),
+                        # Likewise, only a factory with git repositories names them.
+                        *(() if self.git_repositories is None else ("git", *self.git_repositories)),
                     )
                 ).encode()
             ).hexdigest()
@@ -776,6 +800,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             image=self.image,
             egress_mode=self.egress,
             egress_hosts=self.egress_hosts,
+            git_repositories=self.git_repositories,
             lease_seconds=self.lease_seconds,
             labels=labels,
         )
@@ -860,9 +885,11 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         )
 
 
-def _egress_hosts_from_env(env: Mapping[str, str]) -> tuple[str, ...] | None:
-    hosts = tuple(env.get(BROKERED_SANDBOX_EGRESS_HOSTS_ENV, "").replace(",", " ").split())
-    return hosts or None
+def _env_list(env: Mapping[str, str], name: str) -> tuple[str, ...] | None:
+    """A variable's entries, separated by commas or whitespace; ``None`` when it has none."""
+
+    items = tuple(env.get(name, "").replace(",", " ").split())
+    return items or None
 
 
 def _validated_commands(commands: Sequence[str], *, field_name: str) -> tuple[str, ...]:
@@ -984,6 +1011,8 @@ def _configuration_fingerprint(factory: BrokeredSandboxCodingEnvironmentFactory)
     if factory.egress_hosts is not None:
         # Only allowlist names hosts; the other modes keep their earlier fingerprint.
         material["egress_hosts"] = list(factory.egress_hosts)
+    if factory.git_repositories is not None:
+        material["git_repositories"] = list(factory.git_repositories)
     return (
         "sha256:"
         + sha256(
@@ -1038,9 +1067,14 @@ class BrokeredCodingBackendOptions:
                 f"{BROKERED_SANDBOX_EGRESS_ENV}={egress} conflicts with the coding toolchain, "
                 "which prohibits the network; set it to 'none' or leave it unset."
             )
-        if _egress_hosts_from_env(env) is not None:
+        if _env_list(env, BROKERED_SANDBOX_EGRESS_HOSTS_ENV) is not None:
             raise ValueError(
                 f"{BROKERED_SANDBOX_EGRESS_HOSTS_ENV} conflicts with the coding toolchain, "
+                "which prohibits the network; leave it unset."
+            )
+        if _env_list(env, BROKERED_SANDBOX_GIT_REPOSITORIES_ENV) is not None:
+            raise ValueError(
+                f"{BROKERED_SANDBOX_GIT_REPOSITORIES_ENV} conflicts with the coding toolchain, "
                 "which prohibits the network; leave it unset."
             )
         lease_text = env.get(BROKERED_SANDBOX_LEASE_ENV, "").strip()

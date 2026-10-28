@@ -1586,6 +1586,9 @@ def _fingerprint(runner: BrokeredSandboxRunner) -> str:
     if sandbox.egress.hosts is not None:
         # Only allowlist records carry hosts; the others keep their earlier fingerprint.
         identity["egress_hosts"] = list(sandbox.egress.hosts)
+    if sandbox.git is not None and sandbox.git.repositories:
+        # Only records with git repositories carry them; the others keep their fingerprint.
+        identity["git_repositories"] = list(sandbox.git.repositories)
     if sandbox.image_identity is not None:
         # Records without an image identity keep their earlier fingerprint.
         identity["image_identity"] = sandbox.image_identity.model_dump(mode="json")

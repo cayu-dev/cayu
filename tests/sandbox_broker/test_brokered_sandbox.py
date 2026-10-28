@@ -62,6 +62,7 @@ from cayu.sandbox_broker import (
     SandboxQuotaExceededError,
     sandbox_capability_claims,
     validate_egress_hosts,
+    validate_git_repositories,
 )
 from cayu.sandbox_broker import client as client_module
 from cayu.sandbox_broker import runner as runner_module
@@ -465,6 +466,133 @@ def test_a_factory_allocates_its_allowlist_and_fingerprints_its_hosts(tmp_path: 
         "hosts": ["files.pythonhosted.org", "pypi.org"],
     }
     assert sandbox.status == "destroyed"
+
+
+def test_git_repositories_keep_their_exact_path() -> None:
+    assert validate_git_repositories(
+        ["GitHub.com/Cayu-Tech/cayu.git", "github.com/cayu-tech/cayu", "github.com/cayu-tech/cayu/"]
+    ) == ("github.com/Cayu-Tech/cayu.git", "github.com/cayu-tech/cayu")
+    for value in (
+        "https://github.com/cayu-tech/cayu",
+        "github.com/cayu-tech",
+        "github.com/a/../b",
+        "*.github.com/a/b",
+        "10.0.0.1/a/b",
+        "github.com:443/a/b",
+        "github.com/a b/c",
+    ):
+        with pytest.raises(
+            ValueError, match="isn't a sandbox git repository|isn't a sandbox egress host"
+        ):
+            validate_git_repositories([value])
+    with pytest.raises(ValueError, match="1 to 50"):
+        validate_git_repositories([])
+    with pytest.raises(TypeError, match="not one string"):
+        validate_git_repositories("github.com/a/b")
+
+
+def test_the_client_asks_for_git_repositories_in_the_contracts_shape(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.git_bindings = {"github.com/cayu-tech/cayu.git"}
+
+    async def scenario():
+        client = broker.client()
+        record = await client.create(
+            idempotency_key="git",
+            image="coding-python",
+            egress_mode="allowlist",
+            egress_hosts=["github.com"],
+            git_repositories=["GitHub.com/cayu-tech/cayu.git"],
+            lease_seconds=60,
+        )
+        assert record.git is not None
+        assert record.git.repositories == ("github.com/cayu-tech/cayu.git",)
+        plain = await client.create(
+            idempotency_key="plain", image="coding-python", egress_mode="none", lease_seconds=60
+        )
+        assert plain.git is None
+        # Refused before anything is sent: no way to the host.
+        for egress_mode, hosts in (("none", None), ("allowlist", ["pypi.org"])):
+            with pytest.raises(ValueError, match="egress"):
+                await client.create(
+                    idempotency_key="x",
+                    image="coding-python",
+                    egress_mode=egress_mode,
+                    egress_hosts=hosts,
+                    git_repositories=["github.com/cayu-tech/cayu.git"],
+                    lease_seconds=60,
+                )
+        # Another spelling is another repository, which no binding covers.
+        with pytest.raises(SandboxBrokerRefusedError, match="git_repositories_unbound"):
+            await client.create(
+                idempotency_key="unbound",
+                image="coding-python",
+                egress_mode="public_web",
+                git_repositories=["github.com/cayu-tech/cayu"],
+                lease_seconds=60,
+            )
+        broker.git_credentials = False
+        with pytest.raises(SandboxBrokerRefusedError, match="git_credentials_unsupported"):
+            await client.create(
+                idempotency_key="off",
+                image="coding-python",
+                egress_mode="public_web",
+                git_repositories=["github.com/cayu-tech/cayu.git"],
+                lease_seconds=60,
+            )
+        await client.aclose()
+
+    asyncio.run(scenario())
+    posted = [
+        json.loads(request.content).get("git")
+        for request in broker.requests
+        if request.method == "POST" and request.url.path.endswith("/sandboxes")
+    ]
+    assert posted[:2] == [{"repositories": ["github.com/cayu-tech/cayu.git"]}, None]
+
+
+def test_a_factory_allocates_its_git_repositories_and_fingerprints_them(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.git_bindings = {"github.com/cayu-tech/cayu.git"}
+    factory = _factory(
+        broker,
+        source,
+        egress="allowlist",
+        egress_hosts=["github.com"],
+        git_repositories=["github.com/cayu-tech/cayu.git"],
+    )
+    plain = _factory(broker, source, egress="allowlist", egress_hosts=["github.com"])
+    assert factory.git_repositories == ("github.com/cayu-tech/cayu.git",)
+    assert factory.execution_profile_identity != plain.execution_profile_identity
+    with pytest.raises(ValueError, match="egress"):
+        _factory(broker, source, egress="none", git_repositories=["github.com/a/b"])
+
+    async def scenario():
+        result = await factory.create(_request())
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    asyncio.run(scenario())
+    (sandbox,) = broker.sandboxes.values()
+    assert sandbox.body["git"] == {"repositories": ["github.com/cayu-tech/cayu.git"]}
+
+
+def test_factory_from_env_reads_git_repositories(tmp_path: Path) -> None:
+    source = LocalWorkspace(tmp_path)
+    factory = BrokeredSandboxCodingEnvironmentFactory.from_env(
+        source_workspace=source,
+        environ={
+            **_ENV,
+            "CAYU_CLOUD_SANDBOX_EGRESS": "allowlist",
+            "CAYU_CLOUD_SANDBOX_EGRESS_HOSTS": "github.com",
+            "CAYU_CLOUD_SANDBOX_GIT_REPOSITORIES": "github.com/a/b.git, github.com/a/c.git",
+        },
+    )
+    assert factory.git_repositories == ("github.com/a/b.git", "github.com/a/c.git")
+    unset = BrokeredSandboxCodingEnvironmentFactory.from_env(
+        source_workspace=source, environ={**_ENV, "CAYU_CLOUD_SANDBOX_EGRESS": "public_web"}
+    )
+    assert unset.git_repositories is None
 
 
 # Allocation and use ----------------------------------------------------------

@@ -35,6 +35,7 @@ from cayu.sandbox_broker.client import (
     SandboxEgress,
     SandboxEgressMode,
     SandboxFailure,
+    SandboxGit,
     SandboxGuarantees,
     SandboxImage,
     SandboxImageIdentity,
@@ -51,10 +52,12 @@ from cayu.sandbox_broker.client import (
     SandboxStdinWrite,
     SandboxStdoutChunk,
     validate_egress_hosts,
+    validate_git_repositories,
 )
 from cayu.sandbox_broker.coding import (
     BROKERED_SANDBOX_EGRESS_ENV,
     BROKERED_SANDBOX_EGRESS_HOSTS_ENV,
+    BROKERED_SANDBOX_GIT_REPOSITORIES_ENV,
     BROKERED_SANDBOX_IMAGE_ENV,
     BROKERED_SANDBOX_LEASE_ENV,
     BrokeredCodingBackendOptions,
@@ -72,6 +75,7 @@ from cayu.sandbox_broker.runner import (
 __all__ = [
     "BROKERED_SANDBOX_EGRESS_ENV",
     "BROKERED_SANDBOX_EGRESS_HOSTS_ENV",
+    "BROKERED_SANDBOX_GIT_REPOSITORIES_ENV",
     "BROKERED_SANDBOX_IMAGE_ENV",
     "BROKERED_SANDBOX_LEASE_ENV",
     "BROKER_API_URL_ENV",
@@ -100,6 +104,7 @@ __all__ = [
     "SandboxEgress",
     "SandboxEgressMode",
     "SandboxFailure",
+    "SandboxGit",
     "SandboxGuarantees",
     "SandboxImage",
     "SandboxImageIdentity",
@@ -119,4 +124,5 @@ __all__ = [
     "StagedCopiesMode",
     "sandbox_capability_claims",
     "validate_egress_hosts",
+    "validate_git_repositories",
 ]

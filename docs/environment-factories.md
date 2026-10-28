@@ -569,6 +569,7 @@ factory = BrokeredSandboxCodingEnvironmentFactory.from_env(
 | `CAYU_CLOUD_SANDBOX_TOKEN` | The Agent's sandbox credential (Cloud sets it), or an Organization API key with the `sandboxes` scope. |
 | `CAYU_CLOUD_SANDBOX_EGRESS` | `none` (no outbound network), `public_web` (the open internet through Cloud's logging proxy) or `allowlist` (only the hosts in `CAYU_CLOUD_SANDBOX_EGRESS_HOSTS`, through the same proxy). Required by `from_env`. |
 | `CAYU_CLOUD_SANDBOX_EGRESS_HOSTS` | With `allowlist`, and only with it: the hosts the sandbox may reach, separated by commas or spaces, for example `pypi.org,files.pythonhosted.org,*.githubusercontent.com`. |
+| `CAYU_CLOUD_SANDBOX_GIT_REPOSITORIES` | Optional: repositories the sandbox's git fetches with the Agent's brokered git credentials, `host/path` separated by commas or spaces, for example `github.com/cayu-tech/cayu.git`. Needs `public_web`, or `allowlist` naming each host. |
 | `CAYU_CLOUD_SANDBOX_IMAGE` | Catalog image, default `coding-python`. `SandboxBrokerClient.list_images()` lists what the install offers. |
 | `CAYU_CLOUD_SANDBOX_LEASE_SECONDS` | Lease length, 60 to 3600, default 900. |
 | `CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS` | Timeout for one broker request, default 45. A read that waits (`wait_seconds`) gets its wait on top. |
@@ -677,6 +678,23 @@ in and runs, a broker outage is retried until the copy's own deadline (ten
 minutes plus a second per MiB), as commands are; only a copy still unconfirmed
 then closes the runner for good. File tools and commands run as broker
 commands.
+
+A sandbox can also fetch private repositories itself without holding their
+token, where the Cayu Cloud install brokers git credentials. Bind the Agent's
+token (one of its Cloud secrets, such as `GITHUB_TOKEN`) to the repositories
+in Cloud (`PUT /v1/applications/{id}/sandbox-git-credentials/{host}`, see
+Cloud's sandbox broker contract), then pass
+`git_repositories=["github.com/<owner>/<name>.git"]` with
+`egress="allowlist", egress_hosts=["github.com"]` (or set
+`CAYU_CLOUD_SANDBOX_GIT_REPOSITORIES`). `git clone` and `git fetch` of those
+URLs then work in the sandbox: Cloud's broker adds the credential to those
+fetches on the way to the host, and refuses pushes, other repositories and
+other requests there. Name each repository the way its clone URL spells it;
+the path is compared exactly, case and `.git` included. The sandbox record's
+`git` reports them, and they are part of the factory's and the runner's
+identity. A Cloud that doesn't broker git credentials refuses the create with
+`git_credentials_unsupported`, and a repository no binding covers with
+`git_repositories_unbound`.
 
 The parts work on their own too. An Agent that clones a private repository
 itself can hand the sandbox the checkout, `.git` included, without the

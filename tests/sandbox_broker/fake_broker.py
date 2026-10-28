@@ -34,7 +34,12 @@ from urllib.parse import quote
 
 import httpx
 
-from cayu.sandbox_broker import SandboxBrokerClient, SandboxBrokerSettings, validate_egress_hosts
+from cayu.sandbox_broker import (
+    SandboxBrokerClient,
+    SandboxBrokerSettings,
+    validate_egress_hosts,
+    validate_git_repositories,
+)
 
 TOKEN = "cayu_sbx_test_token"
 APPLICATION = "compound"
@@ -136,6 +141,7 @@ class FakeSandbox:
             "staged_copies": self.staged_copies,
             "interactive_commands": self.interactive_commands,
             "guarantees": {"version": self.guarantees_version, "items": list(self.guarantees)},
+            "git": self.body.get("git"),
             **({} if self.image_identity is None else {"image_identity": self.image_identity}),
         }
 
@@ -170,6 +176,10 @@ class FakeBroker:
         # 2 reports Cloud's version 2 guarantees: the egress item on none and allowlist.
         self.guarantees_version = 1
         self.egress_modes = {"none", "public_web", "allowlist"}
+        # Whether the install brokers git credentials, and the repositories the Agent's
+        # bindings cover.
+        self.git_credentials = True
+        self.git_bindings: set[str] = set()
         self.catalog = {"coding-python"}
         # What new sandboxes offer for staged copies; None offers none.
         self.staged_copies: dict[str, int] | None = None
@@ -426,6 +436,17 @@ class FakeBroker:
             return _error(400, "sandbox_invalid")
         if mode not in self.egress_modes:
             return _error(422, "egress_mode_unsupported")
+        if body.get("git") is not None:
+            if not self.git_credentials:
+                return _error(422, "git_credentials_unsupported")
+            try:
+                repositories = validate_git_repositories(body["git"]["repositories"])
+            except (KeyError, TypeError, ValueError):
+                return _error(400, "sandbox_invalid")
+            unbound = [item for item in repositories if item not in self.git_bindings]
+            if unbound:
+                return _error(422, "git_repositories_unbound", {"repositories": unbound})
+            body = {**body, "git": {"repositories": list(repositories)}}
         key = body["idempotency_key"]
         if key in self.by_key:
             existing = self.sandboxes[self.by_key[key]]
