@@ -115,7 +115,10 @@ def check_project(
 
     source_errors = False
     try:
-        all_source_diagnostics = check_declared_scaffold_source(project.root)
+        all_source_diagnostics = check_declared_scaffold_source(
+            project.root,
+            entry_targets=project.factory_targets,
+        )
         source_diagnostics = filter_findings(
             all_source_diagnostics,
             tags=tags,
@@ -136,7 +139,7 @@ def check_project(
                     *source_diagnostics,
                     *outside_selection,
                     application_not_imported_diagnostic(
-                        len(blocking_source_diagnostics),
+                        blocking_source_diagnostics,
                         outside_selection=len(outside_selection),
                     ),
                 )
@@ -185,6 +188,7 @@ def check_project(
                 manifest,
                 service_manifest=None if service is None else service.manifest,
                 project_control_plane=check_evidence,
+                entry_targets=project.factory_targets,
                 tags=tags,
                 deploy_only=deploy_only,
             )
@@ -207,10 +211,15 @@ def build_project_check_report(
     *,
     service_manifest: PublicServiceManifest | None,
     project_control_plane: ProjectControlPlaneCheckEvidence,
+    entry_targets: tuple[str, ...] = (),
     tags: frozenset[str] = frozenset(),
     deploy_only: bool = False,
 ) -> ProjectCheckReport:
-    """Build the exact structured check report shared by check and doctor."""
+    """Build the exact structured check report shared by check and doctor.
+
+    *entry_targets* are the factory targets that were loaded, so the source
+    findings cover the same modules as the check that ran before the import.
+    """
 
     report = check_manifest(
         manifest,
@@ -222,6 +231,7 @@ def build_project_check_report(
     scaffold_diagnostics = check_declared_scaffold(
         project_root,
         manifest,
+        entry_targets=entry_targets,
         tags=tags,
         deploy_only=deploy_only,
     )

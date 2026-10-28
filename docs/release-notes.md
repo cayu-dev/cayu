@@ -15,6 +15,11 @@ None.
   failed (for example `Staged copy … failed: copy_disk_full. The staged copy
   failed: Extracting the archive failed: the sandbox ran out of disk space (exit
   6).`) instead of the bare code.
+- `cayu check` no longer treats the root `conftest.py` as application code unless
+  application source refers to it, so a pytest fixture there no longer stops the
+  application from being loaded and checked. The factory
+  modules it loads are now always checked, whatever their location. When a
+  finding does stop the import, `SCAFFOLD_APPLICATION_NOT_IMPORTED` now names it.
 
 ## v0.16.0
 

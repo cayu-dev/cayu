@@ -26,6 +26,12 @@ class CayuProject:
     target: str
     service_target: str | None = None
 
+    @property
+    def factory_targets(self) -> tuple[str, ...]:
+        """The ``module:attribute`` targets loading this project imports."""
+
+        return tuple(target for target in (self.target, self.service_target) if target)
+
 
 @dataclass(frozen=True)
 class CayuProjectConfiguration:

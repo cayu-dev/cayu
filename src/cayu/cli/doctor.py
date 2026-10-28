@@ -650,6 +650,7 @@ def _collect_project_report_under_inspection(
         stage = "source_validation"
         source_diagnostics = check_declared_scaffold_source(
             project.root,
+            entry_targets=project.factory_targets,
             tags=frozenset(),
             deploy_only=False,
         )
@@ -705,6 +706,7 @@ def _collect_project_report_under_inspection(
             manifest,
             service_manifest=None if service is None else service.manifest,
             project_control_plane=check_evidence,
+            entry_targets=project.factory_targets,
         )
         resolved_context = resolve_project_control_plane_context(
             control_plane_context,

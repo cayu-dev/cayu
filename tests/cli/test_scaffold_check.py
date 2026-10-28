@@ -15,6 +15,7 @@ from cayu.cli.scaffold_check import (
     check_declared_scaffold,
     check_declared_scaffold_source,
 )
+from cayu.runtime.checks import DiagnosticSeverity, ProjectDiagnostic
 from cayu.runtime.manifest import RegistrationProvenance
 
 
@@ -183,9 +184,277 @@ def test_cli_check_applies_tag_selection_before_source_only_gating(
     assert all(item["code"] != "SCAFFOLD_LAYOUT_PATH_MISSING" for item in report["diagnostics"])
 
 
+def _blocking_finding(path: str) -> ProjectDiagnostic:
+    return ProjectDiagnostic(
+        code="SCAFFOLD_IMPORT_SIDE_EFFECT",
+        severity=DiagnosticSeverity.ERROR,
+        subject="scaffold",
+        path=path,
+        message="unproven",
+        verification_command="cayu check",
+    )
+
+
 @pytest.mark.parametrize(("blocking", "phrase"), [(1, "1 finding leaves"), (2, "2 findings leave")])
 def test_not_imported_diagnostic_counts_its_blocking_findings(blocking: int, phrase: str) -> None:
-    assert phrase in application_not_imported_diagnostic(blocking).message
+    findings = tuple(_blocking_finding(f"app.py:{line}") for line in range(1, blocking + 1))
+
+    assert phrase in application_not_imported_diagnostic(findings).message
+
+
+def test_not_imported_diagnostic_names_the_findings_that_stopped_the_import() -> None:
+    findings = tuple(_blocking_finding(f"app.py:{line}") for line in range(1, 6))
+
+    diagnostic = application_not_imported_diagnostic(findings[:1])
+    assert "(SCAFFOLD_IMPORT_SIDE_EFFECT at app.py:1)" in diagnostic.message
+    assert "did not run" in diagnostic.message
+
+    diagnostic = application_not_imported_diagnostic(findings)
+    assert (
+        "(SCAFFOLD_IMPORT_SIDE_EFFECT at app.py:1; SCAFFOLD_IMPORT_SIDE_EFFECT at app.py:2; "
+        "SCAFFOLD_IMPORT_SIDE_EFFECT at app.py:3; and 2 more)"
+    ) in diagnostic.message
+    assert list(diagnostic.parameters["blocking_locations"]) == [
+        f"SCAFFOLD_IMPORT_SIDE_EFFECT at app.py:{line}" for line in range(1, 6)
+    ]
+
+
+_PYTEST_FIXTURE = """import pytest
+
+
+@pytest.fixture(autouse=True)
+def _private_state_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRIVATE_STATE_ROOT", str(tmp_path))
+"""
+
+
+def _payload(marker: Path) -> str:
+    return f"from pathlib import Path\n\nPath({str(marker)!r}).write_text('ran')\n"
+
+
+def test_cli_check_does_not_treat_the_root_conftest_as_an_application_import(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An autouse fixture in the root conftest.py must not skip every application
+    # check. pytest imports conftest modules; the app does not.
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    (project / "conftest.py").write_text(_PYTEST_FIXTURE, encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--fail-on", "warning", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["manifest_fingerprint"] != "unavailable"
+    assert report["diagnostics"] == []
+
+
+@pytest.mark.parametrize(
+    ("module", "statement"),
+    (
+        ("conftest.py", "import conftest"),
+        ("conftest.py", "from conftest import _private_state_root"),
+        ("conftest.py", "importlib.import_module('conftest')"),
+        # Only the root conftest.py is left out; other modules are application code.
+        ("tools/test_support.py", "from tools import test_support"),
+    ),
+)
+def test_cli_check_scans_a_module_the_factory_imports_inside_a_function(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    module: str,
+    statement: str,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    marker = tmp_path / "lazy-module-ran"
+    (project / module).write_text(_payload(marker), encoding="utf-8")
+    with (project / "app.py").open("a", encoding="utf-8") as source:
+        source.write(
+            "\n\ndef build_lazy_app():\n"
+            "    import importlib  # noqa: F401\n\n"
+            f"    {statement}  # noqa: F401\n"
+            "    return build_app()\n"
+        )
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json", "app:build_lazy_app"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert not marker.exists()
+    assert report["manifest_fingerprint"] == "unavailable"
+    assert ("SCAFFOLD_IMPORT_SIDE_EFFECT", f"{module}:3") in [
+        (item["code"], item["path"]) for item in report["diagnostics"]
+    ]
+
+
+@pytest.mark.parametrize("helper_import", ("module", "function"))
+def test_cli_check_scans_a_conftest_a_local_helper_imports_inside_a_function(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    helper_import: str,
+) -> None:
+    # The helper lives outside the application packages, so only following
+    # every local module reaches the conftest it imports.
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    marker = tmp_path / "helper-conftest-ran"
+    (project / "conftest.py").write_text(_payload(marker), encoding="utf-8")
+    (project / "lib").mkdir()
+    (project / "lib" / "helpers.py").write_text(
+        "def build():\n    import conftest  # noqa: F401\n", encoding="utf-8"
+    )
+    lazy = "    from lib import helpers\n\n" if helper_import == "function" else ""
+    with (project / "app.py").open("a", encoding="utf-8") as source:
+        if helper_import == "module":
+            source.write("\nfrom lib import helpers  # noqa: E402\n")
+        source.write(
+            f"\n\ndef build_lazy_app():\n{lazy}    helpers.build()\n    return build_app()\n"
+        )
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json", "app:build_lazy_app"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert not marker.exists()
+    assert ("SCAFFOLD_IMPORT_SIDE_EFFECT", "conftest.py:3") in [
+        (item["code"], item["path"]) for item in report["diagnostics"]
+    ]
+
+
+@pytest.mark.parametrize("explicit", (False, True))
+def test_cli_check_scans_a_factory_module_named_conftest(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: bool,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    marker = tmp_path / "factory-module-ran"
+    (project / "conftest.py").write_text(
+        _payload(marker) + "from app import build_app  # noqa: E402,F401\n",
+        encoding="utf-8",
+    )
+    command = ["check", "--json"]
+    if explicit:
+        command.append("conftest:build_app")
+    else:
+        pyproject = project / "pyproject.toml"
+        pyproject.write_text(
+            pyproject.read_text(encoding="utf-8").replace(
+                'factory = "app:build_app"', 'factory = "conftest:build_app"'
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.chdir(project)
+
+    assert main(command) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert not marker.exists()
+    assert report["manifest_fingerprint"] == "unavailable"
+    assert [(item["code"], item["path"]) for item in report["diagnostics"]] == [
+        ("SCAFFOLD_IMPORT_SIDE_EFFECT", "conftest.py:3"),
+        ("SCAFFOLD_APPLICATION_NOT_IMPORTED", "app.py"),
+    ]
+
+
+def test_cli_check_keeps_source_findings_from_an_explicit_factory_module(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The checks that run after the import cover the same modules as the scan
+    # before it, so a warning in the loaded module still counts.
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    (project / "conftest.py").write_text(
+        "from app import build_app  # noqa: F401\n"
+        "from cayu.tasks import TaskCreate, TaskQuery, run_task_worker\n\n"
+        "TIMEOUT = 30\n\n\n"
+        "async def worker(app, handler):\n"
+        "    await run_task_worker(app, app.task_store, handler, worker_id='w',\n"
+        "                          query=TaskQuery(type='job'), execution_timeout_s=TIMEOUT)\n\n\n"
+        "async def submit(app):\n"
+        "    await app.create_task(TaskCreate(type='job'))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    assert main(["check", "conftest:build_app", "--fail-on", "warning", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["manifest_fingerprint"] != "unavailable"
+    assert [(item["code"], item["path"]) for item in report["diagnostics"]] == [
+        ("TASK_EVENT_RETRY_POLICY_UNDECLARED", "conftest.py:13"),
+    ]
+
+
+def test_cli_check_still_scans_a_root_conftest_the_application_imports(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    (project / "conftest.py").write_text(_PYTEST_FIXTURE, encoding="utf-8")
+    with (project / "tools" / "registration.py").open("a", encoding="utf-8") as source:
+        source.write("\nimport conftest  # noqa: E402,F401\n")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["manifest_fingerprint"] == "unavailable"
+    assert [(item["code"], item["path"]) for item in report["diagnostics"]] == [
+        ("SCAFFOLD_IMPORT_SIDE_EFFECT", "conftest.py:4"),
+        ("SCAFFOLD_APPLICATION_NOT_IMPORTED", "app.py"),
+    ]
+    assert "SCAFFOLD_IMPORT_SIDE_EFFECT at conftest.py:4" in report["diagnostics"][1]["message"]
+
+
+def test_cli_check_scans_a_conftest_inside_an_application_package(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Package auto-discovery imports every module without naming any of them.
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    marker = tmp_path / "package-conftest-ran"
+    (project / "tools" / "conftest.py").write_text(_payload(marker), encoding="utf-8")
+    with (project / "app.py").open("a", encoding="utf-8") as source:
+        source.write(
+            "\n\ndef build_discovering_app():\n"
+            "    import importlib\n"
+            "    import pkgutil\n\n"
+            "    import tools\n\n"
+            "    for info in pkgutil.iter_modules(tools.__path__):\n"
+            "        importlib.import_module(f'tools.{info.name}')\n"
+            "    return build_app()\n"
+        )
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json", "app:build_discovering_app"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert not marker.exists()
+    assert [(item["code"], item["path"]) for item in report["diagnostics"]] == [
+        ("SCAFFOLD_IMPORT_SIDE_EFFECT", "tools/conftest.py:3"),
+        ("SCAFFOLD_APPLICATION_NOT_IMPORTED", "app.py"),
+    ]
 
 
 def test_cli_check_tag_selection_never_imports_an_unproven_application(

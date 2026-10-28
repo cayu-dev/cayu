@@ -27,6 +27,8 @@ from cayu.runtime.manifest import AppManifest
 _VERIFY = "cayu check --fail-on warning --json"
 _DOCS = "cayu guide applications#convention"
 _MAX_DECLARATION_MODULES = 1024
+# How many blocking findings SCAFFOLD_APPLICATION_NOT_IMPORTED names in its message.
+_NAMED_BLOCKING_FINDINGS = 3
 _LEGACY_DATABASE_CHOICES = ("sqlite", "postgres")
 
 
@@ -115,15 +117,21 @@ _APPLICATION_SOURCE_DIRECTORIES = (
 def check_declared_scaffold_source(
     root: Path,
     *,
+    entry_targets: tuple[str, ...] = (),
     tags: frozenset[str] = frozenset(),
     deploy_only: bool = False,
 ) -> tuple[ProjectDiagnostic, ...]:
-    """Check declared source structure without importing project code."""
+    """Check declared source structure without importing project code.
 
-    diagnostics, _ = _source_diagnostics(root)
+    *entry_targets* are the ``module:attribute`` targets the caller will load
+    after this check, such as an explicit ``cayu check module:build_app``. The
+    ``[tool.cayu]`` factory targets are always scanned; these are scanned too.
+    """
+
+    diagnostics, _ = _source_diagnostics(root, entry_targets)
     diagnostics = (
         *diagnostics,
-        *task_retry_policy_diagnostics(root, _application_module_paths(root)),
+        *task_retry_policy_diagnostics(root, _application_module_paths(root, entry_targets)),
     )
     return _filter(diagnostics, tags=tags, deploy_only=deploy_only)
 
@@ -166,14 +174,22 @@ def import_blocking_findings(
 
 
 def application_not_imported_diagnostic(
-    blocking: int, *, outside_selection: int = 0
+    blocking: tuple[ProjectDiagnostic, ...], *, outside_selection: int = 0
 ) -> ProjectDiagnostic:
-    """Explain which checks did not run because the app was not imported.
+    """Explain which checks did not run because the app was not imported, and why.
 
-    *outside_selection* counts blocking findings outside the requested tags or
-    ``--deploy``; the report lists them anyway, because they stopped the check.
+    *blocking* holds the findings that stopped the import; the message names
+    them so a single finding cannot hide that every application check was
+    skipped. *outside_selection* counts blocking findings outside the requested
+    tags or ``--deploy``; the report lists them anyway, because they stopped
+    the check.
     """
 
+    count = len(blocking)
+    locations = [f"{item.code} at {item.path}" for item in blocking]
+    named = "; ".join(locations[:_NAMED_BLOCKING_FINDINGS])
+    if count > _NAMED_BLOCKING_FINDINGS:
+        named += f"; and {count - _NAMED_BLOCKING_FINDINGS} more"
     listed = (
         "every source finding is listed."
         if not outside_selection
@@ -188,9 +204,9 @@ def application_not_imported_diagnostic(
         code="SCAFFOLD_APPLICATION_NOT_IMPORTED",
         path="app.py",
         message=(
-            f"Cayu did not import the application because {blocking} "
-            f"{'finding leaves' if blocking == 1 else 'findings leave'} importing it "
-            "unproven safe. "
+            f"Cayu did not import the application because {count} "
+            f"{'finding leaves' if count == 1 else 'findings leave'} importing it "
+            f"unproven safe ({named}). "
             "Checks that need the loaded application (agents, tools, policies, "
             f"providers, capabilities) did not run; {listed}"
         ),
@@ -199,8 +215,9 @@ def application_not_imported_diagnostic(
             "`cayu check` to run the remaining checks."
         ),
         parameters={
-            "blocking_findings": blocking,
+            "blocking_findings": count,
             "blocking_findings_outside_selection": outside_selection,
+            "blocking_locations": locations,
         },
         severity=DiagnosticSeverity.INFO,
     )
@@ -226,14 +243,20 @@ def check_declared_scaffold(
     root: Path,
     manifest: AppManifest,
     *,
+    entry_targets: tuple[str, ...] = (),
     tags: frozenset[str] = frozenset(),
     deploy_only: bool = False,
 ) -> tuple[ProjectDiagnostic, ...]:
-    """Return convention findings, or nothing for a freeform project."""
+    """Return convention findings, or nothing for a freeform project.
 
-    source_diagnostics, declared = _source_diagnostics(root)
+    *entry_targets* has the same meaning as in ``check_declared_scaffold_source``.
+    """
+
+    source_diagnostics, declared = _source_diagnostics(root, entry_targets)
     diagnostics = list(source_diagnostics)
-    diagnostics.extend(task_retry_policy_diagnostics(root, _application_module_paths(root)))
+    diagnostics.extend(
+        task_retry_policy_diagnostics(root, _application_module_paths(root, entry_targets))
+    )
     if declared:
         diagnostics.extend(_check_registration_provenance(manifest))
         diagnostics.extend(check_scaffold_capabilities(root, manifest))
@@ -376,6 +399,7 @@ def _starter_agent_name(root: Path) -> str | None:
 
 def _source_diagnostics(
     root: Path,
+    entry_targets: tuple[str, ...] = (),
 ) -> tuple[tuple[ProjectDiagnostic, ...], bool | None]:
     """Return source-only findings and the presence of a valid convention."""
 
@@ -445,7 +469,7 @@ def _source_diagnostics(
 
     diagnostics.extend(_check_selected_plan_source(root, document, plan))
     diagnostics.extend(_check_composition_root(root))
-    diagnostics.extend(_check_import_inertness(root))
+    diagnostics.extend(_check_import_inertness(root, entry_targets))
     return tuple(diagnostics), True
 
 
@@ -824,10 +848,12 @@ def _check_composition_root(root: Path) -> tuple[ProjectDiagnostic, ...]:
     return tuple(diagnostics)
 
 
-def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
+def _check_import_inertness(
+    root: Path, entry_targets: tuple[str, ...] = ()
+) -> tuple[ProjectDiagnostic, ...]:
     diagnostics: list[ProjectDiagnostic] = []
     try:
-        declaration_proofs = _project_declaration_proofs(root)
+        declaration_proofs = _project_declaration_proofs(root, entry_targets)
     except _DeclarationGraphLimit:
         return (
             _diagnostic(
@@ -863,7 +889,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                 )
             )
     reported: set[Path] = set(declaration_proofs.migrations)
-    for path in _application_module_paths(root):
+    for path in _application_module_paths(root, entry_targets):
         # Repair invalid imports before attempting to prove their declarations.
         # The migration finding blocks application loading on its own.
         if path in declaration_proofs.migrations:
@@ -1267,14 +1293,119 @@ def _unproven_base_diagnostic(
     )
 
 
-def _application_module_paths(root: Path) -> tuple[Path, ...]:
+def _application_module_paths(root: Path, entry_targets: tuple[str, ...] = ()) -> tuple[Path, ...]:
     paths = {path for path in root.glob("*.py") if path.is_file() or path.is_symlink()}
     for relative in _APPLICATION_SOURCE_DIRECTORIES:
         package = root / relative
         if not package.is_dir() or package.is_symlink():
             continue
         paths.update(path for path in package.rglob("*.py") if path.is_file() or path.is_symlink())
+    # The modules Cayu loads are always scanned, whatever their names.
+    entries = _entry_module_paths(root, (*_configured_entry_targets(root), *entry_targets))
+    # pytest imports the root conftest.py and the application normally never
+    # does, so a fixture there must not block the check. It is still scanned
+    # when application source refers to it. A conftest.py inside an application
+    # package stays a scan root: package auto-discovery can import it.
+    conftests = {root / "conftest.py"} & (paths - entries)
+    paths = (paths - conftests) | entries
+    paths |= _referenced_modules(root, paths, conftests)
     return tuple(sorted(paths, key=lambda path: path.relative_to(root).as_posix()))
+
+
+def _referenced_modules(root: Path, scanned: set[Path], candidates: set[Path]) -> set[Path]:
+    """Return the *candidates* that *scanned* source refers to, directly or transitively.
+
+    This is wider than the import-time dependency walk on purpose: an import
+    inside a function body counts, because the factory body runs during the
+    check, and so does any string that mentions ``conftest`` (importlib). The
+    walk goes through every local module it reaches, not only the candidates,
+    because a helper outside the application packages can import a conftest
+    inside a function. Source it cannot read, or a walk past the module limit,
+    keeps every candidate in the scan.
+    """
+
+    referenced: set[Path] = set()
+    pending = list(scanned)
+    seen: set[Path] = set()
+    while pending and candidates - referenced:
+        path = pending.pop()
+        if path in seen or path.is_dir():
+            continue
+        seen.add(path)
+        tree = (
+            None
+            if path.is_symlink() or len(seen) > _MAX_DECLARATION_MODULES
+            else _parsed_module(path)
+        )
+        if tree is None:
+            return set(candidates)
+        local = _referenced_local_modules(root, path, tree)
+        found = candidates & local
+        if any(
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "conftest" in node.value
+            for node in ast.walk(tree)
+        ):
+            found = set(candidates)
+        pending.extend((local | found) - seen)
+        referenced |= found
+    return referenced
+
+
+def _referenced_local_modules(root: Path, path: Path, tree: ast.Module) -> set[Path]:
+    """Resolve every import statement in *tree*, at any depth, to local source."""
+
+    modules: list[tuple[str | None, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.extend((alias.name, 0) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            modules.append((node.module, node.level))
+            modules.extend(
+                (f"{node.module}.{alias.name}" if node.module else alias.name, node.level)
+                for alias in node.names
+            )
+    found: set[Path] = set()
+    for module, level in modules:
+        _local, target = _project_local_import_module_path(
+            root, importing_path=path, module=module, level=level
+        )
+        if target is not None:
+            found.add(target)
+    return found
+
+
+def _configured_entry_targets(root: Path) -> tuple[str, ...]:
+    """Return the ``[tool.cayu]`` factory targets ``cayu check`` and ``cayu doctor`` load."""
+
+    try:
+        document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return ()
+    tool = document.get("tool")
+    config = tool.get("cayu") if isinstance(tool, dict) else None
+    if not isinstance(config, dict):
+        return ()
+    return tuple(
+        value for key in ("factory", "service_factory") if isinstance(value := config.get(key), str)
+    )
+
+
+def _entry_module_paths(root: Path, targets: tuple[str, ...]) -> set[Path]:
+    """Resolve ``module:attribute`` targets to local module files without importing them."""
+
+    paths: set[Path] = set()
+    for target in targets:
+        module = target.strip().partition(":")[0]
+        if not module or module.startswith("."):
+            continue
+        _local, path = _project_local_import_module_path(
+            root, importing_path=root, module=module, level=0
+        )
+        if path is not None and path.suffix == ".py" and path.is_relative_to(root):
+            paths.add(path)
+    return paths
 
 
 def _import_time_import_from_nodes(node: ast.stmt) -> tuple[ast.ImportFrom, ...]:
@@ -3121,7 +3252,9 @@ class _DeclarationGraph:
     migrations: dict[Path, tuple[ProjectDiagnostic, ...]]
 
 
-def _project_declaration_proofs(root: Path) -> _DeclarationGraph:
+def _project_declaration_proofs(
+    root: Path, entry_targets: tuple[str, ...] = ()
+) -> _DeclarationGraph:
     """Prove ordered bindings to a fixed point, then invalidate unsafe closures.
 
     No application code is imported. Cyclic imports can re-export already proven
@@ -3132,7 +3265,7 @@ def _project_declaration_proofs(root: Path) -> _DeclarationGraph:
     dependencies: dict[Path, set[Path]] = {}
     invalid: set[Path] = set()
     invalid_imports: dict[Path, list[ast.stmt]] = {}
-    pending = list(_application_module_paths(root))
+    pending = list(_application_module_paths(root, entry_targets))
     while pending:
         path = pending.pop()
         if path in trees or path in invalid:

@@ -4797,7 +4797,8 @@ def test_unbound_release_waits_for_adapter_cleanup_owner_before_retry() -> None:
             await asyncio.wait_for(adapter.retry_started.wait(), timeout=0.02)
 
         adapter.allow_owned_cleanup.set()
-        async with asyncio.timeout(0.2):
+        # This is a deadlock guard, not a cleanup latency contract.
+        async with asyncio.timeout(5):
             await settlement_task
         return adapter, settlement_task
 

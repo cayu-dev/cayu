@@ -60,11 +60,22 @@ layout migration, not a supported way to silence a finding.
 
 `cayu check` never imports application code that failed the import-safety check
 (or whose scaffold contract is too invalid for that check to run). It still lists
-every source finding and adds `SCAFFOLD_APPLICATION_NOT_IMPORTED` naming the
-checks that did not run. Any other source error, such as plan drift, no longer
-stops the check: the application is loaded and checked as usual, and if its
-factory fails, `SCAFFOLD_APPLICATION_LOAD_FAILED` is reported next to the source
-findings that likely caused it.
+every source finding and adds `SCAFFOLD_APPLICATION_NOT_IMPORTED`, which names
+the findings that stopped the import and the checks that did not run. Any other
+source error, such as plan drift, no longer stops the check: the application is
+loaded and checked as usual, and if its factory fails,
+`SCAFFOLD_APPLICATION_LOAD_FAILED` is reported next to the source findings that
+likely caused it.
+
+The import check reads the root `*.py` modules, the application packages listed
+above, and the modules named by `[tool.cayu].factory`, `service_factory` or an
+explicit `cayu check module:build_app` target. The root `conftest.py` is left
+out, because pytest imports it and the application does not, so a fixture there
+never blocks the check. It is still checked when application source, or any
+local module it imports, refers to it: an import at any depth (including inside
+a function), or a string naming it, as `importlib.import_module(...)` takes. A
+`conftest.py` inside an application package is always checked, because package
+auto-discovery can import it without naming it.
 
 The import check accepts inert application class hierarchies, including exception
 classes and subclasses of a shared `Tool` base. Define bases before their uses
