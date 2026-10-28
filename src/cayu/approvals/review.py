@@ -159,8 +159,23 @@ class HumanReviewPolicy(ABC):
         self, context: HumanReviewContext, source: HumanReviewSource
     ) -> HumanReviewDisclosure: ...
 
+    def _project_with_redactor(
+        self, context: HumanReviewContext, source: HumanReviewSource, redactor: SecretRedactor
+    ) -> HumanReviewDisclosure:
+        """Projection boundary for policies that transform text before disclosure."""
+        return self.project(context, source)
+
     def audit(self, *, action: Literal["inspect", "decide"], status: str) -> None:
         """Optional bounded access audit. No model text, arguments or private identities."""
+        return None
+
+    @property
+    def dashboard_purpose(self) -> str | None:
+        """The purpose the dashboard requests reviews with, or None to leave it unset.
+
+        When the dashboard's runtime config sets no ``humanReviewPurpose``, the
+        server uses this one, so approvals and questions go through protected review.
+        """
         return None
 
 
@@ -213,7 +228,7 @@ def build_review(
 ) -> HumanReviewView:
     """Project a private detached snapshot; bind both display and execution content."""
     try:
-        disclosure = policy.project(context, source)
+        disclosure = policy._project_with_redactor(context, source, redactor)
         if type(disclosure) is not HumanReviewDisclosure:
             raise ValueError
         disclosure = HumanReviewDisclosure.model_validate(disclosure.model_dump())

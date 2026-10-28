@@ -153,7 +153,8 @@ class ToolCallDeadlineProvider(ModelProvider):
         return ProviderStreamDeadlines(
             transport_idle_timeout_s=1,
             protocol_idle_timeout_s=1,
-            semantic_progress_timeout_s=0.01,
+            # Allow the first tool call to arrive before testing the subsequent idle deadline.
+            semantic_progress_timeout_s=0.2,
             absolute_stream_timeout_s=1,
         )
 

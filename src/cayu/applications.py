@@ -32,6 +32,7 @@ from cayu._application_environment_maintenance import (
     unregister_application_environment,
 )
 from cayu._application_environment_registry import ApplicationEnvironmentRegistry
+from cayu._application_human_review import HumanReviewEntrances
 from cayu._application_managed_settings import ManagedSettingsEntrances
 from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import _registration_site, _validate_runtime_hooks
@@ -51,10 +52,7 @@ from cayu._validation import (
 )
 from cayu.agents import AgentSpec
 from cayu.approvals.review import (
-    HumanReviewContext,
     HumanReviewPolicy,
-    HumanReviewReference,
-    HumanReviewView,
 )
 from cayu.approvals.tools import (
     PendingToolApproval,
@@ -933,7 +931,7 @@ class _ParticipantExecutionSettlementReader(PermitSettlementReader):
 _PROVIDER_RECONCILIATION_BUDGET_SHARE = 0.5
 
 
-class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
+class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances):
     """Application runtime for registered specialists, providers, and session state."""
 
     def __init__(
@@ -1278,6 +1276,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
         )
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
+        self._set_human_review_purpose(human_review_policy)
         self._loop_policy_execution_profile_identities = policy_execution_profile_identities
         self._mcp_manifest_policy = manifest_policy
         self._tool_result_projection_policy = result_projection_policy
@@ -5774,18 +5773,6 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
         return tuple(targeted_tool_grant_inspection(record, codec) for record in records)
 
     @_tracked_entrance
-    async def require_human_review_resolution_authority(
-        self,
-        session_id: str,
-        reference: HumanReviewReference | None,
-    ) -> None:
-        """Check decision permission independently of inspection and receipt replay."""
-        session_id = await self._resolve_public_session_id(session_id)
-        await self._recovery_coordinator.require_human_review_resolution_authority(
-            session_id, reference
-        )
-
-    @_tracked_entrance
     async def get_human_attention_state(
         self,
         reference: HumanAttentionReference,
@@ -5812,22 +5799,6 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
         return await self._runtime_session_store.query_supervision_events(
             query, include_content=include_content
         )
-
-    @_tracked_entrance
-    async def inspect_human_review(
-        self,
-        session_id: str,
-        *,
-        context: HumanReviewContext,
-    ) -> HumanReviewView:
-        """Inspect protected review content without executing or claiming work.
-
-        Direct SDK callers are trusted to supply verified recipient provenance.
-        The configured policy must authorize the exact session and tenant.
-        """
-        context = HumanReviewContext.model_validate(context.model_dump())
-        session_id = await self._resolve_public_session_id(session_id)
-        return await self._recovery_coordinator.inspect_human_review(session_id, context)
 
     @_tracked_entrance
     async def inspect_tool_discovery_view(

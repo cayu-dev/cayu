@@ -150,6 +150,7 @@ from cayu.approvals.revisions import (
 from cayu.approvals.revisions import ApprovalArgumentsRevision as ApprovalArgumentsRevision
 from cayu.approvals.revisions import ApprovalRevision as ApprovalRevision
 from cayu.approvals.revisions import approval_revision_metadata as approval_revision_metadata
+from cayu.approvals.tool_argument_review import ToolArgumentReview as ToolArgumentReview
 from cayu.approvals.tools import PendingToolApproval as PendingToolApproval
 from cayu.approvals.tools import PendingToolApprovalEventView as PendingToolApprovalEventView
 from cayu.approvals.tools import PendingToolCallApproval as PendingToolCallApproval

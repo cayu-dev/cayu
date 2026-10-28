@@ -102,6 +102,49 @@ use it for access auditing without questions, arguments or private fingerprints.
 It must be fast and safe inside an atomic claim. Ordinary runtime projections
 continue to quarantine pre-execution arguments.
 
+## Ready-made policy: show named tool arguments
+
+Most approvals only need the approver to read a few arguments of one tool.
+`ToolArgumentReview` does that:
+
+```python
+import os
+
+from cayu import CayuApp
+from cayu.approvals import ToolArgumentReview
+
+app = CayuApp(
+    human_review_policy=ToolArgumentReview(
+        {"file_issue": ("title", "body")},
+        binding_key=bytes.fromhex(os.environ["APP_REVIEW_KEY"]),  # 32+ random bytes
+    ),
+)
+```
+
+- Calls to tools it doesn't name stay approvable, as they are without a policy.
+  The view names the tool and says its arguments are not shown.
+- A question from `ask_user` shows its question and options in static secret
+  scope. Dynamic or unknown scope requires a separate `attest_questions=True`
+  assertion that the question and options are safe for the recipient.
+- Complete selected values are checked for known secrets before formatting or splitting.
+- A long argument is split across numbered fields. The view stays within the
+  limits above, and what doesn't fit is replaced by a note saying how many
+  characters are not shown. The decision still binds the complete arguments.
+- Any authenticated recipient may inspect and decide with its `purpose`
+  (`"approvals"` by default). Pass `authorize_recipient` to narrow that.
+- The server points the dashboard at that purpose unless the dashboard's
+  runtime config sets `humanReviewPurpose`.
+- Listed arguments are shown when the paused round is in the static secret
+  scope. Rounds from a factory-backed environment are dynamic unless the
+  factory declares static scope. For those, pass `attest_listed_arguments=True`
+  once you have decided the listed arguments are safe to show your operators;
+  without it such a round can only be denied.
+- `version` changes on its own with these settings. Pass a new `revision` when
+  `authorize_recipient` changes what it allows.
+
+Configuring any policy still makes a `review_reference` necessary for every
+approval and answer, as described above.
+
 ## Small application policy
 
 ```python

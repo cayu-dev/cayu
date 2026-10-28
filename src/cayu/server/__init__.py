@@ -575,7 +575,9 @@ def create_server(
             dashboard_path=resolved_config.dashboard.path,
             auth=dashboard_auth,
             api_base_url=control_plane_path,
-            dashboard_config=dict(thaw_json_value(resolved_config.dashboard.runtime_config)),
+            dashboard_config=_with_human_review_purpose(
+                dict(thaw_json_value(resolved_config.dashboard.runtime_config)), app
+            ),
         )
         if not dashboard_mounted:
             raise _dashboard_assets_unavailable_error(
@@ -584,6 +586,15 @@ def create_server(
             )
 
     return server
+
+
+def _with_human_review_purpose(config: dict[str, Any], app: CayuApp) -> dict[str, Any]:
+    """Point the dashboard at the policy's review purpose unless the config names one."""
+
+    purpose = app.human_review_purpose
+    if purpose is None or config.get("humanReviewPurpose") is not None:
+        return config
+    return {**config, "humanReviewPurpose": purpose}
 
 
 def _validate_fastapi_options(
@@ -721,9 +732,12 @@ def mount_cayu(
         cayu_serve=resolved_project_context is not None,
     )
     prepared_dashboard: tuple[str, DashboardStaticFiles] | None = None
-    resolved_dashboard_config = normalize_dashboard_runtime_config(
-        {} if dashboard_config is None else dashboard_config,
-        field_name="dashboard_config",
+    resolved_dashboard_config = _with_human_review_purpose(
+        normalize_dashboard_runtime_config(
+            {} if dashboard_config is None else dashboard_config,
+            field_name="dashboard_config",
+        ),
+        app,
     )
     if dashboard:
         prepared_dashboard = _prepare_dashboard_mount(
