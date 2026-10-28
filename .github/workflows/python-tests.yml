@@ -27,6 +27,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Validate collection, duration snapshot and shard plan
+        env:
+          # Keep private lock directories separate from other runner users on the host.
+          TMPDIR: ${{ runner.temp }}
         run: >-
           python3 scripts/run_ci.py --lane collection
           --test-collected "$RUNNER_TEMP/ci-tests/collected-test-ids.txt"
@@ -81,6 +84,9 @@ jobs:
           packages: ripgrep ffmpeg
           commands: rg ffmpeg
       - name: Test duration-balanced shard
+        env:
+          # Keep private lock directories separate from other runner users on the host.
+          TMPDIR: ${{ runner.temp }}
         run: python3 scripts/run_ci.py --lane general --shard "${{ matrix.shard }}" --test-durations "$RUNNER_TEMP/test-durations"
       - name: Share measured test durations
         if: always()
@@ -121,6 +127,9 @@ jobs:
           packages: ripgrep
           commands: rg
       - name: Test specialist lane
+        env:
+          # Keep private lock directories separate from other runner users on the host.
+          TMPDIR: ${{ runner.temp }}
         run: >-
           python3 scripts/run_ci.py --lane specialist
           --specialist-lane "${{ matrix.lane }}"

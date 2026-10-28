@@ -877,9 +877,11 @@ def test_real_cayu_child_tree_is_quiescent_after_hard_deadline(tmp_path: Path) -
         socket_path = tree_state / "background.sock"
         socket_path.unlink()
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        directory_fd = os.open(tree_state, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            probe.bind(str(socket_path))
+            probe.bind(f"/proc/self/fd/{directory_fd}/background.sock")
         finally:
+            os.close(directory_fd)
             probe.close()
 
     asyncio.run(scenario())

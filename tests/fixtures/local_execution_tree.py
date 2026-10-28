@@ -130,7 +130,13 @@ def _grandchild(root: Path) -> None:
 def _background_server(root: Path) -> None:
     signal.signal(signal.SIGTERM, _ignore_term)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(root / "background.sock"))
+    # The Linux socket address limit applies to the spelling passed to bind,
+    # even when the fixture directory itself is a valid longer filesystem path.
+    directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        server.bind(f"/proc/self/fd/{directory_fd}/background.sock")
+    finally:
+        os.close(directory_fd)
     server.listen(4)
     _publish(root, "background_server")
     while True:

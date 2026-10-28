@@ -140,6 +140,19 @@ from cayu.testing.base import verify_provider_credential_isolation
 # runners. Checks that a blocked cleanup does not settle keep short budgets.
 _SETTLED_DRAIN_TIMEOUT_S = 2.0
 
+# Some tests shrink a managed runner's teardown limit to 0.01 s so cleanup
+# gives up and retries while the test holds a phase blocked. Once the test
+# unblocks it, a 0.01 s budget only measures how busy the worker is: a stalled
+# loop can miss it on every retry. Tests restore this budget before unblocking.
+_UNBLOCKED_TEARDOWN_TIMEOUT_S = 5.0
+
+
+def _relax_managed_teardown_timeouts(managed: Any) -> None:
+    managed._teardown_timeout_s = _UNBLOCKED_TEARDOWN_TIMEOUT_S
+    managed._egress_binding.teardown_timeout_s = _UNBLOCKED_TEARDOWN_TIMEOUT_S
+    managed._authority_revoker.teardown_timeout_s = _UNBLOCKED_TEARDOWN_TIMEOUT_S
+
+
 REAL_SECRET = "sk_test_51FactoryRealSecret"
 POLICY_NAME = "provider-example"
 
@@ -4788,14 +4801,50 @@ def test_unbound_release_waits_for_adapter_cleanup_owner_before_retry() -> None:
         assert release is not None
         assert managed is not None
         managed._teardown_timeout_s = 0.01
+        # Count how often settlement retries are turned away because the
+        # adapter-owned cleanup is still pending. Waiting for several of these
+        # proves the fence holds across retries, however slow the worker is,
+        # instead of sampling a fixed wall-clock window.
+        original_drain = managed._drain_factory_cleanup_prerequisites
+        fenced_retries = 0
+        fence_held_repeatedly = asyncio.Event()
+
+        async def counting_drain(*, deadline: float) -> None:
+            nonlocal fenced_retries
+            try:
+                await original_drain(deadline=deadline)
+            except TimeoutError as error:
+                owner = environment_factory_cleanup_settlement_task(error)
+                if owner is not None and owner is adapter.owned_cleanup_task:
+                    fenced_retries += 1
+                    if fenced_retries >= 3:
+                        fence_held_repeatedly.set()
+                raise
+
+        managed._drain_factory_cleanup_prerequisites = counting_drain  # type: ignore[method-assign]
         with pytest.raises(BaseExceptionGroup) as release_error:
             await release(EnvironmentFactoryReleaseAction.DISCARD)
         settlement_task = environment_factory_cleanup_settlement_task(release_error.value)
         assert settlement_task is not None
         await adapter.owned_cleanup_started.wait()
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(adapter.retry_started.wait(), timeout=0.02)
+        # Stop at whichever comes first so a broken fence fails here, at once,
+        # rather than at the hang guard. The guard only bounds retries that
+        # back off in real time on loaded CI workers.
+        fence_wait = asyncio.create_task(fence_held_repeatedly.wait())
+        retry_wait = asyncio.create_task(adapter.retry_started.wait())
+        done, pending = await asyncio.wait(
+            {fence_wait, retry_wait},
+            timeout=5,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        assert not adapter.retry_started.is_set()
+        assert fence_wait in done
+        assert not settlement_task.done()
 
+        _relax_managed_teardown_timeouts(managed)
         adapter.allow_owned_cleanup.set()
         # This is a deadlock guard, not a cleanup latency contract.
         async with asyncio.timeout(5):
@@ -5660,7 +5709,10 @@ def test_pending_preserve_settlement_absorbs_later_discard_escalation() -> None:
             await release(EnvironmentFactoryReleaseAction.PRESERVE)
         preserve_settlement = environment_factory_cleanup_settlement_task(preserve_error.value)
         assert preserve_settlement is not None
-        async with asyncio.timeout(0.2):
+        # Hang guards only. Settlement reaches the binding teardown, and later
+        # notices that it finished, only after real-time retry backoff
+        # (0.05 s doubling to 1 s), so a loaded worker can take a while here.
+        async with asyncio.timeout(5):
             await adapter.binding_close_started.wait()
         assert not preserve_settlement.done()
 
@@ -5669,8 +5721,9 @@ def test_pending_preserve_settlement_absorbs_later_discard_escalation() -> None:
         discard_settlement = environment_factory_cleanup_settlement_task(discard_error.value)
         assert discard_settlement is preserve_settlement
 
+        _relax_managed_teardown_timeouts(runner)
         adapter.allow_binding_close.set()
-        async with asyncio.timeout(0.2):
+        async with asyncio.timeout(5):
             await discard_settlement
         return adapter, runner, discard_settlement
 

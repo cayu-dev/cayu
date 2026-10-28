@@ -219,17 +219,28 @@ def test_explicit_application_step_cap_still_applies_to_tasks():
     assert app._with_application_run_defaults(request).max_steps == 7
 
 
-class StallProvider(ModelProvider):
-    name = "stall"
+class ExpireAfterAdmissionProvider(ModelProvider):
+    name = "expire-after-admission"
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        await asyncio.sleep(60)
+        from cayu.deadlines import _TIMERS
+
+        # Expire the real timer only once model execution proves admission finished.
+        # Runner scheduling must not move expiry into session preparation instead.
+        timers = [
+            (timer, deadline) for timer, deadline in _TIMERS.get() if timer.when() is not None
+        ]
+        assert timers
+        timer, deadline = timers[-1]
+        deadline._expired_observed = True
+        timer.reschedule(asyncio.get_running_loop().time())
+        await asyncio.Event().wait()
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
 def test_admitted_deadline_expiry_ends_iterator_normally():
     app = CayuApp(enable_logging=False)
-    app.register_provider(StallProvider(), default=True)
+    app.register_provider(ExpireAfterAdmissionProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake"))
 
     async def scenario():
@@ -240,7 +251,7 @@ def test_admitted_deadline_expiry_ends_iterator_normally():
                     agent_name="assistant",
                     session_id="timed",
                     messages=[Message.text("user", "Wait")],
-                    execution_deadline=ExecutionDeadline.after(0.5),
+                    execution_deadline=ExecutionDeadline.after(60),
                 )
             )
         ]
