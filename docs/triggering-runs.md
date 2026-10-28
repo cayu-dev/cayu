@@ -201,7 +201,7 @@ The limit ends one handler call. An application that retries an event by
 creating a new task for it (a sweeper, a reconciler, a redelivered webhook)
 should pass the same `TaskCreate(retry_key=...)`, such as the event's ID, for
 every task of that event. Tasks with one key share a `TaskRetryBudget`: by
-default 3 tasks, created within 30 minutes of the first. The store counts each
+default 3 tasks, with no time limit (`DEFAULT_TASK_RETRY_BUDGET`). The store counts each
 new task with the key in the transaction that inserts it; restarts of one
 task and duplicate task IDs do not count. The next task past the budget is not
 created: `create_task` raises `TaskRetryBudgetExhausted`, whose `state` is
@@ -209,8 +209,12 @@ the key's durable `TaskRetryKeyState`, and the key stays `given_up` whatever
 budget a later request carries. `TaskStore.load_task_retry_key(key)` and
 `cayu inspect --retry-key KEY` show it. Pass
 `retry_budget=TaskRetryBudget(max_attempts=..., max_elapsed_seconds=...)` to
-raise the budget, or `TaskRetryBudget.unlimited()` to count without a cap; the
-budget on each new request is the one checked. Keys are store-wide, so scoped
+choose the budget, or `TaskRetryBudget.unlimited()` to count without a cap; the
+first admission fixes it. A budget with `max_elapsed_seconds` also ends running
+work: the worker cancels a handler when the event's time runs out, counted from
+its first admission, queue time included, even if `execution_timeout_s` is longer.
+`run_task_worker` logs a warning the first time it claims a task of a type whose
+budget is shorter than its `execution_timeout_s`. Keys are store-wide, so scoped
 (tenant-bound) callers cannot set or read them, and keyed tasks cannot join
 graphs or groups. A `TaskRetryPolicy` still works per task alongside a key.
 

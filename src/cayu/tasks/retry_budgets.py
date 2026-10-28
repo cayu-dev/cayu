@@ -52,6 +52,8 @@ class TaskRetryBudget(BaseModel):
     task is admitted even if attempts remain, and workers cancel admitted work.
     ``None`` turns either limit off; :meth:`TaskRetryBudget.unlimited` turns
     both off. A successfully completed event still refuses duplicate attempts.
+    ``TaskRetryBudget()`` means 3 attempts within 1,800 seconds; a task that
+    declares no budget gets :data:`DEFAULT_TASK_RETRY_BUDGET` instead.
     """
 
     model_config = ConfigDict(
@@ -72,8 +74,11 @@ class TaskRetryBudget(BaseModel):
         return cls(max_attempts=None, max_elapsed_seconds=None)
 
 
-#: Applied to ordinary root events without an explicit budget or retry policy.
-DEFAULT_TASK_RETRY_BUDGET = TaskRetryBudget()
+#: Applied to ordinary root events without an explicit budget or retry policy:
+#: three attempts and no elapsed limit. The attempt cap stops a sweeper that keeps
+#: re-creating a task for the same event; how long one handler may run is left to
+#: the worker's ``execution_timeout_s``, or to a budget the task declares.
+DEFAULT_TASK_RETRY_BUDGET = TaskRetryBudget(max_elapsed_seconds=None)
 
 
 class TaskRetryKeyStatus(StrEnum):
@@ -182,9 +187,19 @@ class TaskRetryBudgetExhausted(ValueError):
     def __init__(self, state: TaskRetryKeyState) -> None:
         self.state = state
         reason = "" if state.given_up_reason is None else f" ({state.given_up_reason.value})"
+        # A store keeps only the budget's value, so this can't tell a declared
+        # budget equal to the default from an undeclared one.
+        hint = (
+            f" The event's budget, {state.budget.max_attempts} attempts with no time limit, "
+            "is also the default a task gets when it declares no retry_budget or "
+            "retry_policy. To allow more attempts, set max_attempts in the task's "
+            "retry_budget or retry_policy on its first submission."
+            if state.budget == DEFAULT_TASK_RETRY_BUDGET
+            else ""
+        )
         super().__init__(
             f"Retry key {state.retry_key!r} exhausted admission after {state.attempts} "
-            f"attempt{'s' if state.attempts != 1 else ''}{reason}; no task was created."
+            f"attempt{'s' if state.attempts != 1 else ''}{reason}; no task was created.{hint}"
         )
 
 
@@ -450,6 +465,7 @@ async def unscoped_task_retry_key(retry_key: str) -> str:
 
 async def enforce_task_event_deadline(task_store: Any, task: Any) -> Any:
     """Request owned cancellation; terminal task evidence still requires cleanup."""
+    from cayu.tasks._event_budget_warnings import with_event_budget_expiry
     from cayu.tasks.cancellation import (
         _task_cancellation_requested,
         _task_retry_cancellation_requested,
@@ -473,9 +489,13 @@ async def enforce_task_event_deadline(task_store: Any, task: Any) -> Any:
         if state.status is TaskRetryKeyStatus.SUCCEEDED
         else ("event_" + state.given_up_reason.value)
     )
+    error: dict[str, Any] = {"code": reason, "retry_key": state.retry_key}
+    if reason == "event_elapsed_exhausted":
+        with_event_budget_expiry(error, task, state)
     logging.getLogger(__name__).warning(
-        "Event execution budget closed; requesting cancellation (%s).",
+        "Event execution budget closed; requesting cancellation (%s).%s",
         reason,
+        f" {error['message']}" if "message" in error else "",
     )
     try:
         if task.schedule is not None:
@@ -487,7 +507,7 @@ async def enforce_task_event_deadline(task_store: Any, task: Any) -> Any:
                 )
             )
             return await task_store.load_task(task.id)
-        return await task_store.cancel_task(task.id, {"code": reason, "retry_key": state.retry_key})
+        return await task_store.cancel_task(task.id, error)
     except TaskScheduleConflict:
         # A concurrent reschedule advances its fence. A later maintenance pass
         # retries against that revision; never cancel using stale authority.

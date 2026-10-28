@@ -13,7 +13,7 @@ from tests.core.test_deadline_tool_settlement import (
 from cayu import Message
 from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded, task_event_deadline_scope
 from cayu.sessions import ResumeRequest
-from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus, run_task_worker
+from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskRetryBudget, TaskStatus, run_task_worker
 from cayu.tasks.worker import complete_managed_task
 
 
@@ -41,7 +41,9 @@ def test_event_scope_durably_bounds_unbounded_resume(backend, mode, tmp_path, re
                 ]
 
             if mode == "worker":
-                task = await tasks.create_task(TaskCreate(type="reply"))
+                task = await tasks.create_task(
+                    TaskCreate(type="reply", retry_budget=TaskRetryBudget(max_elapsed_seconds=1800))
+                )
                 budget = await tasks.load_task_retry_key(task.invocation.event_retry_key)
                 event_deadline = ExecutionDeadline(
                     expires_at=budget.elapsed_deadline, source="task_event"

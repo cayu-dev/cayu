@@ -156,9 +156,10 @@ Choose the event's completion contract before setting timeouts. A service that
 must eventually deliver a result may intentionally retry for hours or days.
 A service with a deadline must instead expose a terminal failure when it gives
 up. Ordinary root tasks receive a bounded event automatically: three attempts
-and 1,800 seconds by default. An explicit `retry_budget` selects the workload's
-limits; otherwise `retry_policy` supplies them when present. There is no universal
-ten-minute cap. Two identical jobs can be independent work.
+by default, with no time limit, so the worker's `execution_timeout_s` decides how
+long a handler runs. An explicit `retry_budget` selects the workload's limits;
+otherwise `retry_policy` supplies them when present. There is no universal time
+cap. Two identical jobs can be independent work.
 
 `TaskCreate.event_id` identifies a logical event within its task type and access
 scope. A nonblank string `input["event_id"]` supplies that identity when the explicit
@@ -229,6 +230,15 @@ Success closes the event and refuses duplicate submissions with
 `TaskEventAlreadyCompleted`. Inspect `task.invocation.event_retry_key` with
 `cayu inspect --retry-key KEY` for the policy, deadline, counts and terminal reason.
 
+A declared `max_elapsed_seconds` counts from the event's first admission, queue
+time included, and ends a running handler even when the worker's
+`execution_timeout_s` is longer. `run_task_worker` logs a warning, once per task
+type, when it claims a task whose event budget is shorter than its
+`execution_timeout_s`, since that handler can never use its full limit. The
+budget still applies; give the tasks a longer `retry_budget` or lower the worker's
+limit. Events first admitted by Cayu 0.16.0 without a budget keep the 1,800-second
+limit that release gave them; the warning and the cancellation reason say so.
+
 `TaskRetryBudget.unlimited()` explicitly opts out of attempt and elapsed limits;
 success deduplication still applies. Cancellation requests do not prove cleanup:
 a handler that resists cancellation retains its owner until it finishes. Handler
@@ -291,7 +301,8 @@ Runs are unattached (`RunRequest.task_id` is absent). An interruption completes
 this launch task with a durable session reference; resolve that session's pending
 action, if any, and deliver the result in its continuation owner. Never retry a
 pause as a new payment session. Successful runs deliver before completing the task.
-Without `execution_timeout_s`, the event deadline still bounds a hung call. Which limit ends what:
+Without `execution_timeout_s`, only an event budget with `max_elapsed_seconds`
+bounds a hung call. Which limit ends what:
 
 - `execution_timeout_s` is the whole call, grace included: at 270 of 300 seconds
   new runs are refused and `current_handler_time_limit().expired` is true; at 300
@@ -301,9 +312,9 @@ Without `execution_timeout_s`, the event deadline still bounds a hung call. Whic
 - A run's `execution_deadline` ends that session, here one attempt. Runs
   without one end when new runs are refused.
 - `retry_key` ends the event: tasks with one key (the event's ID, not the
-  task's) share a `TaskRetryBudget`, by default 3 tasks within 30 minutes. The
+  task's) share a `TaskRetryBudget`, by default 3 tasks with no time limit. The
   next is refused with `TaskRetryBudgetExhausted`; the key gives up after the
-  last admitted failure or when the shared deadline expires. Choose a different
+  last admitted failure or when a declared deadline expires. Choose a different
   budget with `retry_budget=` on the first admission. Inspect the durable reason
   with `cayu inspect --retry-key KEY`.
 - `RetryPolicy` ends a model call that keeps hitting rate limits or outages:

@@ -18,8 +18,12 @@ overrides this derivation. Independent operations use different event IDs even
 when their payloads match. An ordinary root with no event identity gets its own
 identity; the runtime cannot identify an undisclosed relationship between jobs.
 
-The existing retry-budget defaults remain configurable. There is no universal
-ten-minute runtime limit. A workload may explicitly use
+An event without a declared budget or retry policy gets
+`DEFAULT_TASK_RETRY_BUDGET`: three attempts and no elapsed limit. The attempt cap
+stops a sweeper that keeps re-creating a task for the same event; how long one
+handler may run stays with the worker's `execution_timeout_s`. A declared
+`max_elapsed_seconds` bounds the whole event, queue time included. There is no
+universal runtime limit. A workload may explicitly use
 `TaskRetryBudget.unlimited()`. Managed schedules, session-owned continuation and
 verified-work contracts retain their own ownership contracts; they must not be
 silently reclassified as unrelated root events.
@@ -47,6 +51,14 @@ the same terminal event state. Attempt exhaustion is recorded after the final
 admitted attempt finishes unsuccessfully, rather than on a hypothetical next
 submission. No running attempt is falsely marked stopped because the admission
 counter has reached its limit.
+
+A worker whose `execution_timeout_s` is longer than a claimed task's event budget
+logs a warning once per task type, because that handler can never use its full
+limit; the budget still applies. When the elapsed budget ends a task, its
+cancellation or failure payload keeps the `event_elapsed_exhausted` code and adds
+a message with the budget's length and how to declare a longer one. Cayu 0.16.0
+gave undeclared events a 1,800-second elapsed limit; events admitted then keep it,
+and the warning and the payload's message say so.
 
 The event record exposes the fixed policy, deadline, counts and terminal reason.
 Task inspection exposes its event association. In-memory, SQLite and PostgreSQL

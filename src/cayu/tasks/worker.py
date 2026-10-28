@@ -116,6 +116,7 @@ from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
+from cayu.tasks._event_budget_warnings import EventBudgetCheck, with_event_budget_expiry
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._group_maintenance import TaskGroupMaintenance
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
@@ -176,6 +177,7 @@ from cayu.tasks.terminalization import (
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
+    from cayu.tasks.retry_budgets import TaskRetryKeyState
 
 
 class TaskHandlerOutcome(StrEnum):
@@ -572,6 +574,11 @@ async def run_task_worker(
       use on its own. The limit ends one handler call, not the work: an
       application that creates a new task for the same event should pass
       ``TaskCreate(retry_key=...)`` so the key's ``TaskRetryBudget`` stops it.
+      A task's event budget also ends its handler when it runs out. Tasks
+      created without ``retry_budget`` or ``retry_policy`` have no elapsed
+      limit by default, so this limit decides. When the worker claims a task
+      whose event budget is shorter than ``execution_timeout_s``, it logs a
+      warning once per task type; the budget still applies.
     """
     if type(concurrency) is not int or concurrency < 1:
         raise ValueError("concurrency must be a positive int.")
@@ -678,6 +685,7 @@ async def run_task_worker(
         )
 
     budget = _TaskWorkerBudget(max_tasks) if concurrency > 1 and max_tasks is not None else None
+    event_budget_check = EventBudgetCheck(execution_timeout_s)
     group_maintenance = TaskGroupMaintenance.for_store(task_store)
     fenced_monitor = (
         FencedTaskMonitor(
@@ -798,6 +806,7 @@ async def run_task_worker(
                     stop=slot_stop,
                     execution_timeout_s=execution_timeout_s,
                     execution_grace_s=execution_grace_s,
+                    event_budget_check=event_budget_check,
                 )
                 continuation_scan_scanned += continuation_page.scanned_candidates
                 continuation_scan_rejected += continuation_page.rejected_candidates
@@ -987,6 +996,7 @@ async def run_task_worker(
                     lease_seconds,
                     execution_timeout_s=execution_timeout_s,
                     execution_grace_s=execution_grace_s,
+                    event_budget_check=event_budget_check,
                 )
             finally:
                 poller.metrics.handler_finished()
@@ -1098,6 +1108,7 @@ async def _handle_with_heartbeat(
     recover_interrupted_authority_loss: bool = False,
     execution_timeout_s: float | None = None,
     execution_grace_s: float | None = None,
+    event_budget_check: EventBudgetCheck | None = None,
 ) -> None:
     settlement = TaskExecutionSettlement(task_store, app._secret_redactor)
     primary: BaseException | None = None
@@ -1113,6 +1124,7 @@ async def _handle_with_heartbeat(
             recover_interrupted_authority_loss=recover_interrupted_authority_loss,
             execution_timeout_s=execution_timeout_s,
             execution_grace_s=execution_grace_s,
+            event_budget_check=event_budget_check,
         )
         # This worker owns the settlement it created. A write that outlives one
         # observation window is slow, not failed: keep joining it for up to one
@@ -1147,18 +1159,24 @@ async def _handle_with_heartbeat_owned(
     recover_interrupted_authority_loss: bool,
     execution_timeout_s: float | None,
     execution_grace_s: float | None,
+    event_budget_check: EventBudgetCheck | None = None,
 ) -> None:
     # The task timeout may be shorter, but it can never extend its event.
     event_key = task.invocation.event_retry_key
     event_limit = False
     event_deadline = None
     event_dispatch_deadline = None
+    event_state = None
     if event_key is not None and task_store.supports_task_event_execution:
         observed_at = monotonic()
-        state = await task_store.load_task_retry_key(event_key)
-        if state is None:
+        event_state = await task_store.load_task_retry_key(event_key)
+        if event_state is None:
             raise RuntimeError("Task event association has no durable budget record.")
-        event_deadline = ExecutionDeadline(expires_at=state.elapsed_deadline, source="task_event")
+        if event_budget_check is not None:
+            event_budget_check.check(app, task, event_state)
+        event_deadline = ExecutionDeadline(
+            expires_at=event_state.elapsed_deadline, source="task_event"
+        )
         remaining = await task_store.task_event_remaining_seconds(event_key)
         if remaining is not None:
             remaining = max(remaining - (monotonic() - observed_at), 0.0)
@@ -1397,13 +1415,24 @@ async def _handle_with_heartbeat_owned(
                     return
                 if time_limit is not None and time_limit.expired:
                     fail = _fail_task_for_handler_time_limit(
-                        app, task_store, task, worker_id, time_limit, handler_error, lease_authority
+                        app,
+                        task_store,
+                        task,
+                        worker_id,
+                        time_limit,
+                        handler_error,
+                        lease_authority,
+                        event_state=event_state,
                     )
                     handler_error = None
                     await fail
                     return
                 failure_payload = _task_failure_payload(app, handler_error)
                 handler_error = None
+                if event_state is not None and failure_payload.get("code") == (
+                    "event_elapsed_exhausted"
+                ):
+                    with_event_budget_expiry(failure_payload, task, event_state)
                 await _safe_fail_payload(
                     task_store,
                     task.id,
@@ -1437,7 +1466,14 @@ async def _handle_with_heartbeat_owned(
             elif handler_outcome is None and time_limit is not None and time_limit.expired:
                 # Returning after the limit without settling is still a timeout.
                 await _fail_task_for_handler_time_limit(
-                    app, task_store, task, worker_id, time_limit, None, lease_authority
+                    app,
+                    task_store,
+                    task,
+                    worker_id,
+                    time_limit,
+                    None,
+                    lease_authority,
+                    event_state=event_state,
                 )
             elif handler_outcome is not None:
                 await _safe_fail(
@@ -2017,12 +2053,19 @@ async def _fail_task_for_handler_time_limit(
     time_limit: HandlerTimeLimit,
     handler_error: Exception | None,
     lease_authority: _TaskLeaseAuthority,
+    *,
+    event_state: TaskRetryKeyState | None = None,
 ) -> None:
     """Fail a task whose handler outlived its time limit; log it if the failure landed."""
 
     payload = _handler_time_limit_failure_payload(app, time_limit, handler_error)
+    note = ""
     if time_limit.source == "task_event":
         payload["code"] = "event_elapsed_exhausted"
+        note = " source=task_event"
+        if event_state is not None:
+            with_event_budget_expiry(payload, task, event_state)
+            note = f"{note} {payload['message']}"
     del handler_error  # Not held across the store await.
     if not await _safe_fail_payload(
         task_store,
@@ -2037,12 +2080,13 @@ async def _fail_task_for_handler_time_limit(
         return
     logger.warning(
         "Task failed because its handler exceeded its time limit: task_id=%s timeout_s=%s "
-        "grace_s=%s handler_cancelled=%s session_ids=%s",
+        "grace_s=%s handler_cancelled=%s session_ids=%s%s",
         app.redact_json(task.id),
         time_limit.timeout_s,
         time_limit.grace_s,
         time_limit.cancelled,
         app.redact_json(list(time_limit.session_ids)),
+        note,
     )
 
 
@@ -3783,6 +3827,7 @@ async def _run_recovered_interrupted_task_handler(
     stop: asyncio.Event | None = None,
     execution_timeout_s: float | None = None,
     execution_grace_s: float | None = None,
+    event_budget_check: EventBudgetCheck | None = None,
 ) -> InterruptedTaskContinuationClaimPage:
     """Scan one bounded page and supervise its optional continuation claim."""
 
@@ -3878,6 +3923,7 @@ async def _run_recovered_interrupted_task_handler(
         recover_interrupted_authority_loss=True,
         execution_timeout_s=execution_timeout_s,
         execution_grace_s=execution_grace_s,
+        event_budget_check=event_budget_check,
     )
     return page
 
