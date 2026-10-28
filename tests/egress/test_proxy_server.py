@@ -773,9 +773,16 @@ def test_response_overflow_releases_proxy_and_broker_capacity() -> None:
                     conn.sendall(b"GET / HTTP/1.1\r\n\r\n")
                     return conn.recv(1024)
 
+            replacement_response = await asyncio.to_thread(replacement)
+            # The worker discards the connection only after the client has read its reply.
+            for _ in range(100):
+                with server._connections_lock:
+                    if not server._connections:
+                        break
+                await asyncio.sleep(0.01)
             return (
                 overflow,
-                await asyncio.to_thread(replacement),
+                replacement_response,
                 not server._connections,
                 not broker._active_upstream_operations,
                 broker._credentialless_active_requests == 0,
