@@ -140,10 +140,13 @@ from cayu.approvals.review import HumanReviewContext as HumanReviewContext
 from cayu.approvals.review import HumanReviewDenied as HumanReviewDenied
 from cayu.approvals.review import HumanReviewDisclosure as HumanReviewDisclosure
 from cayu.approvals.review import HumanReviewField as HumanReviewField
+from cayu.approvals.review import HumanReviewLongField as HumanReviewLongField
+from cayu.approvals.review import HumanReviewLongFieldView as HumanReviewLongFieldView
 from cayu.approvals.review import HumanReviewPolicy as HumanReviewPolicy
 from cayu.approvals.review import HumanReviewReference as HumanReviewReference
 from cayu.approvals.review import HumanReviewSource as HumanReviewSource
 from cayu.approvals.review import HumanReviewView as HumanReviewView
+from cayu.approvals.review import derive_human_review_binding_key as derive_human_review_binding_key
 from cayu.approvals.revisions import (
     APPROVAL_REVISION_METADATA_KEY as APPROVAL_REVISION_METADATA_KEY,
 )

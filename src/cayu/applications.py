@@ -1273,7 +1273,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         )
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
-        self._set_human_review_purpose(human_review_policy)
+        self._configure_human_review(human_review_policy, self._public_authority_alias_codec)
         self._loop_policy_execution_profile_identities = policy_execution_profile_identities
         self._mcp_manifest_policy = manifest_policy
         self._tool_result_projection_policy = result_projection_policy

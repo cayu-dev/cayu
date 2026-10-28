@@ -147,13 +147,24 @@ def test_limited_counts_are_unavailable_without_hidden_total(tmp_path):
         assert "secret-session" not in response.text
 
 
-def test_approval_argument_display_explicitly_withheld_in_list_and_detail(tmp_path):
-    app = _durable_app("memory", tmp_path)
+@pytest.mark.parametrize(("policy", "reason"), [(False, "no_review_policy"), (True, "quarantined")])
+def test_approval_argument_display_explicitly_withheld_in_list_and_detail(tmp_path, policy, reason):
+    from tests.server.test_server_inbox import _app
+
+    from cayu.approvals import ToolArgumentReview
+
+    # Without a policy the app shows no arguments for approvals at all; with one,
+    # the inbox still lists none and protected review shows what the policy allows.
+    app = (
+        _app(human_review_policy=ToolArgumentReview({"record": ("note",)}))
+        if policy
+        else _durable_app("memory", tmp_path)
+    )
     with TestClient(create_server(app, config=ServerConfig.protected(_authenticate))) as client:
         _pause(client, app, "approval", "approver")
         [item] = client.get("/api/inbox", headers=_as("priya")).json()["items"]
         assert item["arguments"] is None
-        assert item["arguments_unavailable_reason"] == "quarantined"
+        assert item["arguments_unavailable_reason"] == reason
         detail = client.get(f"/api/inbox/{item['id']}", headers=_as("tom")).json()["item"]
         assert detail == item
         assert "proposed" not in str(item)

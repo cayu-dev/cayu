@@ -61,8 +61,10 @@ from cayu._validation import (
     revalidate_model_input,
 )
 from cayu.approvals.review import (
+    HumanReviewConflict,
     HumanReviewContext,
     HumanReviewDenied,
+    HumanReviewLongFieldView,
     HumanReviewReference,
     HumanReviewView,
 )
@@ -2195,6 +2197,15 @@ class SessionsSummaryBody(BaseModel):
 class TaskHoldBody(BaseModel):
     reason: NonBlankString | None = None
     payload: dict[str, Any] | None = None
+
+
+class HumanReviewLongFieldBody(BaseModel):
+    """The reference of the view that lists the long field, and the field's key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    review_reference: HumanReviewReference
+    key: str = Field(min_length=1, max_length=64)
 
 
 class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
@@ -6345,6 +6356,18 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
+    async def _review_item_permitted(
+        auth_context: AuthContext, session_id: str, view: HumanReviewView
+    ) -> bool:
+        """Whether the inbox access rule allows the interaction a review is for."""
+        approval = view.kind == "tool_approval"
+        return await inbox_gate.permits_item(
+            auth_context,
+            await _resolve_public_session_id(session_id),
+            ("approval", "recovery") if approval else ("question", "recovery"),
+            **{"approval_id" if approval else "input_id": view.interaction_id},
+        )
+
     @router.get("/sessions/{session_id}/human-review", response_model=HumanReviewView)
     async def inspect_human_review(
         session_id: str,
@@ -6368,15 +6391,63 @@ def create_router(
             raise HTTPException(
                 status_code=403, detail="Human-review access is not authorized."
             ) from None
-        if view.kind is not None and not await inbox_gate.permits_item(
-            auth_context,
-            await _resolve_public_session_id(session_id),
-            ("approval", "recovery") if view.kind == "tool_approval" else ("question", "recovery"),
-            **{"approval_id" if view.kind == "tool_approval" else "input_id": view.interaction_id},
+        if view.kind is not None and not await _review_item_permitted(
+            auth_context, session_id, view
         ):
             raise HTTPException(status_code=403, detail="Human-review access is not authorized.")
         return JSONResponse(
             view.model_dump(mode="json"),
+            headers={
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @router.post(
+        "/sessions/{session_id}/human-review/long-field",
+        response_model=HumanReviewLongFieldView,
+    )
+    async def read_human_review_long_field(
+        session_id: str,
+        body: HumanReviewLongFieldBody,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
+        """Read one long field of the current protected review, whole.
+
+        ``review_reference`` is the reference of the view listing ``key`` in its
+        ``long_fields``; it must name the authenticated caller, who needs inspect
+        and decide permission. A changed or no longer permitted review answers 409.
+        """
+        reference = body.review_reference
+        if (
+            auth_context is None
+            or reference.context.recipient != auth_context.subject
+            or reference.context.tenant != auth_context.tenant
+        ):
+            raise HTTPException(
+                status_code=403, detail="Human-review recipient does not match authentication."
+            )
+        try:
+            # The inbox access rule applies to the interaction the review is for.
+            current = await cayu_app.inspect_human_review(session_id, context=reference.context)
+            if current.kind is None:
+                raise HumanReviewConflict()
+            if not await _review_item_permitted(auth_context, session_id, current):
+                raise HumanReviewDenied()
+            field = await cayu_app.read_human_review_long_field(
+                session_id, reference=reference, key=body.key
+            )
+        except HumanReviewConflict:
+            raise HTTPException(
+                status_code=409, detail="Human-review content is no longer current; inspect again."
+            ) from None
+        except (HumanReviewDenied, KeyError, ValueError):
+            raise HTTPException(
+                status_code=403, detail="Human-review access is not authorized."
+            ) from None
+        return JSONResponse(
+            field.model_dump(mode="json"),
             headers={
                 "Cache-Control": "no-store",
                 "Pragma": "no-cache",

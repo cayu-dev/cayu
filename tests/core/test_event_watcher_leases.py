@@ -351,7 +351,9 @@ def test_cancelled_synchronous_handler_keeps_renewing_until_thread_stops():
             nonlocal calls
             calls += 1
             started.set()
-            assert release.wait(timeout=5)
+            # Match the surrounding liveness guards: this thread must stay blocked
+            # until the competitor assertion releases it, even on a loaded runner.
+            assert release.wait(timeout=30)
 
         watcher = EventWatcher(
             name="sync-cancel", query=EventQuery(), handler=handler, lease_seconds=0.3

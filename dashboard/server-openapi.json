@@ -24281,6 +24281,125 @@
         "title": "HumanReviewField",
         "type": "object"
       },
+      "HumanReviewLongField": {
+        "additionalProperties": false,
+        "description": "A selected value the view shows only in part; read it whole by its ``key``.\n\nThe policy names it in ``HumanReviewDisclosure.long_fields`` and returns its\ncomplete text from ``HumanReviewPolicy.project_long_field``.",
+        "properties": {
+          "characters": {
+            "minimum": 0.0,
+            "title": "Characters",
+            "type": "integer"
+          },
+          "key": {
+            "pattern": "^[A-Za-z0-9._:-]{1,64}$",
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "characters"
+        ],
+        "title": "HumanReviewLongField",
+        "type": "object"
+      },
+      "HumanReviewLongFieldBody": {
+        "additionalProperties": false,
+        "description": "The reference of the view that lists the long field, and the field's key.",
+        "properties": {
+          "key": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "review_reference": {
+            "$ref": "#/components/schemas/HumanReviewReference"
+          }
+        },
+        "required": [
+          "review_reference",
+          "key"
+        ],
+        "title": "HumanReviewLongFieldBody",
+        "type": "object"
+      },
+      "HumanReviewLongFieldView": {
+        "additionalProperties": false,
+        "description": "Protected response: one long field's complete HTML-escaped text.\n\nLike ``HumanReviewView`` it has no event, trace, transcript or export contract.",
+        "properties": {
+          "characters": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Characters"
+          },
+          "display_format": {
+            "const": "html_escaped_text",
+            "default": "html_escaped_text",
+            "title": "Display Format",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "permitted",
+              "redacted",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "required": [
+          "status",
+          "session_id",
+          "key"
+        ],
+        "title": "HumanReviewLongFieldView",
+        "type": "object"
+      },
       "HumanReviewReference": {
         "additionalProperties": false,
         "description": "Opaque content binding; conveys no authority to execute or resolve.",
@@ -24369,6 +24488,15 @@
               }
             ],
             "title": "Kind"
+          },
+          "long_fields": {
+            "default": [],
+            "description": "Values the fields show only in part. Read one whole from POST /api/sessions/{session_id}/human-review/long-field with this view's reference and the field's key.",
+            "items": {
+              "$ref": "#/components/schemas/HumanReviewLongField"
+            },
+            "title": "Long Fields",
+            "type": "array"
           },
           "reference": {
             "anyOf": [
@@ -24646,13 +24774,17 @@
           "arguments_unavailable_reason": {
             "anyOf": [
               {
-                "const": "quarantined",
+                "enum": [
+                  "quarantined",
+                  "no_review_policy"
+                ],
                 "type": "string"
               },
               {
                 "type": "null"
               }
             ],
+            "description": "Why an approval or recovery item shows no arguments. no_review_policy: the app configured no human review policy, so it shows no arguments for approvals; configure one such as ToolArgumentReview. quarantined: the inbox never lists them, and the app's review policy decides what protected human review shows.",
             "title": "Arguments Unavailable Reason"
           },
           "attention_id": {
@@ -50393,7 +50525,7 @@
                 }
               }
             },
-            "description": "Request Entity Too Large"
+            "description": "Content Too Large"
           },
           "422": {
             "content": {
@@ -50403,7 +50535,7 @@
                 }
               }
             },
-            "description": "Unprocessable Entity"
+            "description": "Unprocessable Content"
           }
         },
         "summary": "List Inbox"
@@ -50495,7 +50627,7 @@
                 }
               }
             },
-            "description": "Request Entity Too Large"
+            "description": "Content Too Large"
           },
           "422": {
             "content": {
@@ -53104,6 +53236,56 @@
           }
         },
         "summary": "Inspect Human Review"
+      }
+    },
+    "/api/sessions/{session_id}/human-review/long-field": {
+      "post": {
+        "description": "Read one long field of the current protected review, whole.\n\n``review_reference`` is the reference of the view listing ``key`` in its\n``long_fields``; it must name the authenticated caller, who needs inspect\nand decide permission. A changed or no longer permitted review answers 409.",
+        "operationId": "read_human_review_long_field_api_sessions__session_id__human_review_long_field_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HumanReviewLongFieldBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HumanReviewLongFieldView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Human Review Long Field"
       }
     },
     "/api/sessions/{session_id}/interactions": {

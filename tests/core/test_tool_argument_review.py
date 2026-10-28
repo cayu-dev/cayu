@@ -259,3 +259,99 @@ def test_known_secrets_are_scanned_before_formatting_splitting_or_truncation(kin
     view = _view(policy, source, redactor=SecretRedactor(secret))
     assert view.status == "redacted"
     assert view.fields == ()
+
+
+def _keyring(seed: bytes = b"k" * 32, active: str = "one"):
+    import base64
+
+    from pydantic import SecretStr
+
+    from cayu.runtime.public_authority import PublicAuthorityAliasKeyring
+
+    encoded = base64.urlsafe_b64encode(seed).decode().rstrip("=")
+    return PublicAuthorityAliasKeyring(active_key_id=active, keys={active: SecretStr(encoded)})
+
+
+def test_without_a_binding_key_the_app_derives_one_from_its_alias_keyring() -> None:
+    from cayu import CayuApp
+    from cayu.approvals import derive_human_review_binding_key
+
+    keyring = _keyring()
+    first = ToolArgumentReview({"file_issue": ("title",)})
+    CayuApp(human_review_policy=first, public_authority_alias_keyring=keyring)
+    # Another worker or a restart with the same keyring derives the same key.
+    second = ToolArgumentReview({"file_issue": ("title",)})
+    CayuApp(human_review_policy=second, public_authority_alias_keyring=_keyring())
+    assert first.binding_key == second.binding_key
+    assert first.binding_key == derive_human_review_binding_key(keyring, purpose="approvals")
+    assert len(first.binding_key) == 32
+
+    other_purpose = ToolArgumentReview({"file_issue": ("title",)}, purpose="filing")
+    CayuApp(human_review_policy=other_purpose, public_authority_alias_keyring=keyring)
+    other_app = ToolArgumentReview({"file_issue": ("title",)})
+    CayuApp(human_review_policy=other_app, public_authority_alias_keyring=_keyring(b"o" * 32))
+    keys = {first.binding_key, other_purpose.binding_key, other_app.binding_key}
+    assert len(keys) == 3
+    # The derived key is not the alias key itself.
+    assert b"k" * 32 not in keys
+
+
+def test_a_durable_stores_keyring_serves_and_a_store_without_one_needs_a_key(tmp_path) -> None:
+    from cayu import CayuApp
+    from cayu.approvals import derive_human_review_binding_key
+    from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+
+    keyed = SQLiteSessionStore(
+        tmp_path / "keyed.sqlite",
+        public_authority_alias_codec=PublicAuthorityAliasCodec(_keyring()),
+    )
+    policy = ToolArgumentReview({"file_issue": ("title",)})
+    CayuApp(session_store=keyed, human_review_policy=policy)
+    assert policy.binding_key == derive_human_review_binding_key(_keyring(), purpose="approvals")
+
+    # A durable store without a keyring has no key material to derive from.
+    plain = SQLiteSessionStore(tmp_path / "plain.sqlite")
+    with pytest.raises(ValueError, match="binding_key"):
+        CayuApp(session_store=plain, human_review_policy=ToolArgumentReview({"file_issue": ("t",)}))
+    explicit = ToolArgumentReview({"file_issue": ("title",)}, binding_key=KEY)
+    CayuApp(session_store=plain, human_review_policy=explicit)
+    assert explicit.binding_key == KEY
+    with pytest.raises(ValueError, match="binding_key"):
+        ToolArgumentReview({"file_issue": ("title",)}).binding_key  # noqa: B018
+
+
+def test_an_explicit_binding_key_wins_over_the_keyring() -> None:
+    from cayu import CayuApp
+
+    explicit = ToolArgumentReview({"file_issue": ("title",)}, binding_key=KEY)
+    CayuApp(human_review_policy=explicit, public_authority_alias_keyring=_keyring())
+    assert explicit.binding_key == KEY
+
+
+def test_one_derived_policy_cannot_serve_apps_with_different_keyrings() -> None:
+    from cayu import CayuApp
+
+    policy = ToolArgumentReview({"file_issue": ("title",)})
+    CayuApp(human_review_policy=policy, public_authority_alias_keyring=_keyring())
+    CayuApp(human_review_policy=policy, public_authority_alias_keyring=_keyring())
+    with pytest.raises(ValueError, match="another app"):
+        CayuApp(human_review_policy=policy, public_authority_alias_keyring=_keyring(b"o" * 32))
+
+
+def test_the_derived_key_follows_the_active_key() -> None:
+    import base64
+
+    from pydantic import SecretStr
+
+    from cayu.approvals import derive_human_review_binding_key
+
+    keyring = _keyring()
+    rotated = keyring.rotated(
+        active_key_id="two",
+        key=SecretStr(base64.urlsafe_b64encode(b"t" * 32).decode().rstrip("=")),
+    )
+    assert derive_human_review_binding_key(
+        keyring, purpose="approvals"
+    ) != derive_human_review_binding_key(rotated, purpose="approvals")
+    with pytest.raises(TypeError):
+        derive_human_review_binding_key(b"x" * 32, purpose="approvals")

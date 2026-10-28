@@ -220,7 +220,12 @@ export interface InboxItem {
   detail: string | null
   tool_name: string | null
   arguments: null
-  arguments_unavailable_reason: "quarantined" | null
+  /**
+   * Why an approval or recovery item shows no arguments: "no_review_policy" when the
+   * app configured no human review policy (such as ToolArgumentReview), "quarantined"
+   * when one decides what protected human review shows.
+   */
+  arguments_unavailable_reason: "quarantined" | "no_review_policy" | null
   question: string | null
   options: string[]
   knowledge: { entry_id: string; revision: number; kind: string } | null

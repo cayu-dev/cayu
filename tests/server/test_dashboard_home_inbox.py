@@ -357,7 +357,7 @@ def test_inbox_member_decides_without_arguments_and_counts_refresh(decision):
                 page.get_by_role("button", name="Approve", exact=True).first
             ).to_be_visible()
             await expect(
-                page.get_by_text("Arguments are withheld", exact=False).first
+                page.get_by_text("This app shows no arguments for approvals", exact=False).first
             ).to_be_visible()
             await expect(page.get_by_label("Changed arguments", exact=True)).to_have_count(0)
             assert "/api/inbox/counts" in requests

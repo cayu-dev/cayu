@@ -75,7 +75,13 @@ retries similarly retain their exact request identity. Keep the original request
 for these retries.
 
 Use a private random `binding_key` of at least 32 bytes, shared by authorized
-workers. Keep it in application configuration, never session metadata. Keep the
+workers. Keep it in application configuration, never session metadata. A policy
+can derive one with `derive_human_review_binding_key(keyring, purpose=...)` from
+the app's public authority alias keyring, the key material a durable app already
+shares across its workers (`CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS`). The derived key
+is HMAC-SHA256 of a fixed Cayu label and the purpose under the keyring's active
+key, so it is distinct per purpose and never equals an alias. Rotating the active
+key changes it, which invalidates outstanding views. Keep the
 policy deterministic and side-effect free and change `version` for every change
 to authorization, projection or sensitive-content rules. A new process with the
 same configuration reconstructs the same view from SQLite or PostgreSQL. Lost
@@ -102,25 +108,50 @@ use it for access auditing without questions, arguments or private fingerprints.
 It must be fast and safe inside an atomic claim. Ordinary runtime projections
 continue to quarantine pre-execution arguments.
 
+## Long fields
+
+A value longer than the display field limits above can be shown in part in the view and read whole
+on its own. The policy lists it in `HumanReviewDisclosure.long_fields` as a
+`HumanReviewLongField` with a `key`, a `label` and its length in `characters`,
+and returns its complete text from `project_long_field(context, source, key)`.
+The view repeats the list in `long_fields`. To read one, call
+`app.read_human_review_long_field(session_id, reference=view.reference, key=...)`
+or `POST /api/sessions/{session_id}/human-review/long-field` with
+`{"review_reference": ..., "key": ...}`. It returns `HumanReviewLongFieldView`
+with the HTML-escaped text, under the same no-publication rules as the view.
+
+Cayu reads a long field only when the reference names a recipient with both
+`inspect` and `decide` permission, the view it was issued for is still current
+and `permitted`, and that view lists the key. The long field takes the view's
+secret scope and sensitive-content result, and its complete value is checked
+for known secrets: a match returns `redacted` with no text. A value over 1 MiB
+of UTF-8 returns `unavailable`. Changed content answers 409 (inspect again), and
+a reference that names another recipient answers 403. The view's own limits are
+unchanged, and listing a long field binds it into the view's reference.
+
 ## Ready-made policy: show named tool arguments
 
 Most approvals only need the approver to read a few arguments of one tool.
 `ToolArgumentReview` does that:
 
 ```python
-import os
-
 from cayu import CayuApp
 from cayu.approvals import ToolArgumentReview
 
 app = CayuApp(
-    human_review_policy=ToolArgumentReview(
-        {"file_issue": ("title", "body")},
-        binding_key=bytes.fromhex(os.environ["APP_REVIEW_KEY"]),  # 32+ random bytes
-    ),
+    session_store=store,  # a durable store opened with the app's alias keyring
+    human_review_policy=ToolArgumentReview({"file_issue": ("title", "body")}),
 )
 ```
 
+- Without `binding_key`, the app derives the key from its public authority alias
+  keyring, set on `CayuApp(public_authority_alias_keyring=...)` or on the session
+  store. Every worker and restart with the same keyring derives the same key. An
+  in-memory store has a random keyring of its own, which is enough for its one
+  process. A durable store without a keyring has nothing to derive from, so
+  `CayuApp` refuses the policy until you configure the keyring or pass
+  `binding_key=bytes.fromhex(os.environ["APP_REVIEW_KEY"])` (32+ random bytes).
+  One derived policy object can't serve apps with different keyrings.
 - Calls to tools it doesn't name stay approvable, as they are without a policy.
   The view names the tool and says its arguments are not shown.
 - A question from `ask_user` shows its question and options in static secret
@@ -129,7 +160,9 @@ app = CayuApp(
 - Complete selected values are checked for known secrets before formatting or splitting.
 - A long argument is split across numbered fields. The view stays within the
   limits above, and what doesn't fit is replaced by a note saying how many
-  characters are not shown. The decision still binds the complete arguments.
+  characters are not shown. Each listed argument that doesn't fit in one field
+  is also a long field, so the approver can read it whole (see Long fields
+  above). The decision still binds the complete arguments.
 - Any authenticated recipient may inspect and decide with its `purpose`
   (`"approvals"` by default). Pass `authorize_recipient` to narrow that.
 - The server points the dashboard at that purpose unless the dashboard's
@@ -213,6 +246,8 @@ default purpose. Both API and dashboard must authenticate the operator.
 
 For normal input and approval pauses, click **Refresh review**, inspect the
 permitted fields and the scope of every call, then answer, approve, or deny.
+A value shown only in part has a **Show all N characters** button that reads the
+long field whole for the review on screen.
 The dashboard sends the displayed reference and its protected identities;
 ordinary pending-action IDs are only projection aliases. Reviews stay in
 component memory and are fetched with `no-store`, outside shared query caches.

@@ -45,10 +45,12 @@ from cayu.approvals.review import (
     HumanReviewConflict,
     HumanReviewContext,
     HumanReviewDenied,
+    HumanReviewLongFieldView,
     HumanReviewPolicy,
     HumanReviewReference,
     HumanReviewSource,
     HumanReviewView,
+    build_long_field,
     build_review,
     require_current_review,
     require_review_authority,
@@ -705,6 +707,31 @@ class RecoveryCoordinator:
         checkpoint: dict[str, Any] | None,
         context: HumanReviewContext,
     ) -> HumanReviewView:
+        policy, source, content = self._human_review_source(session, checkpoint)
+        return self._review_view(session, policy, source, content, context)
+
+    def _review_view(
+        self,
+        session: Session,
+        policy: HumanReviewPolicy,
+        source: HumanReviewSource,
+        content: object,
+        context: HumanReviewContext,
+    ) -> HumanReviewView:
+        return build_review(
+            policy=policy,
+            context=context,
+            source=source,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            authoritative_content=content,
+            redactor=self._secret_redactor,
+            now=self._clock(),
+        )
+
+    def _human_review_source(
+        self, session: Session, checkpoint: dict[str, Any] | None
+    ) -> tuple[HumanReviewPolicy, HumanReviewSource, object]:
         policy = self._human_review_policy
         if policy is None:
             raise HumanReviewDenied()
@@ -800,16 +827,7 @@ class RecoveryCoordinator:
             expires_at=expires_at,
             executable=executable,
         )
-        return build_review(
-            policy=policy,
-            context=context,
-            source=source,
-            session_id=session.id,
-            session_instance_id=session.instance_id,
-            authoritative_content=content,
-            redactor=self._secret_redactor,
-            now=self._clock(),
-        )
+        return policy, source, content
 
     async def inspect_human_review(
         self,
@@ -865,6 +883,49 @@ class RecoveryCoordinator:
             return result
         except Exception:
             return unavailable
+
+    async def read_human_review_long_field(
+        self, session_id: str, reference: HumanReviewReference, key: str
+    ) -> HumanReviewLongFieldView:
+        session = await self._session_store.load(session_id)
+        if session is None:
+            raise HumanReviewDenied()
+        for action in ("inspect", "decide"):
+            require_review_authority(
+                self._human_review_policy,
+                reference.context,
+                session_id=session.id,
+                session_metadata=session.metadata,
+                action=action,
+            )
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        if session.status in {SessionStatus.COMPLETED, SessionStatus.INTERRUPTING}:
+            raise HumanReviewConflict()
+        try:
+            policy, source, content = self._human_review_source(session, checkpoint)
+            current = self._review_view(session, policy, source, content, reference.context)
+        except Exception:
+            raise HumanReviewConflict() from None
+        # Only the exact current, permitted view the approver holds opens its long fields.
+        require_current_review(reference, current, denying=False)
+        result = build_long_field(
+            policy=policy,
+            context=reference.context,
+            source=source,
+            view=current,
+            key=key,
+            redactor=self._secret_redactor,
+        )
+        if (
+            await self._session_store.load(session_id) != session
+            or await self._session_store.load_checkpoint(session_id) != checkpoint
+        ):
+            raise HumanReviewConflict()
+        try:
+            policy.audit(action="inspect", status=f"long_field_{result.status}")
+        except Exception:
+            raise HumanReviewDenied() from None
+        return result
 
     async def require_human_review_resolution_authority(
         self,

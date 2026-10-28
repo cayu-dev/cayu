@@ -498,9 +498,13 @@ def register_inbox_routes(
             title=projected["title"],
             detail=projected["detail"],
             tool_name=projected["tool_name"],
-            arguments_unavailable_reason="quarantined"
-            if kind in {"approval", "recovery"}
-            else None,
+            arguments_unavailable_reason=(
+                None
+                if kind not in {"approval", "recovery"}
+                else "quarantined"
+                if cayu_app.human_review_configured
+                else "no_review_policy"
+            ),
             question=projected["question"],
             options=projected["options"],
             decisions=list(INBOX_DECISIONS[kind]),
@@ -1174,8 +1178,8 @@ def register_inbox_routes(
         response_model=InboxPage,
         responses={
             409: {"model": ApiErrorResponse},
-            413: {"model": ApiErrorResponse},
-            422: {"model": ApiErrorResponse},
+            413: {"model": ApiErrorResponse, "description": "Content Too Large"},
+            422: {"model": ApiErrorResponse, "description": "Unprocessable Content"},
         },
         description=(
             "List what is waiting on a person: approvals, questions and recovery items "
@@ -1272,7 +1276,10 @@ def register_inbox_routes(
     @router.get(
         "/inbox/counts",
         response_model=InboxCounts,
-        responses={409: {"model": ApiErrorResponse}, 413: {"model": ApiErrorResponse}},
+        responses={
+            409: {"model": ApiErrorResponse},
+            413: {"model": ApiErrorResponse, "description": "Content Too Large"},
+        },
         description=(
             "Count every pending inbox kind independently of list page size. "
             "Limited callers receive unavailable counts, never hidden totals. "

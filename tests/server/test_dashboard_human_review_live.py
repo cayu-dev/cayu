@@ -247,3 +247,86 @@ def test_withheld_and_missing_review_clicks(status):
                 await browser.close()
 
     asyncio.run(scenario())
+
+
+def test_long_field_click_reads_the_complete_value_then_approves(tmp_path):
+    from playwright.async_api import async_playwright, expect
+    from tests.core.test_human_review_long_fields import BODY, KEY
+    from tests.core.test_human_review_long_fields import _app as long_field_app
+
+    from cayu.approvals import ToolArgumentReview
+
+    async def scenario():
+        store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+        policy = ToolArgumentReview(
+            {"side_effect": ("value",)},
+            binding_key=KEY,
+            purpose="delivery",
+            attest_listed_arguments=True,
+        )
+        app, tool = long_field_app(store, policy, BODY)
+        await pause(app)
+        root = os.environ["CAYU_BROWSER_DASHBOARD_URL"].rstrip("/")
+        long_field_bodies = []
+
+        def auth(request):
+            return AuthContext(subject="operator", tenant="tenant-a")
+
+        with TestClient(create_server(app, config=ServerConfig.protected(auth))) as client:
+
+            async def api(route):
+                req = route.request
+                path = req.url.split(root, 1)[1]
+                if path.endswith("/long-field"):
+                    long_field_bodies.append(json.loads(req.post_data))
+                response = client.request(
+                    req.method,
+                    path,
+                    content=req.post_data,
+                    headers={
+                        "Content-Type": "application/json",
+                        **{k: v for k, v in req.headers.items() if k.startswith("x-cayu-")},
+                    },
+                )
+                await route.fulfill(
+                    status=response.status_code,
+                    body=response.content,
+                    headers={"content-type": response.headers.get("content-type", "")},
+                )
+
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(
+                    executable_path=os.environ.get("CAYU_BROWSER_CONTROL_CHROMIUM"), headless=True
+                )
+                try:
+                    page = await browser.new_page()
+                    await page.route(f"{root}/api/**", api)
+                    await page.route(
+                        f"{root}/review-test",
+                        lambda route: route.fulfill(
+                            content_type="text/html",
+                            body=HTML.replace("KIND", '"tool_approval"'),
+                        ),
+                    )
+                    await page.goto(f"{root}/review-test")
+                    await page.get_by_role("button", name="Refresh review").click()
+                    show = page.get_by_role(
+                        "button", name=f"Show all {len(BODY):,} characters of value"
+                    )
+                    await show.click()
+                    last_line = BODY.splitlines()[-1]
+                    await expect(page.locator("pre")).to_contain_text(last_line)
+                    await expect(show).to_have_count(0)
+                    [body] = long_field_bodies
+                    assert body["key"] == "1.1"
+                    assert body["review_reference"]["context"]["recipient"] == "operator"
+                    await page.get_by_role("button", name="Approve", exact=True).click()
+                    # Approving runs the tool on the long value before the decision settles.
+                    await expect(page.locator("pre")).to_have_count(0, timeout=30000)
+                    await expect(page.get_by_role("alert")).to_have_count(0)
+                finally:
+                    await browser.close()
+        assert tool.calls == [{"value": BODY}]
+        await store.close()
+
+    asyncio.run(scenario())

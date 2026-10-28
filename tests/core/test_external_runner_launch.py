@@ -445,7 +445,13 @@ def test_lost_interactive_start_keeps_launch_cleanup_retryable(tmp_path):
                     )
                     assert code != 0
             [record] = transport.supervisor._records.values()
-            assert record.process is not None and record.process.poll() is None
+            # An accepted start registers the record before its worker thread
+            # spawns the process. Wait for that boundary before testing cleanup.
+            async with asyncio.timeout(10):
+                while record.process is None:
+                    assert record.state == "accepted"
+                    await asyncio.sleep(0.01)
+            assert record.process.poll() is None
             assert not transport.released
             transport.fail_cancel = False
             await failure.value.retry()

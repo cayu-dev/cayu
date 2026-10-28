@@ -11720,6 +11720,80 @@ export type HumanReviewField = {
 };
 
 /**
+ * HumanReviewLongField
+ *
+ * A selected value the view shows only in part; read it whole by its ``key``.
+ *
+ * The policy names it in ``HumanReviewDisclosure.long_fields`` and returns its
+ * complete text from ``HumanReviewPolicy.project_long_field``.
+ */
+export type HumanReviewLongField = {
+    /**
+     * Characters
+     */
+    characters: number;
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Label
+     */
+    label: string;
+};
+
+/**
+ * HumanReviewLongFieldBody
+ *
+ * The reference of the view that lists the long field, and the field's key.
+ */
+export type HumanReviewLongFieldBody = {
+    /**
+     * Key
+     */
+    key: string;
+    review_reference: HumanReviewReference;
+};
+
+/**
+ * HumanReviewLongFieldView
+ *
+ * Protected response: one long field's complete HTML-escaped text.
+ *
+ * Like ``HumanReviewView`` it has no event, trace, transcript or export contract.
+ */
+export type HumanReviewLongFieldView = {
+    /**
+     * Characters
+     */
+    characters?: number | null;
+    /**
+     * Display Format
+     */
+    display_format?: 'html_escaped_text';
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Label
+     */
+    label?: string | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Status
+     */
+    status: 'permitted' | 'redacted' | 'unavailable';
+    /**
+     * Text
+     */
+    text?: string | null;
+};
+
+/**
  * HumanReviewReference
  *
  * Opaque content binding; conveys no authority to execute or resolve.
@@ -11768,6 +11842,12 @@ export type HumanReviewView = {
      * Kind
      */
     kind?: 'user_input' | 'tool_approval' | null;
+    /**
+     * Long Fields
+     *
+     * Values the fields show only in part. Read one whole from POST /api/sessions/{session_id}/human-review/long-field with this view's reference and the field's key.
+     */
+    long_fields?: Array<HumanReviewLongField>;
     reference?: HumanReviewReference | null;
     /**
      * Session Id
@@ -11906,8 +11986,10 @@ export type InboxItem = {
     arguments?: null;
     /**
      * Arguments Unavailable Reason
+     *
+     * Why an approval or recovery item shows no arguments. no_review_policy: the app configured no human review policy, so it shows no arguments for approvals; configure one such as ToolArgumentReview. quarantined: the inbox never lists them, and the app's review policy decides what protected human review shows.
      */
-    arguments_unavailable_reason?: 'quarantined' | null;
+    arguments_unavailable_reason?: 'quarantined' | 'no_review_policy' | null;
     /**
      * Attention Id
      *
@@ -26205,11 +26287,11 @@ export type ListInboxApiInboxGetErrors = {
      */
     409: ApiErrorResponse;
     /**
-     * Request Entity Too Large
+     * Content Too Large
      */
     413: ApiErrorResponse;
     /**
-     * Unprocessable Entity
+     * Unprocessable Content
      */
     422: ApiErrorResponse;
 };
@@ -26251,7 +26333,7 @@ export type InboxCountsApiInboxCountsGetErrors = {
      */
     409: ApiErrorResponse;
     /**
-     * Request Entity Too Large
+     * Content Too Large
      */
     413: ApiErrorResponse;
     /**
@@ -27433,6 +27515,36 @@ export type InspectHumanReviewApiSessionsSessionIdHumanReviewGetResponses = {
 };
 
 export type InspectHumanReviewApiSessionsSessionIdHumanReviewGetResponse = InspectHumanReviewApiSessionsSessionIdHumanReviewGetResponses[keyof InspectHumanReviewApiSessionsSessionIdHumanReviewGetResponses];
+
+export type ReadHumanReviewLongFieldApiSessionsSessionIdHumanReviewLongFieldPostData = {
+    body: HumanReviewLongFieldBody;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/human-review/long-field';
+};
+
+export type ReadHumanReviewLongFieldApiSessionsSessionIdHumanReviewLongFieldPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ReadHumanReviewLongFieldApiSessionsSessionIdHumanReviewLongFieldPostError = ReadHumanReviewLongFieldApiSessionsSessionIdHumanReviewLongFieldPostErrors[keyof ReadHumanReviewLongFieldApiSessionsSessionIdHumanReviewLongFieldPostErrors];
+
+export type ReadHumanReviewLongFieldApiSessionsSessionIdHumanReviewLongFieldPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: HumanReviewLongFieldView;
+};
+
+export type ReadHumanReviewLongFieldApiSessionsSessionIdHumanReviewLongFieldPostResponse = ReadHumanReviewLongFieldApiSessionsSessionIdHumanReviewLongFieldPostResponses[keyof ReadHumanReviewLongFieldApiSessionsSessionIdHumanReviewLongFieldPostResponses];
 
 export type ListSessionInteractionsApiSessionsSessionIdInteractionsGetData = {
     body?: never;

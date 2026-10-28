@@ -965,7 +965,7 @@ def test_failed_sqlite_settlement_never_replays_uncommitted_receipt(
                 == 1
             )
             entered.set()
-            assert release.wait(10)
+            assert release.wait(30)
             raise primary
 
         def rollback(self):
@@ -1004,7 +1004,8 @@ def test_failed_sqlite_settlement_never_replays_uncommitted_receipt(
                     )
                 )
                 try:
-                    assert await asyncio.to_thread(entered.wait, 5)
+                    # Reaching the injected commit is a scheduling barrier, not a latency limit.
+                    assert await asyncio.to_thread(entered.wait, 30)
                     if cancel_owner:
                         assert owner.cancel()
                         await asyncio.sleep(0)

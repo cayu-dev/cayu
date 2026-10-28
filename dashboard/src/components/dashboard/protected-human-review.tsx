@@ -3,6 +3,7 @@ import { ApiClientError, throwResponseError } from "../../lib/api"
 import { apiUrl } from "../../lib/config"
 import { roleForbiddenMessage } from "../../lib/dashboard-access"
 import type {
+  HumanReviewLongFieldView,
   HumanReviewView,
   ToolApprovalBody,
   UserInputResolveBody,
@@ -46,19 +47,69 @@ export function ProtectedHumanReview({
   const [busy, setBusy] = useState(false)
   const [answer, setAnswer] = useState("")
   const [reason, setReason] = useState("")
+  // Complete text of long fields, by key, for the view on screen only.
+  const [longText, setLongText] = useState<Record<string, string>>({})
+  const [reading, setReading] = useState<string | null>(null)
   const request = useRef<AbortController | null>(null)
+  const longRequest = useRef<AbortController | null>(null)
   const deciding = useRef(false)
   useEffect(
     () => () => {
       request.current?.abort()
+      longRequest.current?.abort()
     },
     [],
   )
+
+  const forgetLongText = () => {
+    longRequest.current?.abort()
+    setLongText({})
+    setReading(null)
+  }
+
+  const readLongField = async (key: string) => {
+    if (!view?.reference || reading || busy) return
+    const controller = new AbortController()
+    longRequest.current = controller
+    setReading(key)
+    setError(null)
+    try {
+      const response = await fetch(
+        apiUrl(`/sessions/${encodeURIComponent(view.session_id)}/human-review/long-field`),
+        {
+          method: "POST",
+          credentials: "include",
+          cache: "no-store",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ review_reference: view.reference, key }),
+          signal: controller.signal,
+        },
+      )
+      if (!response.ok) await throwResponseError(response)
+      const field: HumanReviewLongFieldView = await response.json()
+      if (field.key !== key || field.session_id !== view.session_id) {
+        throw new Error("The field does not match this review.")
+      }
+      if (field.status !== "permitted" || field.text == null) {
+        throw new Error("The complete text is withheld or unavailable.")
+      }
+      const text = reviewText(field.text)
+      if (!controller.signal.aborted) setLongText((current) => ({ ...current, [key]: text }))
+    } catch (failure) {
+      if (!controller.signal.aborted)
+        setError(
+          `${failure instanceof Error ? failure.message : "Reading the field failed."} Refresh the review and try again.`,
+        )
+    } finally {
+      if (!controller.signal.aborted) setReading(null)
+    }
+  }
 
   const inspect = async () => {
     request.current?.abort()
     const controller = new AbortController()
     request.current = controller
+    forgetLongText()
     setView(null)
     setAnswer("")
     setReason("")
@@ -125,10 +176,12 @@ export function ProtectedHumanReview({
           review_reference: view.reference,
         })
       }
+      forgetLongText()
       setView(null)
       setAnswer("")
       setReason("")
     } catch (failure) {
+      forgetLongText()
       setView(null)
       setError(
         `${failure instanceof Error ? failure.message : "Decision failed."} Refresh the review and inspect it before deciding again. An unconfirmed decision may still have completed.`,
@@ -166,6 +219,35 @@ export function ProtectedHumanReview({
                   </div>
                 ))}
               </dl>
+            )}
+            {view.status === "permitted" && (view.long_fields?.length ?? 0) > 0 && (
+              <div className="space-y-2">
+                <p className="text-xs text-muted-foreground">
+                  Some values above are shown only in part. The decision covers them whole.
+                </p>
+                {view.long_fields?.map((field) =>
+                  // Keys are policy text; "__proto__" must not read as loaded.
+                  !Object.hasOwn(longText, field.key) ? (
+                    <Button
+                      key={field.key}
+                      size="sm"
+                      variant="outline"
+                      disabled={busy || reading !== null}
+                      onClick={() => void readLongField(field.key)}
+                    >
+                      Show all {field.characters.toLocaleString()} characters of{" "}
+                      {reviewText(field.label)}
+                    </Button>
+                  ) : (
+                    <div key={field.key} className="space-y-1">
+                      <p className="font-medium">{reviewText(field.label)}, complete</p>
+                      <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted px-3 py-2 text-xs">
+                        {longText[field.key]}
+                      </pre>
+                    </div>
+                  ),
+                )}
+              </div>
             )}
             <p>
               Whole-round scope: all listed calls remain subject to their eligibility and execution

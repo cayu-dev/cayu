@@ -86,8 +86,13 @@ The queue is live, not a transactional snapshot across sources; refresh after
 settling an item. `client.getInboxCounts` reads this endpoint. The read-only
 `inbox_queries` capability advertises filters, counts and argument availability.
 
-Approval and recovery items explicitly return `arguments: null` and
-`arguments_unavailable_reason: "quarantined"`. Other kinds return a null reason.
+Approval and recovery items explicitly return `arguments: null` with a reason.
+`arguments_unavailable_reason: "no_review_policy"` means the app configured no
+human review policy, so it shows no arguments for approvals; configure one such
+as `ToolArgumentReview` ([human review](human-review.md)) to show selected
+arguments. `"quarantined"` means the app has a policy: the inbox still lists no
+arguments, and the policy decides what protected human review shows. Other kinds
+return a null reason.
 The public API never reconstructs executable arguments from private checkpoints
 for display. The separately authorized human-review policy remains the route
 for reviewer-specific disclosure; this field does not bypass it.

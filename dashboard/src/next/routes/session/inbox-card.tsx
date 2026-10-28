@@ -406,9 +406,16 @@ export function InboxCard({
             showEvidence={showKnowledgeEvidence}
           />
         )}
+        {item.arguments_unavailable_reason === "no_review_policy" && (
+          <p className="text-xs text-muted-foreground">
+            This app shows no arguments for approvals. To show selected ones, the app can configure
+            a human review policy such as <code className="font-mono">ToolArgumentReview</code>.
+          </p>
+        )}
         {item.arguments_unavailable_reason === "quarantined" && (
           <p className="text-xs text-muted-foreground">
-            Arguments are withheld. Use protected human review when this agent provides it.
+            Arguments are not listed in the inbox. The app's review policy decides what protected
+            human review shows.
           </p>
         )}
         {!decided && item.kind !== "recovery" && (

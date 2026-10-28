@@ -97,7 +97,16 @@ class InboxItem(_InboxModel):
     arguments: None = Field(
         default=None, description="Proposed arguments remain quarantined before execution."
     )
-    arguments_unavailable_reason: Literal["quarantined"] | None = None
+    arguments_unavailable_reason: Literal["quarantined", "no_review_policy"] | None = Field(
+        default=None,
+        description=(
+            "Why an approval or recovery item shows no arguments. no_review_policy: the "
+            "app configured no human review policy, so it shows no arguments for "
+            "approvals; configure one such as ToolArgumentReview. quarantined: the "
+            "inbox never lists them, and the app's review policy decides what protected "
+            "human review shows."
+        ),
+    )
     question: str | None = None
     options: list[str] = Field(default_factory=list)
     knowledge: InboxKnowledgeEntry | None = None
