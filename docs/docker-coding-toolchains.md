@@ -98,6 +98,21 @@ or lockfile still receives a stale-toolchain result before execution: prepare an
 admit a new immutable image/profile revision. Cayu never runs an installer or
 falls back to the host.
 
+A dependency input's `content_sha256` covers the file's exact bytes by default.
+Build it with `CodingDependencyInput.from_content(path, content)` rather than
+hashing by hand. An input whose toolchain reads a `pyproject.toml` only to
+install the environment can pass `digest_scope="pyproject_environment"`: its
+digest then covers the `[project]` name, `requires-python`, dependencies,
+optional dependencies and `dynamic`, and the `[build-system]`,
+`[dependency-groups]` and `[tool.uv]` tables, so editing a tool setting such as
+`[tool.pytest.ini_options]` doesn't make the toolchain stale. The stale-input
+error names up to five changed inputs (longer or unprintable paths are only
+counted) and, when the profile sets `rebuild_command`, ends with that command.
+`rebuild_command` is operator guidance and isn't part of the profile
+fingerprint. The structured fields of tool results and failure events still
+carry only the error code, path count and path-set fingerprint; only the message
+names paths, and only these declared input paths.
+
 The generated built-in Python path is selected explicitly with:
 
 ```console
@@ -313,7 +328,9 @@ become build inputs. They must be regular files without symlinks in their
 path, and neither may also be listed in `extra_build_inputs`. The builder copies
 them into its private build context with the other inputs, records each in
 `docker-coding-image.json`'s `dependency_inputs` (checked like the project's own
-lock, so editing one requires a rebuild), and includes them in
+files: any edit to `uv.lock`, and an edit to what `pyproject.toml` installs,
+requires a rebuild; once `Dockerfile.coding` is edited, any edit to either
+does), and includes them in
 `trusted_build_context_sha256`: the sha256 of the compact, key-sorted JSON list
 of `{"path", "content_sha256"}` for every build input sorted by path, where
 `content_sha256` is `sha256:` plus the hex digest of the file's bytes.

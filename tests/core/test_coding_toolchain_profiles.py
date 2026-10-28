@@ -428,8 +428,10 @@ def test_neutral_dependency_checks_raise_the_neutral_error(tmp_path: Path) -> No
         "path_count": 1,
         "paths_fingerprint": missing.value.paths_fingerprint,
     }
-    assert "uv.lock" not in str(missing.value)
-    assert "1 of 1 declared inputs" in str(missing.value)
+    # The message names the declared input; the published diagnostic doesn't.
+    assert "(1 of 1 declared inputs are missing or unreadable in the workspace: uv.lock)" in (
+        str(missing.value)
+    )
 
 
 def test_docker_dependency_checks_keep_raising_the_docker_error(tmp_path: Path) -> None:

@@ -25,6 +25,12 @@ from cayu.cli import main
 from cayu.cli._bounded_command import BoundedCommandResult
 from cayu.cli.project import project_context
 from cayu.cli.scaffold_check import check_declared_scaffold_source
+from cayu.environments import (
+    CodingDependencyInput,
+    CodingToolchainError,
+    CodingToolchainProfile,
+    verify_local_coding_toolchain_dependencies,
+)
 from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
 from cayu.evals.models import EvalStatus
 from cayu.evals.reporting import load_eval_run
@@ -907,6 +913,39 @@ def test_generated_docker_builder_uses_one_immutable_input_snapshot(
     assert recorded_dependencies["uv.lock"] == (
         "sha256:" + hashlib.sha256(original_lock).hexdigest()
     )
+    # pyproject.toml is recorded by what uv sync installs from, so a pytest
+    # marker doesn't make the image stale, but a requires-python change does,
+    # and the error names the file and the rebuild command.
+    assert {
+        item["path"]: item.get("digest_scope", "file") for item in recorded["dependency_inputs"]
+    } == {path: "file" for path in builder._BASE_BUILD_CONTEXT_INPUT_LIMITS} | {
+        "pyproject.toml": "pyproject_environment"
+    }
+    image_profile = CodingToolchainProfile(
+        profile_id="snapshot-builder",
+        revision="1",
+        dependency_inputs=tuple(
+            CodingDependencyInput.model_validate(item) for item in recorded["dependency_inputs"]
+        ),
+        rebuild_command="uv run --no-sync python build_coding_image.py",
+    )
+    original_pyproject = (project / "pyproject.toml").read_bytes()
+    assert b'pythonpath = ["."]\n' in original_pyproject
+    (project / "pyproject.toml").write_bytes(
+        original_pyproject.replace(
+            b'pythonpath = ["."]\n',
+            b'pythonpath = ["."]\nmarkers = ["docker: needs the local image"]\n',
+        )
+    )
+    verify_local_coding_toolchain_dependencies(image_profile, project)
+    (project / "pyproject.toml").write_bytes(
+        original_pyproject.replace(b'requires-python = ">=3.11"', b'requires-python = ">=3.12"')
+    )
+    with pytest.raises(CodingToolchainError) as stale:
+        verify_local_coding_toolchain_dependencies(image_profile, project)
+    assert "inputs: pyproject.toml); rebuild the toolchain with " in str(stale.value)
+    assert str(stale.value).endswith("`uv run --no-sync python build_coding_image.py`.")
+    (project / "pyproject.toml").write_bytes(original_pyproject)
     assert captured_build_contexts == [
         {
             path: builder._read_project_input(path, max_bytes=limit)
@@ -1009,6 +1048,23 @@ def test_generated_docker_builder_snapshots_declared_uv_projects(
     )
     # The Dockerfile never changes with the declared projects.
     assert (project / "Dockerfile.coding").read_bytes() == dockerfile
+    # With the generated Dockerfile every pyproject.toml it installs from is
+    # recorded by what uv sync reads; an edited Dockerfile could read more.
+    configuration = json.loads(snapshot["docker-coding-build.json"])
+
+    def scopes(context: dict[str, bytes]) -> dict[str, str]:
+        return {
+            item["path"]: item.get("digest_scope", "file")
+            for item in builder._recorded_dependency_inputs(context, configuration)
+            if item["path"].endswith("pyproject.toml")
+        }
+
+    assert scopes(snapshot) == {
+        "pyproject.toml": "pyproject_environment",
+        "targets/service/pyproject.toml": "pyproject_environment",
+    }
+    edited = {**snapshot, "Dockerfile.coding": dockerfile + b"RUN true\n"}
+    assert scopes(edited) == {"pyproject.toml": "file", "targets/service/pyproject.toml": "file"}
 
     (target / "uv.lock").unlink()
     with pytest.raises(RuntimeError, match=r"build input 'targets/service/uv\.lock'"):

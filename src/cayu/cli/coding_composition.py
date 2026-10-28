@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from hashlib import sha256
 
 from cayu.cli.scaffold_plan import ApplicationPlan
 
@@ -2698,6 +2699,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from pathlib import PurePosixPath
 
+from cayu.environments import CodingDependencyInput
+
 _ROOT = Path(__file__).resolve().parent
 _BUILD_CONFIG = _ROOT / "docker-coding-build.json"
 _IMAGE_CONFIG = _ROOT / "docker-coding-image.json"
@@ -2719,6 +2722,9 @@ _BASE_BUILD_CONTEXT_INPUT_LIMITS = {
     "uv.lock": 64 * 1024 * 1024,
 }
 _EXTRA_INPUT_MAX_BYTES = 16 * 1024 * 1024
+# The Dockerfile.coding `cayu new` wrote. Only it is known to read a
+# pyproject.toml just for uv sync.
+_GENERATED_DOCKERFILE_SHA256 = "__GENERATED_DOCKERFILE_SHA256__"
 # The most a runtime dependency check reads of one input.
 _DEPENDENCY_INPUT_MAX_BYTES = 16 * 1024 * 1024
 _WHEEL_MAX_BYTES = 64 * 1024 * 1024
@@ -3031,6 +3037,49 @@ def _trusted_build_context_inputs(snapshot: dict[str, bytes]) -> list[dict[str, 
             "path": path,
             "content_sha256": "sha256:" + hashlib.sha256(snapshot[path]).hexdigest(),
         }
+        for path in sorted(snapshot)
+    ]
+
+
+def _recorded_dependency_inputs(
+    snapshot: dict[str, bytes], configuration: dict
+) -> list[dict]:
+    """The inputs the app checks before every session, as the receipt records them.
+
+    The generated Dockerfile.coding reads each pyproject.toml only to install
+    the locked environment (uv sync --frozen); checks read the workspace copy.
+    So while Dockerfile.coding is the generated one, a pyproject.toml is
+    recorded by the parts uv sync uses, and a tool setting such as a pytest
+    marker doesn't make the image stale. An edited Dockerfile.coding may read
+    anything in it, so then every input, like all the others always, is
+    recorded by its exact bytes.
+    """
+
+    limits = _build_context_input_limits(snapshot["docker-coding-build.json"])
+    generated_dockerfile = (
+        "sha256:" + hashlib.sha256(snapshot["Dockerfile.coding"]).hexdigest()
+        == _GENERATED_DOCKERFILE_SHA256
+    )
+    environment_files = (
+        {
+            "pyproject.toml",
+            *(
+                f"{project['path']}/pyproject.toml"
+                for project in configuration.get("extra_uv_projects", [])
+            ),
+        }
+        if generated_dockerfile
+        else set()
+    )
+    return [
+        CodingDependencyInput.from_content(
+            path,
+            snapshot[path],
+            digest_scope=(
+                "pyproject_environment" if path in environment_files else "file"
+            ),
+            max_bytes=min(limits[path], _DEPENDENCY_INPUT_MAX_BYTES),
+        ).model_dump(mode="json")
         for path in sorted(snapshot)
     ]
 
@@ -3353,9 +3402,6 @@ def main() -> int:
         raise RuntimeError(
             "Docker coding image tag changed before immutable image settlement"
         )
-    limits = _build_context_input_limits(
-        build_context_snapshot["docker-coding-build.json"]
-    )
     _IMAGE_CONFIG.write_text(
         json.dumps(
             {
@@ -3368,15 +3414,9 @@ def main() -> int:
                 # The reviewed wheel is a protected build input, not a runtime
                 # workspace dependency. Its path and digest remain pinned in
                 # docker-coding-build.json and the complete context fingerprint.
-                "dependency_inputs": [
-                    {
-                        **entry,
-                        "max_bytes": min(
-                            limits[entry["path"]], _DEPENDENCY_INPUT_MAX_BYTES
-                        ),
-                    }
-                    for entry in _trusted_build_context_inputs(build_context_snapshot)
-                ],
+                "dependency_inputs": _recorded_dependency_inputs(
+                    build_context_snapshot, configuration
+                ),
                 "trusted_build_context_sha256": _trusted_build_context_sha256(
                     trusted_input_snapshot
                 ),
@@ -3403,6 +3443,8 @@ _DOCKER_IMAGE_CONFIGURATION = _PROJECT_ROOT / "docker-coding-image.json"
 _DOCKER_BUILD_CONFIGURATION = _PROJECT_ROOT / "docker-coding-build.json"
 _DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _PYTHON_TOOLCHAIN_PROFILE_ID = "__PROJECT_NAME__-python"
+# What a stale-image error tells the operator to run.
+_REBUILD_COMMAND = "uv run --no-sync python build_coding_image.py"
 # The build inputs every image records. docker-coding-build.json adds any
 # extra_build_inputs (for example a target repository's lock file); the image
 # receipt must then record exactly this set plus those.
@@ -3672,14 +3714,16 @@ def read_coding_image_receipt() -> CodingImageReceipt:
     if tuple(item.path for item in dependency_inputs) != required_paths:
         raise RuntimeError(
             "docker-coding-image.json does not record exactly the build inputs "
-            "docker-coding-build.json declares; rebuild the image"
+            "docker-coding-build.json declares; rebuild the image with "
+            f"`{_REBUILD_COMMAND}`"
         )
     recorded_build = next(
         item for item in dependency_inputs if item.path == "docker-coding-build.json"
     )
     if recorded_build.content_sha256 != "sha256:" + sha256(build_raw).hexdigest():
         raise RuntimeError(
-            "docker-coding-build.json changed after the image was built; rebuild the image"
+            "docker-coding-build.json changed after the image was built; rebuild the "
+            f"image with `{_REBUILD_COMMAND}`"
         )
     return CodingImageReceipt(
         image_identity=DockerImageIdentity(reference=reference, content_digest=digest),
@@ -3799,6 +3843,7 @@ def _python_toolchain_profile(receipt: CodingImageReceipt) -> CodingToolchainPro
         ),
         dependency_inputs=receipt.dependency_inputs,
         trusted_build_context_sha256=receipt.trusted_build_context_sha256,
+        rebuild_command=_REBUILD_COMMAND,
         admission_probes=(
             CodingAdmissionProbe(
                 probe_id="python-version",
@@ -4278,6 +4323,18 @@ executables the image must then contain in `extra_probe_executables`. The
 builder snapshots exactly those inputs, the receipt records them, and the app
 requires the receipt to match `docker-coding-build.json`.
 
+Before each session the app checks the workspace against the receipt. Every
+input counts by its exact bytes except `pyproject.toml`, which counts only by
+what `uv sync` installs from: the `[project]` name, `requires-python`,
+dependencies, optional dependencies and `dynamic`, and the `[build-system]`,
+`[dependency-groups]` and `[tool.uv]` tables. Tool settings such as
+`[tool.pytest.ini_options]` or `[tool.ruff]` come from the workspace copy and
+don't make the image stale. That holds only while `Dockerfile.coding` is the
+generated file: once you edit it, a build step could read anything in
+`pyproject.toml`, so the builder records it by its exact bytes too. When an
+input did change, the session fails with an error that names it and says to
+rebuild with `uv run --no-sync python build_coding_image.py`.
+
 When the agent works on a target project inside this repository that has its
 own `pyproject.toml` and `uv.lock`, declare it in `extra_uv_projects` instead of
 editing `Dockerfile.coding` (Cayu Cloud builds only the unmodified file):
@@ -4291,7 +4348,8 @@ editing `Dockerfile.coding` (Cayu Cloud builds only the unmodified file):
 `.runtime`); its last component names the target and must be unique. Its
 `pyproject.toml` (at most 1 MiB) and `uv.lock` (at most 64 MiB) become build
 inputs, recorded in `docker-coding-image.json` and in
-`trusted_build_context_sha256`, so editing either requires a rebuild. The fixed
+`trusted_build_context_sha256`, so changing either requires a rebuild (for the
+`pyproject.toml`, only a change to what it installs). The fixed
 `Dockerfile.coding` step copies them to `/opt/targets/<name>/` and runs
 `uv sync --frozen --no-install-project [--extra EXTRA ...] --python
 /usr/local/bin/python` there with `UV_PROJECT_ENVIRONMENT=/opt/targets/<name>/.venv`.
@@ -4859,6 +4917,7 @@ def test_image_receipt_requires_the_build_inputs_its_build_config_declares(
     profile = composition._python_toolchain_profile(recorded)
     assert [item.path for item in profile.dependency_inputs] == paths
     assert profile.revision == build["profile_revision"]
+    assert profile.rebuild_command == "uv run --no-sync python build_coding_image.py"
     assert profile.platform_architecture is None
 
     receipt_path.write_text(json.dumps({**receipt, "schema_version": "3"}), encoding="utf-8")
@@ -6957,7 +7016,10 @@ def coding_project_files(
                 "Dockerfile.coding": _DOCKERFILE,
                 "docker-coding-build.json": coding_render(_DOCKER_BUILD_CONFIG),
                 "docker-coding-image.json": coding_render(_DOCKER_IMAGE_CONFIG),
-                "build_coding_image.py": coding_render(_DOCKER_BUILD_IMAGE_PY),
+                "build_coding_image.py": coding_render(_DOCKER_BUILD_IMAGE_PY).replace(
+                    "__GENERATED_DOCKERFILE_SHA256__",
+                    "sha256:" + sha256(_DOCKERFILE.encode("utf-8")).hexdigest(),
+                ),
                 "app.py": _docker_coding_app_source(files["app.py"]),
                 "operations/coding.py": coding_render(_docker_composition_source(_COMPOSITION_PY)),
                 "domain/coding_product.py": _CODING_PRODUCT_DOMAIN_PY,

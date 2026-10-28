@@ -38,6 +38,7 @@ from pydantic import (
 
 from cayu._command_diagnostics import CommandDenialCode, CommandValidationError
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
+from cayu.environments._pyproject_environment import pyproject_environment_sha256
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionRequirements,
@@ -67,6 +68,12 @@ _SHELL_CONTROL_CHARACTERS = frozenset("|&;<>()`$\n\r\0")
 _MODEL_CONTROL_CHARACTERS = _SHELL_CONTROL_CHARACTERS | frozenset("*?{}~'\"")
 _PROTECTED_PATH_PARTS = frozenset({".cayu", ".git", ".runtime"})
 _CANDIDATE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
+#: What a dependency input's digest covers; see :class:`CodingDependencyInput`.
+CodingDependencyDigestScope = Literal["file", "pyproject_environment"]
+# The stale-dependency message names at most this many inputs; longer or
+# unprintable paths are only counted.
+_MESSAGE_MAX_NAMED_PATHS = 5
+_MESSAGE_MAX_PATH_CHARS = 200
 #: Every coding profile prohibits these; "network" stays mandatory until a
 #: backend can host a profile with brokered egress.
 REQUIRED_PROHIBITED_CAPABILITIES = frozenset(
@@ -119,7 +126,16 @@ class CodingToolchainError(RuntimeError):
 
 
 class CodingDependencyInput(BaseModel):
-    """One source input whose exact bytes determine toolchain freshness."""
+    """One source input whose content determines toolchain freshness.
+
+    ``digest_scope`` says what ``content_sha256`` covers. ``"file"`` (the
+    default) is the exact bytes. ``"pyproject_environment"`` is only the parts
+    of a ``pyproject.toml`` a ``uv sync`` installs from: ``[project]`` name,
+    ``requires-python``, dependencies, optional dependencies and ``dynamic``,
+    plus ``[build-system]``, ``[dependency-groups]`` and ``[tool.uv]``. Use it
+    when the toolchain reads the file only to install the environment, so a
+    tool setting such as a pytest marker doesn't make the toolchain stale.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
@@ -130,11 +146,61 @@ class CodingDependencyInput(BaseModel):
         ge=1,
         le=MAX_CODING_DEPENDENCY_INPUT_BYTES,
     )
+    # Left out of dumps at its default, so profiles recorded before the field
+    # existed keep their fingerprints.
+    digest_scope: CodingDependencyDigestScope = Field(
+        default="file",
+        exclude_if=lambda value: value == "file",
+    )
 
     @field_validator("path")
     @classmethod
     def validate_path(cls, value: str) -> str:
         return _workspace_relative_path(value, field_name="path", allow_root=False)
+
+    @model_validator(mode="after")
+    def validate_digest_scope(self) -> CodingDependencyInput:
+        if (
+            self.digest_scope == "pyproject_environment"
+            and PurePosixPath(self.path).name != "pyproject.toml"
+        ):
+            raise ValueError("The pyproject_environment digest scope needs a pyproject.toml path.")
+        return self
+
+    @classmethod
+    def from_content(
+        cls,
+        path: str,
+        content: bytes,
+        *,
+        digest_scope: CodingDependencyDigestScope = "file",
+        max_bytes: int = MAX_CODING_DEPENDENCY_INPUT_BYTES,
+    ) -> CodingDependencyInput:
+        """Record ``content`` as it is now, under ``digest_scope``.
+
+        Raises ``ValueError`` when a ``pyproject_environment`` input is not
+        valid TOML.
+        """
+
+        if type(content) is not bytes:
+            raise TypeError("content must be bytes.")
+        if len(content) > max_bytes:
+            raise ValueError(f"Dependency input {path!r} exceeds its {max_bytes}-byte limit.")
+        if digest_scope == "pyproject_environment":
+            digest = pyproject_environment_sha256(content)
+        else:
+            digest = "sha256:" + sha256(content).hexdigest()
+        return cls(path=path, content_sha256=digest, max_bytes=max_bytes, digest_scope=digest_scope)
+
+    def matches(self, content: bytes) -> bool:
+        """Whether ``content`` still has the recorded digest under this input's scope."""
+
+        if self.digest_scope == "file":
+            return "sha256:" + sha256(content).hexdigest() == self.content_sha256
+        try:
+            return pyproject_environment_sha256(content) == self.content_sha256
+        except ValueError:
+            return False
 
 
 class CodingFixedEnvironmentVariable(BaseModel):
@@ -583,6 +649,14 @@ class CodingToolchainProfile(BaseModel):
         pattern=r"^sha256:[0-9a-f]{64}$",
     )
     application_dependency_identity: str | None = Field(default=None, max_length=256)
+    #: The command a stale-dependency error tells the operator to run, for
+    #: example ``uv run --no-sync python build_coding_image.py``. It is guidance,
+    #: not authority: it is left out of the fingerprint.
+    rebuild_command: str | None = Field(
+        default=None,
+        max_length=256,
+        exclude_if=lambda value: value is None,
+    )
     admission_probes: tuple[CodingAdmissionProbe, ...] = Field(
         default_factory=tuple,
         max_length=MAX_CODING_PROFILE_PROBES,
@@ -724,9 +798,22 @@ class CodingToolchainProfile(BaseModel):
                     "authority declares."
                 )
 
+    @field_validator("rebuild_command")
+    @classmethod
+    def validate_rebuild_command(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = require_durable_clean_nonblank(value, "rebuild_command")
+        if not value.isprintable() or "`" in value:
+            raise ValueError("rebuild_command must be one printable line without backticks.")
+        return value
+
     @property
     def fingerprint(self) -> str:
-        return _fingerprint(self.model_dump(mode="json", by_alias=True), "toolchain_profile")
+        return _fingerprint(
+            self.model_dump(mode="json", by_alias=True, exclude={"rebuild_command"}),
+            "toolchain_profile",
+        )
 
     @property
     def dependency_identity(self) -> str:
@@ -1149,8 +1236,7 @@ async def verify_coding_toolchain_dependencies(
         ):
             unavailable.append(dependency.path)
             continue
-        observed = "sha256:" + sha256(content).hexdigest()
-        if observed != dependency.content_sha256:
+        if not dependency.matches(content):
             changed.append(dependency.path)
     _raise_dependency_failure(owned, unavailable=unavailable, changed=changed)
 
@@ -1191,7 +1277,7 @@ def verify_local_coding_toolchain_dependencies(
             except OSError:
                 unavailable.append(dependency.path)
                 continue
-            if "sha256:" + sha256(content).hexdigest() != dependency.content_sha256:
+            if not dependency.matches(content):
                 changed.append(dependency.path)
     finally:
         os.close(root_fd)
@@ -1210,15 +1296,36 @@ def _raise_dependency_failure(
             "dependency_inputs_unavailable",
             f"Toolchain dependency inputs could not be verified ({len(unavailable)} of "
             f"{len(profile.dependency_inputs)} declared inputs are missing or unreadable in "
-            "the workspace).",
+            f"the workspace{_named_paths(unavailable)}).",
             paths=tuple(unavailable),
         )
     if changed:
+        remedy = (
+            "a new admitted profile or build is required"
+            if profile.rebuild_command is None
+            else f"rebuild the toolchain with `{profile.rebuild_command}`"
+        )
         raise error_type(
             "dependency_inputs_changed",
-            "Toolchain dependency inputs changed; a new admitted profile or build is required.",
+            f"Toolchain dependency inputs changed since the toolchain was built "
+            f"({len(changed)} of {len(profile.dependency_inputs)} declared inputs"
+            f"{_named_paths(changed)}); {remedy}.",
             paths=tuple(changed),
         )
+
+
+def _named_paths(paths: list[str]) -> str:
+    """``": a, b and 2 more"`` for the declared inputs a message may name."""
+
+    named = [
+        path
+        for path in paths
+        if len(path) <= _MESSAGE_MAX_PATH_CHARS and path.isprintable() and "`" not in path
+    ][:_MESSAGE_MAX_NAMED_PATHS]
+    if not named:
+        return ""
+    remaining = len(paths) - len(named)
+    return ": " + ", ".join(named) + (f" and {remaining} more" if remaining else "")
 
 
 def _read_local_dependency_input(
