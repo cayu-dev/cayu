@@ -119,7 +119,7 @@ from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks._event_budget_warnings import EventBudgetCheck, with_event_budget_expiry
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._group_maintenance import TaskGroupMaintenance
-from cayu.tasks._schedule_wakeup import next_schedule_wake_at
+from cayu.tasks._schedule_wakeup import next_schedule_wake_at, observe_schedule_wakeup
 from cayu.tasks._terminalization import (
     _terminalize_claimed_task,
     _terminalize_claimed_task_or_detect_peer_winner,
@@ -174,10 +174,12 @@ from cayu.tasks.terminalization import (
     TaskTerminalizationRequest,
     TaskTerminalKind,
 )
+from cayu.tasks.until_idle import _take_until_idle_state
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.tasks.retry_budgets import TaskRetryKeyState
+    from cayu.tasks.scheduling import TaskScheduleWakeup
 
 
 class TaskHandlerOutcome(StrEnum):
@@ -213,6 +215,7 @@ _INTERRUPTED_HANDOFF_MAX_ATTEMPTS = 3
 _INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS = 0.05
 _INTERRUPTED_HANDOFF_MAX_BACKOFF_SECONDS = 1.0
 _INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE = 10
+_RECLAIM_BATCH_SIZE = 100
 _INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS = 30.0
 _DEFAULT_MAX_UNPRODUCTIVE_INTERRUPTED_HANDOFFS = 8
 _UNPRODUCTIVE_CONTINUATION_INITIAL_BACKOFF_SECONDS = 1.0
@@ -543,7 +546,8 @@ async def run_task_worker(
       if the process exits first, the task needs
       ``reconcile_abandoned_task_cancellation``.
     - ``max_tasks`` bounds the total handled across all slots, including recovered
-      continuations and contracted-task parking (useful for one-shot drains).
+      continuations and contracted-task parking. To return once nothing is
+      claimable, use :func:`cayu.tasks.run_task_worker_until_idle`.
     - ``concurrency`` is the positive number of independently heartbeated handler
       slots; it defaults to one. Handler failures are isolated. Setting ``stop``
       stops new claims and drains active handlers; cancelling this coroutine
@@ -580,6 +584,9 @@ async def run_task_worker(
       whose event budget is shorter than ``execution_timeout_s``, it logs a
       warning once per task type; the budget still applies.
     """
+    until_idle = _take_until_idle_state()
+    if until_idle is not None and recovered_interrupted_task_handler is None:
+        until_idle.continuations_scanned = True
     if type(concurrency) is not int or concurrency < 1:
         raise ValueError("concurrency must be a positive int.")
     if lease_seconds <= 0:
@@ -719,7 +726,15 @@ async def run_task_worker(
         if metrics is not None:
             poller.set_metrics(metrics)
         reclaim_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
+        reclaim_backlog = False
         fenced_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
+
+        def until_idle_skips_scan() -> bool:
+            # An until-idle run scans once, in one slot: a session waiting on
+            # a person would otherwise be continued again after every task.
+            return until_idle is not None and (
+                not owns_maintenance or until_idle.continuations_scanned
+            )
 
         async def scan_fenced_tasks() -> bool:
             assert fenced_monitor is not None
@@ -731,10 +746,13 @@ async def run_task_worker(
                 )
                 return False
 
-        async def reclaim_expired_tasks() -> bool:
+        # An until-idle run names the bound so it can tell when one call left more.
+        reclaim_bound = {"max_reclaims": _RECLAIM_BATCH_SIZE} if until_idle is not None else {}
+
+        async def reclaim_expired_tasks() -> int:
             if materialized_work_contract_queue_supported:
                 reclaim_outcome = await capture_task_store_operation(
-                    lambda: task_store.reclaim_expired(query=query),
+                    lambda: task_store.reclaim_expired(query=query, **reclaim_bound),
                     operation_name="Expired task-claim reclamation",
                     redactor=app._secret_redactor,
                     mutation_store=task_store,
@@ -746,9 +764,9 @@ async def run_task_worker(
                     raise_task_store_operation_failure(failure)
                 reclaimed = reclaim_outcome.result
                 del reclaim_outcome
-                return bool(reclaimed)
+                return 0 if reclaimed is None else len(reclaimed)
             else:
-                return bool(await task_store.reclaim_expired(query=query))
+                return len(await task_store.reclaim_expired(query=query, **reclaim_bound))
 
         async def run_step(_now: float, handled: int) -> DurableWorkerStep:
             nonlocal expired_handoff_after
@@ -758,6 +776,7 @@ async def run_task_worker(
             nonlocal continuation_scan_filtered
             nonlocal next_interrupted_handoff_recovery_at
             nonlocal next_interrupted_continuation_scan_at
+            nonlocal reclaim_backlog
 
             loop = asyncio.get_running_loop()
             meaningful_activity = False
@@ -778,6 +797,11 @@ async def run_task_worker(
                 if recovery_page.recovered:
                     meaningful_activity = True
                     next_interrupted_continuation_scan_at = 0.0
+                    if until_idle is not None and recovered_interrupted_task_handler is not None:
+                        # Recovery follows lease expiry and the scan creation
+                        # time, so a recovered task may sort behind the cursor.
+                        continuation_after = None
+                        until_idle.continuations_scanned = False
                 if recovery_page.exhausted:
                     expired_handoff_after = None
                     next_interrupted_handoff_recovery_at = (
@@ -792,6 +816,7 @@ async def run_task_worker(
             handled_this_step = 0
             if (
                 recovered_interrupted_task_handler is not None
+                and not until_idle_skips_scan()
                 and loop.time() >= next_interrupted_continuation_scan_at
             ):
                 continuation_page = await _run_recovered_interrupted_task_handler(
@@ -824,6 +849,8 @@ async def run_task_worker(
                             continuation_scan_scanned,
                         )
                     continuation_after = None
+                    if until_idle is not None:
+                        until_idle.continuations_scanned = True
                     continuation_scan_scanned = 0
                     continuation_scan_rejected = 0
                     continuation_scan_filtered = 0
@@ -860,6 +887,10 @@ async def run_task_worker(
                 )
                 if reclaim_ran:
                     poller.metrics.maintenance(reclaim=True)
+                    # A full batch may leave more; an until-idle run reclaims them first.
+                    reclaim_backlog = bool(reclaimed) and reclaimed >= _RECLAIM_BATCH_SIZE
+                    if until_idle is not None and reclaim_backlog:
+                        reclaim_cadence.expedite()
                 meaningful_activity = meaningful_activity or bool(reclaimed)
             if owns_maintenance and fenced_monitor is not None:
                 _, settled_fenced = await fenced_cadence.run_if_due(
@@ -868,12 +899,25 @@ async def run_task_worker(
                     clock=loop.time,
                 )
                 meaningful_activity = meaningful_activity or bool(settled_fenced)
+            if (
+                until_idle is not None
+                and owns_maintenance
+                and expired_handoff_after is None
+                and not reclaim_backlog
+            ):
+                until_idle.maintenance_settled = True
+            observation: TaskScheduleWakeup | None = None
+            observed_after_steps = 0
 
             async def prepare_claim() -> None:
+                nonlocal observation, observed_after_steps
                 # Maintenance is a database poll too. Only the admitted worker may
                 # scan; otherwise an idle cohort fans out before claim admission.
                 await group_maintenance.step(task_store, app._secret_redactor, now=loop.time())
                 await reconcile_task_event_deadlines(task_store)
+                if until_idle is not None:
+                    observed_after_steps = until_idle.handled_steps
+                    observation = await observe_schedule_wakeup(task_store, query)
 
             async def claim_next_task() -> Task | None:
                 if materialized_work_contract_queue_supported:
@@ -911,6 +955,19 @@ async def run_task_worker(
             # handling so detached failures cannot retain a second task reference.
             del claim
             if task is None:
+                if until_idle is not None and poller.last_attempted and until_idle.may_return():
+                    if until_idle.claim_again(observation, observed_after_steps):
+                        return DurableWorkerStep(
+                            handled=handled_this_step,
+                            continue_immediately=True,
+                            activity=meaningful_activity,
+                        )
+                    infrastructure_stop.set()
+                    return DurableWorkerStep(
+                        handled=handled_this_step,
+                        stop=True,
+                        activity=meaningful_activity,
+                    )
                 if continuation_activity and continuation_after is not None:
                     return DurableWorkerStep(
                         handled=handled_this_step,
@@ -925,7 +982,11 @@ async def run_task_worker(
                     if poller.last_attempted
                     else None
                 )
-                if recovered_interrupted_task_handler is not None and continuation_after is None:
+                if (
+                    recovered_interrupted_task_handler is not None
+                    and not until_idle_skips_scan()
+                    and continuation_after is None
+                ):
                     wake_deadlines.append(next_interrupted_continuation_scan_at)
                 if (
                     owns_maintenance
@@ -1001,6 +1062,9 @@ async def run_task_worker(
             finally:
                 poller.metrics.handler_finished()
             next_interrupted_continuation_scan_at = 0.0
+            if until_idle is not None and recovered_interrupted_task_handler is not None:
+                # The handler may have handed off its session for continuation.
+                until_idle.continuations_pending = True
             return DurableWorkerStep(
                 handled=handled_this_step + 1,
                 continue_immediately=True,
@@ -1025,6 +1089,8 @@ async def run_task_worker(
                     poller.defer_step()
                     return DurableWorkerStep(stop=budget.exhausted, idle=not budget.exhausted)
                 completed = 0
+                if until_idle is not None:
+                    until_idle.steps_running += 1
                 try:
                     result = await app._run_worker_step(lambda: run_step(now, handled))
                     completed = result.handled
@@ -1032,6 +1098,10 @@ async def run_task_worker(
                 finally:
                     if budget is not None:
                         budget.settle(completed)
+                    if until_idle is not None:
+                        until_idle.steps_running -= 1
+                        if completed:
+                            until_idle.handled_steps += 1
 
             return await run_durable_worker_loop(
                 counted_step,

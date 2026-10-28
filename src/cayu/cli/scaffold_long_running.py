@@ -317,7 +317,8 @@ Each pending approval or question gets two one-shot tasks in the task store: a
 reminder and a deadline. The store, not this process, decides when a task is
 due, so timers survive restarts and missed polls. The same worker also
 recovers sessions whose process died mid-run and continues them. Run it with
-`uv run --no-sync cayu worker timers`.
+`uv run --no-sync cayu worker timers`, or with `--until-idle` to run the timers
+that are due and exit, printing when the next one is due.
 """
 
 from __future__ import annotations
@@ -350,8 +351,11 @@ from cayu.tasks import (
     TaskCreate,
     TaskQuery,
     TaskSchedulePolicy,
+    TaskWorkerIdleResult,
     complete_managed_task,
     run_task_worker,
+    run_task_worker_until_idle,
+    worker_until_idle_requested,
 )
 
 from agents.agent import AGENT
@@ -599,39 +603,56 @@ def _timer_actor() -> ResolutionActor:
     return ResolutionActor(subject="timers", source=ResolutionActorSource.SYSTEM)
 
 
-async def run_timer_worker(app: CayuApp, stop: asyncio.Event) -> None:
-    """`cayu worker timers`: schedule timers, run due ones, continue stalled sessions."""
+async def run_timer_worker(
+    app: CayuApp, stop: asyncio.Event
+) -> TaskWorkerIdleResult | None:
+    """`cayu worker timers`: schedule timers, run due ones, continue stalled sessions.
 
-    async def sweep() -> None:
+    With `--until-idle` it sweeps once, runs the timers that are due and returns
+    when none is left. Timers exist only for pauses a sweep or a timer has seen,
+    and only a sweep continues stalled sessions, so a host that starts it this
+    way must also start it after a session pauses and ABANDONED_AFTER after a
+    session stops making progress, not only at the time it prints.
+    """
+
+    async def sweep_once() -> None:
         # Pauses happen in any process (the server, run.py, a worker), so find
         # them here instead of relying on every caller to schedule timers.
+        try:
+            await continue_abandoned_sessions(app)
+        except Exception:
+            logger.exception(
+                "Continuing abandoned sessions failed; retrying next sweep."
+            )
+        await schedule_timers(app)
+
+    async def sweep() -> None:
         while not stop.is_set():
-            try:
-                await continue_abandoned_sessions(app)
-            except Exception:
-                logger.exception(
-                    "Continuing abandoned sessions failed; retrying next sweep."
-                )
-            await schedule_timers(app)
+            await sweep_once()
             with suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), SWEEP_INTERVAL_S)
 
-    assert app.task_store is not None
+    def timers(run):
+        assert app.task_store is not None
+        return run(
+            app,
+            app.task_store,
+            handle_timer,
+            worker_id=f"timers-{socket.gethostname()}-{os.getpid()}",
+            query=TaskQuery(type=TIMER_TASK_TYPE),
+            recover_interrupted_handoffs=False,
+            # Continuations follow the session deadline, without a timer-task cap.
+            execution_timeout_s=None,
+            stop=stop,
+        )
+
+    if worker_until_idle_requested():
+        await sweep_once()
+        return await timers(run_task_worker_until_idle)
     async with asyncio.TaskGroup() as group:
         group.create_task(sweep())
-        group.create_task(
-            run_task_worker(
-                app,
-                app.task_store,
-                handle_timer,
-                worker_id=f"timers-{socket.gethostname()}-{os.getpid()}",
-                query=TaskQuery(type=TIMER_TASK_TYPE),
-                recover_interrupted_handoffs=False,
-                # Continuations follow the session deadline, without a timer-task cap.
-                execution_timeout_s=None,
-                stop=stop,
-            )
-        )
+        group.create_task(timers(run_task_worker))
+    return None
 '''
 
 _TEST_RESTART_PY = '''"""Each pause point survives a process restart.
@@ -1222,6 +1243,10 @@ own module; keep, replace, or delete them separately. The one-page reference is
   finds open approvals and questions itself, whichever process paused them, and
   uses `recover_abandoned_sessions` to continue sessions whose process died
   mid-turn (`ABANDONED_AFTER` in `operations/timers.py`).
+- `cayu worker timers --until-idle` runs the due timers once and exits. It
+  creates timers only for pauses it sees when it starts, so whatever starts it
+  must also start it after a session pauses and `ABANDONED_AFTER` after one
+  stalls, not only at the `next_available_at` it prints.
 """
 
 

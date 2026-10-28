@@ -10,6 +10,10 @@ from cayu.tasks.scheduling import TaskScheduleWakeup
 from cayu.tasks.store import TaskStore
 
 
+async def observe_schedule_wakeup(store: TaskStore, query: TaskQuery | None) -> TaskScheduleWakeup:
+    return revalidate_model_input(await store.next_task_schedule_wakeup(query), TaskScheduleWakeup)
+
+
 async def next_schedule_wake_at(
     store: TaskStore, queries: tuple[TaskQuery | None, ...]
 ) -> float | None:
@@ -17,9 +21,7 @@ async def next_schedule_wake_at(
         return None
     deadline: float | None = None
     for query in queries:
-        observation = revalidate_model_input(
-            await store.next_task_schedule_wakeup(query), TaskScheduleWakeup
-        )
+        observation = await observe_schedule_wakeup(store, query)
         # The store samples as_of during the awaited read, not before it.
         # Anchoring to request start can schedule an early claim under latency;
         # the following observation may then miss a deadline crossed in flight.

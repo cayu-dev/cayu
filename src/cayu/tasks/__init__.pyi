@@ -293,6 +293,9 @@ from cayu.tasks.topology import (
     TaskTopologyTraversalLimitExceeded as TaskTopologyTraversalLimitExceeded,
 )
 from cayu.tasks.types import TaskTypeSpec as TaskTypeSpec
+from cayu.tasks.until_idle import TaskWorkerIdleResult as TaskWorkerIdleResult
+from cayu.tasks.until_idle import run_task_worker_until_idle as run_task_worker_until_idle
+from cayu.tasks.until_idle import worker_until_idle_requested as worker_until_idle_requested
 from cayu.tasks.work_receipts import (
     CompletionDecisionApplicationReceipt as CompletionDecisionApplicationReceipt,
 )

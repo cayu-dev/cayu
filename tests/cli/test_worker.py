@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -704,3 +705,160 @@ once = "app:run_once"
 
     assert main(["worker", "once", "--processes", "2"]) == 1
     assert "can't be combined with --processes" in capsys.readouterr().err
+
+
+_UNTIL_IDLE_PROJECT = """from datetime import UTC, datetime
+from pathlib import Path
+
+from cayu import CayuApp
+from cayu.tasks import (
+    InMemoryTaskStore,
+    TaskCreate,
+    TaskQuery,
+    TaskSchedulePolicy,
+    complete_managed_task,
+    run_task_worker_until_idle,
+    worker_until_idle_requested,
+)
+
+LATER = datetime(2099, 1, 1, tzinfo=UTC)
+
+
+class CloseLogger:
+    async def close(self):
+        print("app closed", flush=True)
+
+
+def build_app():
+    return CayuApp(
+        task_store=InMemoryTaskStore(),
+        enable_logging=False,
+        owned_resources=(CloseLogger(),),
+    )
+
+
+async def handle(app, task, worker_id):
+    with Path("handled.txt").open("a", encoding="utf-8") as log:
+        log.write(f"{task.id}\\n")
+    await complete_managed_task(app.task_store, task, worker_id, {"ok": True})
+
+
+async def run_jobs(app, stop):
+    for task_id in ("due-1", "due-2"):
+        await app.create_task(TaskCreate(task_id=task_id, type="job"))
+    await app.create_task(
+        TaskCreate(
+            task_id="later",
+            type="job",
+            available_at=LATER,
+            schedule_policy=TaskSchedulePolicy(),
+        )
+    )
+    if worker_until_idle_requested():
+        return await run_task_worker_until_idle(
+            app,
+            app.task_store,
+            handle,
+            worker_id="jobs",
+            query=TaskQuery(type="job"),
+            poll_interval_s=60,
+            stop=stop,
+        )
+    Path("ran-without-flag.txt").write_text("ran\\n", encoding="utf-8")
+"""
+
+
+def _until_idle_project(tmp_path: Path, monkeypatch) -> Path:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        """[tool.cayu]
+factory = "until_idle_jobs:build_app"
+
+[tool.cayu.workers]
+jobs = "until_idle_jobs:run_jobs"
+""",
+        encoding="utf-8",
+    )
+    (project / "until_idle_jobs.py").write_text(_UNTIL_IDLE_PROJECT, encoding="utf-8")
+    monkeypatch.chdir(project)
+    sys.modules.pop("until_idle_jobs", None)
+    return project
+
+
+def test_worker_until_idle_runs_due_tasks_and_prints_the_next_wake(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    project = _until_idle_project(tmp_path, monkeypatch)
+
+    assert main(["worker", "jobs", "--until-idle"]) == 0
+
+    output = capsys.readouterr().out.splitlines()
+    # The result is the last line, printed once the app has closed.
+    assert output[0] == "app closed"
+    assert [json.loads(line) for line in output[1:]] == [
+        {
+            "handled": 2,
+            "idle": True,
+            "next_available_at": "2099-01-01T00:00:00Z",
+            "next_expiry_at": None,
+            "maintenance_required": False,
+            "continuations_pending": False,
+        }
+    ]
+    assert (project / "handled.txt").read_text(encoding="utf-8").split() == ["due-1", "due-2"]
+
+
+def test_worker_without_until_idle_does_not_request_it(tmp_path: Path, monkeypatch, capsys) -> None:
+    project = _until_idle_project(tmp_path, monkeypatch)
+
+    assert main(["worker", "jobs"]) == 0
+
+    assert capsys.readouterr().out == "app closed\n"
+    assert (project / "ran-without-flag.txt").is_file()
+
+
+def test_worker_until_idle_requires_the_entrypoint_to_return_its_result(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """[tool.cayu]
+factory = "ignoring_worker:build_app"
+
+[tool.cayu.workers]
+once = "ignoring_worker:run_once"
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "ignoring_worker.py").write_text(
+        """from cayu import CayuApp
+
+
+def build_app():
+    return CayuApp(enable_logging=False)
+
+
+async def run_once(app, stop):
+    return None
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    sys.modules.pop("ignoring_worker", None)
+
+    assert main(["worker", "once", "--until-idle"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "doesn't support --until-idle" in captured.err
+
+
+def test_worker_refuses_until_idle_with_several_processes(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from cayu.tasks.abandoned import RECONCILE_ABANDONED_AFTER_ENV
+
+    _until_idle_project(tmp_path, monkeypatch)
+    monkeypatch.delenv(RECONCILE_ABANDONED_AFTER_ENV, raising=False)
+
+    assert main(["worker", "jobs", "--until-idle", "--processes", "2"]) == 1
+    assert "--until-idle can't be combined with --processes" in capsys.readouterr().err

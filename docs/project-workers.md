@@ -158,6 +158,89 @@ own worker ID (as in the example above), so a restarted worker doesn't share
 the dead one's ID. Otherwise settle fenced tasks yourself once you know the old
 process exited; see [when a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task).
 
+## Run due tasks and exit
+
+A host that starts the worker only when work is due (cron, a function, a
+platform that wakes the application on a timer) runs it with `--until-idle`:
+
+```bash
+cayu worker fresh --until-idle
+```
+
+The entrypoint learns about the flag from `worker_until_idle_requested()` and
+returns the result of `run_task_worker_until_idle`, which takes the same
+arguments as `run_task_worker`:
+
+```python
+from cayu.tasks import run_task_worker, run_task_worker_until_idle, worker_until_idle_requested
+
+
+async def run_fresh_tasks(app: CayuApp, stop):
+    run = run_task_worker_until_idle if worker_until_idle_requested() else run_task_worker
+    return await run(
+        app,
+        app.task_store,
+        handle_task,
+        worker_id=worker_id("fresh"),
+        query=TaskQuery(type="domain_job"),
+        stop=stop,
+    )
+```
+
+The store must report scheduled task times (`supports_task_scheduling`; every
+built-in store does); otherwise the call fails before claiming anything.
+
+The worker reclaims every expired claim, finishes a whole pass of expired
+interrupted-handoff recovery and, with a `recovered_interrupted_task_handler`,
+one continuation scan, scanning again if recovery hands off more sessions. It
+then handles tasks as usual and returns once a claim finds nothing and no
+handler is running; a handler may create a task that is due at once, so with
+`concurrency` above one, slots wait for each other. `max_tasks` still caps the
+run. The command closes the app, then prints one JSON line and exits `0`; read
+the last line of stdout:
+
+```json
+{"handled":2,"idle":true,"next_available_at":"2027-01-15T12:00:00Z","next_expiry_at":null,"maintenance_required":false,"continuations_pending":false}
+```
+
+Start the worker again at `next_available_at` (a scheduled task becomes
+claimable) or `next_expiry_at` (a scheduled task stops being admissible and a
+worker records it as expired), whichever is earlier. Start it again at once when
+`idle` is false (`max_tasks` or a stop ended the run, so work may still be due),
+`maintenance_required` is true, or `continuations_pending` is true. Both times
+are `null` when nothing is scheduled. They come from the store just before the
+claim that found nothing, so a task that becomes due while the worker exits is
+never missed. They cover only that worker's `query`: with several worker names,
+start each at its own time, or one host timer at the earliest.
+
+The continuation scan runs once per start, in one slot, so a handed-off session
+that waits on a person doesn't keep the worker running or get continued after
+every task. A handled task may hand off its session after that scan, so a run
+that handled a task with a `recovered_interrupted_task_handler` reports
+`continuations_pending`. Nothing else in the result covers work that becomes
+due later without a scheduled time; the host must start the worker for it
+itself:
+
+- tasks created after the run, for example by the web process;
+- a session handed off later, for example when a person answers in the web
+  process, and attached handoffs whose owner's lease is still live;
+- claims of a run that was killed or failed, which expire after
+  `lease_seconds` (300 by default); start the worker again after a non-zero exit;
+- tasks fenced after worker loss, which `reconcile_abandoned_after_s` settles
+  only after a worker has seen them fenced for that long;
+- tasks blocked by a concurrency key or a dependency held by work in another
+  process;
+- event retry deadlines of pending and paused tasks, enforced only while a
+  worker runs.
+
+The persisted event side-effect sweep runs in `cayu serve`, not in a worker.
+
+An entrypoint that returns anything else fails with exit `1` and a message
+naming the flag. `--until-idle` can't be combined with `--processes`; use
+`concurrency` instead. The long-running preset's `cayu worker timers` supports
+it; it creates timers only for pauses it sees when it starts, so also start it
+after a session pauses.
+
 ## Use multiple CPU cores
 
 ```bash

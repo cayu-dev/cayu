@@ -121,6 +121,12 @@ cancelled by the time the caller acts, and the store still decides eligibility
 atomically when a worker claims. Stores that do not support scheduling raise
 `NotImplementedError`.
 
+A host that doesn't keep a worker running calls `run_task_worker_until_idle`
+(or `cayu worker NAME --until-idle`) instead. It handles what is claimable,
+returns once nothing is, and reports the store's `next_available_at` and
+`next_expiry_at` for its query so the host knows when to start it again; see
+[run due tasks and exit](project-workers.md#run-due-tasks-and-exit).
+
 `app.list_task_schedule_events(task_id, after_sequence=0, limit=100)` returns
 task-owned evidence, including before a session is attached. Pages are ordered by
 sequence; pass the last sequence to read the next page. The limit is 1–1,000.

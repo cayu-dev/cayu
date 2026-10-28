@@ -147,7 +147,13 @@ task. Run due tasks with `run_task_worker(app, app.task_store, handler, ...)`.
 The task store, not a process timer, decides when a task is due, so timers
 survive restarts, and `expires_at` drops a reminder that would land after the
 deadline. The handler checks the action and the session's status before acting;
-the preset's `operations/timers.py` runs as `cayu worker timers`.
+the preset's `operations/timers.py` runs as `cayu worker timers`. Where no
+process can stay up, `cayu worker timers --until-idle` runs the due timers, exits
+and prints one JSON line with `next_available_at`, the time to start it again;
+an entrypoint supports the flag by returning `run_task_worker_until_idle(...)`
+when `worker_until_idle_requested()` is true. The preset creates timers in its
+sweep, so a run only sees pauses that exist when it starts: also start the
+worker after a session pauses, and `ABANDONED_AFTER` after one stalls.
 Deep guide: [task scheduling](https://github.com/cayu-dev/cayu/blob/main/docs/task-scheduling.md).
 
 ## Event retry policy

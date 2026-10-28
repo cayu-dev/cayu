@@ -31,6 +31,7 @@ from cayu.runtime._process_workers import (
     watch_supervisor,
 )
 from cayu.tasks.abandoned import RECONCILE_ABANDONED_AFTER_ENV
+from cayu.tasks.until_idle import TaskWorkerIdleResult, _worker_until_idle_requested
 
 # A worker that used its whole grace still lets the app seal and report.
 _MIN_APP_SHUTDOWN_SECONDS = 0.1
@@ -80,6 +81,16 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
             "Off by default; can't be combined with --processes."
         ),
     )
+    parser.add_argument(
+        "--until-idle",
+        action="store_true",
+        help=(
+            "Run the tasks that are due, then exit and print one JSON line with the "
+            "number handled and when work is next due. The entrypoint must return "
+            "run_task_worker_until_idle's result when worker_until_idle_requested() "
+            "is true. Can't be combined with --processes."
+        ),
+    )
 
 
 def run_worker(args: argparse.Namespace) -> int:
@@ -99,6 +110,9 @@ def _run_worker(args: argparse.Namespace) -> int:
                 f"--reconcile-abandoned-after-seconds and {RECONCILE_ABANDONED_AFTER_ENV} "
                 "declare a single worker and can't be combined with --processes."
             )
+        until_idle = getattr(args, "until_idle", False)
+        if processes > 1 and until_idle:
+            raise WorkerError("--until-idle can't be combined with --processes.")
         if reconcile_after is not None:
             # run_task_worker reads it when the worker doesn't pass the option itself.
             os.environ[RECONCILE_ABANDONED_AFTER_ENV] = repr(reconcile_after)
@@ -141,6 +155,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                         app,
                         name=args.name,
                         shutdown_grace_seconds=args.shutdown_grace_seconds,
+                        until_idle=until_idle,
                     )
                 )
             except SystemExit as exc:
@@ -222,6 +237,7 @@ async def _invoke_worker(
     *,
     name: str,
     shutdown_grace_seconds: float,
+    until_idle: bool = False,
 ) -> int:
     stop = asyncio.Event()
     signal_received = asyncio.Event()
@@ -253,15 +269,18 @@ async def _invoke_worker(
             loop_handlers.append(signum)
 
     worker_task: asyncio.Future[Any] | None = None
+    idle_result: TaskWorkerIdleResult | None = None
     signal_wait: asyncio.Task[bool] | None = None
     supervisor_watch = asyncio.create_task(watch_supervisor(request_stop))
     try:
         # A no-op outside Cayu Cloud; close_project_app stops it.
         await app.start_managed_settings(role="worker")
-        result = target(app, stop)
-        if not inspect.isawaitable(result):
-            raise WorkerError(f"Worker {name!r} target must return an awaitable.")
-        worker_task = asyncio.ensure_future(result)
+        # The worker task copies this context when it is created.
+        with _worker_until_idle_requested() if until_idle else contextlib.nullcontext():
+            result = target(app, stop)
+            if not inspect.isawaitable(result):
+                raise WorkerError(f"Worker {name!r} target must return an awaitable.")
+            worker_task = asyncio.ensure_future(result)
         if isinstance(worker_task, asyncio.Task):
             worker_task.set_name(f"cayu-worker-{name}")
         signal_wait = asyncio.create_task(
@@ -273,7 +292,15 @@ async def _invoke_worker(
             return_when=asyncio.FIRST_COMPLETED,
         )
         if worker_task in done and received_signal is None:
-            await worker_task
+            outcome = await worker_task
+            if until_idle:
+                if not isinstance(outcome, TaskWorkerIdleResult):
+                    raise WorkerError(
+                        f"Worker {name!r} doesn't support --until-idle: when "
+                        "worker_until_idle_requested() is true its entrypoint must return "
+                        "the result of run_task_worker_until_idle."
+                    )
+                idle_result = outcome
             return 0
         if received_signal is None:
             raise AssertionError("The signal event was set without a process signal.")
@@ -315,6 +342,9 @@ async def _invoke_worker(
                 )
             ),
         )
+        # Last, so a host can read the final stdout line.
+        if idle_result is not None:
+            print(idle_result.model_dump_json(), flush=True)
 
 
 def _positive_seconds(value: str) -> float:

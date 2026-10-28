@@ -88,6 +88,58 @@ def test_long_running_project_passes_its_own_tests_eval_and_check(tmp_path: Path
     assert json.loads(checked.stdout)["diagnostics"] == []
 
 
+_SEED_TIMERS = """import asyncio
+from datetime import UTC, datetime, timedelta
+
+from cayu.tasks import TaskCreate, TaskSchedulePolicy
+
+from app import build_app
+from operations.timers import TIMER_TASK_TYPE
+
+
+def timer(name, available_at):
+    return TaskCreate(
+        task_id=f"reminder-{name}",
+        type=TIMER_TASK_TYPE,
+        input={"session_id": f"session-{name}", "attention_id": name, "timer": "reminder"},
+        available_at=available_at,
+        schedule_policy=TaskSchedulePolicy(),
+    )
+
+
+async def main():
+    app = build_app()
+    try:
+        await app.create_task(timer("due", datetime.now(UTC) - timedelta(seconds=1)))
+        await app.create_task(timer("later", datetime(2099, 1, 1, tzinfo=UTC)))
+    finally:
+        await app.aclose()
+
+
+asyncio.run(main())
+"""
+
+
+def test_timer_worker_runs_due_timers_until_idle(tmp_path: Path) -> None:
+    assert main(["new", "invoices", "--preset", "long-running", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "invoices"
+    (project / "seed_timers.py").write_text(_SEED_TIMERS, encoding="utf-8")
+    seeded = _run(project, "seed_timers.py")
+    assert seeded.returncode == 0, seeded.stdout + seeded.stderr
+
+    worker = _run(project, "-m", "cayu", "worker", "timers", "--until-idle")
+
+    assert worker.returncode == 0, worker.stdout + worker.stderr
+    assert json.loads(worker.stdout) == {
+        "handled": 1,
+        "idle": True,
+        "next_available_at": "2099-01-01T00:00:00Z",
+        "next_expiry_at": None,
+        "maintenance_required": False,
+        "continuations_pending": False,
+    }
+
+
 def test_long_running_preset_is_listed_and_requires_its_patterns(capsys) -> None:
     assert main(["new", "--list-presets", "--json"]) == 0
     presets = {entry["name"]: entry for entry in json.loads(capsys.readouterr().out)["presets"]}
