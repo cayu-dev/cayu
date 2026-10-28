@@ -338,6 +338,7 @@ from cayu.messages import (
     Message,
     PeerContentPart,
 )
+from cayu.observability._store_watchers import resolve_event_watcher_store
 from cayu.observability.events import EventSink
 from cayu.observability.hooks import (
     RuntimeHook,
@@ -349,11 +350,7 @@ from cayu.observability.timing import (
     RuntimeTimingStatus,
     ToolRoundTiming,
 )
-from cayu.observability.watchers import (
-    EventWatcherStore,
-    InMemoryEventWatcherStore,
-    _clock_or_utc_now,
-)
+from cayu.observability.watchers import EventWatcherStore, _clock_or_utc_now
 from cayu.providers.base import ModelProvider, ModelRequest
 from cayu.providers.hosted import OpenAIWebSearch
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
@@ -1261,8 +1258,8 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         self.budget_binding_receiver = budget_binding_receiver
         self.enable_common_root_budget_binding = enable_common_root_budget_binding
         self._event_watcher_supervisor = EventWatcherSupervisor()
-        self.event_watcher_store = (
-            event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
+        self.event_watcher_store = resolve_event_watcher_store(
+            event_watcher_store, self.session_store
         )
         self._browser_control_runtime = (
             None

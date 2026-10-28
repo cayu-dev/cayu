@@ -86,11 +86,13 @@ Call `app.register_event_watcher(approval_outcomes)` in the factory. `cayu
 serve` runs registered watchers while it serves, so a denial on the Pending
 page reaches the handler there; `run_watchers` runs them in a worker. Delivery
 is ordered, at least once, retried up to `max_attempts` and leased by watcher
-name. Give the app a durable cursor with
-`CayuApp(event_watcher_store=SQLiteEventWatcherStore(path))` (from `cayu.storage`)
-on the same SQLite file as its other stores, or `PostgresEventWatcherStore` in a
-deployment. The default store is in memory, so a restart delivers every old
-matching event again; the example keeps it only because its test app is too.
+name. An app built on `open_application_stores(...)`'s session store keeps its
+watcher cursors in the same SQLite file or PostgreSQL database
+(`stores.event_watcher_store`), so a restart does not deliver old events again.
+Otherwise pass `CayuApp(event_watcher_store=SQLiteEventWatcherStore(path))` or
+`PostgresEventWatcherStore` (from `cayu.storage`). Without either the store is in
+memory, so a restart delivers every old matching event again; the example keeps
+it only because its test app is too.
 
 ## Waiting for an outside reply
 

@@ -78,6 +78,16 @@ connections. A `CayuApp` built on those stores' session store without its own
 `CayuApp(budget_ledger=...)` to use another ledger, or
 `open_application_stores(..., budget_ledger=False)` to build none.
 
+They also include a durable event watcher store in the same database
+(`ApplicationStores.event_watcher_store`): a `SQLiteEventWatcherStore` in the
+SQLite file, or a `PostgresEventWatcherStore` on the shared pool, so it adds no
+connections either. A `CayuApp` built on those stores' session store without its
+own `event_watcher_store` uses it, so watcher cursors survive restarts and a
+restarted `cayu serve` or worker does not deliver old events again. Pass
+`CayuApp(event_watcher_store=...)` to use another store, or
+`open_application_stores(..., event_watchers=False)` to build none and keep the
+in-memory default.
+
 A PostgreSQL-backed application process therefore opens at most
 `CAYU_DATABASE_POOL_MAX` pooled connections, one dedicated listener connection,
 and, when `cayu serve` or `cayu check` assembles the project, the Evals store's

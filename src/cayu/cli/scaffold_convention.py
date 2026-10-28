@@ -1674,25 +1674,16 @@ _OWNERSHIP_FILES: dict[str, str] = {
     "operations/watchers.py": (
         '"""Durable event watcher construction and delivery policy.\n'
         "\n"
-        "Example: react when a person approves or denies a tool call. In app.py pass\n"
-        "CayuApp(event_watcher_store=build_watcher_store()) and call\n"
+        "Example: react when a person approves or denies a tool call. In app.py call\n"
         "app.register_event_watcher(APPROVAL_OUTCOMES); `cayu serve` runs registered\n"
-        "watchers. See `uv run --no-sync cayu guide long-running`.\n"
+        "watchers. The app's configured stores keep watcher cursors in its database,\n"
+        "so a restart does not deliver old events again. See\n"
+        "`uv run --no-sync cayu guide long-running`.\n"
         '"""\n'
         "\n"
-        "# from pathlib import Path\n"
-        "#\n"
         "# from cayu.events import EventType\n"
         "# from cayu.observability import EventWatcher\n"
         "# from cayu.sessions import EventQuery\n"
-        "# from cayu.storage import SQLiteEventWatcherStore\n"
-        "#\n"
-        "#\n"
-        "# def build_watcher_store():\n"
-        "#     # Keep cursors in the app's SQLite database so a restart does not redeliver\n"
-        "#     # old events. With CAYU_DATABASE_URL set, use PostgresEventWatcherStore.\n"
-        "#     root = Path(__file__).resolve().parents[1]\n"
-        '#     return SQLiteEventWatcherStore(root / "__LOCAL_DATABASE__")\n'
         "#\n"
         "#\n"
         "# def record_approval_outcome(context):\n"
@@ -1814,11 +1805,12 @@ _STORAGE_GUIDANCE = """
 
 ## Durable data
 
-Cayu's session, task, and knowledge stores live in the configured database.
-`__STORAGE_MODULE__` opens them with `open_application_stores`:
-`CAYU_DATABASE_URL` selects PostgreSQL, and without it they use local SQLite at
-`__LOCAL_DATABASE__`. Cayu CLI commands resolve `CAYU_DATABASE_URL` before
-`[tool.cayu.session_store]`, so they read the same database as the app.
+Cayu's session, task, knowledge, and event watcher stores live in the
+configured database. `__STORAGE_MODULE__` opens them with
+`open_application_stores`: `CAYU_DATABASE_URL` selects PostgreSQL, and without
+it they use local SQLite at `__LOCAL_DATABASE__`. Cayu CLI commands resolve
+`CAYU_DATABASE_URL` before `[tool.cayu.session_store]`, so they read the same
+database as the app.
 
 __APPLICATION_TABLES__- `data/` locally and `/data` in a deployment hold files: artifacts, uploads,
   and fixtures. Do not open SQLite files there for durable application state; a
@@ -1972,9 +1964,6 @@ def convention_files(
     files = dict(_OWNERSHIP_FILES)
     files.update(
         {
-            "operations/watchers.py": _OWNERSHIP_FILES["operations/watchers.py"].replace(
-                "__LOCAL_DATABASE__", local_database_path(plan)
-            ),
             "app.py": app,
             "configuration/__init__.py": _CONFIGURATION_INIT_PY,
             "configuration/settings.py": settings,

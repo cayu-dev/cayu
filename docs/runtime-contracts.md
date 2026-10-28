@@ -101,7 +101,10 @@ database and, on PostgreSQL, the same pool. `agent_snapshots=True` adds an
 `AgentSnapshotStore` the same way. The stores always include a durable budget
 ledger in the same database (`ApplicationStores.budget_ledger`), which a
 `CayuApp` built on their session store uses unless it is given its own
-`budget_ledger`. Per-run overrides
+`budget_ledger`, and a durable event watcher store
+(`ApplicationStores.event_watcher_store`) used the same way unless the app is
+given its own `event_watcher_store`; `event_watchers=False` leaves it out.
+Per-run overrides
 remain at the invocation boundary. Schema versions and internal validation
 ceilings remain feature-owned contracts rather than application settings.
 
@@ -8687,6 +8690,10 @@ delivery because the watcher owns the cursor.
 errors, and dead-letter counts for durable local apps.
 `PostgresEventWatcherStore` provides the same contract for hosted multi-worker
 apps and uses transactional row locks to serialize claims for the same watcher.
+`open_application_stores` builds the SQLite or PostgreSQL store in the
+application's database, and a `CayuApp` on its session store uses it unless
+`event_watcher_store=` names another; without either, the app keeps the
+in-memory store and a restart delivers every matching event again.
 A live lease prevents two workers with the same watcher name from handling the
 same event at the same time; an expired lease can be claimed again, so handlers
 must be idempotent. Use a stable idempotency key such as

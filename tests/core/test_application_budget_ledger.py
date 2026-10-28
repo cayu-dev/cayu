@@ -153,12 +153,12 @@ def test_a_record_is_dropped_with_its_session_store() -> None:
     store = InMemorySessionStore()
     key = id(store)
     _store_ledgers.attach_session_store_budget_ledger(store, InMemoryBudgetLedger())
-    assert key in _store_ledgers._LEDGERS
+    assert key in _store_ledgers._LEDGERS._records
 
     del store
     gc.collect()
 
-    assert key not in _store_ledgers._LEDGERS
+    assert key not in _store_ledgers._LEDGERS._records
 
 
 def test_the_ledger_can_be_left_out(tmp_path: Path) -> None:

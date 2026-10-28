@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import warnings
 from typing import Any
 
@@ -238,6 +239,8 @@ def test_thinking_preflight_revalidates_without_serializer_diagnostics(field, ca
 
     config = ThinkingConfig()
     object.__setattr__(config, field, Hostile())
+    # Finalize objects from earlier tests before observing this call's diagnostics.
+    gc.collect()
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
         with pytest.raises(ValueError, match="Invalid thinking configuration") as caught:
@@ -286,6 +289,8 @@ def test_public_routed_thinking_rejects_mutated_input_without_diagnostic_leak(
         assert await store.load_checkpoint("mutated-thinking") is None
         assert await store.query_events(EventQuery(session_id="mutated-thinking")) == []
 
+    # Finalize objects from earlier tests before observing this call's diagnostics.
+    gc.collect()
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
         asyncio.run(scenario())

@@ -1,4 +1,4 @@
-"""Environment-selected session, task, knowledge, product and snapshot stores and ledger."""
+"""Environment-selected session, task, knowledge, product, snapshot and watcher stores and ledger."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from cayu.budgets.base import BudgetLedger
     from cayu.knowledge.base import KnowledgeStore
     from cayu.knowledge.scopes import KnowledgeAccessScope
+    from cayu.observability.watchers import EventWatcherStore
     from cayu.runtime._policy_storage import ModelPolicyStore
     from cayu.runtime.public_authority import PublicAuthorityAliasCodec
     from cayu.server import ProductOperationStore
@@ -41,8 +42,9 @@ class ApplicationStores:
     close. Cayu's server does not close application stores; long-lived processes
     keep them for their lifetime, and tests or scripts close them explicitly.
 
-    ``budget_ledger`` is recorded beside ``session_store``: a ``CayuApp`` built
-    on that session store without its own ``budget_ledger`` uses it.
+    ``budget_ledger`` and ``event_watcher_store`` are recorded beside
+    ``session_store``: a ``CayuApp`` built on that session store without its own
+    ``budget_ledger`` or ``event_watcher_store`` uses them.
     """
 
     __slots__ = (
@@ -53,6 +55,7 @@ class ApplicationStores:
         "_closed",
         "_closed_parts",
         "_closing",
+        "_event_watcher_store",
         "_knowledge_store",
         "_model_policy_store",
         "_pool",
@@ -74,6 +77,7 @@ class ApplicationStores:
         model_policy_store: ModelPolicyStore | None = None,
         agent_snapshot_store: AgentSnapshotStore | None = None,
         budget_ledger: BudgetLedger | None = None,
+        event_watcher_store: EventWatcherStore | None = None,
         pool: Any | None = None,
         pool_max_size: int | None = None,
         task_admission_listener: bool = False,
@@ -82,6 +86,12 @@ class ApplicationStores:
             from cayu.budgets._store_ledgers import attach_session_store_budget_ledger
 
             attach_session_store_budget_ledger(session_store, budget_ledger)
+        if event_watcher_store is not None:
+            from cayu.observability._store_watchers import (
+                attach_session_store_event_watcher_store,
+            )
+
+            attach_session_store_event_watcher_store(session_store, event_watcher_store)
         self._backend = backend
         self._session_store = session_store
         self._task_store = task_store
@@ -90,6 +100,7 @@ class ApplicationStores:
         self._model_policy_store = model_policy_store
         self._agent_snapshot_store = agent_snapshot_store
         self._budget_ledger = budget_ledger
+        self._event_watcher_store = event_watcher_store
         self._pool = pool
         self._pool_max_size = pool_max_size
         self._task_admission_listener = task_admission_listener
@@ -107,6 +118,7 @@ class ApplicationStores:
             f"product_operations={self._product_store is not None!r}, "
             f"agent_snapshots={self._agent_snapshot_store is not None!r}, "
             f"budget_ledger={self._budget_ledger is not None!r}, "
+            f"event_watchers={self._event_watcher_store is not None!r}, "
             f"pool_max_size={self._pool_max_size!r})"
         )
 
@@ -147,6 +159,12 @@ class ApplicationStores:
         """The durable budget ledger in the same database, when built."""
 
         return self._budget_ledger
+
+    @property
+    def event_watcher_store(self) -> EventWatcherStore | None:
+        """The durable event watcher store in the same database, when built."""
+
+        return self._event_watcher_store
 
     @property
     def pool_max_size(self) -> int | None:
@@ -191,6 +209,7 @@ class ApplicationStores:
             self._model_policy_store,
             self._agent_snapshot_store,
             self._budget_ledger,
+            self._event_watcher_store,
             self._knowledge_store,
             self._session_store,
             self._pool,
@@ -228,6 +247,7 @@ def open_application_stores(
     model_policy: bool = False,
     agent_snapshots: bool = False,
     budget_ledger: bool = True,
+    event_watchers: bool = True,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
     pool_max_size: int | None = None,
     direct_database_url: str | None = None,
@@ -263,7 +283,17 @@ def open_application_stores(
     ``budget_ledger`` uses it, so budget reservations, such as a fork controller's
     per-fork caps, survive restarts. Passing ``CayuApp(budget_ledger=...)`` still
     selects any other ledger; ``budget_ledger=False`` builds none. Diagnostic
-    inspection never builds one. Nothing connects during construction.
+    inspection never builds one.
+
+    ``event_watchers=True`` (the default) adds a durable event watcher store: a
+    ``SQLiteEventWatcherStore`` in the same SQLite file, or a
+    ``PostgresEventWatcherStore`` on the shared pool. A ``CayuApp`` built on this
+    session store without its own ``event_watcher_store`` uses it, so watcher
+    cursors survive restarts and a restarted app does not deliver old events
+    again. Passing ``CayuApp(event_watcher_store=...)`` still selects any other
+    store; ``event_watchers=False`` builds none and leaves the in-memory default.
+    Diagnostic inspection never builds one. Nothing connects to PostgreSQL during
+    construction.
     """
 
     if type(tasks) is not bool:
@@ -276,6 +306,8 @@ def open_application_stores(
         raise TypeError("agent_snapshots must be a bool.")
     if type(budget_ledger) is not bool:
         raise TypeError("budget_ledger must be a bool.")
+    if type(event_watchers) is not bool:
+        raise TypeError("event_watchers must be a bool.")
     target = application_store_target(database_url, sqlite_path=sqlite_path)
     if target.backend is SessionStoreBackend.SQLITE:
         assert target.sqlite_path is not None
@@ -287,6 +319,7 @@ def open_application_stores(
             model_policy=model_policy,
             agent_snapshots=agent_snapshots,
             budget_ledger=budget_ledger,
+            event_watchers=event_watchers,
             public_authority_alias_codec=public_authority_alias_codec,
         )
     assert target.postgres_dsn is not None
@@ -314,6 +347,7 @@ def open_application_stores(
         model_policy=model_policy,
         agent_snapshots=agent_snapshots,
         budget_ledger=budget_ledger,
+        event_watchers=event_watchers,
         public_authority_alias_codec=public_authority_alias_codec,
     )
 
@@ -327,6 +361,7 @@ def _open_sqlite_stores(
     model_policy: bool,
     agent_snapshots: bool,
     budget_ledger: bool,
+    event_watchers: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
@@ -361,11 +396,17 @@ def _open_sqlite_stores(
 
         snapshot_store = SQLiteAgentSnapshotStore(path)
     ledger = None
-    # Diagnostic inspection is read-only and never reserves budget.
-    if budget_ledger and current_diagnostic_store_inspection() is None:
-        from cayu.storage.budget_ledger import SQLiteBudgetLedger
+    watcher_store = None
+    # Diagnostic inspection is read-only: it never reserves budget or claims events.
+    if current_diagnostic_store_inspection() is None:
+        if budget_ledger:
+            from cayu.storage.budget_ledger import SQLiteBudgetLedger
 
-        ledger = SQLiteBudgetLedger(path)
+            ledger = SQLiteBudgetLedger(path)
+        if event_watchers:
+            from cayu.storage.event_watchers import SQLiteEventWatcherStore
+
+            watcher_store = SQLiteEventWatcherStore(path)
     return ApplicationStores(
         backend=SessionStoreBackend.SQLITE,
         session_store=session_store,
@@ -375,6 +416,7 @@ def _open_sqlite_stores(
         model_policy_store=policy_store,
         agent_snapshot_store=snapshot_store,
         budget_ledger=ledger,
+        event_watcher_store=watcher_store,
     )
 
 
@@ -389,12 +431,14 @@ def _open_postgres_stores(
     model_policy: bool,
     agent_snapshots: bool,
     budget_ledger: bool,
+    event_watchers: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     try:
         from psycopg_pool import AsyncConnectionPool
 
         from cayu.storage.budget_postgres import PostgresBudgetLedger
+        from cayu.storage.event_watchers_postgres import PostgresEventWatcherStore
         from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
         from cayu.storage.migrations import SchemaMode
         from cayu.storage.postgres import PostgresSessionStore
@@ -510,6 +554,11 @@ def _open_postgres_stores(
         budget_ledger=(
             PostgresBudgetLedger(pool=pool, schema_mode=SchemaMode.VALIDATE)
             if budget_ledger
+            else None
+        ),
+        event_watcher_store=(
+            PostgresEventWatcherStore(pool=pool, schema_mode=SchemaMode.VALIDATE)
+            if event_watchers
             else None
         ),
         pool=pool,
