@@ -50,6 +50,13 @@ and deployment identifiers remain available independently if the other identifie
 invalid. Cayu Cloud owns final promotion and Agent service publication, so these commands
 only need to observe the durable Deployment Operation rather than reproduce those steps.
 
+While it waits, the CLI rides out up to five consecutive unavailable, throttled or HTTP
+5xx reads of the Release, because the Release keeps building in Cloud whether or not one
+poll arrives. A request that fails before Cloud answers exits `2` with category
+`api_unavailable`, `transport_error` naming how it failed (for example `read_timeout` or
+`connect_failed`) and `request` naming it as `METHOD /path`. A later `deploy` of the same
+source finds the same Release, so running it again is safe.
+
 If release publication finishes but the Agent service is still starting when the same
 local deadline expires, `deploy` exits `2` with category `service_still_starting` and a
 ready-to-run `service status` command. The error also carries `waited_seconds` and, when

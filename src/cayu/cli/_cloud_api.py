@@ -119,6 +119,8 @@ class CloudApiError(RuntimeError):
         code: str | None = None,
         rejected_fields: tuple[tuple[str, str], ...] = (),
         body: dict[str, Any] | None = None,
+        transport_error: str | None = None,
+        request: str | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
@@ -134,6 +136,30 @@ class CloudApiError(RuntimeError):
         # Cloud's structured rejection (FastAPI's `detail` object), only with a documented
         # `code`. Its other fields are Cloud's, so a caller checks each one it reads.
         self.body = body
+        # For `api_unavailable`: how the request failed before Cloud answered (a name from
+        # `_TRANSPORT_ERRORS`) and which request it was, as "METHOD /path" without the query.
+        # Neither carries a credential or the exception's own text.
+        self.transport_error = transport_error
+        self.request = request
+
+
+# Most specific first: httpx's timeouts are transport errors too.
+_TRANSPORT_ERRORS: tuple[tuple[type[httpx.RequestError], str], ...] = (
+    (httpx.ConnectTimeout, "connect_timeout"),
+    (httpx.ReadTimeout, "read_timeout"),
+    (httpx.WriteTimeout, "write_timeout"),
+    (httpx.PoolTimeout, "pool_timeout"),
+    (httpx.ConnectError, "connect_failed"),
+    (httpx.RemoteProtocolError, "connection_closed"),
+    (httpx.ReadError, "read_failed"),
+    (httpx.WriteError, "write_failed"),
+)
+
+
+def _transport_error(exc: httpx.RequestError) -> str:
+    return next(
+        (name for kind, name in _TRANSPORT_ERRORS if isinstance(exc, kind)), "request_failed"
+    )
 
 
 @dataclass(frozen=True)
@@ -294,10 +320,16 @@ class CloudApiClient:
                     content=body,
                     headers=headers,
                 )
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
+            # The exception's own text can carry the full URL, so only its kind is kept.
+            transport_error = _transport_error(exc)
+            request = f"{method} {path}"
             raise CloudApiError(
                 "api_unavailable",
-                "Cayu Cloud API is unavailable.",
+                f"Cayu Cloud API is unavailable ({transport_error.replace('_', ' ')} on "
+                f"{request}).",
+                transport_error=transport_error,
+                request=request,
             ) from None
 
     def _current_api_key(self) -> str:

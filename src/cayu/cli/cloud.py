@@ -283,7 +283,13 @@ class _CloudServicePublicationError(CloudApiError):
 
 class _CloudRetrySubmissionError(CloudApiError):
     def __init__(self, cause: CloudApiError, *, deployment_id: str, retry_key: str):
-        super().__init__(cause.category, str(cause), status_code=cause.status_code)
+        super().__init__(
+            cause.category,
+            str(cause),
+            status_code=cause.status_code,
+            transport_error=cause.transport_error,
+            request=cause.request,
+        )
         self.details = {"deployment_id": deployment_id, "retry_idempotency_key": retry_key}
 
 
@@ -710,6 +716,9 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
     error: dict[str, object] = {"category": category, "message": message}
     if isinstance(exc, CloudApiError) and exc.code is not None:
         error["code"] = exc.code
+    if isinstance(exc, CloudApiError) and exc.transport_error is not None:
+        error["transport_error"] = exc.transport_error
+        error["request"] = exc.request
     if isinstance(exc, CloudSourceInputsError):
         error.update({"path": exc.path, "reason": exc.reason, "hint": exc.hint})
     if isinstance(
@@ -3407,8 +3416,12 @@ def _wait_for_deployment(
     deadline = monotonic() + wait_seconds
     path = f"/v1/applications/{application_id}/deployments/{deployment_id}"
     hold = _SessionHoldWatch(wait_seconds=wait_seconds, monotonic=monotonic)
+    reads = _ReleaseReads(monotonic)
     while True:
-        deployment = client.request("GET", path)
+        deployment = reads.read(client, path, deadline=deadline)
+        if deployment is None:
+            sleep(poll_seconds)
+            continue
         status = _deployment_status(deployment)
         _raise_if_superseded(
             deployment,
@@ -3443,6 +3456,39 @@ def _wait_for_deployment(
                 last_issue=hold.waiting,
             )
         sleep(poll_seconds)
+
+
+class _ReleaseReads:
+    """One wait loop's reads of a Release, riding out a short run of transient failures.
+
+    The Release keeps building, smoke testing or publishing in Cayu Cloud while the CLI
+    polls it, so a brief outage between the CLI and Cloud is not the Release failing.
+    """
+
+    def __init__(self, monotonic: Callable[[], float]) -> None:
+        self.failures = 0
+        self.monotonic = monotonic
+
+    def read(self, client: CloudApiClient, path: str, *, deadline: float) -> dict[str, Any] | None:
+        """The Release, or `None` after a transient failure the loop should wait out.
+
+        The clock is read only after a failure, so a healthy loop reads its clock
+        exactly as before.
+        """
+
+        try:
+            release = client.request("GET", path)
+        except CloudApiError as exc:
+            if (
+                not _transient_api_error(exc)
+                or self.failures >= _SERVICE_POLL_TRANSIENT_LIMIT
+                or self.monotonic() >= deadline
+            ):
+                raise
+            self.failures += 1
+            return None
+        self.failures = 0
+        return release
 
 
 class _SessionHoldWatch:
@@ -3622,8 +3668,12 @@ def _promote_release(
         return promoted, client.request("GET", path)
     deadline = monotonic() + wait_seconds
     hold = _SessionHoldWatch(wait_seconds=wait_seconds, monotonic=monotonic)
+    reads = _ReleaseReads(monotonic)
     while True:
-        deployment = client.request("GET", path)
+        deployment = reads.read(client, path, deadline=deadline)
+        if deployment is None:
+            sleep(poll_seconds)
+            continue
         status = _deployment_status(deployment)
         if status == "promoted":
             return client.request("GET", f"/v1/applications/{application_id}"), deployment

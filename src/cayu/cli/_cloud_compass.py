@@ -55,6 +55,8 @@ class CompassWriteError(CloudApiError):
             detail=error.detail,
             code=error.code,
             rejected_fields=error.rejected_fields,
+            transport_error=error.transport_error,
+            request=error.request,
         )
         self.idempotency_key = idempotency_key
         self.details: dict[str, object] = {"idempotency_key": idempotency_key}

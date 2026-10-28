@@ -12,10 +12,12 @@ import subprocess
 import tarfile
 import threading
 import tomllib
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from tests.cli._cloud_candidate import staged_candidate
 
@@ -3913,6 +3915,108 @@ def test_cloud_wait_tolerates_a_bounded_run_of_transient_api_failures() -> None:
         wait(Client([http(403)]))
 
 
+def test_cloud_deploy_wait_rides_out_a_bounded_run_of_transient_api_failures() -> None:
+    # The Release keeps building in Cloud: one lost poll must not report the deploy failed.
+    class Client:
+        def __init__(self, failures: list[CloudApiError]) -> None:
+            self.failures = failures
+            self.reads = 0
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            assert (method, path) == ("GET", "/v1/applications/ready-agent/deployments/dep-new")
+            self.reads += 1
+            if self.failures:
+                raise self.failures.pop(0)
+            return {"id": "dep-new", "status": "promoted"}
+
+    def wait(client: Client, *, monotonic: Callable[[], float] = lambda: 0.0) -> object:
+        return cloud_cli._wait_for_deployment(
+            client,
+            application_id="ready-agent",
+            deployment_id="dep-new",
+            poll_seconds=0.01,
+            wait_seconds=600.0,
+            sleep=lambda _: None,
+            monotonic=monotonic,
+        )
+
+    def http(status_code: int) -> CloudApiError:
+        return CloudApiError(
+            "api_request_rejected",
+            f"Cayu Cloud API returned HTTP {status_code}.",
+            status_code=status_code,
+        )
+
+    unavailable = CloudApiError("api_unavailable", "down", transport_error="read_timeout")
+    client = Client([unavailable, http(502), http(503)])
+    assert wait(client) == {"id": "dep-new", "status": "promoted"}
+    assert client.reads == 4
+
+    with pytest.raises(CloudApiError, match="HTTP 502"):
+        wait(Client([http(502)] * 6))
+    with pytest.raises(CloudApiError, match="HTTP 403"):
+        wait(Client([http(403)]))
+    # Past the wait's deadline a transient failure is reported, not waited out.
+    clock = iter([0.0, 601.0])
+    with pytest.raises(CloudApiError, match="down"):
+        wait(Client([unavailable]), monotonic=lambda: next(clock))
+
+
+def test_cloud_api_names_how_a_request_failed_without_its_text(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("private-transport-canary", request=request)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(fail), **kwargs),
+    )
+    with pytest.raises(CloudApiError) as raised:
+        CloudApiClient(api_url="https://cloud.example", api_key="test").request(
+            "GET",
+            "/v1/applications/ready-agent/deployments/dep-new",
+            query={"cursor": "private-query-canary"},
+        )
+
+    assert raised.value.category == "api_unavailable"
+    assert raised.value.transport_error == "read_timeout"
+    assert raised.value.request == "GET /v1/applications/ready-agent/deployments/dep-new"
+    assert str(raised.value) == (
+        "Cayu Cloud API is unavailable "
+        "(read timeout on GET /v1/applications/ready-agent/deployments/dep-new)."
+    )
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    output = capsys.readouterr().out
+    assert "canary" not in output
+    error = json.loads(output)["error"]
+    assert error["transport_error"] == "read_timeout"
+    assert error["request"] == "GET /v1/applications/ready-agent/deployments/dep-new"
+
+
+@pytest.mark.parametrize(
+    ("failure", "name"),
+    [
+        (httpx.ConnectTimeout, "connect_timeout"),
+        (httpx.ReadTimeout, "read_timeout"),
+        (httpx.WriteTimeout, "write_timeout"),
+        (httpx.PoolTimeout, "pool_timeout"),
+        (httpx.ConnectError, "connect_failed"),
+        (httpx.RemoteProtocolError, "connection_closed"),
+        (httpx.ReadError, "read_failed"),
+        (httpx.WriteError, "write_failed"),
+        (httpx.UnsupportedProtocol, "request_failed"),
+    ],
+)
+def test_cloud_api_transport_error_names(failure: type[httpx.RequestError], name: str) -> None:
+    from cayu.cli._cloud_api import _transport_error
+
+    assert _transport_error(failure("x")) == name
+
+
 class _ArchiveClient:
     """Records archive requests; the archive completes after `pending` status reads."""
 
@@ -4625,3 +4729,28 @@ def test_cloud_timeline_keeps_breaking_storage_failures(code: str) -> None:
     }
     result = cloud_cli._validated_deployment_diagnostics({"failure": failure, "items": []})
     assert result["failure"] == failure
+
+
+@pytest.mark.parametrize("wrapper", ["compass", "settings", "retry"])
+def test_cloud_error_wrappers_preserve_transport_diagnostics(wrapper, capsys):
+    from cayu.cli._cloud_compass import CompassWriteError
+    from cayu.cli._cloud_settings import CloudSettingsError
+
+    cause = CloudApiError(
+        "api_unavailable",
+        "Cloud request timed out.",
+        transport_error="read_timeout",
+        request="POST /v1/example",
+    )
+    if wrapper == "compass":
+        error = CompassWriteError(cause, idempotency_key="operation")
+    elif wrapper == "settings":
+        error = CloudSettingsError(cause, str(cause), {"operation_id": "operation"})
+    else:
+        error = cloud_cli._CloudRetrySubmissionError(
+            cause, deployment_id="deployment", retry_key="operation"
+        )
+    assert cloud_cli._cloud_failure(error) == 2
+    detail = json.loads(capsys.readouterr().out)["error"]
+    assert detail["transport_error"] == "read_timeout"
+    assert detail["request"] == "POST /v1/example"

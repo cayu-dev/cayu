@@ -55,6 +55,8 @@ class CloudSettingsError(CloudApiError):
             detail=error.detail,
             code=error.code,
             rejected_fields=error.rejected_fields,
+            transport_error=error.transport_error,
+            request=error.request,
         )
         self.details = details
 

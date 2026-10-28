@@ -57,7 +57,7 @@ def _project(tmp_path: Path) -> cloud_project.ResolvedCloudProject:
 class RacingCloud:
     """Cloud where the previous release is promoted while the new one is building."""
 
-    def __init__(self, statuses_after_conflict: list[str]) -> None:
+    def __init__(self, statuses_after_conflict: list[str | CloudApiError]) -> None:
         # The previous release's late promotion moved the Agent from revision 4 to 5.
         self.revision = 5
         self.current = "dep_previous"
@@ -95,6 +95,8 @@ class RacingCloud:
             if not self.conflicted:
                 return {"id": "dep_second", "status": "smoke_tested"}
             status = self.statuses_after_conflict.pop(0)
+            if isinstance(status, CloudApiError):
+                raise status
             if status == "promoted":
                 # The deployment worker promotes with the revision it reads itself.
                 self.revision, self.current = 6, "dep_second"
@@ -139,6 +141,18 @@ def test_deploy_keeps_waiting_when_cloud_promotes_the_release_after_a_promote_co
     assert ("POST", "/v1/applications/staging-smoke/deployments/dep_second/promote") in (
         client.requests
     )
+
+
+def test_deploy_rides_out_a_transient_failure_while_waiting_after_a_promote_conflict(
+    tmp_path: Path,
+) -> None:
+    unavailable = CloudApiError("api_unavailable", "down", transport_error="read_timeout")
+    client = RacingCloud(["smoke_tested", unavailable, "promoted"])
+
+    result = _deploy(client, tmp_path)["result"]
+
+    assert result["deployment"] == {"id": "dep_second", "status": "promoted"}
+    assert result["application"]["current_deployment_id"] == "dep_second"
 
 
 def test_no_wait_deploy_accepts_a_release_cloud_already_promoted(tmp_path: Path) -> None:
