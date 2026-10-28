@@ -208,7 +208,21 @@ after a successful migration. `migrate` reports its path and size (`backup.path`
 automatically named backups of the same database in the backup directory
 after a successful migration; files at an explicit `--backup` path, or of
 other databases, are never touched, and the removed files are listed in
-`backup.removed`. `--waive-backup` skips the copy.
+`backup.removed`. `--waive-backup` keeps no backup after the migration.
+
+Before it writes anything, a SQLite migration checks that the disk has room.
+It writes a snapshot of the database (the retained backup, or a temporary
+snapshot next to the database with `--waive-backup`), then a migrated copy next
+to the database that replaces it. While revisions apply, or while aliases are
+backfilled for a newly configured public-authority alias key, the copy's
+write-ahead log and the copy itself grow. The estimate is one database size for
+the snapshot, one for the copy, and 75% of a database size of working space
+when revisions or an alias backfill are pending; needs on the same file system
+add up. When a file system is short, `migrate` exits 1 before writing and says
+how much it needs and how much is free. When the backup's file system is the
+short one, it also lists older automatic backups of the database there and
+suggests pointing `--backup-dir` (or `--backup`) at another disk. Free space or
+pass `--skip-disk-space-check` to start anyway.
 
 A Postgres migration of a database that already holds Cayu data records its
 backup authority in the migration receipt. Pass exactly one of:

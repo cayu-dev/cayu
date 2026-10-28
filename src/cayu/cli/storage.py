@@ -37,6 +37,7 @@ from cayu.cli.store_targets import (
 )
 from cayu.runtime.public_authority import public_authority_alias_codec_from_environment
 from cayu.sessions.exports import SessionExportLimits
+from cayu.storage import _disk_space as disk_space
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import jsonl_export, migration_authority
@@ -175,6 +176,14 @@ def add_storage_parser(subparsers: Any) -> None:
                         "SQLite: after a successful migration, keep only the newest N "
                         "automatically named backups of this database in the backup "
                         "directory and delete older ones. Not valid for Postgres."
+                    ),
+                )
+                sub.add_argument(
+                    "--skip-disk-space-check",
+                    action="store_true",
+                    help=(
+                        "SQLite: start even when the backup and migrated copy may not fit "
+                        "in the free disk space. Not valid for Postgres."
                     ),
                 )
             if name in {"migrate", "status"}:
@@ -938,6 +947,14 @@ def _migrate_sqlite_locked(
 
     retained_backup = not args.waive_backup
     resuming = recovery is not None
+    if source_existed and not _skip_disk_space_check_arg(args):
+        _require_sqlite_migration_space(
+            path,
+            args,
+            backup_written=resuming,
+            retained_backup=retained_backup,
+            migrates=bool(planned) or _sqlite_alias_backfill_pending(path, codec),
+        )
     backup_sha256: str | None = None
     if recovery is None:
         backup_path = (
@@ -1147,6 +1164,8 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
         raise ValueError("--backup-dir is only valid with --sqlite.")
     if _keep_backups_arg(args) is not None:
         raise ValueError("--keep-backups is only valid with --sqlite.")
+    if _skip_disk_space_check_arg(args):
+        raise ValueError("--skip-disk-space-check is only valid with --sqlite.")
     _preflight_migration_output(args.output, forbidden=())
     requested_backup = _requested_postgres_backup_authority(args)
     codec = public_authority_alias_codec_from_environment()
@@ -1789,6 +1808,74 @@ def _keep_backups_arg(args: argparse.Namespace) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _skip_disk_space_check_arg(args: argparse.Namespace) -> bool:
+    return getattr(args, "skip_disk_space_check", False) is True
+
+
+def _require_sqlite_migration_space(
+    path: Path,
+    args: argparse.Namespace,
+    *,
+    backup_written: bool,
+    retained_backup: bool,
+    migrates: bool,
+) -> None:
+    """Refuse a SQLite migration whose backup and migrated copy may not fit on disk."""
+
+    if args.backup is not None:
+        backup_directory = Path(args.backup).parent
+    else:
+        backup_dir = _backup_dir_arg(args)
+        backup_directory = path.parent if backup_dir is None else Path(backup_dir)
+    needs = disk_space.sqlite_migration_space_needs(
+        path,
+        backup_directory=backup_directory if retained_backup and not backup_written else None,
+        snapshot_directory=path.parent if not retained_backup and not backup_written else None,
+        migrates=migrates,
+    )
+    shortfalls = disk_space.find_space_shortfalls(needs)
+    backup_short = any(
+        need.purpose == disk_space.SQLITE_BACKUP_PURPOSE
+        for shortfall in shortfalls
+        for need in shortfall.needs
+    )
+    hint = "Free some space"
+    if backup_short:
+        # Advice about the backup helps only when the backup's file system is short.
+        older = _automatic_sqlite_backups(path, directory=backup_directory)
+        if older:
+            total = sum(candidate.stat().st_size for candidate in older)
+            hint += (
+                f" ({len(older)} older backup(s) of this database in {backup_directory} "
+                f"take {disk_space.format_bytes(total)})"
+            )
+        option = "--backup" if args.backup is not None else "--backup-dir"
+        hint += f", point {option} at another disk"
+    hint += ", or pass --skip-disk-space-check to start anyway."
+    disk_space.raise_for_shortfalls(shortfalls, operation="SQLite migration", hint=hint)
+
+
+def _sqlite_alias_backfill_pending(path: Path, codec: Any) -> bool:
+    connection = sqlite_connection.connect(path, read_only=True)
+    try:
+        return migration_authority.sqlite_public_authority_backfill_pending(connection, codec)
+    finally:
+        connection.close()
+
+
+def _automatic_sqlite_backups(path: Path, *, directory: Path) -> list[Path]:
+    """This database's automatically named backups in ``directory``, if it exists."""
+
+    if not directory.is_dir():
+        return []
+    prefix = _sqlite_backup_prefix(path, directory)
+    return [
+        candidate
+        for candidate in directory.glob(f"{glob_escape(prefix)}*.sqlite3")
+        if candidate.is_file() and not candidate.is_symlink()
+    ]
+
+
 def _sqlite_backup_prefix(path: Path, directory: Path) -> str:
     """The name prefix that identifies ``path``'s automatic backups in ``directory``.
 
@@ -1835,12 +1922,7 @@ def _prune_sqlite_backups(
     backup this migration just wrote always counts as the newest.
     """
 
-    prefix = _sqlite_backup_prefix(path, directory)
-    candidates = [
-        candidate
-        for candidate in directory.glob(f"{glob_escape(prefix)}*.sqlite3")
-        if candidate.is_file() and not candidate.is_symlink()
-    ]
+    candidates = _automatic_sqlite_backups(path, directory=directory)
     current_resolved = None if current is None else current.resolve()
     candidates.sort(
         key=lambda candidate: (
@@ -2432,7 +2514,7 @@ def vacuum_sqlite_database(path: Path, *, busy_timeout_ms: int = 30_000) -> dict
 
     if not path.is_file():
         raise RuntimeError(f"SQLite database not found for VACUUM: {path}")
-    before = _sqlite_file_set_bytes(path)
+    before = disk_space.sqlite_file_set_bytes(path)
     connection = sqlite3.connect(
         f"{path.resolve().as_uri()}?mode=rw",
         uri=True,
@@ -2443,14 +2525,17 @@ def vacuum_sqlite_database(path: Path, *, busy_timeout_ms: int = 30_000) -> dict
         page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
         page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
         free_pages = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
-        _require_vacuum_space(path, (page_count - free_pages) * page_size)
+        disk_space.require_free_space(
+            disk_space.sqlite_vacuum_space_needs(path, (page_count - free_pages) * page_size),
+            operation="VACUUM",
+        )
         connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
         connection.execute("VACUUM")
         checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         checkpoint_busy = checkpoint is not None and int(checkpoint[0]) != 0
     finally:
         connection.close()
-    after = _sqlite_file_set_bytes(path)
+    after = disk_space.sqlite_file_set_bytes(path)
     result: dict[str, object] = {
         "path": str(path),
         "bytes_before": before,
@@ -2460,43 +2545,6 @@ def vacuum_sqlite_database(path: Path, *, busy_timeout_ms: int = 30_000) -> dict
     if checkpoint_busy:
         result["note"] = "a reader kept the write-ahead log open; it shrinks at the next checkpoint"
     return result
-
-
-def _sqlite_temp_directory() -> Path:
-    """The directory SQLite uses for VACUUM's temporary database on POSIX."""
-
-    for name in ("SQLITE_TMPDIR", "TMPDIR"):
-        value = os.environ.get(name)
-        if value and Path(value).is_dir():
-            return Path(value)
-    for candidate in ("/var/tmp", "/usr/tmp", "/tmp"):
-        if Path(candidate).is_dir():
-            return Path(candidate)
-    return Path(tempfile.gettempdir())
-
-
-def _require_vacuum_space(path: Path, data_bytes: int) -> None:
-    database_directory = path.resolve().parent
-    temp_directory = _sqlite_temp_directory()
-    if database_directory.stat().st_dev == temp_directory.stat().st_dev:
-        needs = {database_directory: 2 * data_bytes}
-    else:
-        needs = {database_directory: data_bytes, temp_directory: data_bytes}
-    for directory, needed in needs.items():
-        available = shutil.disk_usage(directory).free
-        if available < needed:
-            raise RuntimeError(
-                f"VACUUM needs about {needed} bytes free in {directory} (a temporary copy "
-                f"in {temp_directory} and a rewrite next to {path}); {available} are available."
-            )
-
-
-def _sqlite_file_set_bytes(path: Path) -> int:
-    total = 0
-    for candidate in (path, Path(f"{path}-wal")):
-        with contextlib.suppress(FileNotFoundError):
-            total += candidate.stat().st_size
-    return total
 
 
 def _render_prune(

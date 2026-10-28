@@ -87,6 +87,33 @@ def preflight_sqlite_public_authority(
     )
 
 
+def sqlite_public_authority_backfill_pending(
+    connection: sqlite3.Connection,
+    codec: PublicAuthorityAliasCodec | None,
+) -> bool:
+    """Whether opening the store with ``codec`` would backfill aliases for a new key.
+
+    The backfill writes an alias row for existing records, so it can grow the
+    database even when no schema revision is pending. Read-only.
+    """
+
+    if codec is None:
+        return False
+    present = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'cayu_public_authority_alias_keys'"
+    ).fetchone()
+    if present is None:
+        return True
+    completed = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT key_id FROM cayu_public_authority_alias_keys WHERE backfill_completed = 1"
+        )
+    }
+    return any(key_id not in completed for key_id in codec.keyring.key_ids)
+
+
 async def preflight_postgres_public_authority(
     cursor: Any,
     codec: PublicAuthorityAliasCodec | None,
