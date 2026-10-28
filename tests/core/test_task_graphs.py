@@ -1290,6 +1290,8 @@ async def test_graph_retains_cross_session_members_until_terminal(store: TaskSto
     assert await store.create_task_graph(request) == snapshot.receipt
     with pytest.raises(TaskGraphConflict):
         await store.create_task(TaskCreate(task_id="a", type="test"))
+    assert await store.load_task("a") is None
+    assert await store.load_task_graph("closure") == snapshot
 
 
 async def test_sqlite_graph_readiness_wakeup_requires_committed_evidence(

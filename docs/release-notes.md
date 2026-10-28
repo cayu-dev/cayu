@@ -1,237 +1,48 @@
 # Release notes
 
-## Unreleased
+## v0.16.0
 
-Upgrade: migrate task stores to revision 133 before starting event-aware workers.
-This semantic revision fences older binaries. Newly admitted ordinary root tasks
-receive a shared event budget (three attempts and 1,800 seconds by default).
-Declare `TaskCreate.event_id` or a stable `input["event_id"]` for resubmissions;
-independent roots get separate identities. The first admission fixes policy and
-deadline. Choose workload-specific limits with `TaskRetryBudget`, or explicitly
-use `TaskRetryBudget.unlimited()`. Existing tasks without an event association
-are not assigned a retroactive deadline. Custom task stores must implement the
-`supports_task_event_execution` contract before accepting ordinary root tasks.
-
-Event deadlines include human waits and cancel active handlers while retaining
-ownership through cleanup. This event bound remains in force when a shorter
-handler default is renewed after an approval. Resuming an existing session from
-a task durably installs the event bound before continuation, so subsequent
-processes and human-wait decisions retain it. Keep workers running for pending
-and paused event maintenance. Successful events reject duplicate submissions;
-attempt exhaustion becomes durable when the last admitted attempt fails.
-
-Upgrade: migrate persistent eval stores to additive revision 132 before starting
-the new runtime. Regenerate HTTP clients and rebuild custom dashboards for server
-contract 67.
-
-Upgrade: a session that a task handler started without its own
-`execution_deadline`, and that pauses for an approval or a question, no longer
-expires while it waits for the person. To keep the old behavior for a run, pass
-`execution_deadline=current_handler_time_limit().run_deadline()`. Sessions
-paused before the upgrade have no recorded origin and keep their stored
-deadline; settle them with a new `execution_deadline` from code. Regenerate HTTP
-clients for the new `execution_deadline` field on inbox items and pending
-actions. Out-of-tree `SessionStore` implementations need
-`replace_execution_deadline(...)` for explicit deadline replacements and automatic
-renewal after a human wait. Without it, ordinary continuations keep enforcing
-the stored deadline; explicit replacements raise `NotImplementedError`.
-
-Upgrade: projects from `cayu new` (not the coding preset) now declare the
-starter agent's model as a managed setting when its name is lowercase
-(`agents/registration.py` passes `settings=[model_setting()]`). To get the same
-in an existing project, add that argument to its `register_agent` call. `CAYU_MODEL` still sets the scaffold's default model in
-this release and will stop doing so in the next one: set the model in
-`agents/agent.py`, or for a deployed Agent in Cayu Cloud's Agent settings. The
-agent registry registration gains an optional `settings_schema` field; a Cloud
-that doesn't accept it yet answers 422, and the Runtime registers again without
-it.
-
-Upgrade: refresh optional dependencies and rebuild custom dashboards to pick up
-the patched dependency versions. These dependency updates need no additional
-storage migration.
+Upgrade: stop 0.15.x writers, back up the store, and run `cayu storage migrate
+--acknowledge-breaking 133`. Regenerate HTTP clients and rebuild custom
+dashboards. Storage revision 133 (was 131), compatibility floor 133 (was 127),
+server contract 67 (was 66), manifest schema 17 (unchanged). Custom task stores
+need `supports_task_event_execution`; custom session stores need
+`replace_execution_deadline`.
 
 ### Breaking changes
 
-- When a person settles an approval or answers a question on a top-level
-  session whose deadline was the default for runs started inside a task handler
-  (`default_run_deadline`, which `run_task_worker(execution_timeout_s=...)`
-  binds), the session gets back the time it had left when it paused, counted
-  from the decision. Before, the wait counted against the handler's limit, so
-  an approval raised in a handler expired with the handler and lowering
-  `execution_timeout_s` shrank the approval window by the same amount. Explicit
-  deadlines, enclosing-scope deadlines and child sessions are unchanged.
+- Storage revision 133 is a breaking writer boundary; rolling back needs a
+  restore.
+- Root tasks get a default event budget (three attempts, 1,800 seconds);
+  resubmissions share it via `TaskCreate.event_id` or `input["event_id"]`.
+  `TaskRetryBudget.unlimited()` opts out.
+- Server contract 67: clients and dashboards built for 0.15.x refuse this
+  server.
+- Human waits no longer count against a task handler's default run deadline.
+- Sandbox broker requests wait 45 seconds (was 30), with longer archive retry
+  delays.
+- New `cayu check` warnings: `TOOL_KNOWLEDGE_STORE_UNAVAILABLE` and
+  `TASK_EVENT_RETRY_POLICY_UNDECLARED`.
+- Docker admission probe timeouts report `admission_probe_timed_out`.
 
 ### Changes
 
-- `linux_agent_launch` runs external-agent CLIs with Landlock and seccomp
-  confinement on Linux, without a Docker daemon or user namespaces. Filesystem
-  grants and TCP port grants are explicit; it adds no execution or resource quotas.
-  Local launcher cleanup now recognizes stopped Linux zombies when container
-  PID 1 has not reaped them.
-- The Developer dashboard documentation now maps the production shell and pages
-  to their current source owners. Ejected/customised dashboards should follow
-  the [source migration map](../dashboard/README.md#dashboard-structure-and-migration);
-  Usage, Environments, Artifacts and System remain in `src/routes/`. The isolated
-  seeded prototype is retained as a development/demo harness.
-- Judge calibration recovery is documented as replay of an already-stored
-  report, not a durable guarantee for paid calls before report publication.
-  An uncertain retry can repeat those calls; stronger runtime recovery remains
-  separate future work. See [calibration](evals.md#developer-dashboard-calibrate-an-ai-judge).
-- `cayu.server.environment_auth:OPERATOR_ONLY_AUTH` is the ready-made Developer dashboard
-  login without dashboard access for people a sign-in proxy signs in as `member`, for an
-  application whose own users sign in through that proxy. `cayu cloud init` gives it Cloud
-  sign-in like `OPERATOR_BASIC_AUTH`, and the b2b preset uses it.
-- `[tool.cayu.serve] routers = ["module:function"]` serves a project's own FastAPI routes
-  next to Cayu's under `cayu serve`. Each function gets the app and `development=`, the
-  routes authenticate their own callers, and each must start with a fixed path segment that
-  isn't one of Cayu's (such as `/api` or `/cayu`).
-- The b2b preset gains sign-in and an HTTP API under `/app`: a demonstration login only
-  under `cayu serve --dev`, Cayu Cloud's sign-in or OIDC otherwise (503 until one is
-  configured), Cayu's scoped routes for conversations, tasks and runs, and organization
-  admins who add, move and remove members (a new `role` on memberships; an organization
-  always keeps at least one admin). Generated tests
-  prove a removed member's queued task never runs, also after a restart, and that a running
-  conversation stops at its next step.
-- The b2b preset gains a web interface at `/app/ui/`: sign-in (a demonstration picker
-  under `cayu serve --dev`), an organization switcher, conversations with their sharing,
-  streamed replies that only a conversation's owner continues, and a Members page for
-  organization admins. Its source is in `web/` and its committed build in `web/static`, so
-  running and deploying it need no Node. `cayu guide b2b` walks through it.
-- Session actions and specialist Start now warn before navigation or closure would
-  lose an unconfirmed operation's local recovery. Staying preserves the exact
-  task replay, queued-message receipt or run observation; leaving explicitly does
-  not cancel server work. Trace and Conversation now handle recovered run results
-  and reply drafts consistently.
-
-- `cayu new NAME --preset b2b` generates an agent several businesses share on one
-  deployment. Organizations, departments and memberships live in the application's
-  own tables, and a resource-access policy turns each person's current membership
-  into Cayu grants for sessions, tasks and artifacts: personal, department and
-  organization sharing, no access across organizations (a department always with its
-  own organization), and revocation at the next protected step. Generated tests prove each rule, with and without PostgreSQL.
-- Evals Settings has dedicated execution-profile, judge calibration, production
-  scenario, memory-report and import/export tools. Calibration uses an exact saved
-  suite check; scenario runs retain their original request for interrupted-response
-  recovery, including when opened from a captured session.
-- `cayu check` accepts the SQLAlchemy models `cayu new --with app-database` generates,
-  so an agent that uses its own tables no longer fails the import check with
-  `SCAFFOLD_IMPORT_SIDE_EFFECT`. Mixins, mapper options and other calls in a model
-  body stay unproven.
-- `cayu eval run --report-to` publishes CLI evaluation results, and
-  `cayu eval publish` retries an exact saved envelope. Dedicated reporting
-  credentials grant only publication to configured targets. Reported series
-  retain source metadata and optional declared revisions; native baseline and
-  comparison operations remain unavailable. See
-  [CI eval reporting](recipes/ci-eval-reporting.md).
-- Sessions record how they got their execution deadline:
-  `Session.execution_deadline.origin` is `explicit`, `run_default` or
-  `enclosing`, stored next to the deadline as `cayu:execution_deadline_origin`.
-- `ResumeRequest`, `ToolApprovalRequest` and `UserInputResponse` take
-  `execution_deadline`. It is admitted like a new run's deadline (refused when
-  already expired or longer than an enclosing scope) and replaces the session's
-  stored deadline through the new `SessionStore.replace_execution_deadline`,
-  which the memory, SQLite and PostgreSQL stores implement. Work-attempt
-  admission refuses a `ResumeRequest` that carries one.
-- Inbox items and `GET /api/pending-actions` actions carry `execution_deadline`
-  (`expires_at`, `source`, `origin`, `waiting_counts`), also on
-  `PendingActionSession.execution_deadline`.
-- `ExecutionDeadlineExceeded` names the deadline's expiry, origin and source,
-  for example "Execution deadline expired before execution; the deadline was
-  2026-10-26T22:37:00Z, the default for runs started inside a task handler
-  (source task_worker)." The inbox's 409 for an expired deadline carries this
-  message.
-
-### Changes
-
-- `cayu cloud settings list|set|unset --application AGENT` reads and changes an
-  Agent's managed settings in Cayu Cloud: each setting's effective value, source
-  and status, all-or-nothing changes with an operation id, and `--json` for the
-  usual envelope. An older Cayu Cloud answers `settings_unsupported`.
-- `cayu cloud deploy` accepts `[worker] stop_grace_seconds` (whole seconds,
-  10-120) in `cayu-cloud.toml` and sends it to Cayu Cloud, which waits that long
-  after `SIGTERM` before it kills the worker (30 seconds without it). A manifest
-  without it sends the same payload as before.
-- `cayu cloud service status` adds a `warnings` entry when Cayu Cloud reports
-  tasks fenced after their worker was lost (`result.task_health`), with how to
-  list and settle them.
-
-### Changes
-
-- Managed settings: parts declare the settings Cayu Cloud can manage where they
-  are registered (`register_agent`, `register_provider` and
-  `register_environment_factory` take `settings=`; `CayuApp.declare_settings`
-  for the application's own), from `cayu.managed_settings`. The framework
-  declares chosen `CayuConfig` run fields and each application budget limit's
-  amount. `app.describe()` gains a `settings` section, and the agent registry
-  registration publishes it as `settings_schema`
-  (`cayu.managed-settings-schema/v1`). `CayuConfigSource` gains `"managed"`. See
-  `docs/managed-settings.md`.
-- In Cayu Cloud, the Agent reads its settings' values with its registry
-  credential: once when the app is built, for settings that apply at restart,
-  and every 25 seconds once the server or `cayu worker` starts
-  (`CayuApp.start_managed_settings`). New sessions use the values; running and
-  resumed sessions keep theirs, and `session.started` records them under
-  `managed_settings`. The Agent reports what it applied, keeps the last good
-  snapshot when Cloud can't be reached, and uses the code's defaults outside
-  Cloud.
-- `cayu new` (not yet the coding preset) declares the starter agent's model as
-  a managed setting, so a deployed Agent's model can be changed in Cayu Cloud;
-  `CAYU_MODEL` remains a fallback default for one release.
+- Managed settings for Cayu Cloud (`cayu.managed_settings`, `cayu cloud
+  settings`).
+- `cayu new --preset b2b`: a multi-organization starter with sign-in, API and
+  web UI.
+- `linux_agent_launch` confines external-agent CLIs on Linux without Docker.
+- `ToolArgumentReview`, explicit `execution_deadline` on resume and approvals,
+  fenced-task reconciliation, and knowledge tools in coding environments.
+- Evals suite editor and CLI run reporting.
 
 ### Fixes
 
-- The sandbox broker client waits 45 seconds for a request by default, up from
-  30 (`CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS` still overrides it). On Cayu
-  Cloud a request may take as long as the portal's 35-second wait, so the old
-  default timed out first whenever a request queued, and the `ReadTimeout`s left
-  runners poisoned (`runner_poisoned [missing_final_evidence]`). Archive reads
-  and writes now retry after 2, 4 and 8 seconds instead of 0.5, 1 and 2. The
-  wait for an abandoned command's stop now starts once its in-flight start has
-  answered, and a cancel answered after that window is still read once, so a
-  slow broker no longer poisons the runner by itself. The lease keeper marks a
-  lease lost when it runs out with a renewal still unanswered, instead of
-  waiting for the call to give up.
-- A settle that carries `execution_deadline`, or renews a task-handler default,
-  stores the new deadline only once the Runtime admits the decision. Before, a
-  decision refused afterwards (for example with a stale human-review reference)
-  still replaced the stored deadline, so a short replacement could make later
-  valid decisions fail with an expired deadline.
-- Raise the minimum Pillow, pypdf, Brotli, and OpenTelemetry versions to include
-  security fixes, and update the dashboard's Vite and Zod build dependencies.
-- A brokered (Cayu Cloud) session whose release can't finish no longer holds its
-  source workspace for the rest of the process. When copy-back fails, or a final
-  workspace observation or mutating tool call never settles, the sandbox stops
-  being renewed and stays available for a cleanup retry until its lease lapses.
-  Once Cloud reports it destroyed, the session's workspace reservation and its
-  environment's mutation fence are released, and a warning from
-  `cayu.runtime._retained_environment_end` says why. Before, every later session
-  on that workspace failed with "already bound by an active session" or
-  `WorkspaceMutationSettlementError`, and the failed session couldn't run again.
-  Work the sandbox never published is lost, as before. Bindings can take part through the private
-  `WorkspaceBinding._retained_release_end` hook.
-- Knowledge tools work in coding environments. `search_knowledge`,
-  `read_knowledge`, `list_knowledge` and `remember_knowledge` get their store
-  from the environment they run in, and none of the coding entry points could
-  pass one, so in Docker coding and brokered sandbox environments every call
-  failed with `missing_knowledge_store`, including in the coding preset
-  generated with the `knowledge` capability. `register_coding_environment`,
-  `CodingBackend.factory_for` (and the built-in backends' factories) and
-  `BrokeredSandboxCodingEnvironmentFactory` now take `knowledge_store=` and
-  `knowledge_access_scope=`, and `register_coding_environment(...,
-  inherit_app_knowledge=True)` uses the app's `knowledge_store` with exactly
-  its `knowledge_access_scope`. Without either a workspace still has no
-  knowledge, since the app's scope can span tenants a workspace shouldn't see,
-  so existing apps gain no access on upgrade. The Docker and brokered coding
-  factories report `configured_knowledge_store` and a copy of
-  `configured_knowledge_access_scope`, and a coding backend whose factory drops
-  a given store is refused. Regenerated coding projects pass the store
-  explicitly and test that `search_knowledge` finds an entry in the registered
-  coding environment.
-- `register_agent` logs a warning, and `cayu check` reports the new
-  `TOOL_KNOWLEDGE_STORE_UNAVAILABLE` warning, when an agent has a knowledge
-  tool but its default environment has no knowledge store. A factory counts
-  when it reports `configured_knowledge_store`; other factories aren't
-  reported.
+- In-memory task stores retain graph member identities after session cleanup.
+- Local launcher cleanup recognizes stopped Linux zombies when container PID 1
+  has not reaped them.
+- Brokered sessions release their workspace after a failed release.
+- Security floors for Pillow, pypdf, Brotli and OpenTelemetry.
 
 ## v0.15.0
 
@@ -335,14 +146,6 @@ to resume.
   (`register_task_type`, `create_task_operation`), an exact task index with
   counts, cancel and dependents, and retry budgets
   (`TaskCreate(retry_key=, retry_budget=)`, `TaskRetryBudgetExhausted`).
-- Tasks fenced after their worker was lost, as when a deploy replaces the
-  worker during a non-restartable task, can be found and settled:
-  `is_fenced_after_worker_loss`, `TaskQuery(fenced_after_worker_loss=)`,
-  `reconcile_abandoned_tasks`, and `run_task_worker(reconcile_abandoned_after_s=)`
-  or `cayu worker --reconcile-abandoned-after-seconds` for a declared
-  single-worker deployment (off by default). Task workers log a warning for
-  each fenced task they find, `cayu inspect --fenced-tasks` lists them, and the
-  Cayu Cloud activity contract counts them in `task_health`.
 - Approvals and watchers: `app.propose_tool_call(...)` asks a person to approve
   an exact tool call without a model turn, and `app.register_event_watcher`
   runs watchers in servers and workers.

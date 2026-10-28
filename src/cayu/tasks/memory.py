@@ -2282,6 +2282,10 @@ class InMemoryTaskStore(TaskStore):
                     else self._tasks.get(operation.replay_source.task_id)
                 )
                 request = prepare_creation_operation(request, operation, source)
+            if task_id in self._task_graph_by_task or task_id in self._task_group_retry_lineage:
+                from cayu.tasks.graphs import TaskGraphConflict
+
+                raise TaskGraphConflict("Retained graph member identity cannot be reused.")
             if request.schedule_policy is not None and task_id in self._tasks:
                 existing = self._require_task(task_id)
                 if (
