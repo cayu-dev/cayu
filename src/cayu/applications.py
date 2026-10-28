@@ -3919,6 +3919,8 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
                 ).hexdigest()
             )
 
+        from cayu.sessions._participant_run_configuration import participant_configuration_json
+
         def binding_factory(
             session: Session,
         ) -> tuple[ParticipantSessionBinding, ParticipantSessionCreationReceipt]:
@@ -3948,6 +3950,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
                 request_commitment=creation.request_commitment,
                 execution_profile_commitment=execution_profile_commitment,
                 historical_definition_json=historical_definition_json,
+                run_configuration_json=participant_configuration_json(self, prepared, session),
                 creation_key=creation.creation_key,
                 policy_evidence_json=(
                     None if prepared.policy_evidence is None else prepared.policy_evidence.decode()
@@ -4254,6 +4257,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
                 expected_execution_profile=expected_profile,
                 participant_execution_key=execution.execution_key,
                 participant_session_instance_id=execution.session_instance_id,
+                participant_run_configuration_json=binding.run_configuration_json,
                 participant_context=context,
                 participant_permit_operation=operation.caller_key,
                 participant_permit_commitment=permit_commitment,
@@ -6962,6 +6966,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
         pause_after_initial_transcript: bool = False,
         participant_execution_key: str | None = None,
         participant_session_instance_id: str | None = None,
+        participant_run_configuration_json: str | None = None,
         participant_context: CollaborationAccessContext | None = None,
         participant_permit_operation: str | None = None,
         participant_permit_commitment: str | None = None,
@@ -6983,7 +6988,12 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances):
                     )
                 }
             )
-        request = self._with_application_run_defaults(request, expected=expected_execution_profile)
+        request = self._with_application_run_defaults(
+            request,
+            expected=expected_execution_profile,
+            participant_configuration_json=participant_run_configuration_json,
+            participant_session_instance_id=participant_session_instance_id,
+        )
         request = _validate_run_request(request)
         parent = (
             await self.session_store.load(request.parent_session_id)

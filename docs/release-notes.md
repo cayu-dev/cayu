@@ -45,6 +45,11 @@ storage migration.
 
 ### Changes
 
+- `linux_agent_launch` runs external-agent CLIs with Landlock and seccomp
+  confinement on Linux, without a Docker daemon or user namespaces. Filesystem
+  grants and TCP port grants are explicit; it adds no execution or resource quotas.
+  Local launcher cleanup now recognizes stopped Linux zombies when container
+  PID 1 has not reaped them.
 - The Developer dashboard documentation now maps the production shell and pages
   to their current source owners. Ejected/customised dashboards should follow
   the [source migration map](../dashboard/README.md#dashboard-structure-and-migration);

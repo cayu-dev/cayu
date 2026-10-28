@@ -24,9 +24,10 @@ from cayu.sessions.context_views import (
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("explicit_target", [False, True])
-@pytest.mark.parametrize("cloud_changes", [False, True])
+@pytest.mark.parametrize("explicit_default_retry", [False, True])
+@pytest.mark.parametrize("cloud_changes", [False, True, "evicted", "fresh-worker"])
 async def test_participant_execution_keeps_what_it_was_created_with(
-    native_stores, explicit_target, cloud_changes
+    native_stores, explicit_target, cloud_changes, explicit_default_retry
 ):
     collaboration, sessions, *_ = native_stores
     original, _initialized, _, recipient, *_ = await setup(collaboration)
@@ -36,27 +37,34 @@ async def test_participant_execution_keeps_what_it_was_created_with(
         "config.run.max_steps": 40,
         "config.run.retry_policy.max_attempts": 3,
     }
-    application = app(
-        collaboration,
-        original._participant_coordinator._registration,
-        session_store=sessions,
-        managed_settings=_controller(cloud),
-        release_identity=ReleaseIdentity(id=RELEASE),
-    )
-    provider = ScriptedModelProvider(
-        [[ModelStreamEvent.text_delta("result"), ModelStreamEvent.completed()]], name="provider"
-    )
-    application.register_provider(provider, default=True)
-    application.register_agent(
-        AgentSpec(name="reviewer", model="model-a", system_prompt="system"),
-        settings=[model_setting()],
-    )
+
+    def make_application():
+        application = app(
+            collaboration,
+            original._participant_coordinator._registration,
+            session_store=sessions,
+            managed_settings=_controller(cloud),
+            release_identity=ReleaseIdentity(id=RELEASE),
+        )
+        provider = ScriptedModelProvider(
+            [[ModelStreamEvent.text_delta("result"), ModelStreamEvent.completed()]], name="provider"
+        )
+        application.register_provider(provider, default=True)
+        application.register_agent(
+            AgentSpec(name="reviewer", model="model-a", system_prompt="system"),
+            settings=[model_setting()],
+        )
+        return application, provider
+
+    application, provider = make_application()
+    admitting_application = application
     await application.initialize_collaboration()
     case_id = uuid4().hex
     creation = RecipientSessionCreationRequest(
         request=RunRequest(
             agent_name="reviewer",
             messages=[Message.text("user", "input")],
+            **({"retry_policy": None} if explicit_default_retry else {}),
             target=ModelTarget(provider_name="provider", model="model-c")
             if explicit_target
             else None,
@@ -75,6 +83,13 @@ async def test_participant_execution_keeps_what_it_was_created_with(
             config__run__retry_policy__max_attempts=4,
         )
         await application.managed_settings_controller.poll_once()
+        if cloud_changes == "evicted":
+            for steps in range(61, 101):
+                cloud.set(config__run__max_steps=steps)
+                await application.managed_settings_controller.poll_once()
+        elif cloud_changes == "fresh-worker":
+            application, provider = make_application()
+            await application.initialize_collaboration()
     execution = ParticipantSessionExecutionRequest(
         request=creation.participant_request.request.model_copy(update={"session_id": session.id}),
         session_instance_id=session.instance_id,
@@ -95,3 +110,5 @@ async def test_participant_execution_keeps_what_it_was_created_with(
     )
     assert recorded.get("config.run.max_steps") == (None if cloud_changes else 40)
     await application.aclose()
+    if application is not admitting_application:
+        await admitting_application.aclose()

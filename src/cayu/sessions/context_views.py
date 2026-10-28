@@ -716,7 +716,22 @@ class ParticipantSessionBinding(ContractValue):
     historical_definition_json: StrictStr
     creation_key: StrictStr
     policy_evidence_json: StrictStr | None = None
+    run_configuration_json: StrictStr | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
     schema_version: Literal[1] = 1
+
+    @field_validator("run_configuration_json")
+    @classmethod
+    def validate_run_configuration(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        from cayu.sessions._invocation_configuration import InvocationConfiguration
+
+        value = _canonical_json_text(value, "participant run configuration", max_bytes=256 * 1024)
+        InvocationConfiguration.model_validate_json(value)
+        return value
 
     @field_validator("policy_evidence_json")
     @classmethod

@@ -18,6 +18,7 @@ from cayu.external_agents import (
     ClaudeAgentAdapter,
     CodexAgentAdapter,
     ExternalCleanupIncomplete,
+    linux_agent_launch,
     local_agent_launch,
     run_external_agent,
 )
@@ -294,7 +295,7 @@ record["hook"] = ask({"subtype": "hook_callback", "callback_id": hook, "tool_use
                                 "tool_input": arguments}})
 record["permission"] = ask({"subtype": "can_use_tool", "tool_name": "Read", "input": arguments,
                             "tool_use_id": "toolu_1", "permission_suggestions": []})
-with open(os.path.join(os.getcwd(), "..", "fake-claude.json"), "w") as output:
+with open(os.path.join(os.getcwd(), "fake-claude.json"), "w") as output:
     json.dump(record, output)
 session = "fake-session"
 message = {"id": "msg_1", "model": "claude-test", "role": "assistant", "type": "message",
@@ -318,12 +319,22 @@ while sys.stdin.readline():
 """
 
 
-def test_claude_adapter_runs_the_installed_sdk_through_a_local_launch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("confined", [False, True], ids=["local", "linux-confined"])
+def test_claude_adapter_runs_the_installed_sdk_through_a_local_launch(
+    tmp_path, monkeypatch, confined
+):
     """The installed claude-agent-sdk drives the adapter end to end, with no gateway."""
     if os.environ.get(_REQUIRE_SDK_ENV) == "1":
         import claude_agent_sdk as sdk
     else:
         sdk = pytest.importorskip("claude_agent_sdk")
+    if confined:
+        if sys.platform != "linux":
+            pytest.skip("requires Linux Landlock ABI 6")
+        import ctypes
+
+        if ctypes.CDLL(None).syscall(444, 0, 0, 1) < 6:
+            pytest.skip("kernel does not support Landlock ABI 6")
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     cli = _cli(tmp_path, _FAKE_CLAUDE, "claude")
@@ -336,7 +347,9 @@ def test_claude_adapter_runs_the_installed_sdk_through_a_local_launch(tmp_path, 
 
     @asynccontextmanager
     async def launch(context):
-        async with local_agent_launch(cli=str(cli), cwd=checkout) as prepared:
+        launcher = linux_agent_launch if confined else local_agent_launch
+        grants = {"read_only_paths": [sys.base_prefix, sys.prefix]} if confined else {}
+        async with launcher(cli=str(cli), cwd=checkout, **grants) as prepared:
             yield prepared
 
     async def scenario():
@@ -367,7 +380,7 @@ def test_claude_adapter_runs_the_installed_sdk_through_a_local_launch(tmp_path, 
             await app.aclose()
 
     asyncio.run(scenario())
-    record = json.loads((tmp_path / "fake-claude.json").read_text())
+    record = json.loads((checkout / "fake-claude.json").read_text())
     assert decisions == [("Read", {"file_path": "README.md"}, "toolu_1")]
     assert record["hook"]["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert record["permission"]["behavior"] == "allow"
@@ -623,3 +636,34 @@ def test_local_launch_lost_owner_remains_unconfirmed_until_group_is_empty(tmp_pa
                 os.kill(cli_pid, signal.SIGKILL)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux thread-group leader state")
+def test_local_group_probe_keeps_zombie_leader_with_live_thread():
+    from cayu.external_agents.local import _group_alive
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import ctypes, threading, time\n"
+            "threading.Thread(target=lambda: time.sleep(60)).start()\n"
+            "ctypes.CDLL(None).pthread_exit(None)\n",
+        ],
+        start_new_session=True,
+    )
+    try:
+        import time
+
+        deadline = time.monotonic() + 5
+        while True:
+            fields = Path(f"/proc/{process.pid}/stat").read_text().rsplit(") ", 1)[1].split()
+            if fields[0] == "Z":
+                break
+            assert time.monotonic() < deadline, "leader did not exit"
+            time.sleep(0.01)
+        assert int(fields[17]) > 1
+        assert _group_alive(process.pid)
+    finally:
+        os.killpg(process.pid, 9)
+        process.wait(timeout=5)

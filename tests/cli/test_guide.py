@@ -1212,7 +1212,8 @@ def test_external_agents_guide_example_records_a_scrubbed_priced_session(
     for name in ("local_agent_launch", "docker_agent_launch", "ExternalAgentLaunch", "Docker"):
         assert name in launchers
     example, codex = re.findall(r"```python\n(.*?)```", production, re.DOTALL)
-    _, local_codex = re.findall(r"```python\n(.*?)```", local, re.DOTALL)
+    quick_start = local.split("## Quick start without Docker or a gateway", 1)[1]
+    _, local_codex = re.findall(r"```python\n(.*?)```", quick_start, re.DOTALL)
 
     # The Codex snippets are not executed, so check their imports.
     for snippet in (codex, local_codex):

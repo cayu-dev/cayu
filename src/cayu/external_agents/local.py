@@ -110,6 +110,25 @@ def _group_alive(group: int) -> bool:
         return False
     except PermissionError:
         return True
+    if sys.platform == "linux":
+        # A container's PID 1 may never reap orphaned zombies. They cannot
+        # execute, hold files or receive signals, so do not report them as a
+        # running guest. Any unavailable observation remains unconfirmed.
+        try:
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+                except FileNotFoundError:
+                    continue
+                # A leader may exit while its other threads still execute.
+                # Only a single-thread zombie proves this process is stopped.
+                if int(fields[2]) == group and (fields[0] not in {"Z", "X"} or int(fields[17]) > 1):
+                    return True
+            return False
+        except (OSError, ValueError, IndexError):
+            return True
     return True
 
 

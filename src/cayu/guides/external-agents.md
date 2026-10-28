@@ -25,12 +25,13 @@ Required:
   after the process exits.
 - A finite `execution_deadline` on the `RunRequest`.
 - A launcher. It starts the CLI for one run and, when the run ends, stops it and
-  everything it started. Cayu ships three, and you can [write your
+  everything it started. Cayu ships four, and you can [write your
   own](#write-your-own-launcher):
 
 | Launcher | Where the CLI runs | Needs |
 | --- | --- | --- |
 | `local_agent_launch` | On this host, as the current user. Not a sandbox: use it for trusted code and tests. | Nothing else |
+| `linux_agent_launch` | On this Linux host, with Landlock and seccomp confinement | Landlock ABI 6 and seccomp; no Docker, root or namespaces |
 | `docker_agent_launch` | In a container on an internal Docker network | Docker, an image with the CLI, an internal network |
 | `runner_agent_launch` | In a runner that can open interactive processes, such as `LambdaMicroVMRunner` | That runner |
 
@@ -66,6 +67,53 @@ Without the gateway:
 With or without the gateway, every run gets a Cayu session and task, recorded
 events and usage, the deadline, tool authorization through `authorize`, and secret
 scrubbing in what Cayu stores.
+
+## Linux confinement without Docker
+
+`linux_agent_launch` runs the CLI on a Linux x86_64 or aarch64 host using
+Landlock and seccomp. It needs neither a Docker daemon nor user namespaces.
+It grants write access to the checkout and a fresh private HOME/TMPDIR, read
+access to system binaries/libraries and the CLI, and no network access by
+default. Add installation directories with `read_only_paths` when the CLI
+loads files next to its executable. A script whose interpreter is installed
+outside system directories also needs that interpreter installation granted
+(for example a Python installation under /opt). Host home directories and credentials are
+not inherited. This is host-kernel confinement, not a VM boundary.
+
+```python
+from contextlib import asynccontextmanager
+from cayu.external_agents import linux_agent_launch
+
+
+@asynccontextmanager
+async def confined_launch(context):
+    async with linux_agent_launch(
+        cli="/opt/vendor/bin/claude", cwd="/srv/review/checkout",
+        read_only_paths=["/opt/vendor"],
+    ) as prepared:
+        yield prepared
+```
+
+Use this launcher with the same adapters and `run_external_agent` as any
+other launcher. Stdio stays interactive, so approvals and usage observations
+continue to work. Descendants inherit confinement and cannot escape cleanup
+with `setsid` or signal the supervisor. Closing confirms no process in the
+owned group can still execute, including when container PID 1 retains zombies.
+File mode, ownership, timestamp and extended-attribute changes are blocked,
+even inside writable grants. Filesystem ioctls are blocked too; only terminal
+queries and nonblocking/close-on-exec descriptor controls are allowed.
+Missing kernel support refuses the launch; it never falls back to an
+unconfined local process. The launcher adds no CPU, memory, attempt or execution
+time quotas; choose run deadlines and resource policy for the application.
+
+For model access, keep real provider credentials in `ExternalAgentGateway`
+and pass only its per-run token in `environment`. Grant its TCP port with
+`allowed_tcp_ports=[port]` and use an IP literal such as `127.0.0.1` in the
+gateway URL. **A port grant permits that destination port on any address**;
+Landlock does not provide an IP/hostname allowlist. UDP/DNS and external UNIX
+sockets are blocked. Use a host firewall or a network-isolated runner when
+the application's contract requires host-based egress. Do not grant broad
+filesystem paths containing host secrets or writable launcher/interpreter files.
 
 ## Quick start without Docker or a gateway
 

@@ -482,13 +482,15 @@ steps:
           "${wheel_path}[claude-agent-sdk]" pytest
       done
       cp tests/core/test_external_local_launch.py "$external_root/"
+      cp tests/core/test_external_linux_launch.py "$external_root/"
       cd "$external_root"
       unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY \
         CLAUDE_CODE_OAUTH_TOKEN
       venv/bin/python -c \
         'import claude_agent_sdk; print("claude-agent-sdk", claude_agent_sdk.__version__)'
       CAYU_REQUIRE_CLAUDE_AGENT_SDK=1 \
-        venv/bin/python -m pytest -q -p no:cacheprovider test_external_local_launch.py
+        venv/bin/python -m pytest -q -p no:cacheprovider \
+          test_external_local_launch.py test_external_linux_launch.py
   - name: Check built-wheel generated Docker coding contract
     groups: docker
     run: |

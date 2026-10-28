@@ -372,6 +372,8 @@ class ManagedSettingsEntrances:
         *,
         seeded: bool = False,
         expected: ExecutionProfileIdentity | None = None,
+        participant_configuration_json: str | None = None,
+        participant_session_instance_id: str | None = None,
     ) -> _RunConfigurationRequest:
         """Resolve omitted run controls from the application's config.
 
@@ -388,6 +390,18 @@ class ManagedSettingsEntrances:
                 self._config_sources["run.max_steps"],
                 session,
                 freeze_retry_policy=self._managed_settings_controller is not None and not seeded,
+            )
+
+        if participant_configuration_json is not None:
+            from cayu.sessions._participant_run_configuration import (
+                inherit_participant_configuration,
+            )
+
+            return inherit_participant_configuration(
+                request,
+                participant_configuration_json,
+                session_instance_id=participant_session_instance_id,
+                profile=expected,
             )
 
         if expected is not None and len(self._managed_config_history) > 1:
