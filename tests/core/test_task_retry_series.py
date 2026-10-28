@@ -2616,6 +2616,10 @@ def test_task_worker_retains_active_handler_at_series_deadline_until_quiescent(
     store_kind: str,
     tmp_path: Path,
 ) -> None:
+    # The worker must claim the task before the series deadline or it never dispatches it,
+    # so leave room for a slow claim on a busy machine.
+    series_seconds = 1.0
+
     async def run() -> None:
         store = (
             InMemoryTaskStore()
@@ -2632,7 +2636,7 @@ def test_task_worker_retains_active_handler_at_series_deadline_until_quiescent(
                     type="job",
                     retry_policy=TaskRetryPolicy(
                         max_attempts=2,
-                        max_elapsed_seconds=0.2,
+                        max_elapsed_seconds=series_seconds,
                         initial_backoff_seconds=0,
                     ),
                 )
@@ -2660,7 +2664,8 @@ def test_task_worker_retains_active_handler_at_series_deadline_until_quiescent(
                 )
             )
             await asyncio.wait_for(handler_started.wait(), timeout=10)
-            await asyncio.sleep(0.75)
+            # Past the series deadline while the handler still runs.
+            await asyncio.sleep(series_seconds + 0.5)
             assert worker.done() is False
             assert handler_stopped.is_set() is False
             draining = await store.load_task(created.id)
