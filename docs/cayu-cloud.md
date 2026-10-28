@@ -1241,7 +1241,9 @@ Cloud limits how many sandboxes run at once, per Agent, per Organization and
 optionally per install. `SandboxBrokerClient.capacity()` reads what is free
 under each limit right now, from Cloud's `GET .../sandboxes/capacity`. A create
 with `queue_seconds` waits in Cloud's queue instead of being refused, and
-`SandboxBrokerClient.queue_position()` says where it stands
+`SandboxBrokerClient.queue_position()` says where it stands. The coding factory
+takes `queue_seconds` as well and reports a waiting session's queue position in
+its lifecycle progress events
 ([limits and capacity](environment-factories.md#coding-in-a-sandbox-brokered-by-cayu-cloud)).
 
 ## Fixed process resources

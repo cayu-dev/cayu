@@ -8,6 +8,8 @@ The parts compose but each works alone:
   where the broker offers them.
 - ``BrokeredSandboxWorkspace`` is a ``RunnerWorkspace`` whose bulk copies use the broker's
   archives, and its staged copies for trees and files larger than one archive.
+- ``report_sandbox_queue_position`` reports a queued create's place in Cloud's queue as
+  environment lifecycle progress.
 - ``BrokeredSandboxCodingEnvironmentFactory`` assembles them into per-session coding sandboxes.
 
 See "Coding in a sandbox brokered by Cayu Cloud" in ``docs/environment-factories.md``.
@@ -66,6 +68,7 @@ from cayu.sandbox_broker.coding import (
     BrokeredSandboxCodingEnvironmentFactory,
 )
 from cayu.sandbox_broker.lease import SandboxLeaseKeeper
+from cayu.sandbox_broker.queue import report_sandbox_queue_position
 from cayu.sandbox_broker.runner import (
     BrokeredSandboxRunner,
     BrokeredSandboxWorkspace,
@@ -124,6 +127,7 @@ __all__ = [
     "SandboxStdinWrite",
     "SandboxStdoutChunk",
     "StagedCopiesMode",
+    "report_sandbox_queue_position",
     "sandbox_capability_claims",
     "validate_egress_hosts",
     "validate_git_repositories",

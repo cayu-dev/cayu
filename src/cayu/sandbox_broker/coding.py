@@ -25,7 +25,7 @@ import secrets
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.egress._remote_adapter import setup_command_failure_message
@@ -67,6 +67,10 @@ from cayu.environments.coding_toolchains import (
     run_coding_toolchain_admission_probes,
     verify_local_coding_toolchain_dependencies,
 )
+from cayu.environments.lifecycle import (
+    EnvironmentLifecyclePhase,
+    current_environment_lifecycle_progress_reporter,
+)
 from cayu.runners import ExecCommand
 from cayu.runners.base import Runner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
@@ -80,8 +84,14 @@ from cayu.sandbox_broker.client import (
     validate_git_repositories,
     validate_labels,
     validate_lease_seconds,
+    validate_queue_seconds,
 )
 from cayu.sandbox_broker.lease import SandboxLeaseKeeper
+from cayu.sandbox_broker.queue import (
+    DEFAULT_QUEUE_HEARTBEAT_SECONDS,
+    DEFAULT_QUEUE_POLL_INTERVAL_SECONDS,
+    report_sandbox_queue_position,
+)
 from cayu.sandbox_broker.runner import (
     BROKERED_SANDBOX_CANDIDATE,
     MAX_TRANSFER_FILE_BYTES,
@@ -129,12 +139,17 @@ DEFAULT_IMAGE = "coding-python"
 DEFAULT_LEASE_SECONDS = 900
 # Cloud fails a sandbox still provisioning after five minutes.
 DEFAULT_READY_TIMEOUT_SECONDS = 330.0
+# How often a queued sandbox's position is read, and reported when unchanged, while
+# lifecycle progress is reported.
+_QUEUE_POLL_INTERVAL_SECONDS = DEFAULT_QUEUE_POLL_INTERVAL_SECONDS
+_QUEUE_HEARTBEAT_SECONDS = DEFAULT_QUEUE_HEARTBEAT_SECONDS
 #: How long each setup command may run, unless the factory sets otherwise.
 DEFAULT_BROKERED_SETUP_COMMAND_TIMEOUT_SECONDS = 600
 _PROTECTED_DIRECTORY_NAMES = (".cayu", ".git", ".runtime")
 _FACTORY_LABEL_KEYS = frozenset({"cayu.environment", "cayu.session"})
 _MAX_USER_LABELS = 10 - len(_FACTORY_LABEL_KEYS)
 _TOOLCHAIN_WORKSPACE = "/workspace"
+_T = TypeVar("_T")
 
 
 class BrokeredSandboxCodingBinding(SyncBinding):
@@ -374,6 +389,16 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     recovery after a crash is refused, so it never runs against an empty
     replacement.
 
+    With ``queue_seconds`` (default 0, up to ``MAX_QUEUE_SECONDS``) a create
+    over one of Cloud's limits waits in Cloud's queue for up to that long
+    instead of failing the session. ``ready_timeout_s`` (default 330) bounds
+    provisioning once Cloud admits the sandbox, so the factory waits
+    ``queue_seconds + ready_timeout_s`` in all. While the sandbox is queued and
+    the environment has a lifecycle policy, its queue position goes out as
+    ``environment.lifecycle.progress`` in the phase the runtime runs the create
+    under (see ``report_sandbox_queue_position``), and that phase's deadline
+    still applies.
+
     ``setup_commands`` run in the fresh sandbox before the workspace is copied
     in. ``workspace_setup_commands`` run after copy-in (and after the Git
     baseline) in ``/workspace``, for example to install the project's locked
@@ -432,6 +457,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         sandbox_excluded_directory_names: Sequence[str] = (),
         staging_capacity: SyncBindingStagingCapacity | None = None,
         ready_timeout_s: float = DEFAULT_READY_TIMEOUT_SECONDS,
+        queue_seconds: int = 0,
         renew_every_s: float | None = None,
         git_baseline: bool = True,
         workspace_setup_commands: Sequence[str] = (),
@@ -521,6 +547,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         self.sync_back = sync_back
         self.staging_capacity = staging_capacity
         self.ready_timeout_s = float(ready_timeout_s)
+        #: How long a create may wait in Cloud's queue; 0 fails it at once when over a limit.
+        self.queue_seconds = validate_queue_seconds(queue_seconds)
         self.renew_every_s = renew_every_s
         self.git_baseline = git_baseline
         self.setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
@@ -803,12 +831,48 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             git_repositories=self.git_repositories,
             lease_seconds=self.lease_seconds,
             labels=labels,
+            queue_seconds=self.queue_seconds,
+        )
+        # The runtime runs a follow-up turn's create under the reconnect phase.
+        phase = (
+            EnvironmentLifecyclePhase.FACTORY_RECONNECT
+            if request.operation is EnvironmentFactoryOperation.RECONNECT
+            else EnvironmentLifecyclePhase.FACTORY_PROVISIONING
         )
         try:
-            return await self.broker.wait_until_ready(sandbox.id, timeout_s=self.ready_timeout_s)
+            return await self._await_ready(sandbox, phase=phase)
         except BaseException as original:
             await self._discard(sandbox, None, None, original)
             raise
+
+    async def _await_ready(
+        self, sandbox: SandboxRecord, *, phase: EnvironmentLifecyclePhase
+    ) -> SandboxRecord:
+        # Time in the queue comes before provisioning, which ready_timeout_s bounds.
+        ready = self.broker.wait_until_ready(
+            sandbox.id, timeout_s=self.ready_timeout_s + self.queue_seconds
+        )
+        if sandbox.queued_until is None:
+            return await ready
+        _LOGGER.info(
+            "Brokered sandbox %s waits in Cayu Cloud's queue for capacity, at most until %s.",
+            sandbox.id,
+            sandbox.queued_until.isoformat(),
+        )
+        reporter = current_environment_lifecycle_progress_reporter()
+        if reporter is None:
+            return await ready
+        return await _await_beside(
+            ready,
+            report_sandbox_queue_position(
+                self.broker,
+                sandbox.id,
+                reporter=reporter,
+                phase=phase,
+                poll_interval_s=_QUEUE_POLL_INTERVAL_SECONDS,
+                heartbeat_s=_QUEUE_HEARTBEAT_SECONDS,
+            ),
+        )
 
     async def _discard(
         self,
@@ -883,6 +947,26 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             workspace_setup_commands=self.workspace_setup_commands,
             setup_command_timeout_s=self.setup_command_timeout_s,
         )
+
+
+async def _await_beside(main: Awaitable[_T], side: Awaitable[None]) -> _T:
+    """Await ``main`` while ``side`` runs beside it; an error from ``side`` ends both."""
+
+    main_task = asyncio.ensure_future(main)
+    side_task = asyncio.ensure_future(side)
+    try:
+        done, _ = await asyncio.wait({main_task, side_task}, return_when=asyncio.FIRST_COMPLETED)
+        # A side that failed ends main, even when main finished in the same loop turn; one
+        # that finished cleanly leaves main running.
+        if side_task in done:
+            side_task.result()
+        return await main_task
+    finally:
+        for task in (side_task, main_task):
+            if not task.done():
+                task.cancel()
+        # Retrieves every outcome, so none is reported as never retrieved.
+        await asyncio.gather(side_task, main_task, return_exceptions=True)
 
 
 def _env_list(env: Mapping[str, str], name: str) -> tuple[str, ...] | None:
@@ -1040,6 +1124,8 @@ class BrokeredCodingBackendOptions:
     labels: Mapping[str, str] | None = None
     git_baseline: bool = True
     staged_copies: StagedCopiesMode = "auto"
+    #: How long a create may wait in Cloud's queue for capacity (see the factory).
+    queue_seconds: int = 0
 
     def __post_init__(self) -> None:
         if type(self.image) is not str or not self.image.strip():
@@ -1050,6 +1136,7 @@ class BrokeredCodingBackendOptions:
         if type(self.git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
         validate_staged_copies_mode(self.staged_copies)
+        validate_queue_seconds(self.queue_seconds)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> BrokeredCodingBackendOptions:
@@ -1132,6 +1219,7 @@ def brokered_coding_backend(context: Any) -> Any:
             git_baseline=options.git_baseline,
             toolchain_profile=profile,
             staged_copies=options.staged_copies,
+            queue_seconds=options.queue_seconds,
             knowledge_store=knowledge_store,
             knowledge_access_scope=knowledge_access_scope,
         )

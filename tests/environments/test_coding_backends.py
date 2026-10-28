@@ -230,7 +230,7 @@ def test_cloud_backend_runs_the_neutral_profile_at_the_brokers_bar(tmp_path: Pat
         options={
             **_docker_options(),
             CLOUD_CODING_BACKEND: BrokeredCodingBackendOptions(
-                image="release", broker=broker.client()
+                image="release", broker=broker.client(), queue_seconds=120
             ),
         },
         environ=_CLOUD,
@@ -239,6 +239,7 @@ def test_cloud_backend_runs_the_neutral_profile_at_the_brokers_bar(tmp_path: Pat
     factory = backend.factory_for(LocalWorkspace(tmp_path, workspace_id="source"))
     assert isinstance(factory, BrokeredSandboxCodingEnvironmentFactory)
     assert (factory.egress, factory.image) == ("none", "release")
+    assert factory.queue_seconds == 120
     assert factory.toolchain_profile == profile
     assert backend.candidate == "cayu-cloud-sandbox"
     assert backend.execution_requirements().minimum_evidence == "available"

@@ -911,6 +911,14 @@ def validate_lease_seconds(lease_seconds: int) -> int:
     return lease_seconds
 
 
+def validate_queue_seconds(queue_seconds: int) -> int:
+    """Check how long a create may wait in Cloud's queue: 0 (never) to ``MAX_QUEUE_SECONDS``."""
+
+    if type(queue_seconds) is not int or not 0 <= queue_seconds <= MAX_QUEUE_SECONDS:
+        raise ValueError(f"Sandbox queue_seconds must be an integer from 0 to {MAX_QUEUE_SECONDS}.")
+    return queue_seconds
+
+
 def validate_command_shape(
     argv: Sequence[str], env: Mapping[str, str] | None, stdin: str | None
 ) -> None:
@@ -1067,10 +1075,7 @@ class SandboxBrokerClient:
         egress: dict[str, Any] = {"mode": mode}
         if hosts is not None:
             egress["hosts"] = list(hosts)
-        if type(queue_seconds) is not int or not 0 <= queue_seconds <= MAX_QUEUE_SECONDS:
-            raise ValueError(
-                f"Sandbox queue_seconds must be an integer from 0 to {MAX_QUEUE_SECONDS}."
-            )
+        validate_queue_seconds(queue_seconds)
         payload: dict[str, Any] = {
             "idempotency_key": idempotency_key,
             "image": image,

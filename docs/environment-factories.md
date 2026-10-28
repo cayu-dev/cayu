@@ -638,8 +638,9 @@ still unanswered, and the runner stops instead of working past it. When a
 command is abandoned (cancelled, or its start never confirmed), the runner waits
 for a start still in flight, then has 30 seconds to confirm the stop; a cancel
 answered later than that is still read once to confirm it. The factory waits up
-to 330 seconds for the sandbox, since Cloud fails one still provisioning after
-five minutes. Copy-in and copy-back use the broker's archive routes. Copy-in
+to 330 seconds for the sandbox (`ready_timeout_s`), since Cloud fails one still
+provisioning after five minutes, plus `queue_seconds` when it may queue (see
+below). Copy-in and copy-back use the broker's archive routes. Copy-in
 uploads the tree in archives of at most 8 MiB. Copy-back reads the changed
 files by name, in batches, splitting any batch the broker reports as too
 large. So a tree of any size moves, but without staged copies one file must
@@ -798,6 +799,36 @@ the next admission pass takes it. `capacity().queue.requests`
 lists every queued create of the Agent the same way (`None` from a Cloud that
 doesn't report positions, where `queue_position` raises `SandboxBrokerError`).
 
+The factory takes the same option. With
+`BrokeredSandboxCodingEnvironmentFactory(..., queue_seconds=600)` a session
+whose create finds a limit full waits in Cloud's queue for up to ten minutes
+instead of failing at once. The default, 0, keeps the old behavior: such a
+create is refused. `ready_timeout_s` still bounds provisioning once Cloud
+admits the sandbox, so the factory waits `queue_seconds + ready_timeout_s` in
+all (930 seconds here with the default 330). A sandbox still queued when its
+`queue_seconds` run out fails with `capacity_unavailable`, and the factory
+destroys anything a failed wait leaves. `BrokeredCodingBackendOptions` takes
+`queue_seconds` too, for the `cayu-cloud` coding backend.
+
+While a session's sandbox waits in the queue, and its environment has a
+`lifecycle_policy` (see [bounded lifecycle progress](#bounded-lifecycle-progress)),
+the factory reports where it stands as `environment.lifecycle.progress` events:
+`advanced` observations of the phase the runtime runs the create under
+(`factory_provisioning`, or `factory_reconnect` for a follow-up turn's fresh
+sandbox) whose `queued_count` is the queue position (0 when the next admission pass takes it,
+left out when Cloud can't work it out or doesn't report positions). A report
+goes out when the position changes and at least once a minute otherwise, the
+queue is read every 10 seconds, and these reports use at most half of the
+policy's `max_progress_events`. So a session that keeps reporting is queued,
+and one that goes quiet in that phase is stuck. The limit it waits
+for (`waiting_for`) goes to the `cayu.sandbox_broker.queue` log, since progress
+events carry only counts. The policy's deadlines still apply: each of those
+phases allows 900 seconds unless the policy says otherwise, and a queue report past it ends the session with
+`EnvironmentLifecycleDeadlineExceeded` and destroys the sandbox. Give both
+phases at least `queue_seconds + ready_timeout_s` plus the setup commands' time
+when sessions may queue longer. Without a lifecycle policy the factory still
+waits but reports nothing and doesn't read the queue.
+
 Final admission uses the sandbox record's versioned `guarantees`. A capability
 such as `untrusted_code_isolation`, `real_credential_non_possession`,
 `guest_privilege_containment` or `deny_by_default_network` is available only
@@ -818,6 +849,9 @@ Each part also works alone:
 
 - `SandboxBrokerClient` is the wire client;
 - `SandboxLeaseKeeper` renews one lease;
+- `report_sandbox_queue_position(broker, sandbox_id)` reports a queued
+  sandbox's position through the current lifecycle reporter until it leaves
+  the queue; run it beside `wait_until_ready` and cancel it when that returns;
 - `BrokeredSandboxRunner` is a `Runner` over one sandbox and destroys it when
   closed. Where the broker runs interactive commands (the sandbox record's
   `interactive_commands`), its `interactive_process_capability()` opens them
