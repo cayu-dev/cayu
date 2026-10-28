@@ -697,7 +697,14 @@ class FakeBroker:
                 archive.extractall(
                     sandbox.root / copy.get("path", "."), members=members[:1], filter="data"
                 )
-                copy.update(status="failed", error={"code": "copy_failed", "message": ""})
+                copy.update(
+                    status="failed",
+                    error={
+                        "code": "copy_disk_full",
+                        "message": "The staged copy failed: Extracting the archive failed: "
+                        "the sandbox ran out of disk space (exit 6).",
+                    },
+                )
                 return
             archive.extractall(sandbox.root / copy.get("path", "."), filter="data")
         copy.update(status="done", files=len(members))

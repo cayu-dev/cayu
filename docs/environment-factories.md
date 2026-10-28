@@ -684,7 +684,8 @@ repository credential: `BrokeredSandboxRunner.copy_in(source, size=...,
 sha256=..., path="repo")` (or `SandboxBrokerClient.copy_in`) moves a tar of
 any size the install allows, and `copy_out(sink, max_bytes=..., paths=[...])`
 reads one back and checks its digest. A failed copy raises
-`SandboxCopyFailedError` with the broker's error code. The sandbox is destroyed when the session's
+`SandboxCopyFailedError` with the broker's error code, and its message adds the broker's
+own words for where and why it failed. The sandbox is destroyed when the session's
 binding finalizes, or when setup fails. If copy-back fails, the factory keeps
 the sandbox for a retry but stops renewing it. The same happens when a final
 workspace observation or a mutating tool call never settles, since copy-back

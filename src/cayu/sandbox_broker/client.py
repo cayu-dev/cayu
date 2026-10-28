@@ -1537,14 +1537,19 @@ class SandboxBrokerClient:
         if copy.status != "done":
             error = copy.error
             code = None if error is None else error.code
+            # Cloud's message says where and why the copy failed, in its own words.
+            message = "" if error is None else error.message[:_MAX_ERROR_TEXT]
+            reason = f" {message}" if message else ""
             if code == "copy_too_large":
                 raise SandboxArchiveTooLargeError(
-                    f"Staged copy {copy.copy_id} failed: {code}.",
+                    f"Staged copy {copy.copy_id} failed: {code}.{reason}",
                     code=code,
                     detail={} if copy.size is None else {"bytes": copy.size},
                 )
             raise SandboxCopyFailedError(
-                f"Staged copy {copy.copy_id} {copy.status}" + (f": {code}" if code else "."),
+                f"Staged copy {copy.copy_id} {copy.status}"
+                + (f": {code}." if code else ".")
+                + reason,
                 copy=copy,
                 code=code,
                 detail={} if copy.size is None else {"bytes": copy.size},

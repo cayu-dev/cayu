@@ -1165,6 +1165,16 @@ def test_the_client_moves_staged_copies_and_reports_failures(tmp_path: Path) -> 
                 runner.sandbox_id, io.BytesIO(data), size=len(data), sha256="0" * 64
             )
         assert mismatch.value.code == "copy_digest_mismatch"
+        assert str(mismatch.value).endswith("failed: copy_digest_mismatch.")
+        # Cloud's message, which says why, follows the code.
+        broker.fail_copy_ins = 1
+        with pytest.raises(SandboxCopyFailedError) as full:
+            await client.copy_in(runner.sandbox_id, io.BytesIO(data), size=len(data), sha256=digest)
+        assert full.value.code == "copy_disk_full"
+        assert str(full.value).endswith(
+            "failed: copy_disk_full. The staged copy failed: Extracting the archive failed: "
+            "the sandbox ran out of disk space (exit 6)."
+        )
         with pytest.raises(SandboxArchiveTooLargeError):
             await client.start_copy_in(
                 runner.sandbox_id, "huge", size=2 * 1024 * 1024, sha256=digest

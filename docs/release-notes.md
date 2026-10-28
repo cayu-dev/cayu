@@ -1,5 +1,21 @@
 # Release notes
 
+## Unreleased
+
+Upgrade: No storage migration is required. Review the changes below before upgrading.
+
+### Breaking changes
+
+None.
+
+### Fixes
+
+- A failed staged copy's `SandboxCopyFailedError` now carries Cayu Cloud's message
+  after the code, so a brokered binding's failure says where and why the copy
+  failed (for example `Staged copy … failed: copy_disk_full. The staged copy
+  failed: Extracting the archive failed: the sandbox ran out of disk space (exit
+  6).`) instead of the bare code.
+
 ## v0.16.0
 
 Upgrade: stop 0.15.x writers, back up the store, and run `cayu storage migrate
