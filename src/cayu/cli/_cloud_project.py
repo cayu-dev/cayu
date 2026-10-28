@@ -263,6 +263,19 @@ class CloudSignIn:
     public_paths: tuple[str, ...] = ()
 
 
+_WEBHOOK_PATHS_LIMIT = 20
+_WEBHOOK_PATHS_ERROR = (
+    f"[webhooks] paths must be an array of 1 to {_WEBHOOK_PATHS_LIMIT} different path prefixes."
+)
+
+
+@dataclass(frozen=True)
+class CloudWebhooks:
+    """`[webhooks]`: path prefixes Cayu Cloud keeps requests for while the Agent sleeps."""
+
+    paths: tuple[str, ...]
+
+
 # The command `cayu new --with app-database` projects migrate their own tables with.
 APP_DATABASE_MIGRATE = "alembic upgrade head"
 _DATABASE_MIGRATE_ERROR = (
@@ -336,6 +349,19 @@ def _checked_sign_in(mode: object, public_paths: object) -> CloudSignIn:
     return CloudSignIn(mode="cloud", public_paths=paths)
 
 
+def _webhook_paths(paths: object) -> tuple[str, ...]:
+    if not isinstance(paths, list | tuple) or not 1 <= len(paths) <= _WEBHOOK_PATHS_LIMIT:
+        raise CloudApiError("manifest_invalid", _WEBHOOK_PATHS_ERROR)
+    checked = tuple(_same_host_path(item, label="Each [webhooks] paths entry") for item in paths)
+    if len(set(checked)) != len(checked):
+        raise CloudApiError("manifest_invalid", _WEBHOOK_PATHS_ERROR)
+    return checked
+
+
+def _webhooks(table: dict[str, object] | None) -> CloudWebhooks | None:
+    return None if table is None else CloudWebhooks(paths=_webhook_paths(table.get("paths")))
+
+
 def _process_resources(payload: dict[str, object]) -> dict[str, int]:
     resources = {}
     for name, minimum, maximum in (("cpu_millis", 100, 16_000), ("memory_mb", 128, 131_072)):
@@ -368,6 +394,7 @@ class CloudProjectManifest:
     home: str | None = None
     sign_in: CloudSignIn = CloudSignIn()
     database: CloudDatabase | None = None
+    webhooks: CloudWebhooks | None = None
 
     @classmethod
     def load(cls, path: Path) -> CloudProjectManifest:
@@ -407,6 +434,7 @@ class CloudProjectManifest:
             "home",
             "sign_in",
             "database",
+            "webhooks",
         }
         schema_version = payload.get("schema_version")
         if set(payload) - allowed or schema_version not in {1, 2}:
@@ -431,6 +459,11 @@ class CloudProjectManifest:
                 "manifest_invalid",
                 "[database] requires cayu-cloud.toml schema_version 2.",
             )
+        if schema_version == 1 and "webhooks" in payload:
+            raise CloudApiError(
+                "manifest_invalid",
+                "[webhooks] requires cayu-cloud.toml schema_version 2.",
+            )
         application = payload.get("application")
         if type(application) is not str:
             raise CloudApiError(
@@ -448,6 +481,9 @@ class CloudProjectManifest:
             database = payload.get("database")
             if database is not None and not isinstance(database, dict):
                 raise TypeError("database must be a table")
+            webhooks = payload.get("webhooks")
+            if webhooks is not None and not isinstance(webhooks, dict):
+                raise TypeError("webhooks must be a table")
             if web is not None and not isinstance(web, dict):
                 raise TypeError("web must be a table")
             if worker is not None and not isinstance(worker, dict):
@@ -467,6 +503,7 @@ class CloudProjectManifest:
                 ("worker", worker, CloudWorkerProcess),
                 ("sign_in", sign_in, CloudSignIn),
                 ("database", database, CloudDatabase),
+                ("webhooks", webhooks, CloudWebhooks),
                 *(
                     (
                         f'schedule "{item["name"]}"'
@@ -546,6 +583,7 @@ class CloudProjectManifest:
                 home=_home(payload.get("home")),
                 sign_in=_sign_in(sign_in),
                 database=_database(database),
+                webhooks=_webhooks(webhooks),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CloudApiError(
@@ -657,6 +695,8 @@ class CloudProjectManifest:
         _checked_sign_in(self.sign_in.mode, list(self.sign_in.public_paths) or None)
         if self.database is not None:
             _migrate_command(self.database.migrate)
+        if self.webhooks is not None:
+            _webhook_paths(self.webhooks.paths)
 
     def deployment_payload(self, *, repository: str, revision: str) -> dict[str, object]:
         return {
@@ -1144,7 +1184,7 @@ def resolve_project(
         _validate_source_manifest_path(manifest, relative_manifest)
         bundle = _archive_project(project_root, required_file=selected_manifest)
         if relative_manifest != _ROOT_MANIFEST:
-            _validate_root_sign_in(_uploaded_root_manifest(bundle), relative_manifest)
+            _validate_root_settings(_uploaded_root_manifest(bundle), relative_manifest)
         content_digest = "sha256:" + hashlib.sha256(bundle).hexdigest()
         digest = content_digest.removeprefix("sha256:")
         return ResolvedCloudProject(
@@ -1180,7 +1220,7 @@ def resolve_project(
         root_manifest = _optional_github_file(
             repository, revision=revision, path=_ROOT_MANIFEST.as_posix()
         )
-        _validate_root_sign_in(root_manifest, selected_manifest)
+        _validate_root_settings(root_manifest, selected_manifest)
     return ResolvedCloudProject(
         root=None,
         manifest_path=selected_manifest,
@@ -1191,8 +1231,8 @@ def resolve_project(
 
 
 def _validate_source_manifest_path(manifest: CloudProjectManifest, path: Path) -> None:
-    # Cloud reads storage acknowledgements, sign-in and home only from the root file, not
-    # from the selected CLI manifest path.
+    # Cloud reads storage acknowledgements, sign-in, home and webhooks only from the root
+    # file, not from the selected CLI manifest path.
     if path == _ROOT_MANIFEST:
         return
     if manifest.home is not None or manifest.sign_in != CloudSignIn():
@@ -1201,6 +1241,13 @@ def _validate_source_manifest_path(manifest: CloudProjectManifest, path: Path) -
             'home and [sign_in] mode = "cloud" require cayu-cloud.toml at the deployment '
             "root. Move the manifest there as a regular file and deploy without --manifest; "
             "Cloud reads sign-in and the home page only from that file.",
+        )
+    if manifest.webhooks is not None:
+        raise CloudApiError(
+            "manifest_invalid",
+            "[webhooks] requires cayu-cloud.toml at the deployment root. Move the manifest "
+            "there as a regular file and deploy without --manifest; Cloud reads webhook paths "
+            "only from that file.",
         )
     if manifest.local_files:
         raise CloudApiError(
@@ -1213,21 +1260,29 @@ def _validate_source_manifest_path(manifest: CloudProjectManifest, path: Path) -
 
 _ROOT_MANIFEST = Path("cayu-cloud.toml")
 _ROOT_MANIFEST_UNREADABLE = (
-    "Could not read the deployment root's cayu-cloud.toml, which Cloud reads sign-in and "
-    "the home page from. Fix that file, leave it out of the upload, or deploy without "
-    "--manifest."
+    "Could not read the deployment root's cayu-cloud.toml, which Cloud reads sign-in, "
+    "the home page and webhook paths from. Fix that file, leave it out of the upload, or "
+    "deploy without --manifest."
 )
 
 
-def _validate_root_sign_in(root_manifest: str | None, path: Path) -> None:
-    # A custom manifest deploys with the root file's sign-in and home, because Cloud reads
-    # them only from there. Refuse when that file declares anything but the default.
+def _validate_root_settings(root_manifest: str | None, path: Path) -> None:
+    # A custom manifest deploys with the root file's sign-in, home and webhooks, because
+    # Cloud reads them only from there. Refuse when that file declares anything but the
+    # default.
     if root_manifest is None:
         return
     try:
         payload = tomllib.loads(root_manifest)
     except tomllib.TOMLDecodeError as exc:
         raise CloudApiError("manifest_invalid", _ROOT_MANIFEST_UNREADABLE) from exc
+    if payload.get("webhooks") is not None:
+        raise CloudApiError(
+            "manifest_invalid",
+            "The deployment root's cayu-cloud.toml declares [webhooks], and Cloud reads "
+            f"webhook paths only from that file, not from {path.as_posix()}. Deploy without "
+            "--manifest, or remove [webhooks] from the root cayu-cloud.toml.",
+        )
     if payload.get("home") is None and payload.get("sign_in", {"mode": "own"}) == {"mode": "own"}:
         return
     raise CloudApiError(

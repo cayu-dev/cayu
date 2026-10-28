@@ -1449,6 +1449,42 @@ Developer dashboard access are its own, and for any other auth target; see
 because init cannot know a page of the project's own. Add `home` yourself when the
 Agent serves one.
 
+## Webhooks to a sleeping Agent
+
+An Agent's web process sleeps when it is idle. An Agent that receives webhooks lists their
+path prefixes, and Cayu Cloud keeps a `POST`, `PUT`, `PATCH` or `DELETE` to one of them
+while the Agent sleeps, answers the sender `202`, and delivers the request once the Agent
+is ready:
+
+```toml
+[webhooks]
+paths = ["/webhooks/"]
+```
+
+- `[webhooks]` is optional. Without it nothing changes: a request to a sleeping Agent
+  wakes it and gets `503`.
+- `paths` is required in `[webhooks]` and holds 1 to 20 different path prefixes. They
+  match like `public_paths`: one ending in `/` covers everything under it, any other
+  covers that path and everything below it. Each follows the same rules as `home` and
+  `public_paths` (see [Sign-in and home page](#sign-in-and-home-page)).
+- Other keys in `[webhooks]` are rejected like those in `[web]`. It requires
+  `schema_version = 2`. `cayu cloud deploy` checks it before uploading and fails with
+  `manifest_invalid`.
+- With `[sign_in] mode = "cloud"`, webhook paths are also public: no one is sent to sign
+  in and no identity is given, live or on delivery, so you don't list them again in
+  `public_paths`. With the Agent's own sign-in they reach the Agent like any request.
+- A delivered request is the kept one, unchanged, plus `X-Cayu-Cloud-Replayed: 1` and
+  `X-Cayu-Cloud-Received-At`. Delivery is at least once, so verify signatures and
+  deduplicate by the sender's delivery ID, as for
+  [external event waits](external-event-waits.md).
+
+Like `home` and `[sign_in]`, `[webhooks]` is not sent in the deployment request: Cayu
+Cloud reads it from the deployment root's uploaded `cayu-cloud.toml`. A custom
+`--manifest` path that declares it is rejected with `manifest_invalid`, and so is a custom
+`--manifest` deploy whose root `cayu-cloud.toml` declares it. A Cayu Cloud that doesn't
+keep webhooks yet ignores the table. `cayu cloud init` writes no `[webhooks]`, because it
+cannot know which paths receive them.
+
 ## Application database migration
 
 An Agent that keeps its own tables beside Cayu's, such as a project generated with
