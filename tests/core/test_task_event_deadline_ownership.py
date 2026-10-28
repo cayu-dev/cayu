@@ -1,7 +1,7 @@
 """Event cancellation preserves durable continuation and settlement authority."""
 
 import asyncio
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 
 import pytest
 from tests.core.test_continuation_deadlines import _app, _run, _settle, _store
@@ -459,6 +459,138 @@ def test_explicit_run_deadline_replaces_handler_default_across_events(
                     )
                 ]
             assert (await store.load("chat")).execution_deadline.expires_at == requested.expires_at
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("gate", ["approval", "user_input"])
+@pytest.mark.parametrize("event_seconds", [180, 1800])
+@pytest.mark.parametrize("settle_in_event", [False, True])
+def test_renewed_handler_deadline_survives_a_new_event(
+    backend, gate, event_seconds, settle_in_event, tmp_path, request, skip_ahead
+):
+    from tests.core.test_continuation_deadlines import _pause_in_handler
+
+    async def scenario():
+        store = _store(backend, tmp_path, request)
+        app = _app(store)
+        try:
+            first = ExecutionDeadline.after(event_seconds, source="task_event")
+            async with task_event_deadline_scope(first, event_id="first"):
+                await _pause_in_handler(app, "chat", gate)
+            skip_ahead(150)
+            async with AsyncExitStack() as stack:
+                if settle_in_event:
+                    await stack.enter_async_context(
+                        task_event_deadline_scope(first, event_id="first")
+                    )
+                await _settle(app, "chat", gate)
+            # Continue beyond the original handler deadline and, for the short
+            # event, beyond its deadline too. The renewed session bound survives.
+            skip_ahead(40)
+            async with task_event_deadline_scope(ExecutionDeadline.after(600), event_id="second"):
+                events = [
+                    event
+                    async for event in app.resume(
+                        ResumeRequest(session_id="chat", messages=[Message.text("user", "next")])
+                    )
+                ]
+            assert events[-1].type.value == "session.completed"
+            remaining = (await store.load("chat")).execution_deadline.remaining_seconds()
+            assert 50 < remaining < 90
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("gate", ["approval", "user_input"])
+@pytest.mark.parametrize("scope_kind", ["owned", "bound"])
+def test_renewal_retains_execution_scope_inside_event(
+    backend, gate, scope_kind, tmp_path, request, skip_ahead
+):
+    from tests.core.test_continuation_deadlines import _pause_in_handler
+
+    from cayu.deadlines import bind_execution_deadline, execution_deadline_scope
+
+    async def scenario():
+        store = _store(backend, tmp_path, request)
+        app = _app(store)
+        try:
+            await _pause_in_handler(app, "chat", gate)
+            async with (
+                task_event_deadline_scope(ExecutionDeadline.after(30), event_id="first"),
+                AsyncExitStack() as stack,
+            ):
+                inner = ExecutionDeadline.after(50)
+                if scope_kind == "owned":
+                    await stack.enter_async_context(execution_deadline_scope(inner))
+                else:
+                    stack.enter_context(bind_execution_deadline(inner))
+                await _settle(app, "chat", gate)
+            skip_ahead(60)
+            async with task_event_deadline_scope(ExecutionDeadline.after(600), event_id="second"):
+                with pytest.raises(ExecutionDeadlineExceeded):
+                    [
+                        event
+                        async for event in app.resume(
+                            ResumeRequest(
+                                session_id="chat", messages=[Message.text("user", "next")]
+                            )
+                        )
+                    ]
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("explicit_bound", [False, True])
+def test_workflow_event_scope_preserves_only_independent_deadlines(
+    backend, explicit_bound, tmp_path, request, skip_ahead
+):
+    from cayu.workflows import WorkflowBase, WorkflowSpec
+
+    async def scenario():
+        store = _store(backend, tmp_path, request)
+        app = _app(store)
+
+        class ChatWorkflow(WorkflowBase):
+            spec = WorkflowSpec(name="event-chat")
+
+            async def run(self, session_id):
+                for event in await _run(app, session_id, "plain"):
+                    yield event
+
+        try:
+            own = ExecutionDeadline.after(50) if explicit_bound else None
+            async with task_event_deadline_scope(ExecutionDeadline.after(30), event_id="first"):
+                [event async for event in ChatWorkflow(app).execute("chat", execution_deadline=own)]
+            skip_ahead(40)
+
+            async def resume():
+                async with task_event_deadline_scope(ExecutionDeadline.after(600), event_id="next"):
+                    return [
+                        event
+                        async for event in app.resume(
+                            ResumeRequest(
+                                session_id="chat", messages=[Message.text("user", "next")]
+                            )
+                        )
+                    ]
+
+            await resume()
+            skip_ahead(20)
+            if explicit_bound:
+                with pytest.raises(ExecutionDeadlineExceeded):
+                    await resume()
+            else:
+                await resume()
         finally:
             await app.aclose()
 

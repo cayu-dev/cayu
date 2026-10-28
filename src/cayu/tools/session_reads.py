@@ -167,13 +167,26 @@ class OwnTreeSessionAccess:
 class MatchingSessionAccess:
     """Sessions run by the named agents and carrying every label, minus exclusions.
 
-    ``agent_names`` and ``labels`` select sessions; at least one is required, so
-    the policy never admits every session in the store. ``exclude_labels``
-    removes sessions carrying any of its key/value pairs, for example to keep
-    a verifier from reading the work it checks.
+    ``agent_names`` and ``labels`` select sessions by fixed values.
+    ``same_labels`` names label keys whose value must equal the calling
+    session's own value, for example the repository or ticket the caller works
+    on. At least one of the three is required, so the policy never admits every
+    session in the store. ``exclude_labels`` removes sessions carrying any of
+    its key/value pairs, and ``exclude_same_labels`` removes sessions that share
+    the caller's value for any of its keys, for example to keep a verifier from
+    reading the work it checks. Neither exclusion removes a session that lacks
+    the key. A caller that lacks a label named in ``same_labels`` or
+    ``exclude_same_labels`` may read nothing.
     """
 
-    __slots__ = ("_agent_names", "_exclude_labels", "_include_caller", "_labels")
+    __slots__ = (
+        "_agent_names",
+        "_exclude_labels",
+        "_exclude_same_labels",
+        "_include_caller",
+        "_labels",
+        "_same_labels",
+    )
 
     def __init__(
         self,
@@ -181,6 +194,8 @@ class MatchingSessionAccess:
         agent_names: Collection[str] = (),
         labels: Mapping[str, str] | None = None,
         exclude_labels: Mapping[str, str] | None = None,
+        same_labels: Collection[str] = (),
+        exclude_same_labels: Collection[str] = (),
         include_caller: bool = False,
     ) -> None:
         if isinstance(agent_names, str | bytes):
@@ -188,14 +203,25 @@ class MatchingSessionAccess:
         if type(include_caller) is not bool:
             raise TypeError("include_caller must be a boolean.")
         selection = SessionQuery(agent_names=tuple(agent_names), labels=dict(labels or {}))
-        if not selection.agent_names and not selection.labels:
+        same = _label_keys(same_labels, "same_labels")
+        exclude_same = _label_keys(exclude_same_labels, "exclude_same_labels")
+        if not selection.agent_names and not selection.labels and not same:
             raise ValueError(
-                "MatchingSessionAccess requires agent_names or labels; "
+                "MatchingSessionAccess requires agent_names, labels or same_labels; "
                 "it never admits every session."
+            )
+        if overlap := sorted(set(same) & set(selection.labels)):
+            raise ValueError(f"same_labels and labels both name {overlap}; use one rule per key.")
+        if overlap := sorted(set(same) & set(exclude_same)):
+            raise ValueError(
+                f"same_labels and exclude_same_labels both name {overlap}; "
+                "that rule would admit nothing."
             )
         self._agent_names = selection.agent_names
         self._labels = dict(selection.labels)
         self._exclude_labels = copy_label_map(dict(exclude_labels or {}), "exclude_labels")
+        self._same_labels = same
+        self._exclude_same_labels = exclude_same
         self._include_caller = include_caller
 
     @property
@@ -211,10 +237,41 @@ class MatchingSessionAccess:
         return dict(self._exclude_labels)
 
     @property
+    def same_labels(self) -> tuple[str, ...]:
+        return self._same_labels
+
+    @property
+    def exclude_same_labels(self) -> tuple[str, ...]:
+        return self._exclude_same_labels
+
+    @property
     def include_caller(self) -> bool:
         return self._include_caller
 
+    def _label_rules(
+        self, caller: Session
+    ) -> tuple[dict[str, str], tuple[tuple[str, str], ...]] | None:
+        """Required labels and excluded pairs for ``caller``; ``narrow`` and ``allows`` share them.
+
+        Returns ``None`` when the caller lacks a label a caller-relative rule
+        needs, so neither method admits anything.
+        """
+
+        caller_keys = (*self._same_labels, *self._exclude_same_labels)
+        if any(key not in caller.labels for key in caller_keys):
+            return None
+        required = {**self._labels, **{key: caller.labels[key] for key in self._same_labels}}
+        excluded = (
+            *self._exclude_labels.items(),
+            *((key, caller.labels[key]) for key in self._exclude_same_labels),
+        )
+        return required, excluded
+
     async def narrow(self, caller: Session, query: SessionQuery) -> SessionQuery | None:
+        rules = self._label_rules(caller)
+        if rules is None:
+            return None
+        required, excluded = rules
         agent_names = query.agent_names
         if self._agent_names:
             if query.agent_name is not None and query.agent_name not in self._agent_names:
@@ -225,7 +282,7 @@ class MatchingSessionAccess:
             if not agent_names:
                 return None
         labels = dict(query.labels)
-        for key, value in self._labels.items():
+        for key, value in required.items():
             if labels.setdefault(key, value) != value:
                 return None
         selectors = (
@@ -234,7 +291,7 @@ class MatchingSessionAccess:
                 LabelSelectorRequirement(
                     key=key, operator=LabelSelectorOperator.NOT_IN, values=(value,)
                 )
-                for key, value in self._exclude_labels.items()
+                for key, value in excluded
             ),
         )
         return query.model_copy(
@@ -244,13 +301,23 @@ class MatchingSessionAccess:
     async def allows(self, caller: Session, session: Session) -> bool:
         if session.id == caller.id and not self._include_caller:
             return False
+        rules = self._label_rules(caller)
+        if rules is None:
+            return False
+        required, excluded = rules
         if self._agent_names and session.agent_name not in self._agent_names:
             return False
-        if any(session.labels.get(key) != value for key, value in self._labels.items()):
+        if any(session.labels.get(key) != value for key, value in required.items()):
             return False
-        return not any(
-            session.labels.get(key) == value for key, value in self._exclude_labels.items()
-        )
+        return not any(session.labels.get(key) == value for key, value in excluded)
+
+
+def _label_keys(keys: Collection[str], field_name: str) -> tuple[str, ...]:
+    """Validated, de-duplicated label keys for a caller-relative rule."""
+
+    if isinstance(keys, str | bytes):
+        raise TypeError(f"{field_name} must be a collection of label keys.")
+    return tuple(copy_label_map(dict.fromkeys(keys, "_"), field_name))
 
 
 class _SessionReadTool(Tool):

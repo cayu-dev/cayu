@@ -143,8 +143,35 @@ call. `OwnTreeSessionAccess()` admits the caller's root session tree: the root
 named by its invocation provenance and every descendant. `MatchingSessionAccess`
 admits sessions run by any of `agent_names` and carrying every pair in
 `labels`, minus sessions carrying any pair in `exclude_labels`; it needs
-`agent_names` or `labels`, so it never admits the whole store. Both hide the
-calling session unless `include_caller=True`. Other rules implement the
+`agent_names`, `labels` or `same_labels`, so it never admits the whole store.
+Both hide the calling session unless `include_caller=True`.
+
+Tools are registered once per application, so fixed label values can't say
+"the same project as the caller". `same_labels` names label keys whose value
+must equal the calling session's own value, and `exclude_same_labels` removes
+sessions that share the caller's value for any of its keys:
+
+```python
+agents = ("scout-hunter", "scout-verifier")
+# A hunter reads earlier hunter and verifier sessions on its repository and module.
+hunter_access = MatchingSessionAccess(
+    agent_names=agents,
+    same_labels=("scout_repo", "scout_module"),
+)
+# A verifier reads the same, but never a session of its own run.
+verifier_access = MatchingSessionAccess(
+    agent_names=agents,
+    same_labels=("scout_repo", "scout_module"),
+    exclude_same_labels=("scout_run",),
+)
+```
+
+A caller that lacks one of those labels may read nothing. As with
+`exclude_labels`, a session without the excluded key is not removed, so label
+every session the rule should keep out. A key may appear in only one of
+`labels` and `same_labels`, and not in both `same_labels` and
+`exclude_same_labels`. The rule is evaluated against the caller's labels at the
+time of each call. Other rules implement the
 `SessionReadAccess` protocol: `narrow(caller, query)` restricts the listing's
 `SessionQuery` (or returns `None` to admit nothing) and `allows(caller, session)`
 decides one session. The tools check every listed session with `allows`, and a
@@ -172,7 +199,8 @@ Tenancy comes from the scope, never from the model: the `labels` filter rejects
 keys the scope protects, and a cursor or session alias the tools did not issue
 to this caller is rejected. Labels in a `MatchingSessionAccess` (trusted application
 configuration) are intersected with the scope, so naming another tenant there
-admits nothing.
+admits nothing. `same_labels` reads the caller's own labels, which the scope
+already bounds, so it can't reach another tenant either.
 
 Multi-tenant applications must put the tenant label key, such as
 `organization`, in the scope's `protected_label_keys`. Keys used in the scope's

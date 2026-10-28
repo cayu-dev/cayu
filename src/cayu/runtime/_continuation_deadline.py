@@ -26,9 +26,9 @@ from cayu.approvals.user_input import UserInputResponse
 from cayu.deadlines import (
     ExecutionDeadline,
     ExecutionDeadlineRenewal,
-    current_execution_deadline,
     current_task_event_deadline,
     effective_deadline,
+    independent_event_deadline,
     renewal_from_metadata,
     resumed_execution_deadline,
     task_event_deadline_from_metadata,
@@ -113,14 +113,12 @@ async def renewed_human_wait_deadline(
         # It had already run out when the session paused; nothing to give back.
         return None
     renewed = ExecutionDeadline.after(left_at_pause, source=stored.source, scope=stored.scope)
-    enclosing = current_execution_deadline()
+    enclosing = independent_event_deadline(ExecutionDeadline(), explicit=True)
     assert renewed.expires_at is not None
     if enclosing.expires_at is not None and enclosing.expires_at < renewed.expires_at:
         # Never outlive the scope the decision is settled in.
         renewed = enclosing.model_copy(update={"source": stored.source, "scope": stored.scope})
-    renewed = effective_deadline(
-        renewed.with_origin("run_default"), task_event_deadline_from_metadata(session.metadata)
-    )
+    renewed = renewed.with_origin("run_default")
     return renewed, ExecutionDeadlineRenewal(pause_event_id=pause.id, seconds_left=left_at_pause)
 
 
@@ -176,6 +174,7 @@ async def continuation_deadline_replacement(
     # An event may admit a pre-existing session, but its outer bound must be
     # durable before any resumed work runs. Ordinary transient scopes still
     # cannot silently tighten a stored execution.
+    retained = requested.with_origin("explicit") if requested is not None else replacement
     replacement = effective_deadline(replacement, stored_event, event)
     resumed_execution_deadline(replacement).require_admission("resume")
     stored = session.execution_deadline
@@ -186,9 +185,10 @@ async def continuation_deadline_replacement(
         and stored.origin == replacement.origin
     ):
         return None
-    # Stores apply the event bound atomically. Preserve an explicit independent
-    # deadline too, so the next event cannot discard that session-level limit.
-    retained = requested.with_origin("explicit") if requested is not None else replacement
+    # Stores apply the event bound atomically. Preserve the independent explicit
+    # or renewed bound so the next event restores the current session limit.
+    if renewal is None and requested is None:
+        retained = replacement
     retained = retained.model_copy()
     retained._event_rebinding_allowed = event_rebound and allow_rebind
     return retained, renewal

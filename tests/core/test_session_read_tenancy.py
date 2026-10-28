@@ -124,6 +124,7 @@ def _policies(world: World) -> dict[str, SessionReadAccess]:
         "foreign_label": MatchingSessionAccess(labels={ORG: world.foreign_org}),
         "own_label": MatchingSessionAccess(labels={ORG: world.own_org}),
         "own_tree": OwnTreeSessionAccess(),
+        "same_label": MatchingSessionAccess(same_labels=[ORG]),
     }
 
 

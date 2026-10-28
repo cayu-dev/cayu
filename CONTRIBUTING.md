@@ -23,6 +23,14 @@ Our current maintainer priorities are:
 6. **New integrations** — usually belong outside this repo; see
    [placement policy](#placement-policy-what-lands-in-tree) before writing code.
 
+## Release notes
+
+Update `docs/release-notes.md` only when preparing a release. Ordinary feature,
+fix, documentation, and maintenance PRs must leave it unchanged, including the
+`Unreleased` section. Describe user-visible changes, breaking changes, and upgrade
+steps in the PR description so release preparation can curate them from merged PRs.
+Published release sections remain immutable. See [Releasing Cayu](docs/releasing.md).
+
 ## CI triggers
 
 CI runs when a non-draft pull request opens, receives a push, reopens, or is

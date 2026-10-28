@@ -118,8 +118,8 @@ def metadata_with_execution_deadline(
         allow_rebind=deadline._event_rebinding_allowed,
     )
     binding = metadata.get(TASK_EVENT_BINDING_METADATA_KEY)
-    explicit = deadline.origin == "explicit"
-    base = deadline if deadline.origin == "explicit" else deadline_from_metadata(metadata)
+    replaces_base = deadline.origin == "explicit" or renewal is not None
+    base = deadline if replaces_base else deadline_from_metadata(metadata)
     replaced = {
         key: value for key, value in metadata.items() if key not in EXECUTION_DEADLINE_METADATA_KEYS
     }
@@ -131,7 +131,7 @@ def metadata_with_execution_deadline(
     replaced.update(deadline_metadata(deadline))
     if event.expires_at is not None:
         replaced[TASK_EVENT_DEADLINE_METADATA_KEY] = event.model_dump(mode="json")
-        if binding is not None and not explicit:
+        if binding is not None and not replaces_base:
             replaced[TASK_EVENT_BINDING_METADATA_KEY] = binding
         else:
             replaced[TASK_EVENT_BINDING_METADATA_KEY] = {

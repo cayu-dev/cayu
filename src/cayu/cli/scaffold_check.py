@@ -1329,9 +1329,19 @@ def _referenced_modules(root: Path, scanned: set[Path], candidates: set[Path]) -
     seen: set[Path] = set()
     while pending and candidates - referenced:
         path = pending.pop()
-        if path in seen or path.is_dir():
+        if path in seen:
             continue
         seen.add(path)
+        # Python executes regular parent packages even for a dotted import or
+        # an entry target. Namespace packages may have regular ancestors too.
+        for parent in path.parents:
+            if parent == root or not parent.is_relative_to(root):
+                break
+            initializer = parent / "__init__.py"
+            if initializer.is_file() or initializer.is_symlink():
+                pending.append(initializer)
+        if path.is_dir() and not path.is_symlink():
+            continue
         tree = (
             None
             if path.is_symlink() or len(seen) > _MAX_DECLARATION_MODULES

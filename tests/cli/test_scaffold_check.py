@@ -329,6 +329,63 @@ def test_cli_check_scans_a_conftest_a_local_helper_imports_inside_a_function(
     ]
 
 
+@pytest.mark.parametrize(
+    "statement",
+    ("import lib.nested.helpers", "from lib.nested.helpers import build", "import lib.nested"),
+)
+@pytest.mark.parametrize("initializer", ("lib/__init__.py", "lib/nested/__init__.py"))
+def test_cli_check_scans_conftest_imported_by_parent_package(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    statement: str,
+    initializer: str,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    marker = tmp_path / "package-initializer-conftest-ran"
+    (project / "conftest.py").write_text(_payload(marker), encoding="utf-8")
+    (project / "lib" / "nested").mkdir(parents=True)
+    (project / initializer).write_text("import conftest\n", encoding="utf-8")
+    (project / "lib" / "nested" / "helpers.py").write_text(
+        "def build():\n    pass\n", encoding="utf-8"
+    )
+    with (project / "app.py").open("a", encoding="utf-8") as source:
+        source.write(f"\n\ndef build_lazy_app():\n    {statement}\n    return build_app()\n")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json", "app:build_lazy_app"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert not marker.exists()
+    assert ("SCAFFOLD_IMPORT_SIDE_EFFECT", "conftest.py:3") in [
+        (item["code"], item["path"]) for item in report["diagnostics"]
+    ]
+
+
+@pytest.mark.parametrize("module, relative", (("app.py", "."), ("tools/helper.py", "..")))
+def test_cli_check_keeps_parent_initializer_walk_inside_project(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    module: str,
+    relative: str,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    (tmp_path / "__init__.py").write_text("from .sibling import value\n", encoding="utf-8")
+    (project / "conftest.py").write_text(_PYTEST_FIXTURE, encoding="utf-8")
+    with (project / module).open("a", encoding="utf-8") as source:
+        source.write(f"\n\ndef unused():\n    from {relative} import thing\n")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["manifest_fingerprint"] != "unavailable"
+
+
 @pytest.mark.parametrize("explicit", (False, True))
 def test_cli_check_scans_a_factory_module_named_conftest(
     tmp_path: Path,

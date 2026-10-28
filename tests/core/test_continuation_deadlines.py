@@ -911,14 +911,19 @@ def test_human_wait_renewal_cannot_extend_task_event_deadline(
                 task_event_deadline_from_metadata(session.metadata).expires_at == event.expires_at
             )
             skip_ahead(150)
-            replacement, _ = await continuation_deadline_replacement(
+            replacement, renewal = await continuation_deadline_replacement(
                 store,
                 session,
                 None,
                 human_decision=True,
             )
-            assert replacement.expires_at == event.expires_at
-            assert replacement.origin == "enclosing"
+            from cayu.sessions._deadline_replacement import metadata_with_execution_deadline
+
+            effective = deadline_from_metadata(
+                metadata_with_execution_deadline(session.metadata, replacement, renewal)
+            )
+            assert effective.expires_at == event.expires_at
+            assert effective.origin == "enclosing"
             with pytest.raises(ExecutionDeadlineExceeded):
                 skip_ahead(31)
                 await continuation_deadline_replacement(

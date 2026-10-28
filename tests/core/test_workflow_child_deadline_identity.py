@@ -577,8 +577,8 @@ async def test_native_deadline_reconciles_completion_publication(
     scope = deadlines.execution_deadline_scope
 
     @contextlib.asynccontextmanager
-    async def tracked_scope(deadline):
-        async with scope(deadline) as timer:
+    async def tracked_scope(deadline, **options):
+        async with scope(deadline, **options) as timer:
             task_timers = timers.setdefault(asyncio.current_task(), [])
             task_timers.append(timer)
             try:

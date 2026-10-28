@@ -3,6 +3,11 @@
 Publish releases from `cayu-dev/cayu` after the release commit passes validation.
 Only public `v*` tag pushes publish. Leave PR merges and release tags to a maintainer.
 
+Release notes are edited only during release preparation. Ordinary PRs leave
+`docs/release-notes.md` unchanged and record user-visible changes, breaking changes,
+and upgrade steps in their descriptions. Curate the release notes from the merged
+PRs since the previous release; do not rely on an accumulated `Unreleased` section.
+
 1. Choose an unused version. Update `pyproject.toml`, `src/cayu/_version.py`,
    `uv.lock`, and `dashboard/src/lib/release-metadata.ts`. Add one short,
    matching, non-empty `## vX.Y.Z` section to `docs/release-notes.md`. Start it
@@ -45,8 +50,8 @@ matching release-note section verbatim.
 
 Never reuse a published version, move its tag, or edit its tagged release notes.
 If PyPI succeeds but GitHub release creation fails, rerun only the failed job.
-After release, give the development branch a distinct development version and one
-`## Unreleased` section in the same format.
+After release, give the development branch a distinct development version. Leave
+release notes unchanged until preparation of the next release.
 
 CI retains the shared wheel and source archives for three days so package checks,
 approval, and publication consume the same bytes. Complete approval within that

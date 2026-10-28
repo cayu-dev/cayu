@@ -147,8 +147,10 @@ removals, new versions of versioned contracts, and default changes.
 
 ## Release-notes format
 
-Every new release section in [release-notes.md](release-notes.md), including
-`## Unreleased`, has this shape:
+Edit [release-notes.md](release-notes.md) only during release preparation; ordinary
+PRs leave it unchanged and describe changes and upgrade steps in their PR descriptions.
+Every new release section (including a temporary `## Unreleased` draft during
+release preparation) has this shape:
 
 ```markdown
 ## vX.Y.Z

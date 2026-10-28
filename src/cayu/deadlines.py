@@ -233,6 +233,11 @@ _TASK_EVENT_BASE: ContextVar[ExecutionDeadline | None] = ContextVar(
 
 
 _TASK_EVENT_ID: ContextVar[str | None] = ContextVar("cayu_task_event_id", default=None)
+# Raw non-event scopes can be longer than the effective event limit. Keep them
+# independently so a later event cannot erase their session-level bound.
+_TASK_EVENT_INNER: ContextVar[ExecutionDeadline | None] = ContextVar(
+    "cayu_task_event_inner_deadline", default=None
+)
 
 
 def independent_event_deadline(
@@ -257,6 +262,7 @@ def independent_event_deadline(
         _TASK_EVENT_BASE.get() or ExecutionDeadline(),
         independent_default,
         independent_current,
+        _TASK_EVENT_INNER.get() or ExecutionDeadline(),
         requested if explicit or requested.expires_at != event.expires_at else ExecutionDeadline(),
     )
 
@@ -681,7 +687,9 @@ def deadline_metadata(deadline: ExecutionDeadline) -> dict[str, Any]:
 
 
 @asynccontextmanager
-async def execution_deadline_scope(deadline: ExecutionDeadline) -> AsyncIterator[asyncio.Timeout]:
+async def execution_deadline_scope(
+    deadline: ExecutionDeadline, *, _event_bound: bool = False
+) -> AsyncIterator[asyncio.Timeout]:
     """Bind/inherit a boundary and enforce it through ordinary task cancellation.
 
     Exit runs after enclosed cancellation settlement. Cleanup must not call
@@ -690,6 +698,11 @@ async def execution_deadline_scope(deadline: ExecutionDeadline) -> AsyncIterator
     parent = current_execution_deadline()
     selected = effective_deadline(parent, deadline)
     token = _CURRENT.set(selected)
+    independent_token = _TASK_EVENT_INNER.set(
+        _TASK_EVENT_INNER.get()
+        if _event_bound or _TASK_EVENT.get() is None
+        else effective_deadline(_TASK_EVENT_INNER.get() or ExecutionDeadline(), deadline)
+    )
     task = asyncio.current_task()
     already_owned = _OWNER.get() is task and selected.expires_at == parent.expires_at
     owner_token = _OWNER.set(task)
@@ -735,52 +748,85 @@ async def execution_deadline_scope(deadline: ExecutionDeadline) -> AsyncIterator
         raise
     finally:
         _OWNER.reset(owner_token)
+        _TASK_EVENT_INNER.reset(independent_token)
         _CURRENT.reset(token)
 
 
 _T = TypeVar("_T")
 
 
+@contextmanager
+def _retain_event_inner_deadline(deadline: ExecutionDeadline) -> Iterator[None]:
+    """Retain an independent stream bound without changing timer ownership."""
+    token = _TASK_EVENT_INNER.set(
+        _TASK_EVENT_INNER.get()
+        if _TASK_EVENT.get() is None
+        else effective_deadline(_TASK_EVENT_INNER.get() or ExecutionDeadline(), deadline)
+    )
+    try:
+        yield
+    finally:
+        _TASK_EVENT_INNER.reset(token)
+
+
 async def deadline_stream(
-    stream: AsyncIterator[_T], deadline: ExecutionDeadline
+    stream: AsyncIterator[_T],
+    deadline: ExecutionDeadline,
+    *,
+    independent_deadline: ExecutionDeadline | None = None,
 ) -> AsyncGenerator[_T, None]:
     """Bind only while driving the producer, never across a yield to its caller."""
     iterator = aiter(stream)
+    event = current_task_event_deadline()
+    retained = independent_deadline
+    if retained is None:
+        retained = (
+            ExecutionDeadline()
+            if event.expires_at is not None and deadline.expires_at == event.expires_at
+            else deadline
+        )
     try:
         if deadline.expires_at is None and current_execution_deadline().expires_at is None:
             while True:
-                with bind_execution_deadline(deadline):
+                with (
+                    _retain_event_inner_deadline(retained),
+                    bind_execution_deadline(deadline, _event_bound=True),
+                ):
                     try:
                         item = await anext(iterator)
                     except StopAsyncIteration:
                         return
                 yield item
         while True:
-            async with execution_deadline_scope(deadline):
-                try:
-                    if current_execution_deadline().expired:
-                        # Let the owned timer deliver before advancing a
-                        # producer that may yield without suspending.
-                        await asyncio.sleep(0)
-                        current_execution_deadline().require_admission("execution")
-                    item = await anext(iterator)
-                    if current_execution_deadline().expired:
-                        await asyncio.sleep(0)
-                        current_execution_deadline().require_admission("execution_completion")
-                except StopAsyncIteration:
-                    return
-                except BaseException as failure:
-                    # Producer cleanup classifies an owned deadline while its
-                    # timer is still live, including expiry between phases.
-                    close = getattr(iterator, "aclose", None)
-                    if close is not None:
-                        await _close_after_deadline_failure(close, failure)
-                    raise
+            with _retain_event_inner_deadline(retained):
+                async with execution_deadline_scope(deadline, _event_bound=True):
+                    try:
+                        if current_execution_deadline().expired:
+                            # Let the owned timer deliver before advancing a
+                            # producer that may yield without suspending.
+                            await asyncio.sleep(0)
+                            current_execution_deadline().require_admission("execution")
+                        item = await anext(iterator)
+                        if current_execution_deadline().expired:
+                            await asyncio.sleep(0)
+                            current_execution_deadline().require_admission("execution_completion")
+                    except StopAsyncIteration:
+                        return
+                    except BaseException as failure:
+                        # Producer cleanup classifies an owned deadline while its
+                        # timer is still live, including expiry between phases.
+                        close = getattr(iterator, "aclose", None)
+                        if close is not None:
+                            await _close_after_deadline_failure(close, failure)
+                        raise
             yield item
     finally:
         close = getattr(iterator, "aclose", None)
         if close is not None:
-            with bind_execution_deadline(deadline):
+            with (
+                _retain_event_inner_deadline(retained),
+                bind_execution_deadline(deadline, _event_bound=True),
+            ):
                 await close()
 
 
@@ -822,12 +868,20 @@ def resumed_execution_deadline(stored: ExecutionDeadline) -> ExecutionDeadline:
 
 
 @contextmanager
-def bind_execution_deadline(deadline: ExecutionDeadline) -> Iterator[None]:
+def bind_execution_deadline(
+    deadline: ExecutionDeadline, *, _event_bound: bool = False
+) -> Iterator[None]:
     """Restore portable context in a process whose parent owns cancellation."""
     token = _CURRENT.set(effective_deadline(current_execution_deadline(), deadline))
+    independent_token = _TASK_EVENT_INNER.set(
+        _TASK_EVENT_INNER.get()
+        if _event_bound or _TASK_EVENT.get() is None
+        else effective_deadline(_TASK_EVENT_INNER.get() or ExecutionDeadline(), deadline)
+    )
     try:
         yield
     finally:
+        _TASK_EVENT_INNER.reset(independent_token)
         _CURRENT.reset(token)
 
 
@@ -858,13 +912,13 @@ async def task_event_deadline_scope(
                 and (selected.expires_at is None or enclosing.expires_at < selected.expires_at)
             )
         ):
-            async with execution_deadline_scope(selected):
+            async with execution_deadline_scope(selected, _event_bound=True):
                 yield
         else:
             # The handler's event timer is the only cancellation owner. Keep
             # that same live timer visible during session/effect settlement;
             # a passive nested timeout cannot provide expiry evidence.
-            with bind_execution_deadline(selected):
+            with bind_execution_deadline(selected, _event_bound=True):
                 owner_token = _OWNER.set(asyncio.current_task())
                 timer_token = _TIMERS.set((*_TIMERS.get(), (limit._timer, selected)))
                 try:

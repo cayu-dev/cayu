@@ -146,8 +146,10 @@ def test_tools_need_an_explicit_read_only_policy() -> None:
         ListSessionsTool(store, access=None)  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="SessionReadAccess"):
         ReadSessionTool(store, access=object())  # ty: ignore[invalid-argument-type]
-    with pytest.raises(ValueError, match="agent_names or labels"):
+    with pytest.raises(ValueError, match="agent_names, labels or same_labels"):
         MatchingSessionAccess(exclude_labels={"role": "hunter"})
+    with pytest.raises(ValueError, match="agent_names, labels or same_labels"):
+        MatchingSessionAccess(exclude_same_labels=["run"])
     with pytest.raises(TypeError, match="collection"):
         MatchingSessionAccess(agent_names="hunter")
     list_tool = ListSessionsTool(store, access=OwnTreeSessionAccess())
@@ -286,6 +288,94 @@ def test_matching_scope_filters_by_agents_and_labels_and_excludes_labels(
         assert "hunt-1" in await _listed(store, mine, "hunt-1")
         readable = await _read(store, mine, "hunt-1", session_id="hunt-1")
         assert not readable.is_error
+
+    _run_with_store(backend, sqlite_resources, scenario)
+
+
+def test_caller_relative_label_rules_are_validated() -> None:
+    access = MatchingSessionAccess(same_labels=["repo", "repo"], exclude_same_labels=("run",))
+    assert access.same_labels == ("repo",)
+    assert access.exclude_same_labels == ("run",)
+    assert MatchingSessionAccess(agent_names=["hunter"]).same_labels == ()
+    with pytest.raises(TypeError, match="collection of label keys"):
+        MatchingSessionAccess(same_labels="repo")
+    with pytest.raises(TypeError, match="collection of label keys"):
+        MatchingSessionAccess(agent_names=["hunter"], exclude_same_labels="run")
+    with pytest.raises(ValueError, match="same_labels"):
+        MatchingSessionAccess(same_labels=[" "])
+    with pytest.raises(ValueError, match="one rule per key"):
+        MatchingSessionAccess(labels={"repo": "r1"}, same_labels=["repo"])
+    with pytest.raises(ValueError, match="admit nothing"):
+        MatchingSessionAccess(same_labels=["run"], exclude_same_labels=["run"])
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_matching_scope_compares_labels_with_the_calling_session(
+    backend: str, sqlite_resources
+) -> None:
+    async def scenario(store: SessionStore) -> None:
+        def scout(repo: str, module: str, run: str) -> dict[str, str]:
+            return {"repo": repo, "module": module, "run": run}
+
+        await _session(store, "hunt-now", agent="hunter", labels=scout("r1", "m1", "2"))
+        await _session(store, "verify-now", agent="verifier", labels=scout("r1", "m1", "2"))
+        await _session(store, "hunt-old", agent="hunter", labels=scout("r1", "m1", "1"))
+        await _session(store, "verify-old", agent="verifier", labels=scout("r1", "m1", "1"))
+        await _session(store, "other-module", agent="hunter", labels=scout("r1", "m2", "1"))
+        await _session(store, "other-repo", agent="hunter", labels=scout("r2", "m1", "1"))
+        await _session(store, "planner", agent="planner", labels=scout("r1", "m1", "1"))
+        await _session(store, "no-run", agent="verifier", labels={"repo": "r1", "module": "m1"})
+        await _session(store, "no-module", agent="verifier", labels={"repo": "r1", "run": "1"})
+
+        agents = ("hunter", "verifier")
+        hunter = MatchingSessionAccess(agent_names=agents, same_labels=("repo", "module"))
+        verifier = MatchingSessionAccess(
+            agent_names=agents, same_labels=("repo", "module"), exclude_same_labels=("run",)
+        )
+        assert sorted(await _listed(store, hunter, "hunt-now")) == [
+            "hunt-old",
+            "no-run",
+            "verify-now",
+            "verify-old",
+        ]
+        assert sorted(await _listed(store, hunter, "hunt-old")) == [
+            "hunt-now",
+            "no-run",
+            "verify-now",
+            "verify-old",
+        ]
+        # A verifier never sees its own run, so it cannot read the hunter it checks.
+        # A session without a run label is not in the caller's run, as with exclude_labels.
+        assert sorted(await _listed(store, verifier, "verify-now")) == [
+            "hunt-old",
+            "no-run",
+            "verify-old",
+        ]
+        assert await _listed(store, verifier, "verify-now", labels={"run": "2"}) == []
+        assert await _listed(store, verifier, "verify-now", labels={"module": "m2"}) == []
+        assert await _listed(store, verifier, "verify-now", agent_name="planner") == []
+        same_run = await _read(store, verifier, "verify-now", session_id="hunt-now")
+        assert same_run.structured == {"error": "session_not_found"}
+        other_repo = await _read(store, verifier, "verify-now", session_id="other-repo")
+        assert other_repo.structured == {"error": "session_not_found"}
+        assert not (await _read(store, verifier, "verify-now", session_id="hunt-old")).is_error
+
+        # A caller without a label the rule compares with reads nothing.
+        assert await _listed(store, hunter, "no-module") == []
+        assert await _listed(store, verifier, "no-run") == []
+        assert sorted(await _listed(store, hunter, "no-run")) == [
+            "hunt-now",
+            "hunt-old",
+            "verify-now",
+            "verify-old",
+        ]
+        no_run = await _read(store, verifier, "no-run", session_id="hunt-old")
+        assert no_run.structured == {"error": "session_not_found"}
+        no_run_caller = await store.load("no-run")
+        hunt_old = await store.load("hunt-old")
+        assert no_run_caller is not None and hunt_old is not None
+        assert await verifier.narrow(no_run_caller, SessionQuery()) is None
+        assert await verifier.allows(no_run_caller, hunt_old) is False
 
     _run_with_store(backend, sqlite_resources, scenario)
 

@@ -579,7 +579,9 @@ class WorkflowBase(Workflow):
                 raise ValueError("Cannot tighten an existing workflow on resume; create a child.")
             boundary = resumed_execution_deadline(anchor.execution_deadline)
         boundary.require_admission("workflow")
-        async with contextlib.aclosing(deadline_stream(self.run(session_id), boundary)) as stream:
+        async with contextlib.aclosing(
+            deadline_stream(self.run(session_id), boundary, independent_deadline=execution_deadline)
+        ) as stream:
             async for event in stream:
                 yield event
 
