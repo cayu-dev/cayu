@@ -21,7 +21,7 @@ from pydantic import ValidationError
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.budgets.base import BudgetPolicy
-from cayu.configuration import MAX_STEPS, CayuConfig, CayuConfigSource
+from cayu.configuration import MAX_STEPS, CayuConfig, CayuConfigSource, cayu_config_data
 from cayu.context.thinking import ThinkingConfig
 from cayu.execution_profiles import (
     ExecutionProfileComponentClass,
@@ -235,7 +235,9 @@ def managed_config(
     runtime can't hold) leaves the others in place.
     """
 
-    data = code.model_dump(mode="python", warnings=False)
+    # Without retry fields the code didn't set, so a retry time budget it
+    # didn't choose still follows the attempts Cloud manages.
+    data = cayu_config_data(code)
     config, paths, refused = code, set(), {}
     for item in CONFIG_SETTINGS:
         value = value_for(item)

@@ -11064,9 +11064,9 @@ OpenAI, Chat Completions, Vertex, and Anthropic HTTP errors also preserve valid
 an in-band error carried by a successful HTTP stream. This delay comes only
 from the trusted response header, never an event JSON field; the runtime uses
 it in preference to exponential backoff, capped by `RetryPolicy.max_delay_s`
-(30 seconds by default; set it up to 3,600 seconds to honor a long rate-limit
+(60 seconds by default; set it up to 3,600 seconds to honor a long rate-limit
 window). `max_attempts` and `max_unknown_attempts` accept up to 50.
-`max_retry_elapsed_s` (off by default, up to 86,400 seconds) is a time budget
+`max_retry_elapsed_s` (300 seconds by default, up to 86,400 seconds) is a time budget
 for rate-limit and overload failures: HTTP 429, 503 and 529, or the
 `rate_limit` reason. It counts from the start of the model step's first
 attempt. While it applies, each retry waits at least the remaining budget
@@ -11076,9 +11076,11 @@ terminal with `retry_disposition="configured_attempt_exhaustion"` and
 `effective_max_attempts` equal to the last attempt, which still permits model
 failover. `max_attempts` remains the attempt ceiling. Agent model steps and
 automatic compaction apply the budget; auxiliary inference and provider
-completion verifiers use ordinary backoff. A policy without a budget
-serializes exactly as before the field existed, so its execution-profile
-identity is unchanged.
+completion verifiers use ordinary backoff. When a policy leaves
+`max_retry_elapsed_s` unset and its own backoff (`max_attempts - 1` delays of
+`initial_delay_s` growing by `backoff_multiplier`, each plus `jitter_s` and at
+most `max_delay_s`) can exceed 300 seconds, validation sets the budget to
+`None`, so the policy serializes, reloads and fingerprints without one.
 Structured in-band stream errors use the same retry contract and retain an
 explicit valid `status_code` when the event supplies one:
 Anthropic-shaped overload/rate-limit/API/timeout identities map to

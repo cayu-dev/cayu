@@ -96,6 +96,12 @@ budget is spent, and `max_attempts` still bounds the attempts:
 waits out a limit of about a quarter of an hour. `max_retry_elapsed_s=None`
 turns the budget off, and a zero `initial_delay_s` never waits.
 
+The default budget never shortens a policy's own backoff. If you don't set
+`max_retry_elapsed_s` and the policy's delays (each plus `jitter_s`, at most
+`max_delay_s`) can add up to more than 300 seconds across its attempts, the
+budget is off and those delays apply as written. Set `max_retry_elapsed_s` to
+keep a budget with such a policy.
+
 Widen it for every run of an application, or for one run, before writing your
 own loop that retries whole sessions:
 
@@ -105,6 +111,7 @@ from cayu.configuration import RunDefaults
 from cayu.providers import RetryPolicy
 
 # Backoff of 5, 10, 20, 40, 80 and 160 s, then 240 s three times: about 17 minutes.
+# That is longer than the default 300-second budget, so the budget is off for it.
 patient = RetryPolicy(max_attempts=10, initial_delay_s=5.0, max_delay_s=240.0)
 app = CayuApp(config=CayuConfig(run=RunDefaults(retry_policy=patient)))
 request = RunRequest(agent_name="scout", messages=[...], retry_policy=patient)

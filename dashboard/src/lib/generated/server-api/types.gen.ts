@@ -17532,6 +17532,13 @@ export type RetireKnowledgeResponse = {
  * attempts, and a zero `initial_delay_s` still never waits. The budget
  * applies to agent model steps and automatic compaction.
  *
+ * The default budget never cuts a policy's own backoff short: when
+ * `max_retry_elapsed_s` is not set and the attempts and delays can wait
+ * longer than 300 seconds in all (`max_attempts - 1` delays of
+ * `initial_delay_s` growing by `backoff_multiplier`, plus `jitter_s`, each at
+ * most `max_delay_s`), the budget is off and that backoff applies as written.
+ * Set `max_retry_elapsed_s` to keep a budget for such a policy.
+ *
  * Frozen: policies are immutable value objects, so they can be shared across
  * attempts and sessions without per-attempt defensive copies.
  */

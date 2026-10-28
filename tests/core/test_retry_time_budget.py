@@ -48,6 +48,43 @@ def test_budget_rejects_invalid_values(value: object) -> None:
         RetryPolicy.model_validate({"max_retry_elapsed_s": value})
 
 
+def test_default_budget_does_not_cut_a_longer_custom_backoff_short() -> None:
+    # Backoff of 5, 10, 20, 40, 80 and 160 s, then 240 s three times: 1,035 s.
+    patient = RetryPolicy(max_attempts=10, initial_delay_s=5.0, max_delay_s=240.0, jitter_s=0.0)
+
+    assert patient.max_retry_elapsed_s is None
+    assert RetryPolicy.model_validate_json(patient.model_dump_json()) == patient
+    # Well past 300 s, the ninth attempt still gets its own 240 s backoff.
+    late = retry_decision(policy=patient, attempt=9, error="x", status_code=429, elapsed_s=800.0)
+    assert late.retry is True
+    assert late.delay_seconds == 240.0
+
+
+def test_default_budget_stays_for_a_backoff_that_fits_it() -> None:
+    # 0.5 to 32 s, then 60 s twice, each plus up to 0.5 s of jitter: under 300 s.
+    assert RetryPolicy(max_attempts=10).max_retry_elapsed_s == 300.0
+    # Jitter counts: six retries of 0.5 to 16 s are 31.5 s, plus 45 s of
+    # jitter each 301.5 s, plus 44 s each 295.5 s.
+    assert RetryPolicy(max_attempts=7, jitter_s=45.0, max_delay_s=600.0).max_retry_elapsed_s is None
+    assert (
+        RetryPolicy(max_attempts=7, jitter_s=44.0, max_delay_s=600.0).max_retry_elapsed_s == 300.0
+    )
+    # A zero initial delay never waits, so it never outlasts the budget.
+    assert RetryPolicy(max_attempts=50, initial_delay_s=0.0).max_retry_elapsed_s == 300.0
+
+
+@pytest.mark.parametrize("budget", [300.0, 120.0])
+def test_an_explicit_budget_still_caps_a_longer_custom_backoff(budget: float) -> None:
+    policy = RetryPolicy(
+        max_attempts=10, initial_delay_s=5.0, max_delay_s=240.0, max_retry_elapsed_s=budget
+    )
+
+    assert policy.max_retry_elapsed_s == budget
+    spent = retry_decision(policy=policy, attempt=5, error="x", status_code=429, elapsed_s=300.0)
+    assert spent.retry is False
+    assert spent.disposition.value == "configured_attempt_exhaustion"
+
+
 @pytest.mark.parametrize(
     "fields", [{"status_code": 429}, {"status_code": 503}, {"status_code": 529}]
 )

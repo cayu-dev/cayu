@@ -26,7 +26,7 @@ from cayu.managed_settings import (
     provider_option_setting,
     thinking_effort_setting,
 )
-from cayu.providers import ModelStreamEvent
+from cayu.providers import ModelStreamEvent, RetryPolicy
 from cayu.releases import ReleaseIdentity
 from cayu.sessions.outcomes import run_to_completion
 from cayu.tools import Tool, ToolContext, ToolResult, ToolSpec
@@ -348,6 +348,30 @@ def test_without_a_schema_the_defaults_apply_and_the_process_reports_unreported(
         cloud.set(config__run__max_steps=12)
         await controller.poll_once()
         assert app.config.run.max_steps == 12
+        await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected"), [({}, None), ({"max_retry_elapsed_s": 300.0}, 300.0)]
+)
+def test_managed_attempts_keep_a_retry_budget_only_when_the_code_set_one(budget, expected):
+    # Backoff of 5, 10, 20 and 40 s fits the default budget; Cloud's ten
+    # attempts make it about 17 minutes.
+    code = RetryPolicy(initial_delay_s=5.0, max_delay_s=240.0, **budget)
+    assert code.max_retry_elapsed_s == 300.0
+    cloud = FakeCloud()
+    cloud.values = {"config.run.retry_policy.max_attempts": 10}
+    app, _ = _app(cloud, config=CayuConfig(run=RunDefaults(retry_policy=code)))
+
+    # The app applies Cloud's values to its own copy of the config, which must
+    # still know which retry fields the code set.
+    async def scenario():
+        await app.start_managed_settings()
+        policy = app.config.run.retry_policy
+        assert (policy.max_attempts, policy.initial_delay_s) == (10, 5.0)
+        assert policy.max_retry_elapsed_s == expected
         await app.aclose()
 
     asyncio.run(scenario())

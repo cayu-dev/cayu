@@ -311,6 +311,8 @@ Without `execution_timeout_s`, the event deadline still bounds a hung call. Whic
   retry budget (`max_retry_elapsed_s`), counted from the first attempt, with
   each delay capped at 60 seconds (`max_delay_s`). Other retryable failures use
   7.5 to 9.5 seconds of ordinary backoff in total; `Retry-After` can extend it.
+  A policy whose own delays add up to more than 300 seconds keeps them, unless
+  it sets `max_retry_elapsed_s`.
   These are configurable retry limits, not a deadline that cancels a model call.
   Choose them for the provider and workload before retrying whole sessions;
   see `cayu guide providers#provider-retries`.

@@ -247,6 +247,18 @@ def copy_cayu_config(config: CayuConfig | None) -> CayuConfig:
         return CayuConfig()
     if type(config) is not CayuConfig:
         raise TypeError("config must be a CayuConfig.")
-    return CayuConfig.model_validate(
-        config.model_dump(mode="python", warnings=False),
+    return CayuConfig.model_validate(cayu_config_data(config))
+
+
+def cayu_config_data(config: CayuConfig) -> dict[str, Any]:
+    """Dump `config` to rebuild it, leaving out retry fields the code didn't set.
+
+    A rebuilt `RetryPolicy` then still works out a retry time budget the code
+    didn't choose from its attempts and delays, as the original did.
+    """
+
+    data = config.model_dump(mode="python", warnings=False)
+    data["run"]["retry_policy"] = config.run.retry_policy.model_dump(
+        mode="python", exclude_unset=True
     )
+    return data

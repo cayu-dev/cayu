@@ -10,11 +10,13 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     field_validator,
+    model_validator,
 )
 
 DEFAULT_RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504, 529)
 # Rate-limit and overload statuses: the ones `max_retry_elapsed_s` paces.
 RATE_LIMIT_STATUS_CODES = (429, 503, 529)
+DEFAULT_MAX_RETRY_ELAPSED_S = 300.0
 
 
 class RetryPolicy(BaseModel):
@@ -38,6 +40,13 @@ class RetryPolicy(BaseModel):
     attempts, and a zero `initial_delay_s` still never waits. The budget
     applies to agent model steps and automatic compaction.
 
+    The default budget never cuts a policy's own backoff short: when
+    `max_retry_elapsed_s` is not set and the attempts and delays can wait
+    longer than 300 seconds in all (`max_attempts - 1` delays of
+    `initial_delay_s` growing by `backoff_multiplier`, plus `jitter_s`, each at
+    most `max_delay_s`), the budget is off and that backoff applies as written.
+    Set `max_retry_elapsed_s` to keep a budget for such a policy.
+
     Frozen: policies are immutable value objects, so they can be shared across
     attempts and sessions without per-attempt defensive copies.
     """
@@ -51,7 +60,9 @@ class RetryPolicy(BaseModel):
     max_unknown_attempts: StrictInt = Field(default=2, ge=1, le=50)
     initial_delay_s: StrictFloat = Field(default=0.5, ge=0.0, le=600.0)
     max_delay_s: StrictFloat = Field(default=60.0, ge=0.0, le=3600.0)
-    max_retry_elapsed_s: StrictFloat | None = Field(default=300.0, gt=0.0, le=86400.0)
+    max_retry_elapsed_s: StrictFloat | None = Field(
+        default=DEFAULT_MAX_RETRY_ELAPSED_S, gt=0.0, le=86400.0
+    )
     backoff_multiplier: StrictFloat = Field(default=2.0, ge=1.0, le=10.0)
     jitter_s: StrictFloat = Field(default=0.5, ge=0.0, le=600.0)
     retry_on_status_codes: tuple[StrictInt, ...] = Field(
@@ -70,6 +81,32 @@ class RetryPolicy(BaseModel):
             if status_code < 100 or status_code > 599:
                 raise ValueError("retry status codes must be between 100 and 599.")
         return value
+
+    @model_validator(mode="after")
+    def keep_own_backoff(self) -> RetryPolicy:
+        # A budget the caller never set must not stop a longer backoff the
+        # caller did choose. Resolve it here, not when retrying, so the saved
+        # policy carries the budget that applies and reloads unchanged.
+        if (
+            "max_retry_elapsed_s" not in self.model_fields_set
+            and _longest_backoff_s(self) > DEFAULT_MAX_RETRY_ELAPSED_S
+        ):
+            self.__dict__["max_retry_elapsed_s"] = None
+        return self
+
+
+def _longest_backoff_s(policy: RetryPolicy) -> float:
+    """Longest total wait of `policy`'s ordinary backoff across its attempts.
+
+    Ignores `Retry-After` and the rate-limit budget's pacing.
+    """
+    total = 0.0
+    for attempt in range(1, policy.max_attempts):
+        delay = policy.initial_delay_s * (policy.backoff_multiplier ** (attempt - 1))
+        if delay > 0:
+            delay += policy.jitter_s
+        total += min(delay, policy.max_delay_s)
+    return total
 
 
 def copy_retry_policy(policy: RetryPolicy | None) -> RetryPolicy:
