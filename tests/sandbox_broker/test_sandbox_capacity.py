@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,8 @@ from cayu.sandbox_broker import (
 )
 from cayu.sandbox_broker import client as client_module
 
-# The example in Cloud's contract (docs/contracts/sandbox-broker-v1.md, "Capacity").
+# The example in Cloud's contract (docs/contracts/sandbox-broker-v1.md, "Capacity"), as
+# a Cloud that doesn't report queue positions yet answered it.
 CONTRACT_EXAMPLE: dict[str, Any] = {
     "available": 1,
     "limited_by": "install",
@@ -33,11 +35,32 @@ CONTRACT_EXAMPLE: dict[str, Any] = {
 }
 
 
+# The same contract's example once Cloud reports where each queued create stands.
+QUEUED_EXAMPLE: dict[str, Any] = {
+    "available": 0,
+    "limited_by": "install",
+    "agent": {"limit": 8, "in_use": 3, "queued": 1, "available": 5},
+    "organization": {"id": "org_01J", "limit": 32, "in_use": 5, "queued": 1, "available": 27},
+    "install": {"limit": 10, "in_use": 10, "queued": 3, "available": 0},
+    "queue": {
+        "available": 7,
+        "max_seconds": 3600,
+        "requests": [
+            {
+                "id": "sbx_7f2c",
+                "queued_until": "2026-10-27T20:00:00+00:00",
+                "waiting_for": "install",
+                "position": 2,
+            }
+        ],
+    },
+}
+
 _MISSING = object()
 
 
-def _with(path: tuple[str, ...], value: Any) -> dict[str, Any]:
-    body = copy.deepcopy(CONTRACT_EXAMPLE)
+def _with(path: tuple[Any, ...], value: Any, *, base: dict[str, Any] = CONTRACT_EXAMPLE) -> Any:
+    body = copy.deepcopy(base)
     target = body
     for key in path[:-1]:
         target = target[key]
@@ -67,7 +90,7 @@ def test_capacity_reads_clouds_shape(tmp_path: Path) -> None:
                 "available": 32,
             },
             "install": None,
-            "queue": {"available": 8, "max_seconds": 3600},
+            "queue": {"available": 8, "max_seconds": 3600, "requests": ()},
         }
         request = broker.requests[-1]
         assert request.method == "GET"
@@ -96,11 +119,102 @@ def test_capacity_reads_clouds_shape(tmp_path: Path) -> None:
         assert broker.requests[-1].url.params["organization"] == "org_customer"
 
         # The contract's own example parses as documented.
+        broker.capacity_body = QUEUED_EXAMPLE
+        queued = await client.capacity()
+        listed = queued.queued_request("sbx_7f2c")
+        assert listed is not None
+        assert (listed.waiting_for, listed.position) == ("install", 2)
+        # Both are null when a free place is certainly the create's and the next pass takes it.
+        broker.capacity_body = _with(
+            ("queue", "requests", 0),
+            {**listed.model_dump(mode="json"), "waiting_for": None, "position": None},
+            base=QUEUED_EXAMPLE,
+        )
+        free = (await client.capacity()).queued_request("sbx_7f2c")
+        assert free is not None and (free.waiting_for, free.position) == (None, None)
+
         broker.capacity_body = CONTRACT_EXAMPLE
         example = await client.capacity()
         assert example.organization.id == "org_01J"
         assert example.install is not None and example.install.queued == 2
         assert (example.queue.available, example.queue.max_seconds) == (8, 3600)
+        # A Cloud that doesn't report queue positions leaves them out.
+        assert example.queue.requests is None
+        assert example.queued_request("sbx_1") is None
+        await client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_a_queued_create_reports_where_it_stands_until_admitted(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.agent_limit = 1
+
+    async def scenario() -> None:
+        client = broker.client()
+        running = await client.create(
+            idempotency_key="a", image="coding-python", egress_mode="none", lease_seconds=60
+        )
+        assert "queue_seconds" not in json.loads(broker.requests[-1].content)
+        await client.wait_until_ready(running.id, timeout_s=5, poll_interval_s=0)
+        queued = await client.create(
+            idempotency_key="b",
+            image="coding-python",
+            egress_mode="none",
+            lease_seconds=60,
+            queue_seconds=600,
+        )
+        assert json.loads(broker.requests[-1].content)["queue_seconds"] == 600
+        assert queued.status == "provisioning" and queued.queued_until is not None
+
+        position = await client.queue_position(queued.id)
+        assert position is not None
+        assert (position.id, position.waiting_for, position.position) == (queued.id, "agent", 1)
+        assert position.queued_until == queued.queued_until
+        capacity = await client.capacity()
+        assert capacity.agent.queued == 1
+        assert capacity.queued_request(queued.id) == position
+        # A sandbox that isn't waiting has no position.
+        assert await client.queue_position(running.id) is None
+
+        # When Cloud's list is cut short, a queued sandbox missing from it isn't reported as
+        # having left the queue.
+        broker.capacity_body = {
+            **capacity.model_dump(mode="json"),
+            "queue": {**capacity.queue.model_dump(mode="json"), "requests": []},
+        }
+        with pytest.raises(SandboxBrokerError, match="position is unknown"):
+            await client.queue_position(queued.id)
+        broker.capacity_body = None
+
+        # Once the running sandbox ends, the queued one is admitted and leaves the line.
+        await client.destroy(running.id)
+        broker.expire(running.id)
+        ready = await client.wait_until_ready(queued.id, timeout_s=5, poll_interval_s=0)
+        assert (ready.status, ready.queued_until) == ("ready", None)
+        assert await client.queue_position(queued.id) is None
+        await client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_queue_position_needs_a_cloud_that_reports_it(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.capacity_body = CONTRACT_EXAMPLE
+
+    async def scenario() -> None:
+        client = broker.client()
+        with pytest.raises(SandboxBrokerError, match="queue positions"):
+            await client.queue_position("sbx_1")
+        for queue_seconds in (-1, 3601, True, 1.5):
+            with pytest.raises(ValueError, match="queue_seconds"):
+                await client.create(
+                    idempotency_key="q",
+                    image="coding-python",
+                    egress_mode="none",
+                    lease_seconds=60,
+                    queue_seconds=queue_seconds,  # ty: ignore[invalid-argument-type]
+                )
         await client.aclose()
 
     asyncio.run(scenario())
@@ -123,6 +237,25 @@ def test_capacity_reads_clouds_shape(tmp_path: Path) -> None:
         pytest.param(_with(("queue", "available"), 9), id="queue-over-the-agent-limit"),
         pytest.param(_with(("organization", "id"), ""), id="blank-organization"),
         pytest.param(_with(("organization", "id"), 17), id="numeric-organization"),
+        pytest.param(
+            _with(("queue", "requests", 0, "position"), 0, base=QUEUED_EXAMPLE),
+            id="position-zero",
+        ),
+        pytest.param(
+            _with(("queue", "requests", 0, "position"), "2", base=QUEUED_EXAMPLE),
+            id="string-position",
+        ),
+        pytest.param(
+            _with(("queue", "requests", 0, "waiting_for"), None, base=QUEUED_EXAMPLE),
+            id="position-without-a-limit",
+        ),
+        pytest.param(
+            _with(("queue", "requests", 0, "waiting_for"), "region", base=QUEUED_EXAMPLE),
+            id="unknown-waiting-for",
+        ),
+        pytest.param(
+            _with(("agent", "queued"), 0, base=QUEUED_EXAMPLE), id="more-requests-than-queued"
+        ),
     ],
 )
 def test_a_malformed_capacity_answer_is_refused(tmp_path: Path, body: Any) -> None:

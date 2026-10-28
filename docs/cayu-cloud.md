@@ -1232,7 +1232,9 @@ credential fail at startup instead.
 
 Cloud limits how many sandboxes run at once, per Agent, per Organization and
 optionally per install. `SandboxBrokerClient.capacity()` reads what is free
-under each limit right now, from Cloud's `GET .../sandboxes/capacity`
+under each limit right now, from Cloud's `GET .../sandboxes/capacity`. A create
+with `queue_seconds` waits in Cloud's queue instead of being refused, and
+`SandboxBrokerClient.queue_position()` says where it stands
 ([limits and capacity](environment-factories.md#coding-in-a-sandbox-brokered-by-cayu-cloud)).
 
 ## Fixed process resources

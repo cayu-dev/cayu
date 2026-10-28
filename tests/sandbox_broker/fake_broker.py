@@ -13,6 +13,8 @@ to host directories the same way, and ``image_identities`` gives a catalog image
 the identity a broker reports for an image it built.
 ``GET /sandboxes/capacity`` answers in Cloud's shape from ``agent_limit``,
 ``organization_limit``, ``install_limit`` and the sandboxes not yet destroyed.
+A create with ``queue_seconds`` while the Agent is at ``agent_limit`` waits in the
+queue until a read finds a place free; ``/capacity`` lists the queued ones in order.
 """
 
 from __future__ import annotations
@@ -117,6 +119,8 @@ class FakeSandbox:
     staged_copies: dict[str, int] | None = None
     interactive_commands: bool = True
     image_identity: dict[str, Any] | None = None
+    # Set while the sandbox waits in the queue for a place under the Agent's limit.
+    queued_until: datetime | None = None
 
     def record(self) -> dict[str, Any]:
         return {
@@ -138,6 +142,7 @@ class FakeSandbox:
             else self.max_expires_at.isoformat(),
             "destroyed_at": None,
             "destroy_reason": self.destroy_reason,
+            "queued_until": None if self.queued_until is None else self.queued_until.isoformat(),
             "staged_copies": self.staged_copies,
             "interactive_commands": self.interactive_commands,
             "guarantees": {"version": self.guarantees_version, "items": list(self.guarantees)},
@@ -197,7 +202,8 @@ class FakeBroker:
         # The image identity reported for sandboxes of each image name.
         self.image_identities: dict[str, dict[str, Any]] = {}
         # Concurrency limits ``/capacity`` reports, as Cloud's defaults; no install
-        # limit unless set. The fake never queues a create, so ``queued`` stays 0.
+        # limit unless set. Only a create with ``queue_seconds`` over the Agent's
+        # limit queues.
         self.agent_limit = 8
         self.organization_limit = 32
         self.install_limit: int | None = None
@@ -291,7 +297,9 @@ class FakeBroker:
             return httpx.Response(404, json={"error": {"code": "x", "message": "", "detail": {}}})
         action = parts[1:]
         if request.method == "GET" and not action:
-            if sandbox.status == "provisioning":
+            if sandbox.queued_until is not None and self._in_use() < self.agent_limit:
+                sandbox.queued_until = None
+            if sandbox.status == "provisioning" and sandbox.queued_until is None:
                 sandbox.polls_until_ready -= 1
                 if sandbox.polls_until_ready <= 0:
                     if self.fail_allocation:
@@ -377,15 +385,16 @@ class FakeBroker:
         organization = request.url.params.get("organization")
         if organization is not None and organization not in self.hosted_organizations:
             return _error(403, "on_behalf_of_not_allowed")
-        # Every sandbox not yet destroyed or failed holds a place under each limit.
-        in_use = sum(
-            1
-            for sandbox in self.sandboxes.values()
-            if sandbox.status not in {"destroyed", "failed"}
-        )
+        in_use = self._in_use()
+        queued = self._queued()
 
         def scope(limit: int, used: int) -> dict[str, int]:
-            return {"limit": limit, "in_use": used, "queued": 0, "available": max(0, limit - used)}
+            return {
+                "limit": limit,
+                "in_use": used,
+                "queued": len(queued),
+                "available": max(0, limit - used),
+            }
 
         scopes: dict[str, dict[str, Any]] = {
             "agent": scope(self.agent_limit, in_use),
@@ -406,9 +415,38 @@ class FakeBroker:
                 "agent": scopes["agent"],
                 "organization": scopes["organization"],
                 "install": scopes.get("install"),
-                "queue": {"available": self.agent_limit, "max_seconds": 3600},
+                "queue": {
+                    "available": max(0, self.agent_limit - len(queued)),
+                    "max_seconds": 3600,
+                    # Only the Agent's own limit queues here, so the line is in order.
+                    "requests": [
+                        {
+                            "id": sandbox.id,
+                            "queued_until": sandbox.record()["queued_until"],
+                            "waiting_for": "agent",
+                            "position": position,
+                        }
+                        for position, sandbox in enumerate(queued, start=1)
+                    ],
+                },
             },
         )
+
+    def _in_use(self) -> int:
+        """Every sandbox not yet destroyed or failed, and out of the queue, holds a place."""
+
+        return sum(
+            1
+            for sandbox in self.sandboxes.values()
+            if sandbox.status not in {"destroyed", "failed"} and sandbox.queued_until is None
+        )
+
+    def _queued(self) -> list[FakeSandbox]:
+        return [
+            sandbox
+            for sandbox in self.sandboxes.values()
+            if sandbox.status == "provisioning" and sandbox.queued_until is not None
+        ]
 
     def _create(self, body: dict[str, Any]) -> httpx.Response:
         if self.refuse_create is not None:
@@ -453,6 +491,12 @@ class FakeBroker:
             if existing.body != body:
                 return _error(409, "sandbox_idempotency_conflict")
             return httpx.Response(200, json=existing.record())
+        queue_seconds = body.get("queue_seconds", 0)
+        queued_until = (
+            datetime.now(UTC) + timedelta(seconds=queue_seconds)
+            if queue_seconds and self._in_use() >= self.agent_limit
+            else None
+        )
         sandbox_id = f"sbx_{len(self.sandboxes) + 1:04d}"
         root = self.base / sandbox_id
         root.mkdir(parents=True)
@@ -469,6 +513,7 @@ class FakeBroker:
             staged_copies=self.staged_copies,
             interactive_commands=self.interactive_commands,
             image_identity=self.image_identities.get(body["image"]),
+            queued_until=queued_until,
         )
         self.sandboxes[sandbox_id] = sandbox
         self.by_key[key] = sandbox_id

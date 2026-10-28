@@ -4881,7 +4881,8 @@ def test_unbound_release_retains_first_cleanup_handoff_before_retry() -> None:
         assert environment_factory_cleanup_settlement_task(repeated_error.value) is settlement_task
 
         adapter.allow_owned_cleanup.set()
-        async with asyncio.timeout(0.2):
+        # This is a deadlock guard, not a cleanup latency contract.
+        async with asyncio.timeout(5):
             await settlement_task
         return adapter, settlement_task
 

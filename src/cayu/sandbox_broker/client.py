@@ -51,6 +51,7 @@ __all__ = [
     "MAX_EGRESS_HOSTS",
     "MAX_GIT_REPOSITORIES",
     "MAX_LEASE_SECONDS",
+    "MAX_QUEUE_SECONDS",
     "MAX_STDIO_CHUNK_BYTES",
     "MAX_WAIT_SECONDS",
     "MIN_COMMAND_OUTPUT_BYTES",
@@ -81,6 +82,7 @@ __all__ = [
     "SandboxNotReadyError",
     "SandboxOrganizationCapacity",
     "SandboxQueueCapacity",
+    "SandboxQueuedRequest",
     "SandboxQuotaExceededError",
     "SandboxRecord",
     "SandboxSignedTransfer",
@@ -105,6 +107,8 @@ BROKER_REQUEST_TIMEOUT_ENV = "CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS"
 
 MIN_LEASE_SECONDS = 60
 MAX_LEASE_SECONDS = 3_600
+#: The longest a create may wait in Cloud's queue for capacity (``queue_seconds``).
+MAX_QUEUE_SECONDS = 3_600
 MAX_WAIT_SECONDS = 20
 MAX_COMMAND_STDIN_BYTES = 1024 * 1024
 MIN_COMMAND_OUTPUT_BYTES = 1024
@@ -409,6 +413,9 @@ class SandboxRecord(BaseModel):
     max_expires_at: datetime | None = None
     destroyed_at: datetime | None = None
     destroy_reason: str | None = None
+    #: Set while a ``provisioning`` sandbox waits in Cloud's queue for capacity: when it
+    #: gives up and fails with ``capacity_unavailable``. ``None`` once it is admitted.
+    queued_until: datetime | None = None
     staged_copies: SandboxStagedCopies | None = None
     #: Whether the broker runs interactive commands in this sandbox. A broker that
     #: doesn't say so refuses them, so its absence means it doesn't.
@@ -553,13 +560,56 @@ class SandboxOrganizationCapacity(SandboxLimitCapacity):
     id: str = Field(strict=True, min_length=1, max_length=_MAX_ORGANIZATION_ID)
 
 
+class SandboxQueuedRequest(BaseModel):
+    """Where one of the Agent's queued creates stands.
+
+    ``waiting_for`` names the limit that holds it back. ``position`` is how many
+    places have to free up under that limit, if nothing else changes, before it
+    is admitted: 1 means the next one. Cloud admits queued creates by fair
+    share, so it is an estimate and can move back as well as forward.
+
+    ``position`` is ``None`` whenever Cloud can't work it out exactly: when
+    places freed under that limit alone would never admit the create, because
+    another limit would hold it back too; when places are free but other
+    creates could take them first; when the create is too far back for the
+    fixed amount of work Cloud spends on each read; and for the second or so
+    while another Agent's queued creates are being admitted. A position Cloud
+    does report is always worked out in full.
+
+    Both are ``None`` only when a free place is certainly this create's: under
+    each of its limits, more places are free than all the other creates that
+    could take one plus those of its own Agent queued ahead of it. Cloud's next
+    admission pass, within a second or so, takes it.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    id: str = Field(strict=True, min_length=1)
+    queued_until: datetime
+    waiting_for: SandboxCapacityScope | None
+    position: Annotated[int, Field(strict=True, ge=1)] | None
+
+    @model_validator(mode="after")
+    def _position_needs_a_limit(self) -> SandboxQueuedRequest:
+        if self.position is not None and self.waiting_for is None:
+            raise ValueError("a queued request has a position but no limit it waits for")
+        return self
+
+
 class SandboxQueueCapacity(BaseModel):
-    """How many more creates the Agent may queue, and the longest ``queue_seconds``."""
+    """How many more creates the Agent may queue, the longest ``queue_seconds``,
+    and where each of the Agent's queued creates stands.
+
+    ``requests`` lists the Agent's own creates still waiting in the queue, for
+    any Organization, oldest first and at most 100. It is ``None`` from a Cloud
+    that doesn't report queue positions yet.
+    """
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     available: _Count
     max_seconds: _Count
+    requests: tuple[SandboxQueuedRequest, ...] | None = None
 
 
 class SandboxCapacity(BaseModel):
@@ -607,7 +657,18 @@ class SandboxCapacity(BaseModel):
             raise ValueError("available isn't the fewest free places under any limit")
         if self.queue.available > self.agent.limit:
             raise ValueError("queue.available exceeds the Agent's limit")
+        if self.queue.requests is not None and len(self.queue.requests) > self.agent.queued:
+            raise ValueError("queue.requests lists more creates than the Agent has queued")
         return self
+
+    def queued_request(self, sandbox_id: str) -> SandboxQueuedRequest | None:
+        """Where the Agent's queued sandbox ``sandbox_id`` stands; ``None`` when it isn't
+        listed as waiting (admitted, ended, another Agent's, or past the first 100)."""
+
+        for request in self.queue.requests or ():
+            if request.id == sandbox_id:
+                return request
+        return None
 
 
 @dataclass(frozen=True)
@@ -971,6 +1032,7 @@ class SandboxBrokerClient:
         lease_seconds: int,
         labels: Mapping[str, str] | None = None,
         egress_hosts: Sequence[str] | None = None,
+        queue_seconds: int = 0,
         git_repositories: Sequence[str] | None = None,
     ) -> SandboxRecord:
         """Create a sandbox; ``egress_hosts`` names an ``allowlist`` egress's hosts.
@@ -978,6 +1040,12 @@ class SandboxBrokerClient:
         The request's egress is ``{"mode": "none"}``, ``{"mode": "public_web"}``
         or ``{"mode": "allowlist", "hosts": [...]}`` with the hosts in canonical
         form (see ``validate_egress_hosts``).
+
+        With ``queue_seconds`` (up to ``MAX_QUEUE_SECONDS``), a create over a
+        limit waits in Cloud's queue for up to that long instead of being
+        refused: the record is ``provisioning`` with ``queued_until`` set, and
+        ``queue_position`` says where it stands. Wait for it with
+        ``wait_until_ready`` and a timeout of ``queue_seconds`` plus 330.
 
         ``git_repositories`` asks Cayu Cloud to authenticate the sandbox's git
         fetches of those repositories with the Agent's bound git credential,
@@ -999,6 +1067,10 @@ class SandboxBrokerClient:
         egress: dict[str, Any] = {"mode": mode}
         if hosts is not None:
             egress["hosts"] = list(hosts)
+        if type(queue_seconds) is not int or not 0 <= queue_seconds <= MAX_QUEUE_SECONDS:
+            raise ValueError(
+                f"Sandbox queue_seconds must be an integer from 0 to {MAX_QUEUE_SECONDS}."
+            )
         payload: dict[str, Any] = {
             "idempotency_key": idempotency_key,
             "image": image,
@@ -1006,6 +1078,10 @@ class SandboxBrokerClient:
             "lease_seconds": validate_lease_seconds(lease_seconds),
             "labels": validate_labels(labels or {}),
         }
+        # Left out when 0, so a create that doesn't queue sends the body older Runtimes did
+        # and their idempotency keys still match.
+        if queue_seconds:
+            payload["queue_seconds"] = queue_seconds
         if git_repositories is not None:
             repositories = validate_git_repositories(git_repositories)
             validate_git_egress(repositories, mode, hosts)
@@ -1073,6 +1149,30 @@ class SandboxBrokerClient:
                 "Sandbox broker returned capacity for another Organization than the one asked."
             )
         return capacity
+
+    async def queue_position(self, sandbox_id: str) -> SandboxQueuedRequest | None:
+        """Where one of the Agent's sandboxes stands in Cloud's queue, from ``capacity``.
+
+        ``None`` when it isn't waiting (any more): admitted, ended, or never queued.
+        Raises ``SandboxBrokerError`` when the Cloud doesn't report queue positions, or
+        when the sandbox still waits behind more of the Agent's queued creates than Cloud
+        lists (100).
+        """
+
+        capacity = await self.capacity()
+        requests = capacity.queue.requests
+        if requests is None:
+            raise SandboxBrokerError("This Cayu Cloud doesn't report sandbox queue positions.")
+        found = capacity.queued_request(sandbox_id)
+        if found is None and len(requests) < capacity.agent.queued:
+            # The list is cut short, so a sandbox missing from it may still be waiting.
+            record = await self.get(sandbox_id)
+            if record.status == "provisioning" and record.queued_until is not None:
+                raise SandboxBrokerError(
+                    "The sandbox waits behind more of the Agent's queued creates than "
+                    "Cayu Cloud lists, so its position is unknown."
+                )
+        return found
 
     async def events(self, sandbox_id: str) -> list[dict[str, Any]]:
         body, _ = await self._json("GET", self._sandbox_url(sandbox_id) + "/events")

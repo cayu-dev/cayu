@@ -779,6 +779,25 @@ answer that doesn't hold together (a missing field, a count that isn't a
 non-negative integer, an `available` that isn't the tightest limit's) with
 `SandboxBrokerError`, and maps errors and retries as for every other call.
 
+`create(..., queue_seconds=600)` (up to `MAX_QUEUE_SECONDS`, 3,600) asks Cloud
+to queue a create over a limit for up to that long instead of refusing it. The
+record comes back `provisioning` with `queued_until` set; wait for it with
+`wait_until_ready` and a timeout of `queue_seconds` plus 330. While it waits,
+`await broker.queue_position(sandbox_id)` says where it stands: a
+`SandboxQueuedRequest` whose `waiting_for` names the limit that holds it back
+and whose `position` is how many places have to free up under that limit, if
+nothing else changes, before it is admitted (1 is the next). It returns `None`
+once the sandbox isn't waiting. Cloud admits queued creates by fair share, so
+the position is an estimate and can move back as well as forward. It is `None`
+whenever Cloud can't work it out exactly (another limit would hold the create
+back too, other creates could take the free places first, the queue is too long
+to work through in one read, or another Agent's creates are being admitted),
+and a position Cloud reports is always worked out in full. `waiting_for` and
+`position` are both `None` only when a free place is certainly the create's, so
+the next admission pass takes it. `capacity().queue.requests`
+lists every queued create of the Agent the same way (`None` from a Cloud that
+doesn't report positions, where `queue_position` raises `SandboxBrokerError`).
+
 Final admission uses the sandbox record's versioned `guarantees`. A capability
 such as `untrusted_code_isolation`, `real_credential_non_possession`,
 `guest_privilege_containment` or `deny_by_default_network` is available only
