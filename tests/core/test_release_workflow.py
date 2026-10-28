@@ -138,7 +138,8 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
         assert job.index(packages) < job.index("scripts/run_ci.py")
 
     # Matrices follow the caller's store mode; scripts/ci_shard_plan.py owns counts.
-    assert "github.event_name == 'pull_request'" not in shards
+    matrix = shards.split("      matrix:", 1)[1].split("    env:", 1)[0]
+    assert "github.event_name" not in matrix
     assert "timeout-minutes: 30" in shards
     assert "shard: ${{ fromJSON(inputs.stores == 'sqlite' && '[1, 2, 3," in shards
     assert "CAYU_TEST_STORES: ${{ inputs.stores }}" in shards
@@ -446,3 +447,13 @@ def test_manual_tag_validation_cannot_publish() -> None:
         condition = _job_block(workflow, name).split("needs:", 1)[0]
         assert "github.event_name == 'push'" in condition
         assert "startsWith(github.ref, 'refs/tags/v')" in condition
+
+
+def test_shared_test_workers_cannot_host_release_or_nightly_jobs() -> None:
+    shards = _job_block(_PYTHON_TESTS_WORKFLOW.read_text(), "test_shards")
+    assert (
+        "fromJSON(github.event_name == 'pull_request' && vars.CI_RUNNER_SHARED "
+        "|| vars.CI_RUNNER_GENERAL || '[\"ubuntu-latest\"]')"
+    ) in shards
+    specialists = _job_block(_PYTHON_TESTS_WORKFLOW.read_text(), "test_specialists")
+    assert "CI_RUNNER_SHARED" not in specialists

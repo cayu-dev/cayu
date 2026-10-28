@@ -3273,11 +3273,25 @@ def test_http_total_deadline_wins_over_late_protocol_processing_failure(
     monkeypatch: pytest.MonkeyPatch,
     processing_stage: str,
 ) -> None:
+    budgets: list[_HttpCallBudget] = []
+    original_budget_init = _HttpCallBudget.__init__
+
+    def capture_budget(self: _HttpCallBudget, *args: Any, **kwargs: Any) -> None:
+        original_budget_init(self, *args, **kwargs)
+        budgets.append(self)
+
+    def expire_processing_budget() -> None:
+        assert budgets
+        # Expire only once response processing starts. A short wall-clock
+        # deadline can instead expire during dispatch on a loaded CI worker.
+        for budget in budgets:
+            budget._deadline = budget._loop.time() - 1
+
     if processing_stage == "malformed-json":
         original_processing = mcp_http_module._decode_jsonrpc_bytes
 
         def delayed_processing(value: bytes) -> dict[str, Any]:
-            time.sleep(0.04)
+            expire_processing_budget()
             return original_processing(value)
 
         expected_cause = "not valid JSON"
@@ -3285,7 +3299,7 @@ def test_http_total_deadline_wins_over_late_protocol_processing_failure(
         original_processing = mcp_http_module._safe_body
 
         def delayed_processing(value: bytes, **kwargs: Any) -> str:
-            time.sleep(0.04)
+            expire_processing_budget()
             return original_processing(value, **kwargs)
 
         expected_cause = "HTTP 400"
@@ -3306,10 +3320,11 @@ def test_http_total_deadline_wins_over_late_protocol_processing_failure(
     async def run() -> tuple[BaseException | None, bool, bool, bool]:
         session = _session(
             handler,
-            limits=_limits(idle_timeout_s=0.5, total_call_timeout_s=0.02),
+            limits=_limits(idle_timeout_s=10, total_call_timeout_s=60),
         )
         target = "_decode_jsonrpc_bytes" if processing_stage == "malformed-json" else "_safe_body"
         with monkeypatch.context() as patcher:
+            patcher.setattr(_HttpCallBudget, "__init__", capture_budget)
             patcher.setattr(mcp_http_module, target, delayed_processing)
             with pytest.raises(McpCallDeadlineExceededError) as exc_info:
                 await session.call_tool("echo", {})

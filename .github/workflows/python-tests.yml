@@ -55,7 +55,9 @@ jobs:
 
   test_shards:
     name: Test shard ${{ matrix.shard }} (Python 3.14, ${{ inputs.stores }} stores)
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
+    # Only PR shards may share workers. Release and nightly jobs hold runtime
+    # artifact/cache credentials that untrusted co-tenant PR code could steal.
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && vars.CI_RUNNER_SHARED || vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
     # Includes setup, collection, and loaded-runner headroom beyond measured calls.
     timeout-minutes: 30
     strategy:
