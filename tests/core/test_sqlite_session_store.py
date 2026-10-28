@@ -48,8 +48,10 @@ from cayu.storage import _sqlite_public_authority as public_authority_ops
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import migration_authority
 from cayu.storage import migrations as schema_migrations
 from cayu.storage import sqlite as sqlite_storage
+from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 
 
@@ -823,13 +825,92 @@ def test_sqlite_public_authority_aliases_allow_key_rotation_and_reject_conflicts
 
     asyncio.run(run())
 
-    with pytest.raises(ValueError, match="codec is required"):
+    with pytest.raises(ValueError, match="keeps requiring it"):
         SQLiteSessionStore(db_path)
     with pytest.raises(ValueError, match="key material conflicts"):
         SQLiteSessionStore(
             db_path,
             public_authority_alias_codec=_public_authority_codec(primary_key_byte=9),
         )
+
+
+def test_sqlite_store_that_used_a_keyring_names_the_variables_and_opens_read_only_without_it(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "public-authority-keyed.sqlite"
+    codec = _public_authority_codec()
+    session_alias = codec.encode("keyed-session", field_name="session_id")
+    keyed = SQLiteSessionStore(db_path, public_authority_alias_codec=codec)
+
+    async def seed() -> None:
+        await keyed.create(
+            RunRequest(agent_name="assistant", session_id="keyed-session", messages=[]),
+            identity=_identity(),
+        )
+        await keyed.close()
+
+    asyncio.run(seed())
+
+    with pytest.raises(ValueError) as raised:
+        SQLiteSessionStore(db_path)
+    message = str(raised.value)
+    assert "CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID" in message
+    assert "CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS" in message
+    assert "base64url encoding of 32 random bytes" in message
+    assert "keeps requiring it for every writable open" in message
+    # `cayu doctor` forces the app's writable store read-only. It must still
+    # report the missing keyring, because the real writable open fails.
+    with (
+        diagnostic_store_inspection(),
+        pytest.raises(ValueError, match="CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS"),
+    ):
+        SQLiteSessionStore(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        with pytest.raises(
+            RuntimeError, match="before migrating.*CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS"
+        ):
+            migration_authority.preflight_sqlite_public_authority(connection, None)
+    finally:
+        connection.close()
+
+    reader = SQLiteSessionStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.VALIDATE,
+        read_only=True,
+    )
+
+    async def read_without_keyring() -> None:
+        try:
+            assert reader.public_authority_alias_codec is None
+            assert not reader.can_register_public_authority_aliases
+            assert await reader.load("keyed-session") is not None
+            listed = (await reader.list_sessions()).sessions
+            assert [session.id for session in listed] == ["keyed-session"]
+            # Alias authority stays closed without the keyring.
+            assert (
+                await reader.resolve_public_authority_alias(session_alias, field_name="session_id")
+                is None
+            )
+        finally:
+            await reader.close()
+
+    asyncio.run(read_without_keyring())
+
+    reopened = SQLiteSessionStore(db_path, public_authority_alias_codec=codec)
+
+    async def resolve_with_keyring() -> None:
+        try:
+            assert (
+                await reopened.resolve_public_authority_alias(
+                    session_alias, field_name="session_id"
+                )
+                == "keyed-session"
+            )
+        finally:
+            await reopened.close()
+
+    asyncio.run(resolve_with_keyring())
 
 
 def test_sqlite_public_authority_aliases_reject_retired_keys(tmp_path) -> None:
@@ -1019,8 +1100,10 @@ def test_sqlite_rotation_fence_is_atomic_with_identity_write_transaction(
         )
         original_check = public_authority_ops.require_current_configuration
 
-        def pause_after_precheck(connection: sqlite3.Connection, *, codec) -> None:
-            original_check(connection, codec=codec)
+        def pause_after_precheck(
+            connection: sqlite3.Connection, *, codec, keyring_optional: bool = False
+        ) -> None:
+            original_check(connection, codec=codec, keyring_optional=keyring_optional)
             if codec is not first_codec:
                 return
             precheck_completed.set()

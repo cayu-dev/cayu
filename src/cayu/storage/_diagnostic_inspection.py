@@ -46,6 +46,23 @@ class DiagnosticStoreInspection:
 _CURRENT_DIAGNOSTIC_STORE_INSPECTION: DiagnosticStoreInspection | None = None
 
 
+def alias_keyring_optional(*, requested_read_only: bool) -> bool:
+    """Whether a session store may open a keyed alias registry without its keyring.
+
+    Every store backend decides this here, from the ``read_only`` its caller
+    passed, before diagnostic inspection can force the store read-only. A store
+    its caller opened read-only never writes, so it can't leave rows without
+    aliases, and its alias operations fail closed without a codec. Diagnostic
+    inspection (``cayu doctor``) forces the app's stores read-only to stand in
+    for the writable stores the app really opens, so those keep the writable
+    check and doctor still reports a missing keyring.
+    """
+
+    if type(requested_read_only) is not bool:
+        raise TypeError("requested_read_only must be a bool.")
+    return requested_read_only
+
+
 def current_diagnostic_store_inspection() -> DiagnosticStoreInspection | None:
     with _DIAGNOSTIC_STATE_LOCK:
         return _CURRENT_DIAGNOSTIC_STORE_INSPECTION

@@ -16,6 +16,7 @@ from cayu.events import Event, EventType
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     _authenticated_public_authority_alias_private_value,
+    _initialized_alias_store_requires_keyring_message,
     _public_authority_alias_store_key,
 )
 from cayu.storage._postgres_transcript import PostgresConnection
@@ -176,8 +177,13 @@ async def register_alias_row(
 
 
 async def require_current_configuration(
-    connect: PostgresConnection, *, codec: PublicAuthorityAliasCodec | None
+    connect: PostgresConnection,
+    *,
+    codec: PublicAuthorityAliasCodec | None,
+    keyring_optional: bool = False,
 ) -> None:
+    if codec is None and keyring_optional:
+        return
     async with connect() as conn, conn.cursor() as cur:
         await cur.execute(
             "SELECT active_key_id, keyring_fingerprint "
@@ -187,7 +193,7 @@ async def require_current_configuration(
         row = await cur.fetchone()
     if codec is None:
         if row is not None:
-            raise RuntimeError("Postgres public authority aliases require the deployment keyring.")
+            raise RuntimeError(_initialized_alias_store_requires_keyring_message("Postgres"))
         return
     if (
         row is None
@@ -205,6 +211,7 @@ async def reconcile_keys(
     codec: PublicAuthorityAliasCodec | None,
     read_only: bool,
     acquire_schema_lock: SchemaTransactionLock,
+    keyring_optional: bool = False,
 ) -> None:
     async with connect() as conn:
         try:
@@ -219,17 +226,17 @@ async def reconcile_keys(
                     "FROM cayu_public_authority_alias_keys ORDER BY key_id"
                 )
                 durable = {str(row[0]): (str(row[1]), bool(row[2])) for row in await cur.fetchall()}
-                if codec is None:
+                # See alias_keyring_optional for when a store may skip the keyring.
+                if codec is None and not keyring_optional:
                     await cur.execute(
                         "SELECT EXISTS(SELECT 1 FROM cayu_public_authority_alias_config)"
                     )
                     config_exists = await cur.fetchone()
                     if durable or (config_exists is not None and bool(config_exists[0])):
                         raise RuntimeError(
-                            "Postgres public authority aliases are initialized; "
-                            "configure the deployment's alias keyring before opening "
-                            "this session store."
+                            _initialized_alias_store_requires_keyring_message("Postgres")
                         )
+                if codec is None:
                     await conn.commit()
                     return
 
@@ -465,10 +472,7 @@ async def register_authorities(
         await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_public_authority_alias_keys)")
         row = await cur.fetchone()
         if row is not None and row[0] is True:
-            raise RuntimeError(
-                "Postgres public authority aliases are initialized; this writer "
-                "must configure the deployment's alias keyring."
-            )
+            raise RuntimeError(_initialized_alias_store_requires_keyring_message("Postgres"))
         return
     await cur.execute(
         "SELECT active_key_id, keyring_fingerprint "

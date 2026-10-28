@@ -35,7 +35,10 @@ from cayu.resource_access import (
     model_data_access,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime.public_authority import SESSION_REFERENCE_FIELD_NAME
+from cayu.runtime.public_authority import (
+    SESSION_REFERENCE_FIELD_NAME,
+    _public_authority_alias_environment_hint,
+)
 from cayu.session_metadata import SUMMARY_METADATA_KEY, TITLE_METADATA_KEY
 from cayu.sessions._access_rules import _SessionAccessBounds
 from cayu.sessions.access import SessionAccessDenied
@@ -343,8 +346,12 @@ class _SessionReadTool(Tool):
         ):
             raise ValueError(
                 f"{type(self).__name__} returns opaque session aliases and needs a session "
-                "store with a public authority alias keyring, for example "
-                "CayuApp(public_authority_alias_keyring=...)."
+                "store with a public authority alias keyring. "
+                f"{_public_authority_alias_environment_hint()}. Pass that codec to the store "
+                "as public_authority_alias_codec and its keyring to "
+                "CayuApp(public_authority_alias_keyring=codec.keyring). Tests on "
+                "InMemorySessionStore or CayuApp() without a session_store don't need "
+                "these variables, because the in-memory store makes its own key."
             )
         if not session_store.can_register_public_authority_aliases:
             raise ValueError(

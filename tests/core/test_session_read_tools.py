@@ -140,6 +140,25 @@ def _run_with_store(
     asyncio.run(run())
 
 
+def test_tools_name_the_keyring_variables_when_the_store_has_no_keyring(tmp_path) -> None:
+    store = SQLiteSessionStore(tmp_path / "no-keyring.sqlite")
+
+    async def construct() -> None:
+        try:
+            for tool in (ListSessionsTool, ReadSessionTool):
+                with pytest.raises(ValueError) as raised:
+                    tool(store, unscoped=True, access=OwnTreeSessionAccess())
+                message = str(raised.value)
+                assert "CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID" in message
+                assert "CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS" in message
+                assert "base64url encoding of 32 random bytes" in message
+                assert "public_authority_alias_codec_from_environment()" in message
+        finally:
+            await store.close()
+
+    asyncio.run(construct())
+
+
 def test_tools_need_an_explicit_read_only_policy() -> None:
     store = _memory_store()
     with pytest.raises(TypeError, match="SessionReadAccess"):

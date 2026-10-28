@@ -8,7 +8,10 @@ import json
 import sqlite3
 from typing import Any
 
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    _public_authority_alias_environment_hint,
+)
 
 _UNCONFIGURED_FINGERPRINT = hashlib.sha256(
     b"cayu.public-authority-alias-configuration.unconfigured.v1"
@@ -142,7 +145,8 @@ def _validate_public_authority_state(
         if durable or config is not None or aliases_exist:
             raise RuntimeError(
                 f"{backend} public authority aliases are initialized; configure the "
-                "deployment's alias keyring before migrating."
+                "deployment's alias keyring, with the same keys as before, before migrating. "
+                f"{_public_authority_alias_environment_hint()}."
             )
         return
 

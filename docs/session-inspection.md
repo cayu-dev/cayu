@@ -222,8 +222,8 @@ assistant text, or the final structured output when there is no text, cut to
 
 The tools never show raw session ids. `session_id`, `parent_session_id` and
 `next_cursor` carry opaque aliases from the store's public authority alias
-codec (field `session_ref`), so the tools require a store with an alias keyring,
-for example `CayuApp(public_authority_alias_keyring=...)`. An alias is an HMAC of
+codec (field `session_ref`), so the tools require a store with an alias keyring
+(see [the alias keyring](#the-alias-keyring) below). An alias is an HMAC of
 the session id, keyed and scoped to the calling session: it is stable for that
 caller, so the model can list, read and cite it, but it reveals nothing about
 the raw id, and another session gets a different alias it cannot resolve.
@@ -265,6 +265,51 @@ session aliases it relies on and to treat their content as possibly stale.
 `SessionQuery` supports the same scoping directly: `root_session_id` selects one
 root session tree, served by the revision-129 root-session index on SQLite and
 PostgreSQL, and `agent_names` selects sessions run by any listed agent.
+
+### The alias keyring
+
+A generated project builds its stores with
+`public_authority_alias_codec_from_environment()`, which reads two variables:
+
+- `CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID`: the key ID that signs new aliases,
+  for example `primary` (lowercase letters, digits, `-` and `_`, starting with a
+  letter).
+- `CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS`: a JSON object mapping each key ID to the
+  unpadded base64url encoding of 32 random bytes, for example
+  `{"primary": "<43 characters>"}`.
+
+One way to make a key:
+
+```bash
+python -c "import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))"
+```
+
+Keep the keys secret, and give every process that opens the same database the
+same keys. Outside a generated project, pass the codec to the store and its
+keyring to the app:
+
+```python
+from cayu.runtime import public_authority_alias_codec_from_environment
+
+codec = public_authority_alias_codec_from_environment()
+app = CayuApp(
+    session_store=SQLiteSessionStore(path, public_authority_alias_codec=codec),
+    public_authority_alias_keyring=codec.keyring,
+)
+```
+
+`InMemorySessionStore`, and `CayuApp()` without a `session_store`, make their
+own random key, so unit tests on them pass with no variables set while the real
+app on SQLite or Postgres does not start without them.
+
+Once a SQLite or Postgres store has opened with a keyring, it keeps requiring
+the same keyring for every writable open. Sessions written without it would get
+no aliases, so the keyed store could not resolve them later, and the store
+refuses that open with an error that names both variables. A read-only store,
+such as the one `cayu session` opens, still opens without the keyring; it reads
+sessions normally, but alias lookups find nothing and it can't issue aliases.
+Tests that build the app without the variables should use their own database
+file or an `InMemorySessionStore` instead of the project's local database.
 
 ## Configure the session store
 

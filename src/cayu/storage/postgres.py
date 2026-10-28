@@ -64,6 +64,7 @@ from cayu.storage import _postgres_tool_grants as tool_grants_ops
 from cayu.storage import _postgres_transcript as transcript_ops
 from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
+from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
 from cayu.storage._session_execution import PostgresSessionExecutionMixin
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
@@ -684,6 +685,8 @@ class PostgresSessionStore(
             PublicAuthorityAliasCodec,
         ):
             raise TypeError("public_authority_alias_codec must be a PublicAuthorityAliasCodec.")
+        # Decided before the base class can force a diagnostic store read-only.
+        self._alias_keyring_optional = alias_keyring_optional(requested_read_only=read_only)
         super().__init__(
             conninfo,
             pool=pool,
@@ -932,11 +935,14 @@ class PostgresSessionStore(
                         self._connection,
                         codec=self.public_authority_alias_codec,
                         read_only=self._read_only,
+                        keyring_optional=self._alias_keyring_optional,
                         acquire_schema_lock=postgres_base._acquire_schema_transaction_lock,
                     )
                     self._public_authority_aliases_reconciled = True
         await public_authority_ops.require_current_configuration(
-            self._connection, codec=self.public_authority_alias_codec
+            self._connection,
+            codec=self.public_authority_alias_codec,
+            keyring_optional=self._alias_keyring_optional,
         )
 
     async def create(

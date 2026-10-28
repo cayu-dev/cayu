@@ -13,6 +13,7 @@ import sqlite3
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     _authenticated_public_authority_alias_private_value,
+    _initialized_alias_store_requires_keyring_message,
     _public_authority_alias_store_key,
 )
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
@@ -97,18 +98,26 @@ def register_sql_functions(
 
 
 def initialize_registry(
-    connection: sqlite3.Connection, *, codec: PublicAuthorityAliasCodec | None, read_only: bool
+    connection: sqlite3.Connection,
+    *,
+    codec: PublicAuthorityAliasCodec | None,
+    read_only: bool,
+    keyring_optional: bool = False,
 ) -> None:
-    """Validate key continuity and backfill each newly configured signing key."""
+    """Validate key continuity and backfill each newly configured signing key.
+
+    ``keyring_optional`` comes from ``alias_keyring_optional``, which decides
+    when a store may open a keyed registry without its keyring.
+    """
 
     if codec is None:
+        if keyring_optional:
+            return
         initialized = connection.execute(
             "SELECT EXISTS(SELECT 1 FROM cayu_public_authority_alias_config)"
         ).fetchone()[0]
         if initialized:
-            raise ValueError(
-                "A public authority alias codec is required for this initialized store."
-            )
+            raise ValueError(_initialized_alias_store_requires_keyring_message("SQLite"))
         return
 
     configured = tuple((key_id, codec.key_fingerprint(key_id)) for key_id in codec.keyring.key_ids)
@@ -326,15 +335,20 @@ def _backfill_aliases(connection: sqlite3.Connection) -> None:
 
 
 def require_current_configuration(
-    connection: sqlite3.Connection, *, codec: PublicAuthorityAliasCodec | None
+    connection: sqlite3.Connection,
+    *,
+    codec: PublicAuthorityAliasCodec | None,
+    keyring_optional: bool = False,
 ) -> None:
+    if codec is None and keyring_optional:
+        return
     row = connection.execute(
         "SELECT active_key_id, keyring_fingerprint "
         "FROM cayu_public_authority_alias_config WHERE singleton = 1"
     ).fetchone()
     if codec is None:
         if row is not None:
-            raise RuntimeError("SQLite public authority aliases require the deployment keyring.")
+            raise RuntimeError(_initialized_alias_store_requires_keyring_message("SQLite"))
         return
     if (
         row is None

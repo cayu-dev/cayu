@@ -62,6 +62,7 @@ from cayu.storage import _sqlite_tool_grants as tool_grants_ops
 from cayu.storage import _sqlite_transcript as transcript_ops
 from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMixin
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
+from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_sqlite import SQLiteExternalWaitMixin
 from cayu.storage._phase_timing import TimedStoreLock, TimedStoreReadQueue
 from cayu.storage._session_execution import SQLiteSessionExecutionMixin
@@ -1198,6 +1199,9 @@ class SQLiteSessionStore(
         self._diagnostic_source_missing = diagnostic_source_missing
         self._schema_mode = schema_mode
         self._read_only = read_only
+        self._alias_keyring_optional = alias_keyring_optional(
+            requested_read_only=configured_read_only
+        )
         self._public_authority_alias_codec = public_authority_alias_codec
         self._ownership_clock = utc_clock(ownership_clock)
         self._lock = TimedStoreLock()
@@ -1215,7 +1219,10 @@ class SQLiteSessionStore(
             )
             self._initialize_schema()
             public_authority_ops.initialize_registry(
-                self._connection, codec=self.public_authority_alias_codec, read_only=self._read_only
+                self._connection,
+                codec=self.public_authority_alias_codec,
+                read_only=self._read_only,
+                keyring_optional=self._alias_keyring_optional,
             )
             if diagnostic_source_missing:
                 self._connection.execute("PRAGMA query_only = ON")
@@ -1283,7 +1290,9 @@ class SQLiteSessionStore(
 
         def guarded(connection: sqlite3.Connection) -> _T:
             public_authority_ops.require_current_configuration(
-                connection, codec=self.public_authority_alias_codec
+                connection,
+                codec=self.public_authority_alias_codec,
+                keyring_optional=self._alias_keyring_optional,
             )
             return query(connection)
 

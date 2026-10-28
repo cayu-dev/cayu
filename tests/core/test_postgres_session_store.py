@@ -885,7 +885,9 @@ def test_postgres_public_authority_aliases_are_indexed_and_durable(
             schema_mode=SchemaMode.VALIDATE,
         )
         try:
-            with pytest.raises(RuntimeError, match="configure.*alias keyring"):
+            with pytest.raises(
+                RuntimeError, match="keeps requiring it.*CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS"
+            ):
                 await codec_less.ensure_schema()
         finally:
             await codec_less.close()
@@ -948,7 +950,9 @@ def test_postgres_already_open_codec_less_writer_is_fenced_after_key_initializat
         try:
             await stale.ensure_schema()
             await keyed.ensure_schema()
-            with pytest.raises(RuntimeError, match="aliases require.*keyring"):
+            with pytest.raises(
+                RuntimeError, match="keeps requiring it.*CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS"
+            ):
                 await stale.create(
                     RunRequest(
                         agent_name="assistant",
@@ -961,6 +965,84 @@ def test_postgres_already_open_codec_less_writer_is_fenced_after_key_initializat
         finally:
             await stale.close()
             await keyed.close()
+
+    asyncio.run(runner())
+
+
+def test_postgres_store_that_used_a_keyring_names_the_variables_and_opens_read_only_without_it(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
+        from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
+
+        await _truncate(postgres_dsn)
+        codec = _public_authority_codec()
+        session_alias = codec.encode("keyed-session", field_name="session_id")
+        keyed = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=codec,
+        )
+        try:
+            await keyed.create(
+                RunRequest(agent_name="assistant", session_id="keyed-session", messages=[]),
+                identity=_identity(),
+            )
+        finally:
+            await keyed.close()
+
+        writable = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+        )
+        try:
+            with pytest.raises(RuntimeError) as raised:
+                await writable.ensure_schema()
+            message = str(raised.value)
+            assert "CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID" in message
+            assert "CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS" in message
+            assert "keeps requiring it for every writable open" in message
+        finally:
+            await writable.close()
+
+        # `cayu doctor` forces the app's writable store read-only. It must still
+        # report the missing keyring, because the real writable open fails.
+        with diagnostic_store_inspection():
+            doctor_store = PostgresSessionStore(
+                postgres_dsn,
+                min_size=1,
+                max_size=2,
+                schema_mode=SchemaMode.VALIDATE,
+            )
+            try:
+                with pytest.raises(RuntimeError, match="CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS"):
+                    await doctor_store.ensure_schema()
+            finally:
+                await doctor_store.close()
+
+        reader = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            read_only=True,
+        )
+        try:
+            assert not reader.can_register_public_authority_aliases
+            assert await reader.load("keyed-session") is not None
+            # Alias authority stays closed without the keyring.
+            assert (
+                await reader.resolve_public_authority_alias(session_alias, field_name="session_id")
+                is None
+            )
+        finally:
+            await reader.close()
 
     asyncio.run(runner())
 

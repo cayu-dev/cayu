@@ -403,6 +403,32 @@ def public_authority_alias_codec_from_environment(
     )
 
 
+def _public_authority_alias_environment_hint() -> str:
+    """Name the two variables, their format and the loader, for error messages."""
+
+    return (
+        f"Set {PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID_ENV} to a key ID such as 'primary' and "
+        f"{PUBLIC_AUTHORITY_ALIAS_KEYS_ENV} to a JSON object mapping each key ID to the "
+        "unpadded base64url encoding of 32 random bytes, for example "
+        '{"primary": "<43 characters>"}; public_authority_alias_codec_from_environment() '
+        "reads both"
+    )
+
+
+def _initialized_alias_store_requires_keyring_message(backend: str) -> str:
+    """Explain why a store that has used a keyring needs it for every writable open."""
+
+    return (
+        f"This {backend} session store has used a public authority alias keyring, and a "
+        "store that has used one keeps requiring it for every writable open: sessions "
+        "written without it would get no aliases, so the keyed store could not resolve "
+        f"them later. {_public_authority_alias_environment_hint()}. Use the same keys as "
+        "before and pass the codec as public_authority_alias_codec. A read-only store "
+        "opens without the keyring; tests that run without these variables can use their "
+        "own database file or an InMemorySessionStore."
+    )
+
+
 def _require_key_id(value: object, *, field_name: str) -> str:
     if type(value) is not str or _KEY_ID_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{field_name} must be a canonical lowercase ASCII key identifier.")
