@@ -72,6 +72,7 @@ from cayu.runtime._durable_worker_loop import (
     run_durable_worker_loop,
     validate_worker_interval,
     wait_or_stop,
+    worker_event_loop_lag_monitor,
 )
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime._task_store_operation_boundary import (
@@ -2836,7 +2837,9 @@ class TaskStoreDispatcher(Dispatcher):
         if durable_runtime.lifecycle_state != "open":
             return
         admission_wakeup = None
+        lag_monitor = worker_event_loop_lag_monitor(metrics)
         try:
+            lag_monitor.start()
             admission_wakeup = await self._tasks._task_admission_wakeup(claim_queries)
 
             async def counted_step(now: float, handled: int) -> DurableWorkerStep:
@@ -2859,6 +2862,7 @@ class TaskStoreDispatcher(Dispatcher):
                 metrics=metrics if metrics is not None else poller.metrics,
             )
         finally:
+            lag_monitor.stop()
             if admission_wakeup is not None:
                 admission_wakeup.close()
             poller.close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -881,3 +882,105 @@ def test_closing_preferred_poller_skips_busy_handler() -> None:
         busy.close()
         ready.close()
     assert group.subscriber_count == 0
+
+
+def test_event_loop_lag_monitor_measures_a_blocked_loop_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from cayu.observability import event_loop_lag
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    monkeypatch.setattr(event_loop_lag, "_last_warning_at", None)
+    metrics = DurableWorkerMetrics()
+    monitor = EventLoopLagMonitor(
+        interval_s=0.01,
+        warning_threshold_s=0.05,
+        on_sample=metrics.event_loop_lag,
+    )
+
+    async def scenario() -> None:
+        monitor.start()
+        with pytest.raises(RuntimeError, match="already running"):
+            monitor.start()
+        await asyncio.sleep(0.03)
+        # Two blocks, each longer than the threshold.
+        for _ in range(2):
+            time.sleep(0.1)
+            await asyncio.sleep(0.03)
+        monitor.stop()
+        stopped_at = monitor.snapshot().samples
+        await asyncio.sleep(0.05)
+        assert monitor.snapshot().samples == stopped_at
+
+    with caplog.at_level("WARNING", logger="cayu.observability.event_loop_lag"):
+        asyncio.run(scenario())
+    snapshot = monitor.snapshot()
+    assert not monitor.running
+    assert snapshot.samples >= 3
+    assert snapshot.lagging_samples >= 2
+    assert snapshot.maximum_lag_s >= 0.05
+    assert snapshot.total_lag_s >= 2 * 0.05
+    warnings = [record for record in caplog.records if "ran" in record.getMessage()]
+    assert len(warnings) == 1
+    assert "--processes" in warnings[0].getMessage()
+    worker = metrics.snapshot()
+    assert worker.event_loop_lag_samples == snapshot.samples
+    assert worker.event_loop_lag_max_s == pytest.approx(snapshot.maximum_lag_s)
+    assert worker.event_loop_lag_total_s == pytest.approx(snapshot.total_lag_s)
+    assert worker.current_event_loop_lag_s == pytest.approx(snapshot.current_lag_s)
+
+
+def test_event_loop_lag_monitor_drops_a_failing_callback_and_validates_settings(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    calls = 0
+
+    def fail(_lag: float) -> None:
+        nonlocal calls
+        calls += 1
+        raise ValueError("metrics backend is down")
+
+    monitor = EventLoopLagMonitor(interval_s=0.01, warning_threshold_s=None, on_sample=fail)
+
+    async def scenario() -> None:
+        monitor.start()
+        await asyncio.sleep(0.06)
+        monitor.stop()
+
+    with caplog.at_level("WARNING", logger="cayu.observability.event_loop_lag"):
+        asyncio.run(scenario())
+    assert calls == 1
+    assert monitor.snapshot().samples > 1
+    assert monitor.snapshot().lagging_samples == 0
+    assert [record.getMessage() for record in caplog.records] == [
+        "An event-loop lag callback failed and was removed."
+    ]
+    for settings in (
+        {"interval_s": 0},
+        {"interval_s": float("nan")},
+        {"warning_threshold_s": -1.0},
+        {"warning_interval_s": True},
+    ):
+        with pytest.raises(ValueError, match="positive number of seconds"):
+            EventLoopLagMonitor(**settings)
+    with pytest.raises(TypeError, match="on_sample"):
+        EventLoopLagMonitor(on_sample=1)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError):
+        EventLoopLagMonitor().start()
+
+
+def test_worker_metrics_ignore_invalid_event_loop_lag() -> None:
+    metrics = DurableWorkerMetrics()
+    metrics.event_loop_lag(float("nan"))
+    metrics.event_loop_lag(-1.0)
+    metrics.event_loop_lag(0.25)
+    metrics.event_loop_lag(0.5)
+    metrics.event_loop_lag(0.125)
+    snapshot = metrics.snapshot()
+    assert snapshot.event_loop_lag_samples == 3
+    assert snapshot.event_loop_lag_total_s == pytest.approx(0.875)
+    assert snapshot.event_loop_lag_max_s == pytest.approx(0.5)
+    assert snapshot.current_event_loop_lag_s == pytest.approx(0.125)

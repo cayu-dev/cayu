@@ -2010,6 +2010,117 @@ def test_run_task_worker_continues_after_handler_terminalizes_then_raises() -> N
     assert second.result == {"winner": "handler"}
 
 
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_run_task_worker_samples_event_loop_lag_into_its_metrics(
+    monkeypatch: pytest.MonkeyPatch, concurrency: int
+) -> None:
+    import time
+
+    import cayu.runtime._durable_worker_loop as worker_loop_module
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+    from cayu.runtime._durable_worker_loop import DurableWorkerMetrics
+
+    monitors: list[EventLoopLagMonitor] = []
+
+    def fast_monitor(**options: object) -> EventLoopLagMonitor:
+        monitor = EventLoopLagMonitor(interval_s=0.01, warning_threshold_s=None, **options)
+        monitors.append(monitor)
+        return monitor
+
+    monkeypatch.setattr(worker_loop_module, "EventLoopLagMonitor", fast_monitor)
+    store = InMemoryTaskStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+    metrics = DurableWorkerMetrics(configured_handler_capacity=concurrency)
+
+    async def scenario() -> int:
+        await store.create_task(TaskCreate(task_id="blocking-job", type="job"))
+
+        async def block_the_loop(_app: CayuApp, task: Task, worker_id: str) -> None:
+            await asyncio.sleep(0.03)
+            time.sleep(0.1)
+            await store.complete_task(
+                task.id, {}, worker_id=worker_id, lease_expires_at=task.lease_expires_at
+            )
+
+        return await run_task_worker(
+            app,
+            store,
+            block_the_loop,
+            worker_id="lag-worker",
+            max_tasks=1,
+            concurrency=concurrency,
+            metrics=metrics,
+        )
+
+    assert asyncio.run(scenario()) == 1
+    # One sampler per worker run, however many slots; it stops with the worker.
+    assert len(monitors) == 1
+    assert not monitors[0].running
+    snapshot = metrics.snapshot()
+    assert snapshot.event_loop_lag_samples >= 2
+    assert snapshot.event_loop_lag_max_s >= 0.05
+    assert snapshot.event_loop_lag_samples == monitors[0].snapshot().samples
+
+
+def test_run_task_worker_keeps_sampling_lag_until_every_slot_drains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.runtime._durable_worker_loop as worker_loop_module
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    monitors: list[EventLoopLagMonitor] = []
+
+    def fast_monitor(**options: object) -> EventLoopLagMonitor:
+        monitor = EventLoopLagMonitor(interval_s=0.01, warning_threshold_s=None, **options)
+        monitors.append(monitor)
+        return monitor
+
+    monkeypatch.setattr(worker_loop_module, "EventLoopLagMonitor", fast_monitor)
+    store = InMemoryTaskStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+
+    async def scenario() -> None:
+        # The maintenance slot usually takes the quick job and goes idle while
+        # the other slot is still running the long one.
+        await store.create_task(TaskCreate(task_id="quick-job", type="job"))
+        await store.create_task(TaskCreate(task_id="long-job", type="job"))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def long_handler(_app: CayuApp, task: Task, worker_id: str) -> None:
+            if task.id == "long-job":
+                started.set()
+                await release.wait()
+            await store.complete_task(
+                task.id, {}, worker_id=worker_id, lease_expires_at=task.lease_expires_at
+            )
+
+        stop = asyncio.Event()
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                long_handler,
+                worker_id="draining-worker",
+                concurrency=2,
+                poll_interval_s=0.05,
+                stop=stop,
+            )
+        )
+        await asyncio.wait_for(started.wait(), 5)
+        await asyncio.sleep(0.05)
+        stop.set()
+        # The idle slots stop at once; the handler's slot is still draining.
+        await asyncio.sleep(0.2)
+        assert not worker.done()
+        assert len(monitors) == 1 and monitors[0].running
+        release.set()
+        assert await asyncio.wait_for(worker, 5) == 2
+        assert not monitors[0].running
+
+    asyncio.run(scenario())
+
+
 def test_run_task_worker_keeps_same_key_changed_intent_conflict_explicit() -> None:
     class ChangedIntentStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True

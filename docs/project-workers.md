@@ -241,6 +241,97 @@ naming the flag. `--until-idle` can't be combined with `--processes`; use
 it; it creates timers only for pauses it sees when it starts, so also start it
 after a session pauses.
 
+## One process is one CPU core
+
+A Python process runs all of its asyncio work on one CPU core. Model calls and
+commands wait on the network or another process, but the runtime's own work
+between them (preparing the next request, recording tool results and
+evidence, store writes, environment setup) runs on that one core, shared by
+every session the process is running. Adding `concurrency` to
+`run_task_worker` or starting more sessions in the same process adds work to
+that core, not cores.
+
+One service that ran every review session inside its web process (it embedded
+`run_task_worker` there) measured this across 4,349 sessions on a 4-vCPU host.
+Medians in seconds, by how many sessions were running at the time:
+
+| Segment | 1 running | 2–3 | 4–7 | 8+ |
+|---|---|---|---|---|
+| session start → first model call | 4.07 | 4.64 | 7.62 | 29.59 |
+| `model.completed` → `tool.call.started` | 0.51 | 0.49 | 0.85 | 2.53 |
+| tool done → `tool.exposure.recorded` | 0.40 | 0.38 | 0.61 | 2.18 |
+| `tool.exposure.recorded` → `request.footprint.recorded` | 0.26 | 0.25 | 0.36 | 1.57 |
+| `request.footprint.recorded` → `model.started` | 0.06 | 0.07 | 0.13 | 0.82 |
+| `read_file` call | 0.09 | 0.10 | 0.23 | 1.46 |
+| `search_text` call (the command itself takes about 0.17) | 0.30 | 0.33 | 0.83 | 4.92 |
+| `list_files` call | 2.53 | 2.02 | 4.56 | 17.61 |
+
+The runtime's own time between model calls went from about 1.2 s per step
+with one session to about 7 s with eight or more, and tool calls took 5 to 16
+times longer. None of the slow segments include model or command time. When
+20 sessions started within one minute, 18 of them waited 100–120 s before
+their first model call, with each environment lifecycle phase taking 10–20 s
+instead of 0.1–0.6 s.
+
+So the ceiling is a few sessions per process: slowdown starts at about four
+concurrent sessions and is severe at eight. Past that, run the task worker in
+more processes, which the store already coordinates:
+
+- `cayu worker NAME --processes N` in a Cayu project (below). One process per
+  core is a reasonable start.
+- [`supervise_process_workers`](#start-worker-processes-from-your-own-code)
+  from an application's own code, for example a web service that embeds the
+  worker today.
+- Separate containers or hosts, each running one or more worker processes.
+
+Every process must use the same durable stores. SQLite allows one writer at a
+time, so sustained writes from several processes want PostgreSQL. A web
+process that only creates tasks and serves reads can stay a single process;
+it's the processes that run sessions that need to scale out.
+
+## Watch for saturation
+
+`run_task_worker` and `TaskStoreDispatcher.run_worker` measure event-loop
+lag while they run: one timer callback every half second records how late it
+ran. In a healthy process that's a few milliseconds. When it reaches one
+second, the worker logs a warning from the `cayu.observability.event_loop_lag`
+logger, at most once a minute per process, saying that runtime work in this
+process is queuing and to run more worker processes.
+
+A `DurableWorkerMetrics` passed to the worker receives every sample in its
+snapshot, next to the active handler count, for an application's own metrics
+or alerts:
+
+```python
+from cayu.runtime import DurableWorkerMetrics
+
+metrics = DurableWorkerMetrics(configured_handler_capacity=4)
+# run_task_worker(..., concurrency=4, metrics=metrics)
+
+snapshot = metrics.snapshot()
+snapshot.current_event_loop_lag_s  # the latest sample
+snapshot.event_loop_lag_max_s  # the worst since the metrics were created
+snapshot.event_loop_lag_total_s / max(snapshot.event_loop_lag_samples, 1)  # mean
+snapshot.active_handlers  # sessions this worker is running now
+```
+
+Lag that rises with `active_handlers` is the one-process ceiling. A process
+that runs sessions without a task worker can watch the same thing with
+`EventLoopLagMonitor` on its own:
+
+```python
+from cayu.observability import EventLoopLagMonitor
+
+monitor = EventLoopLagMonitor(on_sample=lag_histogram.observe)
+monitor.start()  # inside the running event loop, for example at app startup
+...
+monitor.snapshot().maximum_lag_s
+monitor.stop()
+```
+
+`interval_s` (0.5 by default), `warning_threshold_s` (1.0; `None` turns the
+warning off) and `warning_interval_s` (60) are keyword options.
+
 ## Use multiple CPU cores
 
 ```bash
@@ -268,6 +359,114 @@ also watch for supervisor loss, including during project startup. Workers are
 never automatically restarted: durable recovery remains an explicit store and
 entrypoint policy. The supervisor controls process lifecycle, not external
 container cleanup or sandbox isolation. Windows process mode is unsupported.
+
+## Start worker processes from your own code
+
+`cayu worker --processes` is built from a process supervisor that an
+application can use without a Cayu project or the CLI. It starts each command
+in its own process group, stops the others when one fails, and on a stop or
+signal sends SIGTERM to every group, waits the grace, then SIGKILLs what is
+left and reaps everything before it returns. It never restarts a child.
+
+```python
+# run_workers.py
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+from cayu.runtime import ProcessWorkerCommand, process_worker_environment, supervise_process_workers
+
+
+async def main() -> int:
+    count = os.cpu_count() or 1
+    outcome = await supervise_process_workers(
+        [
+            ProcessWorkerCommand(
+                argv=(sys.executable, "-m", "reviews.worker"),
+                cwd=Path.cwd(),
+                environment=process_worker_environment(index, count),
+            )
+            for index in range(count)
+        ],
+        # A little longer than each worker's own shutdown.
+        shutdown_grace_seconds=46,
+    )
+    return outcome.exit_code
+
+
+raise SystemExit(asyncio.run(main()))
+```
+
+`process_worker_environment(index, count)` copies this process's environment
+and adds `CAYU_WORKER_INDEX`, `CAYU_WORKER_COUNT` and `CAYU_SUPERVISOR_PID`.
+Each child is an ordinary program that builds its own app and stops on SIGTERM
+or when the supervisor goes away:
+
+```python
+# reviews/worker.py
+import asyncio
+import os
+import signal
+import socket
+
+from cayu.runtime import supervisor_watchdog, watch_supervisor
+
+
+async def main() -> None:
+    # Imported here, after the watchdog below has started, so a supervisor that
+    # dies while this process is still importing application code stops it too.
+    from cayu.tasks import TaskQuery, run_task_worker
+
+    from reviews.app import build_app, handle_review
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(signum, stop.set)
+    watcher = asyncio.create_task(watch_supervisor(lambda _signum: stop.set()))
+    app = build_app()
+    try:
+        await run_task_worker(
+            app,
+            app.task_store,
+            handle_review,
+            worker_id=f"{socket.gethostname()}-{os.getpid()}-reviews",
+            query=TaskQuery(type="review"),
+            stop=stop,
+        )
+    finally:
+        watcher.cancel()
+        await app.aclose()
+
+
+# Stops the child if the supervisor dies, including during the imports and
+# build_app() in main().
+with supervisor_watchdog(45):
+    asyncio.run(main())
+```
+
+By default the supervisor installs SIGINT and SIGTERM handlers, so it must run
+on the main thread, and puts the previous handlers back when it returns. A
+host that handles signals itself, such as a web server starting its workers
+at startup, passes `handle_signals=False` and its own `stop` event:
+
+```python
+stop = asyncio.Event()
+supervisor = asyncio.create_task(
+    supervise_process_workers(commands, shutdown_grace_seconds=46, stop=stop, handle_signals=False)
+)
+# ... at shutdown:
+stop.set()
+outcome = await supervisor
+```
+
+`outcome.exit_code` is `0` when every child exited `0` or was stopped through
+`stop`, the first failing child's code otherwise, `128 + signal` after SIGINT
+or SIGTERM, and `124` when a child had to be killed. Cancelling the call also
+stops and reaps the children. POSIX only.
+
+## How `cayu worker` stops and exits
 
 SIGINT and SIGTERM set the cooperative event and allow the configured grace
 period. When the target returns, the CLI closes the app with `app.aclose()`,

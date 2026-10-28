@@ -103,6 +103,26 @@ def test_verified_task_worker_exports_share_the_canonical_owner() -> None:
         assert name in verification.__all__
 
 
+def test_process_supervisor_and_event_loop_lag_are_public_parts() -> None:
+    from cayu import observability, runtime
+    from cayu.observability import event_loop_lag
+    from cayu.runtime import _process_workers
+
+    for name in (
+        "ProcessWorkerCommand",
+        "ProcessWorkerOutcome",
+        "process_worker_environment",
+        "supervise_process_workers",
+        "supervisor_watchdog",
+        "watch_supervisor",
+    ):
+        assert getattr(runtime, name) is getattr(_process_workers, name)
+        assert name in runtime.__all__
+    for name in ("EventLoopLagMonitor", "EventLoopLagSnapshot"):
+        assert getattr(observability, name) is getattr(event_loop_lag, name)
+        assert name in observability.__all__
+
+
 def test_session_message_lifecycle_types_have_matching_public_exports() -> None:
     from cayu.sessions import messaging
 

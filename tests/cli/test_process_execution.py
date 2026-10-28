@@ -305,6 +305,72 @@ def test_cancellation_during_spawn_reaps_registered_child(tmp_path, monkeypatch)
     asyncio.run(scenario())
 
 
+def test_embedded_supervisor_stops_on_caller_event_without_taking_signals(tmp_path):
+    import asyncio
+    import threading
+
+    from cayu.runtime import (
+        ProcessWorkerCommand,
+        process_worker_environment,
+        supervise_process_workers,
+    )
+
+    def mark(_signum, _frame):
+        return None
+
+    results = {}
+
+    async def scenario():
+        stop = asyncio.Event()
+        script = (
+            "import os,sys,time; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text(os.environ['CAYU_WORKER_INDEX']); time.sleep(60)"
+        )
+        commands = [
+            ProcessWorkerCommand(
+                (sys.executable, "-c", script, str(tmp_path / f"child-{index}")),
+                tmp_path,
+                process_worker_environment(index, 2),
+            )
+            for index in range(2)
+        ]
+        supervisor = asyncio.create_task(
+            supervise_process_workers(
+                commands, shutdown_grace_seconds=2, stop=stop, handle_signals=False
+            )
+        )
+        deadline = time.monotonic() + 10
+        while not all((tmp_path / f"child-{index}").exists() for index in range(2)):
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.02)
+        results["handler_while_running"] = signal.getsignal(signal.SIGTERM)
+        stop.set()
+        results["outcome"] = await asyncio.wait_for(supervisor, 10)
+        results["already_stopped"] = await supervise_process_workers(
+            commands, shutdown_grace_seconds=2, stop=stop, handle_signals=False
+        )
+
+    previous = signal.signal(signal.SIGTERM, mark)
+    try:
+        # Off the main thread, as in a host that runs its own loop and signal handling.
+        thread = threading.Thread(target=lambda: asyncio.run(scenario()))
+        thread.start()
+        thread.join(30)
+        assert not thread.is_alive()
+        assert signal.getsignal(signal.SIGTERM) is mark
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert results["handler_while_running"] is mark
+    outcome = results["outcome"]
+    assert outcome.exit_code == 0
+    assert not outcome.forced_shutdown
+    assert outcome.child_exit_codes == (-signal.SIGTERM, -signal.SIGTERM)
+    _assert_dead(outcome.pids)
+    assert [(tmp_path / f"child-{index}").read_text() for index in range(2)] == ["0", "1"]
+    assert results["already_stopped"].pids == ()
+    assert results["already_stopped"].exit_code == 0
+
+
 @pytest.mark.parametrize("failure", ["spawn", "admission"])
 def test_startup_failure_reaps_already_started_children(tmp_path, failure):
     import asyncio

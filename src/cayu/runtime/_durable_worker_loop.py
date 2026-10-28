@@ -19,6 +19,8 @@ from threading import Lock
 from time import monotonic
 from typing import Generic, TypeVar
 
+from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
 _HeartbeatUpdateT = TypeVar("_HeartbeatUpdateT")
 _HeartbeatOutcomeT = TypeVar("_HeartbeatOutcomeT")
 _MaintenanceOutcomeT = TypeVar("_MaintenanceOutcomeT")
@@ -55,6 +57,12 @@ class DurableWorkerMetricsSnapshot:
     admission_to_claim_latency_max_s: float
     current_idle_backoff_s: float
     maximum_idle_backoff_s: float
+    # How late this process's event loop ran a timer while the worker ran; a
+    # growing lag means runtime work is queuing behind other work in the process.
+    event_loop_lag_samples: int = 0
+    event_loop_lag_total_s: float = 0.0
+    event_loop_lag_max_s: float = 0.0
+    current_event_loop_lag_s: float = 0.0
 
 
 class DurableWorkerMetrics:
@@ -90,6 +98,10 @@ class DurableWorkerMetrics:
         self._admission_to_claim_latency_max_s = 0.0
         self._current_idle_backoff_s = 0.0
         self._maximum_idle_backoff_s = 0.0
+        self._event_loop_lag_samples = 0
+        self._event_loop_lag_total_s = 0.0
+        self._event_loop_lag_max_s = 0.0
+        self._current_event_loop_lag_s = 0.0
 
     def snapshot(self, *, active_pollers: int | None = None) -> DurableWorkerMetricsSnapshot:
         if active_pollers is not None and (type(active_pollers) is not int or active_pollers < 0):
@@ -124,6 +136,10 @@ class DurableWorkerMetrics:
                 admission_to_claim_latency_max_s=self._admission_to_claim_latency_max_s,
                 current_idle_backoff_s=self._current_idle_backoff_s,
                 maximum_idle_backoff_s=self._maximum_idle_backoff_s,
+                event_loop_lag_samples=self._event_loop_lag_samples,
+                event_loop_lag_total_s=self._event_loop_lag_total_s,
+                event_loop_lag_max_s=self._event_loop_lag_max_s,
+                current_event_loop_lag_s=self._current_event_loop_lag_s,
             )
 
     def handler_started(self) -> None:
@@ -226,12 +242,29 @@ class DurableWorkerMetrics:
             self._current_idle_backoff_s = seconds
             self._maximum_idle_backoff_s = max(self._maximum_idle_backoff_s, seconds)
 
+    def event_loop_lag(self, seconds: float) -> None:
+        if not isfinite(seconds) or seconds < 0:
+            return
+        with self._lock:
+            self._event_loop_lag_samples += 1
+            self._event_loop_lag_total_s += seconds
+            self._event_loop_lag_max_s = max(self._event_loop_lag_max_s, seconds)
+            self._current_event_loop_lag_s = seconds
+
     def active_pollers(self, count: int) -> None:
         if type(count) is not int or count < 0:
             raise ValueError("active pollers must be a non-negative integer.")
         with self._lock:
             self._active_pollers = count
             self._maximum_active_pollers = max(self._maximum_active_pollers, count)
+
+
+def worker_event_loop_lag_monitor(
+    metrics: DurableWorkerMetrics | None,
+) -> EventLoopLagMonitor:
+    """One sampler for a worker run: it warns on lag and feeds caller-owned metrics."""
+
+    return EventLoopLagMonitor(on_sample=None if metrics is None else metrics.event_loop_lag)
 
 
 def record_task_admission_to_claim_latency(

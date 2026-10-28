@@ -81,6 +81,7 @@ from cayu.runtime._durable_worker_loop import (
     run_durable_worker_loop,
     validate_worker_interval,
     wait_or_stop,
+    worker_event_loop_lag_monitor,
     worker_stop_requested,
 )
 from cayu.runtime._task_lease_authority import (
@@ -1120,51 +1121,57 @@ async def run_task_worker(
                 admission_wakeup.close()
             poller.close()
 
-    if concurrency == 1:
-        return await run_slot(owns_maintenance=True)
-    failures: list[Exception] = []
-
-    async def drain_slot(*, owns_maintenance: bool) -> int:
-        try:
-            return await run_slot(owns_maintenance=owns_maintenance)
-        except asyncio.CancelledError:
-            infrastructure_stop.set()
-            raise
-        except Exception as exc:
-            infrastructure_stop.set()
-            failures.append(exc)
-            return 0
-
-    async def forward_stop() -> None:
-        assert stop is not None
-        await stop.wait()
-        infrastructure_stop.set()
-
+    # One lag sampler per worker run, kept until every slot has drained.
+    lag_monitor = worker_event_loop_lag_monitor(metrics)
+    lag_monitor.start()
     try:
-        async with asyncio.TaskGroup() as group:
-            stop_watcher = group.create_task(forward_stop()) if stop is not None else None
-            slots = [
-                group.create_task(drain_slot(owns_maintenance=index == 0))
-                for index in range(
-                    min(concurrency, max_tasks) if max_tasks is not None else concurrency
-                )
-            ]
+        if concurrency == 1:
+            return await run_slot(owns_maintenance=True)
+        failures: list[Exception] = []
+
+        async def drain_slot(*, owns_maintenance: bool) -> int:
             try:
-                await asyncio.wait(slots)
-            finally:
-                if stop_watcher is not None:
-                    stop_watcher.cancel()
-    except BaseException as failure:
-        for recorded in failures:
-            _attach_task_worker_secondary_failure(
-                failure, recorded, label="Task-worker slot failures during shutdown"
-            )
-        raise
-    if len(failures) == 1:
-        raise failures[0]
-    if failures:
-        raise ExceptionGroup("Task-worker slot failures", failures)
-    return sum(slot.result() for slot in slots)
+                return await run_slot(owns_maintenance=owns_maintenance)
+            except asyncio.CancelledError:
+                infrastructure_stop.set()
+                raise
+            except Exception as exc:
+                infrastructure_stop.set()
+                failures.append(exc)
+                return 0
+
+        async def forward_stop() -> None:
+            assert stop is not None
+            await stop.wait()
+            infrastructure_stop.set()
+
+        try:
+            async with asyncio.TaskGroup() as group:
+                stop_watcher = group.create_task(forward_stop()) if stop is not None else None
+                slots = [
+                    group.create_task(drain_slot(owns_maintenance=index == 0))
+                    for index in range(
+                        min(concurrency, max_tasks) if max_tasks is not None else concurrency
+                    )
+                ]
+                try:
+                    await asyncio.wait(slots)
+                finally:
+                    if stop_watcher is not None:
+                        stop_watcher.cancel()
+        except BaseException as failure:
+            for recorded in failures:
+                _attach_task_worker_secondary_failure(
+                    failure, recorded, label="Task-worker slot failures during shutdown"
+                )
+            raise
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise ExceptionGroup("Task-worker slot failures", failures)
+        return sum(slot.result() for slot in slots)
+    finally:
+        lag_monitor.stop()
 
 
 async def _handle_with_heartbeat(

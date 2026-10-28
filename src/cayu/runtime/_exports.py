@@ -199,6 +199,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "PUBLIC_AUTHORITY_ALIAS_VERSION",
     ),
     "ParsedPublicAuthorityAlias": ("cayu.runtime.public_authority", "ParsedPublicAuthorityAlias"),
+    "ProcessWorkerCommand": ("cayu.runtime._process_workers", "ProcessWorkerCommand"),
+    "ProcessWorkerOutcome": ("cayu.runtime._process_workers", "ProcessWorkerOutcome"),
     "ProjectCheckReport": ("cayu.runtime.checks", "ProjectCheckReport"),
     "ProjectDiagnostic": ("cayu.runtime.checks", "ProjectDiagnostic"),
     "ProviderManifest": ("cayu.runtime.manifest", "ProviderManifest"),
@@ -428,6 +430,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.runtime.public_authority",
         "parse_public_authority_alias",
     ),
+    "process_worker_environment": ("cayu.runtime._process_workers", "process_worker_environment"),
     "public_authority_alias_codec_from_environment": (
         "cayu.runtime.public_authority",
         "public_authority_alias_codec_from_environment",
@@ -443,6 +446,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "run_storage_retention_worker",
     ),
     "runtime_evidence": ("cayu.runtime.evidence", "runtime_evidence"),
+    "supervise_process_workers": ("cayu.runtime._process_workers", "supervise_process_workers"),
+    "supervisor_watchdog": ("cayu.runtime._process_workers", "supervisor_watchdog"),
+    "watch_supervisor": ("cayu.runtime._process_workers", "watch_supervisor"),
 }
 
 PUBLIC_NAMES = [
@@ -533,6 +539,8 @@ PUBLIC_NAMES = [
     "PUBLIC_AUTHORITY_ALIAS_PREFIX",
     "PUBLIC_AUTHORITY_ALIAS_VERSION",
     "ParsedPublicAuthorityAlias",
+    "ProcessWorkerCommand",
+    "ProcessWorkerOutcome",
     "ProjectCheckReport",
     "ProjectDiagnostic",
     "ProviderManifest",
@@ -644,10 +652,14 @@ PUBLIC_NAMES = [
     "local_execution_attempt_capability_evidence",
     "local_execution_parent_death_containment_platform_candidate",
     "parse_public_authority_alias",
+    "process_worker_environment",
     "public_authority_alias_codec_from_environment",
     "public_authority_alias_is_reserved",
     "report_storage_growth",
     "retry_decision",
     "run_storage_retention_worker",
     "runtime_evidence",
+    "supervise_process_workers",
+    "supervisor_watchdog",
+    "watch_supervisor",
 ]

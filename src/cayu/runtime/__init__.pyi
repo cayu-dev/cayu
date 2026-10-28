@@ -14,6 +14,12 @@ from cayu.runtime._invocation_lifecycle import InvocationContext as InvocationCo
 from cayu.runtime._model_completion_contracts import (
     ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
 )
+from cayu.runtime._process_workers import ProcessWorkerCommand as ProcessWorkerCommand
+from cayu.runtime._process_workers import ProcessWorkerOutcome as ProcessWorkerOutcome
+from cayu.runtime._process_workers import process_worker_environment as process_worker_environment
+from cayu.runtime._process_workers import supervise_process_workers as supervise_process_workers
+from cayu.runtime._process_workers import supervisor_watchdog as supervisor_watchdog
+from cayu.runtime._process_workers import watch_supervisor as watch_supervisor
 from cayu.runtime._session_continuation_owner import (
     SessionContinuationOwner as SessionContinuationOwner,
 )
@@ -444,6 +450,8 @@ __all__ = [
     "ModelCompletionManualRecoveryRequired",
     "NamedCheckManifest",
     "ParsedPublicAuthorityAlias",
+    "ProcessWorkerCommand",
+    "ProcessWorkerOutcome",
     "ProjectCheckReport",
     "ProjectDiagnostic",
     "ProviderManifest",
@@ -563,10 +571,14 @@ __all__ = [
     "local_execution_attempt_capability_evidence",
     "local_execution_parent_death_containment_platform_candidate",
     "parse_public_authority_alias",
+    "process_worker_environment",
     "public_authority_alias_codec_from_environment",
     "public_authority_alias_is_reserved",
     "report_storage_growth",
     "retry_decision",
     "run_storage_retention_worker",
     "runtime_evidence",
+    "supervise_process_workers",
+    "supervisor_watchdog",
+    "watch_supervisor",
 ]

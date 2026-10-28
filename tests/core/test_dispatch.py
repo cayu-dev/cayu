@@ -6464,6 +6464,51 @@ def test_run_worker_hint_audits_full_dispatch_namespace_union(
     assert snapshot.wake_hints_followed_by_successful_claims == 1
 
 
+def test_run_worker_samples_event_loop_lag_into_its_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    import cayu.runtime._durable_worker_loop as worker_loop_module
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    monitors: list[EventLoopLagMonitor] = []
+
+    def fast_monitor(**options: object) -> EventLoopLagMonitor:
+        monitor = EventLoopLagMonitor(interval_s=0.01, warning_threshold_s=None, **options)
+        monitors.append(monitor)
+        return monitor
+
+    monkeypatch.setattr(worker_loop_module, "EventLoopLagMonitor", fast_monitor)
+    h = _build([_batch("unused")])
+    stop = asyncio.Event()
+    metrics = DurableWorkerMetrics()
+
+    async def scenario() -> None:
+        worker = asyncio.create_task(
+            h.dispatcher.run_worker(
+                h.app,
+                worker_id="lag-dispatch-worker",
+                stop=stop,
+                metrics=metrics,
+                reconcile_terminal_receipts=False,
+                reclaim_expired_leases=False,
+            )
+        )
+        await asyncio.sleep(0.03)
+        time.sleep(0.1)
+        await asyncio.sleep(0.03)
+        stop.set()
+        await asyncio.wait_for(worker, timeout=5)
+
+    asyncio.run(scenario())
+    assert len(monitors) == 1
+    assert not monitors[0].running
+    snapshot = metrics.snapshot()
+    assert snapshot.event_loop_lag_samples >= 2
+    assert snapshot.event_loop_lag_max_s >= 0.05
+
+
 def test_hundred_idle_dispatch_workers_meet_claim_operation_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

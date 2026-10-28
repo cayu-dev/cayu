@@ -2,6 +2,9 @@
 
 This is a POSIX process lifecycle primitive, not a task queue or a sandbox.
 Children are never restarted automatically after possibly dispatching effects.
+``cayu worker --processes`` and ``cayu eval run --processes`` use it, and an
+application that runs its own task worker can use it to start that worker in
+several processes; see docs/project-workers.md.
 """
 
 from __future__ import annotations
@@ -23,6 +26,12 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ProcessWorkerCommand:
+    """One child process: its argv, working directory and complete environment.
+
+    With ``log_path``, the child's stdout and stderr go to that new file;
+    otherwise they are inherited.
+    """
+
     argv: tuple[str, ...]
     cwd: Path
     environment: dict[str, str]
@@ -31,6 +40,13 @@ class ProcessWorkerCommand:
 
 @dataclass(frozen=True)
 class ProcessWorkerOutcome:
+    """How a supervised group ended once every child was reaped.
+
+    ``exit_code`` is ``0`` when every child exited ``0``, the first failing
+    child's code otherwise, ``128 + signal`` after SIGINT or SIGTERM, and
+    ``124`` when a child had to be killed after the shutdown grace.
+    """
+
     exit_code: int
     child_exit_codes: tuple[int, ...]
     pids: tuple[int, ...]
@@ -50,6 +66,14 @@ def positive_process_count(value: str) -> int:
 
 
 def process_worker_environment(index: int, count: int) -> dict[str, str]:
+    """This process's environment for child ``index`` of ``count``.
+
+    Adds ``CAYU_WORKER_INDEX``, ``CAYU_WORKER_COUNT`` and
+    ``CAYU_SUPERVISOR_PID``, which :func:`watch_supervisor` and
+    :func:`supervisor_watchdog` use to stop the child when this process goes
+    away, and passes ``sys.path`` on so the child imports the same code.
+    """
+
     environment = os.environ.copy()
     # Spawn fresh interpreters, including when the caller came from a source tree.
     environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(map(str, sys.path)))
@@ -60,7 +84,11 @@ def process_worker_environment(index: int, count: int) -> dict[str, str]:
 
 
 async def watch_supervisor(request_stop: Callable[[int], None]) -> None:
-    """A surviving child cooperatively stops when its original parent disappears."""
+    """In a child, call ``request_stop(SIGTERM)`` once its supervisor is gone.
+
+    Run it as a task beside the child's work. It returns at once in a process
+    that wasn't started with :func:`process_worker_environment`.
+    """
     parent = os.environ.get("CAYU_SUPERVISOR_PID")
     if parent is None:
         return
@@ -72,7 +100,12 @@ async def watch_supervisor(request_stop: Callable[[int], None]) -> None:
 
 @contextlib.contextmanager
 def supervisor_watchdog(shutdown_grace_seconds: float):
-    """Cover parent loss during synchronous project import and factory startup too."""
+    """In a child, send itself SIGTERM, then SIGKILL after the grace, if the supervisor goes.
+
+    Unlike :func:`watch_supervisor` it works without a running event loop, so
+    it also covers slow synchronous startup such as imports and app
+    construction.
+    """
     parent = os.environ.get("CAYU_SUPERVISOR_PID")
     if parent is None:
         yield
@@ -102,11 +135,21 @@ async def supervise_process_workers(
     *,
     shutdown_grace_seconds: float,
     ready: Callable[[tuple[asyncio.subprocess.Process, ...]], Awaitable[None]] | None = None,
+    stop: asyncio.Event | None = None,
+    handle_signals: bool = True,
 ) -> ProcessWorkerOutcome:
     """Run all children, stop siblings on failure, and reap them before returning.
 
-    Call from the CLI's fresh event loop on the main thread. Signals are restored
-    when this invocation ends. A ``ready`` callback may implement a pre-dispatch
+    Each child starts in its own process group. When one exits non-zero, when
+    ``stop`` is set, or on SIGINT or SIGTERM, every group gets SIGTERM and has
+    ``shutdown_grace_seconds`` before SIGKILL. Children are never restarted.
+    Cancelling the call stops and reaps the children too.
+
+    With ``handle_signals`` (the default) the call installs SIGINT and SIGTERM
+    handlers on the running loop, so it must run on the main thread, and
+    restores the previous handlers when it ends. An application that handles
+    signals itself, such as a web server, passes ``handle_signals=False`` and
+    sets ``stop`` instead. A ``ready`` callback may implement a pre-dispatch
     admission barrier; it must not dispatch domain work itself.
     """
     if os.name != "posix":
@@ -115,22 +158,31 @@ async def supervise_process_workers(
         raise ValueError("A process group requires between 1 and 256 workers.")
     if not isfinite(shutdown_grace_seconds) or shutdown_grace_seconds <= 0:
         raise ValueError("Process shutdown grace must be finite and positive.")
+    if stop is not None and not isinstance(stop, asyncio.Event):
+        raise TypeError("stop must be an asyncio.Event.")
+    if type(handle_signals) is not bool:
+        raise TypeError("handle_signals must be a bool.")
     loop = asyncio.get_running_loop()
-    stop = asyncio.Event()
+    stop_requested = asyncio.Event()
     received_signal: int | None = None
 
     def request_stop(signum: int) -> None:
         nonlocal received_signal
         if received_signal is None:
             received_signal = signum
-        stop.set()
+        stop_requested.set()
 
-    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    previous = (
+        {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        if handle_signals
+        else {}
+    )
     installed = []
     processes: list[asyncio.subprocess.Process] = []
     logs = []
     waits: list[asyncio.Task[int]] = []
     stop_wait = None
+    caller_stop_wait = None
     admission = None
     forced = False
     drain_requested = asyncio.Event()
@@ -177,8 +229,16 @@ async def supervise_process_workers(
         for sig in previous:
             loop.add_signal_handler(sig, request_stop, sig)
             installed.append(sig)
-        for command in commands:
+        if stop is not None:
+            # The caller's event stops the group the way a signal does.
+            caller_stop_wait = asyncio.create_task(stop.wait())
+            caller_stop_wait.add_done_callback(
+                lambda task: None if task.cancelled() else stop_requested.set()
+            )
             if stop.is_set():
+                stop_requested.set()
+        for command in commands:
+            if stop_requested.is_set():
                 break
             log = None
             if command.log_path is not None:
@@ -207,8 +267,8 @@ async def supervise_process_workers(
             group_drains.append(asyncio.create_task(drain_group(process, waits[-1])))
             if cancelled:
                 raise asyncio.CancelledError
-        stop_wait = asyncio.create_task(stop.wait())
-        if ready is not None and not stop.is_set():
+        stop_wait = asyncio.create_task(stop_requested.wait())
+        if ready is not None and not stop_requested.is_set():
             admission = asyncio.ensure_future(ready(tuple(processes)))
             done, _ = await asyncio.wait(
                 [admission, stop_wait, *waits], return_when=asyncio.FIRST_COMPLETED
@@ -219,7 +279,7 @@ async def supervise_process_workers(
                 await admission
         pending = set(waits)
         failed = None
-        while pending and not stop.is_set():
+        while pending and not stop_requested.is_set():
             done, _ = await asyncio.wait([*pending, stop_wait], return_when=asyncio.FIRST_COMPLETED)
             for task in done & pending:
                 pending.remove(task)
@@ -240,7 +300,7 @@ async def supervise_process_workers(
             forced_shutdown=forced,
         )
     finally:
-        for task in (admission, stop_wait):
+        for task in (admission, stop_wait, caller_stop_wait):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

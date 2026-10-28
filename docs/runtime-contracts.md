@@ -5229,8 +5229,13 @@ Applications may pass a shared `DurableWorkerMetrics` instance to
 `snapshot()` exposes only bounded counts and timing aggregates for configured
 capacity, current and peak active handlers/pollers, claim outcomes, hints,
 fallback polling, maintenance, store failures, idle backoff, persisted
-task-admission-to-claim latency, and the narrower hint-consumption-to-claim
-interval. Failed and cancelled claims remain distinct from successful empty
+task-admission-to-claim latency, the narrower hint-consumption-to-claim
+interval, and event-loop lag. Each worker run samples how late the process's
+event loop runs a timer every half second (`event_loop_lag_samples`,
+`event_loop_lag_total_s`, `event_loop_lag_max_s`, `current_event_loop_lag_s`)
+and logs a warning, at most once a minute per process, when a sample reaches
+one second; `cayu.observability.EventLoopLagMonitor` is the same sampler for
+use on its own. Failed and cancelled claims remain distinct from successful empty
 claims. A received hint becomes accepted only when it obtains a cohort-gated
 authoritative claim attempt. That attempt is counted as ignored if it fails,
 is cancelled, or returns no task, and as followed by a successful claim only

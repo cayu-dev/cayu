@@ -662,6 +662,12 @@ Cayu makes safety boundaries explicit, but configuration still matters:
   credentials, and destination controls where consequences require them.
 - SQLite is appropriate for local and single-writer deployments. Use PostgreSQL
   or another conforming shared store for sustained multi-process concurrency.
+- One process runs its runtime work on one CPU core. Past a few concurrent
+  sessions per process, per-step runtime time grows several times over; run
+  the task worker in more processes (`cayu worker NAME --processes N`, or
+  `supervise_process_workers` from your own code). Workers log a warning when
+  the process's event loop falls behind. See [one process is one CPU
+  core](https://github.com/cayu-dev/cayu/blob/main/docs/project-workers.md#one-process-is-one-cpu-core).
 - The FastAPI server requires an explicit `ServerConfig` access policy.
   Use `AuthenticatedAccess` for a deployed Developer dashboard and API; `OpenAccess` and
   `ServerConfig.local_development()` are deliberate local-only choices.
