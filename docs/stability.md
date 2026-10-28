@@ -145,6 +145,19 @@ would have shipped in a minor release, listed under `Breaking changes`.
 Only **minor releases** (`0.N.0`) carry breaking changes, deprecations and
 removals, new versions of versioned contracts, and default changes.
 
+### v0.16.1 exception
+
+The maintainer approved one explicit exception for v0.16.1: restoring long-running
+handler and custom retry-backoff behavior after the implicit time-budget
+regressions. New implicit task event budgets keep their attempt cap without an
+elapsed-time cap, and custom retry policies whose requested delays exceed the
+implicit 300-second budget keep their requested backoff. Explicit limits and
+budgets already recorded for admitted events remain enforced.
+
+These changes are listed under `Breaking changes` in the v0.16.1 release notes,
+with instructions for applications that need fixed time limits. This exception
+does not change the patch-release rules for subsequent releases.
+
 ## Release-notes format
 
 Edit [release-notes.md](release-notes.md) only during release preparation; ordinary

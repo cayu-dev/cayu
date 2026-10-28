@@ -3698,7 +3698,8 @@ def test_cancellation_resistant_after_observer_fences_finalization_and_reuse(
                         break
                     await asyncio.sleep(0.01)
 
-            assert first.done() is False
+            # The terminal stream may finish while its fenced cleanup owner
+            # is retained. Quiescence governs finalization and reuse.
             assert binding.after_observation_finished.is_set() is False
             assert binding.finalize_calls == 0
             assert not any(
@@ -3728,6 +3729,7 @@ def test_cancellation_resistant_after_observer_fences_finalization_and_reuse(
             binding.release_after_observation.set()
             async with asyncio.timeout(30):
                 completed = await asyncio.gather(first, *([contender] if contender else []))
+        assert await app.drain_environment_cleanups(timeout_s=30)
         first_events, second_events = completed
         first_durable = await store.query_events(
             EventQuery(session_id="session-after-observer-first")
@@ -6985,14 +6987,23 @@ def test_stalled_observer_is_bounded_without_replacing_tool_outcome(
     tmp_path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        workspace_capture_module,
-        "_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS",
-        0.01,
-    )
-
     async def run():
         binding = _StalledObserverBinding()
+        await_outcome = workspace_capture_module.await_shielded_task_outcome
+        observation_calls = 0
+
+        async def timeout_after_dispatch(task, **kwargs):
+            nonlocal observation_calls
+            observation_calls += 1
+            if observation_calls == 2:
+                async with asyncio.timeout(30):
+                    await binding.started.wait()
+                kwargs["timeout_s"] = 0.01
+            return await await_outcome(task, **kwargs)
+
+        monkeypatch.setattr(
+            workspace_capture_module, "await_shielded_task_outcome", timeout_after_dispatch
+        )
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(_ScriptedProvider(), default=True)

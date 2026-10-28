@@ -1,35 +1,68 @@
 # Release notes
 
-## Unreleased
+## v0.16.1
 
-Upgrade: No storage migration is required. Review the changes below before upgrading.
+Upgrade: No storage migration is required from 0.16.0. Storage revision and
+compatibility floor remain 133, server contract remains 67, and manifest schema
+remains 17. Custom retry policies with long backoffs may now run longer: set
+`max_retry_elapsed_s` explicitly when a fixed retry time budget is required.
+New implicit task event budgets no longer impose a 30-minute timeout; use worker
+`execution_timeout_s` or an explicit event budget to bound long handlers. Events
+already admitted under 0.16.0 retain their recorded budget.
 
 ### Breaking changes
 
-None.
+This release uses the explicit v0.16.1 exception in the
+[stability policy](stability.md#v0161-exception) for these budget behavior fixes.
+
+- The implicit task event budget still allows three attempts but no longer has
+  an elapsed-time cap. Workers without `execution_timeout_s` can run longer than
+  30 minutes. Explicit `TaskRetryBudget()` values still impose 1,800 seconds.
+- Custom retry policies whose configured backoff exceeds the implicit
+  300-second retry budget now receive all their requested delays and attempts.
+  Set `max_retry_elapsed_s` explicitly to retain a fixed limit.
 
 ### Changes
 
-- Brokered sandboxes can fetch private repositories without their token:
-  `BrokeredSandboxCodingEnvironmentFactory(git_repositories=...)`,
-  `SandboxBrokerClient.create(git_repositories=...)` and
-  `CAYU_CLOUD_SANDBOX_GIT_REPOSITORIES` ask Cayu Cloud to add the Agent's bound
-  git credential to the sandbox's fetches of exactly those repositories.
-  `SandboxRecord.git` reports them, and `validate_git_repositories` checks them
-  as Cloud does.
+- Cloud reporting exposes upcoming scheduled work and external-event waits,
+  including wakeup times, pending maintenance, and work awaiting application
+  processing, without claiming tasks or advancing waits.
+- `cayu keys generate` creates alias keyrings and can safely update a dotenv
+  file while preserving exports, file ownership, and unrelated settings.
+- Approval inbox items explain why arguments are withheld. Protected human review
+  can read selected long fields in full, subject to the existing authorization
+  and secret checks.
+- `ToolArgumentReview` can derive its binding key from the application's alias
+  keyring; explicit binding keys remain supported.
+- Event watcher cursors and delivery state persist with application stores.
+  `open_application_stores()` exposes the watcher store, and `CayuApp` uses the
+  companion store for persistent session backends.
+- `MatchingSessionAccess` accepts `same_labels` and `exclude_same_labels` to
+  compare target sessions with the caller's labels. Missing caller labels deny
+  access.
+- Brokered sandbox creation accepts `queue_seconds`; capacity responses expose
+  queued requests and their positions when the broker supports them.
+- Brokered sandboxes can request access to named private git repositories while
+  credentials remain with the broker.
 
 ### Fixes
 
-- A failed staged copy's `SandboxCopyFailedError` now carries Cayu Cloud's message
-  after the code, so a brokered binding's failure says where and why the copy
-  failed (for example `Staged copy … failed: copy_disk_full. The staged copy
-  failed: Extracting the archive failed: the sandbox ran out of disk space (exit
-  6).`) instead of the bare code.
-- `cayu check` no longer treats the root `conftest.py` as application code unless
-  application source refers to it, so a pytest fixture there no longer stops the
-  application from being loaded and checked. The factory
-  modules it loads are now always checked, whatever their location. When a
-  finding does stop the import, `SCAFFOLD_APPLICATION_NOT_IMPORTED` now names it.
+- Long task handlers are no longer cut off by the implicit event budget. Workers
+  warn when a declared or previously recorded budget is shorter than their
+  handler timeout, and budget exhaustion identifies the applicable limit.
+- Custom retry backoffs that exceed the implicit 300-second retry budget keep
+  their requested delays and attempts. Explicit budgets remain enforced, and
+  resumed sessions retain their recorded policy.
+- Sessions renewed after a human wait retain the renewed handler deadline when
+  a later task event continues them.
+- Read-only SQLite and PostgreSQL inspection works without alias keys. Writable
+  stores still require their existing keyring, and setup errors name the key
+  environment variables.
+- `cayu check` excludes an unused root `conftest.py` from application scanning,
+  checks explicitly loaded factories, and identifies findings that block import.
+- Deployment polling tolerates bounded transient failures. Cloud API errors
+  identify the transport failure and request without exposing query strings.
+- Failed brokered staged copies include the broker's bounded diagnostic message.
 
 ## v0.16.0
 

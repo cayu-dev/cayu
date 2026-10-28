@@ -5,6 +5,7 @@ import io
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -424,14 +425,43 @@ def test_real_docker_failure_diagnostics_survive_durable_tool_evidence(tmp_path,
     assert inspected.returncode != 0
 
 
+@pytest.fixture(scope="module")
+def python_transport_image():
+    docker_path = _docker_path_or_skip()
+    image = "python:3.12-slim"
+    inspected = subprocess.run(
+        [docker_path, "image", "inspect", image], capture_output=True, timeout=20
+    )
+    if inspected.returncode == 0:
+        return docker_path, image
+
+    # Provision separately from the command under test. Registry outages may
+    # retry here; transport execution and its assertions must run exactly once.
+    error = ""
+    for attempt in range(3):
+        try:
+            pulled = subprocess.run(
+                [docker_path, "pull", image], capture_output=True, text=True, timeout=120
+            )
+        except subprocess.TimeoutExpired:
+            error = "image pull timed out"
+        else:
+            if pulled.returncode == 0:
+                return docker_path, image
+            error = pulled.stderr
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
+    pytest.fail(f"Docker transport test image unavailable after three attempts: {error}")
+
+
 @pytest.mark.parametrize("mode", ["fallback", "no_setsid", "direct", "shell"])
-def test_quote_heavy_transport_on_linux(mode):
+def test_quote_heavy_transport_on_linux(mode, python_transport_image):
     import json
     import shlex
 
     from cayu.runners.docker import _build_docker_exec_argv
 
-    docker_path = _docker_path_or_skip()
+    docker_path, image = python_transport_image
     payload = ["alpha'beta"] * 1000
     raw = (
         "import json, os, sys; print(json.dumps(["
@@ -466,7 +496,7 @@ def test_quote_heavy_transport_on_linux(mode):
             "/tmp",
             "-e",
             "CANARY=environment-canary",
-            "python:3.12-slim",
+            image,
             *guest,
         ],
         input="stdin-canary",

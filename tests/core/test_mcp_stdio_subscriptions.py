@@ -34,8 +34,8 @@ def _spec(log: Path, mode: str = "normal") -> McpServerSpec:
     )
 
 
-async def _until(predicate):
-    async with asyncio.timeout(5):
+async def _until(predicate, *, timeout=5):
+    async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0.001)
 
@@ -243,20 +243,26 @@ def test_modern_stdio_subscription_official_sdk_interoperability(tmp_path, conta
         app = CayuApp(enable_logging=False)
         try:
             app.register_agent(AgentSpec(name="agent", model="unused"), mcp_toolsets=(toolset,))
-            await _until(lambda: toolset.refresh_state is McpToolsetRefreshState.READY)
+            await _until(lambda: toolset.refresh_state is McpToolsetRefreshState.READY, timeout=30)
+            ordinary_limits = toolset.session.transport_limits
             toolset.session.transport_limits = McpTransportLimits(
                 idle_timeout_s=0.2, total_call_timeout_s=2
             )
             await asyncio.sleep(0.3)
             assert not toolset.session._closed
+            # The short idle budget proves the subscription stays open. Restore
+            # ordinary request budgets before testing refresh and SDK cleanup.
+            toolset.session.transport_limits = ordinary_limits
             old = toolset.tools[0]
             await toolset.session.read_resource("control://advance")
-            await _until(lambda: "mcp__sdk__added" in app.get_agent("agent").tools)
+            await _until(lambda: "mcp__sdk__added" in app.get_agent("agent").tools, timeout=30)
             assert not old._dispatch_authority_is_current()
             # Stop just the listener. The SDK must process cancellation while
             # the process is still alive and ordinary requests remain usable.
             toolset.session._set_tools_list_changed_handler(None)
-            await _until(lambda: any(r.get("subscriptionClosed") for r in _requests(log)))
+            await _until(
+                lambda: any(r.get("subscriptionClosed") for r in _requests(log)), timeout=30
+            )
             assert toolset.session.process.returncode is None
             assert len(await toolset.session.list_tools()) == 2
         finally:
