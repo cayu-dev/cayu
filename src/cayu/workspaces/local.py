@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import stat
 from bisect import insort
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable, Iterator
+from contextlib import closing
 from hashlib import sha256
 from os import PathLike
 from pathlib import Path
 
 from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
 from cayu.workspaces._local_guard import (
+    _SEARCH_BASE_FLAGS,
     _require_descriptor_guard_support,
     create_regular,
     delete_regular,
@@ -701,25 +704,19 @@ def _list_files(
 ) -> WorkspaceListResult:
     with workspace_source_lock(root, exclusive=False):
         collector = _WorkspaceListCollector(limit)
-        for path in _iter_list_file_candidates(
-            root,
-            excluded_directory_keys,
-            excluded_path_pattern_keys,
-        ):
-            if _has_symlink_component(root, path):
-                continue
-            resolved = path.resolve()
-            _ensure_inside_root(root, resolved)
-            if resolved == root or not resolved.is_file():
-                continue
-            relative_path = resolved.relative_to(root).as_posix()
-            if _path_has_excluded_directory(relative_path, excluded_directory_keys):
-                continue
-            if _path_matches_excluded_pattern(relative_path, excluded_path_pattern_keys):
-                continue
-            if not matches_list_pattern(relative_path, pattern):
-                continue
-            collector.add(relative_path)
+        matched = 0
+        with closing(
+            _iter_listable_files(root, excluded_directory_keys, excluded_path_pattern_keys)
+        ) as candidates:
+            for relative_path in candidates:
+                if not matches_list_pattern(relative_path, pattern):
+                    continue
+                collector.add(relative_path)
+                matched += 1
+                # The walk yields paths in sorted order, so the first match past
+                # the limit settles both the page and the truncation flag.
+                if limit is not None and matched > limit:
+                    break
         return collector.result(exact_total_when_truncated=False)
 
 
@@ -803,34 +800,260 @@ def _list_git_entries(
     )
 
 
-def _iter_list_file_candidates(
+class _ListEntryNotDirectoryError(Exception):
+    """A directory entry stopped being a real directory before it was opened."""
+
+
+_SUPPORTS_LIST_DIRECTORY_FD = os.scandir in os.supports_fd
+_LIST_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_LIST_SEARCH_FLAGS = (
+    _SEARCH_BASE_FLAGS | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
+# Opening a symlink with O_NOFOLLOW fails with ELOOP (EMLINK on some BSDs), and
+# some kernels report ENOTDIR for O_NOFOLLOW | O_DIRECTORY instead.
+_LIST_NOT_DIRECTORY_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK, errno.ENOTDIR})
+# Errors that mean one directory cannot be read. Anything else, such as running
+# out of descriptors or an I/O error, fails the listing instead of shortening it.
+_LIST_UNREADABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.ENOENT})
+# Directories below the root deeper than this have their descriptors closed and
+# are reopened from the nearest open ancestor if the walk needs them again.
+_LIST_OPEN_DIRECTORY_LIMIT = 32
+
+_ListEntries = Iterator[tuple[str, str, bool]]
+
+
+class _ListLevel:
+    __slots__ = ("fd", "name", "pending")
+
+    def __init__(self, fd: int | None, name: str, pending: _ListEntries) -> None:
+        self.fd = fd
+        self.name = name
+        self.pending = pending
+
+
+def _iter_listable_files(
     root: Path,
     excluded_directory_keys: frozenset[str],
     excluded_path_pattern_keys: tuple[str, ...],
-) -> Iterable[Path]:
-    if not excluded_directory_keys and not excluded_path_pattern_keys:
-        yield from root.rglob("*")
-        return
+) -> Generator[str, None, None]:
+    """Yield the workspace's listable regular files as relative POSIX paths, sorted.
 
-    for directory, child_directories, filenames in os.walk(
-        root,
-        topdown=True,
-        followlinks=False,
-        onerror=_raise_workspace_walk_error,
-    ):
-        parent = Path(directory)
-        child_directories[:] = [
-            name
-            for name in child_directories
-            if _directory_name_key(name) not in excluded_directory_keys
-            and not _path_matches_excluded_pattern(
-                (parent / name).relative_to(root).as_posix(),
-                excluded_path_pattern_keys,
-            )
-            and not (parent / name).is_symlink()
-        ]
-        for filename in filenames:
-            yield parent / filename
+    The root is opened one component at a time from ``/`` and every directory
+    below it relative to an opened parent, all with ``O_NOFOLLOW``; each is read
+    once with ``os.scandir``. Entries are classified from the directory read
+    itself (no per-entry ``stat`` where the filesystem reports entry types),
+    and anything that is not a regular file or a real directory, including
+    every symlink, is skipped. The walk therefore never leaves the root through
+    a symlink, even one swapped in while it runs. At most
+    ``_LIST_OPEN_DIRECTORY_LIMIT`` directories below the root are open at once.
+
+    Siblings are visited by name, with ``/`` appended to directory names, which
+    is exactly the order ``sorted()`` gives the full paths, so callers can stop
+    after the first matches they need.
+    """
+    if not _SUPPORTS_LIST_DIRECTORY_FD:
+        raise RuntimeError(
+            "LocalWorkspace requires POSIX descriptor-relative filesystem primitives."
+        )
+    # Listings without exclusions used Path.rglob, which skips directories it
+    # cannot read; listings with exclusions used os.walk, which raised. Both
+    # behaviors are kept.
+    skip_unreadable = not excluded_directory_keys and not excluded_path_pattern_keys
+    try:
+        root_fd = _open_list_root(root)
+    except OSError as exc:
+        if exc.errno in _LIST_NOT_DIRECTORY_ERRNOS:
+            # The root was resolved when the workspace was created, so a
+            # symlink on the way means it or an ancestor was replaced since.
+            raise ValueError("Workspace path escapes the workspace root.") from exc
+        if skip_unreadable and exc.errno in _LIST_UNREADABLE_ERRNOS:
+            return
+        raise
+    root_entries = _read_list_directory(
+        root_fd,
+        "",
+        excluded_directory_keys,
+        excluded_path_pattern_keys,
+        skip_unreadable,
+    )
+    if root_entries is None:
+        return
+    stack = [_ListLevel(root_fd, "", root_entries)]
+    try:
+        while stack:
+            level = stack[-1]
+            for name, relative_path, is_directory in level.pending:
+                if not is_directory:
+                    yield relative_path
+                    continue
+                if level.fd is None:
+                    level.fd = _reopen_list_level(stack, skip_unreadable)
+                    if level.fd is None:
+                        stack.pop()
+                        break
+                try:
+                    child = _open_list_directory(
+                        level.fd,
+                        name,
+                        relative_path + "/",
+                        excluded_directory_keys,
+                        excluded_path_pattern_keys,
+                        skip_unreadable,
+                    )
+                except _ListEntryNotDirectoryError:
+                    # Replaced by a symlink or a file since it was read; the
+                    # listing skips those either way.
+                    continue
+                if child is not None:
+                    stack.append(_ListLevel(child[0], name, child[1]))
+                    # The root stays open, so a reopen never starts above it.
+                    if len(stack) > _LIST_OPEN_DIRECTORY_LIMIT + 1:
+                        ancestor = stack[-_LIST_OPEN_DIRECTORY_LIMIT - 1]
+                        if ancestor.fd is not None:
+                            os.close(ancestor.fd)
+                            ancestor.fd = None
+                    break
+            else:
+                stack.pop()
+                if level.fd is not None:
+                    os.close(level.fd)
+    finally:
+        for level in stack:
+            if level.fd is not None:
+                os.close(level.fd)
+
+
+def _open_list_root(root: Path) -> int:
+    """Open the absolute root for reading without following any symlink on the way."""
+    parts = root.parts
+    if len(parts) == 1:
+        return os.open(parts[0], _LIST_DIRECTORY_FLAGS)
+    # Ancestors only need search permission, not read permission.
+    current = os.open(parts[0], _LIST_SEARCH_FLAGS)
+    try:
+        for index, name in enumerate(parts[1:], start=2):
+            flags = _LIST_DIRECTORY_FLAGS if index == len(parts) else _LIST_SEARCH_FLAGS
+            descriptor = os.open(name, flags, dir_fd=current)
+            os.close(current)
+            current = descriptor
+        opened, current = current, None
+        return opened
+    finally:
+        if current is not None:
+            os.close(current)
+
+
+def _reopen_list_level(stack: list[_ListLevel], skip_unreadable: bool) -> int | None:
+    """Reopen the top level's directory from its nearest open ancestor.
+
+    Every component is opened with ``O_NOFOLLOW``, so a directory replaced by
+    a symlink in the meantime is not followed; the rest of that directory is
+    then skipped, as is one that became unreadable when ``skip_unreadable``.
+    """
+    base = len(stack) - 1
+    while stack[base].fd is None:
+        base -= 1
+    parent = stack[base].fd
+    opened: int | None = None
+    try:
+        for level in stack[base + 1 :]:
+            try:
+                descriptor = os.open(level.name, _LIST_DIRECTORY_FLAGS, dir_fd=parent)
+            except OSError as exc:
+                if exc.errno in _LIST_NOT_DIRECTORY_ERRNOS:
+                    return None
+                if skip_unreadable and exc.errno in _LIST_UNREADABLE_ERRNOS:
+                    return None
+                raise
+            if opened is not None:
+                os.close(opened)
+            opened = parent = descriptor
+        reopened, opened = opened, None
+        return reopened
+    finally:
+        if opened is not None:
+            os.close(opened)
+
+
+def _open_list_directory(
+    parent_fd: int,
+    name: str,
+    prefix: str,
+    excluded_directory_keys: frozenset[str],
+    excluded_path_pattern_keys: tuple[str, ...],
+    skip_unreadable: bool,
+) -> tuple[int, _ListEntries] | None:
+    """Open and read one subdirectory; ``None`` when it is skipped as unreadable."""
+    try:
+        directory_fd = os.open(name, _LIST_DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno in _LIST_NOT_DIRECTORY_ERRNOS:
+            raise _ListEntryNotDirectoryError(name) from exc
+        if skip_unreadable and exc.errno in _LIST_UNREADABLE_ERRNOS:
+            return None
+        raise
+    entries = _read_list_directory(
+        directory_fd,
+        prefix,
+        excluded_directory_keys,
+        excluded_path_pattern_keys,
+        skip_unreadable,
+    )
+    if entries is None:
+        return None
+    return directory_fd, entries
+
+
+def _read_list_directory(
+    directory_fd: int,
+    prefix: str,
+    excluded_directory_keys: frozenset[str],
+    excluded_path_pattern_keys: tuple[str, ...],
+    skip_unreadable: bool,
+) -> _ListEntries | None:
+    """Return one opened directory's listable entries in walk order.
+
+    Entries are ``(name, relative_path, is_directory)``. Excluded names and
+    paths are dropped here, so excluded directories are never opened. The
+    descriptor is closed when this returns ``None`` or raises.
+    """
+    keyed: list[tuple[str, str, str, bool]] = []
+    try:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                entry_name = entry.name
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        is_directory = True
+                    elif entry.is_file(follow_symlinks=False):
+                        is_directory = False
+                    else:
+                        continue
+                except OSError as exc:
+                    # Filesystems without entry types need a stat here; an
+                    # I/O error must not look like a missing file.
+                    if not skip_unreadable or exc.errno not in _LIST_UNREADABLE_ERRNOS:
+                        raise
+                    continue
+                if _path_has_excluded_directory(entry_name, excluded_directory_keys):
+                    continue
+                relative_path = prefix + entry_name
+                if _path_matches_excluded_pattern(relative_path, excluded_path_pattern_keys):
+                    continue
+                sort_key = entry_name + "/" if is_directory else entry_name
+                keyed.append((sort_key, entry_name, relative_path, is_directory))
+    except BaseException as exc:
+        os.close(directory_fd)
+        if skip_unreadable and isinstance(exc, OSError) and exc.errno in _LIST_UNREADABLE_ERRNOS:
+            return None
+        raise
+    keyed.sort()
+    return ((entry_name, path, is_dir) for _key, entry_name, path, is_dir in keyed)
 
 
 def _raise_workspace_walk_error(error: OSError) -> None:
@@ -935,26 +1158,6 @@ def _path_matches_excluded_pattern(
         for pattern in excluded_path_pattern_keys
         for end in range(1, len(normalized_parts) + 1)
     )
-
-
-def _has_symlink_component(root: Path, path: Path) -> bool:
-    try:
-        relative = path.relative_to(root)
-    except ValueError:
-        return True
-    current = root
-    for part in relative.parts:
-        current = current / part
-        if current.is_symlink():
-            return True
-    return False
-
-
-def _ensure_inside_root(root: Path, path: Path) -> None:
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("Workspace path escapes the workspace root.") from exc
 
 
 def _validate_limit(value: int | None, field_name: str) -> int | None:
