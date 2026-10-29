@@ -507,3 +507,49 @@ def test_a_worker_that_runs_until_idle_takes_an_eval_run_its_last_task_pass_saw_
         assert asyncio.run(_status(store, "late-run")) is EvalRunStatus.COMPLETED
     finally:
         asyncio.run(store.close())
+
+
+def test_the_worker_closes_its_eval_store_in_the_loop_that_used_it(tmp_path: Path) -> None:
+    # A PostgreSQL pool's connections belong to the loop that opened them.
+    used: list[asyncio.AbstractEventLoop] = []
+    closed: list[asyncio.AbstractEventLoop] = []
+
+    class LoopBoundEvalStore(SQLiteEvalStore):
+        async def claim_run(self, **kwargs):
+            used.append(asyncio.get_running_loop())
+            return await super().claim_run(**kwargs)
+
+        async def close(self) -> None:
+            closed.append(asyncio.get_running_loop())
+            await super().close()
+
+    store = LoopBoundEvalStore(tmp_path / "evals.db")
+    declared = _declared("worker-agent")
+    context = _create_project_control_plane_context(
+        project_root=_PROJECT_ROOT,
+        project_id=None,
+        eval_store=store,
+        store_backend="sqlite",
+        store_source="project",
+        access=ProjectControlPlaneAccess.AUTHENTICATED_PRODUCTION,
+        eval_targets=(declared,),
+        eval_worker="evals",
+    )
+
+    async def tasks_idle(app, stop) -> TaskWorkerIdleResult:
+        return TaskWorkerIdleResult(handled=0, idle=True)
+
+    exit_code = asyncio.run(
+        worker_cli._invoke_worker(
+            tasks_idle,
+            _target(_provider(trials=1)).app,
+            name="evals",
+            shutdown_grace_seconds=5,
+            until_idle=True,
+            evals=EvalRunCoordinator(_runtime(store, declared)),
+            eval_context=context,
+        )
+    )
+
+    assert exit_code == 0
+    assert used and closed == [used[0]]

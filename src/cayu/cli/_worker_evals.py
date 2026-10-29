@@ -42,6 +42,8 @@ class WorkerEvals:
     apps: tuple[CayuApp, ...]
 
     def close(self) -> None:
+        """Close the eval store if the worker's loop didn't; a closed context is left as is."""
+
         close_project_control_plane_context(self.context)
 
 

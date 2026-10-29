@@ -43,6 +43,7 @@ from cayu.tasks.until_idle import TaskWorkerIdleResult, _worker_until_idle_reque
 
 if TYPE_CHECKING:
     from cayu.cli._worker_evals import WorkerEvals
+    from cayu.project_control_plane import ProjectControlPlaneContext
     from cayu.server.evals_worker import EvalRunCoordinator
 
 # A worker that used its whole grace still lets the app seal and report.
@@ -208,6 +209,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                         until_idle=until_idle,
                         evals=None if evals is None else evals.coordinator,
                         eval_apps=() if evals is None else evals.apps,
+                        eval_context=None if evals is None else evals.context,
                     )
                 )
             except SystemExit as exc:
@@ -310,13 +312,15 @@ async def _invoke_worker(
     until_idle: bool = False,
     evals: EvalRunCoordinator | None = None,
     eval_apps: tuple[CayuApp, ...] = (),
+    eval_context: ProjectControlPlaneContext | None = None,
 ) -> int:
     """Run ``target`` until it returns or a signal stops it.
 
     ``evals`` runs the project's eval runs beside it: until no run is left when
     the worker runs until idle, and otherwise until it stops. A drained worker
     finishes the eval run it holds before it exits; a signal releases it.
-    ``eval_apps``, the applications the eval targets run on, close with ``app``.
+    ``eval_apps``, the applications the eval targets run on, close with ``app``, and
+    ``eval_context`` closes its eval store in this loop, which its connections belong to.
     """
 
     stop = asyncio.Event()
@@ -466,6 +470,8 @@ async def _invoke_worker(
                     )
                 ),
             )
+        if eval_context is not None:
+            await eval_context.close()
         # Last, so a host can read the final stdout line.
         if idle_result is not None:
             print(idle_result.model_dump_json(), flush=True)
