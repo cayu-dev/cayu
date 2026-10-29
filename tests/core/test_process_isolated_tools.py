@@ -2244,7 +2244,15 @@ def test_caller_cancellation_during_cleanup_retains_the_preceding_child_failure(
     assert cancelling == 1
     assert cancelled is True
     assert isinstance(cancellation.__cause__, IsolatedToolFailure)
-    assert cancellation.__cause__.code == "child_exited_without_terminal_output"
+    # The crash shows up twice: EOF on the result pipe and the child's exit
+    # status. They arrive independently, and when the exit status misses the
+    # bounded wait after EOF on a busy runner the same crash is reported as
+    # missing_terminal_output. Both codes come only from the crash itself;
+    # test_real_process_child_failures_are_typed_and_bounded accepts both too.
+    assert cancellation.__cause__.code in {
+        "child_exited_without_terminal_output",
+        "missing_terminal_output",
+    }
 
 
 def test_parent_process_control_remains_authoritative_when_cleanup_is_unproven(
