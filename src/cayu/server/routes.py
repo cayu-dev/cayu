@@ -340,6 +340,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     SessionExecutionProfiles,
     session_execution_profiles,
 )
+from cayu.sessions._foreground_child_checkpoint import MAX_FOREGROUND_CHAIN_DEPTH
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY
 from cayu.sessions._supervision_projection import supervision_page_with_anchors
@@ -4355,6 +4356,27 @@ def _parse_knowledge_string_filters(values: list[str] | None, field_name: str) -
     return list(dict.fromkeys(result))
 
 
+async def _delegation_ends_in_wake(store: SessionStore, action: PendingActionRecord) -> bool:
+    """Whether a delegated action's chain of subagents ends in a sleep, as Cloud follows it.
+
+    Each child's own pending action decides, since a parent's reference can lag its
+    child; a child with none, for example while it runs after waking, keeps the kind
+    the reference recorded.
+    """
+
+    for _ in range(MAX_FOREGROUND_CHAIN_DEPTH):
+        reference = action.delegated_action
+        if reference is None:
+            return action.kind is PendingActionKind.WAKE
+        children = await store.query_pending_actions(
+            PendingActionQuery(session_id=reference.child_session_id, limit=1)
+        )
+        if not children.actions:
+            return reference.action_kind == "wake"
+        action = children.actions[0]
+    return False
+
+
 def create_router(
     *,
     cayu_app,
@@ -7531,6 +7553,41 @@ def create_router(
                         for action in result.actions
                         if action.kind is not PendingActionKind.WAKE
                     ],
+                    "total_count": total_count,
+                }
+            )
+        # A parent whose subagent sleeps, at any depth, waits on that timer, not on a person.
+        if cayu_app._uses_session_wakes and query.kind in {
+            None,
+            PendingActionKind.DELEGATED_ACTION,
+        }:
+            store = cayu_app._runtime_session_store
+            asleep = [
+                action
+                for action in result.actions
+                if action.delegated_action is not None
+                and await _delegation_ends_in_wake(store, action)
+            ]
+            total_count = result.total_count
+            if (
+                total_count is not None
+                and (
+                    await store.query_pending_actions(
+                        query.model_copy(
+                            update={
+                                "kind": PendingActionKind.DELEGATED_ACTION,
+                                "cursor": None,
+                                "limit": 1,
+                            }
+                        )
+                    )
+                ).actions
+            ):
+                # Any of the store's delegated actions may end in a wake, on any page.
+                total_count = None
+            result = result.model_copy(
+                update={
+                    "actions": [action for action in result.actions if action not in asleep],
                     "total_count": total_count,
                 }
             )

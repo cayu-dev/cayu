@@ -12,6 +12,11 @@ from cayu._validation import (
     canonical_durable_json_bytes,
 )
 from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
+from cayu.approvals.wakes import (
+    PENDING_WAKE_CHECKPOINT_KEY,
+    WAKE_SCHEDULED_INTERRUPTION_TYPE,
+    pending_session_wake_from_checkpoint,
+)
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
@@ -36,8 +41,11 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions._pending_tool_round import PENDING_TOOL_ROUND_CHECKPOINT_KEY
 from cayu.sessions._tool_effect_intent import ToolEffectIntent
 from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.pending_actions import (
+    pending_action_evidence_round_from_checkpoint,
+    woken_round_awaits_manual_recovery,
+)
+from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.sessions.store import SessionStore
 from cayu.tools.base import ToolResult
 
@@ -288,11 +296,13 @@ async def project_current_foreground_child_result(
             tool_call_id=intent.tool_call_id,
         )
     pending_action_evidence_round_from_checkpoint(checkpoint)
-    if pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is not None or (
-        user_input_lifecycle_authority_from_checkpoint(
+    if (
+        pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is not None
+        or user_input_lifecycle_authority_from_checkpoint(
             checkpoint, current_run_epoch=child.run_epoch
         )[0]
         is not None
+        or pending_session_wake_from_checkpoint(checkpoint) is not None
     ):
         return None
     profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
@@ -353,6 +363,11 @@ async def observe_foreground_child_wait(
     pending_input, _ = user_input_lifecycle_authority_from_checkpoint(
         checkpoint, current_run_epoch=child.run_epoch
     )
+    wake = pending_session_wake_from_checkpoint(checkpoint)
+    if wake is not None:
+        # A sleeping child owns its wake as it owns a person's action: the parent waits.
+        # A woken round handed back after a failed attempt still waits on that wake.
+        pending_input = wake.continuation
     if approval is None and pending_input is None and delegated is None:
         return None
     # Reuse the existing paired-round validator, including its conflicting
@@ -385,7 +400,14 @@ async def observe_foreground_child_wait(
         action_id = approval.approval_id
     else:
         assert pending_input is not None
-        action_kind = "user_input"
+        action_kind = (
+            "wake"
+            if pending_input.wake is not None
+            and not await woken_round_awaits_manual_recovery(
+                store, child.id, pending_input.input_id
+            )
+            else "user_input"
+        )
         action_id = pending_input.input_id
     return foreground_checkpoint.ForegroundChildWait(
         parent_effect=intent,
@@ -538,6 +560,14 @@ async def _observe_resumed_child_wait(
             child_action_run_epoch=settlement.session.run_epoch + 1,
             revision=1,
         )
+    if kind == "wake":
+        return await _observe_woken_child_wait(
+            store,
+            child=child,
+            intent=intent,
+            interaction_id=profile.interaction_id,
+            pause=pauses[0],
+        )
     if kind not in {"tool_approval", "user_input"}:
         return None
     action_type = (
@@ -630,6 +660,85 @@ async def _observe_resumed_child_wait(
         # Invocation release advances the settled source epoch by one. Match
         # the ordinary paused-child observer's released fence, not the epoch
         # at which the action's opening publication ran.
+        child_action_run_epoch=settlement.session.run_epoch + 1,
+        revision=1,
+    )
+
+
+async def _observe_woken_child_wait(
+    store: SessionStore,
+    *,
+    child: Session,
+    intent: ToolEffectIntent,
+    interaction_id: str,
+    pause: EventRecord,
+) -> foreground_checkpoint.ForegroundChildWait:
+    """Recover the wake a resumed child slept on from its insert-only opening receipt.
+
+    The pause's own interruption names the wake; its opening receipt authenticates it.
+    The parent still waits on the same wake: the woken child continues its round and
+    the parent's call continues once the child ends.
+    """
+    stopped = await store.query_events(
+        EventQuery(
+            session_id=child.id,
+            event_type=EventType.SESSION_INTERRUPTED,
+            after_sequence=pause.sequence,
+            limit=1,
+        )
+    )
+    timer = stopped[0].event.payload.get("wake") if stopped else None
+    wake_id = timer.get("wake_id") if type(timer) is dict else None
+    if (
+        type(wake_id) is not str
+        or stopped[0].event.payload.get("interruption_type") != WAKE_SCHEDULED_INTERRUPTION_TYPE
+    ):
+        raise RuntimeError("Resumed foreground child has no durable wake pause.")
+    receipt = await store.load_runtime_publication_receipt(child.id, f"wake-open:{wake_id}")
+    openings = (
+        []
+        if receipt is None or len(receipt.appended_event_ids) != 1
+        else await store.query_events(
+            EventQuery(session_id=child.id, event_id=receipt.appended_event_ids[0], limit=2)
+        )
+    )
+    if (
+        receipt is None
+        or receipt.kind != "wake-open"
+        or receipt.interaction_id != interaction_id
+        or receipt.source_run_epoch >= child.run_epoch
+        or receipt.intent.get("wake_id") != wake_id
+        or len(openings) != 1
+        or openings[0].event.payload.get("checkpoint") != PENDING_WAKE_CHECKPOINT_KEY
+        or openings[0].event.payload.get("transition") != "asleep"
+        or openings[0].event.payload.get("wake_id") != wake_id
+        or openings[0].sequence >= pause.sequence
+    ):
+        raise RuntimeError("Resumed foreground child lacks an exact wake opening receipt.")
+    profile = active_invocation_execution_profile_from_checkpoint(
+        await store.load_checkpoint(child.id)
+    )
+    assert profile is not None
+    settlement = await store.load_historical_interaction_settlement(
+        child.id,
+        expected_session_instance_id=child.instance_id,
+        expected_event=pause.event,
+        expected_profile=profile.profile,
+    )
+    if (
+        settlement.transition.to_status != SessionStatus.INTERRUPTED
+        or settlement.session.run_epoch < receipt.source_run_epoch
+        or await store.load(child.id) != child
+    ):
+        raise RuntimeError("Resumed foreground child lacks its exact wake settlement.")
+    return foreground_checkpoint.ForegroundChildWait(
+        parent_effect=intent,
+        child_session_id=child.id,
+        child_session_instance_id=child.instance_id,
+        child_interaction_id=interaction_id,
+        child_spawn_fingerprint=child.metadata["subagent"]["spawn_fingerprint"],
+        child_action_kind="wake",
+        child_action_id=wake_id,
         child_action_run_epoch=settlement.session.run_epoch + 1,
         revision=1,
     )

@@ -25,7 +25,10 @@ from cayu._validation import revalidate_model_input
 from cayu.budgets.pricing import PriceBook, SessionCostTotals, add_cost_amounts
 from cayu.budgets.usage import AggregateCount, SessionUsageSummary
 from cayu.releases import recorded_release_identity
-from cayu.sessions._foreground_child_checkpoint import foreground_child_state_from_checkpoint
+from cayu.sessions._foreground_child_checkpoint import (
+    MAX_FOREGROUND_CHAIN_DEPTH,
+    foreground_child_state_from_checkpoint,
+)
 from cayu.sessions._run_identity import (
     RUN_LINEAGE_METADATA_KEY,
     is_eval_trial,
@@ -53,7 +56,6 @@ if TYPE_CHECKING:
     from cayu.sessions.store import SessionStore
     from cayu.sessions.summaries import SessionOutcome
 
-_MAX_DELEGATION_DEPTH = 8
 _PENDING_ACTION_STATUSES = frozenset(
     {SessionStatus.INTERRUPTED, SessionStatus.FAILED, SessionStatus.COMPLETED}
 )
@@ -177,7 +179,7 @@ class SessionOverviewReader:
 
         affected = [session_id]
         session = await self._load(session_id)
-        for _depth in range(_MAX_DELEGATION_DEPTH):
+        for _depth in range(MAX_FOREGROUND_CHAIN_DEPTH):
             if (
                 session is None
                 or session.parent_session_id is None
@@ -471,7 +473,7 @@ class SessionOverviewReader:
             if reference is None:
                 kinds.add(action.kind)
             elif (
-                depth < _MAX_DELEGATION_DEPTH
+                depth < MAX_FOREGROUND_CHAIN_DEPTH
                 and (child := await self._delegated_child(session, action)) is not None
             ):
                 child_waiting = await self._waiting_kinds(

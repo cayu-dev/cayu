@@ -8321,6 +8321,7 @@
           "enum": [
             "tool_approval",
             "user_input",
+            "wake",
             "delegated_action"
           ],
           "title": "Action Kind",
@@ -23463,7 +23464,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "74",
+          "default": "75",
           "title": "Contract Version",
           "type": "string"
         },
@@ -30774,7 +30775,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "74",
+          "default": "75",
           "title": "Contract Version",
           "type": "string"
         }

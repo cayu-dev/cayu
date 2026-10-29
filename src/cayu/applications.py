@@ -589,7 +589,6 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
     session_execution_profiles,
 )
-from cayu.sessions._foreground_child_checkpoint import ForegroundChildTerminal, ForegroundChildWait
 from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions._model_stage import (
     ModelCompletionManualRecoveryRequest,
@@ -1582,6 +1581,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
                 if task_store is not None and task_store.supports_task_scheduling is True
                 else None
             ),
+            subagent_may_sleep=partial(_session_wakes._subagent_may_sleep, self),
         )
 
         self._manual_model_completion_recovery = ManualModelCompletionRecovery(
@@ -7859,62 +7859,10 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
 
     @execution_owned_by("foreground_child_delivery")
     async def _continue_foreground_parent(self, claim: PersistedEventSideEffectClaim) -> bool:
-        from cayu.runtime._foreground_child_continuation import deliver_foreground_child_terminal
+        from cayu.runtime._foreground_child_continuation import continue_foreground_parent
 
-        async def resume(terminal: ForegroundChildTerminal) -> None:
-            from cayu.resource_access import recovery_access
-
-            parent = await self._runtime_session_store.load(terminal.wait.parent_effect.session_id)
-            if parent is None:
-                raise KeyError("Foreground parent is missing.")
-            async with recovery_access(
-                parent, self.resource_access_policy, self._runtime_session_store
-            ):
-                await self._foreground_child_delivery_owner.run(
-                    claim,
-                    lambda before_mutation: self._session_recovery.resume_foreground_child(
-                        terminal, before_mutation=before_mutation
-                    ),
-                )
-            # The resumed parent may itself be a foreground child. Its terminal
-            # fan-out was deferred while that run was still active. Deliver only
-            # this exact session's latest outcome after its owner has settled,
-            # so each completed hop can wake its own parent without an unrelated
-            # resume or an unbounded scan of other sessions.
-            outcome = await self._runtime_session_store.summarize_outcome(
-                terminal.wait.parent_effect.session_id
-            )
-            if outcome.terminal_event is not None:
-                await self._event_writer.fan_out_persisted([outcome.terminal_event.event])
-
-        async def refresh(wait: ForegroundChildWait, event: Event) -> None:
-            await self._foreground_child_delivery_owner.run(
-                claim,
-                lambda before_mutation: self._session_engine.refresh_foreground_child_action(
-                    wait, event, before_mutation=before_mutation
-                ),
-            )
-
-        async def settle(wait: ForegroundChildWait, event: Event) -> None:
-            await self._foreground_child_delivery_owner.run(
-                claim,
-                lambda before_mutation: self._session_recovery.settle_foreground_child_terminal(
-                    wait, event, before_mutation=before_mutation
-                ),
-            )
-
-        return await deliver_foreground_child_terminal(
-            claim.event,
-            store=self._runtime_session_store,
-            has_active_tasks=lambda session_id: (
-                self._session_control.has_active_tasks(session_id)
-                or self._session_control.is_interruption_request_active(session_id)
-                or self._session_control.is_emitting_interrupted(session_id)
-                or self._foreground_child_delivery_owner.active(session_id)
-            ),
-            resume=resume,
-            refresh=refresh,
-            settle=settle,
+        return await continue_foreground_parent(
+            self, claim.event, run=partial(self._foreground_child_delivery_owner.run, claim)
         )
 
     @_tracked_entrance

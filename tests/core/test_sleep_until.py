@@ -450,66 +450,6 @@ def test_sleep_is_left_out_of_run_limits_but_not_session_limits(scope) -> None:
     asyncio.run(scenario())
 
 
-def test_child_session_refuses_to_sleep_for_now() -> None:
-    from tests.core.test_foreground_subagent_recovery import _identity
-    from tests.core.test_tool_round_execution_identities import _SequencedProvider
-
-    from cayu.sessions.queries import SessionQuery
-    from cayu.tools.subagents import SubagentSpec, SubagentTool
-
-    async def scenario() -> None:
-        clock = _Clock()
-        sessions, tasks = InMemorySessionStore(), InMemoryTaskStore(clock=clock)
-        provider = _SequencedProvider(
-            [
-                [
-                    ModelStreamEvent.tool_call(
-                        id="spawn", name="subagent", arguments={"agent": "child", "task": "wait"}
-                    ),
-                    ModelStreamEvent.completed(),
-                ],
-                [
-                    ModelStreamEvent.tool_call(
-                        id="call_sleep", name="sleep_until", arguments={"duration_seconds": 60}
-                    ),
-                    ModelStreamEvent.completed(),
-                ],
-                [ModelStreamEvent.text_delta("child done"), ModelStreamEvent.completed()],
-                [ModelStreamEvent.text_delta("parent done"), ModelStreamEvent.completed()],
-            ]
-        )
-        app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False, clock=clock)
-        app.register_provider(provider, default=True)
-        app.register_agent(
-            AgentSpec(name="parent", model="test"),
-            tools=[
-                SubagentTool(
-                    app,
-                    agents={"child": SubagentSpec(agent_name="child")},
-                    execution_profile_identity=_identity("sleeping-child"),
-                )
-            ],
-        )
-        app.register_agent(AgentSpec(name="child", model="test"), tools=[SleepUntilTool()])
-        events = [
-            event
-            async for event in app.run(
-                RunRequest(
-                    session_id="parent",
-                    agent_name="parent",
-                    messages=[Message.text("user", "delegate")],
-                )
-            )
-        ]
-        assert events[-1].type is EventType.SESSION_COMPLETED
-        [child] = (await sessions.list_sessions(SessionQuery(parent_session_id="parent"))).sessions
-        [result] = _sleep_results(await sessions.load_transcript(child.id))
-        assert result.is_error is True and "did not pause" in result.content
-        assert await tasks.list_tasks() == []
-
-    asyncio.run(scenario())
-
-
 def test_a_round_with_an_approval_pauses_for_approval_and_never_sleeps_silently() -> None:
     from tests.core.test_tool_round_execution_identities import _RecordingTool, _SequencedProvider
 

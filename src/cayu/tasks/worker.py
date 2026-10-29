@@ -3564,16 +3564,25 @@ async def _handoff_interrupted_session(
 async def _session_parked_wait(app: CayuApp, session_id: str) -> TaskParkedWait | None:
     """Name the wait an interrupted session is parked on, if it has one of its own.
 
-    A woken round that stopped on a tool a person must settle waits on that person,
-    not on its timer, so its task is handed off unparked for them to continue.
+    That is its own sleep, or the sleep of a foreground subagent it waits on, down
+    its chain of subagents. A woken round that stopped on a tool a person must settle
+    waits on that person, not on its timer, so its task is handed off unparked for
+    them to continue.
     """
 
-    from cayu.tasks.session_wakes import _needs_manual_recovery, _open_wake_id
-
-    wake_id = await _open_wake_id(app, session_id)
-    if wake_id is None or await _needs_manual_recovery(app, session_id, wake_id):
+    if not app._uses_session_wakes:
         return None
-    return TaskParkedWait(kind="session_wake", wait_id=wake_id)
+    from cayu.tasks.session_wakes import _sleeping_wait
+
+    sleeping = await _sleeping_wait(app, session_id)
+    if sleeping is None:
+        return None
+    sleeper, wake_id = sleeping
+    return TaskParkedWait(
+        kind="session_wake",
+        wait_id=wake_id,
+        session_id=None if sleeper == session_id else sleeper,
+    )
 
 
 async def _may_await_continuation(task_store: TaskStore, handled: Task) -> bool:

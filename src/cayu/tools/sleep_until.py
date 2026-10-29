@@ -45,9 +45,12 @@ class SleepUntilTool(Tool):
 
     In a session a task owns, the task's worker hands the task off parked on the
     wake: no other continuation claims it, and the wake continues the session under
-    the same task. The tool pauses only top-level sessions that no task owns or
-    that a task worker runs, in a round where no other tool waits for approval;
-    anywhere else the call returns an error.
+    the same task. A subagent sleeps the same way. Its foreground parent's call waits
+    on it, as it waits on a subagent's question, and continues once the subagent ends;
+    the parent's task, if it has one, parks on the subagent's wake. The call returns
+    an error instead of pausing in a task-backed run no task worker owns, in a
+    subagent such a run waits on or that a task-owned parent's approved or answered
+    round runs, and in a round where a tool needed approval first.
     """
 
     # Decoupled markers the runtime checks (via getattr) to recognize a pausing tool
@@ -168,8 +171,9 @@ class SleepUntilTool(Tool):
         # could not pause this round for it.
         return ToolResult(
             content=(
-                "sleep_until did not pause: it can pause only a top-level session that "
-                "no task owns or that a task worker runs, in a round where no tool "
+                "sleep_until did not pause: it cannot pause a task-backed run that no "
+                "task worker owns or a subagent such a run waits on, a subagent of an "
+                "approved or answered round under a task, or a round where a tool "
                 "needed approval, including sleep_until itself. Continue without "
                 "waiting, or call sleep_until again in a later round without other tools."
             ),

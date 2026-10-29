@@ -282,6 +282,7 @@ class ToolRoundExecutor:
         apply_limit_evaluation: LimitEventStream,
         close_interrupted_round: InterruptedRoundEventStream,
         publish_session_wake: Callable[[PendingUserInput], Awaitable[None]] | None = None,
+        subagent_may_sleep: Callable[[Session], Awaitable[bool]] | None = None,
     ) -> None:
         self.invocation = invocation
         self._session_store = session_store
@@ -295,6 +296,7 @@ class ToolRoundExecutor:
         self._apply_limit_evaluation = apply_limit_evaluation
         self._close_interrupted_round = close_interrupted_round
         self._publish_session_wake = publish_session_wake
+        self._subagent_may_sleep = subagent_may_sleep
 
     def create_run(
         self,
@@ -1338,8 +1340,6 @@ class ToolRoundRun:
         self.user_input_pause_superseded = False
 
     def _wake_allowed(self) -> bool:
-        if self._session.parent_session_id is not None:
-            return False
         if self._task_id is None:
             return True
         # Only a worker's task run is handed off, parked until its wake continues
@@ -1347,6 +1347,22 @@ class ToolRoundRun:
         return self._task_worker_id is not None and (
             self._invocation_context is None or self._invocation_context.work_attempt is None
         )
+
+    async def _wake_allowed_now(self, tool_calls: list[runtime_records.ToolCallRequest]) -> bool:
+        """Whether this round may sleep, asking above a subagent only when it would."""
+
+        if not self._wake_allowed():
+            return False
+        if self._session.parent_session_id is None or self._executor._subagent_may_sleep is None:
+            return True
+        if not any(
+            getattr(getattr(registered, "tool", None), "pause_kind", None) == "wake"
+            for registered in (
+                self._registered_agent.executable_tool(call.name) for call in tool_calls
+            )
+        ):
+            return True
+        return await self._executor._subagent_may_sleep(self._session)
 
     @property
     def execution_profile(self) -> ExecutionProfileIdentity | None:
@@ -1556,7 +1572,7 @@ class ToolRoundRun:
             tool_calls,
             policy_results_by_id,
             policy_evidence_by_id,
-            wake_allowed=self._wake_allowed(),
+            wake_allowed=await self._wake_allowed_now(tool_calls),
             now=executor._clock,
         )
         if user_input_pause is not None:

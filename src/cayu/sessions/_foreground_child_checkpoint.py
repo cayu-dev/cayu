@@ -40,6 +40,8 @@ FOREGROUND_CHILD_WAIT_KEY = "foreground_child_wait"
 FOREGROUND_CHILD_TERMINAL_KEY = "foreground_child_terminal"
 FOREGROUND_PARENT_CONTINUATION_KEY = "foreground_parent_continuation"
 FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY = "foreground_child_post_action_continuation"
+#: How many foreground subagent calls deep the runtime follows what a chain waits on.
+MAX_FOREGROUND_CHAIN_DEPTH = 8
 
 
 class ForegroundChildResumeRequest(ResumeRequest):
@@ -75,7 +77,7 @@ class ForegroundChildWait(BaseModel):
     child_session_instance_id: StrictStr
     child_interaction_id: StrictStr
     child_spawn_fingerprint: StrictStr = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    child_action_kind: Literal["tool_approval", "user_input", "delegated_action"]
+    child_action_kind: Literal["tool_approval", "user_input", "wake", "delegated_action"]
     child_action_id: StrictStr
     child_action_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     revision: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)

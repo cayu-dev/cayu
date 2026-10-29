@@ -310,18 +310,25 @@ or not. An older runtime refuses those sessions as
 across this version is not supported (see
 [checkpoint versions](runtime-contracts.md)).
 
-`sleep_until` sleeps top-level sessions, including ones a task worker runs under a
-task. These cases don't sleep, and the call returns an error result saying it did
-not pause, so the model can continue without waiting:
+`sleep_until` sleeps top-level sessions, sessions a task worker runs under a task,
+and subagents (see [sleeping in a subagent](#sleeping-in-a-subagent)). These cases
+don't sleep, and the call returns an error result saying it did not pause, so the
+model can continue without waiting:
 
-- a child (sub-agent) session (not supported yet);
 - a round that paused for approval first, including approval of `sleep_until`
   itself: the approved round runs, and `sleep_until` reports that it did not pause
   (not supported yet);
 - a task-backed run that no task worker owns, such as
   `app.run(RunRequest(task_id=...))` without `task_worker_id`, and an admitted work
   attempt: nothing would hand such a task off parked, so its wake could never
-  continue it. Run the task from a worker instead.
+  continue it. Run the task from a worker instead. The same holds for a foreground
+  subagent whose chain of waiting calls such a run owns;
+- a foreground subagent of a task-owned parent whose waiting call runs inside an
+  approval or answer still being carried out: that continuation keeps the authority
+  it was resolved with, so the wake could not continue it under the task's claim;
+- a foreground subagent more than eight calls below its top session, deeper than
+  the runtime follows a chain to check who owns it. Chains that deep that wait on a
+  person behave as they always have.
 
 The environment follows its ordinary lifecycle while the session sleeps; in-memory
 process state is not kept.
@@ -374,6 +381,64 @@ How the parked task meets task policy:
 | Cancellation | `cancel_task` cancels a parked task at once, since no worker holds it. When its wake is due, the wake finds the task ended and stops the sleep instead of continuing the session without it. |
 | Interrupting the session | Cancels the wake's attempts. On its reclaim cadence, a worker's `reconcile_parked_handoffs` finds the task parked on the closed sleep and hands it off unparked, so a `recovered_interrupted_task_handler` gets it like any interrupted task. |
 | Deleting the session | Refused while the task still runs, as for any session whose task is active, so the parked task is never left without its session. Cancel the task first, which settles a parked task at once, then delete the session; deletion cancels the wake's attempts. |
+
+### Sleeping in a subagent
+
+A subagent sleeps exactly like a top-level session: the same `pending_wake` pause,
+receipts and wake task, named by the subagent's own session.
+
+- **Foreground subagent.** The parent's `subagent` call waits on it, as it waits on
+  a subagent that asks a person. The parent stops with
+  `interruption_type="waiting_on_child_action"`, its `session.interrupted` event and
+  `delegated_action` reference name the subagent and its wake (`action_kind="wake"`,
+  `action_id` the wake id), and no result reaches the parent's transcript. When the
+  wake is due, it continues the subagent's call; once the subagent ends, the
+  parent's original call receives its result and continues, once. This holds for
+  nested subagents too, from the leaf upward. A subagent that sleeps again or asks a
+  person after waking refreshes the parent's reference through
+  `session.delegated_action.updated`. A parent waiting on a sleeping subagent, at
+  any depth, waits on no person: the server's pending-action API leaves it out (its
+  `total_count` is `null` while any delegated action is pending), and Cloud reports
+  the parent `running` with the subagent's `waiting_for.kind = "wake"`. Stopping the parent closes its call; the subagent
+  still wakes and ends, and the parent is not revived. Stopping the sleeping
+  subagent cancels its wake, and the parent's call receives the subagent's
+  interrupted result.
+- **Background and durable subagents.** The parent doesn't wait. `subagent_result`
+  reports a sleeping subagent as not finished, with `status="sleeping"`,
+  `retrieval_status="not_ready"`, `is_error=false` and `wake_at`; waiting on it
+  waits as on a running subagent, and so does one still at work after its wake. A
+  sleeping subagent whose wake ran out of retries
+  is reported `status="needs_recovery"` with `is_error=true`; continue it with
+  `deliver_session_wake`. A foreground subagent in that state is not surfaced yet:
+  as for a top-level sleep whose retries are spent, its parent still reports a
+  wake, so only the `reconcile_session_wakes` log names it. A durable subagent's queue task still ends when it
+  pauses, and the wake continues it outside the queue.
+- **A parent a task owns.** When a worker runs the parent under a task and its
+  foreground subagent sleeps, the worker parks the parent's task on the subagent's
+  wake: the handoff's `TaskParkedWait` names that wake and the subagent
+  (`session_id`). The wake's attempt claims the parent's task through the same
+  bound claim, continues the subagent and then each parent up the chain under that
+  claim, and the task completes, fails or parks again with its session; a subagent
+  that sleeps again parks it on the new wake. Only an
+  attempt holding that claim continues the chain: while the task's session waits on
+  the subagent's wake, parked or claimed, any other delivery of a subagent's ending
+  (another process's side-effect sweep, for example) acknowledges it and leaves the
+  parent to the attempt, so nothing stays claimable for a sweep to retry. If an
+  attempt dies after a subagent ended and before the calls above it continued, the
+  task stays parked on that wake, also across an ended middle subagent of a nested
+  chain; once the dead claim expired and no attempt is live,
+  `reconcile_parked_handoffs` gives the wake a new attempt, which continues them. It
+  logs a wake whose retry window is spent; continue that one with
+  `deliver_session_wake`. The task is handed off unparked instead once its own call
+  was stopped (interrupting the parent), the subagent's sleep was stopped, or its
+  woken round, or a subagent it ran, waits on a person. Cancelling the task stops the chain when the wake
+  is due: every waiting call in the chain and the subagent's sleep are stopped, and
+  none runs another model turn. If the subagent had already woken and its attempt
+  died, `reconcile_session_wakes` stops the chain's open calls once the task has
+  ended. Deleting the sleeping subagent is refused while
+  the task runs. A worker that dies inside the woken subagent's own model call or
+  tool leaves the subagent to the recovery any subagent needs after its process
+  died.
 
 #### Upgrading to storage revision 137
 

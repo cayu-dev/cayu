@@ -1,10 +1,14 @@
 """Deliver a child-terminal wakeup using persisted lineage, never a callback ID."""
 
+from __future__ import annotations
+
 from collections.abc import Awaitable, Callable
 from hashlib import sha256
+from typing import TYPE_CHECKING
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
+from cayu.approvals.wakes import pending_session_wake_from_checkpoint
 from cayu.events import Event, EventType
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
 from cayu.runtime._foreground_child_wait import owned_delegated_wait
@@ -26,6 +30,14 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.store import SessionStore
+
+if TYPE_CHECKING:
+    from cayu.applications import CayuApp
+
+# Runs one parent-continuation step, given the guard to call before each mutation.
+ContinuationRunner = Callable[
+    [Callable[[Callable[[], Awaitable[None]]], Awaitable[None]]], Awaitable[None]
+]
 
 
 async def _has_unsettled_parent_spawn(
@@ -209,6 +221,10 @@ async def deliver_foreground_child_terminal(
     pending_input, _ = user_input_lifecycle_authority_from_checkpoint(
         child_checkpoint, current_run_epoch=child.run_epoch
     )
+    if pending_input is None:
+        # A sleeping child owns its wake as it owns a person's action.
+        wake = pending_session_wake_from_checkpoint(child_checkpoint)
+        pending_input = None if wake is None else wake.continuation
     parent = await store.load(child.parent_session_id)
     if parent is None:
         return True
@@ -299,3 +315,71 @@ async def deliver_foreground_child_terminal(
     await resume(terminal)
     remaining = await store.load_checkpoint(parent.id)
     return remaining is None or remaining.get(FOREGROUND_CHILD_WAIT_KEY) != raw_wait
+
+
+async def continue_foreground_parent(
+    app: CayuApp, event: Event, *, run: ContinuationRunner
+) -> bool:
+    """Continue the parent of the child whose terminal ``event`` this is.
+
+    ``run`` owns each continuation step: event delivery runs it under its persisted
+    claim, and a sleeping subagent's wake under its claim on the parent's task. A
+    parent whose task is parked on a sleeping subagent's wake is that wake's to
+    continue, so a delivery holding no claim on the task acknowledges the event and
+    leaves the parent to it. Returns ``False`` while owned work is still settling.
+    """
+
+    from cayu.resource_access import recovery_access
+    from cayu.tasks.session_wakes import _leaves_parent_to_its_wake
+
+    if await _leaves_parent_to_its_wake(app, event.session_id):
+        return True
+    store = app._runtime_session_store
+
+    async def resume(terminal: ForegroundChildTerminal) -> None:
+        parent = await store.load(terminal.wait.parent_effect.session_id)
+        if parent is None:
+            raise KeyError("Foreground parent is missing.")
+        async with recovery_access(parent, app.resource_access_policy, store):
+            await run(
+                lambda before_mutation: app._session_recovery.resume_foreground_child(
+                    terminal, before_mutation=before_mutation
+                )
+            )
+        # The resumed parent may itself be a foreground child. Its terminal
+        # fan-out was deferred while that run was still active. Deliver only
+        # this exact session's latest outcome after its owner has settled,
+        # so each completed hop can wake its own parent without an unrelated
+        # resume or an unbounded scan of other sessions.
+        outcome = await store.summarize_outcome(terminal.wait.parent_effect.session_id)
+        if outcome.terminal_event is not None:
+            await app._event_writer.fan_out_persisted([outcome.terminal_event.event])
+
+    async def refresh(wait: ForegroundChildWait, event: Event) -> None:
+        await run(
+            lambda before_mutation: app._session_engine.refresh_foreground_child_action(
+                wait, event, before_mutation=before_mutation
+            )
+        )
+
+    async def settle(wait: ForegroundChildWait, event: Event) -> None:
+        await run(
+            lambda before_mutation: app._session_recovery.settle_foreground_child_terminal(
+                wait, event, before_mutation=before_mutation
+            )
+        )
+
+    control = app._session_control
+    return await deliver_foreground_child_terminal(
+        event,
+        store=store,
+        has_active_tasks=lambda session_id: (
+            control.has_active_tasks(session_id)
+            or control.is_interruption_request_active(session_id)
+            or control.is_emitting_interrupted(session_id)
+            or app._foreground_child_delivery_owner.active(session_id)
+        ),
+        resume=resume,
+        refresh=refresh,
+        settle=settle,
+    )

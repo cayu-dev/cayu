@@ -524,6 +524,11 @@ unavailable counts rather than guessed totals. Empty cursor pages are followed;
 a long scan pauses with a continuation control, stale cursors restart, and source
 issues remain visible, with an inspection link when the source identifies a
 session. Child delegated actions have a separate read-only panel.
+A delegated action whose chain of subagents ends in a `sleep_until` wake waits on
+no person, so `GET /api/pending-actions` leaves it out, and `total_count` is `null`
+while any delegated action is pending. Server contract 75 adds `wake` to
+`DelegatedActionReference.action_kind`; independently hosted dashboards should
+regenerate their client and update their supported contract version together.
 Knowledge proposals retain their source fields. Optional reasons are durably bound
 to decisions; runtime audit privacy may withhold them from the public response.
 

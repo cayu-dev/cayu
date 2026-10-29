@@ -5544,7 +5544,7 @@ export type DelegatedActionReference = {
     /**
      * Action Kind
      */
-    action_kind: 'tool_approval' | 'user_input' | 'delegated_action';
+    action_kind: 'tool_approval' | 'user_input' | 'wake' | 'delegated_action';
     /**
      * Child Session Id
      */

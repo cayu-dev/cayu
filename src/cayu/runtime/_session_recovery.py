@@ -1168,9 +1168,17 @@ class SessionRecovery:
         *,
         before_mutation: Callable[[], Awaitable[None]],
     ) -> None:
-        """Continue the original pending round using its persisted run configuration."""
+        """Continue the original pending round using its persisted run configuration.
+
+        A sleeping subagent's wake that holds the parent's task claim continues the
+        parent under that claim.
+        """
         await before_mutation()
         wait = terminal.wait
+        from cayu.tasks.session_wakes import _held_task_claim
+
+        claim = _held_task_claim(wait.parent_effect.session_id)
+        task_worker_id, task_handoff_id = (None, None) if claim is None else claim[1:]
         from cayu.runtime._foreground_child_continuation import (
             load_attached_foreground_continuation,
         )
@@ -1233,6 +1241,14 @@ class SessionRecovery:
                         "loop_policies": await self._foreground_gate_policy_owner.for_attached(
                             self.session_store, parent=parent, continuation=attached
                         ),
+                        **(
+                            {}
+                            if claim is None
+                            else {
+                                "task_worker_id": task_worker_id,
+                                "task_handoff_id": task_handoff_id,
+                            }
+                        ),
                     }
                 ),
                 task_id=attached.task_id,
@@ -1289,6 +1305,8 @@ class SessionRecovery:
             retry_policy=pending.retry_policy,
             structured_output=pending.structured_output,
             thinking=pending.thinking,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
         )
         stream = self.resume_session(
             request=request,

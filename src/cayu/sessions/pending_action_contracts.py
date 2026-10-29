@@ -149,7 +149,7 @@ class DelegatedActionReference(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     child_session_id: StrictStr
-    action_kind: Literal["tool_approval", "user_input", "delegated_action"]
+    action_kind: Literal["tool_approval", "user_input", "wake", "delegated_action"]
     action_id: StrictStr
     status: Literal["waiting_on_child_action"] = "waiting_on_child_action"
 

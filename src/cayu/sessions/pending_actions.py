@@ -6,7 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -43,6 +43,7 @@ from cayu.sessions.pending_action_contracts import (
     MAX_PENDING_ACTION_TOOL_CALLS,
     PENDING_ACTION_EVENT_TYPE_VALUES,
     DelegatedActionReference,
+    PendingActionQuery,
     PendingActionRecord,
     _PendingActionSourceLinkage,
 )
@@ -52,6 +53,9 @@ from cayu.sessions.records import (
     PendingActionSession,
     SessionStatus,
 )
+
+if TYPE_CHECKING:
+    from cayu.sessions.store import SessionStore
 
 PENDING_ACTION_SESSION_STATUSES = frozenset(
     {SessionStatus.INTERRUPTED, SessionStatus.FAILED, SessionStatus.COMPLETED}
@@ -1328,6 +1332,24 @@ def woken_round_needs_manual_recovery(records_desc: list[EventRecord], wake_id: 
             and payload.get("manual_recovery_required") is True
         )
     return False
+
+
+async def woken_round_awaits_manual_recovery(
+    store: SessionStore, session_id: str, wake_id: str
+) -> bool:
+    """Whether a session's woken round stopped on a tool a person must settle.
+
+    Its pending action is then that tool's manual recovery, not its timer.
+    """
+
+    page = await store.query_pending_actions(
+        PendingActionQuery(
+            session_id=session_id,
+            kind=PendingActionKind.MANUAL_RECOVERY,
+            statuses=frozenset({SessionStatus.INTERRUPTED}),
+        )
+    )
+    return any(action.input_id == wake_id for action in page.actions)
 
 
 def _wake_action_from_records(

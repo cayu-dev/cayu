@@ -167,3 +167,78 @@ def test_the_total_leaves_out_wakes_beyond_this_page_where_the_store_counts_them
         portal.call(pause)
         page = client.get("/api/pending-actions", params={"limit": 1}, headers=_as("tom")).json()
         assert page["total_count"] == 1
+
+
+def test_a_parent_waiting_on_a_sleeping_child_is_not_listed_for_a_person() -> None:
+    from datetime import UTC, datetime
+
+    from tests.core.test_foreground_subagent_recovery import _Provider
+    from tests.core.test_sleep_until_children import _delegate, _family, _sleep, _spawn, _text
+
+    clock = _Clock(datetime.now(UTC))
+    app = _family(
+        InMemorySessionStore(),
+        InMemoryTaskStore(clock=clock),
+        clock,
+        _Provider([_spawn(), _sleep(), _text("child"), _text("parent")]),
+    )
+    with TestClient(create_server(app, config=ServerConfig.protected(_authenticate))) as client:
+        portal = client.portal
+        assert portal is not None
+        portal.call(lambda: _delegate(app, "p_consumers"))
+
+        assert _items(client, "priya") == []
+        for params in ({}, {"kind": "delegated_action"}):
+            listed = client.get("/api/pending-actions", params=params, headers=_as("tom"))
+            assert listed.status_code == 200, listed.text
+            assert listed.json()["actions"] == []
+
+        async def observe() -> None:
+            [record] = (
+                await app.session_store.query_pending_actions(
+                    PendingActionQuery(session_id="p_consumers")
+                )
+            ).actions
+            assert record.kind is PendingActionKind.DELEGATED_ACTION
+            assert record.delegated_action is not None
+            assert record.delegated_action.action_kind == "wake"
+            assert HumanAttentionRequest.from_pending_action(record) is None
+            activity = await read_cloud_activity(app)
+            [parent] = [run for run in activity.runs if run.session_id == "p_consumers"]
+            # Followed to its child, the parent waits on no person.
+            assert parent.status == "running"
+            [waiting] = parent.waiting_for
+            assert waiting.kind == "delegated_action" and waiting.child_session_id is not None
+            [child] = [run for run in activity.runs if run.parent_session_id == "p_consumers"]
+            assert [item.kind for item in child.waiting_for] == ["wake"]
+
+        portal.call(observe)
+
+
+def test_a_grandparent_waiting_on_a_sleeping_grandchild_is_not_listed_and_totals_agree() -> None:
+    from tests.core.test_sleep_until_children import _clocked_stores, _owned_family
+
+    from cayu import Message, RunRequest
+
+    clock, sessions, tasks = _clocked_stores("memory", None, None)
+    app = _owned_family(sessions, tasks, clock, nested=True)
+
+    async def delegate() -> None:
+        async for _ in app.run(
+            RunRequest(
+                agent_name="parent",
+                session_id="g_consumers",
+                messages=[Message.text("user", "delegate")],
+            )
+        ):
+            pass
+
+    with TestClient(create_server(app, config=ServerConfig.protected(_authenticate))) as client:
+        portal = client.portal
+        assert portal is not None
+        portal.call(delegate)
+        for params in ({}, {"kind": "delegated_action"}, {"limit": 1}):
+            listed = client.get("/api/pending-actions", params=params, headers=_as("tom"))
+            assert listed.status_code == 200, listed.text
+            assert listed.json()["actions"] == []
+            assert listed.json()["total_count"] is None

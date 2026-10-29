@@ -49,18 +49,21 @@ class TaskParkedWait(BaseModel):
     A parked handoff releases the worker like any interrupted handoff, but the
     generic continuation scan never claims it. ``session_wake`` names the wake id
     of a session asleep in ``sleep_until``; its wake task continues the task
-    through a bound claim that presents this same wait.
+    through a bound claim that presents this same wait. ``session_id`` names the
+    sleeping session when it is a subagent the task's session waits on, and is
+    left out when the task's own session sleeps.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     kind: Literal["session_wake"]
     wait_id: str
+    session_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
-    @field_validator("wait_id")
+    @field_validator("wait_id", "session_id")
     @classmethod
-    def validate_wait_id(cls, value: str) -> str:
-        return require_clean_nonblank(value, "wait_id")
+    def validate_wait_id(cls, value: str | None, info) -> str | None:
+        return None if value is None else require_clean_nonblank(value, info.field_name)
 
 
 class TaskInterruptedHandoffRequest(BaseModel):

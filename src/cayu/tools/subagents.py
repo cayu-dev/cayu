@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
 from hashlib import sha256
@@ -22,6 +23,14 @@ from cayu._validation import (
     require_nonblank,
     require_unicode_scalar_json,
     require_unicode_scalar_text,
+)
+from cayu.approvals.user_input import (
+    PENDING_USER_INPUT_CHECKPOINT_KEY,
+    user_input_lifecycle_authority_from_checkpoint,
+)
+from cayu.approvals.wakes import (
+    WAKE_SCHEDULED_INTERRUPTION_TYPE,
+    pending_session_wake_from_checkpoint,
 )
 from cayu.budgets.base import copy_request_budget_limits
 from cayu.budgets.run_limits import RunLimits, copy_run_limits
@@ -50,12 +59,14 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.invocation import (
     SessionExecutionSource,
     SessionInvocation,
     TaskExecutionSource,
     inherited_session_invocation,
 )
+from cayu.sessions.pending_actions import woken_round_awaits_manual_recovery
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.requests import (
@@ -117,6 +128,16 @@ _SUBAGENT_TERMINAL_STATUSES = {
 }
 BACKGROUND_SUBAGENT_FAILURE_ARTIFACT_TYPE = "cayu.subagent_background_failure.v1"
 _MAX_BACKGROUND_FAILURE_RECORDS = 1000
+
+
+def _wall_clock() -> datetime:
+    return datetime.now(UTC)
+
+
+def _runtime_clock(ctx: ToolContext) -> Callable[[], datetime]:
+    """The application's clock in a tool call; the wall clock outside the runtime."""
+
+    return lambda: ctx._runtime_now() or datetime.now(UTC)
 
 
 class BackgroundSubagentTaskRegistry:
@@ -1206,6 +1227,7 @@ class SubagentResultTool(Tool):
             task_store=self._task_store,
             wait=wait,
             timeout_s=timeout_s,
+            clock=_runtime_clock(ctx),
         )
         summary = await _summarize_child_session(
             self._session_store,
@@ -1213,6 +1235,7 @@ class SubagentResultTool(Tool):
             max_chars=max_chars,
             background_failure=self._background_registry.failure(child.id),
             task_store=self._task_store,
+            clock=_runtime_clock(ctx),
         )
         return _tool_result_from_child_summary(summary)
 
@@ -1261,6 +1284,7 @@ class SubagentResultTool(Tool):
                 children,
                 task_store=self._task_store,
                 timeout_s=timeout_s,
+                clock=_runtime_clock(ctx),
             )
         # Return children in order while their results fit the declared bound,
         # and name where the rest begin instead of failing the whole call.
@@ -1285,6 +1309,7 @@ class SubagentResultTool(Tool):
                 max_chars=max_chars,
                 background_failure=self._background_registry.failure(child.id),
                 task_store=self._task_store,
+                clock=_runtime_clock(ctx),
             )
             line, rendered_is_error = _subagent_result_line(summary)
             cost = _published_bytes(redactor, summary, line)
@@ -1713,15 +1738,16 @@ async def _wait_for_subagent_terminal(
     wait: bool,
     timeout_s: float,
     task_store: TaskStore | None = None,
+    clock: Callable[[], datetime] = _wall_clock,
 ) -> Session:
-    if not wait or child.status in _SUBAGENT_TERMINAL_STATUSES:
+    if not wait or await _subagent_settled(session_store, child, task_store, clock):
         return child
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     loaded = child
     delay = SUBAGENT_RESULT_POLL_MIN_INTERVAL_S
-    while loaded.status not in _SUBAGENT_TERMINAL_STATUSES:
-        if await _durable_task_stops_result_wait(session_store, task_store, loaded):
+    while not await _subagent_settled(session_store, loaded, task_store, clock):
+        if await _durable_task_stops_result_wait(session_store, task_store, loaded, clock):
             refreshed = await session_store.load(loaded.id)
             if refreshed is None:
                 raise RuntimeError(f"Subagent session disappeared: {loaded.id}")
@@ -1745,6 +1771,7 @@ async def _wait_for_all_subagents_terminal(
     *,
     timeout_s: float,
     task_store: TaskStore | None = None,
+    clock: Callable[[], datetime] = _wall_clock,
 ) -> list[Session]:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
@@ -1754,7 +1781,7 @@ async def _wait_for_all_subagents_terminal(
     pending = {
         child_id
         for child_id, child in loaded_by_id.items()
-        if child.status not in _SUBAGENT_TERMINAL_STATUSES
+        if not await _subagent_settled(session_store, child, task_store, clock)
     }
     delay = SUBAGENT_RESULT_POLL_MIN_INTERVAL_S
     while pending:
@@ -1763,6 +1790,7 @@ async def _wait_for_all_subagents_terminal(
                 session_store,
                 task_store,
                 loaded_by_id[child_id],
+                clock,
             ):
                 refreshed = await session_store.load(child_id)
                 if refreshed is None:
@@ -1780,16 +1808,89 @@ async def _wait_for_all_subagents_terminal(
             if refreshed is None:
                 raise RuntimeError(f"Subagent session disappeared: {child_id}")
             loaded_by_id[child_id] = refreshed
-            if refreshed.status in _SUBAGENT_TERMINAL_STATUSES:
+            if await _subagent_settled(session_store, refreshed, task_store, clock):
                 pending.discard(child_id)
         delay = min(delay * 2, SUBAGENT_RESULT_POLL_MAX_INTERVAL_S)
     return list(loaded_by_id.values())
+
+
+async def _subagent_settled(
+    session_store: SessionStore,
+    child: Session,
+    task_store: TaskStore | None,
+    clock: Callable[[], datetime],
+) -> bool:
+    """A child is settled once terminal, unless it sleeps in ``sleep_until`` on a live wake."""
+
+    if child.status not in _SUBAGENT_TERMINAL_STATUSES:
+        return False
+    wake = await _child_wake(session_store, task_store, child, clock)
+    return wake is None or wake[1]
+
+
+async def _child_wake(
+    session_store: SessionStore,
+    task_store: TaskStore | None,
+    child: Session,
+    clock: Callable[[], datetime],
+) -> tuple[datetime, bool] | None:
+    """An interrupted child's ``sleep_until`` deadline and whether its retries are spent.
+
+    ``None`` when it does not sleep. A wake whose attempt failed after it closed still
+    waits, handed over, on a retry, unless its woken round stopped on a tool a person
+    must settle. A wake whose retry window is spent no longer continues on its own.
+    """
+
+    if child.status is not SessionStatus.INTERRUPTED:
+        return None
+    checkpoint = await session_store.load_checkpoint(child.id)
+    asleep = pending_session_wake_from_checkpoint(checkpoint)
+    if asleep is not None:
+        wake_id, deadline = asleep.wake_id, asleep.timer.deadline
+    else:
+        if checkpoint is None or checkpoint.get(PENDING_USER_INPUT_CHECKPOINT_KEY) is None:
+            return None
+        handed_over, _ = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint, current_run_epoch=child.run_epoch
+        )
+        if handed_over is None or handed_over.wake is None:
+            return None
+        if await woken_round_awaits_manual_recovery(session_store, child.id, handed_over.input_id):
+            return None
+        wake_id, deadline = handed_over.input_id, handed_over.wake.deadline
+    from cayu.tasks.session_wakes import wake_retries_spent
+
+    spent = task_store is not None and await wake_retries_spent(task_store, wake_id, now=clock())
+    return deadline, spent
+
+
+async def _continues_after_wake(session_store: SessionStore, child: Session) -> bool:
+    """Whether a child still at work last stopped to sleep, so its wake continues it.
+
+    A durable child's queue work ends with that pause; its continuation after the
+    wake runs outside the queue.
+    """
+
+    if child.status in _SUBAGENT_TERMINAL_STATUSES:
+        return False
+    stopped = await session_store.query_events(
+        EventQuery(
+            session_id=child.id,
+            event_type=EventType.SESSION_INTERRUPTED,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=1,
+        )
+    )
+    return bool(stopped) and (
+        stopped[0].event.payload.get("interruption_type") == WAKE_SCHEDULED_INTERRUPTION_TYPE
+    )
 
 
 async def _durable_task_stops_result_wait(
     session_store: SessionStore,
     task_store: TaskStore | None,
     child: Session,
+    clock: Callable[[], datetime] = _wall_clock,
 ) -> bool:
     """Stop polling once exact queue evidence proves progress is impossible or conflicting."""
 
@@ -1803,11 +1904,20 @@ async def _durable_task_stops_result_wait(
     authority_status = task_summary.get("task_authority_status")
     if authority_status in {"malformed", "conflict"}:
         return True
-    return authority_status == "verified" and task_summary.get("task_status") in {
+    if authority_status != "verified" or task_summary.get("task_status") not in {
         TaskStatus.COMPLETED.value,
         TaskStatus.FAILED.value,
         TaskStatus.CANCELLED.value,
-    }
+    }:
+        return False
+    # A sleeping child's queue work ended with its pause; its wake continues it.
+    return not (
+        task_summary.get("task_status") == TaskStatus.COMPLETED.value
+        and (
+            await _child_wake(session_store, task_store, child, clock)
+            or await _continues_after_wake(session_store, child)
+        )
+    )
 
 
 async def _summarize_child_session(
@@ -1817,6 +1927,7 @@ async def _summarize_child_session(
     max_chars: int,
     background_failure: dict[str, Any] | None = None,
     task_store: TaskStore | None = None,
+    clock: Callable[[], datetime] = _wall_clock,
 ) -> dict[str, Any]:
     task_summary = await _durable_subagent_task_summary(
         session_store,
@@ -1858,14 +1969,19 @@ async def _summarize_child_session(
         if terminal_event is not None
         else None
     )
-    ready = child.status in _SUBAGENT_TERMINAL_STATUSES
+    wake = await _child_wake(session_store, task_store, child, clock)
+    wake_at = None if wake is None else wake[0]
+    sleeping = wake is not None and not wake[1]
+    ready = child.status in _SUBAGENT_TERMINAL_STATUSES and not sleeping
     summary = {
         "agent": subagent_metadata.get("agent"),
         "agent_name": child.agent_name,
         "child_session_id": child.id,
         "parent_session_id": child.parent_session_id,
         "causal_budget_id": child.causal_budget_id,
-        "status": child.status.value,
+        "status": (
+            child.status.value if wake is None else "needs_recovery" if wake[1] else "sleeping"
+        ),
         "retrieval_status": "ready" if ready else "not_ready",
         "result_text": result_text,
         "result_truncated": result_truncated,
@@ -1877,13 +1993,17 @@ async def _summarize_child_session(
             if background_failure is None
             else copy_json_value(background_failure, "background_failure")
         ),
-        "is_error": child.status in {SessionStatus.FAILED, SessionStatus.INTERRUPTED},
+        "is_error": ready and child.status in {SessionStatus.FAILED, SessionStatus.INTERRUPTED},
     }
+    if wake_at is not None:
+        summary["wake_at"] = wake_at.isoformat().replace("+00:00", "Z")
     summary.update(task_summary)
     if (
         task_summary.get("task_authority_status") == "verified"
         and task_summary.get("task_status") == TaskStatus.COMPLETED.value
         and not ready
+        and wake is None
+        and not await _continues_after_wake(session_store, child)
     ):
         summary["retrieval_status"] = "queue_conflict"
         summary["is_error"] = True
@@ -2285,11 +2405,28 @@ def _tool_result_from_child_summary(summary: dict[str, Any]) -> ToolResult:
                 structured=summary,
                 is_error=True,
             )
+        if status == "sleeping":
+            return ToolResult(
+                content=(
+                    f"Subagent {summary['child_session_id']} is sleeping until "
+                    f"{summary['wake_at']}; it continues on its own then."
+                ),
+                structured=summary,
+            )
         return ToolResult(
             content=(
                 f"Subagent {summary['child_session_id']} is still running with status {status}."
             ),
             structured=summary,
+        )
+    if status == "needs_recovery":
+        return ToolResult(
+            content=(
+                f"Subagent {summary['child_session_id']} slept until {summary['wake_at']}, but "
+                "its wake ran out of retries; continue it with deliver_session_wake."
+            ),
+            structured=summary,
+            is_error=True,
         )
     if summary["is_error"]:
         terminal_payload = summary.get("terminal_payload")
