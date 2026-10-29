@@ -30,6 +30,12 @@ from cayu.tasks.worker import run_task_worker
 LEASE_SECONDS = 30
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_declaration(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Tests here expect no single-worker declaration unless they set one.
+    monkeypatch.delenv(RECONCILE_ABANDONED_AFTER_ENV, raising=False)
+
+
 class _Clock:
     """The store's ownership clock, an hour behind real time so wall-clock checks agree."""
 

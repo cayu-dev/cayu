@@ -632,12 +632,16 @@ async def run_once(app, stop):
         encoding="utf-8",
     )
     monkeypatch.chdir(project)
-    monkeypatch.delenv(RECONCILE_ABANDONED_AFTER_ENV, raising=False)
+    # main() writes the declaration into os.environ for the entrypoint. Setting
+    # the variable through monkeypatch first records its original state, so
+    # teardown removes what main() wrote. Deleting it at the end instead would
+    # record "120.0" and restore it, leaking into later tests in this process.
+    monkeypatch.setenv(RECONCILE_ABANDONED_AFTER_ENV, "")
+    monkeypatch.delenv(RECONCILE_ABANDONED_AFTER_ENV)
     sys.modules.pop("declared_worker", None)
 
     assert main(["worker", "once", "--reconcile-abandoned-after-seconds", "120"]) == 0
     assert float((project / "declared.txt").read_text(encoding="utf-8")) == 120.0
-    monkeypatch.delenv(RECONCILE_ABANDONED_AFTER_ENV, raising=False)
 
 
 def test_worker_refuses_a_single_worker_declaration_with_several_processes(
