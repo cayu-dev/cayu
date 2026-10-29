@@ -949,6 +949,7 @@ def test_failed_sqlite_settlement_never_replays_uncommitted_receipt(
 
     class FaultedConnection:
         closed = False
+        armed = False
 
         def __init__(self, connection):
             self.connection = connection
@@ -957,18 +958,26 @@ def test_failed_sqlite_settlement_never_replays_uncommitted_receipt(
             return getattr(self.connection, name)
 
         def commit(self):
+            receipts = self.connection.execute(
+                "SELECT COUNT(*) FROM cayu_eval_session_additions"
+            ).fetchone()[0]
+            if receipts == 0:
+                # The server's eval run coordinator polls through the same
+                # connection; on a slow runner its claim can commit here first.
+                # Fault only the addition publication.
+                self.connection.commit()
+                return
             # The real receipt INSERT and document writes have already executed.
-            assert (
-                self.connection.execute(
-                    "SELECT COUNT(*) FROM cayu_eval_session_additions"
-                ).fetchone()[0]
-                == 1
-            )
+            assert receipts == 1
+            self.armed = True
             entered.set()
             assert release.wait(30)
             raise primary
 
         def rollback(self):
+            if not self.armed:
+                self.connection.rollback()
+                return
             assert self.connection.in_transaction
             raise rollback_error
 
