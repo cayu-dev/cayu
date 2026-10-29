@@ -41,3 +41,33 @@ export function NavigationContract() {
     </>
   )
 }
+
+export function RemainingPageNavigationContract() {
+  const environment = <NavLink to="/environments/$name" params={{ name: "local / % ? café" }} />
+  // @ts-expect-error Environment names are required dynamic parameters.
+  const missingEnvironment = <NavLink to="/environments/$name" />
+  // @ts-expect-error A session ID cannot stand in for the environment name.
+  const wrongEnvironment = <NavLink to="/environments/$name" params={{ sessionId: "wrong" }} />
+  const artifact = (
+    <NavLink
+      to="/artifacts"
+      search={{
+        artifact: "file",
+        artifact_store_id: "store",
+        preview_store_id: "other",
+        offset: "25",
+      }}
+    />
+  )
+  // @ts-expect-error Artifact selection has a closed search vocabulary.
+  const unknownArtifactSearch = <NavLink to="/artifacts" search={{ made_up: "value" }} />
+  return (
+    <>
+      {environment}
+      {missingEnvironment}
+      {wrongEnvironment}
+      {artifact}
+      {unknownArtifactSearch}
+    </>
+  )
+}

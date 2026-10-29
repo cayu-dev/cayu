@@ -4815,18 +4815,15 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         await expect(page.get_by_role("link", name="Usage", exact=True)).to_be_visible()
         await expect(
             page.get_by_text(
-                "Usage remains available, but cost is unavailable rather than displayed as zero.",
+                "Costs aren't shown because this agent has no price list.",
                 exact=False,
             )
         ).to_be_visible()
         await expect(
             page.get_by_text(
-                'dashboard_config={"priceBook": default_price_book()}',
+                "cayu serve --price-book path/to/prices.json",
                 exact=True,
             )
-        ).to_be_visible()
-        await expect(
-            page.get_by_text("complete application-owned PriceBook", exact=False)
         ).to_be_visible()
         require(
             usage_request_without_pricing,
@@ -4905,9 +4902,11 @@ async def _exercise_system_page(page: Page, base_url: str) -> None:
     try:
         await page.goto(f"{base_url}/cayu/system", wait_until="networkidle")
         await expect(page.get_by_role("heading", name="System", exact=True)).to_be_visible()
-        await expect(page.get_by_test_id("system-snapshot-scope")).to_contain_text(
-            "does not probe databases, workers, networks, or external services"
-        )
+        await expect(
+            page.get_by_role("heading", name="About this agent", exact=True)
+        ).to_be_visible()
+        await expect(page.get_by_text("Server contract", exact=True)).to_be_hidden()
+        await page.locator("summary").filter(has_text=re.compile(r"^Debug$")).click()
         await expect(page.get_by_text("Server contract", exact=True)).to_be_visible()
         await expect(page.get_by_text(f"v{SERVER_CONTRACT_VERSION}", exact=True)).to_be_visible()
         require_equal(diagnostics_requests, 1, "the System page must load one initial snapshot")
@@ -4918,10 +4917,8 @@ async def _exercise_system_page(page: Page, base_url: str) -> None:
             1,
             "the System page must not refresh diagnostics in the background",
         )
-        await page.get_by_role("button", name="Refresh snapshot", exact=True).click()
-        await expect(
-            page.get_by_role("button", name="Refresh snapshot", exact=True)
-        ).to_be_enabled()
+        await page.get_by_role("button", name="Refresh", exact=True).click()
+        await expect(page.get_by_role("button", name="Refresh", exact=True)).to_be_enabled()
         require_equal(
             diagnostics_requests,
             2,
@@ -4989,210 +4986,121 @@ async def _exercise_dashboard_knowledge(page: Page, base_url: str) -> str:
 
 async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     await _exercise_dashboard_home(page, base_url)
+    await _exercise_usage_page(page, base_url)
 
-    await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
+
+async def _exercise_usage_page(page: Page, base_url: str) -> None:
+    async with page.expect_response(
+        lambda response: (
+            response.request.method == "POST"
+            and urlsplit(response.url).path.endswith("/api/usage/rollup")
+        )
+    ) as initial:
+        await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
+    data = await (await initial.value).json()
     await expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
-    await expect(
-        page.get_by_text(
-            "Store-native activity, token, and cost totals over an explicit event-time window.",
-            exact=True,
-        )
-    ).to_be_visible()
-    usage_scope = page.get_by_test_id("usage-aggregate-scope")
-    await expect(usage_scope).to_be_visible()
-    await expect(usage_scope.get_by_text("Authoritative store rollup", exact=True)).to_be_visible()
-    await expect(
-        usage_scope.get_by_text(
-            re.compile(
-                r"Events from .* inclusive to .* exclusive, as of .* event time is the usage basis\."
-            )
-        )
-    ).to_be_visible()
-    for label in (
-        "Matching Sessions",
-        "Sessions with Activity",
-        "Tokens",
-        "Model Steps",
-        "Tool Calls",
-        "Estimated Cost",
-    ):
-        await expect(page.get_by_text(label, exact=True)).to_be_visible()
-    await expect(
-        page.get_by_text(
-            "Price book dashboard-browser-contract, generated 2026-07-21; "
-            "currencies are never combined.",
-            exact=True,
-        )
-    ).to_be_visible()
-    bedrock_breakdown = page.get_by_test_id("usage-billing-breakdown")
-    await expect(
-        bedrock_breakdown.get_by_text("Billing Identity Breakdown", exact=True)
-    ).to_be_visible()
-    identity_counts = bedrock_breakdown.get_by_test_id("usage-billing-identity-counts")
-    await expect(
-        identity_counts.get_by_text("Steps with commercial identity", exact=True)
-    ).to_be_visible()
-    await expect(identity_counts.get_by_text("Evaluated steps", exact=True)).to_be_visible()
-    await expect(identity_counts.get_by_text("1", exact=True)).to_be_visible()
-    await expect(identity_counts.get_by_text("6", exact=True)).to_be_visible()
-    await expect(identity_counts.get_by_text("Without identity", exact=True)).to_have_count(0)
-    await expect(bedrock_breakdown.get_by_test_id("usage-billing-identity-gap")).to_have_count(0)
-    bedrock_row = bedrock_breakdown.get_by_role("row").filter(
-        has_text="global.anthropic.claude-sonnet-4-6"
-    )
-    await expect(bedrock_row).to_contain_text("us-east-1")
-    await expect(bedrock_row).to_contain_text("global")
-    await expect(bedrock_row).to_contain_text("default / default")
-    await expect(bedrock_row).to_contain_text("bedrock/global.anthropic.claude-sonnet-4-6")
+    await expect(page.get_by_role("button", name="Last 30 days", exact=True)).to_be_visible()
+    for label in ("Sessions", "Model steps", "Tool calls", "Estimated cost (partial)"):
+        await expect(page.get_by_role("main").get_by_text(label, exact=True).first).to_be_visible()
+    # Detailed commercial identities remain available in Debug, not in the headline UI.
+    billing = data["cost"]["billing_breakdown"]
+    require_equal(billing["identified_model_steps"], "1", "identified pricing steps")
+    require_equal(data["cost"]["evaluated_model_steps"], "6", "evaluated pricing steps")
+    await page.get_by_text("Debug", exact=True).click()
+    raw = page.locator("pre").filter(has_text='"billing_breakdown"')
+    await expect(raw).to_contain_text("global.anthropic.claude-sonnet-4-6")
+    await expect(raw).to_contain_text("us-east-1")
+    await expect(raw).to_contain_text("dashboard-browser-contract")
 
-    no_identity_query = urlencode({"provider_name": PROVIDER_NAME})
-    await page.goto(f"{base_url}/cayu/usage?{no_identity_query}", wait_until="networkidle")
-    no_identity_breakdown = page.get_by_test_id("usage-billing-breakdown")
-    await expect(no_identity_breakdown).to_have_count(0)
-    await expect(page.get_by_text(re.compile(r"Billing identity is missing for"))).to_have_count(0)
-
-    await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
-
-    await page.get_by_text("Session filters", exact=True).click()
-    await page.get_by_label("Specialist", exact=True).fill(AGENT_NAME)
-    await page.locator("#usage-label-filter").fill("stage=initial")
-    await page.get_by_role("button", name="Apply", exact=True).click()
-    await expect(page).to_have_url(re.compile(r"[?&]agent_name=dashboard-contract-agent(?:&|$)"))
-    filtered_query = parse_qs(urlsplit(page.url).query)
-    require_equal(
-        filtered_query.get("label"),
-        ["stage=initial"],
-        "usage URL state must preserve repeated exact label parameters",
-    )
-    await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
-    matching_metric = page.get_by_text("Matching Sessions", exact=True).locator("..").locator("..")
-    await expect(matching_metric.get_by_text("1", exact=True)).to_be_visible()
-    await page.reload(wait_until="networkidle")
+    filters = urlencode([("agent_name", AGENT_NAME), ("label", "stage=initial")])
+    await page.goto(f"{base_url}/cayu/usage?{filters}", wait_until="networkidle")
     await expect(page.get_by_label("Specialist", exact=True)).to_have_value(AGENT_NAME)
-    await expect(page.locator("#usage-label-filter")).to_have_value("stage=initial")
-
+    await expect(page.get_by_text("stage=initial", exact=True)).to_be_visible()
+    await page.reload(wait_until="networkidle")
+    require_equal(
+        parse_qs(urlsplit(page.url).query).get("label"), ["stage=initial"], "repeat label URL"
+    )
     await page.get_by_role("button", name="Clear filters", exact=True).click()
     await expect(page).not_to_have_url(re.compile(r"[?&](?:agent_name|label)="))
-    await page.locator("#usage-range").select_option("7d")
-    await page.get_by_role("button", name="Apply", exact=True).click()
+    await page.get_by_role("button", name="Last 7 days", exact=True).click()
     await expect(page).to_have_url(re.compile(r"[?&]range=7d(?:&|$)"))
-    await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
 
     precise_start = "2026-07-01T00:00:59.999123Z"
     offset_end = "2026-07-02T08:30:00.123456+06:00"
-    custom_query = urlencode(
-        {
-            "range": "custom",
-            "start_at": precise_start,
-            "end_at": offset_end,
-        }
-    )
-    await page.goto(f"{base_url}/cayu/usage?{custom_query}", wait_until="networkidle")
-    await expect(page.get_by_label("Start (UTC)", exact=True)).to_have_value(
-        "2026-07-01T00:00:59.999"
-    )
-    await expect(page.get_by_label("End (UTC)", exact=True)).to_have_value(
-        "2026-07-02T02:30:00.123"
-    )
-    await page.get_by_text("Session filters", exact=True).click()
-    await page.get_by_label("Specialist", exact=True).fill(AGENT_NAME)
+    custom = urlencode({"range": "custom", "start_at": precise_start, "end_at": offset_end})
+    await page.goto(f"{base_url}/cayu/usage?{custom}", wait_until="networkidle")
     async with page.expect_request(
         lambda request: (
-            request.method == "POST" and urlsplit(request.url).path == "/api/usage/rollup"
+            request.method == "POST" and urlsplit(request.url).path.endswith("/api/usage/rollup")
         )
-    ) as custom_request_info:
-        await page.get_by_role("button", name="Apply", exact=True).click()
-    custom_request = await custom_request_info.value
-    custom_request_body = custom_request.post_data_json
-    if not isinstance(custom_request_body, dict):
-        raise AssertionError("usage rollup POST body must be an object")
-    require_equal(
-        custom_request_body.get("start_at"),
-        precise_start,
-        "the usage POST must preserve the exact custom start boundary",
-    )
-    require_equal(
-        custom_request_body.get("end_at"),
-        offset_end,
-        "the usage POST must preserve the exact custom end boundary",
-    )
-    custom_filtered_query = parse_qs(urlsplit(page.url).query)
-    require_equal(
-        custom_filtered_query.get("start_at"),
-        [precise_start],
-        "an unrelated usage filter must preserve the exact custom start boundary",
-    )
-    require_equal(
-        custom_filtered_query.get("end_at"),
-        [offset_end],
-        "an unrelated usage filter must preserve the exact custom end boundary",
-    )
-    await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
+    ) as pending:
+        await page.get_by_label("Specialist", exact=True).select_option(AGENT_NAME)
+    body = (await pending.value).post_data_json
+    assert isinstance(body, dict)
+    require_equal(body["start_at"], precise_start, "exact custom start")
+    require_equal(body["end_at"], offset_end, "exact custom end")
+    query = parse_qs(urlsplit(page.url).query)
+    require_equal(query["start_at"], [precise_start], "custom start URL")
+    require_equal(query["end_at"], [offset_end], "custom end URL")
 
     await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
-    await expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
-
     usage_path = "**/api/usage/rollup"
-    slow_usage_started = asyncio.Event()
-    release_slow_usage = asyncio.Event()
-    slow_usage_continued = asyncio.Event()
+    slow_started, release_slow, slow_continued = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
-    async def delay_superseded_usage(route, request) -> None:
+    async def delay_superseded_usage(route, request):
         body = request.post_data_json
-        agent_name = body.get("session_filter", {}).get("agent_name") if body else None
-        if agent_name != SLOW_USAGE_AGENT:
+        if not body or body.get("session_filter", {}).get("agent_name") != SLOW_USAGE_AGENT:
             await route.continue_()
             return
-        slow_usage_started.set()
-        await release_slow_usage.wait()
+        slow_started.set()
+        await release_slow.wait()
         try:
             await route.continue_()
         except Exception:
-            # The AbortSignal deliberately owns the superseded request. Chromium may
-            # dispose its intercepted route before this test releases the server path.
+            # Consuming the AbortSignal can dispose the intercepted superseded route.
             pass
         finally:
-            slow_usage_continued.set()
+            slow_continued.set()
 
     await page.route(usage_path, delay_superseded_usage)
     try:
-        await page.get_by_text("Session filters", exact=True).click()
-        await page.get_by_label("Specialist", exact=True).fill(SLOW_USAGE_AGENT)
-        await page.get_by_role("button", name="Apply", exact=True).click()
-        await asyncio.wait_for(slow_usage_started.wait(), timeout=5)
-        await page.get_by_label("Specialist", exact=True).fill(AGENT_NAME)
-        await page.get_by_role("button", name="Apply", exact=True).click()
+        await page.goto(
+            f"{base_url}/cayu/usage?{urlencode({'agent_name': SLOW_USAGE_AGENT})}",
+            wait_until="domcontentloaded",
+        )
+        await asyncio.wait_for(slow_started.wait(), timeout=5)
+        await page.get_by_label("Specialist", exact=True).select_option(AGENT_NAME)
         await expect(page).to_have_url(
             re.compile(r"[?&]agent_name=dashboard-contract-agent(?:&|$)")
         )
-        await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
-        await expect(
-            page.get_by_text("Loading the bounded usage rollup...", exact=True)
-        ).to_have_count(0)
+        await expect(page.get_by_text("Sessions per day", exact=True)).to_be_visible()
+        await expect(page.get_by_text("Loading usage…", exact=True)).to_have_count(0)
     finally:
-        release_slow_usage.set()
-        if slow_usage_started.is_set():
-            await asyncio.wait_for(slow_usage_continued.wait(), timeout=5)
+        release_slow.set()
+        if slow_started.is_set():
+            await asyncio.wait_for(slow_continued.wait(), timeout=5)
         await page.unroute(usage_path, delay_superseded_usage)
 
-    async def reject_usage_refresh(route) -> None:
+    async def reject_refresh(route):
         await route.fulfill(
             status=501,
-            headers={"content-type": "application/json"},
+            content_type="application/json",
             body=json.dumps({"detail": "Injected aggregate refresh failure."}),
         )
 
-    await page.route(usage_path, reject_usage_refresh)
+    await page.route(usage_path, reject_refresh)
     try:
-        await page.get_by_role("button", name="Refresh window", exact=True).click()
-        await expect(page.get_by_test_id("usage-retained-error")).to_be_visible()
-        await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
+        await page.get_by_role("button", name="Refresh", exact=True).click()
+        await expect(
+            page.get_by_text("Couldn't refresh; showing the last numbers loaded.", exact=True)
+        ).to_be_visible()
+        await expect(page.get_by_text("Sessions per day", exact=True)).to_be_visible()
     finally:
-        await page.unroute(usage_path, reject_usage_refresh)
-
-    await page.get_by_role("button", name="Retry", exact=True).click()
-    await expect(page.get_by_test_id("usage-retained-error")).to_have_count(0)
-    await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
+        await page.unroute(usage_path, reject_refresh)
+    await page.get_by_role("button", name="Refresh", exact=True).click()
+    await expect(
+        page.get_by_text("Couldn't refresh; showing the last numbers loaded.", exact=True)
+    ).to_have_count(0)
 
 
 async def _exercise_session_annotations(page: Page) -> None:

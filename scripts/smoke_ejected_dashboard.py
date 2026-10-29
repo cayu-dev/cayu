@@ -11,9 +11,10 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 import uvicorn
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 
 from cayu import CayuApp
+from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.server import DashboardConfig, ServerConfig, create_server
 
 
@@ -55,7 +56,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             page.on("pageerror", lambda error: browser_errors.append(str(error)))
             page.goto(f"{base_url}/operator/system", wait_until="networkidle")
-            page.get_by_text("Bounded Cayu configuration snapshot", exact=True).wait_for()
+            expect(page.get_by_role("heading", name="System", exact=True)).to_be_visible()
+            expect(page.get_by_role("heading", name="About this agent", exact=True)).to_be_visible()
+            expect(page.get_by_text("Server contract", exact=True)).to_be_hidden()
+            page.locator("summary").filter(has_text="Debug").click()
+            expect(page.get_by_text("Server contract", exact=True)).to_be_visible()
+            expect(page.get_by_text(f"v{SERVER_CONTRACT_VERSION}", exact=True)).to_be_visible()
             if page.locator('[data-testid="dashboard-contract-gate"]').count() != 0:
                 raise RuntimeError(
                     "dashboard server-contract compatibility gate rejected the server"

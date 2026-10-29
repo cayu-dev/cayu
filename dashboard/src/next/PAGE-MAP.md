@@ -3,9 +3,8 @@
 The production Developer dashboard uses `src/main.tsx`, `src/app/router.tsx` and
 `src/app/layout.tsx`. The shell supplies `api/real.ts`, checks the server contract
 before page reads, and respects the configured dashboard base path. Home, Inbox,
-Sessions, Session/Trace, Tasks, Specialists, Tools, Knowledge and Evals use the
-pages in this directory. Usage, Environments, Artifacts and System retain their
-existing implementations under `src/routes/` inside the production shell.
+Sessions, Session/Trace, Tasks, Specialists, Tools, Knowledge, Evals, Usage,
+Environments, Artifacts and System use the pages in this directory.
 
 This map describes the implemented surfaces, their owners and current runtime
 contracts.
@@ -27,8 +26,9 @@ CAYU_PROTOTYPE=1 npx vite build   # prototype-only output in dist/prototype/
 
 `prototype.html` starts `src/next/main.tsx` with hash routing, `src/next/mock/api.ts` and the
 fake fetch adapter in `src/next/mock/legacy/`. Its bar switches seeded agents and resets
-simulated state. `src/next/routes/legacy-page.tsx` and `src/next/legacy-config.ts` adapt the four
-retained pages to that harness; production mounts those pages directly.
+simulated state. The prototype mounts reworked Usage, Environments, Artifacts and System
+pages from this directory (`usage-page.tsx`, `environments-page.tsx`, `artifacts-page.tsx`,
+`system-page.tsx`), shared with production. `src/next/legacy-config.ts` points shared link helpers at the hash router.
 The normal production build starts `src/main.tsx`, not this mock entry point.
 The prototype sources remain in the editable source archive; its separate build
 is not the dashboard served by the Python package.
@@ -79,7 +79,11 @@ reported series expose their supported read-only evidence and downloads.
 | Eval editor: shared full-page suite settings and case rail; Input/Checks tabs, all portable checks and typed judges; exact parent-aware Save, then separate reviewed Run; private in-memory drafts and explicit leave confirmation | Suite authoring sheet | `/evals/suites/new?target=…`, `/evals/suites/:id/edit?case=…` |
 | Eval run: verdict (Improvement, Regression, Tradeoff, No change) and counts, passing / flaky / judge score / cost against the compared run, filter chips (Regressed, Improved, Failing, Flaky), compare with the baseline or any other run, Approve as baseline; a case opens a drawer with each trial's checks and judge reasons, both outputs side by side and the trial's trace | Results and Runs tabs, their inspectors and Compare | `/evals/runs/:id` |
 | Eval settings: what trials run with per specialist, the judge, limits, what this deployment supports, and the advanced tools (corpus import and export, judge calibration, memory reports, production scenarios) | Readiness and execution profile cards, header actions | `/evals/settings` |
-| Usage, Environments, Artifacts, System | unchanged, inside the new shell (the prototype harness marks them "Today's page, unchanged") | same URLs |
+| Usage: range chips (Last 24 hours, Last 7 days, Last 30 days, custom); cost or tokens, sessions, model steps and tool calls; sessions per day with failures; models grouped by provider, linking to filtered Sessions; the sessions that used the most, by title; a quiet note when pricing is off or partial; Debug with window, accuracy and pricing coverage | Usage (rollup cards, "authoritative store rollup" wording, breakdown tables) | `/usage?range=&agent_name=&environment_name=…` |
+| Environments: one row per environment with where it runs, workspace and branches, whether files are kept, knowledge store and last activity | Environments (wiring tables) | `/environments` |
+| Environment: Runs on, Workspace, Files, Knowledge, MCP servers, recent sessions by title, recent files; Debug with IDs, branch capabilities and lifecycle | – (new) | `/environments/:name` |
+| Artifacts: files with kind, size, the session that made them (by title) and specialist; filters and paging in the URL; a preview drawer with Download and Open raw (its `preview_store_id` is separate from the list’s `artifact_store_id`); Debug with store, scope and metadata | Artifacts (ID-first table, side preview) | `/artifacts?artifact=…` |
+| System (full access only): About this agent (version, deployment, who you're signed in as, stores, pricing); what's turned off and why; Evals readiness; Debug with the feature tables, store fingerprints and raw diagnostics | System (diagnostics matrices) | `/system` |
 
 ## Current runtime contracts
 
@@ -100,14 +104,34 @@ current behavior rather than outstanding proposals.
 | 12 | Kept-knowledge reads and revision-fenced retirement. Reviews share Inbox decisions and source evidence. Members may read and Keep/Drop; Remove requires full access. See [Knowledge](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
 | 14 | Suite-centred native reads and reported CI series. Reported evidence does not grant native execution, comparison or baseline authority. See [Evals](https://github.com/cayu-tech/cayu/blob/main/docs/evals.md) and [CI reporting](https://github.com/cayu-tech/cayu/blob/main/docs/recipes/ci-eval-reporting.md). |
 
+## Current page limitations
+
+The production and prototype pages retain the following explicit limitations.
+Usage series and filtered overview counts are available in the API; connecting
+them to these pages remains separate work. Other backend additions are still
+pending. The UI does not infer missing values or claim an exact result from a
+partial read.
+
+| Page | Remaining work | Current behavior |
+| --- | --- | --- |
+| Usage | Connect the available usage series and filtered overview counts APIs | One `overview/counts` call per bar, unfiltered, with a caption saying so |
+| Usage | Cost per model and provider | Models table shows tokens only |
+| Usage | Session breakdown ranked by cost, with the specialist | Ranked by tokens; one session read per row for the specialist |
+| Environments | MCP server names | Shows the count only |
+| Environments | Last activity and session counts per environment | One `sessions?environment_name=…&limit=1` call per row; no counts |
+| Environments | Artifact store kind (local disk, S3…) | Says only whether files are kept |
+| Artifacts | Text search and sort | `q` filters the loaded page; newest first only |
+| Artifacts | Session titles on artifact rows | One overview read per page |
+| System | Deployment kind (local, Cloud, embedded) | Shows the deployment name and whether sign-in is required |
+
 ## Production ownership and navigation
 
 - `src/app/` owns production routing, layout, identity and the contract gate.
   `src/next/api/real.ts` implements the shared page API; generated HTTP types and
   the maintained clients remain the runtime boundary.
-- `src/next/routes/` owns the ported pages. `src/routes/usage.tsx`,
-  `environments.tsx`, `artifacts.tsx` and `system.tsx` remain live production
-  implementations. The old `src/Layout.tsx` and ported route modules are removed.
+- `src/next/routes/` owns all ported pages, including Usage, Environments,
+  Artifacts and System. Their old `src/routes/` modules and the old `src/Layout.tsx`
+  are removed.
   See [editable-dashboard migration](../../README.md#dashboard-structure-and-migration).
 - `/agents` maps to `/specialists`; `/pending-actions` maps to `/inbox`; `/run`
   opens Home's Start form. The former `/sessions/:id/workflow` URL opens the

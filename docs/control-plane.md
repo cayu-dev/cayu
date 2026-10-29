@@ -131,6 +131,44 @@ permission. The server independently authenticates and authorizes every read
 and decision. The server-contract gate still precedes page reads, and an
 unavailable app identity does not grant full access.
 
+## Usage, environments, artifacts and setup
+
+Usage opens the last 30 days by default. The Last 24 hours, Last 7 days and
+Last 30 days choices start at the first displayed hour or day and end now;
+the headline totals and chart use the same bounds. Custom links retain exact
+timezone and microsecond boundaries. Existing specialist, environment, provider,
+model, parent, budget, label and label-selector URL filters remain valid, and
+model/provider links carry those session filters into Sessions. Chart counts
+currently show all ordinary sessions started in the window, excluding forks and
+eval trials, even when the usage totals are filtered. Models show tokens; top
+sessions are ranked by tokens. Pricing coverage, exact windows and raw billing
+breakdowns are available in the collapsed Debug section.
+
+Environments links to `/environments/:name` for runner, workspace, branch,
+file-storage and knowledge information, plus recent sessions and saved files.
+Workspace branches are optional private copies created by agent code, not Git
+branches or automatic per-session workspaces. Branch lifecycle rows describe bounded
+attached-handle observations, including completed handles and incomplete inspection;
+they are not an exact count of all open or durable branches. Existing
+`/environments?q=...` links filter the list, while Session links open the exact
+environment detail. Basic recent-session reads remain available without optional
+overview enrichment. Without a runner, Shell, Git and
+text-search tools are unavailable. MCP currently shows a count, and file storage
+says whether files are kept without inferring its storage backend.
+
+Artifacts keeps filters and paging in the URL. Search currently filters only
+the loaded page, ordered newest first. A preview link uses both `artifact` and
+`artifact_store_id` because an artifact ID alone is not globally unique. The
+drawer offers Download and Open raw where supported, with internal identities
+in Debug. Session and environment links remain within the configured dashboard
+mount. Usage and Artifacts respect their server capability gates; optional
+session-title/count reads are omitted when overview queries are unavailable.
+
+System is for full-access viewers. It shows agent setup, disabled-feature reasons
+and Evals readiness; capability matrices and raw diagnostics stay in Debug.
+It reports deployment name and sign-in requirements without guessing deployment
+kind. Member reads on the other pages still require server authorization.
+
 ## Project-owned Evals assembly
 
 `cayu serve` assembles the durable, non-executable Evals foundation without

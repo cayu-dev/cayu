@@ -478,24 +478,6 @@ function sessionBreakdown(acts: Activity[], limit: number): UsageSessionAggregat
   }
 }
 
-function sessionCostBreakdown(
-  acts: Activity[],
-  limit: number,
-  seed: AppSeed,
-): UsageSessionCostBreakdown {
-  const ranked = acts.filter(active).sort((a, b) => (b.cost ?? 0) - (a.cost ?? 0))
-  const rest = ranked.slice(limit)
-  return {
-    accuracy: EXACT,
-    groups: ranked
-      .slice(0, limit)
-      .map((a) => ({ session_id: a.s.session.id, cost: costSummary([a]) })),
-    remainder: rest.length ? { group_count: String(rest.length), cost: costSummary(rest) } : null,
-    price_book_version: PRICE_BOOK,
-    price_book_generated_at: seed.now,
-  }
-}
-
 function usageRollup({ body: raw }: LegacyRequest, context: LegacyContext): UsageRollup {
   const seed = context.records()
   const body = record(raw)
@@ -506,6 +488,23 @@ function usageRollup({ body: raw }: LegacyRequest, context: LegacyContext): Usag
   const groupLimit = Math.max(1, Number(body.group_limit) || 20)
   const sessionLimit = Number(body.session_group_limit) || 0
   const costs = seedHasCosts(seed)
+  const sessions = sessionLimit > 0 ? sessionBreakdown(acts, sessionLimit) : null
+  // Like the server, session costs cover the same sessions, in the same order, as session usage.
+  const alignedCosts = (usage: UsageSessionAggregateBreakdown): UsageSessionCostBreakdown => {
+    const kept = new Set(usage.groups.map((g) => g.session_id))
+    const byId = new Map(acts.map((a) => [a.s.session.id, a]))
+    const rest = acts.filter((a) => active(a) && !kept.has(a.s.session.id))
+    return {
+      accuracy: EXACT,
+      price_book_version: PRICE_BOOK,
+      price_book_generated_at: seed.now,
+      groups: usage.groups.flatMap((g) => {
+        const a = byId.get(g.session_id)
+        return a ? [{ session_id: g.session_id, cost: costSummary([a]) }] : []
+      }),
+      remainder: rest.length ? { group_count: String(rest.length), cost: costSummary(rest) } : null,
+    }
+  }
   return {
     scope: "configured_session_store",
     time_basis: "event.timestamp",
@@ -522,9 +521,8 @@ function usageRollup({ body: raw }: LegacyRequest, context: LegacyContext): Usag
     model_breakdown: usageBreakdown(acts, groupLimit, true),
     cost: costs ? costRollup(acts, seed) : null,
     reported_costs: { records: [], truncated: false },
-    session_breakdown: sessionLimit > 0 ? sessionBreakdown(acts, sessionLimit) : null,
-    session_cost_breakdown:
-      sessionLimit > 0 && costs ? sessionCostBreakdown(acts, sessionLimit, seed) : null,
+    session_breakdown: sessions,
+    session_cost_breakdown: sessions && costs ? alignedCosts(sessions) : null,
   }
 }
 
@@ -960,30 +958,137 @@ function operationsSnapshot(
 // ---------------------------------------------------------------------------------------
 // Environments and system diagnostics, after a real `cayu serve --dev` capture.
 
+/**
+ * Environments registered without sessions yet, so the list has more than one shape: an
+ * AWS Lambda microVM sandbox made fresh per session, and a shared Docker container. A
+ * seed with no sessions (a new agent) keeps only the default `local` environment.
+ */
+const EXTRA_ENVIRONMENTS = ["docker-dev", "sandbox"]
+
 function environmentNames(seed: AppSeed): string[] {
   const names = new Set(seed.sessions.flatMap((s) => s.session.environment_name ?? []))
-  return names.size ? [...names].sort() : ["local"]
+  if (!names.size) return ["local"]
+  for (const name of EXTRA_ENVIRONMENTS) names.add(name)
+  return [...names].sort()
 }
 
 const storeOf = (environment: string) =>
   environment === "local" ? "standard-local-artifacts" : `${environment}-artifacts`
 
-function environment(name: string): EnvironmentSummary {
+const NO_BRANCHES: EnvironmentSummary["workspace_branch_capabilities"] = {
+  isolation: false,
+  net_changes: false,
+  publication: "unsupported",
+  recovery: "unsupported",
+  retention: "unsupported",
+  lifecycle_inspection: "unsupported",
+  detail_code: "workspace_branching_unsupported",
+}
+
+/** Branches on a workspace reached through a runner (`RunnerWorkspace`), as the runtime reports them. */
+const RUNNER_BRANCHES: EnvironmentSummary["workspace_branch_capabilities"] = {
+  isolation: true,
+  net_changes: true,
+  publication: "cooperative_atomic",
+  recovery: "process_local",
+  retention: "process_local",
+  lifecycle_inspection: "attached",
+  detail_code: "process_local_remote_runner_workspace_branches",
+}
+
+const DURABLE_RUNNER_BRANCHES: EnvironmentSummary["workspace_branch_capabilities"] = {
+  ...RUNNER_BRANCHES,
+  recovery: "durable",
+  retention: "durable",
+  lifecycle_inspection: "recoverable_by_id",
+  detail_code: "durable_remote_runner_workspace_branches",
+}
+
+const NO_SNAPSHOTS: EnvironmentSummary["execution_snapshot_capability"] = {
+  fidelity: "unsupported",
+  adapter: "unsupported",
+  adapter_version: "1",
+  snapshot_format: "none",
+  compatibility_sha256: null,
+  requires_managed_launch: false,
+}
+
+/** What differs from the default local environment, by environment name. */
+const ENVIRONMENT_PROFILES: Record<string, Partial<EnvironmentSummary>> = {
+  checkout: {
+    metadata: { profile: "pr-checkout-v2", repository: "cayu-tech/cayu" },
+    workspace_id: "checkout-repo",
+    runner_type: "DockerRunner",
+    binding_type: "GitRepositoryBinding",
+    vault_type: "LocalEnvVault",
+    proxy_type: "AllowlistProxy",
+    knowledge_store_type: "PostgresKnowledgeStore",
+    mcp_server_count: 2,
+    lifecycle_policy: {
+      lifecycle_timeout_seconds: 600,
+      phase_timeout_seconds: { bind: 180, materialize: 300 },
+      max_progress_events: 64,
+      progress_min_interval_seconds: 2,
+    },
+    workspace_instructions:
+      "The pull request is checked out at /workspace. Run the repository's own checks before commenting.",
+  },
+  "docker-dev": {
+    metadata: { profile: "docker-dev-v1", image: "cayu/dev:2026.10" },
+    workspace_id: "docker-dev-workspace",
+    workspace_branch_capabilities: RUNNER_BRANCHES,
+    runner_type: "DockerRunner",
+    binding_type: "NativeBinding",
+    vault_type: "LocalEnvVault",
+    proxy_type: "PassthroughProxy",
+    knowledge_store_type: "SQLiteKnowledgeStore",
+    mcp_server_count: 1,
+  },
+  sandbox: {
+    metadata: { profile: "aws-lambda-microvm-v1", region: "us-west-2" },
+    is_factory: true,
+    workspace_id: "sandbox-workspace",
+    workspace_branch_capabilities: DURABLE_RUNNER_BRANCHES,
+    runner_type: "LambdaMicroVMRunner",
+    binding_type: "NativeBinding",
+    vault_type: "SecretsManagerVault",
+    proxy_type: "AllowlistProxy",
+    knowledge_store_type: "PostgresEmbeddingKnowledgeStore",
+    mcp_server_count: 3,
+    execution_snapshot_capability: {
+      fidelity: "filesystem",
+      adapter: "lambda-microvm",
+      adapter_version: "3",
+      snapshot_format: "ext4-delta",
+      compatibility_sha256: hex("sandbox-snapshot", 64),
+      requires_managed_launch: true,
+    },
+    lifecycle_policy: {
+      lifecycle_timeout_seconds: 900,
+      phase_timeout_seconds: { provision: 300, bind: 120 },
+      max_progress_events: 128,
+      progress_min_interval_seconds: 1,
+    },
+    workspace_instructions: "Work inside /workspace. Network access is limited to the allowlist.",
+  },
+}
+
+function environment(name: string, seed: AppSeed): EnvironmentSummary {
+  const profile = ENVIRONMENT_PROFILES[name] ?? {}
+  // Branches the agent's code still has open; the fake counts one per running or waiting session.
+  const open = profile.workspace_branch_capabilities?.isolation
+    ? seed.sessions.filter(
+        (s) =>
+          s.session.environment_name === name &&
+          !["completed", "failed", "interrupted"].includes(s.overview.state),
+      ).length
+    : 0
   return {
     name,
     metadata: { profile: "standard-local-v1", runner: "unavailable", network: "unavailable" },
     is_factory: false,
     workspace_id: null,
-    workspace_branch_capabilities: {
-      isolation: false,
-      net_changes: false,
-      publication: "unsupported",
-      recovery: "unsupported",
-      retention: "unsupported",
-      lifecycle_inspection: "unsupported",
-      detail_code: "workspace_branching_unsupported",
-    },
-    workspace_branch_lifecycle: { attached_count: 0, statuses: [], truncated: false },
+    workspace_branch_capabilities: NO_BRANCHES,
     artifact_store_id: storeOf(name),
     runner_type: null,
     binding_type: null,
@@ -992,23 +1097,23 @@ function environment(name: string): EnvironmentSummary {
     knowledge_store_type: "SQLiteKnowledgeStore",
     mcp_server_count: 0,
     workspace_checkpoint_policy: null,
-    execution_snapshot_capability: {
-      fidelity: "unsupported",
-      adapter: "unsupported",
-      adapter_version: "1",
-      snapshot_format: "none",
-      compatibility_sha256: null,
-      requires_managed_launch: false,
-    },
+    execution_snapshot_capability: NO_SNAPSHOTS,
     lifecycle_policy: null,
     workspace_instructions: null,
     bound_workspace: null,
+    ...profile,
+    workspace_branch_lifecycle: {
+      attached_count: open,
+      statuses: open ? ["active"] : [],
+      truncated: false,
+    },
   }
 }
 
 function environments(_: LegacyRequest, context: LegacyContext): EnvironmentsPage {
-  const names = environmentNames(context.records())
-  return { environments: names.map(environment), total_count: names.length }
+  const seed = context.records()
+  const names = environmentNames(seed)
+  return { environments: names.map((name) => environment(name, seed)), total_count: names.length }
 }
 
 function systemDiagnostics(_: LegacyRequest, context: LegacyContext): SystemDiagnostics {
@@ -1064,11 +1169,17 @@ function systemDiagnostics(_: LegacyRequest, context: LegacyContext): SystemDiag
 }
 
 // ---------------------------------------------------------------------------------------
-// Artifacts: a report from each finished session and a CSV of its tool results.
+// Artifacts: files the agent saved. Each finished session leaves a Markdown report, and
+// depending on what it did, a CSV of its tool results, a JSON result, a PNG chart or a
+// large workspace archive. A few environments also hold shared files no session owns.
 
-type StoredArtifact = { summary: ArtifactSummary; content: string }
+type StoredArtifact = {
+  summary: ArtifactSummary
+  /** The file's bytes, made on read so a large archive costs nothing until it's opened. */
+  content: () => string | Uint8Array<ArrayBuffer>
+}
 
-const MAX_ARTIFACTS = 8
+const MAX_ARTIFACTS = 60
 
 function csvCell(value: unknown): string {
   const raw = typeof value === "string" ? value : JSON.stringify(value)
@@ -1102,50 +1213,251 @@ function evidenceCsv(s: SeedSession): string {
   return ["step,tool,arguments,result,status", ...rows, ""].join("\n")
 }
 
-function storedArtifact(
-  s: SeedSession,
-  filename: string,
+function resultJson(s: SeedSession): string {
+  const output = structuredOutput(s)
+  const result = {
+    title: titleOf(s),
+    specialist: s.session.agent_name,
+    outcome: s.overview.state,
+    summary: s.overview.summary,
+    ...(output === undefined ? {} : { output }),
+    steps: toolCalls(s).map((c) => ({ tool: c.tool, arguments: c.args, ok: !c.error })),
+  }
+  return `${JSON.stringify(result, null, 2)}\n`
+}
+
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+  let c = n
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+  return c >>> 0
+})
+
+function crc32(bytes: Uint8Array): number {
+  let c = 0xffffffff
+  for (const b of bytes) c = (CRC_TABLE[(c ^ b) & 0xff] ?? 0) ^ (c >>> 8)
+  return (c ^ 0xffffffff) >>> 0
+}
+
+const u32 = (n: number) => [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]
+
+function pngChunk(type: string, data: Uint8Array): number[] {
+  const body = new Uint8Array([...type].map((c) => c.charCodeAt(0)).concat([...data]))
+  return [...u32(data.length), ...body, ...u32(crc32(body))]
+}
+
+/** A palette PNG with uncompressed (stored) zlib blocks: small code, real image bytes. */
+function png(
+  width: number,
+  height: number,
+  palette: number[],
+  pixel: (x: number, y: number) => number,
+): Uint8Array<ArrayBuffer> {
+  const raw = new Uint8Array((width + 1) * height)
+  for (let y = 0; y < height; y++)
+    for (let x = 0; x < width; x++) raw[y * (width + 1) + 1 + x] = pixel(x, y)
+  const zlib = [0x78, 0x01]
+  for (let i = 0; i < raw.length; i += 65_535) {
+    const len = Math.min(65_535, raw.length - i)
+    zlib.push(i + len >= raw.length ? 1 : 0, len & 0xff, len >> 8, ~len & 0xff, (~len >> 8) & 0xff)
+    for (const v of raw.subarray(i, i + len)) zlib.push(v)
+  }
+  let a = 1
+  let b = 0
+  for (const v of raw) {
+    a = (a + v) % 65_521
+    b = (b + a) % 65_521
+  }
+  zlib.push(...u32(((b << 16) | a) >>> 0))
+  const plte = new Uint8Array(palette.flatMap((rgb) => [rgb >> 16, (rgb >> 8) & 0xff, rgb & 0xff]))
+  const ihdr = new Uint8Array([...u32(width), ...u32(height), 8, 3, 0, 0, 0])
+  return new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    ...pngChunk("IHDR", ihdr),
+    ...pngChunk("PLTE", plte),
+    ...pngChunk("IDAT", new Uint8Array(zlib)),
+    ...pngChunk("IEND", new Uint8Array()),
+  ])
+}
+
+/** A small bar chart, its bars derived from the session so each chart differs. */
+function chartPng(s: SeedSession): Uint8Array<ArrayBuffer> {
+  const [w, h, left, top, base] = [240, 140, 20, 12, 120]
+  const values = Array.from({ length: 6 }, (_, i) =>
+    Number.parseInt(hex(`${s.session.id}/bar${i}`, 2), 16),
+  )
+  const slot = (w - left - 10) / values.length
+  return png(w, h, [0xffffff, 0xe5e7eb, 0x9ca3af, 0x3b82f6, 0xf59e0b], (x, y) => {
+    if ((y === base && x >= left && x < w - 10) || (x === left && y >= top && y <= base)) return 2
+    const i = Math.floor((x - left) / slot)
+    const inBar = x > left && i < values.length && (x - left) % slot > 6 && (x - left) % slot < 28
+    if (inBar && y < base && y >= base - (16 + ((values[i] ?? 0) % 90)))
+      return i === values.length - 1 ? 4 : 3
+    if ([39, 66, 93].includes(y) && x > left && x < w - 10) return 1
+    return 0
+  })
+}
+
+/** A deterministic stand-in for a workspace archive of `size` bytes. */
+function archive(key: string, size: number): Uint8Array<ArrayBuffer> {
+  const bytes = new Uint8Array(size)
+  bytes.set([0x50, 0x4b, 0x03, 0x04])
+  let h = Number.parseInt(hex(key, 8), 16)
+  for (let i = 4; i < size; i++) {
+    h = Math.imul(h ^ i, 16777619)
+    bytes[i] = h >>> 24
+  }
+  return bytes
+}
+
+const bytesOf = (content: string | Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> =>
+  typeof content === "string" ? new TextEncoder().encode(content) : content
+
+function stored(
+  summary: Omit<ArtifactSummary, "id" | "size_bytes" | "created_at" | "content_type">,
   contentType: string,
-  content: string,
   createdAt: number,
+  content:
+    | string
+    | Uint8Array<ArrayBuffer>
+    | { size: number; bytes: () => Uint8Array<ArrayBuffer> },
 ): StoredArtifact {
-  const environmentName = s.session.environment_name ?? "local"
+  const owner = summary.session_id ?? summary.environment_name
+  const lazy = typeof content === "object" && "size" in content ? content : null
   return {
-    content,
+    content: lazy ? lazy.bytes : () => content as string | Uint8Array<ArrayBuffer>,
     summary: {
-      id: `art_${hex(`${s.session.id}/${filename}`, 24)}`,
-      artifact_store_id: storeOf(environmentName),
-      scope: "session",
-      session_id: s.session.id,
-      agent_name: s.session.agent_name,
-      environment_name: environmentName,
-      filename,
+      ...summary,
+      id: `art_${hex(`${owner}/${summary.filename}`, 24)}`,
       content_type: contentType,
-      size_bytes: new TextEncoder().encode(content).length,
+      size_bytes: lazy ? lazy.size : bytesOf(content as string | Uint8Array<ArrayBuffer>).length,
       created_at: iso(createdAt),
-      metadata: {
-        workspace_path: `outputs/${filename}`,
-        published_by: "publish_workspace_artifact",
-      },
     },
   }
 }
 
-/** Newest first, from the most recent finished sessions. */
-function allArtifacts(seed: AppSeed): StoredArtifact[] {
+function sessionFiles(s: SeedSession, index: number): StoredArtifact[] {
+  const environmentName = s.session.environment_name ?? "local"
+  const name = slug(titleOf(s))
+  const ended = Date.parse(s.overview.ended_at ?? s.overview.last_activity_at)
+  const file = (
+    filename: string,
+    contentType: string,
+    offsetMs: number,
+    content: Parameters<typeof stored>[3],
+  ) =>
+    stored(
+      {
+        artifact_store_id: storeOf(environmentName),
+        scope: "session",
+        session_id: s.session.id,
+        agent_name: s.session.agent_name,
+        environment_name: environmentName,
+        filename,
+        metadata: {
+          workspace_path: `outputs/${filename}`,
+          published_by: "publish_workspace_artifact",
+        },
+      },
+      contentType,
+      ended - offsetMs,
+      content,
+    )
+  const files = [file(`${name}.md`, "text/markdown", 1_000, report(s))]
+  if (toolCalls(s).length >= 2)
+    files.push(file(`${name}-evidence.csv`, "text/csv", 0, evidenceCsv(s)))
+  if (index % 2 === 0)
+    files.push(file(`${name}-result.json`, "application/json", 2_000, resultJson(s)))
+  if (index % 3 === 1) files.push(file(`${name}-chart.png`, "image/png", 3_000, chartPng(s)))
+  if (index % 7 === 3) {
+    const size = 2_200_000 + Number.parseInt(hex(s.session.id, 5), 16)
+    const key = `${s.session.id}/archive`
+    files.push(
+      file(`${name}-workspace.zip`, "application/zip", 4_000, {
+        size,
+        bytes: () => archive(key, size),
+      }),
+    )
+  }
+  return files
+}
+
+/** Files kept at the environment level, readable by every session there. */
+const SHARED_FILES: Record<
+  string,
+  Array<{ filename: string; contentType: string; daysAgo: number; text: string }>
+> = {
+  local: [
+    {
+      filename: "agent-handbook.md",
+      contentType: "text/markdown",
+      daysAgo: 12,
+      text: "# Agent handbook\n\nNotes every session in this environment can read.\n\n- Cite the record you used for every number.\n- Ask before changing anything outside the workspace.\n",
+    },
+  ],
+  checkout: [
+    {
+      filename: "review-checklist.md",
+      contentType: "text/markdown",
+      daysAgo: 9,
+      text: "# Review checklist\n\n1. Does the change do what the description says?\n2. Are there tests for the new behavior?\n3. Could it break an existing caller?\n4. Is anything left that the author should clean up?\n",
+    },
+  ],
+  sandbox: [
+    {
+      filename: "base-image.json",
+      contentType: "application/json",
+      daysAgo: 4,
+      text: `${JSON.stringify(
+        {
+          image: "cayu/sandbox:2026.10.2",
+          python: "3.13",
+          node: "22",
+          tools: ["git", "ripgrep", "uv"],
+          network_allowlist: ["pypi.org", "registry.npmjs.org", "github.com"],
+        },
+        null,
+        2,
+      )}\n`,
+    },
+  ],
+}
+
+function environmentFiles(seed: AppSeed, now: number): StoredArtifact[] {
+  if (!seed.sessions.length) return []
+  return environmentNames(seed).flatMap((environmentName) =>
+    (SHARED_FILES[environmentName] ?? []).map((f) =>
+      stored(
+        {
+          artifact_store_id: storeOf(environmentName),
+          scope: "environment",
+          session_id: null,
+          agent_name: null,
+          environment_name: environmentName,
+          filename: f.filename,
+          metadata: { workspace_path: `shared/${f.filename}` },
+        },
+        f.contentType,
+        now - f.daysAgo * 86_400_000,
+        f.text,
+      ),
+    ),
+  )
+}
+
+/** Newest first: the recent finished sessions' files and the environments' shared files. */
+function allArtifacts(seed: AppSeed, now: number): StoredArtifact[] {
   const finished = seed.sessions
     .filter((s) => s.overview.state === "completed" && s.overview.ended_at)
     .sort((a, b) => (b.overview.ended_at ?? "").localeCompare(a.overview.ended_at ?? ""))
-  return finished
-    .flatMap((s) => {
-      const name = slug(titleOf(s))
-      const ended = Date.parse(s.overview.ended_at ?? s.overview.last_activity_at)
-      const files = [storedArtifact(s, `${name}.md`, "text/markdown", report(s), ended - 1_000)]
-      if (toolCalls(s).length >= 2) {
-        files.unshift(storedArtifact(s, `${name}-evidence.csv`, "text/csv", evidenceCsv(s), ended))
-      }
-      return files
-    })
+  return [...finished.flatMap(sessionFiles), ...environmentFiles(seed, now)]
+    .sort((a, b) => b.summary.created_at.localeCompare(a.summary.created_at))
     .slice(0, MAX_ARTIFACTS)
 }
 
@@ -1154,7 +1466,7 @@ export function findArtifact(
   context: LegacyContext,
 ): StoredArtifact {
   const store = query.get("artifact_store_id")
-  const found = allArtifacts(context.records()).find(
+  const found = allArtifacts(context.records(), context.now()).find(
     (a) => a.summary.id === params.artifactId && (!store || a.summary.artifact_store_id === store),
   )
   if (!found) throw new HttpError(404, `Artifact ${params.artifactId} was not found.`)
@@ -1169,7 +1481,7 @@ function listArtifacts({ query }: LegacyRequest, context: LegacyContext): Artifa
     "artifact_store_id",
     "scope",
   ] as const
-  const matching = allArtifacts(context.records())
+  const matching = allArtifacts(context.records(), context.now())
     .map((a) => a.summary)
     .filter((a) => keys.every((key) => !query.get(key) || a[key] === query.get(key)))
   const limit = integer(query, "limit", 50)
@@ -1193,12 +1505,13 @@ function base64(bytes: Uint8Array): string {
 
 function readArtifact(request: LegacyRequest, context: LegacyContext): ArtifactRead {
   const artifact = findArtifact(request, context)
-  const bytes = new TextEncoder().encode(artifact.content)
+  const content = artifact.content()
+  const bytes = bytesOf(content)
   const preview = bytes.slice(0, integer(request.query, "max_bytes", 65_536))
   return {
     artifact: artifact.summary,
     preview_base64: base64(preview),
-    text_preview: new TextDecoder().decode(preview),
+    text_preview: typeof content === "string" ? new TextDecoder().decode(preview) : null,
     total_bytes: bytes.length,
     truncated: preview.length < bytes.length,
   }
@@ -1206,10 +1519,12 @@ function readArtifact(request: LegacyRequest, context: LegacyContext): ArtifactR
 
 function artifactContent(request: LegacyRequest, context: LegacyContext): Response {
   const { summary, content } = findArtifact(request, context)
+  const body = content()
   const disposition = request.query.get("disposition") === "attachment" ? "attachment" : "inline"
-  return new Response(content, {
+  return new Response(bytesOf(body), {
     headers: {
-      "Content-Type": `${summary.content_type}; charset=utf-8`,
+      "Content-Type":
+        typeof body === "string" ? `${summary.content_type}; charset=utf-8` : summary.content_type,
       "Content-Disposition": `${disposition}; filename="${summary.filename}"`,
     },
   })

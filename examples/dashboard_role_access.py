@@ -5,7 +5,8 @@ browser, so the server behind them still grants full access. This part serves th
 packaged dashboard behind proxy identity with the default `ControlPlaneRoles`. Every
 browser request carries a freshly signed identity, so the server decides each request
 by the viewer's real role. It checks a developer and a member across the shell, Home,
-a session, Inbox, Tasks, Specialists, Tools, Knowledge, Evals and System, including
+a session, Inbox, Tasks, Specialists, Tools, Knowledge, Evals, Usage, Environments,
+Artifacts and System, including
 the 403 `role_forbidden` a member gets when a write reaches the server anyway.
 
 Run it alone with `CAYU_DASHBOARD_PART=roles python examples/dashboard_behavior_live.py`.
@@ -508,9 +509,27 @@ async def _exercise_developer(
     await expect(
         page.get_by_role("heading", name="What trials run with", exact=True)
     ).to_be_visible()
+    await _exercise_remaining_reads(page, base_url)
     await page.goto(f"{base_url}/cayu/system", wait_until="networkidle")
+    await expect(page.get_by_text("About this agent", exact=True)).to_be_visible()
     await expect(page.get_by_test_id("dashboard-role-unavailable")).to_have_count(0)
     await expect(page.get_by_role("heading", name="System", exact=True)).to_be_visible()
+
+
+async def _exercise_remaining_reads(page: Page, base_url: str) -> None:
+    await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
+    await expect(page.get_by_role("button", name="Last 30 days", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Sessions per day", exact=True)).to_be_visible()
+    await page.goto(f"{base_url}/cayu/environments", wait_until="networkidle")
+    await expect(
+        page.get_by_text(
+            "Where your agent's sessions run, and what they can reach there.", exact=True
+        )
+    ).to_be_visible()
+    # This role fixture has no artifact store. The same read capability gate must
+    # explain unavailable storage before mounting a page that would issue reads.
+    await page.goto(f"{base_url}/cayu/artifacts", wait_until="networkidle")
+    await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_be_visible()
 
 
 async def _exercise_member(
@@ -551,6 +570,7 @@ async def _exercise_member(
         ROLE_FORBIDDEN_REASON
     )
     require_equal(system_reads, [], "a member must not read System diagnostics")
+    await _exercise_remaining_reads(page, base_url)
     await page.goto(f"{base_url}/cayu/evals/settings", wait_until="networkidle")
     await expect(
         page.get_by_text("Your role can read eval suites and comparisons", exact=False)

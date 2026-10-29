@@ -23,9 +23,9 @@ owners before rebuilding:
 | `src/routes/agents.tsx`, `knowledge.tsx` | Specialists, Tools and Knowledge pages in `src/next/routes/` |
 | `src/routes/tasks.tsx` | `src/next/routes/tasks-page.tsx` and `task-page.tsx` |
 | `src/routes/evals.tsx` | `src/next/routes/evals/` and shared editors in `src/components/dashboard/` |
+| `src/routes/usage.tsx`, `environments.tsx`, `artifacts.tsx`, `system.tsx` | Corresponding pages and helpers in `src/next/routes/` |
 
-Usage, Environments, Artifacts and System still use their `src/routes/` modules.
-Do not remove that directory wholesale. The full workflow inspector is embedded
+The full workflow inspector is embedded
 in Session Trace. The `/sessions/:id/workflow` alias opens it; `/agents`,
 `/pending-actions` and `/run` lead to Specialists, Inbox and Home's Start form.
 Supported old Evals run/result query links map to the current Evals pages.
@@ -38,10 +38,10 @@ changes or migrate older prototype/browser state.
 ## Retained prototype
 
 `prototype.html`, `src/next/mock/`, its `mock/legacy/` fetch adapter,
-`src/next/routes/legacy-page.tsx`, `src/next/legacy-config.ts` and the
-`CAYU_PROTOTYPE` build remain deliberately as a development/demo harness.
-They supply simulated data and hash navigation; they are not the production
-integration or proof of runtime permissions and durability.
+`src/next/legacy-config.ts` and the `CAYU_PROTOTYPE` build remain deliberately
+as a development/demo harness. It supplies simulated data and hash navigation
+to the shared page components; it is not the production integration or proof
+of runtime permissions and durability.
 
 With the development server running, open `/prototype.html`. To build only that
 harness, run `CAYU_PROTOTYPE=1 npx vite build`; it writes `dist/prototype/`.

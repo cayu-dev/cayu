@@ -14,6 +14,7 @@ import type { SessionRow } from "../../app/queries"
 import { useServices } from "../../app/services"
 import { formatDuration } from "../../app/session-model"
 import { LabelChips, NavLink, SessionSummary, sessionRoute } from "../common"
+import { environmentRoute } from "../environments/environment-model"
 
 export const PANEL_TABS = ["overview", "usage", "artifacts", "browser"] as const
 export type PanelTab = (typeof PANEL_TABS)[number]
@@ -189,7 +190,10 @@ export function DetailsPanel({
                 </Row>
                 <Row k="Environment">
                   {session.environment_name ? (
-                    <NavLink to="/environments" className="hover:underline">
+                    <NavLink
+                      {...environmentRoute(session.environment_name)}
+                      className="hover:underline"
+                    >
                       {session.environment_name}
                     </NavLink>
                   ) : (
@@ -241,8 +245,8 @@ export function DetailsPanel({
                     to="/artifacts"
                     search={{
                       session_id: session.id,
-                      artifact_store_id: artifact.artifact_store_id,
-                      q: artifact.id,
+                      preview_store_id: artifact.artifact_store_id,
+                      artifact: artifact.id,
                     }}
                     className="block rounded-md border border-border p-2 text-sm hover:bg-muted"
                   >

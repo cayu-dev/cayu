@@ -13,9 +13,11 @@ export function installArtifactLinks(context: LegacyContext): () => void {
       { params: { artifactId: decodeURIComponent(match[1]!) }, query: url.searchParams },
       context,
     )
-    // The fake artifacts are text reports and CSV. Plain text also lets the browser
-    // display a copied URL or an Open raw tab instead of downloading by MIME type.
-    const blobUrl = URL.createObjectURL(new Blob([content], { type: "text/plain;charset=utf-8" }))
+    // Text files open as plain text, so the browser displays a copied URL or an Open raw
+    // tab instead of downloading by MIME type. Images and archives keep their own type.
+    const bytes = content()
+    const type = typeof bytes === "string" ? "text/plain;charset=utf-8" : summary.content_type
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type }))
     urls.add(blobUrl)
     anchor.href = blobUrl
     if (url.searchParams.get("disposition") === "attachment") anchor.download = summary.filename

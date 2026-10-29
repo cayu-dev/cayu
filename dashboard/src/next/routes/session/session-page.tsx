@@ -86,6 +86,7 @@ import {
   TopBar,
   useGo,
 } from "../common"
+import { environmentRoute } from "../environments/environment-model"
 import { useEvalAccess } from "../evals/shared"
 import { selectClassName } from "../session-filters"
 import { AddToEvalsDialog } from "./add-to-evals"
@@ -816,8 +817,7 @@ export function SessionPage({
                   </NavLink>
                   {detail.data?.environment_name && (
                     <NavLink
-                      to="/environments"
-                      search={{ q: detail.data.environment_name }}
+                      {...environmentRoute(detail.data.environment_name)}
                       className="hover:underline"
                     >
                       {detail.data.environment_name}

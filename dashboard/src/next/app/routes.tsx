@@ -9,7 +9,11 @@ import {
   type RouterHistory,
   redirect,
 } from "@tanstack/react-router"
+import { validateArtifactSearch } from "@/lib/artifact-search"
 import { validateSessionIndexSearch } from "@/lib/session-index-search"
+import { validateUsageRollupSearch } from "@/lib/usage-rollup-search"
+import { ArtifactsPage } from "../routes/artifacts-page"
+import { EnvironmentPage, EnvironmentsPage } from "../routes/environments-page"
 import { EvalRunPage } from "../routes/eval-run-page"
 import { EvalSettingsPage } from "../routes/eval-settings-page"
 import { EvalSuitePage } from "../routes/eval-suite-page"
@@ -18,13 +22,14 @@ import { HomePage } from "../routes/home-page"
 import { InboxPage } from "../routes/inbox-page"
 import { KnowledgePage } from "../routes/knowledge-page"
 import { Layout } from "../routes/layout"
-import { LegacyPage } from "../routes/legacy-page"
 import { SessionPage } from "../routes/session/session-page"
 import { SessionsPage } from "../routes/sessions-page"
 import { SpecialistsPage } from "../routes/specialists-page"
+import { SystemPage } from "../routes/system-page"
 import { TaskPage } from "../routes/task-page"
 import { TasksPage } from "../routes/tasks-page"
 import { ToolsPage } from "../routes/tools-page"
+import { UsagePage } from "../routes/usage-page"
 
 // The default search parser turns "1" into a number and "true" into a boolean.
 const str = (v: unknown) =>
@@ -128,14 +133,26 @@ export function createDashboardRouter(history?: RouterHistory) {
       component: ToolsPage,
     }),
     page("/knowledge", KnowledgePage),
-    ...(
-      [
-        ["/usage", "Usage"],
-        ["/environments", "Environments"],
-        ["/artifacts", "Artifacts"],
-        ["/system", "System"],
-      ] as const
-    ).map(([path, title]) => page(path, () => <LegacyPage title={title} />)),
+    createRoute({
+      getParentRoute: () => root,
+      path: "/usage",
+      validateSearch: validateUsageRollupSearch,
+      component: UsagePage,
+    }),
+    createRoute({
+      getParentRoute: () => root,
+      path: "/environments",
+      validateSearch: (s: Record<string, unknown>) => ({ q: str(s.q) }),
+      component: EnvironmentsPage,
+    }),
+    page("/environments/$name", EnvironmentPage),
+    createRoute({
+      getParentRoute: () => root,
+      path: "/artifacts",
+      validateSearch: validateArtifactSearch,
+      component: ArtifactsPage,
+    }),
+    page("/system", SystemPage),
     moved("/pending-actions", "/inbox"),
     moved("/run", "/"),
     moved("/agents", "/specialists"),

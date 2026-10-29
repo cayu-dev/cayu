@@ -11,6 +11,7 @@ import {
 import { useContext } from "react"
 import { CapabilityRoute } from "../components/dashboard/server-contract"
 import { FullAccessRoute } from "../components/dashboard/viewer"
+import { validateArtifactSearch } from "../lib/artifact-search"
 import { dashboardConfig } from "../lib/config"
 import { DASHBOARD_ROUTE_REQUIREMENTS } from "../lib/dashboard-capabilities"
 import { type EvalSettingsTool, validateEvalSettingsSearch } from "../lib/eval-settings-search"
@@ -34,11 +35,18 @@ const SpecialistsPage = lazyRouteComponent(
   "SpecialistsEntry",
 )
 const ToolsPage = lazyRouteComponent(() => import("../next/routes/tools-entry"), "ToolsEntry")
-const ArtifactsPage = lazyRouteComponent(() => import("../routes/artifacts"), "ArtifactsPage")
+const ArtifactsPage = lazyRouteComponent(
+  () => import("../next/routes/artifacts-page"),
+  "ArtifactsPage",
+)
 const DashboardPage = lazyRouteComponent(() => import("../next/routes/home-page"), "HomePage")
 const EnvironmentsPage = lazyRouteComponent(
-  () => import("../routes/environments"),
+  () => import("../next/routes/environments-page"),
   "EnvironmentsPage",
+)
+const EnvironmentPage = lazyRouteComponent(
+  () => import("../next/routes/environments-page"),
+  "EnvironmentPage",
 )
 const EvalsPage = lazyRouteComponent(
   () => import("../next/routes/evals/index-page"),
@@ -78,8 +86,8 @@ const SessionsPage = lazyRouteComponent(
 )
 const TasksPage = lazyRouteComponent(() => import("../next/routes/tasks-page"), "TasksPage")
 const TaskPage = lazyRouteComponent(() => import("../next/routes/task-page"), "TaskPage")
-const UsagePage = lazyRouteComponent(() => import("../routes/usage"), "UsagePage")
-const SystemPage = lazyRouteComponent(() => import("../routes/system"), "SystemPage")
+const UsagePage = lazyRouteComponent(() => import("../next/routes/usage-page"), "UsagePage")
+const SystemPage = lazyRouteComponent(() => import("../next/routes/system-page"), "SystemPage")
 const TASK_SEARCH_KEYS = [
   "q",
   "group",
@@ -132,6 +140,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   })
 
   const usageRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/usage",
     validateSearch: validateUsageRollupSearch,
@@ -331,14 +340,28 @@ export function createDashboardRouter(history?: RouterHistory) {
   })
 
   const environmentsRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/environments",
+    validateSearch: (search: Record<string, unknown>): { q?: string } => ({
+      q: typeof search.q === "string" ? search.q : undefined,
+    }),
     component: EnvironmentsPage,
   })
 
+  const environmentRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
+    getParentRoute: () => rootRoute,
+    path: "/environments/$name",
+    remountDeps: ({ params }) => params,
+    component: EnvironmentPage,
+  })
+
   const artifactsRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/artifacts",
+    validateSearch: validateArtifactSearch,
     component: () => (
       <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/artifacts"]} title="Artifacts">
         <ArtifactsPage />
@@ -397,6 +420,7 @@ export function createDashboardRouter(history?: RouterHistory) {
   })
 
   const systemRoute = createRoute({
+    staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/system",
     component: () => (
@@ -424,6 +448,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     specialistsRoute,
     toolsRoute,
     environmentsRoute,
+    environmentRoute,
     artifactsRoute,
     workflowRoute,
     sessionDetailRoute,

@@ -146,6 +146,9 @@ function IdentityGate() {
         value={{
           api: realApi,
           now: Date.now,
+          overviewQueriesEnabled:
+            serverContract.capabilities.surfaces.session_overview_queries?.read.enabled === true,
+          artifactsEnabled: serverContract.capabilities.surfaces.artifacts?.read.enabled === true,
           taskIndexEnabled: serverContract.capabilities.surfaces.task_index?.read.enabled === true,
           taskCreationEnabled:
             serverContract.capabilities.surfaces.task_creation?.mutate.enabled === true,
