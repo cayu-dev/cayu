@@ -20522,6 +20522,21 @@ endpoint, arguments recorded before a call ran (its start, approval request or i
 request) show as `[quarantined]`; a terminal record's arguments are summarized after the
 application's secret redactor runs on them.
 
+### Session rollups and creation windows
+
+`GET /api/sessions` accepts `created_since` (inclusive) and `created_before` (exclusive),
+timezone-aware instants that select sessions by creation time; `SessionQuery` has the same
+two fields and every built-in store applies them in its native query.
+
+`POST /api/sessions/rollup` returns one page of `cayu session rollup`: for up to
+`max_sessions` (at most 500) sessions created in the `since`/`until` window, oldest first,
+the per-group sums of sessions, statuses, model and tool calls, tool failures by error kind,
+aggregate usage and time by phase. `group_by` is `agent`, `day`, `release` or `label:KEY`;
+`agent_name`, `environment_name`, `status` and `labels` filter sessions. Groups merge by
+adding, so a client reads `next_cursor` pages and merges groups with the same key. Each
+session's events are read in byte-bounded pages of only the event types the rollup needs.
+Group keys and tool names pass through the application's secret redactor.
+
 ### Exact session trace reads
 
 Server contract 59 advertises `capabilities.surfaces.session_trace`.

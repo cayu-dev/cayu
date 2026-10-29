@@ -131,3 +131,134 @@ def test_reader_bounds_multi_type_event_reads_at_one_high_water_mark() -> None:
 
     assert [record.sequence for record in records] == [1, 3]
     assert {params.get("before_sequence") for params in asked[1:]} == {"5"}
+
+
+def test_reader_names_rollups_an_older_agent_does_not_serve() -> None:
+    from cayu.sessions._rollup import SessionRollupQuery
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_SESSIONS)
+        return httpx.Response(405, json={"detail": "Method Not Allowed"})
+
+    reader = AgentSessionReader(_api(handler))
+    with pytest.raises(CayuApiError, match="doesn't serve session rollups yet"):
+        asyncio.run(reader.rollup_page(SessionRollupQuery()))
+
+
+def test_reader_filters_the_creation_window_when_an_older_agent_ignores_it() -> None:
+    from datetime import UTC, datetime
+
+    from cayu.sessions.queries import SessionQuery
+
+    def row(session_id: str, created_at: str) -> dict:
+        return {"id": session_id, "status": "completed", "created_at": created_at}
+
+    pages = {
+        None: {
+            "sessions": [
+                row("new", "2026-10-28T00:00:00+00:00"),
+                row("in", "2026-10-27T01:00:00+00:00"),
+            ],
+            "next_cursor": "c1",
+            "total_count": 9,
+        },
+        "c1": {
+            "sessions": [row("in2", "2026-10-27T00:30:00+00:00")],
+            "next_cursor": None,
+            "total_count": 9,
+        },
+    }
+    asked: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        if params.get("limit") == "1" and "created_since" not in params:
+            return httpx.Response(200, json=_SESSIONS)
+        asked.append(params)
+        return httpx.Response(200, json=pages[params.get("cursor")])
+
+    reader = AgentSessionReader(_api(handler))
+    page = asyncio.run(
+        reader.list_sessions(
+            SessionQuery(
+                created_since=datetime(2026, 10, 27, tzinfo=UTC),
+                created_before=datetime(2026, 10, 28, tzinfo=UTC),
+                limit=5,
+            )
+        )
+    )
+
+    assert [item["id"] for item in page.rows] == ["in", "in2"]
+    assert page.total_count is None and page.next_cursor is None
+    assert asked[0]["created_since"] == "2026-10-27T00:00:00+00:00"
+    assert asked[1]["cursor"] == "c1" and asked[1]["limit"] == "4"
+
+
+def test_reader_applies_the_offset_after_filtering_the_creation_window() -> None:
+    from datetime import UTC, datetime
+
+    from cayu.sessions.queries import SessionQuery
+
+    ordered = [
+        {"id": "a", "status": "completed", "created_at": "2026-10-20T00:00:00+00:00"},
+        {"id": "b", "status": "completed", "created_at": "2026-10-27T01:00:00+00:00"},
+        {"id": "c", "status": "completed", "created_at": "2026-10-27T02:00:00+00:00"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        if params.get("limit") == "1" and "created_since" not in params:
+            return httpx.Response(200, json=_SESSIONS)
+        # An older Agent: ignores the window, pages by offset or cursor.
+        start = int(params.get("cursor") or params.get("offset") or 0)
+        stop = start + int(params["limit"])
+        cursor = str(stop) if stop < len(ordered) else None
+        return httpx.Response(200, json={"sessions": ordered[start:stop], "next_cursor": cursor})
+
+    reader = AgentSessionReader(_api(handler))
+    page = asyncio.run(
+        reader.list_sessions(
+            SessionQuery(created_since=datetime(2026, 10, 27, tzinfo=UTC), offset=1, limit=1)
+        )
+    )
+
+    assert [item["id"] for item in page.rows] == ["c"]
+
+
+def test_post_falls_back_past_another_apps_route_at_the_mount() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.url.path.startswith("/cayu/"):
+            return httpx.Response(405, json={"detail": "Method Not Allowed"})
+        return httpx.Response(200, json={"ok": True})
+
+    assert _api(handler).post("/sessions/rollup", {}, resource="session rollups") == {"ok": True}
+    assert seen == ["POST /cayu/api/sessions/rollup", "POST /api/sessions/rollup"]
+
+
+def test_reader_never_trusts_an_agents_total_for_a_creation_window() -> None:
+    from datetime import UTC, datetime
+
+    from cayu.sessions.queries import SessionQuery
+
+    rows = [
+        {"id": "new1", "status": "completed", "created_at": "2026-10-28T01:00:00+00:00"},
+        {"id": "new2", "status": "completed", "created_at": "2026-10-28T00:30:00+00:00"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # An older Agent: ignores the window and counts every session.
+        return httpx.Response(200, json={"sessions": rows, "next_cursor": "c", "total_count": 3})
+
+    reader = AgentSessionReader(_api(handler))
+    page = asyncio.run(
+        reader.list_sessions(
+            SessionQuery(created_since=datetime(2026, 10, 27, tzinfo=UTC), limit=2)
+        )
+    )
+
+    assert [item["id"] for item in page.rows] == ["new1", "new2"]
+    assert page.total_count is None

@@ -280,6 +280,9 @@ def test_session_commands_have_sqlite_postgres_semantic_parity(
     asyncio.run(prepare())
     commands = (
         ("list", ["list", "--label", "suite=parity"]),
+        ("list", ["list", "--since", "2000-01-01", "--label", "suite=parity"]),
+        ("list", ["list", "--until", "2000-01-01"]),
+        ("rollup", ["rollup", "--by", "label:suite"]),
         ("show", ["show", "sess_parity"]),
         ("usage", ["usage", "sess_parity"]),
         ("tools", ["tools", "sess_parity"]),

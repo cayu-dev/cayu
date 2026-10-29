@@ -204,7 +204,10 @@ from cayu.server._scenario_routes import (
     register_scenario_authoring_routes,
     register_scenario_launch_routes,
 )
-from cayu.server._session_call_routes import register_session_call_routes
+from cayu.server._session_call_routes import (
+    register_session_call_routes,
+    register_session_rollup_route,
+)
 from cayu.server._session_overview import (
     SessionOverviewService,
     overview_http_error,
@@ -7588,6 +7591,14 @@ def create_router(
         order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
         label: Annotated[list[str] | None, Query()] = None,
         label_selector: Annotated[list[str] | None, Query()] = None,
+        created_since: Annotated[
+            datetime | None,
+            Query(description="Only sessions created at or after this timezone-aware instant."),
+        ] = None,
+        created_before: Annotated[
+            datetime | None,
+            Query(description="Only sessions created before this timezone-aware instant."),
+        ] = None,
         overview_state: Annotated[list[SessionOverviewStatus] | None, Query(max_length=32)] = None,
         include_eval: bool = True,
         include_forks: bool = True,
@@ -7632,6 +7643,8 @@ def create_router(
             or causal_budget_id is not None
             or label
             or label_selector
+            or created_since is not None
+            or created_before is not None
             or limit != 50
             or order_by != SessionOrder.UPDATED_AT_DESC
         ):
@@ -7668,6 +7681,8 @@ def create_router(
                     causal_budget_id=private_causal_budget_id,
                     labels=labels,
                     label_selectors=label_selectors,
+                    created_since=created_since,
+                    created_before=created_before,
                     limit=limit,
                     offset=offset,
                     cursor=None,
@@ -8560,6 +8575,13 @@ def create_router(
         project_session=cayu_app.project_session_id_for_exposure,
         redact=cayu_app.redact_json,
         codec=lambda: cayu_app._public_authority_alias_codec,
+    )
+    register_session_rollup_route(
+        router,
+        protected=protected,
+        store=session_store,
+        redact=cayu_app.redact_json,
+        serialize_cursor=partial(_serialize_session_cursor, cayu_app),
     )
     register_session_trace(
         router,

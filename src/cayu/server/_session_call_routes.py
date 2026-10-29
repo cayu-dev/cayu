@@ -1,4 +1,4 @@
-"""HTTP assembly for one session's model-call usage and paired tool calls.
+"""HTTP assembly for one session's model-call usage and paired tool calls, and rollups.
 
 `GET /sessions/{id}/model-calls` and `GET /sessions/{id}/tool-calls` serve the views behind
 `cayu session usage` and `cayu session tools` (`cayu.sessions._call_inspection`). They pair
@@ -26,6 +26,7 @@ from cayu.sessions._call_inspection import (
     inspect_model_calls,
     inspect_tool_calls,
 )
+from cayu.sessions._rollup import RollupPage, SessionRollupQuery, rollup_page
 from cayu.sessions.store import SessionStore
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -165,3 +166,46 @@ def _public_tool_call(
         "model_attempt_id": None,
         "tool_round_id": None,
     }
+
+
+def register_session_rollup_route(
+    router: APIRouter,
+    *,
+    protected: list[Any],
+    store: SessionStore,
+    redact: Callable[[Any], Any],
+    serialize_cursor: Callable[[str | None], str | None],
+) -> None:
+    @router.post(
+        "/sessions/rollup",
+        response_model=RollupPage,
+        dependencies=protected,
+        description=(
+            "One page of `cayu session rollup`: usage, time by phase and tool failures by "
+            "error kind for up to `max_sessions` sessions created in the window, grouped by "
+            "agent, UTC day, Release or `label:KEY`. Groups merge by adding; pass "
+            "`next_cursor` back as `cursor` for the next page."
+        ),
+    )
+    async def post_session_rollup(query: SessionRollupQuery, response: Response):
+        try:
+            page = await rollup_page(store, query)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        response.headers["Cache-Control"] = "private, no-store"
+        return RollupPage(
+            groups=[
+                group.model_copy(
+                    update={
+                        "key": redact(group.key),
+                        "failure_kinds": [
+                            kind.model_copy(update={"tool": redact(kind.tool)})
+                            for kind in group.failure_kinds
+                        ],
+                    }
+                )
+                for group in page.groups
+            ],
+            sessions_read=page.sessions_read,
+            next_cursor=serialize_cursor(page.next_cursor),
+        )

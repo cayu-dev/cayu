@@ -10,7 +10,7 @@ import os
 import sys
 import unicodedata
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
@@ -39,6 +39,13 @@ from cayu.runtime.public_authority import public_authority_alias_codec_from_envi
 from cayu.sessions._call_inspection import InspectionWindow
 from cayu.sessions._call_inspection import redact_inspection_value as _redact_sensitive
 from cayu.sessions._call_inspection import truncate_utf8 as _truncate_utf8
+from cayu.sessions._rollup import (
+    RollupGroup,
+    SessionRollupQuery,
+    merge_groups,
+    rollup_grouping,
+    top_failure_kinds,
+)
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord, SessionStatus
@@ -89,11 +96,64 @@ def add_session_parser(subparsers: Any) -> None:
         metavar="KEY=VALUE",
         help="Filter by an exact label; repeat for multiple labels.",
     )
+    _add_created_window_options(list_parser)
     list_parser.add_argument("--limit", type=_positive_limit, default=50)
     paging = list_parser.add_mutually_exclusive_group()
     paging.add_argument("--offset", type=_nonnegative_int, default=0)
     paging.add_argument("--cursor")
     add_output_options(list_parser, formats=FORMAT_CHOICES)
+
+    rollup_parser = commands.add_parser(
+        "rollup",
+        help="Sum usage, time and tool failures across many sessions.",
+        description=(
+            "Sum token usage, time by phase (model calls, tool calls, environment setup and "
+            "the runtime gaps between them) and tool failures by error kind across the "
+            "sessions created in a window, grouped by agent, UTC day, Release or label. "
+            "Sessions are read a page at a time and each session's events in bounded "
+            "pages, so a large store is never loaded at once."
+        ),
+    )
+    _add_target_options(rollup_parser)
+    _add_created_window_options(rollup_parser)
+    rollup_parser.add_argument(
+        "--by",
+        dest="group_by",
+        default="agent",
+        type=_group_by_argument,
+        metavar="agent|day|release|label:KEY",
+        help="Group sessions by agent (default), UTC creation day, Release, or a label.",
+    )
+    rollup_parser.add_argument("--status", choices=tuple(item.value for item in SessionStatus))
+    rollup_parser.add_argument("--agent", help="Only sessions of this exact agent.")
+    rollup_parser.add_argument("--environment", help="Only sessions of this exact environment.")
+    rollup_parser.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Only sessions with this exact label; repeat for multiple labels.",
+    )
+    rollup_parser.add_argument(
+        "--max-sessions",
+        type=_positive_int,
+        default=10_000,
+        help=(
+            "Stop after this many sessions (default 10000); the output says whether the "
+            "window was complete and gives a cursor to continue."
+        ),
+    )
+    rollup_parser.add_argument(
+        "--cursor", help="Continue a rollup after the sessions an earlier run read."
+    )
+    rollup_parser.add_argument(
+        "--failure-kinds",
+        type=_positive_int,
+        default=10,
+        metavar="N",
+        help="Tool failure kinds shown per group in tables (default 10; JSON has all).",
+    )
+    add_output_options(rollup_parser, formats=FORMAT_CHOICES)
 
     show_parser = commands.add_parser(
         "show",
@@ -501,6 +561,8 @@ async def _run_session_command(
             return await _list_sessions(args, reader)
         if args.session_command == "show":
             return await _show_session(args, reader)
+        if args.session_command == "rollup":
+            return await _session_rollup(args, reader)
         if args.session_command == "snapshots":
             from cayu.environments.snapshot_lifecycle import inspect_execution_snapshots
 
@@ -562,6 +624,8 @@ async def _list_sessions(args: argparse.Namespace, reader: SessionReader) -> int
             agent_name=args.agent,
             environment_name=args.environment,
             labels=labels,
+            created_since=args.since,
+            created_before=args.until,
             limit=args.limit,
             offset=args.offset,
             cursor=args.cursor,
@@ -595,6 +659,149 @@ async def _list_sessions(args: argparse.Namespace, reader: SessionReader) -> int
         ),
     )
     return 0
+
+
+# Sessions per rollup page: an Agent reads each page within one request.
+_ROLLUP_PAGE_SESSIONS = {"local": 200, "cloud": 25}
+
+
+async def _session_rollup(args: argparse.Namespace, reader: SessionReader) -> int:
+    page_size = _ROLLUP_PAGE_SESSIONS[
+        "local" if isinstance(reader, StoreSessionReader) else "cloud"
+    ]
+    query = SessionRollupQuery(
+        since=args.since,
+        until=args.until,
+        group_by=args.group_by,
+        agent_name=args.agent,
+        environment_name=args.environment,
+        status=None if args.status is None else SessionStatus(args.status),
+        labels=_parse_labels(args.label),
+        cursor=args.cursor,
+        max_sessions=min(page_size, args.max_sessions),
+    )
+    groups: list[RollupGroup] = []
+    sessions_read = 0
+    while True:
+        page = await reader.rollup_page(query)
+        groups = merge_groups([*groups, *page.groups])
+        sessions_read += page.sessions_read
+        cursor = page.next_cursor
+        remaining = args.max_sessions - sessions_read
+        if cursor is None or remaining <= 0 or not page.sessions_read:
+            break
+        query = query.model_copy(
+            update={"cursor": cursor, "max_sessions": min(page_size, remaining)}
+        )
+    rows = [_rollup_row(group) for group in groups]
+    payload = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "group_by": args.group_by,
+        "since": None if args.since is None else args.since.isoformat(),
+        "until": None if args.until is None else args.until.isoformat(),
+        "sessions": sessions_read,
+        "complete": cursor is None,
+        "next_cursor": cursor,
+        "groups": rows,
+    }
+    _render_rollup(args.output_format, payload, rows, failure_kinds=args.failure_kinds)
+    return 0
+
+
+def _rollup_row(group: RollupGroup) -> dict[str, Any]:
+    return {
+        "key": group.key,
+        "sessions": group.sessions,
+        "statuses": group.statuses,
+        "model_calls": group.model_calls,
+        "model_calls_with_usage": group.model_calls_with_usage,
+        "model_errors": group.model_errors,
+        "tool_calls": group.tool_calls,
+        "tool_failures": group.tool_failures,
+        "usage": aggregate_usage_cli_payload(group.usage),
+        "durations": group.durations.model_dump(mode="json"),
+        "failure_kinds": [item.model_dump(mode="json") for item in top_failure_kinds(group)],
+    }
+
+
+def _render_rollup(
+    output: str, payload: dict[str, Any], rows: list[dict[str, Any]], *, failure_kinds: int
+) -> None:
+    if output in {"json", "jsonl"}:
+        if output == "json":
+            print(json.dumps(_redact_sensitive(payload), ensure_ascii=False, sort_keys=True))
+            return
+        for row in rows:
+            record = {"record_type": "group", **row, "schema_version": CLI_SCHEMA_VERSION}
+            print(json.dumps(_redact_sensitive(record), ensure_ascii=False, sort_keys=True))
+        # The summary says whether the groups cover the whole window and how to continue.
+        summary = {"record_type": "summary"} | {k: v for k, v in payload.items() if k != "groups"}
+        print(json.dumps(_redact_sensitive(summary), ensure_ascii=False, sort_keys=True))
+        return
+    table = [
+        {
+            "group": row["key"],
+            "sessions": row["sessions"],
+            "model_calls": row["model_calls"],
+            "tool_calls": row["tool_calls"],
+            "tool_failures": row["tool_failures"],
+            "input_tokens": row["usage"]["input_tokens"],
+            "output_tokens": row["usage"]["output_tokens"],
+            "cache_read_tokens": row["usage"]["cache_read_tokens"],
+            **{
+                name: _duration_text(row["durations"][f"{name}_ms"])
+                for name in ("active", "model", "tool", "setup", "gap")
+            },
+        }
+        for row in rows
+    ]
+    _print_table(
+        (
+            "group",
+            "sessions",
+            "model_calls",
+            "tool_calls",
+            "tool_failures",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "active",
+            "model",
+            "tool",
+            "setup",
+            "gap",
+        ),
+        cast("list[dict[str, Any]]", _redact_sensitive(table)),
+    )
+    kinds = [
+        {"group": row["key"], **kind}
+        for row in rows
+        for kind in row["failure_kinds"][:failure_kinds]
+    ]
+    if kinds:
+        print()
+        print("Tool failures by kind")
+        _print_table(("group", "tool", "kind", "count"), _redact_sensitive(kinds))
+    print()
+    state = (
+        "complete"
+        if payload["complete"]
+        else f"stopped early; continue with --cursor {payload['next_cursor']}"
+    )
+    print(f"{payload['sessions']} sessions ({state}).")
+
+
+def _duration_text(milliseconds: int) -> str:
+    seconds, ms = divmod(milliseconds, 1000)
+    if not seconds:
+        return f"{ms}ms"
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}.{ms // 100}s"
 
 
 async def _show_session(args: argparse.Namespace, reader: SessionReader) -> int:
@@ -1064,6 +1271,39 @@ def _message_preview(serialized: dict[str, Any], *, max_bytes: int) -> str:
     if len(content) > _MAX_TRANSCRIPT_SUMMARY_PARTS:
         previews.append(f"[+{len(content) - _MAX_TRANSCRIPT_SUMMARY_PARTS} parts]")
     return _truncate_utf8(" | ".join(previews), max_bytes=max_bytes)
+
+
+def _add_created_window_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--since",
+        type=_window_instant,
+        metavar="WHEN",
+        help=(
+            "Only sessions created at or after WHEN: an ISO 8601 time with an offset, "
+            "or a date (UTC midnight)."
+        ),
+    )
+    parser.add_argument(
+        "--until",
+        type=_window_instant,
+        metavar="WHEN",
+        help="Only sessions created before WHEN, in the same form as --since.",
+    )
+
+
+def _window_instant(value: str) -> datetime:
+    try:
+        return datetime.combine(date.fromisoformat(value), datetime.min.time(), tzinfo=UTC)
+    except ValueError:
+        return _datetime_argument(value)
+
+
+def _group_by_argument(value: str) -> str:
+    try:
+        rollup_grouping(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value
 
 
 def _add_target_options(parser: argparse.ArgumentParser, *, cloud: bool = True) -> None:

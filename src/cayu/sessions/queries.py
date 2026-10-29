@@ -154,6 +154,9 @@ class SessionQuery(BaseModel):
     causal_budget_id: str | None = None
     # Sessions created strictly after this instant.
     created_after: datetime | None = None
+    # Sessions created in the half-open window [created_since, created_before).
+    created_since: datetime | None = None
+    created_before: datetime | None = None
     last_activity_before: datetime | None = None
     inactive_for_seconds: StrictInt | None = Field(
         default=None,
@@ -183,6 +186,12 @@ class SessionQuery(BaseModel):
             raise ValueError("cursor and a non-zero offset cannot be combined.")
         if self.last_activity_before is not None and self.inactive_for_seconds is not None:
             raise ValueError("last_activity_before and inactive_for_seconds cannot be combined.")
+        if (
+            self.created_since is not None
+            and self.created_before is not None
+            and self.created_since >= self.created_before
+        ):
+            raise ValueError("created_since must be before created_before.")
         return self
 
     @field_validator(
@@ -222,7 +231,7 @@ class SessionQuery(BaseModel):
             names.append(name)
         return tuple(names)
 
-    @field_validator("created_after", "last_activity_before")
+    @field_validator("created_after", "created_since", "created_before", "last_activity_before")
     @classmethod
     def validate_aware_instants(cls, value: datetime | None, info) -> datetime | None:
         if value is None:
@@ -355,6 +364,8 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         root_session_id=query.root_session_id,
         causal_budget_id=query.causal_budget_id,
         created_after=query.created_after,
+        created_since=query.created_since,
+        created_before=query.created_before,
         last_activity_before=query.last_activity_before,
         inactive_for_seconds=query.inactive_for_seconds,
         labels=copy_label_map(query.labels, "labels"),
@@ -416,6 +427,10 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
     if query.causal_budget_id is not None and session.causal_budget_id != query.causal_budget_id:
         return False
     if query.created_after is not None and session.created_at <= query.created_after:
+        return False
+    if query.created_since is not None and session.created_at < query.created_since:
+        return False
+    if query.created_before is not None and session.created_at >= query.created_before:
         return False
     if (
         query.last_activity_before is not None

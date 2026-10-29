@@ -412,6 +412,10 @@ before accepting the additive response-correlation fields.
 # Newest activity first; filters may be combined.
 cayu session list --status completed --agent reviewer --label tenant=acme
 
+# Sessions created in a window: --since is inclusive, --until exclusive. A bare date
+# means UTC midnight.
+cayu session list --since 2026-10-27 --until 2026-10-28T12:00:00-07:00
+
 # Content-free operational summary, including runtime name/version, usage, and
 # pending-action counts.
 cayu session show SESSION_ID
@@ -445,10 +449,62 @@ cayu session transcript SESSION_ID --include-content 4096 --output json
 cayu session transcript SESSION_ID --interaction-id INTERACTION_ID
 ```
 
+### Rollups across many sessions
+
+`cayu session rollup` sums usage, time by phase and tool failures across the sessions
+created in a window and groups them by agent (default), UTC creation day, Release, or a
+label:
+
+```console
+cayu session rollup --since 2026-10-01 --by day --table
+cayu session rollup --since 2026-10-01 --by label:repository --agent hunter --json
+cayu session rollup --by release --application bug-hunter --table
+```
+
+Each group reports its sessions and their statuses, model calls (with usage evidence and
+errors), tool calls and tool failures, aggregate token usage (auxiliary inference and
+hosted tool usage included, as the store's usage totals count them), and time in
+milliseconds:
+
+| Field | Meaning |
+| --- | --- |
+| `active_ms` | Active time of finished turns, without time spent waiting for a person. |
+| `wall_ms` | The same turns' wall time, waits included. |
+| `model_ms` | Union of model-call intervals (start to completion or error). |
+| `tool_ms` | Union of tool-call intervals; parallel calls count once. |
+| `setup_ms` | Union of environment factory, binding and materialization intervals. |
+| `gap_ms` | Active time no model call, tool call or setup covered: the runtime's own work between steps. |
+
+Time spent waiting for a person (from an approval request to its decision, block or resume,
+or from an input request to the answer, and at the latest until the model runs again) is
+cut out of every phase, as it is out of `active_ms`, so a tool call that waited an hour for
+approval counts only the time it ran. `gap_ms` is
+approximate: an interval in an unfinished turn still counts as busy, and an unfinished turn
+adds no active time. `release` groups a session by the Release it started
+on (`session.started`); sessions without one group as `(none)`, as do sessions without
+the label `--by label:KEY` names.
+
+`failure_kinds` counts failed and blocked tool calls by tool and error kind. The kind comes
+from structured evidence only: `blocked:<by>` for a blocked call, the first exception type
+the failure evidence names (such as `TimeoutError`), its classification (`timeout`,
+`deadline`, ...), an isolated tool's failure code, `tool_error` when the tool returned an
+error result, else `unknown`. Groups keep exact counts for every kind while pages are
+merged, so the answer doesn't depend on page size; the output lists each group's 200 most
+common kinds and counts the rest as one `*`/`other` row, and tables show the top
+`--failure-kinds` (default 10). A rollup page served by an Agent carries every kind.
+
+The rollup reads one page of sessions at a time, oldest first, and each session's events in
+byte-bounded pages of only the event types it needs, so memory stays bounded however large
+the store is. `--max-sessions` (default 10,000) stops early; the output then has
+`complete: false` and a `next_cursor` to pass back with `--cursor` (in JSONL, the last
+record has `record_type: summary` and carries both). A Cloud Agent serves the
+same computation a page at a time at `POST /api/sessions/rollup`; an Agent whose Cayu
+predates it answers that it doesn't serve rollups yet.
+
 ### Sessions of a Cloud Agent
 
-Add `--application NAME` to `list`, `show`, `interactions`, `usage`, `tools`, `events` or
-`transcript` to read a Cayu Cloud Agent's sessions instead of a local store. `NAME` is the
+Add `--application NAME` to `list`, `rollup`, `show`, `interactions`, `usage`, `tools`,
+`events` or `transcript` to read a Cayu Cloud Agent's sessions instead of a local store. `NAME` is the
 Agent's id, name or slug, as in `cayu cloud` commands. The CLI signs in the same way:
 `CAYU_CLOUD_API_KEY` or an API-key file, the selected private context (`--context PATH`,
 `CAYU_CLOUD_CONTEXT`, or `cayu cloud context use`), or `cayu cloud login`.
@@ -470,7 +526,8 @@ The commands print the same rows as for a local store, with what the Agent's pub
 withholds left out:
 
 - `list` and `show` report `run_epoch` as `null`; `list` also reports `last_activity_at`
-  as `null`. `show` reports record byte sizes, queue counts, `operation` and `budget` as
+  as `null`, and `total_count` as `null` with `--since` or `--until`, because an Agent on
+  an older Cayu ignores the window and the CLI filters its rows itself. `show` reports record byte sizes, queue counts, `operation` and `budget` as
   `null`.
 - `events` and `interactions` show the Agent's public view of each record: private ids
   are record-scoped aliases such as `cayu_event_7:tool_call_id`, so payload sizes differ

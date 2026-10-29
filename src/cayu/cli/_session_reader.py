@@ -24,6 +24,7 @@ from cayu.sessions._call_inspection import (
     inspect_model_calls,
     inspect_tool_calls,
 )
+from cayu.sessions._rollup import RollupPage, SessionRollupQuery, rollup_page
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import INTERACTION_TERMINAL_EVENT_TYPES, InteractionSummaryEvidence
 from cayu.sessions.queries import SessionQuery
@@ -89,6 +90,10 @@ class SessionReader(Protocol):
         self, session_id: str, window: InspectionWindow, *, offset: int, limit: int
     ) -> dict[str, Any]:
         """`inspect_tool_calls`: paired tool calls without result bodies."""
+        ...
+
+    async def rollup_page(self, query: SessionRollupQuery) -> RollupPage:
+        """One page of `rollup_page`: groups for the next sessions and where to continue."""
         ...
 
     async def query_events(self, query: EventQuery) -> list[EventRecord]: ...
@@ -256,6 +261,9 @@ class StoreSessionReader:
         self, session_id: str, window: InspectionWindow, *, offset: int, limit: int
     ) -> dict[str, Any]:
         return await inspect_tool_calls(self.store, session_id, window, offset=offset, limit=limit)
+
+    async def rollup_page(self, query: SessionRollupQuery) -> RollupPage:
+        return await rollup_page(self.store, query)
 
     async def query_events(self, query: EventQuery) -> list[EventRecord]:
         return await self.store.query_events(query)

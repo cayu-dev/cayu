@@ -22380,6 +22380,177 @@
       "title": "RoleForbiddenResponse",
       "type": "object"
     },
+    "RollupDurations": {
+      "description": "Milliseconds summed over a group's sessions; see the module docstring.",
+      "properties": {
+        "active_ms": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Active Ms",
+          "type": "integer"
+        },
+        "gap_ms": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Gap Ms",
+          "type": "integer"
+        },
+        "model_ms": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Model Ms",
+          "type": "integer"
+        },
+        "setup_ms": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Setup Ms",
+          "type": "integer"
+        },
+        "tool_ms": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Tool Ms",
+          "type": "integer"
+        },
+        "wall_ms": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Wall Ms",
+          "type": "integer"
+        }
+      },
+      "title": "RollupDurations",
+      "type": "object"
+    },
+    "RollupFailureKind": {
+      "properties": {
+        "count": {
+          "minimum": 0.0,
+          "title": "Count",
+          "type": "integer"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "tool": {
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "kind",
+        "count"
+      ],
+      "title": "RollupFailureKind",
+      "type": "object"
+    },
+    "RollupGroup": {
+      "description": "One group's sums. Two groups with the same key merge by adding.",
+      "properties": {
+        "durations": {
+          "$ref": "#/components/schemas/RollupDurations"
+        },
+        "failure_kinds": {
+          "items": {
+            "$ref": "#/components/schemas/RollupFailureKind"
+          },
+          "title": "Failure Kinds",
+          "type": "array"
+        },
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "model_calls": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Model Calls",
+          "type": "integer"
+        },
+        "model_calls_with_usage": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Model Calls With Usage",
+          "type": "integer"
+        },
+        "model_errors": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Model Errors",
+          "type": "integer"
+        },
+        "sessions": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Sessions",
+          "type": "integer"
+        },
+        "statuses": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Statuses",
+          "type": "object"
+        },
+        "tool_calls": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Tool Calls",
+          "type": "integer"
+        },
+        "tool_failures": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Tool Failures",
+          "type": "integer"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/AggregateUsageMetrics"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "title": "RollupGroup",
+      "type": "object"
+    },
+    "RollupPage": {
+      "description": "One page of a rollup: groups for `sessions_read` sessions and where to continue.",
+      "properties": {
+        "groups": {
+          "items": {
+            "$ref": "#/components/schemas/RollupGroup"
+          },
+          "title": "Groups",
+          "type": "array"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
+        "sessions_read": {
+          "minimum": 0.0,
+          "title": "Sessions Read",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "groups",
+        "sessions_read"
+      ],
+      "title": "RollupPage",
+      "type": "object"
+    },
     "RunBody": {
       "properties": {
         "agent": {
@@ -24548,6 +24719,100 @@
         "accepted_at"
       ],
       "title": "SessionQueuedMessage",
+      "type": "object"
+    },
+    "SessionRollupQuery": {
+      "additionalProperties": false,
+      "description": "Which sessions a rollup reads and how it groups them.\n\n``since``/``until`` select sessions by creation time, half-open. ``group_by`` is\n``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)\nor ``label:KEY``. ``cursor`` continues after the previous page's last session.",
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Agent Name"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cursor"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "group_by": {
+          "default": "agent",
+          "title": "Group By",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "max_sessions": {
+          "default": 100,
+          "maximum": 500.0,
+          "minimum": 1.0,
+          "title": "Max Sessions",
+          "type": "integer"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Since"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/SessionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "until": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Until"
+        }
+      },
+      "title": "SessionRollupQuery",
       "type": "object"
     },
     "SessionStateResponse": {
@@ -33392,6 +33657,42 @@
           },
           {
             "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only sessions created before this timezone-aware instant.",
+              "title": "Created Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only sessions created at or after this timezone-aware instant.",
+              "title": "Created Since"
+            }
+          },
+          {
+            "in": "query",
             "name": "cursor",
             "required": false,
             "schema": {
@@ -33761,6 +34062,36 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/SessionOverviewCountsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/rollup": {
+      "post": {
+        "operation_id": "post_session_rollup_api_sessions_rollup_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/SessionRollupQuery"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/RollupPage"
               }
             }
           },

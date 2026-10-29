@@ -342,6 +342,20 @@ def test_cloud_agent_without_cayu_address_is_named(monkeypatch, capsys) -> None:
     assert "serves no Cayu address" in captured.out + captured.err
 
 
+def test_cloud_rollup_and_creation_window_match_the_local_store(agent, capsys) -> None:
+    database, _, seen = agent
+
+    for argv in (("rollup",), ("rollup", "--by", "label:team"), ("rollup", "--max-sessions", "1")):
+        local, remote = _both(capsys, database, *argv)
+        assert remote == local, argv
+    assert any(request.url.path == "/api/sessions/rollup" for request in seen)
+
+    local, remote = _both(capsys, database, "list", "--since", "2000-01-01")
+    assert [row["id"] for row in remote["sessions"]] == [row["id"] for row in local["sessions"]]
+    local, remote = _both(capsys, database, "list", "--until", "2000-01-01")
+    assert remote["sessions"] == local["sessions"] == []
+
+
 def test_cloud_tool_calls_quarantine_arguments_recorded_before_the_call_ran(agent, capsys) -> None:
     database, _, _ = agent
 

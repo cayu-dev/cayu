@@ -111,17 +111,36 @@ class CayuApi:
         raises ``CayuApiNotFound``.
         """
 
+        return self._request("GET", path, query, None, resource)
+
+    def post(self, path: str, body: Mapping[str, Any], *, resource: str) -> Any:
+        """POST a JSON read request (such as a session rollup page) and return its answer.
+
+        Errors are reported as for ``get``; a server that predates the route answers
+        ``CayuApiError("unsupported")``.
+        """
+
+        return self._request("POST", path, None, body, resource)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        query: Mapping[str, str | Sequence[str]] | None,
+        body: Mapping[str, Any] | None,
+        resource: str,
+    ) -> Any:
         if self._base is not None:
-            return self._read(self._base, path, query, resource)
+            return self._read(method, self._base, path, query, body, resource)
         missing: list[str] = []
         for base in self._candidates:
             try:
-                body = self._read(base, path, query, resource)
+                answer = self._read(method, base, path, query, body, resource)
             except _RouteMissing:
                 missing.append(f"{base}/")
                 continue
             self._base = base
-            return body
+            return answer
         raise CayuApiError(
             "not_served",
             f"{self.description} does not serve Cayu's API at {' or '.join(missing)}.",
@@ -140,15 +159,19 @@ class CayuApi:
 
     def _read(
         self,
+        method: str,
         base: str,
         path: str,
         query: Mapping[str, str | Sequence[str]] | None,
+        body: Mapping[str, Any] | None,
         resource: str,
     ) -> Any:
         deadline = self._monotonic() + self._wake_timeout_seconds
         while True:
             try:
-                response = self._bounded_get(self._origin + base + path, query, resource)
+                response = self._bounded_request(
+                    method, self._origin + base + path, query, body, resource
+                )
             except httpx.TimeoutException as exc:
                 raise CayuApiError(
                     "timeout", f"{self.description} did not answer in time."
@@ -169,18 +192,27 @@ class CayuApi:
                 continue
             return self._body(response, resource)
 
-    def _bounded_get(
-        self, url: str, query: Mapping[str, str | Sequence[str]] | None, resource: str
+    def _bounded_request(
+        self,
+        method: str,
+        url: str,
+        query: Mapping[str, str | Sequence[str]] | None,
+        body: Mapping[str, Any] | None,
+        resource: str,
     ) -> httpx.Response:
-        """GET ``url``, reading at most ``MAX_RESPONSE_BYTES`` of its (decoded) body."""
+        """Send one request, reading at most ``MAX_RESPONSE_BYTES`` of its (decoded) answer."""
 
         with self._client().stream(
-            "GET", url, params=None if query is None else dict(query), headers=self._headers
+            method,
+            url,
+            params=None if query is None else dict(query),
+            json=None if body is None else dict(body),
+            headers=self._headers,
         ) as response:
-            body = bytearray()
+            received = bytearray()
             for chunk in response.iter_bytes():
-                body.extend(chunk)
-                if len(body) > MAX_RESPONSE_BYTES:
+                received.extend(chunk)
+                if len(received) > MAX_RESPONSE_BYTES:
                     raise CayuApiError(
                         "too_large",
                         f"{self.description}'s answer for {resource} is larger than the CLI "
@@ -196,7 +228,7 @@ class CayuApi:
                 for key, value in response.headers.multi_items()
                 if key.lower() not in {"content-encoding", "content-length"}
             ],
-            content=bytes(body),
+            content=bytes(received),
         )
 
     def _body(self, response: httpx.Response, resource: str) -> Any:
@@ -220,6 +252,9 @@ class CayuApi:
                     status_code=404,
                 )
             raise CayuApiNotFound(detail)
+        if status == 405 and not established:
+            # Another app's route at this base (such as a page served for any GET), not Cayu's.
+            raise _RouteMissing
         if status in {405, 501}:
             raise CayuApiError(
                 "unsupported",

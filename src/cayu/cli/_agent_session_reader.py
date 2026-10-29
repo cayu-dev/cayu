@@ -29,6 +29,7 @@ from cayu.cli._session_reader import (
 )
 from cayu.events import Event
 from cayu.sessions._call_inspection import InspectionWindow
+from cayu.sessions._rollup import RollupPage, SessionRollupQuery
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord
@@ -59,18 +60,50 @@ class AgentSessionReader:
             "environment_name": query.environment_name,
             "label": [f"{key}={value}" for key, value in query.labels.items()],
             "order_by": query.order_by.value,
+            "created_since": _instant(query.created_since),
+            "created_before": _instant(query.created_before),
         }
-        body = self.api.get("/sessions", query=_query(params), resource="sessions")
-        sessions = body.get("sessions")
-        if not isinstance(sessions, list):
-            raise CayuApiError("not_cayu", "The Agent's session list is invalid.")
-        rows = [_session_list_row(item) for item in sessions if isinstance(item, dict)]
-        next_cursor = body.get("next_cursor")
+        windowed = query.created_since is not None or query.created_before is not None
+        # An Agent whose Cayu predates the creation-time filter ignores it, so with a window
+        # the CLI filters rows itself and applies the offset to the filtered rows.
+        skip = query.offset if windowed else 0
+        if skip:
+            params["offset"] = None
+        rows: list[dict[str, Any]] = []
+        filtered_here = False
+        while True:
+            # Ask only for what the page still needs, so no row is read past the cursor.
+            params["limit"] = min(query.limit - len(rows) + skip, 1000)
+            body = self.api.get("/sessions", query=_query(params), resource="sessions")
+            sessions = body.get("sessions")
+            if not isinstance(sessions, list):
+                raise CayuApiError("not_cayu", "The Agent's session list is invalid.")
+            for item in sessions:
+                if not isinstance(item, dict):
+                    continue
+                row = _session_list_row(item)
+                if not _created_in_window(row, query):
+                    filtered_here = True
+                elif skip:
+                    skip -= 1
+                else:
+                    rows.append(row)
+            next_cursor = body.get("next_cursor")
+            next_cursor = next_cursor if isinstance(next_cursor, str) else None
+            if (
+                not (filtered_here or (query.offset and windowed))
+                or len(rows) >= query.limit
+                or next_cursor is None
+            ):
+                break
+            params = {**params, "offset": None, "cursor": next_cursor}
         total_count = body.get("total_count")
         return SessionListPage(
             rows=rows,
-            next_cursor=next_cursor if isinstance(next_cursor, str) else None,
-            total_count=total_count if type(total_count) is int else None,
+            next_cursor=next_cursor,
+            # Matching rows don't prove an Agent applied the window, so a windowed total
+            # from the Agent is never trusted.
+            total_count=None if windowed or type(total_count) is not int else total_count,
         )
 
     async def require_session(self, session_id: str) -> None:
@@ -188,6 +221,26 @@ class AgentSessionReader:
             session_id, "tool-calls", params=_window_params(window, offset, limit)
         )
 
+    async def rollup_page(self, query: SessionRollupQuery) -> RollupPage:
+        try:
+            body = self.api.post(
+                "/sessions/rollup", query.model_dump(mode="json"), resource="session rollups"
+            )
+        except CayuApiError as exc:
+            if exc.category == "unsupported" or exc.status_code in {404, 405}:
+                raise CayuApiError(
+                    "unsupported",
+                    "This Agent's Cayu doesn't serve session rollups yet; redeploy it with a "
+                    "newer cayu release, or run `cayu session rollup --sqlite PATH` on a copy "
+                    "of its session store.",
+                    status_code=exc.status_code,
+                ) from None
+            raise
+        try:
+            return RollupPage.model_validate_json(json.dumps(body))
+        except ValueError as exc:
+            raise CayuApiError("not_cayu", "The Agent's session rollup is invalid.") from exc
+
     async def query_events(self, query: EventQuery) -> list[EventRecord]:
         if query.order_by is not EventOrder.SEQUENCE_ASC:
             raise ValueError("Cloud Agent event reads are in ascending sequence order.")
@@ -291,6 +344,22 @@ class AgentSessionReader:
             return self.api.get(path, query=_query(params), resource=_resource(path))
         except CayuApiNotFound:
             raise _unsupported(path) from None
+
+
+def _instant(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _created_in_window(row: dict[str, Any], query: SessionQuery) -> bool:
+    if query.created_since is None and query.created_before is None:
+        return True
+    try:
+        created = datetime.fromisoformat(str(row.get("created_at")))
+    except ValueError:
+        return False
+    return (query.created_since is None or created >= query.created_since) and (
+        query.created_before is None or created < query.created_before
+    )
 
 
 def _window_params(window: InspectionWindow, offset: int, limit: int) -> dict[str, Any]:

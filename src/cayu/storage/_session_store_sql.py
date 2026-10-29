@@ -352,6 +352,12 @@ def build_session_query_sql(
     if query.created_after is not None:
         clauses.append(f"created_at > {dialect.placeholder}")
         params.append(dialect.datetime_param(query.created_after))
+    if query.created_since is not None:
+        clauses.append(f"created_at >= {dialect.placeholder}")
+        params.append(dialect.datetime_param(query.created_since))
+    if query.created_before is not None:
+        clauses.append(f"created_at < {dialect.placeholder}")
+        params.append(dialect.datetime_param(query.created_before))
     if query.last_activity_before is not None:
         clauses.append(f"last_activity_at <= {dialect.placeholder}")
         params.append(dialect.datetime_param(query.last_activity_before))

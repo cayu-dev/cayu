@@ -18046,6 +18046,124 @@ export type RoleForbiddenResponse = {
 };
 
 /**
+ * RollupDurations
+ *
+ * Milliseconds summed over a group's sessions; see the module docstring.
+ */
+export type RollupDurations = {
+    /**
+     * Active Ms
+     */
+    active_ms?: number;
+    /**
+     * Gap Ms
+     */
+    gap_ms?: number;
+    /**
+     * Model Ms
+     */
+    model_ms?: number;
+    /**
+     * Setup Ms
+     */
+    setup_ms?: number;
+    /**
+     * Tool Ms
+     */
+    tool_ms?: number;
+    /**
+     * Wall Ms
+     */
+    wall_ms?: number;
+};
+
+/**
+ * RollupFailureKind
+ */
+export type RollupFailureKind = {
+    /**
+     * Count
+     */
+    count: number;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Tool
+     */
+    tool: string;
+};
+
+/**
+ * RollupGroup
+ *
+ * One group's sums. Two groups with the same key merge by adding.
+ */
+export type RollupGroup = {
+    durations?: RollupDurations;
+    /**
+     * Failure Kinds
+     */
+    failure_kinds?: Array<RollupFailureKind>;
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Model Calls
+     */
+    model_calls?: number;
+    /**
+     * Model Calls With Usage
+     */
+    model_calls_with_usage?: number;
+    /**
+     * Model Errors
+     */
+    model_errors?: number;
+    /**
+     * Sessions
+     */
+    sessions?: number;
+    /**
+     * Statuses
+     */
+    statuses?: {
+        [key: string]: number;
+    };
+    /**
+     * Tool Calls
+     */
+    tool_calls?: number;
+    /**
+     * Tool Failures
+     */
+    tool_failures?: number;
+    usage?: AggregateUsageMetrics;
+};
+
+/**
+ * RollupPage
+ *
+ * One page of a rollup: groups for `sessions_read` sessions and where to continue.
+ */
+export type RollupPage = {
+    /**
+     * Groups
+     */
+    groups: Array<RollupGroup>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+    /**
+     * Sessions Read
+     */
+    sessions_read: number;
+};
+
+/**
  * RootStatusAssertionSpec
  */
 export type RootStatusAssertionSpec = {
@@ -19750,6 +19868,53 @@ export type SessionQueuedMessage = {
      */
     session_id: string;
     status: SessionMessageQueueStatus;
+};
+
+/**
+ * SessionRollupQuery
+ *
+ * Which sessions a rollup reads and how it groups them.
+ *
+ * ``since``/``until`` select sessions by creation time, half-open. ``group_by`` is
+ * ``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)
+ * or ``label:KEY``. ``cursor`` continues after the previous page's last session.
+ */
+export type SessionRollupQuery = {
+    /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
+     * Cursor
+     */
+    cursor?: string | null;
+    /**
+     * Environment Name
+     */
+    environment_name?: string | null;
+    /**
+     * Group By
+     */
+    group_by?: string;
+    /**
+     * Labels
+     */
+    labels?: {
+        [key: string]: string;
+    };
+    /**
+     * Max Sessions
+     */
+    max_sessions?: number;
+    /**
+     * Since
+     */
+    since?: string | null;
+    status?: SessionStatus | null;
+    /**
+     * Until
+     */
+    until?: string | null;
 };
 
 /**
@@ -27503,6 +27668,18 @@ export type ListSessionsApiSessionsGetData = {
          */
         label_selector?: Array<string> | null;
         /**
+         * Created Since
+         *
+         * Only sessions created at or after this timezone-aware instant.
+         */
+        created_since?: string | null;
+        /**
+         * Created Before
+         *
+         * Only sessions created before this timezone-aware instant.
+         */
+        created_before?: string | null;
+        /**
          * Overview State
          */
         overview_state?: Array<SessionOverviewStatus> | null;
@@ -27581,6 +27758,31 @@ export type GetSessionOverviewCountsApiSessionsOverviewCountsGetResponses = {
 };
 
 export type GetSessionOverviewCountsApiSessionsOverviewCountsGetResponse = GetSessionOverviewCountsApiSessionsOverviewCountsGetResponses[keyof GetSessionOverviewCountsApiSessionsOverviewCountsGetResponses];
+
+export type PostSessionRollupApiSessionsRollupPostData = {
+    body: SessionRollupQuery;
+    path?: never;
+    query?: never;
+    url: '/api/sessions/rollup';
+};
+
+export type PostSessionRollupApiSessionsRollupPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type PostSessionRollupApiSessionsRollupPostError = PostSessionRollupApiSessionsRollupPostErrors[keyof PostSessionRollupApiSessionsRollupPostErrors];
+
+export type PostSessionRollupApiSessionsRollupPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: RollupPage;
+};
+
+export type PostSessionRollupApiSessionsRollupPostResponse = PostSessionRollupApiSessionsRollupPostResponses[keyof PostSessionRollupApiSessionsRollupPostResponses];
 
 export type GetSessionsSummaryApiSessionsSummaryPostData = {
     /**
