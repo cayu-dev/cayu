@@ -75,28 +75,9 @@ class ExternalWaitHost:
         failures: list[ExternalWaitHostFailure] = []
         for row in rows:
             key = row.correlation.request.correlation_key
-            try:
-                disposition = await self._service_row(row)
-            except (ExternalWaitUnavailable, ContinuationUnavailable):
-                disposition = "pending"
-            except (
-                ExternalWaitConflict,
-                ContinuationConflict,
-                SessionRunFenced,
-                ExternalWaitCapacityExceeded,
-            ) as error:
-                kind: Literal["conflict", "fenced", "capacity"] = (
-                    "fenced"
-                    if isinstance(error, SessionRunFenced)
-                    else "capacity"
-                    if isinstance(error, ExternalWaitCapacityExceeded)
-                    else "conflict"
-                )
-                failures.append(ExternalWaitHostFailure(correlation_key=key, kind=kind))
-                disposition = "pending"
-            if disposition == "orphaned":
-                failures.append(ExternalWaitHostFailure(correlation_key=key, kind="orphaned"))
-                disposition = "pending"
+            disposition, failure = await self.service_row(row)
+            if failure is not None:
+                failures.append(ExternalWaitHostFailure(correlation_key=key, kind=failure))
             if disposition == "settled":
                 settled.append(key)
             elif disposition == "pending":
@@ -110,6 +91,34 @@ class ExternalWaitHost:
             if len(rows) == limit
             else None,
         )
+
+    async def service_row(
+        self, row: ExternalWaitSnapshot
+    ) -> tuple[
+        Literal["settled", "pending"] | None,
+        Literal["conflict", "fenced", "capacity", "orphaned"] | None,
+    ]:
+        """Service one discovered wait; report a row failure instead of raising it."""
+        try:
+            disposition = await self._service_row(row)
+        except (ExternalWaitUnavailable, ContinuationUnavailable):
+            return "pending", None
+        except (
+            ExternalWaitConflict,
+            ContinuationConflict,
+            SessionRunFenced,
+            ExternalWaitCapacityExceeded,
+        ) as error:
+            return "pending", (
+                "fenced"
+                if isinstance(error, SessionRunFenced)
+                else "capacity"
+                if isinstance(error, ExternalWaitCapacityExceeded)
+                else "conflict"
+            )
+        if disposition == "orphaned":
+            return "pending", "orphaned"
+        return disposition, None
 
     async def _service_row(
         self, row: ExternalWaitSnapshot

@@ -17,6 +17,7 @@ from cayu.sessions.external_waits import (
     external_wait_timer,
 )
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.records import Task
 from cayu.tasks.scheduling import TaskSchedulePolicy
 from cayu.tasks.store import TaskStore
 
@@ -97,22 +98,30 @@ class TaskStoreWaitScheduler:
         )
         result = []
         for row in rows:
-            if not row.pending_timer:
-                continue
-            record = await self.waits.store._read_external_wait(
-                scope, row.correlation.request.correlation_key
-            )
-            if (
-                record is not None
-                and record.timer is not None
-                and record.timer.scheduler_id == self.scheduler_id
-                and not record.timer_published
-            ):
-                assert record.registration is not None
-                timer = await self.schedule(record.registration, context=context)
-                assert timer is not None
+            timer = await self.reconcile_row(row, context=context)
+            if timer is not None:
                 result.append(timer)
         return tuple(result)
+
+    async def reconcile_row(
+        self, row: ExternalWaitSnapshot, *, context: ExternalWaitContext
+    ) -> ExternalWaitTimer | None:
+        """Finish one discovered wait's interrupted timer publication, if it is this one's."""
+        if not row.pending_timer:
+            return None
+        request = row.correlation.request
+        record = await self.waits.store._read_external_wait(request.scope, request.correlation_key)
+        if (
+            record is None
+            or record.timer is None
+            or record.timer.scheduler_id != self.scheduler_id
+            or record.timer_published
+        ):
+            return None
+        assert record.registration is not None
+        timer = await self.schedule(record.registration, context=context)
+        assert timer is not None
+        return timer
 
     async def notify(
         self, timer: ExternalWaitTimer, *, context: ExternalWaitContext
@@ -166,29 +175,36 @@ class TaskStoreWaitScheduler:
         context = _snapshot(context, ExternalWaitContext)
 
         async def handle(app, task, worker_id):
-            if app.task_store is not self.task_store or task.type != EXTERNAL_WAIT_TASK_TYPE:
+            if app.task_store is not self.task_store:
                 raise ExternalWaitConflict("External timer worker has a different task owner.")
-            try:
-                encoded = canonical_durable_json_bytes(task.input, "external timer")
-                if len(encoded) > EXTERNAL_WAIT_TIMER_BYTES:
-                    raise ValueError("External timer exceeds its envelope.")
-                timer = ExternalWaitTimer.model_validate_json(encoded)
-            except (ValueError, TypeError):
-                raise ExternalWaitConflict("External timer task is malformed.") from None
-            if task.id != timer.task_id:
-                raise ExternalWaitConflict("External timer task identity conflicts.")
-            snapshot = await self.notify(timer, context=context)
-            await complete_managed_task(
-                self.task_store,
-                task,
-                worker_id,
-                {
-                    "outcome_kind": None
-                    if snapshot is None or snapshot.outcome is None
-                    else snapshot.outcome.kind,
-                    "pending_handoff": False if snapshot is None else snapshot.pending_handoff,
-                    **({"obsolete": True} if snapshot is None else {}),
-                },
-            )
+            snapshot = await self.notify(timer_from_task(task), context=context)
+            await complete_managed_task(self.task_store, task, worker_id, timer_result(snapshot))
 
         return handle
+
+
+def timer_from_task(task: Task) -> ExternalWaitTimer:
+    """Read the exact timer a deadline task carries, or refuse a malformed one."""
+    if task.type != EXTERNAL_WAIT_TASK_TYPE:
+        raise ExternalWaitConflict("External timer worker has a different task owner.")
+    try:
+        encoded = canonical_durable_json_bytes(task.input, "external timer")
+        if len(encoded) > EXTERNAL_WAIT_TIMER_BYTES:
+            raise ValueError("External timer exceeds its envelope.")
+        timer = ExternalWaitTimer.model_validate_json(encoded)
+    except (ValueError, TypeError):
+        raise ExternalWaitConflict("External timer task is malformed.") from None
+    if task.id != timer.task_id:
+        raise ExternalWaitConflict("External timer task identity conflicts.")
+    return timer
+
+
+def timer_result(snapshot: ExternalWaitSnapshot | None) -> dict[str, object]:
+    """The deadline task's result: what the wait store observed when it ran."""
+    return {
+        "outcome_kind": None
+        if snapshot is None or snapshot.outcome is None
+        else snapshot.outcome.kind,
+        "pending_handoff": False if snapshot is None else snapshot.pending_handoff,
+        **({"obsolete": True} if snapshot is None else {}),
+    }

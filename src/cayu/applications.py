@@ -314,6 +314,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
 from cayu.external_agents._session_control import require_native_session
+from cayu.external_wait_hosting import host_external_waits as _host_external_waits
 from cayu.fork_controllers import (
     ForkController,
     ForkControllerAccess,
@@ -832,6 +833,7 @@ if TYPE_CHECKING:
     from cayu.collaboration._producer_progress_contracts import ProducerProgressOccurrence
     from cayu.collaboration._producer_recovery import ProducerOutputRecovery, ProducerPendingPage
     from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
+    from cayu.external_wait_hosting import ExternalWaitHosting
     from cayu.runtime._host_continuation_discovery import (
         ContinuationDiscoveryPage,
         ContinuationRecovery,
@@ -1223,6 +1225,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         self._task_store = task_store
         # Set when an agent registers a wake tool; task workers then reconcile wakes.
         self._uses_session_wakes = False
+        self._external_wait_hosting: ExternalWaitHosting | None = None
         self._recovery_task_store = task_store
         self._knowledge_store = knowledge_store
         owned_store_ids = list(closure_stores)
@@ -5893,6 +5896,8 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
     @property
     def _agents(self) -> dict[str, runtime_records.RegisteredAgentState]:
         return self._agent_registry._agents
+
+    host_external_waits = _host_external_waits
 
     def register_task_type(self, spec: TaskTypeSpec) -> TaskTypeSpec:
         """Declare a public task type without starting or scheduling work."""

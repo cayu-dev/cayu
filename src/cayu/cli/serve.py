@@ -217,6 +217,17 @@ def _build_serve_app(
                     "Refusing to start an unsafe public service: "
                     f"{codes}. Run `cayu check --deploy --fail-on warning --json`."
                 )
+        hosting = service.cayu_app._external_wait_hosting
+        if (
+            hosting is not None
+            and hosting.delivery_path is not None
+            and not hosting.serves_delivery(service.asgi_app)
+        ):
+            raise ServeError(
+                "The service_factory's app hosts external-wait webhooks that its service "
+                "doesn't serve: call app.host_external_waits(...) before "
+                "create_agent_service(...), which then mounts the delivery route."
+            )
         server = service.asgi_app
         print(
             "Cayu product service: "
@@ -271,6 +282,9 @@ def _build_serve_app(
             project_context=project_control_plane,
         )
         _include_project_routers(server, app, settings.routers, development=args.dev)
+        hosting = app._external_wait_hosting
+        if hosting is not None and hosting.delivery_path is not None:
+            print(f"External-wait delivery: POST {hosting.delivery_path}/{{source}}")
         print(
             "Cayu Developer dashboard: "
             f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"
@@ -285,8 +299,9 @@ def _include_project_routers(
 ) -> None:
     """Serve the project's own routes next to Cayu's, never in place of one.
 
-    They authenticate their own callers: the Developer dashboard's access policy doesn't
-    cover them.
+    These routes, like the delivery route of ``app.host_external_waits`` served
+    first, are outside ``--auth`` and the Developer dashboard's access policy: they
+    authenticate their own callers (each ``ExternalEventSource`` does for its route).
     """
 
     from fastapi import APIRouter
@@ -296,6 +311,12 @@ def _include_project_routers(
         for path in (getattr(route, "path", "") for route in server.routes)
         if path.startswith("/")
     }
+    hosting = app._external_wait_hosting
+    delivery_path = None if hosting is None else hosting.delivery_path
+    if delivery_path is not None:
+        _include_router(
+            server, hosting.delivery_router(), reserved, None, label="External-wait delivery"
+        )
     for target in targets:
         try:
             build = load_target(target, label="Serve router target", normalize_errors=True)
@@ -306,22 +327,41 @@ def _include_project_routers(
         router = build(app, development=development)
         if not isinstance(router, APIRouter):
             raise ServeError(f"Serve router target {target} must return a fastapi.APIRouter.")
-        for route in router.routes:
-            path = getattr(route, "path", "")
-            first = path.split("/")[1] if path.startswith("/") else ""
-            # A parameter or an empty first segment would also match Cayu's own paths.
-            if not first or "{" in first:
-                raise ServeError(
-                    f"Serve router target {target}: {path or '/'} must start with a fixed "
-                    "path segment, such as /app."
-                )
-            prefix = "/" + first
-            if prefix in reserved:
-                raise ServeError(
-                    f"Serve router target {target}: {path} collides with Cayu's own "
-                    f"{prefix} routes; serve the project's routes under another prefix."
-                )
-        server.include_router(router)
+        _include_router(
+            server, router, reserved, delivery_path, label=f"Serve router target {target}"
+        )
+
+
+def _include_router(
+    server: Any,
+    router: Any,
+    reserved: set[str],
+    delivery_path: str | None,
+    *,
+    label: str,
+) -> None:
+    for route in router.routes:
+        path = getattr(route, "path", "")
+        first = path.split("/")[1] if path.startswith("/") else ""
+        # A parameter or an empty first segment would also match Cayu's own paths.
+        if not first or "{" in first:
+            raise ServeError(
+                f"{label}: {path or '/'} must start with a fixed path segment, such as /app."
+            )
+        prefix = "/" + first
+        if prefix in reserved:
+            raise ServeError(
+                f"{label}: {path} collides with Cayu's own {prefix} routes; serve the "
+                "project's routes under another prefix."
+            )
+        if delivery_path is not None and (
+            path == delivery_path or path.startswith(delivery_path + "/")
+        ):
+            raise ServeError(
+                f"{label}: {path} collides with the external-wait delivery route under "
+                f"{delivery_path}; serve it under another path."
+            )
+    server.include_router(router)
 
 
 def run_serve(args: argparse.Namespace) -> int:

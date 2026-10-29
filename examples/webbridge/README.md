@@ -69,7 +69,9 @@ recurrence or wake a sleeping worker. Use platform cron, Kubernetes CronJob,
 GitHub Actions, or another external scheduler to make the tick. Durable
 future eligibility already exists: create a task with `available_at` (see
 [task scheduling](../../docs/task-scheduling.md)) and a worker claims it once it
-is due. Self-wake scheduling is a separate future capability.
+is due. An agent that should continue the same session later can call the
+opt-in `sleep_until` tool (see
+[letting an agent sleep](../../docs/task-scheduling.md#let-an-agent-sleep-and-continue-later)).
 
 For sandboxed execution, construct the bridge directly from the same
 factory/store pair that the app registers. No session resource is allocated at

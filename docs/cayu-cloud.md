@@ -213,6 +213,11 @@ command in `sh -c '...'`; the image has the BusyBox `sh`, not `bash`.
   `[worker]` (`cayu worker NAME`). Work that runs at fixed times belongs in
   `[[schedules]]`. Don't also start the same work in the web process, or two
   processes will do it.
+- External-event waits hosted with `app.host_external_waits(...)` already split this
+  way: `cayu serve` takes their webhooks and the worker continues the waiting
+  sessions. List the delivery path under
+  [`[webhooks] paths`](#webhooks-to-a-sleeping-agent); see
+  [external-event waits](external-event-waits.md#run-them-from-cayu-serve-and-cayu-worker).
 - `idle_timeout_seconds` can't turn sleep off, and no other manifest value does.
 
 ### How the worker stops

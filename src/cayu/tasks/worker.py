@@ -819,6 +819,7 @@ async def run_task_worker(
             # and releases parked tasks whose sleep has gone away.
             if await _reconcile_session_wakes(app, task_store):
                 rescan_continuations()
+            await _sweep_external_waits(app, task_store, query)
             if materialized_work_contract_queue_supported:
                 reclaim_outcome = await capture_task_store_operation(
                     lambda: task_store.reclaim_expired(query=query, **reclaim_bound),
@@ -1269,14 +1270,40 @@ async def _reconcile_session_wakes(app: CayuApp, task_store: TaskStore) -> int:
     return released
 
 
+async def _sweep_external_waits(
+    app: CayuApp, task_store: TaskStore, query: TaskQuery | None
+) -> None:
+    """Schedule the tasks ``app.host_external_waits`` still needs; never stops the worker.
+
+    Only a worker that claims those tasks sweeps, so a narrow worker never makes
+    work it leaves to another one.
+    """
+
+    from cayu.external_wait_hosting import claims_hosted_tasks
+
+    hosting = app._external_wait_hosting
+    if hosting is None or task_store is not app.task_store or not claims_hosted_tasks(query):
+        return
+    try:
+        await hosting.sweep()
+    except Exception as exc:
+        logger.warning("Servicing external waits failed (%s); retrying later.", type(exc).__name__)
+
+
 async def _with_session_wakes(
     app: CayuApp, task_store: TaskStore, handler: TaskHandler
 ) -> TaskHandler:
-    """Run ``sleep_until`` wake tasks here, so no application handler has to."""
+    """Run ``sleep_until`` wake tasks and hosted external-wait tasks here.
+
+    No application handler has to know about either.
+    """
 
     from cayu.tasks.session_wakes import SESSION_WAKE_TASK_TYPE, _handle_session_wake_task
 
     await _reconcile_session_wakes(app, task_store)
+    hosting = app._external_wait_hosting
+    if hosting is not None and task_store is app.task_store:
+        handler = hosting._worker_handler(handler)
 
     async def handle(app: CayuApp, task: Task, worker_id: str):
         if task.type == SESSION_WAKE_TASK_TYPE:

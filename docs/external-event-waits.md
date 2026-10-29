@@ -37,6 +37,150 @@ same declared execution-profile identities. Missing or changed policies fail the
 existing profile check; the adapter never drops a policy to make recovery work.
 Application-wide policies remain configured on `CayuApp` as usual.
 
+## Run them from `cayu serve` and `cayu worker`
+
+`app.host_external_waits(...)` builds the parts below once from the application's
+own session and task stores, in the factory that both commands load. After that the
+task worker services the waits and `cayu serve` takes their webhooks, so the
+application writes no servicing loop, deadline handler or delivery route:
+
+```python
+import json
+
+from cayu.external_wait_hosting import ExternalEventSource, ReceivedExternalEvent
+from cayu.external_waits import ExternalWaitContext
+from cayu.sessions.external_waits import ExternalWaitScope
+
+SCOPE = ExternalWaitScope(application_scope="video-service", generation=1)
+
+
+class RendererWebhook(ExternalEventSource):
+    source = "renderer"
+
+    async def receive(self, request):
+        if not valid_signature(request):  # Your sender's own verification.
+            return None  # The route answers 401.
+        body = await request.json()
+        return ReceivedExternalEvent(
+            context=ExternalWaitContext(principal="renderer-webhook"),
+            # The generation you issued the key in, from the signed body or URL.
+            scope=ExternalWaitScope(
+                application_scope="video-service", generation=body["generation"]
+            ),
+            correlation_key=body["job_id"],
+            delivery_id=body["delivery_id"],
+            payload_json=json.dumps(body["result"]),
+        )
+
+
+def build_app():
+    app = CayuApp(session_store=..., task_store=...)
+    app.host_external_waits(
+        access_policy=JobPolicy(),  # As in the next section.
+        context=ExternalWaitContext(principal="cayu-worker"),
+        scopes={SCOPE: ("renderer",)},
+        sources=(RendererWebhook(),),
+        delivery_path="/webhooks/waits",
+    )
+    return app
+```
+
+- `context` is the principal the worker services and schedules deadlines as; the
+  policy must grant it `read` and `service` for every configured scope and source,
+  or construction fails. An application caller needs `reserve` and `register` to
+  start a wait, and `service` to park a session on it. A webhook's principal, from
+  its source, needs `deliver`.
+- `sources` and `delivery_path` are optional. Without them nothing is served, and the
+  application delivers through `hosting.deliver(...)` itself. A path segment holds
+  letters, digits, `-`, `.`, `_` or `~`.
+- `max_request_bytes` bounds a webhook body; it defaults to the payload limit plus
+  16 KiB (80 KiB) and is at most 1 MiB.
+- The task store must schedule tasks: the worker continues sessions from tasks.
+
+Register, park and deliver through the returned hosting instead of the bare parts.
+`hosting.register(...)` registers the wait as the caller and schedules its deadline
+task as the hosting. `hosting.run_to_wait(...)` and `hosting.resume_to_wait(...)`
+park the session as the adapter does. `hosting.deliver(...)` delivers an event. The
+parts stay available as `hosting.waits`, `hosting.adapter`, `hosting.host` and
+`hosting.scheduler`.
+
+What runs where:
+
+- **Web process.** `cayu serve` mounts `POST {delivery_path}/{source}`, next to the
+  project's own routes, which may share its prefix but not sit under the path
+  itself. The route is outside `cayu serve --auth` and the Developer dashboard's
+  access policy: each `ExternalEventSource` authenticates its own callers in
+  `receive(request)`, and a principal never comes from the event JSON. The source
+  also returns the exact scope generation the correlation was issued in, read from
+  the signed request, so put the generation in the callback URL or the correlation
+  key you give the sender. A key is never reopened within a generation, so scope and
+  key name exactly one wait: a webhook replayed after you move to a new generation
+  that reuses the key is refused, not delivered to the new wait. The body is read
+  up to `max_request_bytes` before the source sees it. The route answers:
+  - 202 with the delivery receipt;
+  - 401 when the source refuses the request, and for a source that isn't
+    configured, so a caller can't tell which sources exist;
+  - 403 when the access policy refuses the sender, before the correlation is
+    looked up;
+  - 404 for an unknown correlation, or a scope not configured for the source;
+  - 409 for a conflicting retry;
+  - 413 for a body over `max_request_bytes`, without calling the source;
+  - 422 when the source raises `ValueError`, `KeyError` or `TypeError` reading the
+    body, or the payload is malformed or over the payload limit;
+  - 429 with `Retry-After` when the wait owner is at capacity, and 503 when the
+    acknowledgement is unavailable.
+
+  There is no rate limit per sender; 429 reflects only the owner's capacity, so put
+  any per-sender limit in front of the route. `hosting.delivery_router()` returns
+  the same route for any other ASGI host, and `hosting.serves_delivery(app)` says
+  whether an ASGI app includes it. `create_agent_service(...)` mounts it in a
+  maintained service when the app hosts waits first, refusing a delivery path
+  inside the service's own paths; `cayu serve` refuses a `service_factory` whose
+  service doesn't serve it. The web process never continues a session.
+- **Worker.** `run_task_worker`, and so `cayu worker` and `cayu worker --until-idle`,
+  runs two task types itself, beside the application's handler, as it does for
+  `sleep_until` wakes. Every continuation runs inside one of these tasks, under its
+  lease and the worker's time limits, and counts as a handled task.
+  - `cayu.external-wait-deadline.v1`, the deadline task, observes the timeout and
+    continues the session in the same task. A deadline task created by a scheduler
+    the application wired by hand, with another `scheduler_id`, goes to the
+    application's handler.
+  - `cayu.external-wait-service.v1` continues one parked wait whose outcome was
+    elected. Delivery, parking, the deadline task and the sweep share one attempt
+    chain per outcome, so they converge on the same tasks: an accepted delivery to
+    a parked session creates the first attempt, due at once; a retried webhook and
+    a later event that doesn't win create none; an event that arrives before the
+    session starts parking is scheduled when it parks.
+  - A wait whose execution was prepared but whose binding wasn't published (the
+    process failed between the two) is scheduled too, and its attempt repairs the
+    binding. The binding is published before the turn runs, so such a session has
+    no completed turn to continue: its attempts keep retrying, without dispatching
+    the model, until you retire it with `hosting.adapter.retire_execution(...)`.
+  - An attempt that fails, or ends while its parked session still can't continue
+    (behind a live writer, or before the wait store elected a timeout), gets a
+    successor with backoff from 30 seconds to an hour. Each successor is timed from
+    when its predecessor ran, and the 24-hour retry window starts when the first
+    attempt ran, so attempts that only run long after the event still get their
+    retries. A deadline task that elects the timeout but can't finish continues
+    in that chain, so `--until-idle` reports when to come back.
+  - On its expired-lease reclaim cadence, starting with its first pass and then
+    every `reclaim_every_s` (60 seconds by default), the worker's maintenance slot
+    sweeps every configured scope and source. It finishes interrupted deadline
+    scheduling, and gives a parked wait whose outcome is elected a live attempt:
+    the first one after a delivery whose task creation failed, or a successor when
+    the last attempt failed or ended without servicing it. It only reads a wait
+    that needs nothing, and never continues a session itself.
+  - A worker whose `query` leaves these task types out, or narrows by session,
+    agent, parent, status or text, doesn't claim them and doesn't sweep. Run at
+    least one worker that claims them, with `reclaim` on.
+
+On Cayu Cloud the web process sleeps and the worker runs. List the delivery path
+under `[webhooks] paths` in `cayu-cloud.toml`, so a webhook sent while the Agent sleeps
+is kept and delivered once it is ready. A deadline is a delayed task and a delivered
+event a task due now, so a host that starts `cayu worker --until-idle` when work is
+due needs nothing specific to external waits. Hosted waits keep the adapter's
+boundary: ordinary root sessions only.
+
 ## Assemble and reserve before submission
 
 ```python
@@ -280,7 +424,9 @@ existing managed one-shot task machinery. `schedule(registration, context=...)`
 retains an exact task intent before task creation and acknowledges its publication
 afterward. `reconcile(...)` discovers interrupted publication. Its
 `worker_handler(context=...)` plugs into the existing task worker; it observes the
-wait-store outcome and does not dispatch a model. It starts no worker itself.
+wait-store outcome and does not dispatch a model. It starts no worker itself;
+[hosted waits](#run-them-from-cayu-serve-and-cayu-worker) run it, and continue the
+session, without one.
 Early or delayed hints cannot change election policy; explicit host polling also
 observes due deadlines. Event-only registrations produce no scheduled task.
 After scope retirement, an exact retained timer task completes as an obsolete
@@ -288,11 +434,12 @@ hint, including after wait-record pruning. The scheduler verifies the durable
 retirement tombstone and task identity; missing records alone are not proof.
 `notify()` returns `None` for this case, without publishing another outcome.
 
-This shares the native continuation ticket/checkpoint owner and managed
-[task scheduler](task-scheduling.md) with the planned one-shot self-wake design,
-which would own model-facing timer waits; it is not built yet. External-event
-waits add correlation, early input and event/timeout arbitration, not a second
-scheduling system.
+Model-facing timer waits belong to the opt-in `sleep_until` tool (see
+[task scheduling](task-scheduling.md#let-an-agent-sleep-and-continue-later)). It
+shares the managed [task scheduler](task-scheduling.md) with these hints and, for a
+task-owned session, the worker's parked handoff. External-event waits add
+correlation, early input and event/timeout arbitration, not a second scheduling
+system.
 
 `observe_page(scope=..., source=..., context=..., after=..., limit=...)` advances
 due outcomes in bounded pages using native time. Each item commits separately;

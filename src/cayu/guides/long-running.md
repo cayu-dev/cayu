@@ -115,6 +115,10 @@ async def record_reply(app, session_id, reply_text):
         pass
 ```
 
+`ask_user` waits for a reply that a person sends, or that application code relays
+from an email or a document; it is not an external-event wait. For a machine event
+with a deadline, see [Waiting for a webhook](#waiting-for-a-webhook).
+
 The question is stored with the session, so any process can answer it and the
 run continues from there. Questions never expire; give each a deadline timer.
 If the answering process dies mid-turn, the question is closed but the session
@@ -122,6 +126,24 @@ stays `running`. `app.recover_abandoned_sessions(...)` settles sessions with no
 live owner, and a `ResumeRequest` with the same `budget_limits` continues them;
 `expected_run_epoch` keeps two workers from both continuing one session. The
 preset's timer worker does both. Deep guide: `cayu guide human-attention`.
+
+## Waiting for a webhook
+
+A CI result, a payment or a render job that arrives by webhook, with a deadline, is an
+external-event wait, not `ask_user`. Host it in the factory with
+`app.host_external_waits(access_policy=..., context=..., scopes={scope: ("payments",)},
+sources=(PaymentWebhook(),), delivery_path="/webhooks/waits")`, and park the session
+with `hosting.run_to_wait(...)`. Then:
+
+- `cayu serve` serves `POST /webhooks/waits/payments`. Your `ExternalEventSource`
+  verifies the sender in `receive(request)` and returns a `ReceivedExternalEvent`
+  naming the scope generation, correlation key and delivery ID; the route is outside
+  `--auth`.
+- `cayu worker` continues the parked session on the event or at the deadline, each
+  inside a task, and repairs a task a crash left out.
+
+Deep guide, with the full example and status codes:
+[external-event waits](https://github.com/cayu-dev/cayu/blob/main/docs/external-event-waits.md#run-them-from-cayu-serve-and-cayu-worker).
 
 ## Timers
 

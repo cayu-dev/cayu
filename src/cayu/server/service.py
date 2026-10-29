@@ -2876,6 +2876,7 @@ def create_agent_service(
         _project_context=project_context,
         _system_diagnostics_snapshot_sink=service._attach_system_diagnostics_snapshot,
     )
+    _include_external_wait_delivery(server, app, (product_api_path, control_plane_path))
     server.state.cayu_public_service = service
     server.state.cayu_public_service_manifest = manifest
     _materialize_asgi_middleware_stacks(server, seen=set())
@@ -2884,6 +2885,24 @@ def create_agent_service(
 
 
 _SERVICE_ASSEMBLY_TOKEN = object()
+
+
+def _include_external_wait_delivery(
+    server: FastAPI, app: CayuApp, service_paths: tuple[str, ...]
+) -> None:
+    """Serve the webhooks of ``app.host_external_waits``; they authenticate their callers."""
+
+    hosting = app._external_wait_hosting
+    if hosting is None or hosting.delivery_path is None:
+        return
+    path = hosting.delivery_path
+    for owned in (*service_paths, "/health"):
+        if path == owned or path.startswith(f"{owned}/") or owned.startswith(f"{path}/"):
+            raise ValueError(
+                f"The external-wait delivery path {path} must be separate from the "
+                f"service's {owned} routes."
+            )
+    server.include_router(hosting.delivery_router())
 
 
 async def _placeholder_product_auth(_request: Request) -> ProductPrincipal:

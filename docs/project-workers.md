@@ -292,6 +292,17 @@ itself:
 
 The persisted event side-effect sweep runs in `cayu serve`, not in a worker.
 
+External-event waits that the app hosts with `app.host_external_waits(...)` need no
+host timer of their own. Their deadlines are delayed tasks, which `next_available_at`
+reports, and an event delivered in the web process creates a task that is due at once.
+Each run's first maintenance pass also recreates the task of any parked wait that
+needs one, so a run started after a delivery continues the waiting session even if
+that task was lost; the continuation runs in the task and counts in `handled`. As
+for `sleep_until` wakes, a worker whose `query` leaves out the task types
+`cayu.external-wait-deadline.v1` and `cayu.external-wait-service.v1` doesn't run
+them, and doesn't sweep.
+See [external-event waits](external-event-waits.md#run-them-from-cayu-serve-and-cayu-worker).
+
 An entrypoint that returns anything else fails with exit `1` and a message
 naming the flag. `--until-idle` can't be combined with `--processes`; use
 `concurrency` instead. The long-running preset's `cayu worker timers` supports
