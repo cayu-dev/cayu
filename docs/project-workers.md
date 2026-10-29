@@ -158,6 +158,28 @@ own worker ID (as in the example above), so a restarted worker doesn't share
 the dead one's ID. Otherwise settle fenced tasks yourself once you know the old
 process exited; see [when a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task).
 
+## Inspect tasks
+
+`cayu task` reads tasks without starting the application. It opens the project's store
+the way `cayu session` does (`--sqlite PATH`, `--postgres DSN`, `CAYU_DATABASE_URL`, then
+the project's configured or canonical store), read-only, or reads a Cayu Cloud Agent with
+`--application NAME` ([how](cayu-cloud.md#reading-an-agents-state-from-the-cli)):
+
+```bash
+cayu task list --status running
+cayu task list --application my-agent --type scan --limit 20
+cayu task show TASK_ID --json
+```
+
+`list` prints the newest-updated tasks first with their status, the reason for it, the
+assigned agent, the retry attempt and the worker holding the claim; add `--offset` for
+the next page. Like `GET /api/tasks`, its rows leave out each task's input and result.
+`show` adds the input, result or error, a `cancellation` summary (whether cancelling was
+asked for or done, the reason, and for a task cancelled after its worker was lost, the
+reconciliation outcome such as `quiescent`), and every attempt of the task's retry series
+found through its predecessor and successor links. Table output is the default;
+`--json` (and `--jsonl` for `list`) prints the same data with a `schema_version`.
+
 ## Run due tasks and exit
 
 A host that starts the worker only when work is due (cron, a function, a

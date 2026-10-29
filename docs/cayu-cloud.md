@@ -913,6 +913,22 @@ category `operator_credentials_unsupported`. To use a different login, set the s
 with `cayu cloud env set` (the password as a `--secret`); Agent values win over Cloud's.
 The older environment-wide `AUTH_USER`/`AUTH_PASS` pair Cloud also injects is deprecated.
 
+## Reading an Agent's state from the CLI
+
+Read commands that inspect durable state take `--application NAME` to read an Agent on
+Cayu Cloud instead of a local store, for example `cayu task list --application my-agent`
+([inspecting tasks](project-workers.md#inspect-tasks)). The CLI signs in as `cayu cloud`
+does (`cayu cloud login`, `--context PATH`, or `CAYU_CLOUD_API_KEY`), asks Cloud for the
+Agent's Cayu address and its [Developer dashboard login](#agent-developer-dashboard-credentials),
+and reads the Agent's own Cayu API with that login, so the same people who can read the
+login can use these commands. It reads `/cayu/api/` first and `/api/` when the Agent runs
+`cayu serve`. A sleeping Agent is woken by the read. Nothing is stored locally.
+
+A failure names its cause in `error.category`: `not_serving` when the Agent has no running
+web process, `credentials_rejected` when the Agent doesn't accept its Developer dashboard
+login, `not_served` when it doesn't serve Cayu's API, and `unsupported` when its Cayu is
+older than the command needs.
+
 ## Signing in to an Agent
 
 `ProxyIdentityAuth` lets an Agent trust a sign-in proxy that authenticates people

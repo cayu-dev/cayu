@@ -3258,6 +3258,33 @@ def _schedule_input(value: str) -> object:
     return parsed
 
 
+def cloud_client(*, context: Path | None = None, timeout_seconds: float = 30.0) -> CloudApiClient:
+    """A Cayu Cloud API client signed in as `cayu cloud` is, for other CLI commands.
+
+    ``context`` stands for `cayu cloud --context`; without it the client uses
+    ``CAYU_CLOUD_API_KEY``, ``CAYU_CLOUD_CONTEXT``, the selected context or the saved login.
+    """
+
+    arguments = argparse.Namespace(
+        api_key_file=None, context=context, timeout_seconds=timeout_seconds
+    )
+    selected = _selected_context_path(context)
+    selected_context = _read_context(selected) if selected is not None else {}
+    return _cloud_client(arguments, context=selected_context, context_path=selected)
+
+
+def resolve_application_id(client: CloudApiClient, reference: str) -> str:
+    """The id of the Agent that ``reference`` (its slug or name) names exactly once."""
+
+    return _application_id(client, reference)
+
+
+def operator_credentials(client: CloudApiClient, *, application_id: str) -> dict[str, Any]:
+    """The Agent's Developer dashboard login (`cayu cloud service credentials`)."""
+
+    return _operator_credentials(client, application_id=application_id)
+
+
 def _operator_credentials(client: CloudApiClient, *, application_id: str) -> dict[str, Any]:
     """The Agent's per-Agent `/cayu/` login; printed to stdout only, never recorded."""
 

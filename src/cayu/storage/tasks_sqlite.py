@@ -535,7 +535,15 @@ class SQLiteTaskStore(TaskStore):
         clock: Callable[[], datetime] | None = None,
         ownership_clock: Callable[[], datetime] | None = None,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
+        read_only: bool = False,
     ) -> None:
+        """Open the task store at ``path``.
+
+        ``read_only=True`` opens an existing database for inspection only (as
+        ``cayu task`` does): the connection can't write, and it requires
+        ``schema_mode=SchemaMode.VALIDATE``.
+        """
+
         require_sqlite_store_allowed("SQLiteTaskStore")
         if isinstance(path, Path):
             db_path = path
@@ -550,6 +558,12 @@ class SQLiteTaskStore(TaskStore):
         )
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be a bool.")
+        if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
+            raise ValueError("read_only SQLite stores require schema_mode=validate.")
+        if read_only:
+            self.service_durability = RuntimeStoreDurability.READ_ONLY
 
         self.path = db_path
         diagnostic_source_missing = sqlite_connection.diagnostic_sqlite_source_missing(db_path)
@@ -560,7 +574,11 @@ class SQLiteTaskStore(TaskStore):
         self._ownership_clock = utc_clock(ownership_clock)
         self._lock = TimedStoreLock()
         effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
-        self._connection = self._connect(effective_db_path)
+        self._connection = (
+            self._connect_read_only(effective_db_path)
+            if read_only and not diagnostic_source_missing
+            else self._connect(effective_db_path)
+        )
         try:
             self._initialize_schema()
             if diagnostic_source_missing:
@@ -7075,6 +7093,11 @@ class SQLiteTaskStore(TaskStore):
 
     def _connect(self, path: Path) -> sqlite3.Connection:
         return sqlite_connection.connect(path)
+
+    def _connect_read_only(self, path: Path) -> sqlite3.Connection:
+        if sqlite_support.current_diagnostic_store_inspection() is not None:
+            return sqlite_connection.connect_read_only_inspection(path)
+        return sqlite_connection.connect(path, read_only=True)
 
     def _initialize_schema(self) -> None:
         sqlite_support.reconcile_schema(

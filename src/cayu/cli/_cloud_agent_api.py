@@ -1,0 +1,326 @@
+"""Read a Cayu server's own API, and find a Cayu Cloud Agent's with the CLI's Cloud login.
+
+Read commands that inspect durable state (`cayu task`) open a local store, or, with
+`--application NAME`, read the Agent on Cayu Cloud. For the Agent they read the same
+authenticated API its Developer dashboard uses, at the Agent's own address: the CLI signs
+in to Cayu Cloud as `cayu cloud` does (`cayu cloud login`, `--context` or
+`CAYU_CLOUD_API_KEY`), asks Cloud for the Agent's Cayu address (`cayu cloud service
+status`) and its Developer dashboard login (`cayu cloud service credentials`), and sends
+that login to the Agent. Nothing is written locally.
+
+`CayuApi` is the part that knows nothing about Cayu Cloud: a Cayu server's API under a
+mount URL, with an optional `Authorization` value. `open_cloud_agent_api` is how Cayu
+Cloud supplies both.
+"""
+
+from __future__ import annotations
+
+import base64
+import ipaddress
+import time
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlsplit
+
+import httpx
+
+# FastAPI's answer for a path no route serves, as opposed to a route's own "not found".
+_ROUTE_NOT_FOUND = "Not Found"
+_MAX_DETAIL_CHARS = 512
+# Agent states in which its web process can't answer; Cloud wakes a sleeping one.
+_NOT_SERVING_STATUSES = frozenset({"stopping", "stopped", "deleting", "archived", "failed"})
+
+
+class CayuApiError(RuntimeError):
+    """A Cayu API read that could not be answered, with a stable ``category``."""
+
+    def __init__(self, category: str, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+
+
+class CayuApiNotFound(CayuApiError):
+    """The route answered that the requested resource does not exist."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("not_found", message, status_code=404)
+
+
+class CayuApi:
+    """Read-only JSON client for one Cayu server's API.
+
+    ``url`` is where the server mounts Cayu: an application that embeds it with
+    ``mount_cayu(..., path="/cayu")`` serves the API at ``/cayu/api/``, and ``cayu serve``
+    at ``/api/`` on the same origin. The first read tries the mount's ``api/`` and falls
+    back to ``/api/`` only when no route answers there, as Cayu Cloud does.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        authorization: str | None = None,
+        description: str = "The Cayu server",
+        http: httpx.Client | None = None,
+        timeout_seconds: float = 30.0,
+        wake_timeout_seconds: float = 60.0,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        parts = urlsplit(url)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            raise CayuApiError("invalid_url", f"{description}'s Cayu URL is not an HTTP(S) URL.")
+        if parts.scheme == "http" and authorization is not None and not _is_loopback(parts):
+            raise CayuApiError(
+                "invalid_url", f"{description}'s Cayu URL must use HTTPS to send credentials."
+            )
+        self._origin = f"{parts.scheme}://{parts.netloc}"
+        self._candidates = tuple(dict.fromkeys((parts.path.rstrip("/") + "/api", "/api")))
+        self._base: str | None = None
+        self._headers = {"Accept": "application/json"}
+        if authorization is not None:
+            self._headers["Authorization"] = authorization
+        self.description = description
+        self._http = http
+        self._owns_http = http is None
+        self._timeout = httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds))
+        self._wake_timeout_seconds = wake_timeout_seconds
+        self._sleep = sleep
+        self._monotonic = monotonic
+
+    def get(
+        self,
+        path: str,
+        *,
+        query: Mapping[str, str | Sequence[str]] | None = None,
+        resource: str,
+    ) -> Any:
+        """GET ``path`` under the API and return its JSON body.
+
+        ``resource`` names what is read in messages, for example ``"tasks"``. A route the
+        server doesn't serve raises ``CayuApiError("unsupported")``; a route's own 404
+        raises ``CayuApiNotFound``.
+        """
+
+        if self._base is not None:
+            return self._read(self._base, path, query, resource)
+        missing: list[str] = []
+        for base in self._candidates:
+            try:
+                body = self._read(base, path, query, resource)
+            except _RouteMissing:
+                missing.append(f"{base}/")
+                continue
+            self._base = base
+            return body
+        raise CayuApiError(
+            "not_served",
+            f"{self.description} does not serve Cayu's API at {' or '.join(missing)}.",
+            status_code=404,
+        )
+
+    def close(self) -> None:
+        if self._http is not None and self._owns_http:
+            self._http.close()
+            self._http = None
+
+    def _client(self) -> httpx.Client:
+        if self._http is None:
+            self._http = httpx.Client(timeout=self._timeout, follow_redirects=False)
+        return self._http
+
+    def _read(
+        self,
+        base: str,
+        path: str,
+        query: Mapping[str, str | Sequence[str]] | None,
+        resource: str,
+    ) -> Any:
+        deadline = self._monotonic() + self._wake_timeout_seconds
+        while True:
+            try:
+                response = self._client().get(
+                    self._origin + base + path,
+                    params=None if query is None else dict(query),
+                    headers=self._headers,
+                )
+            except httpx.TimeoutException as exc:
+                raise CayuApiError(
+                    "timeout", f"{self.description} did not answer in time."
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise CayuApiError(
+                    "unreachable", f"Could not connect to {self.description.lower()}."
+                ) from exc
+            if response.status_code == 503 and "retry-after" in response.headers:
+                # Cayu Cloud's router is waking a sleeping Agent; this request did the waking.
+                if self._monotonic() >= deadline:
+                    raise CayuApiError(
+                        "starting",
+                        f"{self.description} is starting and could not answer yet; try again.",
+                        status_code=503,
+                    )
+                self._sleep(_retry_after_seconds(response.headers["retry-after"]))
+                continue
+            return self._body(response, resource)
+
+    def _body(self, response: httpx.Response, resource: str) -> Any:
+        established = self._base is not None
+        status = response.status_code
+        detail = _detail(response)
+        if status in {401, 403}:
+            raise CayuApiError(
+                "credentials_rejected",
+                f"{self.description} did not accept the credentials for reading {resource}.",
+                status_code=status,
+            )
+        if status == 404:
+            if detail is None or detail == _ROUTE_NOT_FOUND:
+                if not established:
+                    raise _RouteMissing
+                raise CayuApiError(
+                    "unsupported",
+                    f"{self.description} runs a Cayu that doesn't serve {resource} yet; "
+                    "deploy it with a newer Cayu.",
+                    status_code=404,
+                )
+            raise CayuApiNotFound(detail)
+        if status in {405, 501}:
+            raise CayuApiError(
+                "unsupported",
+                f"{self.description} can't serve {resource}"
+                + (f": {detail}" if detail else ".")
+                + ("" if detail else " Its Cayu may be older than this CLI."),
+                status_code=status,
+            )
+        if status in {400, 409, 413, 422}:
+            raise CayuApiError(
+                "request_rejected",
+                f"{self.description} rejected the {resource} request"
+                + (f": {detail}" if detail else f" (HTTP {status})."),
+                status_code=status,
+            )
+        if status != 200:
+            raise CayuApiError(
+                "server_error",
+                f"{self.description} answered HTTP {status} for {resource}.",
+                status_code=status,
+            )
+        try:
+            return response.json()
+        except ValueError:
+            if not established:
+                raise _RouteMissing from None
+            raise CayuApiError(
+                "not_cayu", f"{self.description} did not answer {resource} as Cayu."
+            ) from None
+
+
+class _RouteMissing(Exception):
+    """No route served the path at this API base."""
+
+
+def basic_authorization(username: str, password: str) -> str:
+    """The ``Authorization`` value of a Cayu operator login."""
+
+    credentials = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+    return f"Basic {credentials}"
+
+
+def open_cloud_agent_api(
+    application: str,
+    *,
+    context: Path | None = None,
+    timeout_seconds: float = 30.0,
+    http: httpx.Client | None = None,
+) -> CayuApi:
+    """The Cayu API of the Cayu Cloud Agent ``application`` (its slug or name).
+
+    Signs in to Cayu Cloud the way `cayu cloud` does, with ``context`` standing for its
+    ``--context``. Raises ``CayuApiError`` with Cloud's category when Cloud refuses, and
+    ``"not_serving"`` when the Agent has no running web process to answer.
+    """
+
+    from cayu.cli._cloud_api import CloudApiError
+    from cayu.cli._cloud_auth import CloudAuthError
+    from cayu.cli.cloud import (
+        CloudCommandError,
+        cloud_client,
+        operator_credentials,
+        resolve_application_id,
+    )
+
+    try:
+        client = cloud_client(context=context, timeout_seconds=timeout_seconds)
+        application_id = resolve_application_id(client, application)
+        service = client.request("GET", f"/v1/applications/{quote(application_id)}/service")
+        status = service.get("status")
+        cayu_url = service.get("cayu_url")
+        if not isinstance(cayu_url, str) or not cayu_url or status in _NOT_SERVING_STATUSES:
+            state = f" (its service is {status})" if isinstance(status, str) else ""
+            raise CayuApiError(
+                "not_serving",
+                f"The Agent {application_id} serves no Cayu address{state}, so it can't be "
+                "read. `cayu cloud service status` shows why.",
+            )
+        login = operator_credentials(client, application_id=application_id)
+        authorization = basic_authorization(login["username"], login["password"])
+    except (CloudApiError, CloudAuthError, CloudCommandError) as exc:
+        raise CayuApiError(exc.category, str(exc)) from None
+    return CayuApi(
+        cayu_url,
+        authorization=authorization,
+        description=f"The Agent {application_id}",
+        http=http,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _detail(response: httpx.Response) -> str | None:
+    """The server's own bounded ``detail``, never a request value it echoes."""
+
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, list):
+        # FastAPI request validation: name each rejected parameter and its rule.
+        parts = []
+        for item in detail[:10]:
+            if not isinstance(item, dict):
+                continue
+            location = item.get("loc")
+            name = (
+                ".".join(str(part) for part in location[1:] or location)
+                if isinstance(location, list) and location
+                else None
+            )
+            message = item.get("msg")
+            if isinstance(message, str):
+                parts.append(f"{name}: {message}" if name else message)
+        detail = "; ".join(parts) or None
+    if not isinstance(detail, str) or not detail.strip():
+        return None
+    detail = " ".join(detail.split())
+    return detail if len(detail) <= _MAX_DETAIL_CHARS else detail[: _MAX_DETAIL_CHARS - 1] + "…"
+
+
+def _retry_after_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        return 3.0
+    return min(max(seconds, 1.0), 5.0)
+
+
+def _is_loopback(parts: Any) -> bool:
+    hostname = parts.hostname
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname or "").is_loopback
+    except ValueError:
+        return False

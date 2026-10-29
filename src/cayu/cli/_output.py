@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import re
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TextIO
 
@@ -79,3 +80,41 @@ def output_destination(path: str | None) -> Iterator[TextIO]:
         contextlib.redirect_stdout(stream),
     ):
         yield stream
+
+
+# C0 and C1 control characters, which a terminal may act on (escape sequences, OSC 52).
+_TERMINAL_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_TERMINAL_CONTROLS_EXCEPT_LINES = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def terminal_safe(text: str, *, keep_lines: bool = False) -> str:
+    """``text`` with control characters shown as ``\\xNN``, for human-readable output.
+
+    Stored or remote text (task titles, error messages, knowledge entries) can carry
+    escape sequences that would rewrite the terminal or its clipboard. ``keep_lines``
+    keeps newlines and tabs for multi-line text.
+    """
+
+    pattern = _TERMINAL_CONTROLS_EXCEPT_LINES if keep_lines else _TERMINAL_CONTROLS
+    return pattern.sub(lambda match: f"\\x{ord(match.group()):02x}", text)
+
+
+def print_table(headers: Sequence[str], rows: Sequence[Mapping[str, object]]) -> None:
+    """Print ``rows`` as aligned columns, ``-`` for a missing value, controls escaped."""
+
+    if not rows:
+        return
+    rendered = [
+        [
+            "-" if row.get(header) is None else terminal_safe(str(row.get(header)))
+            for header in headers
+        ]
+        for row in rows
+    ]
+    widths = [
+        max(len(header), *(len(row[index]) for row in rendered))
+        for index, header in enumerate(headers)
+    ]
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    for row in rendered:
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
