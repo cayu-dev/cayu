@@ -60,6 +60,8 @@ def test_public_interruption_and_replay_work_without_engine(
                 monkeypatch.delattr(app, "_session_engine")
                 stop = InterruptSessionRequest(session_id=session.id, reason="operator stop")
                 first = [event async for event in app.interrupt_session(stop)]
+                # Settle the cascade the interrupt started; replays must not reopen it.
+                assert await app.drain_background_interruptions()
                 app.session_store = InMemorySessionStore()
                 direct_replay = [
                     event async for event in app._session_interruption.interrupt_session(stop)

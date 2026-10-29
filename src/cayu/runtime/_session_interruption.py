@@ -366,12 +366,15 @@ class SessionInterruption:
                                 )
                             )
                         )
-                    self._session_finalization.schedule_background_interruption_cascade(
-                        parent_session_id=loaded_session.id,
-                        interrupt_payload=existing_interrupt_event.payload,
-                        create_if_missing=False,
-                        retry_request=retry_request,
-                    )
+                    # A settled cascade has cleared its marker. Scheduling a
+                    # no-op cascade for it would report it as pending again.
+                    if marker is not None:
+                        self._session_finalization.schedule_background_interruption_cascade(
+                            parent_session_id=loaded_session.id,
+                            interrupt_payload=existing_interrupt_event.payload,
+                            create_if_missing=False,
+                            retry_request=retry_request,
+                        )
                 yield existing_interrupt_event
                 if retry_event is not None:
                     yield retry_event
