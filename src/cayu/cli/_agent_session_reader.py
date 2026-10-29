@@ -48,6 +48,8 @@ class AgentSessionReader:
 
     def __init__(self, api: CayuApi) -> None:
         self.api = api
+        # Set once an Agent refuses a priced rollup page; later pages are asked unpriced.
+        self.rollup_pricing_unsupported = False
 
     async def list_sessions(self, query: SessionQuery) -> SessionListPage:
         params: dict[str, Any] = {
@@ -243,10 +245,23 @@ class AgentSessionReader:
         )
 
     async def rollup_page(self, query: SessionRollupQuery) -> RollupPage:
+        if self.rollup_pricing_unsupported:
+            query = query.model_copy(update={"pricing": None})
         try:
-            body = self.api.post(
-                "/sessions/rollup", query.model_dump(mode="json"), resource="session rollups"
-            )
+            try:
+                body = self.api.post(
+                    "/sessions/rollup", _rollup_body(query), resource="session rollups"
+                )
+            except CayuApiError as exc:
+                # An Agent whose Cayu predates priced rollups rejects the `pricing` field;
+                # its pages come back without cost.
+                if query.pricing is None or exc.status_code not in {400, 422}:
+                    raise
+                self.rollup_pricing_unsupported = True
+                query = query.model_copy(update={"pricing": None})
+                body = self.api.post(
+                    "/sessions/rollup", _rollup_body(query), resource="session rollups"
+                )
         except CayuApiError as exc:
             if exc.category == "unsupported" or exc.status_code in {404, 405}:
                 raise CayuApiError(
@@ -457,6 +472,16 @@ def _iso(value: object) -> object:
 
 def _mapping(value: object) -> dict[str, Any]:
     return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
+
+
+def _rollup_body(query: SessionRollupQuery) -> dict[str, Any]:
+    """A rollup page request; without pricing the key is left out, since an older Agent
+    rejects the field whatever its value."""
+
+    body = query.model_dump(mode="json")
+    if query.pricing is None:
+        body.pop("pricing", None)
+    return body
 
 
 def _unsupported(path: str) -> CayuApiError:

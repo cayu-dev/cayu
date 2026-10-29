@@ -698,7 +698,14 @@ async def _session_rollup(args: argparse.Namespace, reader: SessionReader) -> in
         query = query.model_copy(
             update={"cursor": cursor, "max_sessions": min(page_size, remaining)}
         )
-    rows = [_rollup_row(group) for group in groups]
+    unpriced_by_agent = getattr(reader, "rollup_pricing_unsupported", False)
+    rows = [_rollup_row(group, priced=not unpriced_by_agent) for group in groups]
+    if unpriced_by_agent and args.output_format != "json":
+        print(
+            "warning: this Agent's Cayu can't price rollups, so costs are left out; "
+            "redeploy it with a newer cayu release to see them.",
+            file=sys.stderr,
+        )
     payload = {
         "schema_version": CLI_SCHEMA_VERSION,
         "group_by": args.group_by,
@@ -708,7 +715,9 @@ async def _session_rollup(args: argparse.Namespace, reader: SessionReader) -> in
         "complete": cursor is None,
         "next_cursor": cursor,
         "groups": rows,
-        "price_book": _price_book_source(
+        "price_book": None
+        if unpriced_by_agent
+        else _price_book_source(
             args, {"version": pricing.price_book_version, "generated_at": pricing.generated_at}
         ),
     }
@@ -716,7 +725,9 @@ async def _session_rollup(args: argparse.Namespace, reader: SessionReader) -> in
     return 0
 
 
-def _rollup_row(group: RollupGroup) -> dict[str, Any]:
+def _rollup_row(group: RollupGroup, *, priced: bool = True) -> dict[str, Any]:
+    """One group's row; when the Agent priced nothing, every model call counts as unpriced."""
+
     return {
         "key": group.key,
         "sessions": group.sessions,
@@ -727,8 +738,9 @@ def _rollup_row(group: RollupGroup) -> dict[str, Any]:
         "tool_calls": group.tool_calls,
         "tool_failures": group.tool_failures,
         "usage": aggregate_usage_cli_payload(group.usage),
-        "estimated_cost": group.cost,
-        "unpriced_model_calls": group.unpriced_model_calls,
+        # Without pricing nothing says whether a group cost anything, so both are unknown.
+        "estimated_cost": group.cost if priced else None,
+        "unpriced_model_calls": group.unpriced_model_calls if priced else None,
         "durations": group.durations.model_dump(mode="json"),
         "failure_kinds": [item.model_dump(mode="json") for item in top_failure_kinds(group)],
     }
@@ -960,9 +972,11 @@ def _cost_text(call: dict[str, Any]) -> str | None:
     return call.get("cost_state")
 
 
-def _cost_total_text(cost: dict[str, str], unpriced: int | None) -> str:
+def _cost_total_text(cost: dict[str, str] | None, unpriced: int | None) -> str:
     """A cost total that never shows calls without a price as free."""
 
+    if cost is None:
+        return "unknown"
     priced = ", ".join(f"{amount} {currency}" for currency, amount in cost.items()) or None
     if not unpriced:
         return priced or "0"

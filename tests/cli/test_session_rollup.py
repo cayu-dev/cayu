@@ -531,3 +531,54 @@ def test_approval_waits_close_however_the_approval_resolves(
 
     # The model call after the approval still counts.
     assert asyncio.run(scenario()).model_ms == 4_000
+
+
+def test_rollup_marks_every_call_unpriced_when_the_agent_cant_price(capsys) -> None:
+    import argparse
+    import asyncio
+
+    from cayu.cli import session as session_cli
+    from cayu.sessions._rollup import RollupGroup, RollupPage
+
+    class UnpricedAgent:
+        rollup_pricing_unsupported = True
+
+        async def rollup_page(self, query):
+            return RollupPage(
+                groups=[
+                    RollupGroup(key="a", sessions=1, model_calls=5),
+                    # Billed hosted usage with no completed model call.
+                    RollupGroup(key="hosted-only", sessions=1, model_errors=1),
+                ],
+                sessions_read=1,
+                next_cursor=None,
+            )
+
+    def args(output_format: str) -> argparse.Namespace:
+        return argparse.Namespace(
+            since=None,
+            until=None,
+            group_by="agent",
+            agent=None,
+            environment=None,
+            status=None,
+            label=[],
+            cursor=None,
+            max_sessions=100,
+            price_book=None,
+            output_format=output_format,
+            failure_kinds=5,
+        )
+
+    assert asyncio.run(session_cli._session_rollup(args("json"), UnpricedAgent())) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["price_book"] is None
+    assert payload["groups"][0]["unpriced_model_calls"] is None
+    assert payload["groups"][0]["estimated_cost"] is None
+
+    assert asyncio.run(session_cli._session_rollup(args("table"), UnpricedAgent())) == 0
+    captured = capsys.readouterr()
+    rows = {line.split()[0]: line for line in captured.out.splitlines() if line.split()}
+    assert "unknown" in rows["a"] and "unknown" in rows["hosted-only"]
+    assert payload["groups"][1]["estimated_cost"] is None
+    assert "costs are left out" in captured.err

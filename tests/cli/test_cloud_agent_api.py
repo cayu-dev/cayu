@@ -297,3 +297,33 @@ def test_reader_never_trusts_an_agents_total_for_a_creation_window() -> None:
 
     assert [item["id"] for item in page.rows] == ["new1", "new2"]
     assert page.total_count is None
+
+
+def test_reader_asks_an_agent_that_cant_price_rollups_again_without_pricing() -> None:
+    from cayu.budgets.pricing import default_price_book
+    from cayu.sessions._rollup import SessionRollupQuery
+
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "pricing" in body:
+            return httpx.Response(
+                422,
+                json={
+                    "detail": "Invalid control-plane request: body field pricing is not allowed."
+                },
+            )
+        return httpx.Response(200, json={"groups": [], "sessions_read": 0, "next_cursor": None})
+
+    reader = AgentSessionReader(_api(handler))
+    priced = SessionRollupQuery(pricing=default_price_book())
+
+    asyncio.run(reader.rollup_page(priced))
+    asyncio.run(reader.rollup_page(priced))
+
+    assert reader.rollup_pricing_unsupported is True
+    # The first page tried the price book once; every later page goes straight to unpriced.
+    # The key itself is left out: an older Agent rejects it whatever its value.
+    assert ["pricing" in body for body in bodies] == [True, False, False]
