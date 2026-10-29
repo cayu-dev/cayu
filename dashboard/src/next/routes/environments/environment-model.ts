@@ -5,7 +5,9 @@
 import type { EnvironmentSummary } from "@/lib/api"
 
 export const environmentRoute = (name: string) =>
-  ({ to: "/environments/$name", params: { name } }) as const
+  name === "." || name === ".."
+    ? ({ to: "/environments", search: { name } } as const)
+    : ({ to: "/environments/$name", params: { name } } as const)
 
 /** Split a class name into words, dropping a known suffix: `LambdaMicroVMRunner` → "Lambda MicroVM". */
 function words(className: string, suffix: string) {
@@ -160,4 +162,42 @@ export function branchObservationText(
     .map(([status, count]) => `${count} ${status.replaceAll("_", " ")}`)
     .join(", ")
   return `${summary.attached_count} attached branch handle${summary.attached_count === 1 ? "" : "s"}${summary.truncated ? " (incomplete)" : ""}: ${detail}. This is not a count of all open branches.`
+}
+
+/** Storage is a declaration, not an inference from its opaque ID or a health check. */
+export function artifactStorageText(env: EnvironmentSummary): string {
+  if (!savesFiles(env)) return "No file storage"
+  if (env.artifact_store_kind === "local_disk") return "Local disk"
+  if (env.artifact_store_kind === "s3") return "S3"
+  return "Storage kind unavailable"
+}
+
+export function mcpNamesText(env: EnvironmentSummary): string {
+  if (env.mcp_server_count === 0) return "None"
+  const names = env.mcp_server_names
+  return Array.isArray(names) &&
+    names.length === env.mcp_server_count &&
+    names.every((name) => typeof name === "string" && name.length > 0)
+    ? names.join(", ")
+    : `${mcpText(env.mcp_server_count)} (names unavailable)`
+}
+
+/** Only a complete, supported native observation proves a count (including zero). */
+export function environmentActivity(env: EnvironmentSummary, enabled: boolean) {
+  const count = env.session_count
+  const last = env.last_activity_at
+  const asOf = env.activity_as_of
+  if (
+    !enabled ||
+    typeof count !== "string" ||
+    !/^(0|[1-9]\d*)$/.test(count) ||
+    typeof asOf !== "string" ||
+    !Number.isFinite(Date.parse(asOf))
+  )
+    return null
+  if (
+    count === "0" ? last !== null : typeof last !== "string" || !Number.isFinite(Date.parse(last))
+  )
+    return null
+  return { count, last: last ?? null, asOf }
 }

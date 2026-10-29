@@ -1074,6 +1074,7 @@ const ENVIRONMENT_PROFILES: Record<string, Partial<EnvironmentSummary>> = {
     proxy_type: "AllowlistProxy",
     knowledge_store_type: "PostgresKnowledgeStore",
     mcp_server_count: 2,
+    mcp_server_names: ["Repository search", "Issue tracker"],
     lifecycle_policy: {
       lifecycle_timeout_seconds: 600,
       phase_timeout_seconds: { bind: 180, materialize: 300 },
@@ -1093,6 +1094,7 @@ const ENVIRONMENT_PROFILES: Record<string, Partial<EnvironmentSummary>> = {
     proxy_type: "PassthroughProxy",
     knowledge_store_type: "SQLiteKnowledgeStore",
     mcp_server_count: 1,
+    mcp_server_names: ["Local docs"],
   },
   sandbox: {
     metadata: { profile: "aws-lambda-microvm-v1", region: "us-west-2" },
@@ -1105,6 +1107,8 @@ const ENVIRONMENT_PROFILES: Record<string, Partial<EnvironmentSummary>> = {
     proxy_type: "AllowlistProxy",
     knowledge_store_type: "PostgresEmbeddingKnowledgeStore",
     mcp_server_count: 3,
+    mcp_server_names: ["Knowledge lookup", "Metrics", "Release notes"],
+    artifact_store_kind: "s3",
     execution_snapshot_capability: {
       fidelity: "filesystem",
       adapter: "lambda-microvm",
@@ -1123,7 +1127,15 @@ const ENVIRONMENT_PROFILES: Record<string, Partial<EnvironmentSummary>> = {
   },
 }
 
-function environment(name: string, seed: AppSeed): EnvironmentSummary {
+function environment(name: string, seed: AppSeed, now: number): EnvironmentSummary {
+  const sessions = seed.sessions.filter((s) => s.session.environment_name === name)
+  const last = sessions.reduce<string | null>(
+    (latest, s) =>
+      !latest || Date.parse(s.overview.last_activity_at) > Date.parse(latest)
+        ? s.overview.last_activity_at
+        : latest,
+    null,
+  )
   const profile = ENVIRONMENT_PROFILES[name] ?? {}
   // Branches the agent's code still has open; the fake counts one per running or waiting session.
   const open = profile.workspace_branch_capabilities?.isolation
@@ -1140,12 +1152,17 @@ function environment(name: string, seed: AppSeed): EnvironmentSummary {
     workspace_id: null,
     workspace_branch_capabilities: NO_BRANCHES,
     artifact_store_id: storeOf(name),
+    artifact_store_kind: "local_disk",
+    session_count: String(sessions.length),
+    last_activity_at: last,
+    activity_as_of: new Date(now).toISOString(),
     runner_type: null,
     binding_type: null,
     vault_type: null,
     proxy_type: null,
     knowledge_store_type: "SQLiteKnowledgeStore",
     mcp_server_count: 0,
+    mcp_server_names: [],
     workspace_checkpoint_policy: null,
     execution_snapshot_capability: NO_SNAPSHOTS,
     lifecycle_policy: null,
@@ -1163,7 +1180,11 @@ function environment(name: string, seed: AppSeed): EnvironmentSummary {
 function environments(_: LegacyRequest, context: LegacyContext): EnvironmentsPage {
   const seed = context.records()
   const names = environmentNames(seed)
-  return { environments: names.map((name) => environment(name, seed)), total_count: names.length }
+  const now = context.now()
+  return {
+    environments: names.map((name) => environment(name, seed, now)),
+    total_count: names.length,
+  }
 }
 
 function systemDiagnostics(_: LegacyRequest, context: LegacyContext): SystemDiagnostics {

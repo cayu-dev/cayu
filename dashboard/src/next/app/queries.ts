@@ -4,7 +4,7 @@
  */
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useEffect, useMemo, useRef, useState } from "react"
-import { ApiClientError, fetchEnvironments } from "@/lib/api"
+import { ApiClientError } from "@/lib/api"
 import { activityPollInterval } from "@/lib/polling"
 import {
   loadTranscriptWindow,
@@ -46,10 +46,7 @@ export function useSpecialists() {
   return useQuery({ queryKey: ["specialists"], queryFn: ({ signal }) => api.specialists(signal) })
 }
 
-/** The agent's environments, shared by the Environments and Artifacts pages. */
-export function useEnvironments() {
-  return useQuery({ queryKey: ["environments"], queryFn: fetchEnvironments, staleTime: 15_000 })
-}
+export { useEnvironments } from "@/lib/environment-query"
 
 /** The session list joined with each session's overview. */
 export function useSessionRows(filter: { agent?: string; q?: string; label?: string } = {}) {

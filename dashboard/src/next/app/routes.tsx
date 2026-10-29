@@ -10,6 +10,7 @@ import {
   redirect,
 } from "@tanstack/react-router"
 import { validateArtifactSearch } from "@/lib/artifact-search"
+import { validateEnvironmentSearch } from "@/lib/environment-search"
 import { validateSessionIndexSearch } from "@/lib/session-index-search"
 import { validateUsageRollupSearch } from "@/lib/usage-rollup-search"
 import { ArtifactsPage } from "../routes/artifacts-page"
@@ -142,7 +143,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     createRoute({
       getParentRoute: () => root,
       path: "/environments",
-      validateSearch: (s: Record<string, unknown>) => ({ q: str(s.q) }),
+      validateSearch: validateEnvironmentSearch,
       component: EnvironmentsPage,
     }),
     page("/environments/$name", EnvironmentPage),

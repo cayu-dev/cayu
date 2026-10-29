@@ -50,6 +50,7 @@ const MEMBER_READ_SURFACES = new Set([
   "supervision",
   "tasks",
   "usage",
+  "environment_details",
   "usage_series",
   "session_overview_series",
   "workflow",

@@ -14,6 +14,7 @@ import { FullAccessRoute } from "../components/dashboard/viewer"
 import { validateArtifactSearch } from "../lib/artifact-search"
 import { dashboardConfig } from "../lib/config"
 import { DASHBOARD_ROUTE_REQUIREMENTS } from "../lib/dashboard-capabilities"
+import { validateEnvironmentSearch } from "../lib/environment-search"
 import { type EvalSettingsTool, validateEvalSettingsSearch } from "../lib/eval-settings-search"
 import { validateEvalsSearch } from "../lib/evals-search"
 import { parseDashboardSearch, stringifyDashboardSearch } from "../lib/search-params"
@@ -343,9 +344,7 @@ export function createDashboardRouter(history?: RouterHistory) {
     staticData: { dashboardLayout: "page" },
     getParentRoute: () => rootRoute,
     path: "/environments",
-    validateSearch: (search: Record<string, unknown>): { q?: string } => ({
-      q: typeof search.q === "string" ? search.q : undefined,
-    }),
+    validateSearch: validateEnvironmentSearch,
     component: EnvironmentsPage,
   })
 

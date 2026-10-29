@@ -23,7 +23,6 @@ import {
   type EvalScenario,
   type EvalScenarioDraft,
   type EvalScenarioPreview,
-  fetchEnvironments,
   fetchEvalTargets,
   launchEvalScenario,
   materializeEvalScenarioArtifact,
@@ -31,6 +30,7 @@ import {
   saveEvalScenario,
 } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
+import { useEnvironments } from "@/lib/environment-query"
 import { scenarioArtifactBindingsRequireMaterialization } from "@/lib/eval-suite-authoring"
 import {
   confirmAbandonEvalRecovery,
@@ -209,12 +209,7 @@ export function ScenarioAuthoring({
   const [invalidJsonEditors, setInvalidJsonEditors] = useState(0)
   const controllerRef = useRef<AbortController | null>(null)
   const launchRegistryRef = useRef<EvalLaunchIdempotencyRegistry | null>(null)
-  const environments = useQuery({
-    queryKey: ["environments"],
-    queryFn: fetchEnvironments,
-    staleTime: 15_000,
-    enabled: showLaunchSettings,
-  })
+  const environments = useEnvironments(showLaunchSettings)
   const targets = useQuery({
     queryKey: EVAL_TARGET_QUERY_KEY,
     queryFn: ({ signal }) => fetchEvalTargets(signal),

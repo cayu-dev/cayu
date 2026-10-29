@@ -4,12 +4,13 @@
  * session last ran there); an environment's page adds its recent sessions and files.
  * Class names, IDs and raw capability records stay in Debug.
  */
-import { useQueries, useQuery } from "@tanstack/react-query"
+import { useQuery } from "@tanstack/react-query"
 import { useParams, useSearch } from "@tanstack/react-router"
-import { Box, ChevronRight } from "lucide-react"
+import { Box, ChevronRight, RefreshCw } from "lucide-react"
 import type { ReactNode } from "react"
+import { Button } from "@/components/ui/button"
 import { type EnvironmentSummary, fetchArtifacts } from "@/lib/api"
-import { formatBytes } from "@/lib/format"
+import { formatBytes, formatCount } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { overviewForDisplay } from "../api/overview"
 import { useEnvironments } from "../app/queries"
@@ -30,12 +31,14 @@ import {
   useRowClick,
 } from "./common"
 import {
+  artifactStorageText,
   branchDetails,
   branchObservationText,
   branchShort,
+  environmentActivity,
   environmentRoute,
   knowledgeText,
-  mcpText,
+  mcpNamesText,
   networkText,
   runsOn,
   runsOnDetail,
@@ -45,36 +48,37 @@ import {
 } from "./environments/environment-model"
 
 export function EnvironmentsPage() {
+  const search = useSearch({ from: "/environments" })
+  return search.name ? (
+    <EnvironmentView key={search.name} name={search.name} />
+  ) : (
+    <EnvironmentList />
+  )
+}
+
+function EnvironmentList() {
   const environments = useEnvironments()
   const search = useSearch({ from: "/environments" })
-  const api = useApi()
+  const { environmentDetailsEnabled = false } = useServices()
   const now = useNow()
   const rowClick = useRowClick()
   const needle = search.q?.trim().toLocaleLowerCase() ?? ""
   const rows = (environments.data?.environments ?? []).filter(
     (env) => !needle || env.name.toLocaleLowerCase().includes(needle),
   )
-  // One small read per environment for "last session"; environments are few.
-  const latest = useQueries({
-    queries: rows.map((env) => ({
-      queryKey: ["environment-latest-session", env.name],
-      staleTime: 15_000,
-      queryFn: ({ signal }: { signal: AbortSignal }) =>
-        api.sessions(
-          {
-            environment_name: env.name,
-            limit: 1,
-            order_by: "updated_at_desc" as const,
-            include: [],
-          },
-          signal,
-        ),
-    })),
-  })
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <TopBar>Environments</TopBar>
+      <TopBar
+        actions={
+          <Refresh
+            fetching={environments.isFetching}
+            onRefresh={() => void environments.refetch()}
+          />
+        }
+      >
+        Environments
+      </TopBar>
       <PageBody width="max-w-6xl">
         <p className="text-sm text-muted-foreground">
           Where your agent's sessions run, and what they can reach there.
@@ -95,6 +99,7 @@ export function EnvironmentsPage() {
         {environments.error && (
           <div className="mt-4">
             <ErrorState error={environments.error} />
+            {rows.length > 0 && <StaleInventory />}
           </div>
         )}
         {environments.isSuccess && rows.length === 0 && (
@@ -115,12 +120,12 @@ export function EnvironmentsPage() {
                   <th className="hidden px-3 py-2 font-medium md:table-cell">Workspace</th>
                   <th className="hidden px-3 py-2 font-medium md:table-cell">Files</th>
                   <th className="hidden px-3 py-2 font-medium md:table-cell">Knowledge</th>
-                  <th className="px-3 py-2 text-right font-medium">Last session</th>
+                  <th className="px-3 py-2 text-right font-medium">Last activity</th>
                 </tr>
               </thead>
               <tbody>
-                {rows.map((env, i) => {
-                  const last = latest[i]?.data?.sessions[0]
+                {rows.map((env) => {
+                  const activity = environmentActivity(env, environmentDetailsEnabled)
                   const workspace = workspaceText(env)
                   return (
                     <tr
@@ -145,9 +150,7 @@ export function EnvironmentsPage() {
                           <span className="md:hidden">
                             {runsOn(env)} · {workspace ?? "No workspace"} ·{" "}
                           </span>
-                          {env.mcp_server_count === 0
-                            ? "No MCP servers"
-                            : mcpText(env.mcp_server_count)}
+                          {env.mcp_server_count === 0 ? "No MCP servers" : mcpNamesText(env)}
                         </div>
                       </td>
                       <td className="hidden px-3 py-2.5 md:table-cell">
@@ -169,23 +172,27 @@ export function EnvironmentsPage() {
                         )}
                       </td>
                       <td className="hidden px-3 py-2.5 text-muted-foreground md:table-cell">
-                        {savesFiles(env) ? "Can save files" : "No file storage"}
+                        {artifactStorageText(env)}
                       </td>
                       <td className="hidden px-3 py-2.5 text-muted-foreground md:table-cell">
                         {knowledgeText(env)}
                       </td>
                       <td className="px-3 py-2.5 text-right whitespace-nowrap tabular-nums text-muted-foreground">
-                        {latest[i]?.error
-                          ? last
-                            ? `${relativeTime(Date.parse(last.updated_at), now())} (last read; refresh failed)`
-                            : "Unavailable"
-                          : latest[i]?.isPending
-                            ? "…"
-                            : latest[i]?.data
-                              ? last
-                                ? relativeTime(Date.parse(last.updated_at), now())
-                                : "None yet"
-                              : "Unavailable"}
+                        <div title={activity?.last ?? undefined}>
+                          {activity
+                            ? activity.last
+                              ? relativeTime(Date.parse(activity.last), now())
+                              : "None yet"
+                            : "Unavailable"}
+                        </div>
+                        <div
+                          className="mt-0.5 text-xs"
+                          title={activity ? `Observed ${activity.asOf}` : undefined}
+                        >
+                          {activity
+                            ? sessionCountText(activity.count)
+                            : "Session count unavailable"}
+                        </div>
                       </td>
                     </tr>
                   )
@@ -199,8 +206,33 @@ export function EnvironmentsPage() {
             {rows.length === 1 ? "1 environment" : `${rows.length} environments`}
           </p>
         )}
+        {rows.length > 0 && <p className="mt-2 text-xs text-muted-foreground">{COUNT_SCOPE}</p>}
       </PageBody>
     </div>
+  )
+}
+
+const COUNT_SCOPE = "Counts include all retained sessions, including eval trials and forks."
+const sessionCountText = (count: string) =>
+  `${formatCount(count)} ${count === "1" ? "session" : "sessions"}`
+const StaleInventory = () => (
+  <p role="status" className="mt-2 text-sm text-muted-foreground">
+    Couldn't refresh environments; showing the last inventory loaded.
+  </p>
+)
+
+function Refresh({ fetching, onRefresh }: { fetching: boolean; onRefresh: () => void }) {
+  return (
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      aria-label="Refresh"
+      title="Refresh"
+      disabled={fetching}
+      onClick={onRefresh}
+    >
+      <RefreshCw className={cn(fetching && "animate-spin")} />
+    </Button>
   )
 }
 
@@ -254,14 +286,23 @@ function minutes(seconds: number) {
 
 export function EnvironmentPage() {
   const { name } = useParams({ strict: false }) as { name: string }
+  return <EnvironmentView name={name} />
+}
+
+function EnvironmentView({ name }: { name: string }) {
   const environments = useEnvironments()
   const env = environments.data?.environments.find((e) => e.name === name)
 
   const header = (
-    <TopBar>
+    <TopBar
+      actions={
+        <Refresh fetching={environments.isFetching} onRefresh={() => void environments.refetch()} />
+      }
+    >
       <span className="flex min-w-0 items-center gap-1">
         <NavLink
           to="/environments"
+          search={{}}
           className="shrink-0 text-muted-foreground hover:text-foreground"
         >
           Environments
@@ -271,7 +312,7 @@ export function EnvironmentPage() {
       </span>
     </TopBar>
   )
-  if (environments.error)
+  if (environments.error && !env)
     return (
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {header}
@@ -298,7 +339,7 @@ export function EnvironmentPage() {
         <PageBody width="max-w-3xl">
           <EmptyState title="Environment not found">
             This agent has no environment named “{name}”.{" "}
-            <NavLink to="/environments" className="underline">
+            <NavLink to="/environments" search={{}} className="underline">
               See all environments
             </NavLink>
           </EmptyState>
@@ -308,13 +349,18 @@ export function EnvironmentPage() {
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {header}
-      <EnvironmentDetail env={env} />
+      <EnvironmentDetail env={env} stale={!!environments.error} />
     </div>
   )
 }
 
-function EnvironmentDetail({ env }: { env: EnvironmentSummary }) {
-  const { overviewQueriesEnabled = true, artifactsEnabled = true } = useServices()
+function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boolean }) {
+  const {
+    overviewQueriesEnabled = true,
+    artifactsEnabled = true,
+    environmentDetailsEnabled = false,
+  } = useServices()
+  const activity = environmentActivity(env, environmentDetailsEnabled)
   const api = useApi()
   const now = useNow()
   const recent = useQuery({
@@ -378,6 +424,40 @@ function EnvironmentDetail({ env }: { env: EnvironmentSummary }) {
         </div>
       </div>
 
+      {stale && <StaleInventory />}
+      <Section title="Activity">
+        <Facts
+          rows={[
+            ["Sessions", activity ? sessionCountText(activity.count) : "Unavailable"],
+            [
+              "Last activity",
+              activity ? (
+                activity.last ? (
+                  <time key="last-activity" dateTime={activity.last} title={activity.last}>
+                    {relativeTime(Date.parse(activity.last), now())}
+                  </time>
+                ) : (
+                  "None yet"
+                )
+              ) : (
+                "Unavailable"
+              ),
+            ],
+            [
+              "Observed",
+              activity ? (
+                <time key="observed" dateTime={activity.asOf} title={activity.asOf}>
+                  {relativeTime(Date.parse(activity.asOf), now())}
+                </time>
+              ) : (
+                "Unavailable"
+              ),
+            ],
+          ]}
+        />
+        <p className="mt-2 text-xs text-muted-foreground">{COUNT_SCOPE}</p>
+      </Section>
+
       <Section title="Where it runs">
         <Facts
           rows={[
@@ -434,6 +514,7 @@ function EnvironmentDetail({ env }: { env: EnvironmentSummary }) {
           rows={
             savesFiles(env)
               ? [
+                  ["Storage", artifactStorageText(env)],
                   [
                     "Where they go",
                     "Sessions here can save files, and they're kept after the session ends.",
@@ -473,22 +554,17 @@ function EnvironmentDetail({ env }: { env: EnvironmentSummary }) {
       </Section>
 
       <Section title="MCP servers">
-        <Facts
-          rows={[
-            [
-              "Connected",
-              env.mcp_server_count === 0
-                ? "None"
-                : `${mcpText(env.mcp_server_count)}. The server reports how many, not their names.`,
-            ],
-          ]}
-        />
+        <Facts rows={[["Declared servers", mcpNamesText(env)]]} />
       </Section>
 
       <Section
         title="Recent sessions"
         action={
-          <NavLink to="/sessions" search={{ environment_name: env.name }} className={linkClass}>
+          <NavLink
+            to="/sessions"
+            search={{ environment_name: env.name, include_eval: true, include_forks: true }}
+            className={linkClass}
+          >
             All sessions here
           </NavLink>
         }
@@ -587,6 +663,8 @@ function EnvironmentDetail({ env }: { env: EnvironmentSummary }) {
           ["Vault", env.vault_type],
           ["Proxy", env.proxy_type],
           ["MCP servers", String(env.mcp_server_count)],
+          ["Last activity", activity?.last],
+          ["Activity observed at", activity?.asOf],
           ["Factory-backed", env.is_factory ? "yes" : "no"],
           [
             "Branches",

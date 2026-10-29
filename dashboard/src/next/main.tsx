@@ -32,6 +32,7 @@ function App() {
     () => ({
       api,
       now: api.now,
+      environmentDetailsEnabled: true,
       usageSeriesEnabled: true,
       sessionOverviewSeriesEnabled: true,
       prototype: {

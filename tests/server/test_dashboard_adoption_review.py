@@ -128,7 +128,7 @@ def test_environment_old_search_and_both_session_links(tmp_path):
     asyncio.run(exercise())
 
 
-def test_environment_failed_optional_reads_do_not_claim_empty_or_counts(tmp_path):
+def test_environment_optional_detail_failures_do_not_replace_native_inventory(tmp_path):
     async def exercise():
         runtime, name = await _environment_app(tmp_path)
         async with _home_browser(seeded_runtime=runtime) as (page, base, _, _responses):
@@ -143,9 +143,11 @@ def test_environment_failed_optional_reads_do_not_claim_empty_or_counts(tmp_path
 
             await page.route("**/api/sessions?*", fail)
             await page.goto(f"{base}/cayu/environments", wait_until="networkidle")
-            await expect(
-                page.get_by_role("row").filter(has_text=name).get_by_text("Unavailable", exact=True)
-            ).to_be_visible(timeout=15_000)
+            # Native inventory remains authoritative even when the separate recent-session
+            # read is unavailable; the list no longer performs that optional read per row.
+            row = page.get_by_role("row").filter(has_text=name)
+            await expect(row.get_by_text("None yet", exact=True)).to_be_visible()
+            await expect(row.get_by_text("0 sessions", exact=True)).to_be_visible()
             await page.route("**/api/artifacts?*", fail)
             await page.get_by_role("link", name=name, exact=True).click()
             saved = page.get_by_text("Saved so far", exact=True).locator("..")

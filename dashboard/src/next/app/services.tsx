@@ -17,6 +17,7 @@ type Services = {
   now: () => number
   prototype?: PrototypeControls
   overviewQueriesEnabled?: boolean
+  environmentDetailsEnabled?: boolean
   usageSeriesEnabled?: boolean
   sessionOverviewSeriesEnabled?: boolean
   artifactsEnabled?: boolean

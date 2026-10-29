@@ -9,13 +9,9 @@ import { Info, RefreshCw, X } from "lucide-react"
 import { type ReactNode, useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { retryAggregateRequest } from "@/lib/aggregate-query"
-import {
-  fetchEnvironments,
-  fetchUsageRollup,
-  type UsageRollup,
-  type UsageRollupBody,
-} from "@/lib/api"
+import { fetchUsageRollup, type UsageRollup, type UsageRollupBody } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
+import { useEnvironments } from "@/lib/environment-query"
 import { formatCount, formatCurrency } from "@/lib/format"
 import type {
   SessionStartSeries,
@@ -466,11 +462,7 @@ function CustomRange({
 
 function Filters({ search, set }: { search: UsageSearch; set: (p: Partial<UsageSearch>) => void }) {
   const specialists = useSpecialists()
-  const environments = useQuery({
-    queryKey: ["usage", "environment-options"],
-    queryFn: fetchEnvironments,
-    staleTime: 60_000,
-  })
+  const environments = useEnvironments()
   const options = (names: string[], current: string | undefined) =>
     [...new Set([...names, ...(current ? [current] : [])])].sort()
   const agents = options(

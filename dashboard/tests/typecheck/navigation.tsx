@@ -44,6 +44,11 @@ export function NavigationContract() {
 
 export function RemainingPageNavigationContract() {
   const environment = <NavLink to="/environments/$name" params={{ name: "local / % ? café" }} />
+  const dotEnvironment = <NavLink to="/environments" search={{ name: ".." }} />
+  // @ts-expect-error Only browser-normalized dot names use this exceptional selector.
+  const invalidEnvironmentSelector = <NavLink to="/environments" search={{ name: "other" }} />
+  void dotEnvironment
+  void invalidEnvironmentSelector
   // @ts-expect-error Environment names are required dynamic parameters.
   const missingEnvironment = <NavLink to="/environments/$name" />
   // @ts-expect-error A session ID cannot stand in for the environment name.

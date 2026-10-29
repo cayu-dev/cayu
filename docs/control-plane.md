@@ -1040,3 +1040,18 @@ than publishing a partial catalog with incomplete counts.
 activity support. MCP and storage declarations remain available independently.
 Use `cayu environment list` or `cayu environment show NAME` with `--server-url`
 or `--application` for the same data, in JSON or table form.
+
+The dashboard's Environments list and detail page use these inventory fields
+for retained-session counts, last activity, declared MCP names and file storage
+kind. Counts include eval trials and forks; the All sessions link includes them
+as well. The detail page shows the activity observation time, with exact timestamps
+in Debug. Recent sessions and files remain separate, bounded lists. Missing native
+activity support is shown as unavailable, and an empty supported environment shows
+zero sessions. Refresh failures retain the last inventory with a visible warning;
+authorization failures discard the shared cached inventory until a successful read replaces it. MCP names and storage descriptions remain
+visible independently of activity support and do not imply a live connection or
+storage health check.
+
+Environment links preserve exact registered names. The special names `.` and `..`
+use `/environments?name=.` and `/environments?name=..` so browser path normalization
+cannot discard them; other names keep the existing named detail URLs.

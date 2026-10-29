@@ -80,7 +80,7 @@ reported series expose their supported read-only evidence and downloads.
 | Eval run: verdict (Improvement, Regression, Tradeoff, No change) and counts, passing / flaky / judge score / cost against the compared run, filter chips (Regressed, Improved, Failing, Flaky), compare with the baseline or any other run, Approve as baseline; a case opens a drawer with each trial's checks and judge reasons, both outputs side by side and the trial's trace | Results and Runs tabs, their inspectors and Compare | `/evals/runs/:id` |
 | Eval settings: what trials run with per specialist, the judge, limits, what this deployment supports, and the advanced tools (corpus import and export, judge calibration, memory reports, production scenarios) | Readiness and execution profile cards, header actions | `/evals/settings` |
 | Usage: range chips (Last 24 hours, Last 7 days, Last 30 days, custom); cost or tokens, sessions, model steps and tool calls; sessions per day with failures; models grouped by provider, linking to filtered Sessions; the sessions that used the most, by title; a quiet note when pricing is off or partial; Debug with window, accuracy and pricing coverage | Usage (rollup cards, "authoritative store rollup" wording, breakdown tables) | `/usage?range=&agent_name=&environment_name=…` |
-| Environments: one row per environment with where it runs, workspace and branches, whether files are kept, knowledge store and last activity | Environments (wiring tables) | `/environments` |
+| Environments: one row per environment with where it runs, workspace and branches, whether files are kept, knowledge store, declared MCP servers, retained-session counts and last activity | Environments (wiring tables) | `/environments` |
 | Environment: Runs on, Workspace, Files, Knowledge, MCP servers, recent sessions by title, recent files; Debug with IDs, branch capabilities and lifecycle | – (new) | `/environments/:name` |
 | Artifacts: files with kind, size, the session that made them (by title) and specialist; filters and paging in the URL; a preview drawer with Download and Open raw (its `preview_store_id` is separate from the list’s `artifact_store_id`); Debug with store, scope and metadata | Artifacts (ID-first table, side preview) | `/artifacts?artifact=…` |
 | System (full access only): About this agent (version, deployment, who you're signed in as, stores, pricing); what's turned off and why; Evals readiness; Debug with the feature tables, store fingerprints and raw diagnostics | System (diagnostics matrices) | `/system` |
@@ -108,18 +108,16 @@ current behavior rather than outstanding proposals.
 
 The production and prototype pages retain the following explicit limitations.
 Usage now reads one filtered, batched start/failure histogram and event-activity
-token details in the same window and viewer time zone. Other backend additions
-are still pending. The UI does not infer missing values or claim an exact result from a
-partial read.
+token details in the same window and viewer time zone. Environments show declared
+MCP names and file storage kind, plus native retained-session counts and activity
+observations without per-row session reads. Other backend additions are still pending.
+The UI does not infer missing values or claim an exact result from a partial read.
 
 | Page | Remaining work | Current behavior |
 | --- | --- | --- |
 | Usage | Start counts for labels, parent sessions and causal budgets | Headline keeps these filters; chart explicitly unavailable because the histogram API cannot apply them |
 | Usage | Cost per model and provider | Models table shows tokens only |
 | Usage | Session breakdown ranked by cost, with the specialist | Ranked by tokens; one session read per row for the specialist |
-| Environments | MCP server names | Shows the count only |
-| Environments | Last activity and session counts per environment | One `sessions?environment_name=…&limit=1` call per row; no counts |
-| Environments | Artifact store kind (local disk, S3…) | Says only whether files are kept |
 | Artifacts | Text search and sort | `q` filters the loaded page; newest first only |
 | Artifacts | Session titles on artifact rows | One overview read per page |
 | System | Deployment kind (local, Cloud, embedded) | Shows the deployment name and whether sign-in is required |
