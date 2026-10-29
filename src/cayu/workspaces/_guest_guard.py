@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, cast
 from cayu.runners import ExecCommand
 from cayu.workspaces.base import (
     WorkspaceGitMode,
+    WorkspaceLineSpan,
     WorkspaceMoveAmbiguousError,
     WorkspaceMoveResult,
     WorkspaceMoveUnsupportedError,
@@ -83,7 +84,8 @@ _READ_OUTPUT_HEADROOM_BYTES = 4096
 # "unsupported"; any
 # non-zero exit is an operational error whose detail is on stderr. Read
 # payloads are base64 on stdout after the status line; write payloads are
-# base64 on stdin.
+# base64 on stdin. Line lookups answer only
+# "ok <size> <start offset> <end offset> <lines>" and return no file content.
 GUEST_DESCRIPTOR_GUARD_SOURCE = r"""
 import contextlib
 import errno
@@ -642,6 +644,42 @@ def finish(status):
     sys.exit(0)
 
 
+def locate_lines(fd, start_line, end_line):
+    # Line N starts after the (N-1)th newline and ends after the Nth; an
+    # end_line of 0 runs to the end of the file. Offsets not found are EOF.
+    newlines = 0
+    offset = 0
+    start_offset = 0 if start_line == 1 else -1
+    end_offset = -1
+    ends_with_newline = True
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        pos = 0
+        while start_offset < 0 or (end_line and end_offset < 0):
+            wanted = start_line - 1 if start_offset < 0 else end_line
+            needed = wanted - newlines
+            if chunk.count(b"\n", pos) < needed:
+                break
+            for _ in range(needed):
+                pos = chunk.index(b"\n", pos) + 1
+            newlines = wanted
+            if start_offset < 0:
+                start_offset = offset + pos
+            else:
+                end_offset = offset + pos
+        newlines += chunk.count(b"\n", pos)
+        offset += len(chunk)
+        ends_with_newline = chunk.endswith(b"\n")
+    total_lines = newlines if ends_with_newline else newlines + 1
+    if start_offset < 0:
+        start_offset = offset
+    if end_offset < 0:
+        end_offset = offset
+    return offset, start_offset, end_offset, total_lines
+
+
 def mutation_payload(operation, before, after):
     before_revision, before_sha256 = (
         content_identity(before) if before is not None else (None, None)
@@ -767,6 +805,10 @@ def main():
                 sys.stdout.write(base64.b64encode(content).decode("ascii"))
                 sys.stdout.flush()
                 return
+            if mode == "lines":
+                leaf_fd, _ = open_guarded_regular(leaf_name, parent_fd)
+                located = locate_lines(leaf_fd, int(sys.argv[4]), int(sys.argv[5]))
+                finish("ok " + " ".join(str(value) for value in located))
             if mode == "write":
                 payload = base64.b64decode(sys.stdin.read(), validate=True)
                 write_guarded_regular(leaf_name, parent_fd, (payload,))
@@ -817,6 +859,20 @@ main()
 )
 
 
+def guard_read_limit(runner: Runner) -> int | None:
+    """The most file bytes one guarded read can return through ``runner``.
+
+    Reads come back base64-encoded after a status line, so a runner that caps
+    command output caps reads at about three quarters of that. ``None`` means
+    the runner declares no cap.
+    """
+
+    output_cap = runner.max_exec_output_bytes
+    if output_cap is None:
+        return None
+    return max(1, (output_cap - _READ_OUTPUT_HEADROOM_BYTES) // 4 * 3)
+
+
 async def guard_read(
     runner: Runner,
     *,
@@ -829,8 +885,15 @@ async def guard_read(
     timeout_s: int | None = None,
     python_executable: str = GUEST_PYTHON,
 ) -> tuple[bytes, int, str | None, str | None, WorkspaceGitMode | None]:
-    """Atomically resolve-and-read a contained file and complete-snapshot identity."""
+    """Atomically resolve-and-read a contained file and complete-snapshot identity.
 
+    A ``limit`` larger than the runner can return is lowered to fit, so a
+    large request comes back as a shorter page rather than cut-off output.
+    """
+
+    runner_limit = guard_read_limit(runner)
+    if runner_limit is not None:
+        limit = min(limit, runner_limit)
     output_limit = 4 * ((limit + 2) // 3) + _READ_OUTPUT_HEADROOM_BYTES
     result = await _exec_guard(
         runner,
@@ -863,6 +926,57 @@ async def guard_read(
             f"{backend} workspace guard returned an invalid read payload: {original_path}"
         ) from exc
     return content, total_bytes, revision, digest, git_mode
+
+
+async def guard_locate_lines(
+    runner: Runner,
+    *,
+    root: str,
+    rel_path: str,
+    start_line: int,
+    end_line: int | None,
+    original_path: str,
+    backend: str,
+    timeout_s: int | None = None,
+    python_executable: str = GUEST_PYTHON,
+) -> WorkspaceLineSpan:
+    """Find a line range's byte offsets inside the guest, returning no file content."""
+
+    if type(start_line) is not int or start_line < 1:
+        raise ValueError("start_line must be a positive integer.")
+    if end_line is not None and (type(end_line) is not int or end_line < start_line):
+        raise ValueError("end_line must be an integer no less than start_line.")
+    result = await _exec_guard(
+        runner,
+        "lines",
+        root,
+        rel_path,
+        str(start_line),
+        str(end_line or 0),
+        timeout_s=timeout_s,
+        output_limit_bytes=_READ_OUTPUT_HEADROOM_BYTES,
+        python_executable=python_executable,
+    )
+    status, _ = _guard_status(result, mode="read", backend=backend, original_path=original_path)
+    if status in {_STATUS_ENOENT, _STATUS_NOTFILE, _STATUS_NOTDIR}:
+        raise FileNotFoundError(f"Workspace file not found: {original_path}")
+    _raise_common_status(status, mode="read", backend=backend, original_path=original_path)
+    parts = status.split()
+    if len(parts) == 5 and parts[0] == _STATUS_OK and all(part.isdigit() for part in parts[1:]):
+        total_bytes, start_offset, end_offset, total_lines = (int(part) for part in parts[1:])
+        try:
+            return WorkspaceLineSpan(
+                start_offset=start_offset,
+                end_offset=end_offset,
+                total_bytes=total_bytes,
+                total_lines=total_lines,
+            )
+        except ValueError:
+            pass
+    raise RuntimeError(
+        f"Failed to read {backend} workspace file: "
+        f"{original_path}: unexpected guard status {status!r}"
+    )
 
 
 async def guard_write(

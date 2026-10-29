@@ -7629,7 +7629,24 @@ def test_read_file_multiline_secret_at_eof_keeps_last_line(tmp_path, trailing_ne
     assert _read_text(result) == REDACTED_SECRET + trailing_newline
 
 
-def test_read_file_line_range_rejects_redaction_that_consumes_restored_newlines(tmp_path):
+@pytest.mark.parametrize("start_line", [1, 2, 3])
+def test_read_file_line_range_rejects_redaction_that_consumes_restored_newlines(
+    tmp_path, start_line
+):
+    (tmp_path / "config.txt").write_text("public\nfirst-secret\nlast-secret\nlast\n")
+    ctx = _workspace_read_ctx(
+        tmp_path,
+        invocation_secret_redactor=lambda: SecretRedactor(
+            ["first-secret\nlast-secret", REDACTED_SECRET + "\n"]
+        ),
+    )
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "config.txt", "start_line": start_line}))
+    assert result.is_error
+    assert result.structured["error"] == "line_range_redaction_unavailable"
+    assert "first-secret" not in result.content
+
+
+def test_read_file_line_range_after_a_multiline_secret_reads_from_its_line(tmp_path):
     (tmp_path / "config.txt").write_text("public\nfirst-secret\nlast-secret\nlast\n")
     ctx = _workspace_read_ctx(
         tmp_path,
@@ -7638,6 +7655,6 @@ def test_read_file_line_range_rejects_redaction_that_consumes_restored_newlines(
         ),
     )
     result = asyncio.run(ReadFileTool().run(ctx, {"path": "config.txt", "start_line": 4}))
-    assert result.is_error
-    assert result.structured["error"] == "line_range_redaction_unavailable"
-    assert "first-secret" not in result.content
+    assert not result.is_error
+    assert _read_text(result) == "last\n"
+    assert result.structured["total_lines"] == 4

@@ -933,6 +933,7 @@ class LambdaMicroVMRunner(Runner):
 
     isolation = "lambda-microvm"
     system_execution_mode: RunnerSystemExecutionMode = "separate"
+    max_exec_output_bytes = LAMBDA_MICROVM_MAX_OUTPUT_BYTES
 
     @property
     def resource_key(self) -> tuple[object, ...]:

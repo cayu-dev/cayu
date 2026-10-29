@@ -245,6 +245,38 @@ class WorkspaceReadOffsetError(ValueError):
         super().__init__(f"Workspace read offset {offset} cannot exceed file size {total_bytes}.")
 
 
+@dataclass(frozen=True)
+class WorkspaceLineSpan:
+    """Where a range of whole lines sits in one workspace file.
+
+    ``start_offset`` is the byte where the range's first line begins and
+    ``end_offset`` the byte just past its last line, newline included. A range
+    that starts past the last line has both at ``total_bytes``. Every newline
+    ends a line, and text after the last newline is one more line.
+    ``total_lines`` is ``None`` when the locator stopped at the range's end
+    without counting the rest of the file.
+    """
+
+    start_offset: int
+    end_offset: int
+    total_bytes: int
+    total_lines: int | None
+
+    def __post_init__(self) -> None:
+        for name in ("start_offset", "end_offset", "total_bytes"):
+            if type(getattr(self, name)) is not int:
+                raise TypeError(f"WorkspaceLineSpan {name} must be an integer.")
+        if not 0 <= self.start_offset <= self.end_offset <= self.total_bytes:
+            raise ValueError(
+                "WorkspaceLineSpan offsets must satisfy "
+                "0 <= start_offset <= end_offset <= total_bytes."
+            )
+        if self.total_lines is not None and (
+            type(self.total_lines) is not int or self.total_lines < 0
+        ):
+            raise ValueError("WorkspaceLineSpan total_lines must be a non-negative integer.")
+
+
 WorkspaceMutationOperation = Literal["create", "replace", "delete"]
 WorkspaceMoveFidelity = Literal["atomic_rename", "link_unlink"]
 
@@ -730,6 +762,14 @@ class Workspace(ABC):
 
         return None
 
+    def line_locator(self) -> WorkspaceLineLocator | None:
+        """Return a capability that finds line ranges where the file lives, if any.
+
+        Without one, line reads page through ``read_bytes`` to find the range.
+        """
+
+        return None
+
     def tar_stream_writer(self) -> TarStreamWriter | None:
         """Return an explicit streaming-tar writer capability, if any."""
 
@@ -917,6 +957,29 @@ class BoundedTarStreamReader(ABC):
         max_archive_bytes: int | None = None,
     ) -> TarStreamReadResult:
         """Write one uncompressed tar to ``destination`` and report its size."""
+
+
+class WorkspaceLineLocator(ABC):
+    """Nominal capability for finding a line range without returning file content.
+
+    A backend that can scan a file where it lives, such as inside a sandbox,
+    implements this so a line read moves only the lines it returns.
+    """
+
+    @abstractmethod
+    async def locate_lines(
+        self,
+        path: str,
+        *,
+        start_line: int,
+        end_line: int | None = None,
+    ) -> WorkspaceLineSpan:
+        """Locate lines ``start_line`` through ``end_line`` (1-based, inclusive).
+
+        ``end_line=None`` runs to the end of the file. Raises
+        ``FileNotFoundError`` when ``path`` is not a regular file, under the
+        same path policy as ``read_bytes``.
+        """
 
 
 class TarWriter(ABC):

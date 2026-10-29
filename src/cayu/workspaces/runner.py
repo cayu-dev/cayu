@@ -25,8 +25,10 @@ from cayu.workspaces._guest_guard import (
     GUEST_DESCRIPTOR_GUARD_SOURCE,
     guard_create,
     guard_delete_if_revision,
+    guard_locate_lines,
     guard_move_if_revision,
     guard_read,
+    guard_read_limit,
     guard_replace,
     guard_require_absent,
 )
@@ -42,6 +44,8 @@ from cayu.workspaces.base import (
     WorkspaceDirectoryPruner,
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
+    WorkspaceLineLocator,
+    WorkspaceLineSpan,
     WorkspaceListResult,
     WorkspaceManifestLimits,
     WorkspaceMoveResult,
@@ -1045,6 +1049,7 @@ main()
 
 class RunnerWorkspace(
     WorkspaceDirectoryPruner,
+    WorkspaceLineLocator,
     RunnerBoundWorkspace,
     BoundedTarReader,
     TarWriter,
@@ -1188,9 +1193,35 @@ class RunnerWorkspace(
         return _runner_resource_key(self._runner)
 
     def bounded_read_limit(self, max_bytes: int) -> int:
-        return min(
+        limit = min(
             self.default_read_limit_bytes,
             _validate_required_limit(max_bytes, "max_bytes"),
+        )
+        # One read must fit in one command's output.
+        runner_limit = guard_read_limit(self._runner)
+        return limit if runner_limit is None else min(limit, runner_limit)
+
+    def line_locator(self) -> WorkspaceLineLocator:
+        return self
+
+    async def locate_lines(
+        self,
+        path: str,
+        *,
+        start_line: int,
+        end_line: int | None = None,
+    ) -> WorkspaceLineSpan:
+        path = _validate_relative_path(path)
+        self._require_path_allowed(path)
+        return await guard_locate_lines(
+            self._runner,
+            root=self._runner.resolve_cwd(self.cwd),
+            rel_path=path,
+            start_line=start_line,
+            end_line=end_line,
+            original_path=path,
+            backend="Runner",
+            python_executable=self.python_executable,
         )
 
     def branch_capabilities(self) -> WorkspaceBranchCapabilities:

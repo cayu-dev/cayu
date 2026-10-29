@@ -256,6 +256,12 @@ class LaunchedRunner(Runner):
     def resource_key(self) -> tuple[object, ...] | None:
         return self._runner.resource_key
 
+    @property
+    def max_exec_output_bytes(self) -> int | None:  # type: ignore[override]
+        """The wrapped runner's output cap, read each time so a deferred runner's later cap shows."""
+
+        return self._runner.max_exec_output_bytes
+
     async def close(self) -> None:
         """Close the wrapped runner, then this one."""
 

@@ -2338,6 +2338,12 @@ class _EgressManagedRunner(Runner):
         return self._runner.resource_key
 
     @property
+    def max_exec_output_bytes(self) -> int | None:  # type: ignore[override]
+        """The wrapped runner's output cap, read each time so a deferred runner's later cap shows."""
+
+        return self._runner.max_exec_output_bytes
+
+    @property
     def name(self) -> str:
         """Return the backend sandbox's name, such as the Docker container name."""
 

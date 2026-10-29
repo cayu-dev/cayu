@@ -464,6 +464,13 @@ class DeferredRunner(Runner):
         self._ensure_exec_open()
         return await self._deferred.materialize("use")
 
+    @property
+    def max_exec_output_bytes(self) -> int | None:  # type: ignore[override]
+        """The materialized runner's output cap; unknown until then."""
+
+        live = self._live()
+        return None if live is None else live.max_exec_output_bytes
+
     def resolve_cwd(self, cwd: str | None = None) -> str:
         live = self._live()
         return live.resolve_cwd(cwd) if live is not None else super().resolve_cwd(cwd)

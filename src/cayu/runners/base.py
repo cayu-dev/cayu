@@ -1149,6 +1149,14 @@ class Runner(ABC):
     isolation: str = "unknown"
     default_cwd: str = "/"
     system_execution_mode: RunnerSystemExecutionMode = "shared"
+    max_exec_output_bytes: int | None = None
+    """The most stdout one command can return, whatever ``output_limit_bytes`` asks for.
+
+    ``None`` means output is bounded only by the caller's limit. A runner whose
+    transport caps output declares the cap for ASCII output, so callers such as
+    guarded workspace reads can size requests to fit instead of being cut off.
+    Runner wrappers must preserve the declaration.
+    """
     _environment_authority_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def workload_authority(self, name: str) -> RunnerWorkloadAuthority | None:

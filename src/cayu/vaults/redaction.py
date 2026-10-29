@@ -475,13 +475,19 @@ class SecretRedactor:
             if piece.source_end <= relative_start or piece.source_start >= relative_end:
                 continue
             if not piece.linear:
-                if piece.source_start < relative_start:
+                if piece.source_start < relative_start and not preserve_line_breaks:
                     omitted_leading_atomic_piece = True
                     continue
                 if preserve_line_breaks:
                     # Redact the complete source before restoring only its line
                     # separators; no secret fragment is selected independently.
-                    source = value[piece.source_start : min(piece.source_end, relative_end)]
+                    # A secret that began before the page still marks each
+                    # page line it covers, so line numbers stay put.
+                    source = value[
+                        max(piece.source_start, relative_start) : min(
+                            piece.source_end, relative_end
+                        )
+                    ]
                     projected.extend((piece.value + b"\n") * source.count(b"\n"))
                     if not source.endswith(b"\n"):
                         projected.extend(piece.value)

@@ -44,6 +44,7 @@ from cayu.tools._errors import (
     structured_invalid_arguments,
     tool_argument_validation,
 )
+from cayu.tools._file_lines import locate_workspace_lines
 from cayu.tools._redaction import (
     InvocationRedactorSnapshot,
     active_secret_redactor,
@@ -66,6 +67,7 @@ from cayu.tools.display import ToolDisplay
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.base import (
     Workspace,
+    WorkspaceLineSpan,
     WorkspaceReadOffsetError,
     WorkspaceReadResult,
     WorkspaceRevisionMismatchError,
@@ -212,6 +214,10 @@ class _WorkspaceText:
     text: str
     structured: dict
     capture_snapshot: InvocationRedactorSnapshot
+    # Redaction ended the text before the end of the raw page it covers.
+    redaction_truncated: bool = False
+    # The workspace returned less than max_bytes before the end of the file.
+    workspace_limited: bool = False
 
 
 @dataclass(frozen=True)
@@ -695,7 +701,13 @@ async def _read_workspace_text(
     offset: int,
     options: ReadFileOptions,
     preserve_line_breaks: bool = False,
+    page_bytes: int | None = None,
 ) -> _WorkspaceText | ToolResult:
+    """Read one page of text; ``page_bytes`` caps the raw page below ``options.max_bytes``."""
+
+    if page_bytes is None:
+        page_bytes = options.max_bytes
+
     async def read_window(redactor):
         if redactor.has_values:
             redaction_overlap = redactor.pagination_overlap_utf8_bytes
@@ -706,7 +718,7 @@ async def _read_workspace_text(
             fetch_offset = offset
             trailing_window_bytes = 0
         prefix_bytes = offset - fetch_offset
-        requested_read_limit = prefix_bytes + options.max_bytes + trailing_window_bytes
+        requested_read_limit = prefix_bytes + page_bytes + trailing_window_bytes
         result, effective_read_limit = await _read_workspace_bytes(
             workspace,
             path,
@@ -726,6 +738,9 @@ async def _read_workspace_text(
     except _WorkspaceFileNotFoundError:
         return _missing_workspace_file_result("Read", path)
     except WorkspaceReadOffsetError as exc:
+        if preserve_line_breaks:
+            # A line read's offset came from the file, which has since shrunk.
+            return _workspace_file_changed_result(path)
         return _invalid_workspace_read_offset_result(
             offset=offset,
             total_bytes=exc.total_bytes,
@@ -750,6 +765,8 @@ async def _read_workspace_text(
             observed_window_start=result.offset,
         )
     if offset > result.total_bytes:
+        if preserve_line_breaks:
+            return _workspace_file_changed_result(path)
         return _invalid_workspace_read_offset_result(
             offset=offset,
             total_bytes=result.total_bytes,
@@ -788,7 +805,7 @@ async def _read_workspace_text(
                 ),
                 observed_window_end=observed_window_end,
             )
-    effective_page_limit_bytes = min(options.max_bytes, workspace_page_limit_bytes)
+    effective_page_limit_bytes = min(page_bytes, workspace_page_limit_bytes)
     if exact_eof:
         page, next_offset = b"", None
     else:
@@ -798,7 +815,7 @@ async def _read_workspace_text(
             content_type=content_type,
             requested_offset=offset,
             max_bytes=effective_page_limit_bytes,
-            caller_max_bytes=options.max_bytes,
+            caller_max_bytes=page_bytes,
             effective_read_limit_bytes=effective_read_limit,
             workspace_page_limit_bytes=workspace_page_limit_bytes,
             raw_read_limit_exhausted=raw_read_limit_exhausted,
@@ -808,7 +825,8 @@ async def _read_workspace_text(
             return page_or_error
         page, next_offset = page_or_error
     if _is_binary_workspace_file(content_type=content_type, content=page):
-        if offset != 0:
+        # Line reads start where their first line does, not at a caller offset.
+        if offset != 0 and not preserve_line_breaks:
             return invalid_tool_arguments_result(
                 ValueError("Tool argument `offset` is only valid for workspace text files.")
             )
@@ -875,7 +893,15 @@ async def _read_workspace_text(
         "encoding": "utf-8",
         "truncated": truncated,
     }
-    return _WorkspaceText(text=text, structured=structured, capture_snapshot=capture_snapshot)
+    return _WorkspaceText(
+        text=text,
+        structured=structured,
+        capture_snapshot=capture_snapshot,
+        redaction_truncated=redaction_truncated,
+        workspace_limited=(
+            workspace_page_limit_bytes < page_bytes and observed_window_end < result.total_bytes
+        ),
+    )
 
 
 async def _read_workspace_lines(
@@ -888,65 +914,123 @@ async def _read_workspace_lines(
     options: ReadFileOptions,
     line_cut_hint: str = _LINE_CUT_RETRY_HINT,
 ) -> _WorkspaceText | ToolResult:
-    """Select whole lines from the redacted text of the file's first read window."""
+    """Select whole lines from the redacted text of a file.
 
+    The workspace first finds where the range starts and ends, so the read
+    moves only those bytes, in a window no larger than the workspace can
+    return. A file that grows between the two steps is read as located; one
+    that shrinks below the range fails. Other edits between the steps can
+    shift the window, as they can between byte pages.
+    """
+
+    start = line_range.start
+    try:
+        span = await locate_workspace_lines(
+            workspace, path, start_line=start, end_line=line_range.end
+        )
+    except FileNotFoundError:
+        return _missing_workspace_file_result("Read", path)
+    if start > 1 and span.start_offset == span.total_bytes:
+        counted = "" if span.total_lines is None else f" ({span.total_lines} lines)"
+        return invalid_tool_arguments_result(
+            ValueError(
+                f"Tool argument `start_line` ({start}) is past the end of the file{counted}."
+            )
+        )
+    if span.start_offset > 0:
+        # The range alone may miss what marks the file as binary.
+        binary = await _binary_workspace_head_result(
+            workspace, path=path, content_type=content_type, total_bytes=span.total_bytes
+        )
+        if binary is not None:
+            return binary
+    span_bytes = span.end_offset - span.start_offset
+    redactor = active_secret_redactor_snapshot(ctx).redactor
+    if redactor.has_values:
+        # Redacted text can be shorter or longer than its source, so read the
+        # whole span, plus enough past it to settle a secret that might start
+        # at its end, and let the selection below apply max_bytes.
+        requested_bytes = min(
+            span_bytes + redactor.pagination_overlap_utf8_bytes + 4,
+            span.total_bytes - span.start_offset,
+            MAX_READ_LIMIT_BYTES,
+        )
+    else:
+        requested_bytes = min(options.max_bytes, span_bytes)
     read = await _read_workspace_text(
         ctx,
         workspace,
         path=path,
         content_type=content_type,
-        offset=0,
+        offset=span.start_offset,
+        # Redacted text can outgrow its raw bytes; the selection below
+        # applies the caller's max_bytes to whole lines.
         options=replace(options, max_bytes=MAX_READ_LIMIT_BYTES),
         preserve_line_breaks=True,
+        page_bytes=max(1, requested_bytes),
     )
     if isinstance(read, ToolResult):
         return read
     source = read.structured
-    complete = not source["truncated"]
+    # Growth, such as a log being written, leaves the located offsets valid.
+    if source["total_bytes"] < span.end_offset:
+        return _workspace_file_changed_result(path)
+    page_end = span.start_offset + source["bytes"]
     lines = _text_lines(read.text)
-    if not complete and lines and not lines[-1].endswith("\n"):
-        lines.pop()
-    start = line_range.start
-    if start > len(lines) and (start > 1 or not complete):
-        if complete:
-            return invalid_tool_arguments_result(
-                ValueError(
-                    f"Tool argument `start_line` ({start}) is past the end of the file "
-                    f"({len(lines)} lines)."
-                )
-            )
-        return ToolResult(
-            content=(
-                f"Line ranges cover the first {MAX_READ_LIMIT_BYTES} bytes of a file, which end "
-                f"at line {len(lines)}. Use `offset` to read further."
-            ),
-            structured={
-                "error": "line_range_beyond_read_window",
-                "path": path,
-                "start_line": start,
-                "readable_lines": len(lines),
-            },
-            is_error=True,
-        )
-    stop = len(lines) if line_range.end is None else min(line_range.end, len(lines))
+    range_lines = None if line_range.end is None else line_range.end - start + 1
+    # Every line of the range is here when the text covers the span, or when
+    # the range's last line arrived whole, with anything after it dropped.
+    covered = (page_end >= span.end_offset and not read.redaction_truncated) or (
+        range_lines is not None
+        and len(lines) >= range_lines
+        and lines[range_lines - 1].endswith("\n")
+    )
+    # Lines past the range can only be here if the file changed after it was
+    # located; then this text is not the whole file, whatever the offsets say.
+    dropped_lines = range_lines is not None and len(lines) > range_lines
+    if range_lines is not None:
+        del lines[range_lines:]
+    partial = lines.pop() if not covered and lines and not lines[-1].endswith("\n") else None
     selected: list[str] = []
     used_bytes = 0
     line_cut = False
-    for line in lines[start - 1 : stop]:
+    for line in lines:
         line_bytes = len(line.encode("utf-8"))
         if used_bytes + line_bytes > options.max_bytes:
-            if not selected:
-                selected.append(
-                    line.encode("utf-8")[: options.max_bytes].decode("utf-8", errors="ignore")
-                )
-                line_cut = True
             break
         selected.append(line)
         used_bytes += line_bytes
+    first_line = lines[0] if lines else partial
+    if not selected and first_line is not None:
+        if partial is not None and not lines and read.workspace_limited:
+            # The workspace returned less than asked: this line is longer
+            # than one read through it can be, whatever max_bytes says.
+            return _line_exceeds_read_window_result(
+                workspace,
+                path=path,
+                start_line=start,
+                span=span,
+            )
+        selected.append(
+            first_line.encode("utf-8")[: options.max_bytes].decode("utf-8", errors="ignore")
+        )
+        line_cut = True
     end_line = start - 1 + len(selected)
-    next_start_line = end_line if line_cut else end_line + 1 if end_line < stop else None
-    window_exhausted = not complete and (line_range.end is None or line_range.end > end_line)
-    whole_file = complete and start == 1 and end_line == len(lines) and not line_cut
+    all_selected = covered and not line_cut and len(selected) == len(lines)
+    next_start_line = end_line if line_cut else None if all_selected else end_line + 1
+    total_lines = span.total_lines
+    if all_selected and not dropped_lines and span.end_offset == span.total_bytes:
+        # The text ran to the end of the file, so it fixes the line count.
+        total_lines = end_line
+    whole_file = (
+        all_selected
+        and start == 1
+        and span.end_offset == span.total_bytes
+        and source["total_bytes"] == span.total_bytes
+        and page_end == source["total_bytes"]
+        and not dropped_lines
+        and not source["truncated"]
+    )
     text = "".join(selected)
     structured = {
         "source": "workspace",
@@ -955,12 +1039,12 @@ async def _read_workspace_lines(
         "total_bytes": source["total_bytes"],
         "start_line": start,
         "end_line": end_line,
-        "total_lines": len(lines) if complete else None,
+        "total_lines": total_lines,
         "next_start_line": next_start_line,
         "revision": source["revision"] if whole_file else None,
         "sha256": source["sha256"] if whole_file else None,
         "encoding": "utf-8",
-        "truncated": next_start_line is not None or line_cut or window_exhausted,
+        "truncated": next_start_line is not None,
     }
     if line_cut:
         structured["line_truncated"] = True
@@ -968,6 +1052,78 @@ async def _read_workspace_lines(
     if not whole_file:
         record_ambiguous_secret_output(ctx, read.capture_snapshot)
     return _WorkspaceText(text=text, structured=structured, capture_snapshot=read.capture_snapshot)
+
+
+def _workspace_file_changed_result(path: str) -> ToolResult:
+    return ToolResult(
+        content=f"{path} shrank while it was being read. Retry the read.",
+        structured={"error": "workspace_file_changed", "path": path},
+        is_error=True,
+    )
+
+
+# Like Git, judge a file binary from its first 8,000 bytes.
+_BINARY_SNIFF_BYTES = 8000
+
+
+async def _binary_workspace_head_result(
+    workspace: Workspace,
+    *,
+    path: str,
+    content_type: str,
+    total_bytes: int,
+) -> ToolResult | None:
+    try:
+        head, _ = await _read_workspace_bytes(workspace, path, max_bytes=_BINARY_SNIFF_BYTES)
+    except _WorkspaceFileNotFoundError:
+        return _missing_workspace_file_result("Read", path)
+    content = head.content
+    if head.truncated:
+        # Don't count a character cut by the sniff's end as invalid UTF-8.
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if exc.reason == "unexpected end of data":
+                content = content[: exc.start]
+    if not _is_binary_workspace_file(content_type=content_type, content=content):
+        return None
+    return _binary_workspace_file_result(
+        path=path,
+        content_type=content_type,
+        bytes_read=len(head.content),
+        total_bytes=total_bytes,
+        truncated=head.truncated,
+        inspectable=False,
+    )
+
+
+def _line_exceeds_read_window_result(
+    workspace: Workspace,
+    *,
+    path: str,
+    start_line: int,
+    span: WorkspaceLineSpan,
+) -> ToolResult:
+    window = _bounded_workspace_read_limit(workspace, MAX_READ_LIMIT_BYTES)
+    return ToolResult(
+        content=(
+            f"Line {start_line} of {path} is longer than the {window} bytes this workspace "
+            f"can return in one read (the file is {span.total_bytes} bytes). Read the line "
+            f"in byte pages instead: omit start_line and end_line, and use "
+            f"offset={span.start_offset} with max_bytes={window}, following next_offset."
+        ),
+        structured={
+            "error": "invalid_arguments",
+            "reason": "line_exceeds_read_window",
+            "path": path,
+            "start_line": start_line,
+            "total_bytes": span.total_bytes,
+            "max_read_bytes": window,
+            "offset": span.start_offset,
+            "max_bytes": window,
+        },
+        is_error=True,
+    )
 
 
 def _text_lines(text: str) -> list[str]:

@@ -263,6 +263,7 @@ class BrokeredSandboxRunner(Runner):
     isolation = BROKERED_SANDBOX_CANDIDATE
     default_cwd = BROKERED_SANDBOX_ROOT
     system_execution_mode: RunnerSystemExecutionMode = "shared"
+    max_exec_output_bytes = MAX_COMMAND_OUTPUT_BYTES
 
     def __init__(
         self,
