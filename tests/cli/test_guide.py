@@ -979,7 +979,7 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
     assert main(["guide", "long-running"]) == 0
     guide = capsys.readouterr().out
     snippets = re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
-    assert len(snippets) == 9
+    assert len(snippets) == 10
     namespace: dict[str, Any] = {}
     for snippet in snippets:
         exec(compile(snippet, "long-running", "exec"), namespace)
@@ -1179,6 +1179,36 @@ def test_long_running_guide_snippets_run_together(capsys, tmp_path: Path) -> Non
         assert await app.task_store.load_task("invoice-INV-11-4") is None
 
     asyncio.run(sweeper_gives_up())
+
+    # Reuse: rerunning the batch makes no model call for sessions that finished.
+    async def rerun_reuses_finished_sessions() -> None:
+        from types import SimpleNamespace
+
+        from cayu.evals.testing import ScriptedModelProvider
+        from cayu.sessions.memory import InMemorySessionStore
+        from cayu.tasks import InMemoryTaskStore
+
+        provider = ScriptedModelProvider(
+            [
+                [ModelStreamEvent.error("lost"), ModelStreamEvent.completed()],  # INV-1 fails once.
+                [ModelStreamEvent.text_delta("INV-1 ok"), ModelStreamEvent.completed()],
+                [ModelStreamEvent.text_delta("INV-2 ok"), ModelStreamEvent.completed()],
+            ]
+        )
+        app = namespace["build_app"](
+            provider=provider,
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        task = SimpleNamespace(id="review-1", input={"invoice_ids": ["INV-1", "INV-2"]})
+        first = await namespace["review_invoices"](app, task)
+        again = await namespace["review_invoices"](app, task)
+        assert first == again == {"INV-1": "INV-1 ok", "INV-2": "INV-2 ok"}
+        assert len(provider.requests) == 3
+        lost = await app.session_store.load("review-1-INV-1-1")
+        assert lost is not None and lost.status.value == "failed"
+
+    asyncio.run(rerun_reuses_finished_sessions())
 
     for reference in re.findall(r"`cayu guide ([a-z0-9#-]+)`", guide):
         assert main(["guide", reference]) == 0, reference

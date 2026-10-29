@@ -336,6 +336,10 @@ from cayu.sessions.forks import (
 from cayu.sessions.forks import (
     session_prompt_anatomy_transition as session_prompt_anatomy_transition,
 )
+from cayu.sessions.idempotent_runs import RunOnceMismatch as RunOnceMismatch
+from cayu.sessions.idempotent_runs import RunOnceRefused as RunOnceRefused
+from cayu.sessions.idempotent_runs import RunOnceSessionNotFinished as RunOnceSessionNotFinished
+from cayu.sessions.idempotent_runs import run_once as run_once
 from cayu.sessions.inspection import SerializedRecordSummary as SerializedRecordSummary
 from cayu.sessions.inspection import SessionInspectionIdentity as SessionInspectionIdentity
 from cayu.sessions.inspection import SessionInspectionSummary as SessionInspectionSummary
@@ -786,6 +790,9 @@ __all__ = [
     "ReleaseInvocationCommand",
     "ResumeRequest",
     "RunInterruption",
+    "RunOnceMismatch",
+    "RunOnceRefused",
+    "RunOnceSessionNotFinished",
     "RunOutcome",
     "RunRequest",
     "RunnerObservedEventIdentity",
@@ -901,6 +908,7 @@ __all__ = [
     "price_supervision_events",
     "project_terminal_child_session_result",
     "replace_session_user_metadata",
+    "run_once",
     "run_to_completion",
     "runtime_publication_checkpoint_mutation",
     "runtime_publication_checkpoint_value_digest",

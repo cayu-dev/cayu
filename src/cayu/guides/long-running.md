@@ -373,6 +373,47 @@ that step's tool calls never run. Spend from every process that ran the
 session counts. Unpriced models are refused unless the limit sets
 `allow_unpriced=True`. Deep guide: `cayu guide references#cost-control`.
 
+## Reuse finished sessions on a rerun
+
+A job made of several sessions loses the finished ones when its worker dies,
+unless the rerun can find them. Name each session after its piece of work and
+run it with `run_once`: a session that already finished returns its stored
+outcome without a model call, so the rerun pays only for what never finished.
+
+```python
+from cayu import Message, RunRequest
+from cayu.sessions import RunOnceSessionNotFinished, run_once
+
+
+async def review_invoices(app, task):
+    notes = {}
+    for invoice_id in task.input["invoice_ids"]:
+        for attempt in (1, 2, 3):  # A new id only when an attempt did not succeed.
+            request = RunRequest(
+                agent_name="invoices", session_id=f"{task.id}-{invoice_id}-{attempt}",
+                messages=[Message.text("user", f"Summarize {invoice_id}.")],
+            )
+            try:
+                outcome = await run_once(app, request)  # Finished: no model call.
+            except RunOnceSessionNotFinished:
+                continue  # Lost with its worker; session recovery settles it.
+            if outcome.ok:
+                break  # A failed or interrupted attempt is redone under the next id.
+        else:
+            raise RuntimeError(f"{invoice_id}: no attempt succeeded.")
+        notes[invoice_id] = outcome.final_text
+    return notes
+```
+
+`run_once` returns a failed or interrupted session as it ended, so check
+`outcome.ok`. An attempt cancelled with its worker usually ends interrupted once
+recovery settles it. `run_once` raises `RunOnceMismatch` when the stored session
+was run by another agent or with another structured-output spec, and
+`RunOnceSessionNotFinished` when it is still pending or running, or its terminal
+event was never published. That session may belong to a worker that died, or to
+one still running it, so `run_once` never touches it. Messages are not compared:
+give each distinct piece of work its own session id.
+
 ## Restart tests
 
 ```python

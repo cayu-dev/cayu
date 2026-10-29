@@ -8865,6 +8865,29 @@ including nested event payloads and structured JSON values. Callers may retain
 them as evidence without subsequent mutation of their source objects changing
 the recorded outcome.
 
+`cayu.sessions.run_once(app, request)` makes a named run safe to repeat. It
+requires `request.session_id`. When no session has that id, it runs the request
+with `run_to_completion`. When the session exists and is `COMPLETED`, `FAILED` or
+`INTERRUPTED`, it returns the `RunOutcome` of the session's latest invocation
+(its run, a later resume or an approval continuation, from the last
+`interaction.started` or `interaction.resumed`) rebuilt from stored events,
+projected the way `CayuApp.run()` yields them, and calls no model. The rebuilt
+outcome has the same status, final text, structured output, usage, tool calls,
+error and events as that invocation's stream gave; only `error_detail`, which is never
+stored, is absent. Before reusing a session it checks that the stored agent and
+structured-output spec (schema, name, strategy, retries and repair prompt) match
+the request and otherwise raises `RunOnceMismatch`. Messages and other request
+fields are not compared, so each distinct piece of work needs its own session id.
+A session that is still `PENDING`, `RUNNING` or `INTERRUPTING`, or whose
+latest invocation has no terminal event matching its status (the status is
+written before that event is published), raises `RunOnceSessionNotFinished` with
+its `status` and is left unchanged: its run may still be live, or its worker may
+be gone, and settling it belongs to the session recovery APIs. A failed or
+interrupted session is returned as it ended, so callers check `outcome.ok` and
+use a new session id to redo it. Both errors subclass `RunOnceRefused`, a `ValueError` that carries
+`session_id`. If the first lookup misses but setup then fails because another
+caller created the session in the meantime, `run_once` answers from that session.
+
 When a caller already has a loaded transcript, `final_output_text(transcript)`
 returns the concatenated text from the most recent assistant message that
 contains text, or an empty string when none does. This is intentionally distinct
