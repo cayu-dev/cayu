@@ -1898,6 +1898,9 @@ async def _exercise_eval_addition_ownership(page: Page, base_url: str) -> None:
             await sheet.get_by_role("button", name="Retry saved addition", exact=True).click()
             if settlement == "abandon":
                 await sheet.get_by_role("button", name="Review a new addition", exact=True).click()
+                # Abandoning recovery reloads the source capture for a fresh review.
+                # Closing before it settles would cancel that read mid-flight.
+                await expect(sheet.get_by_label("Suite", exact=True)).to_be_visible()
                 await sheet.get_by_role("button", name="Close", exact=True).first.click()
             else:
                 await expect(page).to_have_url(re.compile(r"/cayu/evals/runs/"))
