@@ -23,11 +23,19 @@ import { ApiClientError } from "@/lib/api"
 import { executeResolveProviderOperationMutation } from "@/lib/mutation-browser"
 import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
 import {
+  anchorOffset,
+  readingPositionFromScroll,
+  readReadingPosition,
+  restoreScrollPosition,
+  writeReadingPosition,
+} from "@/lib/reading-position"
+import {
   historySearchPatch,
   type SessionDetailSearch,
   workflowSearchFromSession,
   workflowSearchPatch,
 } from "@/lib/session-detail-search"
+import { clearSessionDraft, readSessionDraft, writeSessionDraft } from "@/lib/session-draft"
 import {
   initialFilteredPageNavigation,
   navigateToNewerPage,
@@ -125,7 +133,12 @@ export function SessionPage({
   const mutation = useSessionMutation()
   const interruptMutation = useSessionMutation()
   const queue = useSessionMessageQueue(sessionId, canExecute && !services.prototype)
-  const [draft, setDraft] = useState("")
+  // The unsent draft survives leaving the session and reloading; sending clears it.
+  const [draft, setDraft] = useState(() => readSessionDraft(sessionId))
+  const draftRef = useRef(draft)
+  draftRef.current = draft
+  useEffect(() => writeSessionDraft(sessionId, draft), [sessionId, draft])
+  const keepUnsentDraft = () => writeSessionDraft(sessionId, draftRef.current)
   const submittedDraft = useRef("")
   const now = useNow()
   const queryClient = useQueryClient()
@@ -151,7 +164,18 @@ export function SessionPage({
     initialFilteredPageNavigation<TranscriptPageParam>(filterKey, null),
   )
   const navigation = pageNavigationForFilter(history, filterKey, null)
-  const [pinned, setPinned] = useState(true)
+  // Returning to the session puts the conversation back where it was being read, unless
+  // that was its end, which keeps following new activity.
+  const readingKey = `session:${sessionId}`
+  const [savedReading] = useState(() => {
+    const saved = readReadingPosition(readingKey)
+    return saved && saved.view === filterKey && !saved.atEnd ? saved : null
+  })
+  const restoringReading = useRef(savedReading !== null)
+  const conversationRef = useRef<HTMLDivElement>(null)
+  const conversationContentRef = useRef<HTMLDivElement>(null)
+  const conversationAnchorRef = useRef<HTMLDivElement>(null)
+  const [pinned, setPinned] = useState(savedReading === null)
   const [newActivity, setNewActivity] = useState(false)
   const [transcriptPosition, setTranscriptPosition] = useState<{
     messageIndex: number
@@ -254,7 +278,9 @@ export function SessionPage({
       submittedDraft.current = text
       return mutation.execute("reply", (options) => api.reply(sessionId, text, options))
     },
+    onError: keepUnsentDraft,
     onSuccess: (result, text) => {
+      if (result?.phase === "request_failed") keepUnsentDraft()
       if (result === null) return
       if (!result || result.phase === "terminal")
         setDraft((current) => (current.trim() === text ? "" : current))
@@ -402,6 +428,31 @@ export function SessionPage({
         )
         ?.scrollIntoView({ block: "center" })
   }, [trace, transcriptPosition, transcript.data])
+
+  const transcriptLoaded = !!transcript.data && !transcript.isFetching
+  const transcriptOffset = transcript.data?.offset
+  useEffect(() => {
+    const element = conversationRef.current
+    const content = conversationContentRef.current
+    if (!savedReading || !restoringReading.current || trace || !transcriptLoaded) return
+    if (!element || !content) return
+    // Pixel offsets only identify a position within the same bounded transcript window.
+    if (savedReading.view !== filterKey || savedReading.transcriptOffset !== transcriptOffset) {
+      restoringReading.current = false
+      writeReadingPosition(readingKey, null)
+      setPinned(true)
+      return
+    }
+    return restoreScrollPosition(
+      element,
+      content,
+      savedReading.top,
+      () => {
+        restoringReading.current = false
+      },
+      { anchor: () => conversationAnchorRef.current },
+    )
+  }, [savedReading, trace, transcriptLoaded, transcriptOffset, filterKey, readingKey])
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: follow new transcript and decision content only while pinned
   useEffect(() => {
@@ -725,10 +776,24 @@ export function SessionPage({
         ) : (
           <>
             <div
+              ref={conversationRef}
               className="relative min-h-0 flex-1 overflow-y-auto"
               onScroll={(event) => {
+                if (restoringReading.current) return
                 const node = event.currentTarget
-                const atTail = node.scrollHeight - node.scrollTop - node.clientHeight <= 32
+                const position = readingPositionFromScroll(
+                  node,
+                  filterKey,
+                  anchorOffset(node, conversationAnchorRef.current),
+                )
+                // Only the latest page is restored; an older page isn't where a return lands.
+                writeReadingPosition(
+                  readingKey,
+                  navigation.current === null && transcriptOffset !== undefined
+                    ? { ...position, transcriptOffset }
+                    : null,
+                )
+                const atTail = position.atEnd
                 setPinned(atTail)
                 if (atTail && newActivity && navigation.current === null) {
                   void transcript.refetch().then((result) => {
@@ -737,7 +802,10 @@ export function SessionPage({
                 }
               }}
             >
-              <div className="mx-auto w-full max-w-3xl px-4 pt-5 pb-6 sm:px-6">
+              <div
+                ref={conversationContentRef}
+                className="mx-auto w-full max-w-3xl px-4 pt-5 pb-6 sm:px-6"
+              >
                 <div className="mb-5 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-muted-foreground">
                   <NavLink
                     to="/agents"
@@ -908,145 +976,147 @@ export function SessionPage({
                       )}
                     </article>
                   ))}
-                <Conversation
-                  position={transcriptPosition}
-                  blocks={filters.role === "system" || filters.role === "tool" ? [] : blocks}
-                  displays={displays}
-                  onTrace={(tool) => {
-                    if (services.prototype) openTrace(toolSpanId(tool.id))
-                    else {
-                      setTranscriptPosition({
-                        messageIndex: tool.messageIndex,
-                        partIndex: tool.partIndex,
-                      })
-                      openTrace()
-                    }
-                  }}
-                  pending="unknown"
-                >
-                  <SubagentRows rows={relations.rows} />
-                  {relations.parent.error && <ErrorState error={relations.parent.error} />}
-                  {relations.children.error && <ErrorState error={relations.children.error} />}
-                  {relations.children.hasNextPage && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={relations.children.isFetchingNextPage}
-                      onClick={() => void relations.children.fetchNextPage()}
-                    >
-                      Load more subagents
-                    </Button>
-                  )}
-                  {state === "failed" && (
-                    <p className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-                      <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-                      {o?.reason ?? "This session failed."}
-                    </p>
-                  )}
-                  {state === "interrupted" &&
-                    inbox.isSuccess &&
-                    !inbox.isFetching &&
-                    !inbox.historical &&
-                    !inbox.hasNextPage &&
-                    !inbox.data?.issues.length &&
-                    items.length === 0 && (
-                      <p className="text-sm text-muted-foreground">
-                        This session was stopped. Send a message to continue it.
-                      </p>
-                    )}
-                  {inbox.error && <ErrorState error={inbox.error} />}
-                  {inbox.data?.issues.map((issue) => (
-                    <p
-                      role="status"
-                      key={JSON.stringify(issue)}
-                      className="text-sm text-warning [overflow-wrap:anywhere]"
-                    >
-                      {issue.detail}{" "}
-                      {issue.session_id && (
-                        <NavLink {...sessionRoute(issue.session_id)}>
-                          Inspect session {issue.session_id}
-                        </NavLink>
-                      )}
-                    </p>
-                  ))}
-                  {inbox.isSuccess &&
-                    !inbox.isFetching &&
-                    inbox.historical &&
-                    !items.length &&
-                    !inbox.hasNextPage &&
-                    !inbox.data?.issues.length && (
-                      <p className="text-xs text-muted-foreground">
-                        No actions on this older page. Refresh to check newest actions.
-                      </p>
-                    )}
-                  {inbox.historical && (
-                    <p className="text-xs text-muted-foreground">
-                      Showing an older action page. Refresh to return to newest.
-                    </p>
-                  )}
-                  {(inbox.historical ||
-                    inbox.hasNextPage ||
-                    inbox.error ||
-                    !!inbox.data?.issues.length) && (
-                    <div className="flex flex-wrap gap-2">
+                <div ref={conversationAnchorRef}>
+                  <Conversation
+                    position={transcriptPosition}
+                    blocks={filters.role === "system" || filters.role === "tool" ? [] : blocks}
+                    displays={displays}
+                    onTrace={(tool) => {
+                      if (services.prototype) openTrace(toolSpanId(tool.id))
+                      else {
+                        setTranscriptPosition({
+                          messageIndex: tool.messageIndex,
+                          partIndex: tool.partIndex,
+                        })
+                        openTrace()
+                      }
+                    }}
+                    pending="unknown"
+                  >
+                    <SubagentRows rows={relations.rows} />
+                    {relations.parent.error && <ErrorState error={relations.parent.error} />}
+                    {relations.children.error && <ErrorState error={relations.children.error} />}
+                    {relations.children.hasNextPage && (
                       <Button
                         variant="outline"
-                        disabled={inbox.isFetching}
-                        onClick={() => void inbox.refetch()}
+                        size="sm"
+                        disabled={relations.children.isFetchingNextPage}
+                        onClick={() => void relations.children.fetchNextPage()}
                       >
-                        Refresh actions
+                        Load more subagents
                       </Button>
-                      {inbox.hasNextPage && (
+                    )}
+                    {state === "failed" && (
+                      <p className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                        <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+                        {o?.reason ?? "This session failed."}
+                      </p>
+                    )}
+                    {state === "interrupted" &&
+                      inbox.isSuccess &&
+                      !inbox.isFetching &&
+                      !inbox.historical &&
+                      !inbox.hasNextPage &&
+                      !inbox.data?.issues.length &&
+                      items.length === 0 && (
+                        <p className="text-sm text-muted-foreground">
+                          This session was stopped. Send a message to continue it.
+                        </p>
+                      )}
+                    {inbox.error && <ErrorState error={inbox.error} />}
+                    {inbox.data?.issues.map((issue) => (
+                      <p
+                        role="status"
+                        key={JSON.stringify(issue)}
+                        className="text-sm text-warning [overflow-wrap:anywhere]"
+                      >
+                        {issue.detail}{" "}
+                        {issue.session_id && (
+                          <NavLink {...sessionRoute(issue.session_id)}>
+                            Inspect session {issue.session_id}
+                          </NavLink>
+                        )}
+                      </p>
+                    ))}
+                    {inbox.isSuccess &&
+                      !inbox.isFetching &&
+                      inbox.historical &&
+                      !items.length &&
+                      !inbox.hasNextPage &&
+                      !inbox.data?.issues.length && (
+                        <p className="text-xs text-muted-foreground">
+                          No actions on this older page. Refresh to check newest actions.
+                        </p>
+                      )}
+                    {inbox.historical && (
+                      <p className="text-xs text-muted-foreground">
+                        Showing an older action page. Refresh to return to newest.
+                      </p>
+                    )}
+                    {(inbox.historical ||
+                      inbox.hasNextPage ||
+                      inbox.error ||
+                      !!inbox.data?.issues.length) && (
+                      <div className="flex flex-wrap gap-2">
                         <Button
                           variant="outline"
                           disabled={inbox.isFetching}
-                          onClick={() => void inbox.fetchNextPage()}
+                          onClick={() => void inbox.refetch()}
                         >
-                          Load more actions
+                          Refresh actions
                         </Button>
-                      )}
-                    </div>
-                  )}
-                  {items.map((item) => (
-                    <InboxCard
-                      key={item.id}
-                      item={item}
-                      recoveryEnabled={canRecover}
-                      mutationBlocked={
-                        mutation.fenced ||
-                        mutation.busy ||
-                        interruptMutation.fenced ||
-                        interruptMutation.busy
-                      }
-                      onRecover={async (body) => {
-                        if (!canRecover)
-                          throw new Error(
-                            "Recovery requires full access and pending-action capability.",
+                        {inbox.hasNextPage && (
+                          <Button
+                            variant="outline"
+                            disabled={inbox.isFetching}
+                            onClick={() => void inbox.fetchNextPage()}
+                          >
+                            Load more actions
+                          </Button>
+                        )}
+                      </div>
+                    )}
+                    {items.map((item) => (
+                      <InboxCard
+                        key={item.id}
+                        item={item}
+                        recoveryEnabled={canRecover}
+                        mutationBlocked={
+                          mutation.fenced ||
+                          mutation.busy ||
+                          interruptMutation.fenced ||
+                          interruptMutation.busy
+                        }
+                        onRecover={async (body) => {
+                          if (!canRecover)
+                            throw new Error(
+                              "Recovery requires full access and pending-action capability.",
+                            )
+                          const result = await mutation.execute("recovery", (options) =>
+                            api.recover(sessionId, body, options),
                           )
-                        const result = await mutation.execute("recovery", (options) =>
-                          api.recover(sessionId, body, options),
-                        )
-                        if (result === null)
-                          throw new DOMException("Observation stopped.", "AbortError")
-                        if (result?.phase === "request_failed")
-                          throw new Error(
-                            mutationTransportErrorMessage(result) ?? "Recovery was rejected.",
-                          )
-                        refresh()
-                        return result?.phase === "transport_failed" ? "unknown" : "observed"
-                      }}
-                    />
-                  ))}
-                  {running && (
-                    <p className="flex items-center gap-2 text-sm text-muted-foreground">
-                      <span
-                        className="size-2 animate-pulse rounded-full bg-info motion-reduce:animate-none"
-                        aria-hidden="true"
+                          if (result === null)
+                            throw new DOMException("Observation stopped.", "AbortError")
+                          if (result?.phase === "request_failed")
+                            throw new Error(
+                              mutationTransportErrorMessage(result) ?? "Recovery was rejected.",
+                            )
+                          refresh()
+                          return result?.phase === "transport_failed" ? "unknown" : "observed"
+                        }}
                       />
-                      Working…
-                    </p>
-                  )}
-                </Conversation>
+                    ))}
+                    {running && (
+                      <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <span
+                          className="size-2 animate-pulse rounded-full bg-info motion-reduce:animate-none"
+                          aria-hidden="true"
+                        />
+                        Working…
+                      </p>
+                    )}
+                  </Conversation>
+                </div>
                 <div ref={endRef} />
               </div>
             </div>
@@ -1179,10 +1249,12 @@ export function SessionPage({
                       (!queue.inspection.data || !!queue.inspection.error))
                   }
                   onSend={(text) => {
+                    clearSessionDraft(sessionId)
                     if (running && !services.prototype) {
                       void queue.submit(text).then((content) => {
                         if (content !== null)
                           setDraft((current) => (current.trim() === content ? "" : current))
+                        else if (router.state.location.pathname === origin) keepUnsentDraft()
                       })
                     } else reply.mutate(text)
                   }}

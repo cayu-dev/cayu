@@ -222,7 +222,8 @@ async def run(
                             http_credentials={"username": "operator", "password": password},
                         )
                         page = await context.new_page()
-                        await page.goto(origin + "/operator/sessions/" + SESSION)
+                        # Recordings live in the session's Browser details tab.
+                        await page.goto(origin + "/operator/sessions/" + SESSION + "?panel=browser")
                         selector = page.get_by_label("Select browser recording", exact=True)
                         await expect(selector).to_be_visible(timeout=20000)
                         await selector.select_option(ids[0])

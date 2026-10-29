@@ -1,4 +1,12 @@
-"""Verified browser contract for the packaged Cayu dashboard."""
+"""Verified browser contract for the packaged Cayu dashboard.
+
+It runs four parts: the eval-page journeys (`evals`), this file's contract
+(`contract`), the real-server role checks in `dashboard_role_access.py` (`roles`) and
+the session-workspace journey in `dashboard_session_journey.py` (`journey`). Set
+`CAYU_DASHBOARD_PART` to a comma-separated list to run only some of them, for example
+`CAYU_DASHBOARD_PART=roles,journey`; `CAYU_DASHBOARD_JOURNEY=contract` leaves out the
+eval-page journeys, which CI runs as their own groups.
+"""
 
 from __future__ import annotations
 
@@ -541,14 +549,38 @@ def _profiled_session_identity(
     )
 
 
+DASHBOARD_PARTS = ("evals", "contract", "roles", "journey")
+
+
+def _selected_parts() -> tuple[str, ...]:
+    """The parts `CAYU_DASHBOARD_PART` names (comma-separated), or all of them.
+
+    `evals` runs the eval-page journeys, `contract` this file's browser contract,
+    `roles` the real-server role checks and `journey` the session-workspace journey.
+    """
+
+    raw = os.environ.get("CAYU_DASHBOARD_PART", "")
+    selected = {part.strip() for part in raw.split(",") if part.strip()}
+    if not selected:
+        return DASHBOARD_PARTS
+    unknown = selected - set(DASHBOARD_PARTS)
+    if unknown:
+        raise SystemExit(
+            f"CAYU_DASHBOARD_PART names unknown parts {sorted(unknown)}; "
+            f"choose from {', '.join(DASHBOARD_PARTS)}."
+        )
+    return tuple(part for part in DASHBOARD_PARTS if part in selected)
+
+
 async def main() -> None:
     require_equal(
         DashboardContractTool.spec.effect,
         ToolEffect.NONE,
         "dashboard contract tool must remain mutation-free",
     )
+    parts = _selected_parts()
     # CI runs the eval-page journeys as their own package groups beside this contract.
-    if os.environ.get("CAYU_DASHBOARD_JOURNEY", "all") != "contract":
+    if "evals" in parts and os.environ.get("CAYU_DASHBOARD_JOURNEY", "all") != "contract":
         from dashboard_eval_authoring import exercise_eval_authoring
         from dashboard_eval_boundaries import exercise_eval_boundaries
 
@@ -557,6 +589,21 @@ async def main() -> None:
         from dashboard_eval_reporting import exercise_reported_evals
 
         await asyncio.create_task(exercise_reported_evals())
+    evidence: dict[str, object] = await _run_contract() if "contract" in parts else {}
+    # Each of these serves its own app, so its checks can't disturb the contract's counts.
+    if "roles" in parts:
+        from dashboard_role_access import exercise_role_access
+
+        evidence["role_access"] = await exercise_role_access()
+    if "journey" in parts:
+        from dashboard_session_journey import exercise_session_journey
+
+        evidence["session_journey"] = await exercise_session_journey()
+    evidence["parts"] = list(parts)
+    print(f"{EVIDENCE_PREFIX}{json.dumps(evidence, sort_keys=True)}")
+
+
+async def _run_contract() -> dict[str, object]:
     app, provider, store, task_store, runtime_directory = await _seed_app()
     price_book = _dashboard_price_book()
     judge_app = CayuApp(enable_logging=False)
@@ -728,7 +775,7 @@ async def main() -> None:
         evidence["mutation_provider_requests"] = len(provider.requests)
         evidence["injected_initial_disconnects"] = server_app.initial_run_requests
         evidence["mutation_replay_requests"] = len(server_app.replay_requests)
-        print(f"{EVIDENCE_PREFIX}{json.dumps(evidence, sort_keys=True)}")
+        return evidence
     finally:
         server.should_exit = True
         try:

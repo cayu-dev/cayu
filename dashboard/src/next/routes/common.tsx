@@ -4,11 +4,26 @@ import {
   type NavigateOptions,
   type RegisteredRouter,
   useNavigate,
+  useRouterState,
 } from "@tanstack/react-router"
 import { Ellipsis, Menu, PanelLeft } from "lucide-react"
-import { createContext, type MouseEvent, type ReactNode, type RefObject, useContext } from "react"
+import {
+  createContext,
+  type MouseEvent,
+  type ReactNode,
+  type RefObject,
+  useContext,
+  useLayoutEffect,
+  useRef,
+} from "react"
 import { Button } from "@/components/ui/button"
 import { dashboardAsset } from "@/lib/config"
+import {
+  readingPositionFromScroll,
+  readReadingPosition,
+  restoreScrollPosition,
+  writeReadingPosition,
+} from "@/lib/reading-position"
 import { cn } from "@/lib/utils"
 import type { SessionOverview, SessionState } from "../api/types"
 import { STATE_LABEL, shouldFollowRowClick } from "../app/session-model"
@@ -274,7 +289,10 @@ export function TopBar({ children, actions }: { children?: ReactNode; actions?: 
   )
 }
 
-/** A scrolling page body with a centered column. */
+/**
+ * A scrolling page body with a centered column. Back and Forward return it to where it
+ * was being read, as a browser does for a whole page; following a link starts at the top.
+ */
 export function PageBody({
   children,
   width = "max-w-5xl",
@@ -282,9 +300,31 @@ export function PageBody({
   children: ReactNode
   width?: string
 }) {
+  const scroller = useRef<HTMLDivElement>(null)
+  const content = useRef<HTMLDivElement>(null)
+  const entry = useRouterState({ select: (s) => s.location.state.__TSR_key ?? s.location.href })
+  const key = `page:${entry}`
+  const restoring = useRef(false)
+  useLayoutEffect(() => {
+    const saved = readReadingPosition(key)
+    if (!saved || !scroller.current || !content.current) return
+    restoring.current = true
+    return restoreScrollPosition(scroller.current, content.current, saved.top, () => {
+      restoring.current = false
+    })
+  }, [key])
   return (
-    <div className="relative min-h-0 flex-1 overflow-y-auto">
-      <div className={cn("mx-auto w-full px-4 py-5 sm:px-6", width)}>{children}</div>
+    <div
+      ref={scroller}
+      className="relative min-h-0 flex-1 overflow-y-auto"
+      onScroll={(event) => {
+        if (!restoring.current)
+          writeReadingPosition(key, readingPositionFromScroll(event.currentTarget, "page"))
+      }}
+    >
+      <div ref={content} className={cn("mx-auto w-full px-4 py-5 sm:px-6", width)}>
+        {children}
+      </div>
     </div>
   )
 }

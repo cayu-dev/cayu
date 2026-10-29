@@ -76,6 +76,8 @@ _RELEASE_EXACT_PATHS = {
     "README.md",
     "docs/release-notes.md",
     "examples/dashboard_behavior_live.py",
+    "examples/dashboard_role_access.py",
+    "examples/dashboard_session_journey.py",
     "examples/dashboard_eval_authoring.py",
     "examples/dashboard_eval_settings.py",
     "examples/dashboard_eval_recovery.py",

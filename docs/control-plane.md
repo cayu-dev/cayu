@@ -119,8 +119,10 @@ protected human review is used when configured. Members cannot replace arguments
 For an interrupted task, explicitly select task continuation before deciding;
 this requests a new owned claim and never borrows an active worker's authority.
 
-Evals and System are omitted for members; opening those URLs directly
-shows an access explanation before their page requests start. Home and Sessions
+System is omitted for members; opening it directly shows an access explanation
+before its page requests start. Members can read eval suites, runs and
+comparisons; run details, report downloads, execution configuration and the
+advanced tools stay with full access. Home and Sessions
 hide execution controls for members, including after an old `/run` redirect. Full-access
 mutation controls elsewhere are hidden or disabled with an explanation.
 Browser-control and evaluation-authoring panels do not mount for members.
