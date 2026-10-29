@@ -22,6 +22,7 @@ from pydantic import (
 from cayu._time_buckets import TimeSeriesSpec, bucket_index, time_buckets
 from cayu.budgets.aggregates import (
     EXACT_AGGREGATE,
+    MAX_USAGE_COST_CANDIDATES,
     AggregateAccuracy,
     AggregateAccuracyKind,
     AggregateUsageMetrics,
@@ -32,6 +33,7 @@ from cayu.budgets.aggregates import (
     UsageAggregateTotals,
     UsageRollupStoreResult,
     UsageSessionAggregateBreakdown,
+    UsageSessionAggregateCandidates,
     UsageSessionAggregateGroup,
     UsageSessionAggregateRemainder,
     UsageTimeBucket,
@@ -42,6 +44,7 @@ from cayu.budgets.aggregates import (
     build_aggregate_usage_metrics,
     normalize_aggregate_event_timestamp,
     require_bounded_usage_session_id,
+    usage_session_display,
 )
 from cayu.budgets.reported import ReportedCostCollector
 from cayu.budgets.usage import UsageMetrics
@@ -63,8 +66,15 @@ class UsageRollupQuery(BaseModel):
     sessions: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
     group_limit: StrictInt = Field(default=20, ge=1, le=100)
     session_group_limit: StrictInt | None = Field(default=None, ge=1, le=100)
+    include_cost_candidates: StrictBool = False
     include_pricing_inputs: StrictBool = False
     pricing_input_limit: StrictInt = Field(default=1000, ge=1, le=5000)
+
+    @property
+    def retained_session_limit(self) -> int | None:
+        return (
+            MAX_USAGE_COST_CANDIDATES if self.include_cost_candidates else self.session_group_limit
+        )
 
     @field_validator("start_at", "end_at")
     @classmethod
@@ -75,6 +85,10 @@ class UsageRollupQuery(BaseModel):
 
     @model_validator(mode="after")
     def validate_window(self) -> UsageRollupQuery:
+        if self.include_cost_candidates and (
+            self.session_group_limit is None or not self.include_pricing_inputs
+        ):
+            raise ValueError("Cost candidates require session groups and pricing inputs.")
         if self.start_at >= self.end_at:
             raise ValueError("Usage rollup start_at must be before end_at.")
         if self.end_at - self.start_at > MAX_USAGE_ROLLUP_WINDOW:
@@ -321,6 +335,7 @@ def _usage_rollup_from_session_records(
     as_of: datetime,
     matching_session_count: int,
     active_session_count: int,
+    session_display: Callable[[str], tuple[str, object]] | None = None,
 ) -> UsageRollupStoreResult:
     reported = ReportedCostCollector()
     totals = _UsageAccumulator()
@@ -344,7 +359,7 @@ def _usage_rollup_from_session_records(
         active_buckets: set[int] = set()
         session_accumulator = (
             None
-            if query.session_group_limit is None
+            if query.retained_session_limit is None
             else _SessionUsageAccumulator(session_id=session_id, status=status)
         )
         for record in records:
@@ -444,19 +459,19 @@ def _usage_rollup_from_session_records(
         if session_has_activity:
             activity_session_count += 1
         if session_accumulator is not None:
-            assert query.session_group_limit is not None
+            assert query.retained_session_limit is not None
             _retain_bounded_session_usage_group(
                 retained_session_groups,
                 session_remainder,
                 session_accumulator.candidate(),
-                limit=query.session_group_limit,
+                limit=query.retained_session_limit,
             )
 
     pricing_items, pricing_group_count, pricing_accuracy = pricing.result()
     session_breakdown = _in_memory_session_usage_breakdown(
         retained_session_groups,
         session_remainder,
-        limit=query.session_group_limit,
+        limit=query.retained_session_limit,
     )
     if query.include_pricing_inputs and session_breakdown is not None and session_breakdown.groups:
         visible_session_ids = {group.session_id for group in session_breakdown.groups}
@@ -483,6 +498,12 @@ def _usage_rollup_from_session_records(
         session_pricing_group_count,
         session_pricing_accuracy,
     ) = session_pricing.result()
+
+    if session_breakdown is not None and session_display is not None:
+        for group in session_breakdown.groups:
+            agent_name, title = session_display(group.session_id)
+            group.agent_name = usage_session_display(agent_name)
+            group.title = usage_session_display(title)
 
     totals.session_count = activity_session_count
     return UsageRollupStoreResult(
@@ -524,7 +545,7 @@ def _usage_rollup_from_session_records(
         pricing_inputs_accuracy=pricing_accuracy,
         session_pricing_inputs=session_pricing_items,
         session_pricing_inputs_included=(
-            query.include_pricing_inputs and query.session_group_limit is not None
+            query.include_pricing_inputs and query.retained_session_limit is not None
         ),
         session_pricing_input_group_count=session_pricing_group_count,
         session_pricing_inputs_accuracy=session_pricing_accuracy,
@@ -565,7 +586,7 @@ def _in_memory_session_usage_breakdown(
         for candidate in sorted(retained, key=_session_usage_group_rank_key)
     )
     remainder_result = remainder.result()
-    return UsageSessionAggregateBreakdown(
+    return (UsageSessionAggregateCandidates if limit > 100 else UsageSessionAggregateBreakdown)(
         groups=groups,
         remainder=remainder_result,
         accuracy=(

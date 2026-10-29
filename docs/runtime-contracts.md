@@ -10097,7 +10097,7 @@ they are not historical attributes captured at event time. Active sessions are
 included. Provider and model detail is bounded by `group_limit`, with exact
 omitted totals in a `remainder`, so bounding detail does not understate the
 top-level totals. `session_group_limit` is an opt-in per-session projection for
-workflow and causal-budget attribution. It orders current matching sessions by
+workflow and causal-budget attribution. By default it orders current matching sessions by
 window token usage, then model steps and session id, and returns at most 100
 session groups plus an exact aggregate remainder for omitted sessions. Each
 retained group reports current lifecycle status separately from usage activity
@@ -10125,6 +10125,31 @@ not prevent their exact counters from contributing to the remainder. If
 configured secret redaction would alter a retained session identity, the
 endpoint fails closed with `409` instead of returning a redacted identity that
 could collide with another session or become an invalid drill-down target.
+
+Cost reporting additionally accepts public `session_order="cost"`. Native
+stores advertise `supports_usage_cost_details` (custom-store default false),
+covering bounded complete candidates and snapshot session display metadata.
+The internal `UsageRollupQuery.include_cost_candidates` opt-in requires pricing
+inputs and a session group limit, and expands `retained_session_limit` to 1,000;
+it does not change the public 100-row response limit or the default token path.
+Native candidate groups remain token ordered, and result validation checks the
+explicit effective limit and complete usage/pricing conservation before cost
+selection. The canonical pricing owner prices all candidates before selecting
+winners, using one request-local cache bound to the price book and canonical
+UTC-date/metric identities. Provider, model, headline, candidate and remainder
+costs share that resolution, without introducing a second pricing engine.
+
+Incomplete candidates, incomplete price inputs, unpriced usage or mixed
+currencies never produce partial cost ordering. The public ranking metadata
+reports token fallback and its reason. A candidate identity/byte overflow may
+retry one ordinary bounded token query; no fields from the discarded snapshot
+are retained. Existing token-query errors remain errors. Public rows include
+nullable bounded title and specialist metadata from the same snapshot, with no
+per-session read. Activity may be established by auxiliary or terminal hosted
+usage even when model-step/tool-call counters are zero. Auxiliary occurrences
+must never be counted as ordinary model-step occurrences in pricing remainders.
+See [Usage cost reporting](control-plane.md#usage-costs-and-session-order) for
+public fields, limits, fallback reasons and CLI parity.
 
 An optional usage `series` requests up to 512 contiguous hour/day/week buckets
 with exact UTC bounds and the same normalized event families as the headline.

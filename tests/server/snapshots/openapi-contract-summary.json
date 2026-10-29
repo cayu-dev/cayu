@@ -7650,6 +7650,16 @@
         "usage": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
+        "usage_cost_details": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "usage_series": {
           "anyOf": [
             {
@@ -23533,7 +23543,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "76",
+          "default": "77",
           "title": "Contract Version",
           "type": "string"
         },
@@ -29759,6 +29769,102 @@
       "title": "UsageCurrencyCost",
       "type": "object"
     },
+    "UsageDimensionCostBreakdown": {
+      "additionalProperties": false,
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "groups": {
+          "items": {
+            "$ref": "#/components/schemas/UsageDimensionCostGroup"
+          },
+          "maxItems": 100,
+          "title": "Groups",
+          "type": "array"
+        },
+        "price_book_generated_at": {
+          "title": "Price Book Generated At",
+          "type": "string"
+        },
+        "price_book_version": {
+          "title": "Price Book Version",
+          "type": "string"
+        },
+        "remainder": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageDimensionCostRemainder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "price_book_version",
+        "price_book_generated_at",
+        "groups",
+        "accuracy"
+      ],
+      "title": "UsageDimensionCostBreakdown",
+      "type": "object"
+    },
+    "UsageDimensionCostGroup": {
+      "additionalProperties": false,
+      "properties": {
+        "cost": {
+          "$ref": "#/components/schemas/UsageSessionCostSummary"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        }
+      },
+      "required": [
+        "cost"
+      ],
+      "title": "UsageDimensionCostGroup",
+      "type": "object"
+    },
+    "UsageDimensionCostRemainder": {
+      "additionalProperties": false,
+      "properties": {
+        "cost": {
+          "$ref": "#/components/schemas/UsageSessionCostSummary"
+        },
+        "group_count": {
+          "pattern": "^[1-9]\\d*$",
+          "title": "Group Count",
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_count",
+        "cost"
+      ],
+      "title": "UsageDimensionCostRemainder",
+      "type": "object"
+    },
     "UsageMetrics": {
       "additionalProperties": false,
       "description": "Provider-neutral token counters for one model step.",
@@ -29906,6 +30012,15 @@
           "description": "Opt-in maximum number of per-session usage groups. Omitted matching sessions are represented by an exact aggregate remainder. When omitted, stores perform no per-session breakdown or session-aware pricing work.",
           "title": "Session Group Limit"
         },
+        "session_order": {
+          "default": "tokens",
+          "enum": [
+            "tokens",
+            "cost"
+          ],
+          "title": "Session Order",
+          "type": "string"
+        },
         "start_at": {
           "format": "date-time",
           "title": "Start At",
@@ -29962,8 +30077,28 @@
         "model_breakdown": {
           "$ref": "#/components/schemas/UsageAggregateBreakdown"
         },
+        "model_cost_breakdown": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageDimensionCostBreakdown"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "provider_breakdown": {
           "$ref": "#/components/schemas/UsageAggregateBreakdown"
+        },
+        "provider_cost_breakdown": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageDimensionCostBreakdown"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "reported_costs": {
           "anyOf": [
@@ -30015,6 +30150,16 @@
           "title": "Session Filter Basis",
           "type": "string"
         },
+        "session_ranking": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageSessionRanking"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "start_at": {
           "format": "date-time",
           "title": "Start At",
@@ -30063,6 +30208,15 @@
           "title": "Groups",
           "type": "array"
         },
+        "order": {
+          "default": "tokens",
+          "enum": [
+            "tokens",
+            "cost"
+          ],
+          "title": "Order",
+          "type": "string"
+        },
         "remainder": {
           "anyOf": [
             {
@@ -30090,6 +30244,18 @@
           "title": "Active",
           "type": "boolean"
         },
+        "agent_name": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Agent Name"
+        },
         "session_id": {
           "title": "Session Id",
           "type": "string"
@@ -30105,6 +30271,18 @@
           ],
           "title": "Status",
           "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
         },
         "totals": {
           "$ref": "#/components/schemas/UsageAggregateTotals"
@@ -30300,6 +30478,63 @@
         "unpriced_reasons"
       ],
       "title": "UsageSessionCostSummary",
+      "type": "object"
+    },
+    "UsageSessionRanking": {
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Currency"
+        },
+        "effective_order": {
+          "enum": [
+            "tokens",
+            "cost"
+          ],
+          "title": "Effective Order",
+          "type": "string"
+        },
+        "requested_order": {
+          "enum": [
+            "tokens",
+            "cost"
+          ],
+          "title": "Requested Order",
+          "type": "string"
+        },
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "pricing_not_configured",
+                "candidate_limit",
+                "pricing_projection_incomplete",
+                "prices_incomplete",
+                "mixed_currencies",
+                "candidate_byte_limit"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unavailable Reason"
+        }
+      },
+      "required": [
+        "requested_order",
+        "effective_order"
+      ],
+      "title": "UsageSessionRanking",
       "type": "object"
     },
     "UsageTimeBucket": {
@@ -30844,7 +31079,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "76",
+          "default": "77",
           "title": "Contract Version",
           "type": "string"
         }

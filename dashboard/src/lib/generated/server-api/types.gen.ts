@@ -4800,6 +4800,7 @@ export type ControlPlaneSurfaceCapabilities = {
     tool_inventory?: OptionalSurfaceCapability | null;
     tool_usage?: OptionalSurfaceCapability | null;
     usage: OptionalSurfaceCapability;
+    usage_cost_details?: OptionalSurfaceCapability | null;
     usage_series?: OptionalSurfaceCapability | null;
     workflow?: OptionalSurfaceCapability | null;
 };
@@ -22998,6 +22999,52 @@ export type UsageCurrencyCost = {
 };
 
 /**
+ * UsageDimensionCostBreakdown
+ */
+export type UsageDimensionCostBreakdown = {
+    accuracy: AggregateAccuracy;
+    /**
+     * Groups
+     */
+    groups: Array<UsageDimensionCostGroup>;
+    /**
+     * Price Book Generated At
+     */
+    price_book_generated_at: string;
+    /**
+     * Price Book Version
+     */
+    price_book_version: string;
+    remainder?: UsageDimensionCostRemainder | null;
+};
+
+/**
+ * UsageDimensionCostGroup
+ */
+export type UsageDimensionCostGroup = {
+    cost: UsageSessionCostSummary;
+    /**
+     * Model
+     */
+    model?: string | null;
+    /**
+     * Provider Name
+     */
+    provider_name?: string | null;
+};
+
+/**
+ * UsageDimensionCostRemainder
+ */
+export type UsageDimensionCostRemainder = {
+    cost: UsageSessionCostSummary;
+    /**
+     * Group Count
+     */
+    group_count: string;
+};
+
+/**
  * UsageMetrics
  *
  * Provider-neutral token counters for one model step.
@@ -23091,6 +23138,10 @@ export type UsageRollupRequest = {
      */
     session_group_limit?: number | null;
     /**
+     * Session Order
+     */
+    session_order?: 'tokens' | 'cost';
+    /**
      * Start At
      */
     start_at: string;
@@ -23123,7 +23174,9 @@ export type UsageRollupResponse = {
      */
     matching_session_count: string;
     model_breakdown: UsageAggregateBreakdown;
+    model_cost_breakdown?: UsageDimensionCostBreakdown | null;
     provider_breakdown: UsageAggregateBreakdown;
+    provider_cost_breakdown?: UsageDimensionCostBreakdown | null;
     reported_costs?: ReportedCostPage | null;
     /**
      * Scope
@@ -23136,6 +23189,7 @@ export type UsageRollupResponse = {
      * Session Filter Basis
      */
     session_filter_basis: 'current_session_attributes';
+    session_ranking?: UsageSessionRanking | null;
     /**
      * Start At
      */
@@ -23158,6 +23212,10 @@ export type UsageSessionAggregateBreakdown = {
      * Groups
      */
     groups: Array<UsageSessionAggregateGroup>;
+    /**
+     * Order
+     */
+    order?: 'tokens' | 'cost';
     remainder: UsageSessionAggregateRemainder | null;
 };
 
@@ -23172,6 +23230,10 @@ export type UsageSessionAggregateGroup = {
      */
     active: boolean;
     /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
      * Session Id
      */
     session_id: string;
@@ -23179,6 +23241,10 @@ export type UsageSessionAggregateGroup = {
      * Status
      */
     status: 'pending' | 'running' | 'interrupting' | 'completed' | 'failed' | 'interrupted';
+    /**
+     * Title
+     */
+    title?: string | null;
     totals: UsageAggregateTotals;
 };
 
@@ -23290,6 +23356,28 @@ export type UsageSessionCostSummary = {
      * Unpriced Reasons
      */
     unpriced_reasons: Array<UsageUnpricedReason>;
+};
+
+/**
+ * UsageSessionRanking
+ */
+export type UsageSessionRanking = {
+    /**
+     * Currency
+     */
+    currency?: string | null;
+    /**
+     * Effective Order
+     */
+    effective_order: 'tokens' | 'cost';
+    /**
+     * Requested Order
+     */
+    requested_order: 'tokens' | 'cost';
+    /**
+     * Unavailable Reason
+     */
+    unavailable_reason?: 'pricing_not_configured' | 'candidate_limit' | 'pricing_projection_incomplete' | 'prices_incomplete' | 'mixed_currencies' | 'candidate_byte_limit' | null;
 };
 
 /**

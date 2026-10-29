@@ -46,6 +46,7 @@ class ControlPlaneCapabilitySnapshot:
     task_creation_supported: bool = False
     tool_usage_supported: bool = False
     environment_activity_supported: bool = False
+    session_usage_cost_details_supported: bool = False
     session_usage_series_supported: bool = False
     session_overview_supported: bool = False
     eval_suite_views_supported: bool = False
@@ -120,6 +121,12 @@ class ControlPlaneCapabilitySnapshot:
                 structured_output_transcript=_optional_surface(True, mutation_supported=False),
                 session_display_metadata=_optional_surface(True, mutation_supported=False),
                 app_info=_optional_surface(True, mutation_supported=False),
+                usage_cost_details=_optional_surface(
+                    True,
+                    read_supported=self.session_usage_aggregates_supported
+                    and self.session_usage_cost_details_supported,
+                    mutation_supported=False,
+                ),
                 usage_series=_optional_surface(
                     True,
                     read_supported=self.session_usage_aggregates_supported
@@ -243,6 +250,7 @@ def inspect_control_plane_capabilities(
     task_creation_supported: bool = False,
     tool_usage_supported: bool = False,
     environment_activity_supported: bool = False,
+    session_usage_cost_details_supported: bool = False,
     session_usage_series_supported: bool = False,
     session_overview_supported: bool = False,
     eval_suite_views_supported: bool = False,
@@ -276,6 +284,7 @@ def inspect_control_plane_capabilities(
         ("task_creation_supported", task_creation_supported),
         ("task_graph_creation_supported", task_graph_creation_supported),
         ("tool_usage_supported", tool_usage_supported),
+        ("session_usage_cost_details_supported", session_usage_cost_details_supported),
         ("session_usage_series_supported", session_usage_series_supported),
         ("environment_activity_supported", environment_activity_supported),
         ("session_overview_supported", session_overview_supported),
@@ -307,6 +316,7 @@ def inspect_control_plane_capabilities(
         task_creation_supported=task_creation_supported,
         task_graph_creation_supported=task_graph_creation_supported,
         tool_usage_supported=tool_usage_supported,
+        session_usage_cost_details_supported=session_usage_cost_details_supported,
         session_usage_series_supported=session_usage_series_supported,
         environment_activity_supported=environment_activity_supported,
         session_overview_supported=session_overview_supported,

@@ -403,6 +403,10 @@ async def aggregate_usage(
             as_of=as_of,
             matching_session_count=matching_session_count,
             active_session_count=active_session_count,
+            session_display=lambda session_id: (
+                state.sessions[session_id].agent_name,
+                state.sessions[session_id].metadata.get("cayu:title"),
+            ),
         )
 
 

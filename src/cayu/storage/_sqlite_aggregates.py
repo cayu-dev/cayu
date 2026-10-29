@@ -12,6 +12,7 @@ from cayu.budgets.aggregates import (
     AGGREGATE_IDENTITY_TRIM_CHARACTERS,
     EXACT_AGGREGATE,
     MAX_AGGREGATE_USAGE_COUNTER,
+    MAX_USAGE_COST_CANDIDATES,
     MAX_USAGE_PRICING_INPUT_BYTES,
     MAX_USAGE_PRICING_RAW_CANDIDATES,
     MAX_USAGE_ROLLUP_SESSION_ID_BYTES,
@@ -26,12 +27,14 @@ from cayu.budgets.aggregates import (
     UsageRollupResultTooLarge,
     UsageRollupStoreResult,
     UsageSessionAggregateBreakdown,
+    UsageSessionAggregateCandidates,
     UsageSessionAggregateGroup,
     UsageSessionAggregateRemainder,
     UsageTimeBucket,
     UsageTimeSeries,
     aggregate_identity_value,
     build_aggregate_usage_metrics,
+    usage_session_display,
 )
 from cayu.events import EventType
 from cayu.sessions.usage import UsageRollupQuery
@@ -512,7 +515,8 @@ scope(session_group_limit) AS (
     SELECT ?
 ),
 matched_sessions AS MATERIALIZED (
-    SELECT id, status
+    SELECT id, status, CASE WHEN length(agent_name) <= 256 THEN agent_name END AS agent_name,
+        CASE WHEN json_type(metadata_json, '$."cayu:title"') = 'text' AND length(json_extract(metadata_json, '$."cayu:title"')) <= 256 THEN json_extract(metadata_json, '$."cayu:title"') END AS title
     FROM cayu_sessions
     {session_where_sql}
 ),
@@ -554,7 +558,7 @@ usage_events AS MATERIALIZED (
 session_grouped_raw AS (
     SELECT
         session.id AS session_id,
-        session.status,
+        session.status, session.agent_name, session.title,
         session.status IN ('pending', 'running', 'interrupting') AS active,
         CASE WHEN COUNT(event.session_id) > 0 THEN 1 ELSE 0 END AS session_count,
         COALESCE(SUM(event.event_type = 'model.completed'), 0) AS model_steps,
@@ -565,11 +569,11 @@ session_grouped_raw AS (
         {session_usage_sum} AS usage_sums
     FROM matched_sessions AS session
     LEFT JOIN usage_events AS event ON event.session_id = session.id
-    GROUP BY session.id, session.status
+    GROUP BY session.id, session.status, session.agent_name, session.title
 ),
 session_grouped AS (
     SELECT
-        session_id, status, active, session_count, model_steps,
+        session_id, status, agent_name, title, active, session_count, model_steps,
         model_steps_with_usage, tool_calls,
         {usage_sum_projection}
     FROM session_grouped_raw
@@ -638,7 +642,8 @@ SELECT
     web_search_calls,
     web_search_outcome_unknown,
     0 AS group_count,
-    0 AS active_session_count
+    0 AS active_session_count,
+    agent_name, title
 FROM retained_sessions
 UNION ALL
 SELECT
@@ -665,7 +670,8 @@ SELECT
     web_search_calls,
     web_search_outcome_unknown,
     group_count,
-    active_session_count
+    active_session_count,
+    NULL, NULL
 FROM session_remainder
 """
 
@@ -715,7 +721,7 @@ def aggregate_session_usage(
     try:
         rows = connection.execute(sql, params).fetchall()
         session_breakdown = None
-        if query.session_group_limit is not None:
+        if query.retained_session_limit is not None:
             session_sql, session_params = session_breakdown_statement(
                 session_plan=session_plan,
                 query=query,
@@ -723,7 +729,7 @@ def aggregate_session_usage(
             session_rows = connection.execute(session_sql, session_params).fetchall()
             session_breakdown = _session_breakdown_from_rows(
                 session_rows,
-                limit=query.session_group_limit,
+                limit=query.retained_session_limit,
             )
         pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
         if query.include_pricing_inputs:
@@ -876,7 +882,7 @@ def session_breakdown_statement(
     session_plan: SessionQuerySqlPlan,
     query: UsageRollupQuery,
 ) -> tuple[str, tuple[object, ...]]:
-    if query.session_group_limit is None:
+    if query.retained_session_limit is None:
         raise ValueError("session_group_limit is required for a session breakdown.")
     sql = _SESSION_BREAKDOWN_SQL.format(
         session_where_sql=session_plan.filter_where_sql,
@@ -892,7 +898,7 @@ def session_breakdown_statement(
     return (
         sql,
         (
-            query.session_group_limit,
+            query.retained_session_limit,
             *session_plan.filter_params,
             query.start_at.isoformat(),
             query.end_at.isoformat(),
@@ -937,8 +943,8 @@ def session_pricing_input_statement(
         raise ValueError("max_input_bytes must be a positive integer.")
     if not session_ids:
         raise ValueError("session_ids cannot be empty.")
-    if len(session_ids) > 100 or len(set(session_ids)) != len(session_ids):
-        raise ValueError("session_ids must contain at most 100 distinct values.")
+    if len(session_ids) > MAX_USAGE_COST_CANDIDATES or len(set(session_ids)) != len(session_ids):
+        raise ValueError("session_ids must contain at most 1000 distinct values.")
     return (
         _SESSION_PRICING_INPUT_SQL.format(
             requested_session_values=", ".join("(?)" for _ in session_ids),
@@ -1186,7 +1192,7 @@ def _result_from_rows(
         pricing_inputs_accuracy=pricing_accuracy,
         session_pricing_inputs=tuple(session_pricing_inputs),
         session_pricing_inputs_included=(
-            query.include_pricing_inputs and query.session_group_limit is not None
+            query.include_pricing_inputs and query.retained_session_limit is not None
         ),
         session_pricing_input_group_count=session_pricing_group_count,
         session_pricing_inputs_accuracy=session_pricing_accuracy,
@@ -1205,6 +1211,8 @@ def _session_breakdown_from_rows(
     groups = tuple(
         UsageSessionAggregateGroup(
             session_id=row["session_id"],
+            agent_name=usage_session_display(row["agent_name"]),
+            title=usage_session_display(row["title"]),
             status=row["status"],
             active=bool(row["active"]),
             totals=_totals_from_row(row),
@@ -1231,7 +1239,7 @@ def _session_breakdown_from_rows(
             totals=_totals_from_row(remainder_row),
         )
     )
-    return UsageSessionAggregateBreakdown(
+    return (UsageSessionAggregateCandidates if limit > 100 else UsageSessionAggregateBreakdown)(
         groups=groups,
         remainder=remainder,
         accuracy=(

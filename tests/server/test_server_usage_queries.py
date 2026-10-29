@@ -429,10 +429,13 @@ def test_server_exposes_bounded_event_time_usage_rollup_and_cost() -> None:
         "accuracy": {"kind": "exact", "limit": None, "reason": None},
     }
     assert body["session_breakdown"] == {
+        "order": "tokens",
         "groups": [
             {
                 "session_id": "aggregate-usage",
                 "status": "pending",
+                "agent_name": "assistant",
+                "title": None,
                 "active": True,
                 "totals": body["totals"],
             }

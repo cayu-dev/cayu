@@ -510,6 +510,52 @@ change the session metadata mutation contract.
 
 
 
+### Usage costs and session order
+
+`POST /api/usage/rollup` accepts `session_order: "cost"` together with
+`session_group_limit` (1–100). The default order is `tokens`. Check
+`capabilities.surfaces.usage_cost_details.read.enabled` before requesting cost
+order. Pricing uses the optional request `pricing` price book; reported provider
+charges remain separate from these estimates.
+
+The server collects at most 1,000 current matching sessions in one native
+snapshot and prices every candidate before selecting the returned top N. The
+snapshot also supplies each row's `agent_name` and `title`, avoiding additional
+session reads. These descriptive values are nullable when unavailable or outside
+the bounded display contract (256 characters); configured redaction still applies.
+Usage is attributed by event time and actual normalized provider/model identity,
+including terminal hosted tools and auxiliary attempts, rather than by a
+session's configured model. Price schedules use each event's UTC date.
+
+`session_ranking` explicitly reports `requested_order`, `effective_order`,
+`currency`, and `unavailable_reason`. Complete single-currency costs permit cost
+order; ties use tokens, model steps, then session ID. Known zero cost remains
+zero. Missing prices or usage, incomplete pricing projections, mixed currencies,
+more than 1,000 candidates, or an oversized candidate projection return token
+order with an explicit reason. Clients must label this **Top sessions by tokens**,
+not cost. An oversized candidate projection may cause one fresh token-only read;
+the first snapshot is discarded entirely. Missing pricing is
+`pricing_not_configured`; incomplete prices are `prices_incomplete`; projection
+bounds use `pricing_projection_incomplete`, `candidate_limit`, or
+`candidate_byte_limit`; currency disagreement is `mixed_currencies`.
+
+With pricing, `provider_cost_breakdown` and `model_cost_breakdown` align with the
+existing usage groups and include their explicit omitted-group cost remainder
+when the native projection has one. A sampled native group list remains marked
+as sampled; it does not invent an exact omitted-group count.
+Each group retains pricing coverage, separate currencies, and unpriced reasons;
+unknown cost must not be displayed as zero. If rejected pricing metrics have
+lost their provider/model attribution, both dimension cost sections explicitly
+report unavailable/truncated estimates for all groups and their remainder;
+headline and session unpriced accounting remain available. The existing session cost breakdown
+aligns with the selected session order and retains its aggregate remainder.
+Neither this report nor its ordering changes budget admission.
+
+The same data is available through `cayu usage rollup --server-url URL` or
+`--application NAME`. Add `--price-book prices.json --top-sessions 20
+--session-order cost`; JSON preserves the HTTP result and table output labels
+cost versus token order and explains fallback. Price books remain optional.
+
 ### Usage windows and series
 
 `POST /api/usage/rollup` accepts an optional `series` object with `unit`

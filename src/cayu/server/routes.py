@@ -89,8 +89,8 @@ from cayu.budgets.aggregates import (
     UsageRollupInconsistent,
     UsageRollupResultTooLarge,
     UsageRollupStoreResult,
-    estimate_usage_rollup_cost,
-    estimate_usage_session_cost_breakdown,
+    UsageSessionAggregateBreakdown,
+    usage_session_display,
 )
 from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
 from cayu.budgets.pricing import (
@@ -103,6 +103,7 @@ from cayu.budgets.usage import (
     CausalBudgetUsageSummary,
     SessionUsageSummary,
 )
+from cayu.budgets.usage_costs import build_usage_cost_report
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.context.structured_output import StructuredOutputSpec
 from cayu.context.thinking import ThinkingConfig
@@ -3035,6 +3036,15 @@ def _require_safe_session_topology_authority(
             )
 
 
+async def _read_usage_rollup(
+    store: SessionStore, query: UsageRollupQuery
+) -> UsageRollupStoreResult:
+    result = await store.aggregate_usage(query)
+    if type(result) is not UsageRollupStoreResult:
+        raise UsageRollupInconsistent("Usage aggregate stores must return UsageRollupStoreResult.")
+    return result.validate_for_query(query)
+
+
 def _require_safe_usage_session_authority(
     cayu_app: Any,
     result: UsageRollupStoreResult,
@@ -4748,6 +4758,7 @@ def create_router(
         knowledge_configured=knowledge_store is not None,
         dashboard_pricing_configured=dashboard_pricing_configured,
         session_usage_aggregates_supported=session_store.supports_usage_aggregates,
+        session_usage_cost_details_supported=session_store.supports_usage_cost_details,
         session_usage_series_supported=session_store.supports_usage_series,
         environment_activity_supported=session_store.supports_environment_activity,
         session_topology_supported=session_store.supports_session_topology,
@@ -5399,7 +5410,12 @@ def create_router(
         response.headers["Cache-Control"] = "private, no-store"
         if body.series is not None and not session_store.supports_usage_series:
             raise HTTPException(501, detail="Usage series are unsupported by this deployment.")
+        if body.session_order == "cost" and session_store.supports_usage_cost_details is not True:
+            raise HTTPException(
+                501, detail="Usage cost details are unsupported by this deployment."
+            )
         query = UsageRollupQuery(
+            include_cost_candidates=body.session_order == "cost" and body.pricing is not None,
             series=body.series,
             start_at=body.start_at,
             end_at=body.end_at,
@@ -5409,13 +5425,18 @@ def create_router(
             include_pricing_inputs=body.pricing is not None,
             pricing_input_limit=body.pricing_input_limit,
         )
+        unavailable_reason = None
         try:
-            result = await session_store.aggregate_usage(query)
-            if type(result) is not UsageRollupStoreResult:
-                raise UsageRollupInconsistent(
-                    "Usage aggregate stores must return UsageRollupStoreResult."
-                )
-            result = result.validate_for_query(query)
+            try:
+                result = await _read_usage_rollup(session_store, query)
+            except UsageRollupResultTooLarge:
+                if not query.include_cost_candidates:
+                    raise
+                # Discard the entire oversized snapshot and retry one ordinary
+                # bounded token projection. Never combine two snapshots.
+                query = query.model_copy(update={"include_cost_candidates": False})
+                unavailable_reason = "candidate_byte_limit"
+                result = await _read_usage_rollup(session_store, query)
         except NotImplementedError as exc:
             raise HTTPException(
                 status_code=501,
@@ -5433,21 +5454,26 @@ def create_router(
                 detail="The configured session store returned an inconsistent usage projection.",
                 headers={"Cache-Control": "private, no-store"},
             ) from exc
+        report = build_usage_cost_report(
+            result,
+            body.pricing,
+            session_order=body.session_order,
+            session_limit=body.session_group_limit,
+            group_limit=body.group_limit,
+            unavailable_reason=unavailable_reason,
+        )
+        result = report.result
         _require_safe_usage_session_authority(cayu_app, result)
-        cost = (
-            None
-            if body.pricing is None
-            else estimate_usage_rollup_cost(
-                result,
-                body.pricing,
-                billing_group_limit=body.group_limit,
-            )
-        )
-        session_cost_breakdown = (
-            None
-            if body.pricing is None or result.session_breakdown is None
-            else estimate_usage_session_cost_breakdown(result, body.pricing)
-        )
+        if result.session_breakdown is not None:
+            for group in result.session_breakdown.groups:
+                group.title = usage_session_display(
+                    _redact_control_plane_json(cayu_app, group.title, "usage_rollup.title")
+                )
+                group.agent_name = usage_session_display(
+                    _redact_control_plane_json(
+                        cayu_app, group.agent_name, "usage_rollup.agent_name"
+                    )
+                )
         response_value = UsageRollupResponse(
             series=result.series,
             scope="configured_session_store",
@@ -5463,7 +5489,10 @@ def create_router(
             totals=result.totals,
             provider_breakdown=result.provider_breakdown,
             model_breakdown=result.model_breakdown,
-            cost=cost,
+            cost=report.cost,
+            session_ranking=report.session_ranking,
+            provider_cost_breakdown=report.provider_cost_breakdown,
+            model_cost_breakdown=report.model_cost_breakdown,
             reported_costs=(
                 None
                 if result.reported_costs is None
@@ -5471,8 +5500,12 @@ def create_router(
                     cayu_app, result.reported_costs.model_dump(mode="json"), "reported_costs"
                 )
             ),
-            session_breakdown=result.session_breakdown,
-            session_cost_breakdown=session_cost_breakdown,
+            session_breakdown=None
+            if result.session_breakdown is None
+            else UsageSessionAggregateBreakdown.model_validate(
+                result.session_breakdown.model_dump(mode="python")
+            ),
+            session_cost_breakdown=report.session_cost_breakdown,
         )
         if not json_utf8_size_within_limit(
             response_value.model_dump(mode="json"),

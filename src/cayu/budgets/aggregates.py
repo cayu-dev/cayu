@@ -91,6 +91,7 @@ _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL = 256
 MAX_AGGREGATE_USAGE_COUNTER = 2**63 - 1
 MAX_USAGE_PRICING_INPUT_BYTES = 8 * 1024 * 1024
 MAX_USAGE_PRICING_RAW_CANDIDATES = 5000
+MAX_USAGE_COST_CANDIDATES = 1000
 MAX_USAGE_ROLLUP_SESSION_ID_BYTES = 1024
 MAX_USAGE_ROLLUP_STORE_RESULT_BYTES = 24 * 1024 * 1024
 
@@ -569,6 +570,17 @@ UsageSessionStatus = Literal[
 _ACTIVE_USAGE_SESSION_STATUSES = frozenset({"pending", "running", "interrupting"})
 
 
+def usage_session_display(value: object) -> str | None:
+    """Bound descriptive data without truncating or changing an agent identity."""
+    if type(value) is not str or not 1 <= len(value) <= 256:
+        return None
+    if not value.strip() or any(
+        ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in value
+    ):
+        return None
+    return value
+
+
 class UsageSessionAggregateGroup(BaseModel):
     """Exact usage for one retained current session inside a bounded breakdown."""
 
@@ -576,6 +588,8 @@ class UsageSessionAggregateGroup(BaseModel):
 
     session_id: str
     status: UsageSessionStatus
+    agent_name: str | None = Field(default=None, max_length=256)
+    title: str | None = Field(default=None, max_length=256)
     active: StrictBool
     totals: UsageAggregateTotals
 
@@ -596,7 +610,10 @@ class UsageSessionAggregateGroup(BaseModel):
         if self.totals.session_count not in {0, 1}:
             raise ValueError("One session usage group can report at most one activity session.")
         has_activity = bool(self.totals.model_steps or self.totals.tool_calls)
-        if self.totals.session_count != int(has_activity):
+        # Auxiliary attempts and terminal hosted resources also establish activity,
+        # without incrementing model_steps or tool_calls. Native event eligibility
+        # owns that positive evidence; absence of these counters is not inactivity.
+        if has_activity and self.totals.session_count != 1:
             raise ValueError("Session usage count must match activity in the requested window.")
         return self
 
@@ -630,6 +647,7 @@ class UsageSessionAggregateBreakdown(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     groups: tuple[UsageSessionAggregateGroup, ...] = Field(max_length=100)
+    order: Literal["tokens", "cost"] = "tokens"
     remainder: UsageSessionAggregateRemainder | None
     accuracy: AggregateAccuracy
 
@@ -656,7 +674,7 @@ class UsageSessionAggregateBreakdown(BaseModel):
             raise ValueError("A truncated session breakdown must include a remainder.")
         if self.remainder is not None and self.accuracy.kind is not AggregateAccuracyKind.TRUNCATED:
             raise ValueError("A session breakdown remainder must report truncation.")
-        if self.groups != tuple(
+        if self.order == "tokens" and self.groups != tuple(
             sorted(
                 self.groups,
                 key=lambda group: (
@@ -668,6 +686,12 @@ class UsageSessionAggregateBreakdown(BaseModel):
         ):
             raise ValueError("Session usage groups must use canonical usage ordering.")
         return self
+
+
+class UsageSessionAggregateCandidates(UsageSessionAggregateBreakdown):
+    """Internal opt-in working set; public session detail stays bounded to 100."""
+
+    groups: tuple[UsageSessionAggregateGroup, ...] = Field(max_length=MAX_USAGE_COST_CANDIDATES)
 
 
 UsagePricingEventType = Literal[
@@ -1088,7 +1112,9 @@ class UsageRollupStoreResult(BaseModel):
     totals_accuracy: AggregateAccuracy = Field(default_factory=lambda: EXACT_AGGREGATE.model_copy())
     provider_breakdown: UsageAggregateBreakdown
     model_breakdown: UsageAggregateBreakdown
-    session_breakdown: UsageSessionAggregateBreakdown | None = None
+    session_breakdown: UsageSessionAggregateBreakdown | UsageSessionAggregateCandidates | None = (
+        None
+    )
     pricing_inputs: tuple[UsagePricingInput, ...] = Field(default=(), max_length=5000)
     pricing_inputs_included: StrictBool = False
     pricing_input_group_count: StrictInt = Field(
@@ -1135,6 +1161,7 @@ class UsageRollupStoreResult(BaseModel):
             UsageAggregateTotals,
             AggregateAccuracy,
             UsageAggregateBreakdown,
+            UsageSessionAggregateCandidates,
             UsageSessionAggregateBreakdown,
             ReportedCostPage,
             UsageTimeSeries,
@@ -1412,10 +1439,14 @@ class UsageRollupStoreResult(BaseModel):
                 "Usage rollup session projection does not match the query."
             )
         if self.session_breakdown is not None:
-            session_group_limit = query.session_group_limit
+            session_group_limit = query.retained_session_limit
             if session_group_limit is None:
                 raise UsageRollupInconsistent(
                     "Usage rollup returned an unrequested session projection."
+                )
+            if self.session_breakdown.order != "tokens":
+                raise UsageRollupInconsistent(
+                    "Native candidate projections must use token ordering."
                 )
             for group in self.session_breakdown.groups:
                 require_bounded_usage_session_id(group.session_id)
@@ -1466,6 +1497,7 @@ class UsageRollupStoreResult(BaseModel):
         occurrences_by_session: dict[str, int] = {}
         valid_usage_steps_by_session: dict[str, int] = {}
         known_usage_by_session: dict[str, AggregateUsageMetrics] = {}
+        unknown_usage_sessions: set[str] = set()
         for item in self.session_pricing_inputs:
             assert item.session_id is not None
             session_id = item.session_id
@@ -1475,6 +1507,7 @@ class UsageRollupStoreResult(BaseModel):
                     occurrences_by_session.get(session_id, 0) + item.occurrences
                 )
             if item.metrics is None:
+                unknown_usage_sessions.add(session_id)
                 continue
             if model_step:
                 valid_usage_steps_by_session[session_id] = (
@@ -1511,8 +1544,13 @@ class UsageRollupStoreResult(BaseModel):
                 raise ValueError(
                     "Exact session pricing inputs exceed the retained session's usage totals."
                 )
+            # Tolerant usage can retain counters from a rejected pricing input,
+            # including auxiliary work not represented in model_steps_with_usage.
+            # Keep the known-counter upper bound, but require equality only when
+            # every pricing input has valid metrics.
             if (
-                valid_usage_steps == group.totals.model_steps_with_usage
+                session_id not in unknown_usage_sessions
+                and valid_usage_steps == group.totals.model_steps_with_usage
                 and known_usage != group.totals.usage
             ):
                 raise ValueError(
@@ -1555,7 +1593,7 @@ class UsageRollupStoreResult(BaseModel):
                     event_type,
                     _,
                 ), (occurrences, _) in remainder_groups.items()
-                if event_type != "model.hosted_tool_call"
+                if event_type == "model.completed"
             )
             != expected_remainder_steps
         ):
@@ -2281,6 +2319,16 @@ def estimate_usage_session_cost_breakdown(
     result: UsageRollupStoreResult,
     pricing,
 ) -> UsageSessionCostBreakdown:
+    """Price retained sessions with a fresh cache bound to this price book."""
+    return _estimate_usage_session_cost_breakdown(result, pricing)
+
+
+def _estimate_usage_session_cost_breakdown(
+    result: UsageRollupStoreResult,
+    pricing,
+    *,
+    estimate_cache: dict[tuple[date, str | None], object] | None = None,
+) -> UsageSessionCostBreakdown:
     """Price retained session groups without publishing partial session costs."""
 
     from cayu.budgets.pricing import PriceBook
@@ -2337,7 +2385,8 @@ def estimate_usage_session_cost_breakdown(
             accuracy=breakdown_accuracy,
         )
 
-    estimate_cache: dict[tuple[date, str | None], object] = {}
+    if estimate_cache is None:
+        estimate_cache = {}
     inputs_by_session: dict[str, list[UsagePricingInput]] = {}
     for item in result.session_pricing_inputs:
         assert item.session_id is not None

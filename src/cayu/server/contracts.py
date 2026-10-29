@@ -56,6 +56,11 @@ from cayu.budgets.usage import (
     SessionUsageSummary,
     UsageMetrics,
 )
+from cayu.budgets.usage_costs import (
+    UsageDimensionCostBreakdown,
+    UsageSessionOrder,
+    UsageSessionRanking,
+)
 from cayu.configuration import MAX_STEPS
 from cayu.deadlines import ExecutionDeadlineReport
 from cayu.environments.lifecycle import EnvironmentLifecyclePolicy
@@ -377,6 +382,8 @@ class UsageRollupRequest(ApiBaseModel):
             "no per-session breakdown or session-aware pricing work."
         ),
     )
+    session_order: UsageSessionOrder = "tokens"
+
     pricing_input_limit: StrictInt = Field(
         default=1000,
         ge=1,
@@ -398,6 +405,12 @@ class UsageRollupRequest(ApiBaseModel):
             "exceed 500,000."
         ),
     )
+
+    @model_validator(mode="after")
+    def require_session_limit_for_cost_order(self) -> UsageRollupRequest:
+        if self.session_order == "cost" and self.session_group_limit is None:
+            raise ValueError("Cost ordering requires session_group_limit.")
+        return self
 
     @field_validator("pricing", mode="before")
     @classmethod
@@ -634,6 +647,9 @@ class UsageRollupResponse(ApiBaseModel):
     model_breakdown: UsageAggregateBreakdown
     cost: UsageCostRollup | None
     session_breakdown: UsageSessionAggregateBreakdown | None = None
+    session_ranking: UsageSessionRanking | None = None
+    provider_cost_breakdown: UsageDimensionCostBreakdown | None = None
+    model_cost_breakdown: UsageDimensionCostBreakdown | None = None
     session_cost_breakdown: UsageSessionCostBreakdown | None = None
 
     @model_validator(mode="after")

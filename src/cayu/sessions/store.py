@@ -471,6 +471,7 @@ class SessionStore(ABC):
     _producer_attachment_version: ClassVar[int] = 0
     supports_environment_activity: ClassVar[bool] = False
     supports_usage_series: ClassVar[bool] = False
+    supports_usage_cost_details: ClassVar[bool] = False
     supports_usage_aggregates: ClassVar[bool] = False
     supports_private_argument_continuity: ClassVar[bool] = False
     supports_mcp_manifest_history: ClassVar[bool] = False

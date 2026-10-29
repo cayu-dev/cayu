@@ -64,12 +64,18 @@ def add_usage_parser(subparsers: Any) -> None:
             command.add_argument(
                 "--price-book",
                 type=Path,
-                help="Optional price-book JSON for the existing headline cost. Series contain counters only.",
+                help="Optional price-book JSON for headline, provider, model and session costs. Series contain counters only.",
             )
             command.add_argument(
                 "--top-sessions",
                 type=_top_limit,
-                help="Include up to 100 sessions, using the current token order.",
+                help="Include up to 100 sessions (tokens by default).",
+            )
+            command.add_argument(
+                "--session-order",
+                choices=("tokens", "cost"),
+                default="tokens",
+                help="Rank all bounded candidates by cost, with an explicit token fallback when costs cannot be compared; requires --top-sessions.",
             )
         else:
             command.add_argument("--include-eval", action="store_true")
@@ -118,6 +124,9 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
     from cayu.cli._cloud_agent_api import CayuApi, open_cloud_agent_api
     from cayu.cli.diagnostics import read_authorization
 
+    cost_order = args.usage_command == "rollup" and args.session_order == "cost"
+    if cost_order and args.top_sessions is None:
+        raise ValueError("--session-order cost requires --top-sessions.")
     if args.since >= args.until:
         raise ValueError("--since must be before --until.")
     series = (
@@ -147,15 +156,23 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
         if value is not None
     }
     try:
-        surface = "usage_series" if args.usage_command == "rollup" else "session_overview_series"
+        surfaces = []
         if series is not None or (args.usage_command == "counts" and filters):
-            capability = api.get("/contract", resource="server capabilities")
-            for key in ("capabilities", "surfaces", surface, "read", "enabled"):
-                capability = capability.get(key) if isinstance(capability, dict) else None
-            if capability is not True:
-                raise ValueError(
-                    f"The server does not advertise {surface} support for the requested options."
-                )
+            surfaces.append(
+                "usage_series" if args.usage_command == "rollup" else "session_overview_series"
+            )
+        if cost_order:
+            surfaces.append("usage_cost_details")
+        if surfaces:
+            contract = api.get("/contract", resource="server capabilities")
+            for surface in surfaces:
+                capability = contract
+                for key in ("capabilities", "surfaces", surface, "read", "enabled"):
+                    capability = capability.get(key) if isinstance(capability, dict) else None
+                if capability is not True:
+                    raise ValueError(
+                        f"The server does not advertise {surface} support for the requested options."
+                    )
         if args.usage_command == "rollup":
             body: dict[str, Any] = {
                 "start_at": args.since.isoformat(),
@@ -166,6 +183,8 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
                 body["series"] = series.model_dump()
             if args.top_sessions is not None:
                 body["session_group_limit"] = args.top_sessions
+            if cost_order:
+                body["session_order"] = args.session_order
             if args.price_book is not None:
                 with args.price_book.open("rb") as stream:
                     raw = stream.read(2 * 1024 * 1024 + 1)
@@ -190,6 +209,12 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
             raise ValueError("The server returned an invalid usage response.")
         if series is not None and not isinstance(result.get("series"), dict):
             raise ValueError("The server did not return the requested usage series.")
+        if cost_order:
+            from cayu.budgets.usage_costs import UsageSessionRanking
+
+            ranking = UsageSessionRanking.model_validate(result.get("session_ranking"))
+            if ranking.requested_order != "cost":
+                raise ValueError("The server did not return the requested session ranking.")
         if args.output_format == "json":
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
@@ -230,6 +255,7 @@ def _render_table(result: dict[str, Any], *, starts: bool) -> None:
                     f"Estimated cost (priced work): {amounts or 'unavailable'}; unpriced steps: {cost['unpriced_model_steps']}; unevaluated steps: {cost['unevaluated_model_steps']}"
                 )
             )
+        _render_cost_details(result)
     series = result.get("series")
     if series is not None:
         print(
@@ -252,6 +278,67 @@ def _render_table(result: dict[str, Any], *, starts: bool) -> None:
             for b in series["buckets"]
         ]
         _print_values(headers, rows)
+
+
+def _cost_label(cost: dict[str, Any]) -> str:
+    amounts = ", ".join(f"{row['total_cost']} {row['currency']}" for row in cost["currencies"])
+    partial = cost["accuracy"]["kind"] != "exact" or bool(cost["unpriced_reasons"])
+    if not amounts:
+        return "Unavailable" if partial else "0 (no priced work)"
+    return f"{amounts} (partial)" if partial else amounts
+
+
+def _render_cost_details(result: dict[str, Any]) -> None:
+    for dimension in ("provider", "model"):
+        breakdown = result.get(f"{dimension}_cost_breakdown")
+        if breakdown is None:
+            continue
+        print(f"Cost by {dimension}")
+        _print_values(
+            ("Provider", "Model", "Estimated cost"),
+            [
+                [
+                    group.get("provider_name") or "Unknown",
+                    group.get("model") or "—",
+                    _cost_label(group["cost"]),
+                ]
+                for group in breakdown["groups"]
+            ],
+        )
+        if breakdown.get("remainder") is not None:
+            print(
+                terminal_safe(
+                    f"Other {dimension} groups: {_cost_label(breakdown['remainder']['cost'])}"
+                )
+            )
+    ranking = result.get("session_ranking")
+    if ranking is None:
+        return
+    print(f"Top sessions by {ranking['effective_order']}")
+    if ranking.get("unavailable_reason") is not None:
+        print(
+            terminal_safe(
+                f"Cost ranking unavailable: {ranking['unavailable_reason'].replace('_', ' ')}."
+            )
+        )
+    costs = {
+        group["session_id"]: group["cost"]
+        for group in (result.get("session_cost_breakdown") or {}).get("groups", [])
+    }
+    _print_values(
+        ("Session", "Specialist", "Tokens", "Estimated cost"),
+        [
+            [
+                group.get("title") or "Untitled session",
+                group.get("agent_name") or "Unknown",
+                group["totals"]["usage"]["total_tokens"],
+                _cost_label(costs[group["session_id"]])
+                if group["session_id"] in costs
+                else "Unavailable",
+            ]
+            for group in result["session_breakdown"]["groups"]
+        ],
+    )
 
 
 def _print_values(headers: tuple[str, ...], rows: list[list[object]]) -> None:
