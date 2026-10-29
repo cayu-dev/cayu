@@ -384,7 +384,11 @@ JSONL row also carries the schema version so independently consumed
 `model_call`, `unmatched_ledger`, and `aggregate` records cannot be mistaken for
 the version 1 representation.
 
-Session-inspection CLI schema version `8` adds the exact bounded
+Session-inspection CLI schema version `9` adds estimated cost to `session usage`: each
+model call's `cost`, `cost_currency` and `cost_state` (`priced` or `unpriced`), the
+aggregate's `estimated_cost` (priced calls summed per currency) and `unpriced_calls`, and a
+top-level `price_book` naming the book that priced them (see [Cost](#cost)). Version `8`
+added the exact bounded
 `runtime_build_provenance` manifest to `session show`. Operators can distinguish
 same-version builds, inspect typed OCI or wheel origin, and see explicit weak or
 unavailable legacy evidence without reading runtime-owned metadata. Version `8`
@@ -431,8 +435,9 @@ cayu session resolve-provider-operation SESSION_ID \
 # Newest response-scoped summaries first, using a stable sequence cursor.
 cayu session interactions SESSION_ID --limit 50
 
-# Per-model-call and aggregate token/cache usage. Missing prices stay unknown.
+# Per-model-call and aggregate token/cache usage, priced from the bundled price book.
 cayu session usage SESSION_ID --output json
+cayu session usage SESSION_ID --price-table prices.json --table
 cayu session usage SESSION_ID --interaction-id INTERACTION_ID --output json
 
 # Paired parallel tool calls, timing, status, and result sizes, without results.
@@ -449,6 +454,24 @@ cayu session transcript SESSION_ID --include-content 4096 --output json
 cayu session transcript SESSION_ID --interaction-id INTERACTION_ID
 ```
 
+### Cost
+
+`session usage` and `session rollup` price every model call from Cayu's bundled, dated
+price book (`cayu.budgets.default_price_book()`) on the date the call completed. Pass
+`--price-table PATH` (or `--price-book PATH`) to use your own price book instead: a JSON
+file written by `cayu.budgets.dump_price_book`. A call the book has no price for, or without
+usage evidence, is `unpriced` and counted, never guessed. Costs are estimates from token
+counts; the budget ledger's reconciled amounts (`pricing_state` and the unmatched ledger)
+are separate evidence and are unchanged. Totals are kept per currency. Calls are priced
+as Cayu's cost accounting prices them, hosted web searches included, and the totals also
+cover auxiliary inference attempts, so `estimated_cost` matches
+`POST /api/sessions/{id}/cost` for the same book. Tables show a group or session whose
+calls all lacked a price as `unknown` and a partly priced one as `... + unpriced`, never
+as free.
+
+For a Cloud Agent the CLI sends the price book with the request, so the Agent prices with
+the same book; an Agent whose Cayu predates priced usage returns its calls without cost.
+
 ### Rollups across many sessions
 
 `cayu session rollup` sums usage, time by phase and tool failures across the sessions
@@ -463,8 +486,9 @@ cayu session rollup --by release --application bug-hunter --table
 
 Each group reports its sessions and their statuses, model calls (with usage evidence and
 errors), tool calls and tool failures, aggregate token usage (auxiliary inference and
-hosted tool usage included, as the store's usage totals count them), and time in
-milliseconds:
+hosted tool usage included, as the store's usage totals count them), estimated cost per
+currency with the count of model calls the price book couldn't price (see [Cost](#cost)),
+and time in milliseconds:
 
 | Field | Meaning |
 | --- | --- |

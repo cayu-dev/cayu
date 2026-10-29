@@ -2169,6 +2169,25 @@
       "title": "ApiPendingActionIssue",
       "type": "object"
     },
+    "ApiPriceBookIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "generated_at": {
+          "title": "Generated At",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "generated_at"
+      ],
+      "title": "ApiPriceBookIdentity",
+      "type": "object"
+    },
     "ApiProviderOperationInspection": {
       "additionalProperties": false,
       "properties": {
@@ -3108,6 +3127,45 @@
           ],
           "title": "Cached Input Tokens"
         },
+        "cost": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The call's estimated cost, a decimal string, when priced.",
+          "title": "Cost"
+        },
+        "cost_currency": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cost Currency"
+        },
+        "cost_state": {
+          "anyOf": [
+            {
+              "enum": [
+                "priced",
+                "unpriced"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Null unless the request carried a price book.",
+          "title": "Cost State"
+        },
         "input_tokens": {
           "anyOf": [
             {
@@ -3252,6 +3310,21 @@
     "ApiSessionModelCallAggregate": {
       "additionalProperties": false,
       "properties": {
+        "estimated_cost": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Priced calls' cost summed per currency, as decimal strings.",
+          "title": "Estimated Cost"
+        },
         "model_calls": {
           "minimum": 0.0,
           "title": "Model Calls",
@@ -3266,6 +3339,18 @@
           "minimum": 0.0,
           "title": "Tool Calls",
           "type": "integer"
+        },
+        "unpriced_calls": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unpriced Calls"
         },
         "usage": {
           "$ref": "#/components/schemas/AggregateUsageMetrics"
@@ -22450,6 +22535,13 @@
     "RollupGroup": {
       "description": "One group's sums. Two groups with the same key merge by adding.",
       "properties": {
+        "cost": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Cost",
+          "type": "object"
+        },
         "durations": {
           "$ref": "#/components/schemas/RollupDurations"
         },
@@ -22505,6 +22597,12 @@
           "default": 0,
           "minimum": 0.0,
           "title": "Tool Failures",
+          "type": "integer"
+        },
+        "unpriced_model_calls": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Unpriced Model Calls",
           "type": "integer"
         },
         "usage": {
@@ -24150,6 +24248,23 @@
       "title": "SessionMessageTarget",
       "type": "object"
     },
+    "SessionModelCallsRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/PriceBook"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "title": "SessionModelCallsRequest",
+      "type": "object"
+    },
     "SessionModelCallsResponse": {
       "additionalProperties": false,
       "description": "`cayu session usage` for one session: pages of calls and unclaimed reservations.",
@@ -24184,6 +24299,16 @@
           "minimum": 0.0,
           "title": "Offset",
           "type": "integer"
+        },
+        "price_book": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ApiPriceBookIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "session_id": {
           "title": "Session Id",
@@ -24776,6 +24901,16 @@
           "minimum": 1.0,
           "title": "Max Sessions",
           "type": "integer"
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/PriceBook"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "since": {
           "anyOf": [
@@ -36027,6 +36162,126 @@
         ],
         "request_body": {
           "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionModelCallsResponse"
+              }
+            }
+          },
+          "404": {
+            "content": {}
+          },
+          "413": {
+            "content": {}
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operation_id": "post_session_model_calls_api_sessions__session_id__model_calls_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interaction_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Interaction Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/SessionModelCallsRequest"
+            }
+          },
+          "required": true
         },
         "responses": {
           "200": {

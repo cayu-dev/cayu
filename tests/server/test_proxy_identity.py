@@ -255,6 +255,7 @@ def test_unreachable_keys_answer_503(jwks, signing_key) -> None:
         ("GET", "/api/sessions/missing/model-calls"),
         ("GET", "/api/sessions/missing/tool-calls"),
         ("POST", "/api/sessions/rollup"),
+        ("POST", "/api/sessions/missing/model-calls"),
         ("GET", "/api/pending-actions"),
         ("GET", "/api/inbox"),
         ("GET", "/api/inbox/item-1"),

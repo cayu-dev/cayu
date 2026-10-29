@@ -19,6 +19,7 @@ from uuid import uuid4
 import httpx
 
 from cayu._validation import compact_json_utf8_size
+from cayu.budgets.pricing import PriceBook, default_price_book, load_price_book
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli._session_reader import (
     SessionReader,
@@ -55,7 +56,7 @@ from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 
 FORMAT_CHOICES = ("json", "table", "jsonl")
-CLI_SCHEMA_VERSION = "8"
+CLI_SCHEMA_VERSION = "9"
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
 _MAX_SERVER_ERROR_BODY_BYTES = 128 * 1024
 _MAX_SERVER_ERROR_DETAIL_BYTES = 8 * 1024
@@ -146,6 +147,7 @@ def add_session_parser(subparsers: Any) -> None:
     rollup_parser.add_argument(
         "--cursor", help="Continue a rollup after the sessions an earlier run read."
     )
+    _add_price_book_option(rollup_parser)
     rollup_parser.add_argument(
         "--failure-kinds",
         type=_positive_int,
@@ -210,6 +212,7 @@ def add_session_parser(subparsers: Any) -> None:
     usage_parser.add_argument("--after-sequence", type=_nonnegative_int)
     usage_parser.add_argument("--before-sequence", type=_positive_int)
     usage_parser.add_argument("--interaction-id")
+    _add_price_book_option(usage_parser)
     add_output_options(usage_parser, formats=FORMAT_CHOICES)
 
     tools_parser = commands.add_parser(
@@ -669,6 +672,7 @@ async def _session_rollup(args: argparse.Namespace, reader: SessionReader) -> in
     page_size = _ROLLUP_PAGE_SESSIONS[
         "local" if isinstance(reader, StoreSessionReader) else "cloud"
     ]
+    pricing = _price_book(args)
     query = SessionRollupQuery(
         since=args.since,
         until=args.until,
@@ -679,6 +683,7 @@ async def _session_rollup(args: argparse.Namespace, reader: SessionReader) -> in
         labels=_parse_labels(args.label),
         cursor=args.cursor,
         max_sessions=min(page_size, args.max_sessions),
+        pricing=pricing,
     )
     groups: list[RollupGroup] = []
     sessions_read = 0
@@ -703,6 +708,9 @@ async def _session_rollup(args: argparse.Namespace, reader: SessionReader) -> in
         "complete": cursor is None,
         "next_cursor": cursor,
         "groups": rows,
+        "price_book": _price_book_source(
+            args, {"version": pricing.price_book_version, "generated_at": pricing.generated_at}
+        ),
     }
     _render_rollup(args.output_format, payload, rows, failure_kinds=args.failure_kinds)
     return 0
@@ -719,6 +727,8 @@ def _rollup_row(group: RollupGroup) -> dict[str, Any]:
         "tool_calls": group.tool_calls,
         "tool_failures": group.tool_failures,
         "usage": aggregate_usage_cli_payload(group.usage),
+        "estimated_cost": group.cost,
+        "unpriced_model_calls": group.unpriced_model_calls,
         "durations": group.durations.model_dump(mode="json"),
         "failure_kinds": [item.model_dump(mode="json") for item in top_failure_kinds(group)],
     }
@@ -748,6 +758,8 @@ def _render_rollup(
             "input_tokens": row["usage"]["input_tokens"],
             "output_tokens": row["usage"]["output_tokens"],
             "cache_read_tokens": row["usage"]["cache_read_tokens"],
+            "cost": _cost_total_text(row["estimated_cost"], row["unpriced_model_calls"]),
+            "unpriced": row["unpriced_model_calls"],
             **{
                 name: _duration_text(row["durations"][f"{name}_ms"])
                 for name in ("active", "model", "tool", "setup", "gap")
@@ -765,6 +777,8 @@ def _render_rollup(
             "input_tokens",
             "output_tokens",
             "cache_read_tokens",
+            "cost",
+            "unpriced",
             "active",
             "model",
             "tool",
@@ -856,7 +870,11 @@ async def _session_interactions(args: argparse.Namespace, reader: SessionReader)
 async def _session_usage(args: argparse.Namespace, reader: SessionReader) -> int:
     await reader.require_session(args.session_id)
     result = await reader.model_calls(
-        args.session_id, _inspection_window(args), offset=args.offset, limit=args.limit
+        args.session_id,
+        _inspection_window(args),
+        offset=args.offset,
+        limit=args.limit,
+        pricing=_price_book(args),
     )
     aggregate = result["aggregate"]
     payload = {
@@ -881,7 +899,10 @@ async def _session_usage(args: argparse.Namespace, reader: SessionReader) -> int
             "model_calls_with_usage": aggregate["model_calls_with_usage"],
             "tool_calls": aggregate["tool_calls"],
             **aggregate_usage_cli_payload(aggregate["usage"]),
+            "estimated_cost": aggregate.get("estimated_cost"),
+            "unpriced_calls": aggregate.get("unpriced_calls"),
         },
+        "price_book": _price_book_source(args, result.get("price_book")),
     }
     _render_usage(
         args.output_format,
@@ -890,6 +911,62 @@ async def _session_usage(args: argparse.Namespace, reader: SessionReader) -> int
         result["unmatched_ledger"],
     )
     return 0
+
+
+def _add_price_book_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--price-book",
+        "--price-table",
+        dest="price_book",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Price model calls with this price book (JSON written by "
+            "cayu.budgets.dump_price_book) instead of Cayu's bundled one."
+        ),
+    )
+
+
+def _price_book(args: argparse.Namespace) -> PriceBook:
+    if args.price_book is None:
+        return default_price_book()
+    try:
+        return load_price_book(args.price_book)
+    except OSError as exc:
+        raise ValueError(
+            f"Could not read the price book {args.price_book}: {exc.strerror}."
+        ) from None
+    except ValueError:
+        raise ValueError(f"{args.price_book} is not a valid Cayu price book.") from None
+
+
+def _price_book_source(
+    args: argparse.Namespace, identity: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Which price book priced the calls, or None when the source couldn't price them."""
+
+    if not isinstance(identity, dict):
+        return None
+    return {
+        "source": "bundled" if args.price_book is None else "custom",
+        "version": identity.get("version"),
+        "generated_at": identity.get("generated_at"),
+    }
+
+
+def _cost_text(call: dict[str, Any]) -> str | None:
+    if call.get("cost_state") == "priced":
+        return f"{call['cost']} {call['cost_currency']}"
+    return call.get("cost_state")
+
+
+def _cost_total_text(cost: dict[str, str], unpriced: int | None) -> str:
+    """A cost total that never shows calls without a price as free."""
+
+    priced = ", ".join(f"{amount} {currency}" for currency, amount in cost.items()) or None
+    if not unpriced:
+        return priced or "0"
+    return "unknown" if priced is None else f"{priced} + unpriced"
 
 
 def _inspection_window(args: argparse.Namespace) -> InspectionWindow:
@@ -953,7 +1030,10 @@ def _render_usage(
             )
         )
         return
-    safe_calls = cast("list[dict[str, Any]]", _redact_sensitive(calls))
+    safe_calls = [
+        {**call, "cost": _cost_text(call)}
+        for call in cast("list[dict[str, Any]]", _redact_sensitive(calls))
+    ]
     _print_table(
         (
             "sequence",
@@ -971,6 +1051,7 @@ def _render_usage(
             "uncached_input_tokens",
             "transcript_cursor",
             "pricing_state",
+            "cost",
         ),
         safe_calls,
     )
@@ -980,8 +1061,22 @@ def _render_usage(
     safe_aggregate = cast("dict[str, Any]", safe_payload["aggregate"])
     _print_table(
         ("metric", "value"),
-        [{"metric": metric, "value": value} for metric, value in safe_aggregate.items()],
+        [
+            {
+                "metric": metric,
+                "value": _cost_total_text(value, safe_aggregate.get("unpriced_calls"))
+                if metric == "estimated_cost" and isinstance(value, dict)
+                else value,
+            }
+            for metric, value in safe_aggregate.items()
+        ],
     )
+    price_book = safe_payload.get("price_book")
+    if isinstance(price_book, dict):
+        print(
+            f"Priced with the {price_book['source']} price book "
+            f"{price_book['version']} ({price_book['generated_at']})."
+        )
     if unmatched_ledger:
         print()
         print("Unmatched ledger")

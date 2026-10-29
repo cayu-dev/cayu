@@ -20525,6 +20525,16 @@ endpoint, arguments recorded before a call ran (its start, approval request or i
 request) show as `[quarantined]`; a terminal record's arguments are summarized after the
 application's secret redactor runs on them.
 
+`POST /api/sessions/{session_id}/model-calls` returns the same view with a price book in
+the body (`{"pricing": PriceBook}`): every call carries `cost`, `cost_currency` and
+`cost_state`, the aggregate sums priced calls per currency (`estimated_cost`) and counts
+`unpriced_calls`, and `price_book` names the book. `GET` leaves these `null`. Calls are
+priced as `estimate_session_cost` prices them: a completion's hosted-tool usage and the
+hosted tool calls recorded for its model attempt count toward its cost, and
+`estimated_cost` also covers auxiliary attempts and unclaimed hosted tool calls, so it
+matches `POST /api/sessions/{session_id}/cost` for the same book. A posted price book is
+bounded at 3 MiB and 1,000 prices, here and on `POST /api/sessions/rollup`.
+
 ### Session rollups and creation windows
 
 `GET /api/sessions` accepts `created_since` (inclusive) and `created_before` (exclusive),
@@ -20535,7 +20545,9 @@ two fields and every built-in store applies them in its native query.
 `max_sessions` (at most 500) sessions created in the `since`/`until` window, oldest first,
 the per-group sums of sessions, statuses, model and tool calls, tool failures by error kind,
 aggregate usage and time by phase. `group_by` is `agent`, `day`, `release` or `label:KEY`;
-`agent_name`, `environment_name`, `status` and `labels` filter sessions. Groups merge by
+`agent_name`, `environment_name`, `status` and `labels` filter sessions. With a `pricing`
+price book each group also sums its model calls' estimated cost per currency (`cost`) and
+counts `unpriced_model_calls`. Groups merge by
 adding, so a client reads `next_cursor` pages and merges groups with the same key. Each
 session's events are read in byte-bounded pages of only the event types the rollup needs.
 Group keys and tool names pass through the application's secret redactor.

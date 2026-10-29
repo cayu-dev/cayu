@@ -18,6 +18,7 @@ from itertools import islice
 from typing import Any, cast
 from urllib.parse import quote
 
+from cayu.budgets.pricing import PriceBook
 from cayu.budgets.usage import AggregateUsageMetrics
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, CayuApiNotFound
 from cayu.cli._session_reader import (
@@ -203,11 +204,31 @@ class AgentSessionReader:
         )
 
     async def model_calls(
-        self, session_id: str, window: InspectionWindow, *, offset: int, limit: int
+        self,
+        session_id: str,
+        window: InspectionWindow,
+        *,
+        offset: int,
+        limit: int,
+        pricing: PriceBook | None = None,
     ) -> dict[str, Any]:
-        body = self._session_get(
-            session_id, "model-calls", params=_window_params(window, offset, limit)
-        )
+        params = _window_params(window, offset, limit)
+        body = None
+        if pricing is not None:
+            try:
+                body = self._session_post(
+                    session_id,
+                    "model-calls",
+                    params=params,
+                    body={"pricing": pricing.model_dump(mode="json")},
+                )
+            except CayuApiError as exc:
+                # An Agent whose Cayu predates pricing here serves only GET; its calls
+                # come back without cost.
+                if exc.status_code != 405:
+                    raise
+        if body is None:
+            body = self._session_get(session_id, "model-calls", params=params)
         aggregate = _mapping(body.get("aggregate"))
         return {
             **body,
@@ -334,6 +355,21 @@ class AgentSessionReader:
         path = _path("sessions", session_id, *resource)
         try:
             return self.api.get(path, query=_query(params), resource=_resource(path))
+        except CayuApiNotFound as exc:
+            if _SESSION_NOT_FOUND in str(exc):
+                raise ValueError(f"Session not found: {session_id}") from None
+            raise _unsupported(path) from None
+
+    def _session_post(
+        self,
+        session_id: str,
+        *resource: str,
+        params: dict[str, Any],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        path = _path("sessions", session_id, *resource)
+        try:
+            return self.api.post(path, body, query=_query(params), resource=_resource(path))
         except CayuApiNotFound as exc:
             if _SESSION_NOT_FOUND in str(exc):
                 raise ValueError(f"Session not found: {session_id}") from None

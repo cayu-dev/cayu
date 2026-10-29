@@ -113,14 +113,21 @@ class CayuApi:
 
         return self._request("GET", path, query, None, resource)
 
-    def post(self, path: str, body: Mapping[str, Any], *, resource: str) -> Any:
+    def post(
+        self,
+        path: str,
+        body: Mapping[str, Any],
+        *,
+        query: Mapping[str, str | Sequence[str]] | None = None,
+        resource: str,
+    ) -> Any:
         """POST a JSON read request (such as a session rollup page) and return its answer.
 
         Errors are reported as for ``get``; a server that predates the route answers
         ``CayuApiError("unsupported")``.
         """
 
-        return self._request("POST", path, None, body, resource)
+        return self._request("POST", path, query, body, resource)
 
     def _request(
         self,
@@ -133,14 +140,23 @@ class CayuApi:
         if self._base is not None:
             return self._read(method, self._base, path, query, body, resource)
         missing: list[str] = []
+        method_refused = False
         for base in self._candidates:
             try:
                 answer = self._read(method, base, path, query, body, resource)
-            except _RouteMissing:
+            except _RouteMissing as exc:
                 missing.append(f"{base}/")
+                method_refused = method_refused or exc.status_code == 405
                 continue
             self._base = base
             return answer
+        if method_refused:
+            # A route matched the path but not the method: an older Cayu without this route.
+            raise CayuApiError(
+                "unsupported",
+                f"{self.description} can't serve {resource}. Its Cayu may be older than this CLI.",
+                status_code=405,
+            )
         raise CayuApiError(
             "not_served",
             f"{self.description} does not serve Cayu's API at {' or '.join(missing)}.",
@@ -253,8 +269,9 @@ class CayuApi:
                 )
             raise CayuApiNotFound(detail)
         if status == 405 and not established:
-            # Another app's route at this base (such as a page served for any GET), not Cayu's.
-            raise _RouteMissing
+            # Another app's route at this base (such as a page served for any GET), or an
+            # older Cayu's; the next base, or the caller, tells which.
+            raise _RouteMissing(405)
         if status in {405, 501}:
             raise CayuApiError(
                 "unsupported",
@@ -288,6 +305,10 @@ class CayuApi:
 
 class _RouteMissing(Exception):
     """No route served the path at this API base."""
+
+    def __init__(self, status_code: int = 404) -> None:
+        super().__init__(status_code)
+        self.status_code = status_code
 
 
 def basic_authorization(username: str, password: str) -> str:

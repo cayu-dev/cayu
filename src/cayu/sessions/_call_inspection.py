@@ -17,21 +17,143 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any, Protocol, cast
 
 from cayu._validation import compact_json_utf8_size
-from cayu.budgets.aggregates import summary_usage_metrics_from_event_payload
+from cayu.budgets.aggregates import (
+    aggregate_hosted_tool_usage_metrics_from_event_payload,
+    summary_usage_metrics_from_event_payload,
+)
 from cayu.budgets.base import is_complete_budget_reconciliation_pricing
+from cayu.budgets.pricing import (
+    PriceBook,
+    _combine_hosted_cost_metrics,
+    _cost_usage_metrics_from_event_payload,
+    _merge_hosted_cost_metrics,
+    estimate_model_step_cost,
+)
 from cayu.budgets.usage import (
+    UsageMetrics,
     count_model_steps_with_usage,
     session_usage_summary,
     usage_metrics_from_event_payload,
 )
-from cayu.events import EventType
+from cayu.events import Event, EventType
 from cayu.execution_units import ToolRoundIdentity
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import EventRecord
 from cayu.tools.policy import ToolPolicyDecision
+
+
+@dataclass(frozen=True)
+class CallCost:
+    """One model call priced from a price book: an amount in a currency, or why not."""
+
+    priced: bool
+    currency: str | None = None
+    amount: Decimal = Decimal(0)
+    reason: str | None = None
+
+
+PRICED_EVENT_TYPES = frozenset(
+    {
+        EventType.MODEL_COMPLETED,
+        EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+        EventType.MODEL_HOSTED_TOOL_CALL,
+    }
+)
+# The most prices a posted price book may hold; Cayu's bundled book has a few dozen.
+MAX_POSTED_PRICES = 1000
+
+
+def bounded_price_book(value: PriceBook | None) -> PriceBook | None:
+    """Reject a posted price book too large to resolve against every call of a read."""
+
+    if value is not None and len(value.prices) > MAX_POSTED_PRICES:
+        raise ValueError(f"A posted price book may hold at most {MAX_POSTED_PRICES} prices.")
+    return value
+
+
+class CallPricer:
+    """Prices one session's usage events, read in sequence order, as Cayu's cost accounting does.
+
+    It reads the same metrics as `estimate_session_cost` (a completion's usage plus its
+    hosted-tool usage), folds hosted tool calls recorded as separate events into the model
+    attempt they belong to, and prices each call on the date it completed. Hosted tool
+    calls no completion claims are priced on their own by `unclaimed`.
+    """
+
+    def __init__(self, pricing: PriceBook) -> None:
+        self.pricing = pricing
+        self._hosted: dict[str, tuple[UsageMetrics, datetime]] = {}
+        self._loose: list[tuple[UsageMetrics, datetime]] = []
+
+    def observe(self, event: Event) -> CallCost | None:
+        """A model call's cost, or None for an event that is folded into a later call."""
+
+        if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
+            try:
+                hosted = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
+            except (TypeError, ValueError):
+                # Malformed hosted evidence is skipped, as the usage totals skip it.
+                return None
+            if hosted is None:
+                return None
+            attempt = _optional_string(event.payload.get("model_attempt_id"))
+            if attempt is None:
+                self._loose.append((hosted, event.timestamp))
+            else:
+                current = self._hosted.get(attempt)
+                self._hosted[attempt] = (
+                    (hosted, event.timestamp)
+                    if current is None
+                    else (_combine_hosted_cost_metrics(current[0], hosted), current[1])
+                )
+            return None
+        metrics = _cost_usage_metrics_from_event_payload(event.payload)
+        attempt = _optional_string(event.payload.get("model_attempt_id"))
+        claimed = None if attempt is None else self._hosted.pop(attempt, None)
+        if claimed is not None:
+            metrics = _merge_hosted_cost_metrics(metrics, claimed[0])
+        if metrics is None:
+            return CallCost(priced=False, reason="no usage evidence")
+        return self._price(metrics, event.timestamp)
+
+    def unclaimed(self) -> list[CallCost]:
+        """Hosted tool calls no completion claimed, each priced on its own."""
+
+        return [self._price(metrics, at) for metrics, at in (*self._loose, *self._hosted.values())]
+
+    def _price(self, metrics: UsageMetrics, at: datetime) -> CallCost:
+        estimate = estimate_model_step_cost(
+            metrics=metrics, pricing=self.pricing, effective_on=at.astimezone(UTC).date()
+        )
+        if not estimate.priced or estimate.currency is None:
+            return CallCost(
+                priced=False,
+                reason=estimate.missing_pricing_reason or "no matching model pricing",
+            )
+        return CallCost(priced=True, currency=estimate.currency, amount=estimate.total_cost)
+
+
+def currency_totals_text(totals: dict[str, Decimal]) -> dict[str, str]:
+    """Per-currency totals as decimal strings, ordered by currency."""
+
+    return {currency: decimal_text(totals[currency]) for currency in sorted(totals)}
+
+
+def add_cost(totals: dict[str, Decimal], cost: CallCost) -> None:
+    if cost.priced and cost.currency is not None:
+        totals[cost.currency] = totals.get(cost.currency, Decimal(0)) + cost.amount
+
+
+def decimal_text(value: Decimal) -> str:
+    """A cost as a plain decimal string, without exponent or trailing zeros."""
+
+    text = format(value.normalize(), "f")
+    return text if text != "-0" else "0"
 
 
 class InspectionTooLarge(ValueError):
@@ -89,6 +211,9 @@ _TOOL_INSPECTION_IDENTITY_CONFLICT_KEY = "_cayu_tool_identity_conflict"
 
 USAGE_INSPECTION_EVENT_TYPES = (
     EventType.MODEL_COMPLETED,
+    # Read for cost only: they add to a priced view's estimated cost, not to its rows.
+    EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+    EventType.MODEL_HOSTED_TOOL_CALL,
     EventType.TOOL_CALL_STARTED,
     EventType.BUDGET_RESERVED,
     EventType.BUDGET_RECONCILED,
@@ -142,6 +267,7 @@ def model_call_usage(
                 ),
                 "pricing_state": "unknown",
                 "ledger": [],
+                **_call_cost(event.payload.get(_COST_KEY)),
             }
             calls.append(call)
             continue
@@ -1019,9 +1145,19 @@ async def collect_inspection_records(
             return records
 
 
-def usage_inspection_record(record: EventRecord) -> EventRecord:
+_COST_KEY = "_cayu_cost"
+
+
+def usage_inspection_record(record: EventRecord, pricer: CallPricer | None = None) -> EventRecord:
     event = record.event
     payload: dict[str, Any] = {}
+    cost = None if pricer is None or event.type not in PRICED_EVENT_TYPES else pricer.observe(event)
+    if cost is not None:
+        payload[_COST_KEY] = {
+            "cost": decimal_text(cost.amount) if cost.priced else None,
+            "cost_currency": cost.currency,
+            "cost_state": "priced" if cost.priced else "unpriced",
+        }
     if event.type == EventType.MODEL_COMPLETED:
         transcript_cursor = event.payload.get("transcript_cursor")
         if transcript_cursor is not None:
@@ -1329,6 +1465,41 @@ def _bounded_argument_summary(value: Any, disclosure: ArgumentDisclosure = LOCAL
     return bounded_json_summary(redact_inspection_value(value), max_bytes=256)
 
 
+def _call_cost(value: object) -> dict[str, str | None]:
+    if not isinstance(value, dict):
+        return dict.fromkeys(("cost", "cost_currency", "cost_state"))
+    cost = cast("dict[str, Any]", value)
+    return {key: cost.get(key) for key in ("cost", "cost_currency", "cost_state")}
+
+
+def _cost_totals(records: list[EventRecord], pricer: CallPricer) -> tuple[dict[str, str], int]:
+    """Estimated cost per currency over every priced event, and the model calls left unpriced.
+
+    The total covers model calls, auxiliary attempts and unclaimed hosted tool calls, as
+    `estimate_session_cost` does; the unpriced count covers model calls, auxiliary attempts
+    and unclaimed hosted calls left unpriced, so a partial total never looks complete.
+    """
+
+    totals: dict[str, Decimal] = {}
+    unpriced = 0
+    for record in records:
+        cost = record.event.payload.get(_COST_KEY)
+        if not isinstance(cost, dict):
+            continue
+        if cost.get("cost_state") == "priced":
+            currency = str(cost["cost_currency"])
+            totals[currency] = totals.get(currency, Decimal(0)) + Decimal(str(cost["cost"]))
+        elif record.event.type in {
+            EventType.MODEL_COMPLETED,
+            EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+        }:
+            unpriced += 1
+    for cost in pricer.unclaimed():
+        add_cost(totals, cost)
+        unpriced += not cost.priced
+    return currency_totals_text(totals), unpriced
+
+
 async def inspect_model_calls(
     reader: EventReader,
     session_id: str,
@@ -1336,18 +1507,23 @@ async def inspect_model_calls(
     *,
     offset: int,
     limit: int,
+    pricing: PriceBook | None = None,
 ) -> dict[str, Any]:
     """Per-model-call usage, ledger reservations no call claims, and aggregate counters.
 
     `calls` and `unmatched_ledger` are pages of the same `offset` and `limit`. The aggregate
-    usage is an `AggregateUsageMetrics` instance under `aggregate["usage"]`.
+    usage is an `AggregateUsageMetrics` instance under `aggregate["usage"]`. With
+    ``pricing``, every call is priced on its own date and the aggregate sums the priced
+    calls per currency (`estimated_cost`) and counts the rest (`unpriced_calls`); without
+    it the cost fields are `None`.
     """
 
+    pricer = None if pricing is None else CallPricer(pricing)
     records = await collect_inspection_records(
         reader,
         session_id,
         event_types=USAGE_INSPECTION_EVENT_TYPES,
-        project_record=usage_inspection_record,
+        project_record=lambda record: usage_inspection_record(record, pricer),
         after_sequence=window.after_sequence,
         before_sequence=window.before_sequence,
         interaction_id=window.interaction_id,
@@ -1359,6 +1535,7 @@ async def inspect_model_calls(
     ]
     aggregate = session_usage_summary(session_id, usage_events)
     calls, unmatched_ledger = model_call_usage(records)
+    estimated_cost, unpriced_calls = ({}, 0) if pricer is None else _cost_totals(records, pricer)
     page = calls[offset : offset + limit]
     ledger_page = unmatched_ledger[offset : offset + limit]
     next_offset = offset + len(page)
@@ -1380,7 +1557,12 @@ async def inspect_model_calls(
             "model_calls_with_usage": count_model_steps_with_usage(usage_events),
             "tool_calls": aggregate.tool_calls,
             "usage": aggregate.usage,
+            "estimated_cost": None if pricing is None else estimated_cost,
+            "unpriced_calls": None if pricing is None else unpriced_calls,
         },
+        "price_book": None
+        if pricing is None
+        else {"version": pricing.price_book_version, "generated_at": pricing.generated_at},
     }
 
 

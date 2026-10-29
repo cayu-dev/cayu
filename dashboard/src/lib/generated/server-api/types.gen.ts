@@ -1217,6 +1217,20 @@ export type ApiPendingActionIssue = {
 };
 
 /**
+ * ApiPriceBookIdentity
+ */
+export type ApiPriceBookIdentity = {
+    /**
+     * Generated At
+     */
+    generated_at: string;
+    /**
+     * Version
+     */
+    version: string;
+};
+
+/**
  * ApiProviderOperationInspection
  */
 export type ApiProviderOperationInspection = {
@@ -1669,6 +1683,22 @@ export type ApiSessionModelCall = {
      */
     cached_input_tokens: number | null;
     /**
+     * Cost
+     *
+     * The call's estimated cost, a decimal string, when priced.
+     */
+    cost?: string | null;
+    /**
+     * Cost Currency
+     */
+    cost_currency?: string | null;
+    /**
+     * Cost State
+     *
+     * Null unless the request carried a price book.
+     */
+    cost_state?: 'priced' | 'unpriced' | null;
+    /**
      * Input Tokens
      */
     input_tokens: number | null;
@@ -1727,6 +1757,14 @@ export type ApiSessionModelCall = {
  */
 export type ApiSessionModelCallAggregate = {
     /**
+     * Estimated Cost
+     *
+     * Priced calls' cost summed per currency, as decimal strings.
+     */
+    estimated_cost?: {
+        [key: string]: string;
+    } | null;
+    /**
      * Model Calls
      */
     model_calls: number;
@@ -1738,6 +1776,10 @@ export type ApiSessionModelCallAggregate = {
      * Tool Calls
      */
     tool_calls: number;
+    /**
+     * Unpriced Calls
+     */
+    unpriced_calls?: number | null;
     usage: AggregateUsageMetrics;
 };
 
@@ -18101,6 +18143,12 @@ export type RollupFailureKind = {
  * One group's sums. Two groups with the same key merge by adding.
  */
 export type RollupGroup = {
+    /**
+     * Cost
+     */
+    cost?: {
+        [key: string]: string;
+    };
     durations?: RollupDurations;
     /**
      * Failure Kinds
@@ -18140,6 +18188,10 @@ export type RollupGroup = {
      * Tool Failures
      */
     tool_failures?: number;
+    /**
+     * Unpriced Model Calls
+     */
+    unpriced_model_calls?: number;
     usage?: AggregateUsageMetrics;
 };
 
@@ -19573,6 +19625,13 @@ export type SessionMessageTarget = {
 };
 
 /**
+ * SessionModelCallsRequest
+ */
+export type SessionModelCallsRequest = {
+    pricing?: PriceBook | null;
+};
+
+/**
  * SessionModelCallsResponse
  *
  * `cayu session usage` for one session: pages of calls and unclaimed reservations.
@@ -19595,6 +19654,7 @@ export type SessionModelCallsResponse = {
      * Offset
      */
     offset: number;
+    price_book?: ApiPriceBookIdentity | null;
     /**
      * Session Id
      */
@@ -19906,6 +19966,7 @@ export type SessionRollupQuery = {
      * Max Sessions
      */
     max_sessions?: number;
+    pricing?: PriceBook | null;
     /**
      * Since
      */
@@ -28832,6 +28893,65 @@ export type GetSessionModelCallsApiSessionsSessionIdModelCallsGetResponses = {
 };
 
 export type GetSessionModelCallsApiSessionsSessionIdModelCallsGetResponse = GetSessionModelCallsApiSessionsSessionIdModelCallsGetResponses[keyof GetSessionModelCallsApiSessionsSessionIdModelCallsGetResponses];
+
+export type PostSessionModelCallsApiSessionsSessionIdModelCallsPostData = {
+    body: SessionModelCallsRequest;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * Offset
+         */
+        offset?: number;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * After Sequence
+         */
+        after_sequence?: number | null;
+        /**
+         * Before Sequence
+         */
+        before_sequence?: number | null;
+        /**
+         * Interaction Id
+         */
+        interaction_id?: string | null;
+    };
+    url: '/api/sessions/{session_id}/model-calls';
+};
+
+export type PostSessionModelCallsApiSessionsSessionIdModelCallsPostErrors = {
+    /**
+     * The session does not exist.
+     */
+    404: unknown;
+    /**
+     * The event window holds more than one view reads; narrow it.
+     */
+    413: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type PostSessionModelCallsApiSessionsSessionIdModelCallsPostError = PostSessionModelCallsApiSessionsSessionIdModelCallsPostErrors[keyof PostSessionModelCallsApiSessionsSessionIdModelCallsPostErrors];
+
+export type PostSessionModelCallsApiSessionsSessionIdModelCallsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionModelCallsResponse;
+};
+
+export type PostSessionModelCallsApiSessionsSessionIdModelCallsPostResponse = PostSessionModelCallsApiSessionsSessionIdModelCallsPostResponses[keyof PostSessionModelCallsApiSessionsSessionIdModelCallsPostResponses];
 
 export type GetSessionStateApiSessionsSessionIdStateGetData = {
     body?: never;

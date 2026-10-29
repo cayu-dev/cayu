@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from cayu.budgets.pricing import PriceBook
 from cayu.budgets.usage import AggregateUsageMetrics
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.provider_operations import inspect_provider_operation
@@ -81,9 +82,15 @@ class SessionReader(Protocol):
     ) -> InteractionPage: ...
 
     async def model_calls(
-        self, session_id: str, window: InspectionWindow, *, offset: int, limit: int
+        self,
+        session_id: str,
+        window: InspectionWindow,
+        *,
+        offset: int,
+        limit: int,
+        pricing: PriceBook | None = None,
     ) -> dict[str, Any]:
-        """`inspect_model_calls`: usage per model call, unclaimed ledger, aggregate."""
+        """`inspect_model_calls`: usage (and cost) per model call, unclaimed ledger, aggregate."""
         ...
 
     async def tool_calls(
@@ -253,9 +260,17 @@ class StoreSessionReader:
         )
 
     async def model_calls(
-        self, session_id: str, window: InspectionWindow, *, offset: int, limit: int
+        self,
+        session_id: str,
+        window: InspectionWindow,
+        *,
+        offset: int,
+        limit: int,
+        pricing: PriceBook | None = None,
     ) -> dict[str, Any]:
-        return await inspect_model_calls(self.store, session_id, window, offset=offset, limit=limit)
+        return await inspect_model_calls(
+            self.store, session_id, window, offset=offset, limit=limit, pricing=pricing
+        )
 
     async def tool_calls(
         self, session_id: str, window: InspectionWindow, *, offset: int, limit: int

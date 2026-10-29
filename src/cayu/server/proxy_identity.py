@@ -198,6 +198,7 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/sessions/rollup",
             "/sessions/summary",
             "/sessions/{session_id}/cost",
+            "/sessions/{session_id}/model-calls",
             "/sessions/{session_id}/human-review/long-field",
             "/sessions/{session_id}/topology",
             "/supervision-events/query",

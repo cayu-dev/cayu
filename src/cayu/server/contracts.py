@@ -3062,6 +3062,13 @@ class ApiSessionModelCall(ApiBaseModel):
     transcript_cursor: StrictInt | None
     pricing_state: str
     ledger: list[ApiSessionLedgerReservation]
+    cost: str | None = Field(
+        default=None, description="The call's estimated cost, a decimal string, when priced."
+    )
+    cost_currency: str | None = None
+    cost_state: Literal["priced", "unpriced"] | None = Field(
+        default=None, description="Null unless the request carried a price book."
+    )
 
 
 class ApiSessionModelCallAggregate(ApiBaseModel):
@@ -3069,6 +3076,26 @@ class ApiSessionModelCallAggregate(ApiBaseModel):
     model_calls_with_usage: StrictInt = Field(ge=0)
     tool_calls: StrictInt = Field(ge=0)
     usage: AggregateUsageMetrics
+    estimated_cost: dict[str, str] | None = Field(
+        default=None, description="Priced calls' cost summed per currency, as decimal strings."
+    )
+    unpriced_calls: StrictInt | None = Field(default=None, ge=0)
+
+
+class ApiPriceBookIdentity(ApiBaseModel):
+    version: str
+    generated_at: str
+
+
+class SessionModelCallsRequest(ApiBaseModel):
+    pricing: PriceBook | None = None
+
+    @field_validator("pricing")
+    @classmethod
+    def validate_pricing(cls, value: PriceBook | None) -> PriceBook | None:
+        from cayu.sessions._call_inspection import bounded_price_book
+
+        return bounded_price_book(value)
 
 
 class SessionModelCallsResponse(ApiBaseModel):
@@ -3085,6 +3112,7 @@ class SessionModelCallsResponse(ApiBaseModel):
     unmatched_ledger_next_offset: StrictInt | None = Field(ge=0)
     unmatched_ledger_has_more: StrictBool
     aggregate: ApiSessionModelCallAggregate
+    price_book: ApiPriceBookIdentity | None = None
 
 
 class ApiSessionToolCall(ApiBaseModel):

@@ -13,12 +13,18 @@ from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi.routing import APIRoute
 from pydantic import StringConstraints
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu.budgets.pricing import PriceBook
 from cayu.runtime._tool_call_correlation import public_tool_call_handle
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
-from cayu.server.contracts import SessionModelCallsResponse, SessionToolCallsResponse
+from cayu.server.contracts import (
+    SessionModelCallsRequest,
+    SessionModelCallsResponse,
+    SessionToolCallsResponse,
+)
 from cayu.sessions._call_inspection import (
     ArgumentDisclosure,
     InspectionTooLarge,
@@ -47,6 +53,7 @@ def register_session_call_routes(
     project_session: Callable[[str], str],
     redact: Callable[[Any], Any],
     codec: Callable[[], PublicAuthorityAliasCodec | None],
+    pricing_route: type[APIRoute] = APIRoute,
 ) -> None:
     async def window(
         session_id: str,
@@ -65,32 +72,23 @@ def register_session_call_routes(
             interaction_id=interaction_id,
         )
 
-    @router.get(
-        "/sessions/{session_id}/model-calls",
-        response_model=SessionModelCallsResponse,
-        responses=_RESPONSES,
-        dependencies=protected,
-        description=(
-            "Per-model-call token usage, budget reservations no call claims, and aggregate "
-            "counters for one session, as `cayu session usage` reports them. `offset` and "
-            "`limit` page the calls and the reservations alike."
-        ),
-    )
-    async def get_session_model_calls(
-        session_id: NonBlankString,
+    async def model_calls(
+        session_id: str,
         response: Response,
-        offset: Annotated[int, Query(ge=0, le=MAX_DURABLE_JSON_INTEGER)] = 0,
-        limit: Annotated[int, Query(ge=1, le=_PAGE_LIMIT_MAX)] = 100,
-        after_sequence: Annotated[int | None, Query(ge=0)] = None,
-        before_sequence: Annotated[int | None, Query(ge=1)] = None,
-        interaction_id: Annotated[NonBlankString | None, Query()] = None,
-    ):
+        *,
+        offset: int,
+        limit: int,
+        after_sequence: int | None,
+        before_sequence: int | None,
+        interaction_id: str | None,
+        pricing: PriceBook | None,
+    ) -> dict[str, Any]:
         private_id, selected = await window(
             session_id, after_sequence, before_sequence, interaction_id
         )
         try:
             result = await inspect_model_calls(
-                store, private_id, selected, offset=offset, limit=limit
+                store, private_id, selected, offset=offset, limit=limit, pricing=pricing
             )
         except InspectionTooLarge as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from None
@@ -102,6 +100,74 @@ def register_session_call_routes(
                 {**ledger, "reservation_id": None} for ledger in result["unmatched_ledger"]
             ],
         }
+
+    @router.get(
+        "/sessions/{session_id}/model-calls",
+        response_model=SessionModelCallsResponse,
+        responses=_RESPONSES,
+        dependencies=protected,
+        description=(
+            "Per-model-call token usage, budget reservations no call claims, and aggregate "
+            "counters for one session, as `cayu session usage` reports them. `offset` and "
+            "`limit` page the calls and the reservations alike. POST a price book to price "
+            "each call as well."
+        ),
+    )
+    async def get_session_model_calls(
+        session_id: NonBlankString,
+        response: Response,
+        offset: Annotated[int, Query(ge=0, le=MAX_DURABLE_JSON_INTEGER)] = 0,
+        limit: Annotated[int, Query(ge=1, le=_PAGE_LIMIT_MAX)] = 100,
+        after_sequence: Annotated[int | None, Query(ge=0)] = None,
+        before_sequence: Annotated[int | None, Query(ge=1)] = None,
+        interaction_id: Annotated[NonBlankString | None, Query()] = None,
+    ):
+        return await model_calls(
+            session_id,
+            response,
+            offset=offset,
+            limit=limit,
+            after_sequence=after_sequence,
+            before_sequence=before_sequence,
+            interaction_id=interaction_id,
+            pricing=None,
+        )
+
+    async def post_session_model_calls(
+        session_id: NonBlankString,
+        body: SessionModelCallsRequest,
+        response: Response,
+        offset: Annotated[int, Query(ge=0, le=MAX_DURABLE_JSON_INTEGER)] = 0,
+        limit: Annotated[int, Query(ge=1, le=_PAGE_LIMIT_MAX)] = 100,
+        after_sequence: Annotated[int | None, Query(ge=0)] = None,
+        before_sequence: Annotated[int | None, Query(ge=1)] = None,
+        interaction_id: Annotated[NonBlankString | None, Query()] = None,
+    ):
+        return await model_calls(
+            session_id,
+            response,
+            offset=offset,
+            limit=limit,
+            after_sequence=after_sequence,
+            before_sequence=before_sequence,
+            interaction_id=interaction_id,
+            pricing=body.pricing,
+        )
+
+    router.add_api_route(
+        "/sessions/{session_id}/model-calls",
+        post_session_model_calls,
+        methods=["POST"],
+        response_model=SessionModelCallsResponse,
+        responses=_RESPONSES,
+        dependencies=protected,
+        route_class_override=pricing_route,
+        description=(
+            "The same view as `GET`, with every call priced on its own date from the "
+            "body's price book. `aggregate.estimated_cost` sums priced calls per currency "
+            "and `aggregate.unpriced_calls` counts calls the book has no price for."
+        ),
+    )
 
     @router.get(
         "/sessions/{session_id}/tool-calls",
@@ -175,18 +241,8 @@ def register_session_rollup_route(
     store: SessionStore,
     redact: Callable[[Any], Any],
     serialize_cursor: Callable[[str | None], str | None],
+    pricing_route: type[APIRoute] = APIRoute,
 ) -> None:
-    @router.post(
-        "/sessions/rollup",
-        response_model=RollupPage,
-        dependencies=protected,
-        description=(
-            "One page of `cayu session rollup`: usage, time by phase and tool failures by "
-            "error kind for up to `max_sessions` sessions created in the window, grouped by "
-            "agent, UTC day, Release or `label:KEY`. Groups merge by adding; pass "
-            "`next_cursor` back as `cursor` for the next page."
-        ),
-    )
     async def post_session_rollup(query: SessionRollupQuery, response: Response):
         try:
             page = await rollup_page(store, query)
@@ -209,3 +265,18 @@ def register_session_rollup_route(
             sessions_read=page.sessions_read,
             next_cursor=serialize_cursor(page.next_cursor),
         )
+
+    router.add_api_route(
+        "/sessions/rollup",
+        post_session_rollup,
+        methods=["POST"],
+        response_model=RollupPage,
+        dependencies=protected,
+        route_class_override=pricing_route,
+        description=(
+            "One page of `cayu session rollup`: usage, cost, time by phase and tool failures "
+            "by error kind for up to `max_sessions` sessions created in the window, grouped "
+            "by agent, UTC day, Release or `label:KEY`. Groups merge by adding; pass "
+            "`next_cursor` back as `cursor` for the next page."
+        ),
+    )

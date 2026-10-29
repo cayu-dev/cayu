@@ -944,6 +944,14 @@ class _BoundedSupervisionEventsRoute(_BoundedPrivateJsonBodyRoute):
         return _private_no_store_validation_error_response(self.invalid_request_detail)
 
 
+class _BoundedSessionPricingRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound the posted price book of session usage and rollup reads before validation."""
+
+    max_request_bytes = MAX_USAGE_ROLLUP_REQUEST_BYTES
+    invalid_request_detail = "Invalid session pricing request."
+    oversized_request_detail = "Session pricing request exceeds the server byte limit."
+
+
 class _BoundedUsageRollupRoute(_BoundedPrivateJsonBodyRoute):
     """Bound and sanitize usage bodies before FastAPI exposes pricing input."""
 
@@ -8575,6 +8583,15 @@ def create_router(
         project_session=cayu_app.project_session_id_for_exposure,
         redact=cayu_app.redact_json,
         codec=lambda: cayu_app._public_authority_alias_codec,
+        pricing_route=_BoundedSessionPricingRoute,
+    )
+    register_session_rollup_route(
+        router,
+        protected=protected,
+        store=session_store,
+        redact=cayu_app.redact_json,
+        serialize_cursor=partial(_serialize_session_cursor, cayu_app),
+        pricing_route=_BoundedSessionPricingRoute,
     )
     register_session_rollup_route(
         router,

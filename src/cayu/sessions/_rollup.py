@@ -1,7 +1,7 @@
 """Usage, time and tool failures across many sessions, grouped, read a page at a time.
 
 `cayu session rollup` answers questions about many sessions at once: how many tokens each
-agent used per day, where time went (model calls, tool calls, environment setup, and the
+agent used per day, what that cost (priced per call from a price book), where time went (model calls, tool calls, environment setup, and the
 runtime gaps between them), and which tools failed and why. It reads one page of sessions
 at a time, and each session's events in bounded pages of only the types it needs, keeping
 per-session facts and per-group sums, never whole histories. Groups merge by adding, so a
@@ -26,6 +26,7 @@ from collections import Counter
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
@@ -35,6 +36,7 @@ from cayu.budgets.aggregates import (
     aggregate_usage_metrics_from_event_payload,
     summary_usage_metrics_from_event_payload,
 )
+from cayu.budgets.pricing import PriceBook
 from cayu.budgets.usage import (
     AggregateUsageMetrics,
     UsageMetrics,
@@ -43,6 +45,13 @@ from cayu.budgets.usage import (
 )
 from cayu.events import Event, EventType
 from cayu.releases import recorded_release_identity
+from cayu.sessions._call_inspection import (
+    CallCost,
+    CallPricer,
+    add_cost,
+    bounded_price_book,
+    currency_totals_text,
+)
 from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus
@@ -125,6 +134,13 @@ class SessionRollupQuery(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     cursor: str | None = None
     max_sessions: StrictInt = Field(default=100, ge=1, le=ROLLUP_MAX_SESSIONS_PER_PAGE)
+    # Prices every model call on its own date; without it groups report no cost.
+    pricing: PriceBook | None = None
+
+    @field_validator("pricing")
+    @classmethod
+    def validate_pricing(cls, value: PriceBook | None) -> PriceBook | None:
+        return bounded_price_book(value)
 
     @field_validator("group_by")
     @classmethod
@@ -211,6 +227,10 @@ class RollupGroup(BaseModel):
     tool_calls: StrictInt = Field(default=0, ge=0)
     tool_failures: StrictInt = Field(default=0, ge=0)
     usage: AggregateUsageMetrics = Field(default_factory=build_aggregate_usage_metrics)
+    # Priced model calls' estimated cost per currency (decimal strings), and the calls the
+    # price book had no price for. Both empty when the query carried no price book.
+    cost: dict[str, str] = Field(default_factory=dict)
+    unpriced_model_calls: StrictInt = Field(default=0, ge=0)
     durations: RollupDurations = Field(default_factory=RollupDurations)
     failure_kinds: list[RollupFailureKind] = Field(default_factory=list)
 
@@ -232,6 +252,8 @@ class RollupGroup(BaseModel):
             tool_calls=self.tool_calls + other.tool_calls,
             tool_failures=self.tool_failures + other.tool_failures,
             usage=add_aggregate_usage(self.usage, other.usage),
+            cost=_add_costs(self.cost, other.cost),
+            unpriced_model_calls=self.unpriced_model_calls + other.unpriced_model_calls,
             durations=RollupDurations(
                 **{
                     name: getattr(self.durations, name) + getattr(other.durations, name)
@@ -273,6 +295,8 @@ class SessionFacts:
     tool_calls: int = 0
     tool_failures: Counter[tuple[str, str]] = field(default_factory=Counter)
     usage: AggregateUsageMetrics = field(default_factory=build_aggregate_usage_metrics)
+    cost: dict[str, Decimal] = field(default_factory=dict)
+    unpriced_model_calls: int = 0
     active_ms: int = 0
     wall_ms: int = 0
     model_ms: int = 0
@@ -288,7 +312,7 @@ async def rollup_page(store: SessionStore, query: SessionRollupQuery) -> RollupP
     result = await store.list_sessions(query.session_query())
     groups: list[RollupGroup] = []
     for session in result.sessions:
-        facts = await session_facts(store, session.id)
+        facts = await session_facts(store, session.id, pricing=query.pricing)
         key = _group_key(session, facts, dimension, label_key)
         groups.append(_session_group(key, session, facts))
     return RollupPage(
@@ -298,7 +322,9 @@ async def rollup_page(store: SessionStore, query: SessionRollupQuery) -> RollupP
     )
 
 
-async def session_facts(store: SessionStore, session_id: str) -> SessionFacts:
+async def session_facts(
+    store: SessionStore, session_id: str, *, pricing: PriceBook | None = None
+) -> SessionFacts:
     """Read one session's rollup facts from its events, a bounded page at a time."""
 
     facts = SessionFacts()
@@ -308,6 +334,7 @@ async def session_facts(store: SessionStore, session_id: str) -> SessionFacts:
     model_spans: list[tuple[datetime, datetime]] = []
     tool_spans: list[tuple[datetime, datetime]] = []
     setup_spans: list[tuple[datetime, datetime]] = []
+    pricer = None if pricing is None else CallPricer(pricing)
     wait_open: dict[tuple[str, str], datetime] = {}
     wait_spans: list[tuple[datetime, datetime]] = []
     async for record in _events(store, session_id):
@@ -333,6 +360,9 @@ async def session_facts(store: SessionStore, session_id: str) -> SessionFacts:
                 if metrics is not None:
                     facts.model_calls_with_usage += 1
                     facts.usage = add_aggregate_usage(facts.usage, metrics)
+                _count_cost(
+                    facts, None if pricer is None else pricer.observe(event), model_call=True
+                )
             else:
                 facts.model_errors += 1
             started = model_open.pop(_text(payload.get("model_attempt_id")) or "", None)
@@ -344,10 +374,14 @@ async def session_facts(store: SessionStore, session_id: str) -> SessionFacts:
             metrics = _usage_only(aggregate_usage_metrics_from_event_payload, payload)
             if metrics is not None:
                 facts.usage = add_aggregate_usage(facts.usage, metrics)
+            _count_cost(facts, None if pricer is None else pricer.observe(event), model_call=True)
         elif event.type == EventType.MODEL_HOSTED_TOOL_CALL:
             metrics = _usage_only(aggregate_hosted_tool_usage_metrics_from_event_payload, payload)
             if metrics is not None:
                 facts.usage = add_aggregate_usage(facts.usage, metrics)
+            # Folded into the cost of the model attempt it belongs to.
+            if pricer is not None:
+                pricer.observe(event)
         elif event.type == EventType.TOOL_CALL_STARTED:
             facts.tool_calls += 1
             call = _tool_call(payload)
@@ -401,6 +435,9 @@ async def session_facts(store: SessionStore, session_id: str) -> SessionFacts:
         elif event.type in _TURN_ENDS:
             facts.active_ms += _milliseconds(payload.get("active_duration_ms"))
             facts.wall_ms += _milliseconds(payload.get("wall_duration_ms"))
+    for cost in [] if pricer is None else pricer.unclaimed():
+        # A hosted call no model call claimed still leaves the total incomplete when unpriced.
+        _count_cost(facts, cost, model_call=True)
     # A tool call that waited for approval spans the wait; turn time leaves waits out, so
     # every phase does too. A wait still open runs to the end of what was read.
     wait_spans.extend((started, datetime.max.replace(tzinfo=UTC)) for started in wait_open.values())
@@ -488,6 +525,8 @@ def _session_group(key: str, session: Session, facts: SessionFacts) -> RollupGro
         tool_calls=facts.tool_calls,
         tool_failures=sum(facts.tool_failures.values()),
         usage=facts.usage,
+        cost=currency_totals_text(facts.cost),
+        unpriced_model_calls=facts.unpriced_model_calls,
         durations=RollupDurations(
             active_ms=facts.active_ms,
             wall_ms=facts.wall_ms,
@@ -510,6 +549,21 @@ def _group_key(
     if dimension == "release":
         return facts.release or _NO_VALUE
     return session.labels.get(label_key or "", _NO_VALUE)
+
+
+def _count_cost(facts: SessionFacts, cost: CallCost | None, *, model_call: bool) -> None:
+    if cost is None:
+        return
+    add_cost(facts.cost, cost)
+    if not cost.priced and model_call:
+        facts.unpriced_model_calls += 1
+
+
+def _add_costs(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
+    totals = {currency: Decimal(amount) for currency, amount in left.items()}
+    for currency, amount in right.items():
+        totals[currency] = totals.get(currency, Decimal(0)) + Decimal(amount)
+    return currency_totals_text(totals)
 
 
 def _kind_rows(kinds: Counter[tuple[str, str]]) -> list[RollupFailureKind]:

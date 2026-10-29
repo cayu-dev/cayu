@@ -239,6 +239,41 @@ def test_post_falls_back_past_another_apps_route_at_the_mount() -> None:
     assert seen == ["POST /cayu/api/sessions/rollup", "POST /api/sessions/rollup"]
 
 
+def test_reader_prices_usage_on_the_agent_and_falls_back_without_cost() -> None:
+    from cayu.budgets.pricing import default_price_book
+    from cayu.budgets.usage import build_aggregate_usage_metrics
+
+    usage = {
+        "session_id": "s",
+        "calls": [],
+        "aggregate": {
+            "model_calls": 0,
+            "usage": build_aggregate_usage_metrics().model_dump(mode="json"),
+        },
+    }
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sessions"):
+            return httpx.Response(200, json=_SESSIONS)
+        methods.append(request.method)
+        if request.method == "POST":
+            assert "price_book_version" in request.content.decode()
+            return httpx.Response(405, json={"detail": "Method Not Allowed"})
+        return httpx.Response(200, json=usage)
+
+    reader = AgentSessionReader(_api(handler))
+    result = asyncio.run(
+        reader.model_calls(
+            "s", InspectionWindow(), offset=0, limit=10, pricing=default_price_book()
+        )
+    )
+
+    # Both API bases refuse the POST before the GET falls back to unpriced calls.
+    assert methods == ["POST", "POST", "GET"]
+    assert result["calls"] == [] and result.get("price_book") is None
+
+
 def test_reader_never_trusts_an_agents_total_for_a_creation_window() -> None:
     from datetime import UTC, datetime
 

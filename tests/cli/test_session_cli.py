@@ -139,7 +139,7 @@ def test_session_list_uses_project_target_and_emits_stable_json(
     assert payload == {
         "has_more": False,
         "next_cursor": None,
-        "schema_version": "8",
+        "schema_version": "9",
         "sessions": [
             {
                 "agent": "writer",
@@ -268,7 +268,7 @@ def test_session_resolve_provider_operation_posts_fenced_server_request(
     }
     output = json.loads(capsys.readouterr().out)
     assert output == {
-        "schema_version": "8",
+        "schema_version": "9",
         "accepted": True,
         "session_id": "session_757",
         "stage_id": "stage_757",
@@ -1418,6 +1418,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         "cache_read_tokens": "7",
         "cache_write_tokens": "0",
         "cached_input_tokens": "7",
+        "estimated_cost": {},
         "input_tokens": "11",
         "model_calls": 2,
         "model_calls_with_usage": 2,
@@ -1425,6 +1426,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         "reasoning_tokens": "1",
         "tool_calls": 0,
         "total_tokens": "12",
+        "unpriced_calls": 2,
         "uncached_input_tokens": "3",
     }
     first = payload["calls"][0]
@@ -1523,7 +1525,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         "model_call",
         "unmatched_ledger",
     }
-    assert {row["schema_version"] for row in jsonl_rows} == {"8"}
+    assert {row["schema_version"] for row in jsonl_rows} == {"9"}
     aggregate_row = next(row for row in jsonl_rows if row["record_type"] == "aggregate")
     assert aggregate_row["total_tokens"] == "12"
 
@@ -1582,7 +1584,7 @@ def test_session_usage_json_serializes_aggregate_counters_losslessly(
         == 0
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema_version"] == "8"
+    assert payload["schema_version"] == "9"
     assert payload["aggregate"]["input_tokens"] == expected
     assert payload["aggregate"]["total_tokens"] == expected
 
@@ -3082,7 +3084,7 @@ def test_session_cli_lists_and_filters_response_scoped_interactions(
         == 0
     )
     listed = json.loads(capsys.readouterr().out)
-    assert listed["schema_version"] == "8"
+    assert listed["schema_version"] == "9"
     assert [item["interaction_id"] for item in listed["interactions"]] == [
         "interaction-b",
         "interaction-a",
