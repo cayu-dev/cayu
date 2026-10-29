@@ -173,11 +173,15 @@ def test_deploy_reports_running_tasks_before_uploading(
     assert "cayu cloud: 1 task is claimed or running" in capsys.readouterr().err
 
 
-def test_candidate_and_first_deploys_skip_the_check(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_first_deploy_skips_the_check_and_a_candidate_lists_them_for_its_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def read(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("no running-task read expected")
+    report = {"status": "read", "tasks": [_task("scan-1", "running")], "complete": True}
+    reads: list[str] = []
+
+    def read(client: Any, application_id: str, **kwargs: Any) -> dict[str, Any]:
+        reads.append(application_id)
+        return report
 
     monkeypatch.setattr(deploy_tasks, "read_running_tasks", read)
     monkeypatch.setattr(cloud_cli, "_requested_candidate", lambda arguments: None)
@@ -190,7 +194,7 @@ def test_candidate_and_first_deploys_skip_the_check(
         application={"id": "scanner-agent", "current_deployment_id": None},
         project=project,  # type: ignore[arg-type]
     )
-    assert first is None
+    assert first is None and reads == []
 
     monkeypatch.setattr(cloud_cli, "_requested_candidate", lambda arguments: {"id": "candidate"})
     candidate = cloud_cli._running_tasks_before_deploy(
@@ -199,7 +203,8 @@ def test_candidate_and_first_deploys_skip_the_check(
         application={"id": "scanner-agent", "current_deployment_id": "dep_1"},
         project=project,  # type: ignore[arg-type]
     )
-    assert candidate is None
+    assert candidate == {**report, "candidate": True}
+    assert "Promoting this candidate later publishes it" in capsys.readouterr().err
 
 
 def test_a_running_agent_without_an_address_is_unavailable_not_safe() -> None:

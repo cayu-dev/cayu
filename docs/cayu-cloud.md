@@ -239,6 +239,29 @@ A task the worker can't finish or hand back within the grace stays fenced; see
 [a deploy during a long task](project-workers.md#a-deploy-during-a-long-task).
 `cayu cloud service status` reports such tasks (below).
 
+### Draining the worker a deploy replaces
+
+A worker can instead keep running after a later release replaces it, for up to
+`drain_seconds` (a whole number from 60 to 172,800, which is 48 hours), and finish the
+tasks it holds while the new release's worker takes every new task:
+
+```toml
+[worker]
+command = "cayu worker scout"
+drain_seconds = 10800
+```
+
+It is the replaced release's value that counts, so the first release that declares it is
+still replaced at once. Cloud drains only an Agent with its provisioned database, since
+two workers run side by side, and both see the same `/data`. `cayu worker` asks Cloud
+whether its release is draining and, once it is, stops claiming and exits when its tasks
+finish ([a deploy during a long task](project-workers.md#a-deploy-during-a-long-task));
+another worker command keeps claiming until Cloud stops it at the deadline. The value is
+part of the release; a manifest without it sends the same payload as before. A Cayu
+Cloud release that predates the key refuses it. `cayu cloud service status` lists each
+drain while it lasts, with its deadline and the time left, and `cayu cloud deployment
+status` lists the drain a release's publication started.
+
 Before it uploads anything, `cayu cloud deploy` reads the Agent's claimed and running
 tasks through the Agent's own task API
 ([reading an Agent's state](#reading-an-agents-state-from-the-cli)) and, when there
@@ -247,10 +270,15 @@ it to the JSON `warnings`. The JSON `result.running_tasks` has the list (`status
 `read`, with `complete` false when there were more), `not_running` when the service
 is stopped or absent, or `unavailable` with the reason the read failed, which never
 stops the deploy. An Agent without a `[web]` process has no Cayu API to read, so its
-tasks are reported `unavailable` (`no_address`): its worker may still be running them. The deploy doesn't
-wait for these tasks or drain the worker; to keep their work, let them finish first.
-A candidate release (`--no-promote`) and an Agent with no selected release skip the
-check. Reading an asleep Agent wakes its web process.
+tasks are reported `unavailable` (`no_address`): its worker may still be running them.
+Cayu Cloud's deploy check then covers these tasks with the session choice below: `wait`
+holds the publication until they finish, `block` refuses, and `proceed` interrupts only
+the tasks `--acknowledge-session` names (by task ID, or `'*'`). Once the release is
+published, the JSON `warnings` also name the tasks it interrupted, a Cayu Cloud whose
+check predates tasks (so the choice didn't cover them), and the drain of the replaced
+worker. A candidate release (`--no-promote`) lists the tasks for its later promotion
+(`result.running_tasks.candidate`). An Agent with no selected release skips the check.
+Reading an asleep Agent wakes its web process.
 
 ### Schedules
 
@@ -424,6 +452,17 @@ the output adds a `warnings` entry saying how to list the tasks (`cayu inspect
 --fenced-tasks`) and settle them ([when a worker dies
 mid-task](triggering-runs.md#when-a-worker-dies-mid-task)). The service status itself is
 unchanged: fenced tasks don't make it `degraded`.
+
+`service status` also returns `result.worker_exits`: Cloud's record of the Agent's worker
+instances that stopped (an ECS task ARN or a Kubernetes container ID as `instance`, its
+`state`, `stopped_at`, `reason` and `exit_code`, newest first, at most 50), with
+`looked_at` saying when Cloud last asked the platform, and `status` `read`. It's the same
+record the Agent reads at `CAYU_WORKER_EXITS_URL`, so you can confirm that a replaced or
+drained worker really exited. A Cayu Cloud that doesn't serve it yet gives `status`
+`unsupported` with a message, and a read that fails gives `unavailable`; neither fails the
+status. `worker_drains` lists the replaced workers still finishing their tasks
+([draining](#draining-the-worker-a-deploy-replaces)), each also as a `warnings` line with
+its deadline and the time left.
 
 By default, `deploy` also waits for a declared Agent service to reach `running`. A
 `degraded` service ends that wait with a nonzero `service_degraded` result. Its
@@ -807,6 +846,13 @@ You choose what Cloud does about blocking sessions, per release:
   every unfinished session, including ones Cloud could not read. It implies
   `--session-policy proceed`.
 
+The same check lists the tasks the serving release's worker has claimed or is running
+(`session_preflight.tasks`). Replacing the worker interrupts them, so each blocks like a
+running session: `wait` waits for it to finish, `block` refuses, and `proceed` publishes
+only when `--acknowledge-session` names it by its task ID (or `'*'`). The release then
+records the tasks it interrupted as `session_preflight.interrupted_tasks`. A worker that
+drains ([above](#draining-the-worker-a-deploy-replaces)) finishes them instead.
+
 ```bash
 cayu cloud deploy . --session-policy block
 cayu cloud deploy . --session-wait-seconds 1800
@@ -852,7 +898,9 @@ again, or, for a `promoted` release, select it again with the `commands.rollback
 
 When Cloud refuses, the previous release keeps serving and the commands exit `2` with
 category `service_publication_failed` and `error.code` `unfinished_sessions` (Cloud read
-the blocking sessions) or `sessions_unreadable` (it could not read them all).
+the blocking sessions), `held_tasks` (only tasks the worker holds block) or
+`sessions_unreadable` (it could not read them all). For `held_tasks`, `error.commands.retry`
+acknowledges the tasks by ID, and the message says to let them finish first.
 `error.publication_error.acknowledge_sessions` is Cloud's list of the blocking sessions
 the release's choice doesn't acknowledge yet (`["*"]` when Cloud could not read them). A
 retry replaces the release's choice, so `error.acknowledge_sessions` and

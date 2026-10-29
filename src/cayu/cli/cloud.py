@@ -106,8 +106,11 @@ _MAX_SESSION_WAIT_SECONDS = 3600
 _MAX_SESSION_ACKNOWLEDGEMENTS = 200
 _MAX_SESSION_ID_LENGTH = 256
 _ACKNOWLEDGE_ALL_SESSIONS = "*"
-# Publication refusals for unfinished sessions; a retry with a new choice gets past them.
-_SESSION_PUBLICATION_FAILURES = frozenset({"unfinished_sessions", "sessions_unreadable"})
+# Publication refusals for unfinished sessions and the tasks the serving worker holds; a
+# retry with a new choice gets past them.
+_SESSION_PUBLICATION_FAILURES = frozenset(
+    {"unfinished_sessions", "sessions_unreadable", "held_tasks"}
+)
 # Session checks after which Cloud publishes, whatever choice is stored later.
 _PASSED_SESSION_CHECKS = frozenset({"clear", "acknowledged", "unsupported", "not_running"})
 # A waiting preflight's `waiting_for` (Cloud names sessions, session_read or agent_wake).
@@ -245,7 +248,7 @@ class _CloudServicePublicationError(CloudApiError):
                 commands["retry"] = retry_command
             self.details["commands"] = commands
         if wait_command is not None:
-            unfinished = code == "unfinished_sessions"
+            unfinished = code in {"unfinished_sessions", "held_tasks"}
             wait_step = (
                 "wait for them again" if unfinished else "wait for Cloud to read them"
             ) + f" with `{wait_command}`"
@@ -253,15 +256,23 @@ class _CloudServicePublicationError(CloudApiError):
                 # Cloud's hint names the portal first for older CLIs; give this CLI's steps.
                 self.details["acknowledge_sessions"] = sessions
                 everyone = sessions == [_ACKNOWLEDGE_ALL_SESSIONS]
-                parts.append(
-                    (
-                        "Answer or finish the sessions and retry, or "
-                        if unfinished
-                        else "Retry once the Agent answers, or "
+                if code == "held_tasks":
+                    parts.append(
+                        "Let the tasks finish and retry, or accept that "
+                        + ("every task the worker holds is" if everyone else "they are")
+                        + f" interrupted with `{retry_command}`, or {wait_step}."
                     )
-                    + f"accept that {'every unfinished session' if everyone else 'they'} may "
-                    + f"not resume on this release with `{retry_command}`, or {wait_step}."
-                )
+                else:
+                    parts.append(
+                        (
+                            "Answer or finish the sessions and retry, or "
+                            if unfinished
+                            else "Retry once the Agent answers, or "
+                        )
+                        + f"accept that {'every unfinished session' if everyone else 'they'} "
+                        + f"may not resume on this release with `{retry_command}`, or "
+                        + f"{wait_step}."
+                    )
             else:
                 # Without a list of sessions a retry can pass with (Cloud's is missing,
                 # invalid or truncated), keep Cloud's hint (the portal's Acknowledge and
@@ -2092,6 +2103,8 @@ def _deploy(
         reference=arguments.application or project.manifest.application,
         name=project.manifest.name,
     )
+    # The release the Agent served before this command; a promote below changes `application`.
+    selected_before = application.get("current_deployment_id")
     running_tasks = _running_tasks_before_deploy(
         arguments, client=client, application=application, project=project
     )
@@ -2497,12 +2510,19 @@ def _deploy(
         "operation": "deploy",
         "result": safe_result,
     }
-    if running_tasks is not None:
-        from cayu.cli._cloud_deploy_tasks import running_tasks_warning
-
-        warning = running_tasks_warning(running_tasks, application_id=str(application["id"]))
-        if warning is not None:
-            response["warnings"] = [warning]
+    warnings = _deploy_handoff_warnings(
+        client,
+        application_id=str(application["id"]),
+        deployment=deployment,
+        service=service,
+        running_tasks=running_tasks,
+        reread=not check_preflight,
+        waited=not arguments.no_wait,
+        # A rerun that found the release already selected replaced no worker.
+        replaced=selected_before != deployment.get("id"),
+    )
+    if warnings:
+        response["warnings"] = warnings
     try:
         evidence_path = recorder.record(
             "deploy",
@@ -2520,6 +2540,89 @@ def _deploy(
     return response
 
 
+def _deploy_handoff_warnings(
+    client: CloudApiClient,
+    *,
+    application_id: str,
+    deployment: dict[str, Any],
+    service: dict[str, Any] | None,
+    running_tasks: dict[str, Any] | None,
+    reread: bool,
+    waited: bool,
+    replaced: bool,
+) -> list[str]:
+    """What the deploy did to the tasks the previous worker held, once the service runs it.
+
+    The tasks read before the upload, then (when this deploy published the release over
+    another and some tasks were running) Cloud's record of what its deploy check did with
+    them: tasks it interrupted, a Cloud whose check predates tasks, and the drain of the
+    replaced worker. Every read here is best effort: the deploy has already succeeded.
+    """
+
+    from cayu.cli._cloud_deploy_tasks import running_tasks_warning
+    from cayu.cli._cloud_worker_handoff import (
+        drain_warnings,
+        interrupted_tasks_warning,
+        task_check_unsupported_notice,
+    )
+
+    warnings: list[str] = []
+    if running_tasks is not None:
+        warning = running_tasks_warning(
+            running_tasks,
+            application_id=application_id,
+            candidate=running_tasks.get("candidate") is True,
+        )
+        if warning is not None:
+            warnings.append(warning)
+    if not (
+        waited
+        and replaced
+        and isinstance(service, dict)
+        and service.get("deployment_id") == deployment.get("id")
+    ):
+        return warnings
+    release = deployment
+    if reread and isinstance(running_tasks, dict) and running_tasks.get("tasks"):
+        # What Cloud recorded about the held tasks once it published this release.
+        try:
+            release = client.request(
+                "GET", f"/v1/applications/{application_id}/deployments/{deployment['id']}"
+            )
+        except (CloudApiError, CloudAuthError):
+            release = deployment
+    for notice in (
+        interrupted_tasks_warning(release),
+        task_check_unsupported_notice(release, running_tasks),
+    ):
+        if notice is not None:
+            warnings.append(notice)
+    warnings.extend(drain_warnings(service, replaced_by=str(deployment.get("id"))))
+    return warnings
+
+
+def _release_handoff_warnings(
+    client: CloudApiClient, *, application_id: str, release: dict[str, Any]
+) -> list[str]:
+    """For `deployment status`: the tasks this Release interrupted, and the drain of the
+    worker it replaced while that drain lasts (read from the service, best effort)."""
+
+    from cayu.cli._cloud_worker_handoff import drain_warnings, interrupted_tasks_warning
+
+    warning = interrupted_tasks_warning(release)
+    warnings = [] if warning is None else [warning]
+    if release.get("status") != "promoted":
+        return warnings
+    try:
+        service = client.request("GET", f"/v1/applications/{application_id}/service")
+    except (CloudApiError, CloudAuthError):
+        # The Release's own status stands without the service's.
+        return warnings
+    if isinstance(service, dict):
+        warnings.extend(drain_warnings(service, replaced_by=str(release.get("id"))))
+    return warnings
+
+
 def _running_tasks_before_deploy(
     arguments: argparse.Namespace,
     *,
@@ -2529,16 +2632,15 @@ def _running_tasks_before_deploy(
 ) -> dict[str, Any] | None:
     """Read and report the tasks a published release would interrupt, before uploading.
 
-    None for a candidate (`--no-promote` publishes nothing), a release without processes,
-    or an Agent with no selected release yet (nothing of it runs).
+    None for a release without processes, or an Agent with no selected release yet (nothing
+    of it runs). A candidate (`--no-promote`) is listed for its later promotion.
     """
 
-    if (
-        _requested_candidate(arguments) is not None
-        or project.manifest.runtime_payload() is None
-        or ("current_deployment_id" in application and not application["current_deployment_id"])
+    if project.manifest.runtime_payload() is None or (
+        "current_deployment_id" in application and not application["current_deployment_id"]
     ):
         return None
+    candidate = _requested_candidate(arguments) is not None
     application_id = str(application["id"])
     from cayu.cli._cloud_deploy_tasks import (
         read_running_tasks,
@@ -2550,12 +2652,12 @@ def _running_tasks_before_deploy(
         client, application_id, timeout_seconds=getattr(arguments, "timeout_seconds", 30.0)
     )
     for notice in (
-        running_tasks_warning(report, application_id=application_id),
+        running_tasks_warning(report, application_id=application_id, candidate=candidate),
         unavailable_notice(report),
     ):
         if notice is not None:
             print(f"cayu cloud: {terminal_safe(notice)}", file=sys.stderr)
-    return report
+    return {**report, "candidate": True} if candidate else report
 
 
 def _existing_source_deployment(
@@ -3111,6 +3213,9 @@ def _deployment(
     if arguments.deployment_command == "status":
         result = client.request("GET", base)
         _deployment_status(result)
+        warnings = _release_handoff_warnings(client, application_id=application_id, release=result)
+        if warnings:
+            return {"operation": "deployment.status", "result": result, "warnings": warnings}
     elif arguments.deployment_command == "discard":
         release = client.request("GET", base)
         if not isinstance(release.get("candidate"), dict):
@@ -3286,9 +3391,21 @@ def _service(
     if action == "status":
         result = client.request("GET", path)
         _service_status(result)
-        warning = fenced_tasks_warning(result)
-        if warning is not None:
-            return {"operation": "service.status", "result": result, "warnings": [warning]}
+        from cayu.cli._cloud_worker_handoff import drain_warnings, worker_exits_report
+
+        result = {
+            **result,
+            "worker_exits": worker_exits_report(
+                lambda: client.request("GET", f"/v1/applications/{application_id}/worker-exits")
+            ),
+        }
+
+        warnings = [
+            *drain_warnings(result),
+            *(warning for warning in (fenced_tasks_warning(result),) if warning is not None),
+        ]
+        if warnings:
+            return {"operation": "service.status", "result": result, "warnings": warnings}
     elif action == "restart":
         result = client.request("POST", f"{path}/restart")
     elif action in {"sleep", "wake"}:

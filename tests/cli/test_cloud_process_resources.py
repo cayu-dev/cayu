@@ -279,3 +279,31 @@ def test_worker_stop_grace_outside_cloud_bounds_is_refused(value):
 def test_only_the_worker_takes_a_stop_grace(table):
     with pytest.raises(CloudApiError, match="unsupported fields: stop_grace_seconds"):
         CloudProjectManifest.loads(_BASE + table + "stop_grace_seconds = 60\n")
+
+
+@pytest.mark.parametrize("seconds", [60, 172_800])
+def test_worker_drain_is_forwarded_in_the_runtime_payload(seconds):
+    manifest = CloudProjectManifest.loads(_BASE + _WORKER + f"drain_seconds = {seconds}\n")
+    assert manifest.worker is not None and manifest.worker.drain_seconds == seconds
+    runtime = manifest.deployment_payload(
+        repository="https://github.com/example/agent", revision="a" * 40
+    )["manifest"]["runtime"]
+    assert runtime["worker"] == {"command": "cayu worker scout", "drain_seconds": seconds}
+    # Undeclared, nothing is sent, so the manifest digest stays as before.
+    assert CloudProjectManifest.loads(_BASE + _WORKER).runtime_payload()["worker"] == {
+        "command": "cayu worker scout"
+    }
+
+
+@pytest.mark.parametrize("value", ["59", "172801", "3600.0", '"3600"', "true"])
+def test_worker_drain_outside_cloud_bounds_is_refused(value):
+    with pytest.raises(CloudApiError, match="drain_seconds must be a whole number") as raised:
+        CloudProjectManifest.loads(_BASE + _WORKER + f"drain_seconds = {value}\n")
+    assert raised.value.category == "manifest_invalid"
+
+
+def test_only_the_worker_takes_a_drain():
+    with pytest.raises(CloudApiError, match="unsupported fields: drain_seconds"):
+        CloudProjectManifest.loads(
+            _BASE + '[web]\ncommand = "web"\nport = 8000\ndrain_seconds = 600\n'
+        )

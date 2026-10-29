@@ -842,6 +842,11 @@ def test_service_status_preserves_structured_health_issues(
             del method, kwargs
             if path == "/v1/applications":
                 return {"items": [{"id": "outbound-agent", "name": "Outbound Agent"}]}
+            if path.endswith("/worker-exits"):
+                # A Cayu Cloud that predates the operator read of worker exits.
+                raise CloudApiError(
+                    "api_request_rejected", "Cayu Cloud API returned HTTP 404.", status_code=404
+                )
             return {
                 "application_id": "outbound-agent",
                 "issues": [issue],
@@ -862,6 +867,13 @@ def test_service_status_preserves_structured_health_issues(
             "application_id": "outbound-agent",
             "issues": [issue],
             "status": "degraded",
+            "worker_exits": {
+                "message": (
+                    "This Cayu Cloud doesn't report worker exits yet; the Agent itself can "
+                    "read them at CAYU_WORKER_EXITS_URL."
+                ),
+                "status": "unsupported",
+            },
         },
     }
 

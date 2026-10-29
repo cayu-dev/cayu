@@ -124,21 +124,38 @@ def _ready_seconds(value: object, *, name: str, bounds: tuple[int, int]) -> int:
 _WORKER_STOP_GRACE_RANGE = (10, 120)
 
 
-def _stop_grace_seconds(value: object) -> int | None:
-    low, high = _WORKER_STOP_GRACE_RANGE
+def _worker_seconds(value: object, *, name: str, bounds: tuple[int, int]) -> int | None:
+    """An optional whole number of seconds a worker declares, within Cloud's bounds."""
+
+    low, high = bounds
     if value is not None and (type(value) is not int or not low <= value <= high):
         raise CloudApiError(
             "manifest_invalid",
-            f"Runtime worker stop_grace_seconds must be a whole number of seconds from {low} "
-            f"to {high}.",
+            f"Runtime worker {name} must be a whole number of seconds from {low} to {high}.",
         )
     return value
+
+
+def _stop_grace_seconds(value: object) -> int | None:
+    return _worker_seconds(value, name="stop_grace_seconds", bounds=_WORKER_STOP_GRACE_RANGE)
+
+
+# Cayu Cloud's bounds on how long a replaced worker may keep finishing its tasks; keep them
+# identical to Cloud. Omitted, a deploy replaces the worker at once.
+_WORKER_DRAIN_RANGE = (60, 172_800)
+
+
+def _drain_seconds(value: object) -> int | None:
+    return _worker_seconds(value, name="drain_seconds", bounds=_WORKER_DRAIN_RANGE)
 
 
 @dataclass(frozen=True)
 class CloudWorkerProcess(CloudProcess):
     # Seconds the platform waits after SIGTERM before it kills the worker; None: Cloud's 30.
     stop_grace_seconds: int | None = None
+    # Seconds the worker may keep finishing its tasks after a later Release replaces it, while
+    # the new worker takes new ones; None: it is replaced at once.
+    drain_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -566,6 +583,7 @@ class CloudProjectManifest:
                         command=str(worker["command"]),
                         **_process_resources(worker),
                         stop_grace_seconds=_stop_grace_seconds(worker.get("stop_grace_seconds")),
+                        drain_seconds=_drain_seconds(worker.get("drain_seconds")),
                     )
                 ),
                 schedules=tuple(
@@ -643,6 +661,7 @@ class CloudProjectManifest:
             raise CloudApiError("manifest_invalid", "Runtime web port is invalid.")
         if self.worker is not None:
             _stop_grace_seconds(self.worker.stop_grace_seconds)
+            _drain_seconds(self.worker.drain_seconds)
         if self.web is not None:
             _ready_path(self.web.ready_path)
             _ready_seconds(
@@ -783,6 +802,11 @@ class CloudProjectManifest:
                         {}
                         if self.worker.stop_grace_seconds is None
                         else {"stop_grace_seconds": self.worker.stop_grace_seconds}
+                    ),
+                    **(
+                        {}
+                        if self.worker.drain_seconds is None
+                        else {"drain_seconds": self.worker.drain_seconds}
                     ),
                 }
             ),

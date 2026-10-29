@@ -561,8 +561,11 @@ def test_a_rerun_of_a_candidate_never_publishes_it(tmp_path: Path) -> None:
     assert result["result"]["service_publication_pending"] is False
     # The acknowledgement would need a publication retry, which only a person runs.
     assert result["result"]["not_applied"]["acknowledge_breaking"] == [115]
+    # Reading the Agent's running tasks for the candidate's later promotion publishes nothing.
     assert not any(
-        path.endswith(("/retry", "/promote", "/service")) for _, path, _ in client.requests
+        path.endswith(("/retry", "/promote", "/service"))
+        for method, path, _ in client.requests
+        if method != "GET"
     )
 
 

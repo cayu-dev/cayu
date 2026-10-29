@@ -1,13 +1,13 @@
 """What `cayu cloud deploy` says about tasks the Agent's current workers are running.
 
-A deploy that publishes a release replaces the Agent's worker. The old worker gets its
-stop grace (`[worker] stop_grace_seconds`, 30 seconds by default, 120 at most) to finish
-or hand back what it holds; a task it can't is cancelled when the new worker reconciles
-its claim, or stays fenced until someone settles it, and only a restartable task runs
-again (`docs/project-workers.md`, "A deploy during a long task"). So before uploading,
-`deploy` reads the Agent's claimed and running tasks through its own task API, the same
-way `cayu task list --application` does, lists them and warns. It doesn't wait or drain.
-A failed read never stops the deploy; it is reported.
+A deploy that publishes a release replaces the Agent's worker. Cayu Cloud's deploy check
+covers the tasks that worker holds with the session choice (wait for them, refuse, or
+interrupt the acknowledged ones), and a worker that declares `[worker] drain_seconds` keeps
+finishing them beside its replacement (`docs/project-workers.md`, "A deploy during a long
+task"). Before uploading, `deploy` reads the Agent's claimed and running tasks through its
+own task API, the same way `cayu task list --application` does, and lists them, so the
+owner sees them while the choice can still change; a `--no-promote` candidate lists them
+for its later promotion. A failed read never stops the deploy; it is reported.
 """
 
 from __future__ import annotations
@@ -84,8 +84,14 @@ def read_running_tasks(
     return {"status": "read", "tasks": list(tasks.values()), "complete": complete}
 
 
-def running_tasks_warning(report: dict[str, Any], *, application_id: str) -> str | None:
-    """The warning for a report with tasks in it, or ``None``."""
+def running_tasks_warning(
+    report: dict[str, Any], *, application_id: str, candidate: bool = False
+) -> str | None:
+    """The warning for a report with tasks in it, or ``None``.
+
+    ``candidate`` is for `deploy --no-promote`: staging publishes nothing, and the promotion
+    that later publishes the candidate is what replaces the workers.
+    """
 
     if report.get("status") != "read" or not report.get("tasks"):
         return None
@@ -97,11 +103,19 @@ def running_tasks_warning(report: dict[str, Any], *, application_id: str) -> str
     if len(tasks) > _NAMED_IN_WARNING:
         named += ", ..."
     noun = "task is" if count == "1" else "tasks are"
+    publishing = (
+        "Promoting this candidate later publishes it and replaces those workers. "
+        if candidate
+        else "A deploy that publishes a new release replaces those workers. "
+    )
     return (
-        f"{count} {noun} claimed or running on the Agent's current workers: {named}. A "
-        "deploy that publishes a new release replaces those workers: each gets its stop "
-        "grace to finish, and a task still running after that is cancelled or left fenced, "
-        "so its work so far may be lost. To keep it, let these tasks finish before deploying; "
+        f"{count} {noun} claimed or running on the Agent's current workers: {named}. "
+        f"{publishing}Cayu Cloud's deploy check holds the publication until they finish under "
+        "--session-policy wait (the default, up to --session-wait-seconds), refuses under "
+        "block, and interrupts them only when --acknowledge-session names them; a task "
+        "interrupted that way is cancelled or left fenced, so its work so far may be lost. A "
+        "worker that declares [worker] drain_seconds keeps finishing them beside the new one "
+        "instead. A Cayu Cloud that predates the task check replaces the workers anyway. "
         f"`cayu task list --application {application_id} --status claimed` and "
         "`--status running` show them."
     )
