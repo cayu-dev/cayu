@@ -6250,6 +6250,31 @@ class EnvironmentLifecycle:
         if decision.status == "refused":
             raise ExecutionAdmissionError(decision)
 
+        # Publication is asynchronous. Recheck the same observation without
+        # refreshing its TTL before handing the runner back for copy-in and use.
+        rechecked = evaluate_execution_admission(
+            candidate=decision.candidate,
+            requirements=decision.requirements,
+            evidence=decision.evidence,
+            stage="pre_exposure",
+        )
+        if rechecked.status == "refused":
+            refused: list[Event] = []
+            await self._emit_transition(
+                session=session,
+                agent_name=registered_agent.spec.name,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                phase=EnvironmentLifecycleTransitionPhase.ADMISSION,
+                outcome=EnvironmentLifecycleTransitionOutcome.REFUSED,
+                candidate=candidate,
+                events=refused,
+                decision=rechecked,
+            )
+            for transition in refused:
+                publish(transition)
+            raise ExecutionAdmissionError(rechecked)
+
     def sessions_with_environment_work(
         self, environment_name: str
     ) -> tuple[frozenset[str], frozenset[str]]:
