@@ -2199,29 +2199,48 @@ class ToolInvocation:
                         yield workspace_event, None
                     yield published_terminal_event, published_terminal_outcome
             proxy_events: list[Event] = []
-            async for event in _iterate_post_tool_events(
-                self._emit_proxy_authorization_events(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    records=proxy_authorizations,
-                    tool_round_identity=tool_round_identity,
-                    execution_profile=execution_profile,
-                    approval_id=approval_id,
-                    input_id=input_id,
-                    idempotency_key=idempotency_key,
+            try:
+                async for event in _iterate_post_tool_events(
+                    self._emit_proxy_authorization_events(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=tool_call,
+                        records=proxy_authorizations,
+                        tool_round_identity=tool_round_identity,
+                        execution_profile=execution_profile,
+                        approval_id=approval_id,
+                        input_id=input_id,
+                        idempotency_key=idempotency_key,
+                        redactor=redactor,
+                        output_redactor=output_redactor,
+                        quarantine_output=publish_arguments_as_unavailable,
+                    ),
+                    cancellation=post_tool_cancellation,
+                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                ):
+                    if published_terminal_event is not None:
+                        yield event, None
+                    else:
+                        proxy_events.append(event)
+            except asyncio.CancelledError as exc:
+                if effective_terminal_stager is None or result_event is None:
+                    raise
+                # Telemetry must not discard a completed result that still
+                # needs durable staging. Retain caller control until the
+                # terminal publisher below has preserved that result.
+                if post_tool_cancellation is not None:
+                    # The iterator restored these requests before raising.
+                    post_tool_cancellation_requests_consumed = 0
+                observed_cancellation = await consume_post_tool_cancellation(exc)
+                post_tool_cancellation = post_tool_cancellation or observed_cancellation
+                if post_tool_cancellation is None:
+                    raise
+                retain_cancellation_context(
+                    post_tool_cancellation,
                     redactor=redactor,
-                    output_redactor=output_redactor,
-                    quarantine_output=publish_arguments_as_unavailable,
-                ),
-                cancellation=post_tool_cancellation,
-                restore_cancellation_requests=post_tool_cancellation_requests_consumed,
-            ):
-                if published_terminal_event is not None:
-                    yield event, None
-                else:
-                    proxy_events.append(event)
+                    tool_call_id=tool_call.id,
+                )
             if projection_cancellation is not None:
                 _raise_restored_post_tool_cancellation(
                     post_tool_cancellation or projection_cancellation,
