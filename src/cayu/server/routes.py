@@ -11,7 +11,7 @@ import json
 import logging
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from math import isfinite
@@ -310,6 +310,8 @@ from cayu.server.contracts import (
 from cayu.server.contracts import PendingActionKind as ApiPendingActionKind
 from cayu.server.eval_report_auth import EvalReportingAccess
 from cayu.server.evals_registry import (
+    EvalTargetRegistry,
+    declared_eval_target_registrations,
     generated_eval_target_registry,
     resolved_evals_runtime,
 )
@@ -4588,16 +4590,57 @@ def create_router(
             ),
             judge_configuration=_project_context.eval_judge_configuration,
         )
+    project_registry = generated_registry
+    declared_eval_targets_served = (
+        evals is None
+        and automatic_evals_access
+        and _project_context is not None
+        and bool(_project_context.eval_targets)
+    )
+    if declared_eval_targets_served:
+        assert _project_context is not None
+        # The project's declared eval targets are served next to the generated ones.
+        # They are optional: a set the registry refuses never stops the server.
+        try:
+            project_registry = EvalTargetRegistry(
+                (
+                    *(() if generated_registry is None else generated_registry.registrations),
+                    *declared_eval_target_registrations(
+                        _project_context.eval_targets,
+                        project_root=_project_context.app_manifest_project_root,
+                    ),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                "The project's declared eval targets are not served: %s", type(exc).__name__
+            )
+            declared_eval_targets_served = False
     eval_runtime = resolved_evals_runtime(
         explicit=evals,
-        registry=generated_registry,
+        registry=project_registry,
         automatic_store=(
             None
             if not automatic_evals_access or _project_context is None
             else _project_context.eval_store
         ),
     )
-    eval_registry = eval_runtime.registry if eval_runtime is not None else generated_registry
+    if (
+        eval_runtime is not None
+        and declared_eval_targets_served
+        and _project_context is not None
+        and _project_context.eval_worker is not None
+    ):
+        # The project's eval worker runs its declared targets' runs; this process
+        # admits them and runs only the generated targets' runs.
+        worker_keys = {item.target.key for item in _project_context.eval_targets}
+        eval_runtime = replace(
+            eval_runtime,
+            claimed_target_keys=tuple(
+                key for key in eval_runtime.registry.target_keys if key not in worker_keys
+            ),
+        )
+    eval_registry = eval_runtime.registry if eval_runtime is not None else project_registry
 
     api_prefix = normalize_api_path(api_path, field_name="api_path")
     browser_client_contract = (
@@ -4616,9 +4659,19 @@ def create_router(
         max_streams_per_session=session_follow_max_streams_per_session,
     )
 
+    declared_eval_apps = (
+        ()
+        if _project_context is None
+        else _project_context.owner.declared_eval_apps(exclude=cayu_app)
+    )
+
     @contextlib.asynccontextmanager
     async def evals_lifespan(_app):
-        coordinator = None if eval_runtime is None else EvalRunCoordinator(eval_runtime)
+        coordinator = (
+            None
+            if eval_runtime is None or not eval_runtime.target_keys_to_claim
+            else EvalRunCoordinator(eval_runtime)
+        )
         if coordinator is not None:
             coordinator.start()
         try:
@@ -4626,6 +4679,12 @@ def create_router(
         finally:
             if coordinator is not None:
                 await coordinator.stop()
+            # The declared targets' own applications stop with the server that served them.
+            for declared_app in declared_eval_apps:
+                try:
+                    await declared_app.aclose()
+                except Exception:
+                    logger.warning("A declared eval target's application did not close cleanly.")
 
     router = APIRouter(prefix=api_prefix, lifespan=evals_lifespan)
     bounded_control_plane_router = APIRouter(route_class=_BoundedControlPlaneRequestRoute)
@@ -4677,8 +4736,10 @@ def create_router(
             or (_project_context is not None and _project_context.eval_store is not None)
         ),
         eval_target_configured=eval_registry is not None,
+        # Explicit and declared targets carry their own identity; generated ones
+        # take the project's.
         eval_project_identity_configured=(
-            (eval_runtime is not None and evals is not None)
+            (eval_runtime is not None and (evals is not None or declared_eval_targets_served))
             or (_project_context is not None and _project_context.project_id is not None)
         ),
         eval_captured_results_supported=(

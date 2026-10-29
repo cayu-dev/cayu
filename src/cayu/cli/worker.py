@@ -9,10 +9,11 @@ import inspect
 import os
 import signal
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from cayu.applications import CayuApp
 from cayu.cli._targets import TargetResolutionError, load_target
@@ -23,6 +24,7 @@ from cayu.cli.project import (
     close_project_app,
     project_context,
 )
+from cayu.cli.project_control_plane import project_eval_worker
 from cayu.runtime._process_workers import (
     ProcessWorkerCommand,
     positive_process_count,
@@ -39,8 +41,15 @@ from cayu.tasks.abandoned import (
 from cayu.tasks.records import TASK_MAX_RESTARTS_LIMIT
 from cayu.tasks.until_idle import TaskWorkerIdleResult, _worker_until_idle_requested
 
+if TYPE_CHECKING:
+    from cayu.cli._worker_evals import WorkerEvals
+    from cayu.server.evals_worker import EvalRunCoordinator
+
 # A worker that used its whole grace still lets the app seal and report.
 _MIN_APP_SHUTDOWN_SECONDS = 0.1
+# How long a worker that runs until idle lets its eval runs go on before it serves
+# the tasks they may have created.
+_EVAL_TASK_SERVICE_SECONDS = 5.0
 
 
 class WorkerError(ValueError):
@@ -183,6 +192,7 @@ def _run_worker(args: argparse.Namespace) -> int:
             try:
                 target = _load_worker_target(project.worker_target, name=args.name)
                 app = build_project_app(project.factory_target, command="Worker")
+                evals = _worker_evals(project.root, args.name, app)
             except SystemExit as exc:
                 status = exc.code if type(exc.code) is int else 1
                 raise WorkerError(
@@ -196,6 +206,8 @@ def _run_worker(args: argparse.Namespace) -> int:
                         name=args.name,
                         shutdown_grace_seconds=args.shutdown_grace_seconds,
                         until_idle=until_idle,
+                        evals=None if evals is None else evals.coordinator,
+                        eval_apps=() if evals is None else evals.apps,
                     )
                 )
             except SystemExit as exc:
@@ -203,9 +215,27 @@ def _run_worker(args: argparse.Namespace) -> int:
                 raise WorkerError(
                     f"Worker {args.name!r} entrypoint raised SystemExit with status {status}."
                 ) from exc
+            finally:
+                if evals is not None:
+                    evals.close()
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def _worker_evals(root: Path, name: str, app: CayuApp) -> WorkerEvals | None:
+    if project_eval_worker(root) != name:
+        return None
+    try:
+        from cayu.cli._worker_evals import worker_evals
+    except ModuleNotFoundError as exc:
+        if (exc.name or "").partition(".")[0] not in {"fastapi", "starlette", "sse_starlette"}:
+            raise
+        raise WorkerError(
+            f"[tool.cayu.evals].worker runs eval runs on worker {name!r}, which needs "
+            'cayu\'s server extra. Install it with: pip install "cayu[server]"'
+        ) from exc
+    return worker_evals(root, name, app)
 
 
 def _resolve_worker_project(name: str) -> _WorkerProject:
@@ -278,8 +308,19 @@ async def _invoke_worker(
     name: str,
     shutdown_grace_seconds: float,
     until_idle: bool = False,
+    evals: EvalRunCoordinator | None = None,
+    eval_apps: tuple[CayuApp, ...] = (),
 ) -> int:
+    """Run ``target`` until it returns or a signal stops it.
+
+    ``evals`` runs the project's eval runs beside it: until no run is left when
+    the worker runs until idle, and otherwise until it stops. A drained worker
+    finishes the eval run it holds before it exits; a signal releases it.
+    ``eval_apps``, the applications the eval targets run on, close with ``app``.
+    """
+
     stop = asyncio.Event()
+    drain_requested = False
     signal_received = asyncio.Event()
     loop = asyncio.get_running_loop()
     received_signal: int | None = None
@@ -311,9 +352,14 @@ async def _invoke_worker(
     def request_drain(request: DrainRequest) -> None:
         # Cayu Cloud kept this worker running past its replacement: stop claiming, as a
         # SIGTERM would, but without the shutdown grace, so held tasks finish in their time.
+        nonlocal drain_requested
         if not stop.is_set():
             print(drain_notice(request), file=sys.stderr, flush=True)
+        drain_requested = True
         stop.set()
+        if evals is not None:
+            # The replacement takes new eval runs from now on, whatever the entrypoint holds.
+            evals.request_drain()
 
     worker_task: asyncio.Future[Any] | None = None
     idle_result: TaskWorkerIdleResult | None = None
@@ -323,12 +369,23 @@ async def _invoke_worker(
     try:
         # A no-op outside Cayu Cloud; close_project_app stops it.
         await app.start_managed_settings(role="worker")
-        # The worker task copies this context when it is created.
-        with _worker_until_idle_requested() if until_idle else contextlib.nullcontext():
-            result = target(app, stop)
-            if not inspect.isawaitable(result):
-                raise WorkerError(f"Worker {name!r} target must return an awaitable.")
-            worker_task = asyncio.ensure_future(result)
+
+        def start_entrypoint() -> asyncio.Future[Any]:
+            # The entrypoint's task copies this context when it is created.
+            with _worker_until_idle_requested() if until_idle else contextlib.nullcontext():
+                result = target(app, stop)
+                if not inspect.isawaitable(result):
+                    raise WorkerError(f"Worker {name!r} target must return an awaitable.")
+                return asyncio.ensure_future(result)
+
+        if evals is not None and until_idle:
+            worker_task = asyncio.ensure_future(
+                _until_idle_with_evals(start_entrypoint, evals, name=name)
+            )
+        else:
+            if evals is not None:
+                evals.start()
+            worker_task = start_entrypoint()
         if isinstance(worker_task, asyncio.Task):
             worker_task.set_name(f"cayu-worker-{name}")
         signal_wait = asyncio.create_task(
@@ -342,19 +399,28 @@ async def _invoke_worker(
         if worker_task in done and received_signal is None:
             outcome = await worker_task
             if until_idle:
-                if not isinstance(outcome, TaskWorkerIdleResult):
-                    raise WorkerError(
-                        f"Worker {name!r} doesn't support --until-idle: when "
-                        "worker_until_idle_requested() is true its entrypoint must return "
-                        "the result of run_task_worker_until_idle."
-                    )
-                idle_result = outcome
-            return 0
+                idle_result = _idle_result(outcome, name)
+            if evals is None or until_idle:
+                return 0
+            # A drained worker finishes the eval run it holds; otherwise it releases it.
+            finished = asyncio.ensure_future(evals.drain() if drain_requested else evals.stop())
+            done, _pending = await asyncio.wait(
+                {finished, signal_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if finished in done:
+                await finished
+                return 0
+            # A signal came first: the eval runs are stopped below, within the grace.
+            finished.cancel()
         if received_signal is None:
             raise AssertionError("The signal event was set without a process signal.")
+        stopping = [asyncio.shield(worker_task)]
+        if evals is not None:
+            stopping.append(asyncio.ensure_future(evals.stop()))
         try:
             await asyncio.wait_for(
-                asyncio.shield(worker_task),
+                asyncio.gather(*stopping, return_exceptions=True),
                 timeout=shutdown_grace_seconds,
             )
         except TimeoutError:
@@ -377,26 +443,79 @@ async def _invoke_worker(
             signal_wait.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await signal_wait
+        if evals is not None:
+            # Already stopped on every path but a failed worker target, which
+            # releases the eval run it holds the same way.
+            with contextlib.suppress(Exception):
+                await evals.stop()
         for signum in loop_handlers:
             loop.remove_signal_handler(signum)
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-        # After a stop signal the app gets what is left of the same grace, so
+        # After a stop signal the apps get what is left of the same grace, so
         # the whole shutdown stays within the supervisor's bound.
-        await close_project_app(
-            app,
-            timeout_s=(
-                shutdown_grace_seconds
-                if stop_requested_at is None
-                else max(
-                    stop_requested_at + shutdown_grace_seconds - loop.time(),
-                    _MIN_APP_SHUTDOWN_SECONDS,
-                )
-            ),
-        )
+        for closing in (*eval_apps, app):
+            await close_project_app(
+                closing,
+                timeout_s=(
+                    shutdown_grace_seconds
+                    if stop_requested_at is None
+                    else max(
+                        stop_requested_at + shutdown_grace_seconds - loop.time(),
+                        _MIN_APP_SHUTDOWN_SECONDS,
+                    )
+                ),
+            )
         # Last, so a host can read the final stdout line.
         if idle_result is not None:
             print(idle_result.model_dump_json(), flush=True)
+
+
+def _idle_result(outcome: object, name: str) -> TaskWorkerIdleResult:
+    if not isinstance(outcome, TaskWorkerIdleResult):
+        raise WorkerError(
+            f"Worker {name!r} doesn't support --until-idle: when "
+            "worker_until_idle_requested() is true its entrypoint must return "
+            "the result of run_task_worker_until_idle."
+        )
+    return outcome
+
+
+async def _until_idle_with_evals(
+    start_entrypoint: Callable[[], asyncio.Future[Any]],
+    evals: EvalRunCoordinator,
+    *,
+    name: str,
+) -> TaskWorkerIdleResult:
+    """Run the entrypoint and the eval runs until neither has work left.
+
+    An eval run's workflow may create tasks for this worker, so the entrypoint runs
+    again while eval runs go on and once more after them. Eval runs admitted meanwhile,
+    as by a task that pass handled, get another pass: the worker is idle once a round
+    in which neither took any work. ``handled`` counts both.
+    """
+
+    outcome = _idle_result(await start_entrypoint(), name)
+    handled = outcome.handled
+    while True:
+        running = asyncio.ensure_future(evals.run_until_idle())
+        tasks_handled = 0
+        try:
+            while not running.done():
+                await asyncio.wait({running}, timeout=_EVAL_TASK_SERVICE_SECONDS)
+                outcome = _idle_result(await start_entrypoint(), name)
+                tasks_handled += outcome.handled
+            took, evals_idle = running.result()
+        finally:
+            if not running.done():
+                running.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await running
+        handled += took + tasks_handled
+        if not evals_idle or not outcome.idle or (took == 0 and tasks_handled == 0):
+            return outcome.model_copy(
+                update={"handled": handled, "idle": outcome.idle and evals_idle}
+            )
 
 
 def _positive_seconds(value: str) -> float:

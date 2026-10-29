@@ -296,6 +296,76 @@ def test_project_context_rejects_unknown_eval_configuration_keys(tmp_path: Path)
         build_project_control_plane_context(tmp_path, mode="production", environ={})
 
 
+def test_project_eval_targets_are_read_in_order_without_importing_them(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        store=(
+            "\n[tool.cayu.evals]\n"
+            'targets = ["evals.questions:build_corpus_eval", "evals.refunds:plan.build"]\n'
+        ),
+    )
+
+    assert project_control_plane_cli.project_eval_target_references(tmp_path) == (
+        "evals.questions:build_corpus_eval",
+        "evals.refunds:plan.build",
+    )
+    context = build_project_control_plane_context(tmp_path, mode="production", environ={})
+    try:
+        assert context.eval_targets == ()
+    finally:
+        asyncio.run(context.close())
+
+
+def test_a_project_without_eval_targets_declares_none(tmp_path: Path) -> None:
+    _project(tmp_path)
+
+    assert project_control_plane_cli.project_eval_target_references(tmp_path) == ()
+
+
+@pytest.mark.parametrize(
+    ("targets", "message"),
+    [
+        ('"evals:build"', r"must be a list"),
+        ('["evals.build"]', r"'evals.build' must be \"module:function\""),
+        ('["evals:build()"]', r"must be \"module:function\""),
+        ('["evals:build", "evals:build"]', r"lists an entry twice"),
+        ("[" + ", ".join(f'"evals:build_{index}"' for index in range(17)) + "]", r"at most 16"),
+    ],
+)
+def test_project_context_rejects_malformed_eval_targets(
+    tmp_path: Path, targets: str, message: str
+) -> None:
+    _project(tmp_path, store=f"\n[tool.cayu.evals]\ntargets = {targets}\n")
+
+    with pytest.raises(ProjectError, match=message):
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+
+def test_the_eval_worker_must_be_a_declared_worker_with_targets_to_run(tmp_path: Path) -> None:
+    workers = '\n[tool.cayu.workers]\nevals = "workers:evals"\n'
+    _project(
+        tmp_path,
+        store=workers + '\n[tool.cayu.evals]\ntargets = ["evals:plan"]\nworker = "evals"\n',
+    )
+    assert project_control_plane_cli.project_eval_worker(tmp_path) == "evals"
+    context = build_project_control_plane_context(tmp_path, mode="production", environ={})
+    try:
+        assert context.eval_worker == "evals"
+    finally:
+        asyncio.run(context.close())
+
+    _project(tmp_path, store=workers + '\n[tool.cayu.evals]\nworker = "evals"\n')
+    with pytest.raises(ProjectError, match=r"declare them in \[tool.cayu.evals\].targets"):
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+    _project(
+        tmp_path,
+        store=workers + '\n[tool.cayu.evals]\ntargets = ["evals:plan"]\nworker = "timers"\n',
+    )
+    with pytest.raises(ProjectError, match=r"names 'timers', which \[tool.cayu.workers\]"):
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+
 def test_project_context_requires_pricing_for_a_judge_cost_ceiling(tmp_path: Path) -> None:
     _project(
         tmp_path,

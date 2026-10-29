@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,7 +36,7 @@ from cayu.evals.execution_profiles import (
 )
 from cayu.evals.store import EvalRunInvocation, EvalStore
 from cayu.human_attention_handoff import HumanAttentionHandoff
-from cayu.project_control_plane import ProjectEvalJudgeConfiguration
+from cayu.project_control_plane import ProjectEvalJudgeConfiguration, ProjectEvalTarget
 from cayu.server.config import (
     DEFAULT_EVAL_LEASE_SECONDS,
     DEFAULT_EVAL_POLL_INTERVAL_SECONDS,
@@ -347,19 +347,14 @@ class EvalTargetRegistry:
         )
         if len(logical_identities) != len(set(logical_identities)):
             raise ValueError("Eval target logical identities must be unique.")
-        app = ordered[0].target.app
-        if any(item.target.app is not app for item in ordered):
-            raise ValueError("All eval registry targets must belong to one CayuApp instance.")
-        manifest_project_root = ordered[0].manifest_project_root
-        if any(item.manifest_project_root != manifest_project_root for item in ordered):
-            raise ValueError("All eval registry targets must use one application-manifest root.")
-        manifest_identity = evaluation_target_identity(
-            ordered[0].target,
-            project_root=manifest_project_root,
-        )
+        # Generated targets share the served app; a project's declared targets bring
+        # their own. Each catalog entry must describe the app its target runs on.
         if any(
             item.catalog_entry.app_manifest_fingerprint
-            != manifest_identity.app_manifest_fingerprint
+            != evaluation_target_identity(
+                item.target,
+                project_root=item.manifest_project_root,
+            ).app_manifest_fingerprint
             for item in ordered
         ):
             raise ValueError(
@@ -379,6 +374,12 @@ class EvalTargetRegistry:
     @property
     def target_keys(self) -> tuple[str, ...]:
         return tuple(item.target_key for item in self._catalog.items)
+
+    @property
+    def registrations(self) -> tuple[EvalTargetRegistration, ...]:
+        """Every registration, in catalog order."""
+
+        return tuple(self._registrations[key] for key in self.target_keys)
 
     @property
     def default_target_key(self) -> str:
@@ -540,6 +541,9 @@ class ResolvedEvalsRuntime:
     lease_seconds: int
     poll_interval_seconds: float
     shutdown_grace_seconds: float
+    # The targets whose runs this process claims, when not all of them: the
+    # project's eval worker runs the rest.
+    claimed_target_keys: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if type(self.registry) is not EvalTargetRegistry:
@@ -548,6 +552,19 @@ class ResolvedEvalsRuntime:
             raise TypeError("store must be a durable EvalStore.")
         if type(self.execution_capacity) is not EvalExecutionCapacity:
             raise TypeError("execution_capacity must be an exact EvalExecutionCapacity.")
+        if self.claimed_target_keys is not None and not set(self.claimed_target_keys) <= set(
+            self.registry.target_keys
+        ):
+            raise ValueError("Claimed eval targets must be registered targets.")
+
+    @property
+    def target_keys_to_claim(self) -> tuple[str, ...]:
+        """The registered targets whose runs this process executes."""
+
+        if self.claimed_target_keys is None:
+            return self.registry.target_keys
+        claimed = set(self.claimed_target_keys)
+        return tuple(key for key in self.registry.target_keys if key in claimed)
 
 
 def generated_eval_target_registry(
@@ -717,12 +734,61 @@ def explicit_eval_target_registry(
 ) -> EvalTargetRegistry:
     """Adapt the V1 singleton target into the common registry contract."""
 
+    return EvalTargetRegistry(
+        (
+            _explicit_registration(
+                target,
+                policy=policy,
+                profile_id=_EXPLICIT_EVAL_PROFILE_ID,
+                label_suffix="Explicit",
+                manifest_project_root=None,
+            ),
+        )
+    )
+
+
+def declared_eval_target_registrations(
+    targets: Sequence[ProjectEvalTarget],
+    *,
+    project_root: Path,
+) -> tuple[EvalTargetRegistration, ...]:
+    """Register the eval targets a project declares in ``[tool.cayu.evals].targets``.
+
+    Each runs on the app its declaration built, under the execution-profile policy
+    its plan declared. Its key is its profile, so declared targets of one agent stay
+    distinct from each other and from the generated default.
+    """
+
+    registrations: list[EvalTargetRegistration] = []
+    for declared in targets:
+        if type(declared) is not ProjectEvalTarget:
+            raise TypeError("targets must contain exact ProjectEvalTarget values.")
+        registrations.append(
+            _explicit_registration(
+                declared.target,
+                policy=declared.execution_profile_policy,
+                profile_id=declared.target.key,
+                label_suffix=declared.target.key,
+                manifest_project_root=project_root,
+            )
+        )
+    return tuple(registrations)
+
+
+def _explicit_registration(
+    target: CorpusTarget,
+    *,
+    policy: EvalExecutionProfilePolicyV1 | None,
+    profile_id: str,
+    label_suffix: str,
+    manifest_project_root: Path | None,
+) -> EvalTargetRegistration:
     if type(target) not in _EXACT_TARGET_TYPES:
         raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
     policy = EvalExecutionProfilePolicyV1.safe_default() if policy is None else policy
     if type(policy) is not EvalExecutionProfilePolicyV1:
         raise TypeError("policy must be an exact EvalExecutionProfilePolicyV1 or None.")
-    identity = evaluation_target_identity(target)
+    identity = evaluation_target_identity(target, project_root=manifest_project_root)
     agent_name = _target_identity_component(target.request_base.agent_name, "agent_name")
     cost_budget_currencies = cost_budget_currencies_for_target(target)
     judge_profiles = tuple(
@@ -762,8 +828,8 @@ def explicit_eval_target_registry(
         target_key=target.key,
         project_id=None,
         agent_name=agent_name,
-        profile_id=_EXPLICIT_EVAL_PROFILE_ID,
-        label=f"{agent_name} · Explicit",
+        profile_id=profile_id,
+        label=f"{agent_name} · {label_suffix}",
         source="explicit",
         application_release_id=identity.application_release_id,
         app_manifest_fingerprint=identity.app_manifest.fingerprint,
@@ -783,14 +849,11 @@ def explicit_eval_target_registry(
         execution_profile_diagnostics=(EvalExecutionProfileDiagnostic.for_code("not_resolved"),),
     )
     _require_public_catalog_entry(target.app, entry)
-    return EvalTargetRegistry(
-        (
-            EvalTargetRegistration(
-                catalog_entry=entry,
-                target=target,
-                execution_profile_policy=policy,
-            ),
-        )
+    return EvalTargetRegistration(
+        catalog_entry=entry,
+        target=target,
+        execution_profile_policy=policy,
+        manifest_project_root=manifest_project_root,
     )
 
 

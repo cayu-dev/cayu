@@ -24,6 +24,7 @@ values they do not know.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from functools import cache
@@ -36,6 +37,7 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_by
 from cayu._version import __version__
 from cayu.approvals.actors import ResolutionActorSource
 from cayu.budgets.pricing import PriceBook, SessionCostTotals, default_price_book
+from cayu.evals.store import EvalRunQuery, EvalRunStatus, EvalStore
 from cayu.events import EventType
 from cayu.runtime._cost_accounting import COST_EVENT_TYPES
 from cayu.sessions._run_identity import (
@@ -76,6 +78,10 @@ CLOUD_ACTIVITY_DEFAULT_LIMIT = 100
 CLOUD_ACTIVITY_MAX_LIMIT = 200
 #: The most tasks one ``CloudTaskHealth`` count reads.
 CLOUD_TASK_HEALTH_MAX_COUNT = 100
+#: Where the schedule's eval-run counts stop.
+CLOUD_EVAL_RUN_MAX_COUNT = 100
+_EVAL_RUN_WAITING = (EvalRunStatus.QUEUED,)
+_EVAL_RUN_HELD = (EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING)
 _ACTIVITY_CONTRACT = f"{CLOUD_AGENT_CONTRACT}/v1"
 # Events read per store query, and per page, while collecting changes.
 _SCAN_BATCH = 200
@@ -147,6 +153,7 @@ class CloudContract(_ContractModel):
         "task_health",
         "schedule",
         "external_event_waits",
+        "eval_runs",
     )
     store_id: str | None = None
 
@@ -344,17 +351,33 @@ class CloudExternalWaitSchedule(_ContractModel):
     awaiting_service: int
 
 
+class CloudEvalRunSchedule(_ContractModel):
+    """The eval runs waiting for the agent's eval worker, as its eval store observed at ``as_of``.
+
+    ``queued`` counts admitted runs no worker has claimed yet and ``running`` the
+    ones a worker holds, including those it is cancelling. Both stop at
+    ``CLOUD_EVAL_RUN_MAX_COUNT``. Only the targets whose runs the project's eval
+    worker runs count; the web process runs the others itself.
+    """
+
+    as_of: datetime
+    queued: int
+    running: int
+
+
 class CloudSchedule(_ContractModel):
     """When the agent next has work it scheduled, without its content.
 
     ``tasks`` is ``None`` when the agent has no task store or the store cannot
     schedule tasks; ``external_waits`` is ``None`` when the session store keeps
-    no external waits.
+    no external waits; ``eval_runs`` is ``None`` when no worker runs the
+    agent's eval runs.
     """
 
     contract: str = _ACTIVITY_CONTRACT
     tasks: CloudTaskSchedule | None
     external_waits: CloudExternalWaitSchedule | None
+    eval_runs: CloudEvalRunSchedule | None = None
 
 
 class CloudActivityPage(_ContractModel):
@@ -536,11 +559,42 @@ async def read_cloud_task_health(app: CayuApp) -> CloudTaskHealth | None:
     )
 
 
-async def read_cloud_schedule(app: CayuApp) -> CloudSchedule:
-    """When the agent next has scheduled work: its delayed tasks and external-wait deadlines."""
+async def read_cloud_schedule(
+    app: CayuApp,
+    *,
+    eval_runs: EvalRunScheduleSource | None = None,
+) -> CloudSchedule:
+    """When the agent next has scheduled work: its delayed tasks, external-wait deadlines
+    and the eval runs waiting for its eval worker."""
 
     return CloudSchedule(
-        tasks=await _task_schedule(app), external_waits=await _external_wait_schedule(app)
+        tasks=await _task_schedule(app),
+        external_waits=await _external_wait_schedule(app),
+        eval_runs=None if eval_runs is None else await _eval_run_schedule(eval_runs),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EvalRunScheduleSource:
+    """The eval store and the targets whose runs the project's eval worker runs."""
+
+    store: EvalStore
+    target_keys: tuple[str, ...]
+
+
+async def _eval_run_schedule(source: EvalRunScheduleSource) -> CloudEvalRunSchedule:
+    as_of = datetime.now(UTC)
+    counts = {status: 0 for status in _EVAL_RUN_WAITING + _EVAL_RUN_HELD}
+    for target_key in source.target_keys:
+        for status in counts:
+            page = await source.store.list_runs(
+                EvalRunQuery(target_key=target_key, status=status, limit=CLOUD_EVAL_RUN_MAX_COUNT)
+            )
+            counts[status] += len(page.items)
+    return CloudEvalRunSchedule(
+        as_of=as_of,
+        queued=min(sum(counts[status] for status in _EVAL_RUN_WAITING), CLOUD_EVAL_RUN_MAX_COUNT),
+        running=min(sum(counts[status] for status in _EVAL_RUN_HELD), CLOUD_EVAL_RUN_MAX_COUNT),
     )
 
 

@@ -16,6 +16,7 @@ from cayu._operator_credentials import (
     OPERATOR_PASSWORD_VARIABLE,
     OPERATOR_USERNAME_VARIABLE,
 )
+from cayu.cli._project_evals import load_project_eval_targets
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import (
     CayuProject,
@@ -157,6 +158,30 @@ def _resolve_serve_project(
             f"{OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE}."
         )
     return project, settings
+
+
+def serve_project_control_plane(
+    args: argparse.Namespace,
+    project: CayuProject,
+) -> ProjectControlPlaneContext:
+    """The project context `cayu serve` serves, with the eval targets it declares.
+
+    Call it inside ``project_context(project.root)``. A declared eval target that
+    can't be loaded is reported and left out; the Agent still serves.
+    """
+
+    def report(reference: str, reason: str) -> None:
+        print(
+            f"warning: eval target {reference} is not served: {reason}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return build_project_control_plane_context(
+        project.root,
+        mode="development" if args.dev else "production",
+        eval_targets=load_project_eval_targets(project.root, on_error=report),
+    )
 
 
 def _build_serve_app(
@@ -319,9 +344,7 @@ def run_serve(args: argparse.Namespace) -> int:
         else:
             with project_context(project.root):
                 try:
-                    project_control_plane = build_project_control_plane_context(
-                        project.root, mode="development" if args.dev else "production"
-                    )
+                    project_control_plane = serve_project_control_plane(args, project)
                     server = _build_serve_app(args, project, settings, project_control_plane)
                 except SystemExit as exc:
                     status = exc.code if type(exc.code) is int else 1

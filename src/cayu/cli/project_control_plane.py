@@ -19,9 +19,11 @@ from cayu.cli.store_targets import (
     resolve_project_session_store_target,
 )
 from cayu.project_control_plane import (
+    MAX_PROJECT_EVAL_TARGETS,
     ProjectControlPlaneAccess,
     ProjectControlPlaneContext,
     ProjectEvalJudgeConfiguration,
+    ProjectEvalTarget,
     _create_project_control_plane_context,
 )
 from cayu.storage.targets import configured_database_pool_max
@@ -44,7 +46,12 @@ _DEFAULT_JUDGE_KEYS = {
     "provider",
     "timeout_seconds",
 }
-_EVALS_KEYS = {"default_judge", "price_book"}
+_EVALS_KEYS = {"default_judge", "price_book", "targets", "worker"}
+_EVAL_TARGET_REFERENCE_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z",
+    re.ASCII,
+)
 
 
 def build_project_control_plane_context(
@@ -52,8 +59,13 @@ def build_project_control_plane_context(
     *,
     mode: str,
     environ: Mapping[str, str] | None = None,
+    eval_targets: tuple[ProjectEvalTarget, ...] = (),
 ) -> ProjectControlPlaneContext:
-    """Resolve one framework-owned context without importing project code."""
+    """Resolve one framework-owned context without importing project code.
+
+    ``eval_targets`` are the declared eval targets the caller loaded from the
+    project (see ``cayu.cli._project_evals``); this function imports none of them.
+    """
 
     root = root.resolve()
     if mode == "development":
@@ -66,6 +78,7 @@ def build_project_control_plane_context(
         raise ValueError("mode must be development or production.")
     environment = os.environ if environ is None else environ
     project_id, eval_judge_configuration, eval_price_book = _project_metadata(root)
+    eval_worker = project_eval_worker(root)
     try:
         target = resolve_project_session_store_target(
             environ=environment,
@@ -91,7 +104,41 @@ def build_project_control_plane_context(
         store_backend=None if target is None else target.backend.value,
         store_source=None if target is None else target.source,
         access=access,
+        eval_targets=eval_targets,
+        eval_worker=eval_worker,
     )
+
+
+def project_eval_worker(root: Path) -> str | None:
+    """The ``[tool.cayu.workers]`` name in ``[tool.cayu.evals].worker``, if any.
+
+    That worker runs the eval runs of the project's declared eval targets, so the
+    web process doesn't.
+    """
+
+    pyproject = root.resolve() / "pyproject.toml"
+    try:
+        document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ProjectError(f"Could not read {pyproject}: {exc}") from exc
+    evals = _evals_table(document, pyproject=pyproject)
+    return None if evals is None else _eval_worker(document, evals, pyproject=pyproject)
+
+
+def project_eval_target_references(root: Path) -> tuple[str, ...]:
+    """The ``module:function`` references in ``[tool.cayu.evals].targets``, in order."""
+
+    pyproject = root.resolve() / "pyproject.toml"
+    try:
+        document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ProjectError(f"Could not read {pyproject}: {exc}") from exc
+    evals = _evals_table(document, pyproject=pyproject)
+    return () if evals is None else _eval_target_references(evals, pyproject=pyproject)
 
 
 def close_project_control_plane_context(context: ProjectControlPlaneContext | None) -> None:
@@ -146,26 +193,26 @@ def _project_metadata(
     return project_id, eval_judge_configuration, eval_price_book
 
 
-def _project_evals_configuration(
+def _evals_table(
     document: Mapping[str, object],
     *,
     pyproject: Path,
-) -> tuple[ProjectEvalJudgeConfiguration | None, PriceBook | None]:
+) -> Mapping[str, object] | None:
     tool = document.get("tool")
     if tool is None:
-        return None, None
+        return None
     if not isinstance(tool, Mapping):
         raise ProjectError(f"{pyproject}: [tool] must be a table.")
     tool = cast("Mapping[str, object]", tool)
     cayu = tool.get("cayu")
     if cayu is None:
-        return None, None
+        return None
     if not isinstance(cayu, Mapping):
         raise ProjectError(f"{pyproject}: [tool.cayu] must be a table.")
     cayu = cast("Mapping[str, object]", cayu)
     evals = cayu.get("evals")
     if evals is None:
-        return None, None
+        return None
     if not isinstance(evals, Mapping):
         raise ProjectError(f"{pyproject}: [tool.cayu.evals] must be a table.")
     evals = cast("Mapping[str, object]", evals)
@@ -174,6 +221,75 @@ def _project_evals_configuration(
         raise ProjectError(
             f"{pyproject}: [tool.cayu.evals] has unsupported keys: {', '.join(sorted(unexpected))}."
         )
+    return evals
+
+
+def _eval_target_references(
+    evals: Mapping[str, object],
+    *,
+    pyproject: Path,
+) -> tuple[str, ...]:
+    configured = evals.get("targets")
+    if configured is None:
+        return ()
+    if not isinstance(configured, list) or not all(isinstance(item, str) for item in configured):
+        raise ProjectError(
+            f'{pyproject}: [tool.cayu.evals].targets must be a list of "module:function" text.'
+        )
+    references = cast("list[str]", configured)
+    if len(references) > MAX_PROJECT_EVAL_TARGETS:
+        raise ProjectError(
+            f"{pyproject}: [tool.cayu.evals].targets lists at most "
+            f"{MAX_PROJECT_EVAL_TARGETS} eval targets."
+        )
+    for reference in references:
+        if _EVAL_TARGET_REFERENCE_RE.fullmatch(reference) is None:
+            raise ProjectError(
+                f"{pyproject}: [tool.cayu.evals].targets entry {reference!r} must be "
+                '"module:function".'
+            )
+    if len(set(references)) != len(references):
+        raise ProjectError(f"{pyproject}: [tool.cayu.evals].targets lists an entry twice.")
+    return tuple(references)
+
+
+def _eval_worker(
+    document: Mapping[str, object],
+    evals: Mapping[str, object],
+    *,
+    pyproject: Path,
+) -> str | None:
+    worker = evals.get("worker")
+    if worker is None:
+        return None
+    if not isinstance(worker, str) or not worker.strip():
+        raise ProjectError(f"{pyproject}: [tool.cayu.evals].worker must be a worker name.")
+    if not _eval_target_references(evals, pyproject=pyproject):
+        raise ProjectError(
+            f"{pyproject}: [tool.cayu.evals].worker runs the declared eval targets; "
+            "declare them in [tool.cayu.evals].targets."
+        )
+    tool = cast("Mapping[str, object]", document["tool"])
+    cayu = cast("Mapping[str, object]", tool["cayu"])
+    workers = cayu.get("workers")
+    if not isinstance(workers, Mapping) or worker not in workers:
+        raise ProjectError(
+            f"{pyproject}: [tool.cayu.evals].worker names {worker!r}, which "
+            "[tool.cayu.workers] doesn't declare."
+        )
+    return worker
+
+
+def _project_evals_configuration(
+    document: Mapping[str, object],
+    *,
+    pyproject: Path,
+) -> tuple[ProjectEvalJudgeConfiguration | None, PriceBook | None]:
+    evals = _evals_table(document, pyproject=pyproject)
+    if evals is None:
+        return None, None
+    _eval_target_references(evals, pyproject=pyproject)
+    _eval_worker(document, evals, pyproject=pyproject)
     price_book_source = evals.get("price_book")
     if price_book_source is None:
         eval_price_book = None

@@ -324,7 +324,9 @@ def create_server(
         else None
     )
     cloud_reporting_router = (
-        _environment_cloud_reporting_router(app, resolved_config.api.path)
+        _environment_cloud_reporting_router(
+            app, resolved_config.api.path, project_context=resolved_project_context
+        )
         if resolved_config.api.enabled
         else None
     )
@@ -827,7 +829,9 @@ def mount_cayu(
     )
     client_router = browser_client_router(base_path=mount_path, auth=auth)
     fork_controller_router = _environment_fork_controller_router(app, api_path)
-    cloud_reporting_router = _environment_cloud_reporting_router(app, api_path)
+    cloud_reporting_router = _environment_cloud_reporting_router(
+        app, api_path, project_context=resolved_project_context
+    )
 
     # All caller-controlled values and route construction are validated before
     # changing the host application. A rejected mount must leave it reusable.
@@ -1581,16 +1585,31 @@ def _environment_fork_controller_router(app: CayuApp, api_path: str) -> Any:
     )
 
 
-def _environment_cloud_reporting_router(app: CayuApp, api_path: str) -> Any:
+def _environment_cloud_reporting_router(
+    app: CayuApp,
+    api_path: str,
+    *,
+    project_context: ResolvedProjectControlPlaneContext | None,
+) -> Any:
     """The Cayu Cloud reader's router when the process environment names its token digests.
 
     It is served at ``{api_path}/cloud`` with its own bearer authentication,
-    never the operator's. ``None`` without that configuration.
+    never the operator's. ``None`` without that configuration. Its schedule
+    counts the eval runs waiting for the project's eval worker, when it has one.
     """
 
+    from cayu.cloud_reporting import EvalRunScheduleSource
     from cayu.server.cloud_reporting import environment_cloud_reporting_router
 
-    return environment_cloud_reporting_router(app, prefix=_join_public_paths(api_path, "cloud"))
+    worker_keys = () if project_context is None else project_context.owner.worker_eval_target_keys
+    eval_runs = (
+        EvalRunScheduleSource(store=project_context.eval_store, target_keys=worker_keys)
+        if project_context is not None and project_context.eval_store is not None and worker_keys
+        else None
+    )
+    return environment_cloud_reporting_router(
+        app, prefix=_join_public_paths(api_path, "cloud"), eval_runs=eval_runs
+    )
 
 
 def _join_public_paths(base: str, child: str) -> str:

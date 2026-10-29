@@ -17,8 +17,12 @@ from uvicorn import Server
 from uvicorn.supervisors.watchfilesreload import WatchFilesReload
 
 from cayu.cli.project import project_context
-from cayu.cli.project_control_plane import build_project_control_plane_context
-from cayu.cli.serve import _build_serve_app, _resolve_serve_project, parse_serve_arguments
+from cayu.cli.serve import (
+    _build_serve_app,
+    _resolve_serve_project,
+    parse_serve_arguments,
+    serve_project_control_plane,
+)
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -105,9 +109,7 @@ class _ReloadApp:
         try:
             project, settings = _resolve_serve_project(args, start=root)
             self._scope.enter_context(project_context(project.root))
-            self._context = build_project_control_plane_context(
-                project.root, mode="development" if args.dev else "production"
-            )
+            self._context = serve_project_control_plane(args, project)
             self._server = _build_serve_app(args, project, settings, self._context)
         except BaseException as primary:
             try:

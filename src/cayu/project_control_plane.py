@@ -8,12 +8,19 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
 from cayu.applications import CayuApp
 from cayu.budgets.pricing import PriceBook, copy_price_book
 from cayu.evals.store import EvalStore
+
+if TYPE_CHECKING:
+    from cayu.evals.execution import CorpusTarget
+    from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
+
+#: How many eval targets one project may declare in ``[tool.cayu.evals].targets``.
+MAX_PROJECT_EVAL_TARGETS = 16
 
 _CANONICAL_POSITIVE_DECIMAL_RE = re.compile(
     r"(?:0|[1-9]\d*)(?:\.\d*[1-9])?\Z",
@@ -113,6 +120,33 @@ class ProjectEvalJudgeConfiguration:
             object.__setattr__(self, "cost_currency", currency)
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectEvalTarget:
+    """One eval target a project declares in ``[tool.cayu.evals].targets``.
+
+    ``reference`` is the declared ``module:function``; ``target`` is the corpus or
+    workflow target it built, and ``execution_profile_policy`` the policy its plan
+    declared (the one-trial default when it declared none).
+    """
+
+    reference: str
+    target: CorpusTarget
+    execution_profile_policy: EvalExecutionProfilePolicyV1
+
+    def __post_init__(self) -> None:
+        from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
+        from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
+
+        reference = require_clean_nonblank(self.reference, "reference")
+        require_unicode_scalar_text(reference, "reference")
+        if type(self.target) not in {CorpusTarget, WorkflowEvalTarget}:
+            raise TypeError("target must be an exact CorpusTarget or WorkflowEvalTarget.")
+        if type(self.execution_profile_policy) is not EvalExecutionProfilePolicyV1:
+            raise TypeError(
+                "execution_profile_policy must be an exact EvalExecutionProfilePolicyV1."
+            )
+
+
 class ProjectControlPlaneContext:
     """Opaque project authority assembled by ``cayu serve`` and ``cayu check``.
 
@@ -129,6 +163,8 @@ class ProjectControlPlaneContext:
         "_eval_judge_configuration",
         "_eval_price_book",
         "_eval_store",
+        "_eval_targets",
+        "_eval_worker",
         "_project_id",
         "_project_root",
         "_store_backend",
@@ -146,6 +182,8 @@ class ProjectControlPlaneContext:
         store_backend: Literal["sqlite", "postgres"] | None,
         store_source: str | None,
         access: ProjectControlPlaneAccess,
+        eval_targets: tuple[ProjectEvalTarget, ...] = (),
+        eval_worker: str | None = None,
         _assembly_token: object | None = None,
     ) -> None:
         if _assembly_token is not _PROJECT_CONTEXT_ASSEMBLY_TOKEN:
@@ -177,6 +215,10 @@ class ProjectControlPlaneContext:
             store_source = require_clean_nonblank(store_source, "store_source")
         if not isinstance(access, ProjectControlPlaneAccess):
             raise TypeError("access must be a ProjectControlPlaneAccess.")
+        eval_targets = _validated_eval_targets(eval_targets)
+        if eval_worker is not None:
+            eval_worker = require_clean_nonblank(eval_worker, "eval_worker")
+            require_unicode_scalar_text(eval_worker, "eval_worker")
 
         self._project_root = project_root
         self._project_id = project_id
@@ -185,6 +227,8 @@ class ProjectControlPlaneContext:
             None if eval_price_book is None else copy_price_book(eval_price_book)
         )
         self._eval_store = eval_store
+        self._eval_targets = eval_targets
+        self._eval_worker = eval_worker
         self._store_backend = store_backend
         self._store_source = store_source
         self._access = access
@@ -199,6 +243,7 @@ class ProjectControlPlaneContext:
             f"eval_store_configured={self.eval_store_configured!r}, "
             f"eval_judge_configured={self.eval_judge_configured!r}, "
             f"eval_pricing_configured={self.eval_pricing_configured!r}, "
+            f"eval_target_count={len(self._eval_targets)!r}, "
             f"access={self._access.value!r})"
         )
 
@@ -221,6 +266,39 @@ class ProjectControlPlaneContext:
     @property
     def access(self) -> ProjectControlPlaneAccess:
         return self._access
+
+    @property
+    def eval_targets(self) -> tuple[ProjectEvalTarget, ...]:
+        """The eval targets the project declares, as ``cayu serve`` loaded them."""
+
+        return self._eval_targets
+
+    @property
+    def eval_worker(self) -> str | None:
+        """The worker that runs the declared targets' eval runs, if not the server."""
+
+        return self._eval_worker
+
+    def declared_eval_apps(self, *, exclude: CayuApp | None = None) -> tuple[CayuApp, ...]:
+        """The distinct applications the declared eval targets run on, except ``exclude``.
+
+        Whoever runs the targets closes them when it stops.
+        """
+
+        apps: list[CayuApp] = []
+        for item in self._eval_targets:
+            app = item.target.app
+            if app is not exclude and all(app is not seen for seen in apps):
+                apps.append(app)
+        return tuple(apps)
+
+    @property
+    def worker_eval_target_keys(self) -> tuple[str, ...]:
+        """Keys of the declared targets whose eval runs the project's eval worker runs."""
+
+        if self._eval_worker is None:
+            return ()
+        return tuple(item.target.key for item in self._eval_targets)
 
     async def close(self) -> None:
         """Close the framework-owned store at most once."""
@@ -270,6 +348,8 @@ class ProjectControlPlaneContext:
                 None if self._eval_price_book is None else copy_price_book(self._eval_price_book)
             ),
             eval_store=self._eval_store,
+            eval_targets=self._eval_targets,
+            eval_worker=self._eval_worker,
             store_backend=self._store_backend,
             store_source=self._store_source,
             access=self._access,
@@ -289,6 +369,8 @@ class ResolvedProjectControlPlaneContext:
     eval_judge_configuration: ProjectEvalJudgeConfiguration | None
     eval_price_book: PriceBook | None
     eval_store: EvalStore | None
+    eval_targets: tuple[ProjectEvalTarget, ...]
+    eval_worker: str | None
     store_backend: Literal["sqlite", "postgres"] | None
     store_source: str | None
     access: ProjectControlPlaneAccess
@@ -336,6 +418,8 @@ def _create_project_control_plane_context(
     access: ProjectControlPlaneAccess,
     eval_judge_configuration: ProjectEvalJudgeConfiguration | None = None,
     eval_price_book: PriceBook | None = None,
+    eval_targets: tuple[ProjectEvalTarget, ...] = (),
+    eval_worker: str | None = None,
 ) -> ProjectControlPlaneContext:
     return ProjectControlPlaneContext(
         project_root=project_root,
@@ -346,8 +430,26 @@ def _create_project_control_plane_context(
         store_backend=store_backend,
         store_source=store_source,
         access=access,
+        eval_targets=eval_targets,
+        eval_worker=eval_worker,
         _assembly_token=_PROJECT_CONTEXT_ASSEMBLY_TOKEN,
     )
+
+
+def _validated_eval_targets(value: object) -> tuple[ProjectEvalTarget, ...]:
+    if type(value) is not tuple:
+        raise TypeError("eval_targets must be a tuple of ProjectEvalTarget values.")
+    if len(value) > MAX_PROJECT_EVAL_TARGETS:
+        raise ValueError(f"A project declares at most {MAX_PROJECT_EVAL_TARGETS} eval targets.")
+    targets: list[ProjectEvalTarget] = []
+    for item in value:
+        if type(item) is not ProjectEvalTarget:
+            raise TypeError("eval_targets must contain exact ProjectEvalTarget values.")
+        targets.append(item)
+    keys = [item.target.key for item in targets]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Declared eval targets must have distinct keys.")
+    return tuple(targets)
 
 
 def resolve_project_control_plane_context(

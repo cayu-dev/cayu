@@ -289,7 +289,7 @@ def test_reload_worker_closes_context_after_startup_failure(tmp_path, monkeypatc
 
     monkeypatch.setattr(
         reload_cli,
-        "build_project_control_plane_context",
+        "serve_project_control_plane",
         lambda *a, **kw: SimpleNamespace(close=close),
     )
     monkeypatch.setattr(reload_cli, "_build_serve_app", build)
@@ -332,7 +332,7 @@ def test_reload_worker_preserves_delivered_cancellation_and_closes_context(tmp_p
 
         monkeypatch.setattr(
             reload_cli,
-            "build_project_control_plane_context",
+            "serve_project_control_plane",
             lambda *a, **kw: SimpleNamespace(close=close),
         )
         monkeypatch.setattr(reload_cli, "_build_serve_app", lambda *a: inner)
@@ -643,7 +643,7 @@ def test_reload_worker_closes_bootstrap_resources_when_server_setup_fails(
 
     monkeypatch.setattr(
         reload_cli,
-        "build_project_control_plane_context",
+        "serve_project_control_plane",
         lambda *a, **kw: SimpleNamespace(close=close),
     )
     monkeypatch.setattr(reload_cli, "_build_serve_app", lambda *a: object())

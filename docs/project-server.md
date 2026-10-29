@@ -270,7 +270,9 @@ the application's [release identity](runtime-contracts.md#release-identity)
 may create the project-local `data/cayu.db` default; production without an
 explicit or already-discovered durable store keeps Evals storage gated rather
 than guessing. After the application factory returns, Cayu publishes one
-bounded executable eval target per registered specialist. An optional
+bounded executable eval target per registered specialist, plus the eval
+targets the project declares in `[tool.cayu.evals].targets` (see
+[Evals](evals.md)). An optional
 `[tool.cayu.evals.default_judge]` declaration can also publish one exact,
 tool-free model judge; it must name an already-registered provider, privacy
 policy, same-model decision, and bounded time/token ceilings. An explicit

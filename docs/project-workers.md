@@ -155,6 +155,10 @@ the deadline. Outside Cayu Cloud, or with a control plane that doesn't answer
 the question, nothing is asked. A worker run by another command can ask the same
 endpoint itself.
 
+A worker that `[tool.cayu.evals].worker` names also runs the project's declared
+eval targets' runs, and drains them the same way: it finishes the run it holds
+and takes no new one ([Evals](evals.md)).
+
 When this is the only worker process for its tasks, say so and it settles them
 itself:
 

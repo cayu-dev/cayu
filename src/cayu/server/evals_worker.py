@@ -7,6 +7,7 @@ import contextlib
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
@@ -41,6 +42,7 @@ from cayu.evals.store import (
     EvalRunFailureDiagnostic,
     EvalRunFailureReason,
     EvalRunLease,
+    EvalRunQuery,
     EvalRunStateConflict,
     EvalRunStatus,
     EvalScenarioTrialFailureCode,
@@ -64,6 +66,14 @@ from cayu.server.evals_registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Runs a coordinator that runs until idle must not leave behind.
+_OUTSTANDING_RUN_STATUSES = (
+    EvalRunStatus.QUEUED,
+    EvalRunStatus.RUNNING,
+    EvalRunStatus.CANCELLING,
+)
 
 
 @dataclass(frozen=True)
@@ -217,11 +227,12 @@ class EvalRunCoordinator:
             from cayu.evals.corpus import _sha256_revision
 
             launch_revision = _sha256_revision(launch_revision, "launch_revision")
-            if len(config.registry.target_keys) != 1:
+            if len(config.target_keys_to_claim) != 1:
                 raise ValueError("A launch-scoped worker requires exactly one registered target.")
         self._launch_revision = launch_revision
         self._stop_requested = asyncio.Event()
-        self._task: asyncio.Task[None] | None = None
+        self._drain_requested = asyncio.Event()
+        self._task: asyncio.Task[Any] | None = None
 
     def start(self) -> None:
         """Start the single embedded worker in the current event loop."""
@@ -233,6 +244,44 @@ class EvalRunCoordinator:
             name="cayu-eval-run-coordinator",
         )
 
+    async def run_until_idle(self) -> tuple[int, bool]:
+        """Run claimable work until none is left, then return.
+
+        Returns how many runs it took and whether it stopped because none was
+        left (``False`` when a stop, a drain or a store failure ended it first).
+        """
+
+        if self._task is not None:
+            raise RuntimeError("Eval run coordinator has already been started.")
+        task = asyncio.create_task(
+            self._run_until_idle(),
+            name="cayu-eval-run-coordinator-until-idle",
+        )
+        self._task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                self._task = None
+
+    def request_drain(self) -> None:
+        """Claim no new run from now on; the run in progress goes on."""
+
+        self._drain_requested.set()
+
+    async def drain(self) -> None:
+        """Claim nothing more and return once the run in progress has finished.
+
+        A later ``stop`` still releases that run within the shutdown grace.
+        """
+
+        self.request_drain()
+        task = self._task
+        if task is None:
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(task)
+
     async def stop(self) -> None:
         """Stop dispatch within the configured grace period.
 
@@ -242,10 +291,11 @@ class EvalRunCoordinator:
         for a stalled store operation.
         """
 
+        # Recorded even before a start, so a stop that came first is never lost.
+        self._stop_requested.set()
         task = self._task
         if task is None:
             return
-        self._stop_requested.set()
         done, _ = await asyncio.wait(
             {task},
             timeout=self._config.shutdown_grace_seconds,
@@ -258,8 +308,11 @@ class EvalRunCoordinator:
         task.cancel()
         task.add_done_callback(self._consume_detached_task)
 
+    def _claiming(self) -> bool:
+        return not (self._stop_requested.is_set() or self._drain_requested.is_set())
+
     async def _run_forever(self) -> None:
-        while not self._stop_requested.is_set():
+        while self._claiming():
             try:
                 lease = await self._claim_run()
             except asyncio.CancelledError:
@@ -271,18 +324,59 @@ class EvalRunCoordinator:
             if lease is None:
                 await self._wait_for_work()
                 continue
+            await self._run_claimed_lease(lease)
+
+    async def _run_until_idle(self) -> tuple[int, bool]:
+        handled = 0
+        while self._claiming():
             try:
-                await self._run_lease(lease)
+                lease = await self._claim_run()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # Per-lease handlers are deliberately defensive so this branch
-                # indicates an implementation fault, not a workload diagnostic.
-                logger.error("Unexpected failure while coordinating durable eval work.")
-                await self._release_after_interruption(lease.claim)
+                logger.error("Failed to claim durable eval work; this run ends without it.")
+                return handled, False
+            if lease is None:
+                # Nothing claimable may still leave a run held under a lease that hasn't
+                # expired yet, as after a worker died, and the runs queued behind it.
+                try:
+                    outstanding = await self._has_outstanding_runs()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.error("Failed to read durable eval work; this run ends without it.")
+                    return handled, False
+                if not outstanding:
+                    return handled, True
+                await self._wait_for_work()
+                continue
+            await self._run_claimed_lease(lease)
+            handled += 1
+        return handled, False
+
+    async def _has_outstanding_runs(self) -> bool:
+        for target_key in self._config.target_keys_to_claim:
+            for status in _OUTSTANDING_RUN_STATUSES:
+                page = await self._config.store.list_runs(
+                    EvalRunQuery(target_key=target_key, status=status, limit=1)
+                )
+                if page.items:
+                    return True
+        return False
+
+    async def _run_claimed_lease(self, lease: EvalRunLease) -> None:
+        try:
+            await self._run_lease(lease)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Per-lease handlers are deliberately defensive so this branch
+            # indicates an implementation fault, not a workload diagnostic.
+            logger.error("Unexpected failure while coordinating durable eval work.")
+            await self._release_after_interruption(lease.claim)
 
     async def _claim_run(self) -> EvalRunLease | None:
-        target_keys = self._config.registry.target_keys
+        target_keys = self._config.target_keys_to_claim
         if self._launch_revision is not None:
             return await self._config.store.claim_run(
                 target_key=target_keys[0],
@@ -300,11 +394,17 @@ class EvalRunCoordinator:
         )
 
     async def _wait_for_work(self) -> None:
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(
-                self._stop_requested.wait(),
+        stopped = asyncio.ensure_future(self._stop_requested.wait())
+        drained = asyncio.ensure_future(self._drain_requested.wait())
+        try:
+            await asyncio.wait(
+                {stopped, drained},
                 timeout=self._config.poll_interval_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+        finally:
+            stopped.cancel()
+            drained.cancel()
 
     async def _run_lease(self, lease: EvalRunLease) -> None:
         if lease.run.status is EvalRunStatus.CANCELLING:

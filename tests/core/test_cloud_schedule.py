@@ -68,6 +68,7 @@ def test_an_agent_without_a_task_store_reports_no_task_schedule() -> None:
             "next_deadline_at": None,
             "awaiting_service": 0,
         },
+        "eval_runs": None,
     }
     assert schedule.external_waits.as_of.utcoffset() == timedelta(0)
 

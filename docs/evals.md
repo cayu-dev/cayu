@@ -3009,6 +3009,60 @@ target with the automatically assembled store. Arbitrary embedded
 `create_server(...)` and `mount_cayu(...)` integrations continue to provide
 trusted runtime objects explicitly.
 
+A project can also serve its own eval targets next to the generated ones, so
+corpora written for them run on the deployed Agent:
+
+```toml
+[tool.cayu.evals]
+targets = ["evals.questions:build_corpus_eval"]
+```
+
+Each entry is a `module:function` (at most 16) returning an `EvalPlan` with a
+`corpus_target` or a `workflow_target` and no direct suite, or a bare
+`WorkflowEvalTarget`; an async function is awaited. The target keeps the app it
+was built with, and its key is the `target_key` its corpora name. The catalog lists
+it with `source = "explicit"`, its key as `profile_id`, and the plan's
+`execution_profile_policy` (the one-trial default when the plan declares none),
+so a plan that declares an application-managed reset contract with
+`max_trials = 3` can run three-trial suites. `cayu serve` loads the declarations
+after reading the project; one that fails to load is reported on standard error
+and left out, and the Agent still serves. Try a declaration before deploying by
+running one of its corpora locally: `cayu eval run module:function --corpus FILE
+--suite ID`. A server built with an explicit
+`EvalsConfig` serves only that target, as before.
+
+The web process runs a declared target's eval runs itself unless a worker does:
+
+```toml
+[tool.cayu.workers]
+evals = "workers:run_evals"
+
+[tool.cayu.evals]
+targets = ["evals.questions:build_corpus_eval"]
+worker = "evals"
+```
+
+`cayu serve` then still lists the targets, imports their corpora and admits their
+runs, but runs only the generated targets' runs; `cayu worker evals` loads the same
+declarations and runs the declared targets' runs beside its own entrypoint, from
+the same durable eval store. On Cayu Cloud that is what keeps a long eval run
+going: a worker that declares `[worker] drain_seconds` finishes the run it holds
+when a deploy replaces it, claiming no new one, and a worker that runs until idle
+(`cayu worker evals --until-idle`) returns only once no run of its targets is
+queued or held, adds the runs it took to the result's `handled`, and is woken for
+the next one (the schedule summary reports them as `eval_runs`). While eval runs
+go on it runs its entrypoint again every few seconds, and once more after them,
+so tasks their workflows create are served. The worker and the server close the
+declared targets' own applications when they stop. A web process
+that runs eval runs itself stops them when it sleeps or a deploy replaces it. The
+worker's entrypoint runs until the `stop` event it is given is set, as any
+`cayu worker` entrypoint does; `run_task_worker` or `run_task_worker_until_idle`
+over the app's tasks serves. The worker needs the server extra and the project's
+durable store (`CAYU_DATABASE_URL` or `[tool.cayu.session_store]`); without
+either it says so and runs no eval runs. Its runs use the execution profile the
+web process admitted them under, so a target with process-local components,
+whose profile differs between processes, can't move to a worker.
+
 A project may also declare one bounded default model judge without writing
 Evals-specific Python:
 

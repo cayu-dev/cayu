@@ -26,6 +26,7 @@ from cayu.cloud_reporting import (
     CloudActivityPage,
     CloudContract,
     CloudSchedule,
+    EvalRunScheduleSource,
     read_cloud_activity,
     read_cloud_contract,
     read_cloud_schedule,
@@ -110,6 +111,7 @@ def create_cloud_reporting_router(
     *,
     authenticate: Callable[[Request], Awaitable[bool]],
     prefix: str = "/cloud",
+    eval_runs: EvalRunScheduleSource | None = None,
 ) -> APIRouter:
     """Serve the contract's discovery and activity routes behind ``authenticate``.
 
@@ -176,7 +178,7 @@ def create_cloud_reporting_router(
     @router.get("/v1/schedule", response_model=CloudSchedule)
     async def schedule(response: Response) -> CloudSchedule:
         response.headers.update(_NO_STORE)
-        return await read_cloud_schedule(app)
+        return await read_cloud_schedule(app, eval_runs=eval_runs)
 
     return router
 
@@ -186,6 +188,7 @@ def environment_cloud_reporting_router(
     *,
     prefix: str = "/cloud",
     environ: Mapping[str, str] | None = None,
+    eval_runs: EvalRunScheduleSource | None = None,
 ) -> APIRouter | None:
     """The router for the reader ``CAYU_CLOUD_READER_TOKEN_SHA256`` names, or ``None``.
 
@@ -196,7 +199,9 @@ def environment_cloud_reporting_router(
     authenticate = CloudReaderBearerAuth.from_environment(environ)
     if authenticate is None:
         return None
-    return create_cloud_reporting_router(app, authenticate=authenticate, prefix=prefix)
+    return create_cloud_reporting_router(
+        app, authenticate=authenticate, prefix=prefix, eval_runs=eval_runs
+    )
 
 
 __all__ = [

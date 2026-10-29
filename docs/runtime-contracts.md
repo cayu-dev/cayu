@@ -20116,7 +20116,7 @@ authenticate=...)` serves the same routes behind a host's own authentication.
 | --- | --- |
 | `GET {api}/cloud/contract` | `{"contract": "cayu.cloud-agent", "versions": [1], "runtime_version": str, "features": [str, ...], "store_id": str \| null}` |
 | `GET {api}/cloud/v1/activity?cursor=&limit=` | `{"contract": "cayu.cloud-agent/v1", "runs": [run, ...], "touches": [touch, ...], "next_cursor": str, "has_more": bool, "task_health": {"fenced_after_worker_loss": int, "complete": bool} \| null}` |
-| `GET {api}/cloud/v1/schedule` | `{"contract": "cayu.cloud-agent/v1", "tasks": {"as_of": str, "next_available_at": str \| null, "next_expiry_at": str \| null, "maintenance_required": bool, "scheduled": int \| null, "due": int \| null} \| null, "external_waits": {"as_of": str, "next_deadline_at": str \| null, "awaiting_service": int} \| null}` |
+| `GET {api}/cloud/v1/schedule` | `{"contract": "cayu.cloud-agent/v1", "tasks": {"as_of": str, "next_available_at": str \| null, "next_expiry_at": str \| null, "maintenance_required": bool, "scheduled": int \| null, "due": int \| null} \| null, "external_waits": {"as_of": str, "next_deadline_at": str \| null, "awaiting_service": int} \| null, "eval_runs": {"as_of": str, "queued": int, "running": int} \| null}` |
 
 Responses carry `Cache-Control: private, no-store`. A missing or wrong token
 answers 401 with `WWW-Authenticate: Bearer`, a cursor the contract did not issue
@@ -20190,6 +20190,15 @@ task created between the two can appear in one and not the other. They are
 | `as_of` | The session store's clock when it observed the waits (PostgreSQL's statement clock; the SQLite and memory ownership clock). |
 | `next_deadline_at` | The earliest deadline, in UTC, of a registered wait whose outcome is still open, or `null`. A wait without a deadline, an unregistered reservation and a wait whose event or timeout was already elected add none. |
 | `awaiting_service` | Waits whose event or timeout was elected while their session has not continued yet. `deliver()` only records an event; the session continues when the application services it (`ExternalWaitHost`, `SessionExternalWaitAdapter.service_wait`), so the application must run. It counts every elected wait the runtime still owes a handoff: one not serviced yet, a continuation running now until it settles, and a retirement (`retire_execution`) whose acknowledgement has not completed, which the next servicing finishes. |
+
+`eval_runs` is `null` unless the project names an eval worker
+(`[tool.cayu.evals].worker`). Otherwise `queued` counts the declared targets'
+admitted eval runs no worker has claimed yet and `running` the ones a worker
+holds, including those it is cancelling, each up to 100, as the eval store
+observed them at `as_of` (the reader's clock). The contract lists `eval_runs` in
+`features`. A host wakes the eval worker while either count is above zero; a
+`running` count that stays unchanged while no worker runs belongs to a worker
+that stopped, and its run is claimed again once its lease expires.
 
 A timeout is elected only when something observes the wait after its
 deadline, such as `ExternalWaitHost` or the `TaskStoreWaitScheduler` handler,

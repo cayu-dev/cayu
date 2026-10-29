@@ -109,6 +109,7 @@ def test_the_reader_token_reads_the_contract_and_nothing_else(reader) -> None:
                 "task_health",
                 "schedule",
                 "external_event_waits",
+                "eval_runs",
             ],
             "store_id": store_id,
         }
