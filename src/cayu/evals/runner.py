@@ -2484,6 +2484,7 @@ async def _run_workflow_case_once_with_public_projection(
                     context,
                     portable_evidence=prepared,
                     portable_evidence_error=prepared_error,
+                    runtime_app=runtime_app,
                 )
             )
             if capture_diagnostic is not None:
@@ -3294,6 +3295,7 @@ async def _run_case_once_with_public_projection(
                     prepared_context,
                     portable_evidence=prepared_portable_evidence,
                     portable_evidence_error=portable_evidence_error,
+                    runtime_app=app,
                 )
                 assertion_results = list(evaluated)
                 assertion_error = _assertion_diagnostic(
@@ -3564,6 +3566,7 @@ async def _evaluate_assertions(
         context,
         portable_evidence=portable_evidence,
         portable_evidence_error=portable_evidence_error,
+        runtime_app=runtime_app,
     )
 
 
@@ -3598,7 +3601,9 @@ async def _evaluate_assertions_with_prepared_evidence(
     *,
     portable_evidence: AssertionEvidenceView | None,
     portable_evidence_error: Exception | None,
+    runtime_app: CayuApp | None,
 ) -> tuple[EvalAssertionResult, ...]:
+    from cayu.evals.application_evaluators import _CompiledApplicationEvaluatorAssertion
     from cayu.evals.portable_assertions import (
         _CompiledModelJudgeAssertion,
         _CompiledPortableAssertion,
@@ -3621,6 +3626,8 @@ async def _evaluate_assertions_with_prepared_evidence(
                 if portable_evidence is None:
                     raise RuntimeError("Compiled assertion evidence was not prepared.")
                 result = await assertion.evaluate_evidence(portable_evidence, context)
+            elif type(assertion) is _CompiledApplicationEvaluatorAssertion:
+                result = await assertion.evaluate_in(context, runtime_app=runtime_app)
             else:
                 result = assertion.evaluate(context)
                 if inspect.isawaitable(result):

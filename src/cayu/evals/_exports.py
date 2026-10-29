@@ -46,6 +46,15 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.evals.evidence",
         "ASSERTION_EVIDENCE_SCHEMA_VERSION",
     ),
+    "ApplicationEvaluator": ("cayu.evals.application_evaluators", "ApplicationEvaluator"),
+    "ApplicationEvaluatorAssertionSpec": (
+        "cayu.evals.corpus",
+        "ApplicationEvaluatorAssertionSpec",
+    ),
+    "ApplicationEvaluatorFactory": (
+        "cayu.evals.application_evaluators",
+        "ApplicationEvaluatorFactory",
+    ),
     "ArtifactAssertionSpec": ("cayu.evals.corpus", "ArtifactAssertionSpec"),
     "ArtifactCreated": ("cayu.evals.assertions", "ArtifactCreated"),
     "ArtifactScopeEvidenceV1": ("cayu.evals.evidence", "ArtifactScopeEvidenceV1"),
@@ -253,6 +262,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY": (
         "cayu.evals.execution",
         "CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY",
+    ),
+    "CORPUS_EXECUTION_MAX_APPLICATION_EVALUATORS": (
+        "cayu.evals.execution",
+        "CORPUS_EXECUTION_MAX_APPLICATION_EVALUATORS",
     ),
     "CORPUS_EXECUTION_MAX_APP_MANIFEST_BYTES": (
         "cayu.evals.execution",
@@ -1113,6 +1126,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "PromotionWarningCode": ("cayu.evals.promotion", "PromotionWarningCode"),
     "PublicJudgeReferenceDraftV1": ("cayu.evals.suite_authoring", "PublicJudgeReferenceDraftV1"),
     "PublicJudgeReferenceV1": ("cayu.evals.corpus", "PublicJudgeReferenceV1"),
+    "PublishedApplicationEvaluatorDetail": (
+        "cayu.evals.published",
+        "PublishedApplicationEvaluatorDetail",
+    ),
+    "PublishedApplicationEvaluatorObservationV1": (
+        "cayu.evals.published",
+        "PublishedApplicationEvaluatorObservationV1",
+    ),
     "PublishedArtifactDetail": ("cayu.evals.published", "PublishedArtifactDetail"),
     "PublishedAssertionDetail": ("cayu.evals.published", "PublishedAssertionDetail"),
     "PublishedAssertionResult": ("cayu.evals.published", "PublishedAssertionResult"),
@@ -1867,6 +1888,9 @@ PUBLIC_NAMES = [
     "validate_project_improvement",
     "ASSERTION_EVIDENCE_MAX_BYTES",
     "ASSERTION_EVIDENCE_SCHEMA_VERSION",
+    "ApplicationEvaluator",
+    "ApplicationEvaluatorAssertionSpec",
+    "ApplicationEvaluatorFactory",
     "ArtifactAssertionSpec",
     "ArtifactCreated",
     "ArtifactScopeEvidenceV1",
@@ -1931,6 +1955,7 @@ PUBLIC_NAMES = [
     "CORPUS_EXECUTION_COMPARISON_MAX_HTML_BYTES",
     "CORPUS_EXECUTION_COMPARISON_MAX_JSON_BYTES",
     "CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY",
+    "CORPUS_EXECUTION_MAX_APPLICATION_EVALUATORS",
     "CORPUS_EXECUTION_MAX_APP_MANIFEST_BYTES",
     "CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES",
     "CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS",
@@ -2355,6 +2380,8 @@ PUBLIC_NAMES = [
     "PromotionWarningCode",
     "PublicJudgeReferenceDraftV1",
     "PublicJudgeReferenceV1",
+    "PublishedApplicationEvaluatorDetail",
+    "PublishedApplicationEvaluatorObservationV1",
     "PublishedArtifactDetail",
     "PublishedAssertionDetail",
     "PublishedAssertionResult",

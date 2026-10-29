@@ -337,11 +337,18 @@ Portable corpora use the same target discovery but must select corpus mode:
 
 ```bash
 cayu eval validate evals.json
+cayu eval validate evals.json evals.assistant:build_eval
 cayu eval inspect evals.json --json
 cayu eval merge combined.json team-a.json team-b.json
 cayu eval run --corpus combined.json --suite refund-regressions \
   --output refund-results.json --html-output refund-results.html
 ```
+
+`validate` checks the corpus alone without loading application code. With a
+target in the same `module:attribute` form as `eval run`, it also compiles every
+runnable suite against that target's `CorpusTarget` or `WorkflowEvalTarget`, so
+an unknown model-judge or application-evaluator key, a mismatched target key or
+evidence policy, or a target limit violation fails before any run.
 
 `--suite` is optional only when the corpus contains exactly one suite. Corpus
 trial counts and timeouts come from the content-addressed corpus contract and
@@ -390,7 +397,7 @@ evaluator_only_paths = ["evals/reference", "evals/expected_states"]
 All paths are normalized project-relative POSIX paths, and no list may repeat a
 path, ignoring case and Unicode normalization. `objectives` names the
 objectives file. `eval_targets` use the `module:attribute` form of `eval_target`,
-`corpora` are portable corpus files (schema version 4, suites referenced by
+`corpora` are portable corpus files (schema version 5, suites referenced by
 `suite_id`), and `benchmark_packages` are package directories or manifest files.
 At least one of these three is required. `evaluator_only_paths` hold material a
 candidate must never see, such as reference answers and expected states, in
@@ -757,16 +764,17 @@ set of structural assertion specifications. It cannot contain a `CayuApp`,
 provider/model/environment selection, import path, callback, raw session ID, or
 runtime event payload.
 
-Portable corpus schema version 4 adds bounded memory-attribution assertions to
-the version 3 surface, which introduced the explicit immutable suite trial
-policy. The assertion surface covers root and child terminal status,
-final-output equality/containment, tool presence/order/count, bounded
-tool-argument/result JSON subsets, workspace-file structure, artifact structure
-and explicitly retained public artifact text, memory admission/provider-exposure
-ranges, model-step and token limits, recorded usage, estimated-cost limits, and
-trusted model judgments. Cost assertions require a `PricingProfileIdentityV1`;
-the identity fingerprints trusted pricing used elsewhere and never embeds or
-authorizes a `PriceBook`. A `ModelJudgeAssertionSpec` remains data-only: it
+Portable corpus schema version 5 adds application-evaluator assertions to the
+version 4 surface, which added bounded memory-attribution assertions to the
+explicit immutable suite trial policy of version 3. The assertion surface covers
+root and child terminal status, final-output equality/containment, tool
+presence/order/count, bounded tool-argument/result JSON subsets, workspace-file
+structure, artifact structure and explicitly retained public artifact text,
+memory admission/provider-exposure ranges, model-step and token limits, recorded
+usage, estimated-cost limits, trusted model judgments, and
+[application evaluators](#application-evaluators). Cost assertions require a
+`PricingProfileIdentityV1`; the identity fingerprints trusted pricing used
+elsewhere and never embeds or authorizes a `PriceBook`. A `ModelJudgeAssertionSpec` remains data-only: it
 carries a bounded rubric and rubric version, threshold, transcript-selection
 flag, and trusted evaluator key. The target resolves that key to its local
 trusted judge implementation at execution time. Each published result records
@@ -794,7 +802,7 @@ and publication shapes but are rejected by fresh-run admission until runnable
 input is authored.
 
 `eval_corpus_to_json(...)`, `eval_corpus_from_json(...)`, and
-`load_eval_corpus(...)` enforce schema version 4 and Cayu's durable-JSON rules,
+`load_eval_corpus(...)` enforce schema version 5 and Cayu's durable-JSON rules,
 including duplicate-key, non-finite-number, integer-range, Unicode, and nesting
 validation. Input is rejected before an unbounded read or decode. The hard
 document limit is 8 MiB, with at most 64 suites, 1,000 cases, 64 assertions per
@@ -805,7 +813,7 @@ cases and trials, matching the boundary of the one-suite execution result. A
 multi-suite corpus may exceed that aggregate because suites execute and publish
 independently; inspection reports the complete corpus-wide count without
 materializing result graphs.
-Unknown fields and assertion kinds fail closed; schema version 4 has no
+Unknown fields and assertion kinds fail closed; schema version 5 has no
 prior-version compatibility loader.
 
 ### Safe tool argument and result assertions
@@ -862,6 +870,100 @@ an expected path are distinct `unavailable` observation states. Redaction on an
 unselected extra field does not prevent a safe comparison. These states and the
 bounded safe actual value are the same in SDK/HTTP results, Developer dashboard
 drill-down, CLI, and JSON/HTML reports.
+
+### Application evaluators
+
+Some checks belong to the application, such as comparing a numeric answer with a
+reference value inside a tolerance, or applying the application's own rules to
+a verdict. Register the check once on the trusted target as an
+`ApplicationEvaluator`, then reference it from corpus data by key:
+
+```python
+from collections.abc import Mapping
+from decimal import Decimal
+
+from cayu.evals import (
+    ApplicationEvaluator,
+    ApplicationEvaluatorAssertionSpec,
+    EvalAssertion,
+    EvalAssertionResult,
+    EvalContext,
+)
+
+
+class AnswerCheck(EvalAssertion):
+    def __init__(self, params: Mapping[str, object]) -> None:
+        self.expected = Decimal(str(params["expected"]))
+        self.tolerance = Decimal(str(params.get("tolerance", 0)))
+
+    @property
+    def reads_final_output_only(self) -> bool:
+        return True
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        output = context.trajectory.workflow_output
+        if output is None or output.structured_output is None:
+            return self.unavailable("No structured answer was retained.")
+        observed = Decimal(str(output.structured_output["answer"]))
+        metadata = {"expected": str(self.expected), "observed": str(observed)}
+        if abs(observed - self.expected) <= self.tolerance:
+            return self.passed("The answer is within tolerance.", metadata=metadata)
+        return self.failed("The answer is outside tolerance.", metadata=metadata)
+
+
+answer_check = ApplicationEvaluator(
+    key="answer-check",
+    implementation_revision="sha256:...",  # declared by the application
+    factory=AnswerCheck,
+)
+assertion = ApplicationEvaluatorAssertionSpec(
+    id="answer-correct",
+    evaluator_key="answer-check",
+    params={"expected": 42.75, "tolerance": 0.005},
+)
+# Pass application_evaluators=(answer_check,) to CorpusTarget or WorkflowEvalTarget.
+```
+
+The corpus carries only the key and a JSON object of parameters, limited to
+16 KiB, 24 levels, and 1,024 nodes. It cannot name an import path, callable, or
+evaluator revision. Compilation resolves the key on the trusted target and calls
+the factory once per assertion with a copy of the parameters. An unknown key
+fails compilation before any candidate runs, in `cayu eval run --corpus`,
+`cayu eval validate CORPUS TARGET`, server corpus import, and run admission. A
+factory that raises or returns something other than an `EvalAssertion` also fails
+compilation; the error names the key, the assertion ID, and the exception type
+only. Every validation, import, admission, and run compiles the corpus again, so
+keep factories deterministic and free of side effects.
+
+The built assertion receives the same `EvalContext` as any Python assertion. A
+`WorkflowEvalTarget` exposes its projected structured output as
+`context.trajectory.workflow_output.structured_output`; a `CorpusTarget` provides
+the final output, transcript, events, and probes. Cayu honors the assertion's
+`reads_final_output_only`, `evaluates_failed_session`, and `required_probes()`,
+and publishes its result under the spec ID and the spec's content revision.
+
+`implementation_revision` is the application's declared `sha256:` identity for
+the evaluator, because Cayu cannot fingerprint Python behavior: change it
+whenever the evaluation logic changes. Published results record it in
+`PublishedApplicationEvaluatorDetail`, along with the parameters and, for passed
+or failed outcomes, the evaluator's message (at most 2,048 characters and 4 KiB
+of JSON) and metadata (a JSON object of at most 4 KiB) after the redaction of the
+application the trial ran in. Metadata keys starting with `cayu.` are reserved and
+removed. Every trial publishes the parameters and the observation again, so a
+suite whose parameters plus the largest observations, times its trials, would
+exceed 16 MiB of compact UTF-8 JSON is rejected when the corpus is built, before
+anything runs.
+A graded result keeps its score and threshold; without a threshold, only a score
+of 1.0 passes. An exception, an oversized observation, or an invalid result is
+an `error` that still records the evaluator identity. Comparisons treat a
+different implementation revision as an assertion-contract change, while the
+corpus revision stays the same, so one corpus can be reused across evaluator
+rollouts without mixing their results.
+
+Paths that rescore saved evidence without a trusted target, such as
+`evaluate_assertion_spec`, captured-session scoring, saved workflow captures,
+and benchmark rescoring, reject application evaluators. The Developer dashboard
+does not author them yet; write them in corpus JSON or Python.
 
 ### Portable workspace and artifact assertions
 
@@ -1098,7 +1200,8 @@ def build_eval() -> EvalPlan:
 ```
 
 `CorpusTarget` is immutable and defensively copies its request, bootstrap,
-evidence-policy, limit, optional pricing, and model-judge target inputs. Its request base must have
+evidence-policy, limit, optional pricing, model-judge target, and
+application-evaluator inputs. Its request base must have
 no messages, session/parent/causal/task identity, structured-output request,
 prior redaction state, or runtime authority. Bootstrap messages are bounded
 single-text-part system, user, or assistant messages. Trusted assistant text can
@@ -1603,7 +1706,7 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-10 `PublishedEvalRun` containing
+produces a content-addressed schema-version-11 `PublishedEvalRun` containing
 every case, trial, exact source-trial revision, assertion outcome, safe
 structural detail, duration, and identity-free aggregate usage. Every trial also
 retains the exact bounded memory-attribution section used during evaluation, so
@@ -2288,7 +2391,7 @@ with stable `SessionPromotionErrorCode` values. These rules affect automatic
 portable promotion only: normal Cayu sessions and direct Python evals retain all
 of those capabilities, while runtime tool calls, artifacts, and admitted child
 agents remain eligible. Tool calls and child status remain available as portable
-assertion evidence; corpus v4 does not silently infer replay input or an artifact
+assertion evidence; corpus v5 does not silently infer replay input or an artifact
 assertion from uncaptured state. Caller-driven approval, resume, queued-input, and
 later-interaction phases are checked recursively across every admitted descendant,
 not only on the root.
@@ -2310,7 +2413,7 @@ intentionally absent from serialized trajectories, so a detached or older trajec
 cannot guess which
 transcript messages were caller input; it fails closed as
 `input_evidence_unavailable` instead. Multiple text parts reject because their
-provider-specific boundaries cannot be represented exactly by corpus v4's single
+provider-specific boundaries cannot be represented exactly by corpus v5's single
 text field. The resulting sanitized input and redaction fact carry one exact content
 revision.
 

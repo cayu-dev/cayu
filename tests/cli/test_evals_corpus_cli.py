@@ -8,7 +8,10 @@ from tests.evals.eval_store_conformance import captured_result_for_corpus
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.cli import main
+from cayu.evals.application_evaluators import ApplicationEvaluator
+from cayu.evals.assertions import FinalOutputContains
 from cayu.evals.corpus import (
+    ApplicationEvaluatorAssertionSpec,
     CorpusUserMessageSpec,
     EvalCaseSpec,
     EvalCorpusDocument,
@@ -43,7 +46,12 @@ def _source() -> EvaluationSourceIdentityV1:
     )
 
 
-def _corpus(*, suite_id: str = "refunds", case_id: str = "refund-approved"):
+def _corpus(
+    *,
+    suite_id: str = "refunds",
+    case_id: str = "refund-approved",
+    assertions=None,
+):
     suite = EvalSuiteSpec.create(
         id=suite_id,
         name=suite_id.title(),
@@ -55,7 +63,11 @@ def _corpus(*, suite_id: str = "refunds", case_id: str = "refund-approved"):
         name=case_id.title(),
         source=_source(),
         input=RunInputSpec(messages=(CorpusUserMessageSpec(text="Review refund."),)),
-        assertions=(FinalOutputEqualsAssertionSpec(id="answer", expected="Approved"),),
+        assertions=(
+            (FinalOutputEqualsAssertionSpec(id="answer", expected="Approved"),)
+            if assertions is None
+            else assertions
+        ),
     )
     return EvalCorpusDocument.create(
         target_key="refund-agent",
@@ -65,7 +77,11 @@ def _corpus(*, suite_id: str = "refunds", case_id: str = "refund-approved"):
     )
 
 
-def _corpus_eval_plan(*, output: str = "Approved") -> EvalPlan:
+def _corpus_eval_plan(
+    *,
+    output: str = "Approved",
+    application_evaluators: tuple[ApplicationEvaluator, ...] = (),
+) -> EvalPlan:
     app = CayuApp(enable_logging=False)
     app.register_provider(
         ScriptedModelProvider(
@@ -93,12 +109,37 @@ def _corpus_eval_plan(*, output: str = "Approved") -> EvalPlan:
             request_base=RunRequest(agent_name="agent", messages=[], max_steps=1),
             bootstrap_messages=(Message.text("system", "Follow policy."),),
             application_release_id="release-2026-08-06",
+            application_evaluators=application_evaluators,
         )
     )
 
 
 def build_corpus_eval_plan() -> EvalPlan:
     return _corpus_eval_plan()
+
+
+def build_application_evaluator_eval_plan() -> EvalPlan:
+    return _corpus_eval_plan(
+        application_evaluators=(
+            ApplicationEvaluator(
+                key="answer-check",
+                implementation_revision="sha256:" + "a" * 64,
+                factory=lambda params: FinalOutputContains(params["text"]),
+            ),
+        )
+    )
+
+
+def _application_evaluator_corpus(evaluator_key: str) -> EvalCorpusDocument:
+    return _corpus(
+        assertions=(
+            ApplicationEvaluatorAssertionSpec(
+                id="answer",
+                evaluator_key=evaluator_key,
+                params={"text": "Approved"},
+            ),
+        )
+    )
 
 
 def build_failing_corpus_eval_plan() -> EvalPlan:
@@ -562,6 +603,70 @@ def test_eval_corpus_validate_inspect_and_atomic_merge_commands(
         "accounts",
         "refunds",
     )
+
+
+def test_eval_validate_with_a_target_rejects_unknown_evaluator_keys(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    known = tmp_path / "known.json"
+    unknown = tmp_path / "unknown.json"
+    unknown_judge = tmp_path / "unknown-judge.json"
+    known.write_text(
+        eval_corpus_to_json(_application_evaluator_corpus("answer-check")), encoding="utf-8"
+    )
+    unknown.write_text(
+        eval_corpus_to_json(_application_evaluator_corpus("missing-check")), encoding="utf-8"
+    )
+    _, judge_corpus = _model_judge_eval_plan_and_corpus()
+    unknown_judge.write_text(eval_corpus_to_json(judge_corpus), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    target = f"{__name__}:build_application_evaluator_eval_plan"
+
+    assert main(["eval", "validate", str(known), target]) == 0
+    assert "for target refund-agent" in capsys.readouterr().out
+
+    assert main(["eval", "validate", str(unknown), target, "--json"]) == 2
+    message = json.loads(capsys.readouterr().out)["error"]["message"]
+    assert "requires application evaluator 'missing-check'" in message
+
+    assert main(["eval", "validate", str(unknown_judge), target, "--json"]) == 2
+    message = json.loads(capsys.readouterr().out)["error"]["message"]
+    assert "requires trusted model judge 'quality-judge'" in message
+
+    # Without a target, validation stays structural and loads no application code.
+    assert main(["eval", "validate", str(unknown)]) == 0
+    assert "for target" not in capsys.readouterr().out
+
+
+def test_eval_run_cli_executes_an_application_evaluator(tmp_path: Path, monkeypatch) -> None:
+    corpus_path = tmp_path / "corpus.json"
+    result_path = tmp_path / "result.json"
+    corpus_path.write_text(
+        eval_corpus_to_json(_application_evaluator_corpus("answer-check")), encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(
+        [
+            "eval",
+            "run",
+            f"{__name__}:build_application_evaluator_eval_plan",
+            "--corpus",
+            str(corpus_path),
+            "--output",
+            str(result_path),
+        ]
+    )
+
+    result = load_corpus_execution_result(result_path)
+    detail = result.run.cases[0].trials[0].assertions[0].detail
+    assert exit_code == 0
+    assert result.run.status == "passed"
+    assert detail.kind == "application_evaluator"
+    assert detail.evaluator_key == "answer-check"
+    assert detail.evaluator_implementation_revision == "sha256:" + "a" * 64
 
 
 def test_eval_run_requires_explicit_suite_for_multi_suite_corpus(

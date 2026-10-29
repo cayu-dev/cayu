@@ -25,6 +25,7 @@ from cayu.applications import CayuApp
 from cayu.budgets.pricing import PriceBook, copy_price_book
 from cayu.evals._admission import LaunchScheduling
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
+from cayu.evals.application_evaluators import ApplicationEvaluator, _copy_application_evaluator
 from cayu.evals.capacity import (
     DEFAULT_EVAL_MAX_ACTIVE_TRIALS,
     EVAL_MAX_CONCURRENCY,
@@ -113,6 +114,7 @@ CORPUS_EXECUTION_MAX_REQUEST_BASE_BYTES = 64 << 10
 CORPUS_EXECUTION_RESULT_MAX_BYTES = 40 << 20
 CORPUS_EXECUTION_RESULT_SCHEMA_VERSION = 3
 CORPUS_EXECUTION_MAX_MODEL_JUDGES = 32
+CORPUS_EXECUTION_MAX_APPLICATION_EVALUATORS = 64
 MODEL_JUDGE_MAX_PRIVATE_REFERENCES = 256
 MODEL_JUDGE_MAX_PRIVATE_REFERENCE_CHARS = 65_536
 
@@ -691,6 +693,10 @@ class CorpusTarget(BaseModel):
         default=(),
         max_length=CORPUS_EXECUTION_MAX_MODEL_JUDGES,
     )
+    application_evaluators: tuple[ApplicationEvaluator, ...] = Field(
+        default=(),
+        max_length=CORPUS_EXECUTION_MAX_APPLICATION_EVALUATORS,
+    )
     limits: CorpusExecutionLimits = Field(default_factory=CorpusExecutionLimits)
     external_process: ExternalProcessTargetIdentityV1 | None = Field(
         default=None,
@@ -800,6 +806,24 @@ class CorpusTarget(BaseModel):
             raise ValueError("CorpusTarget model judge keys must be unique.")
         return tuple(copied)
 
+    @field_validator("application_evaluators", mode="before")
+    @classmethod
+    def copy_application_evaluators(cls, value: object) -> tuple[ApplicationEvaluator, ...]:
+        if not isinstance(value, list | tuple):
+            raise TypeError("CorpusTarget application_evaluators must be an ordered list or tuple.")
+        copied: list[ApplicationEvaluator] = []
+        for item in value:
+            if type(item) is not ApplicationEvaluator:
+                raise TypeError(
+                    "CorpusTarget application_evaluators must contain exact "
+                    "ApplicationEvaluator values."
+                )
+            copied.append(_copy_application_evaluator(item))
+        keys = tuple(item.key for item in copied)
+        if len(keys) != len(set(keys)):
+            raise ValueError("CorpusTarget application evaluator keys must be unique.")
+        return tuple(copied)
+
     @field_validator("limits", mode="before")
     @classmethod
     def copy_limits(cls, value: object) -> CorpusExecutionLimits:
@@ -827,6 +851,8 @@ class CorpusTarget(BaseModel):
             self.application_release_id,
             "application_release_id",
         )
+        for evaluator in self.application_evaluators:
+            _require_public_target_text(self.app, evaluator.key, "application_evaluators.key")
         identity_fields = (
             "session_id",
             "parent_session_id",
@@ -1010,6 +1036,7 @@ def _copy_corpus_target(target: CorpusTarget) -> CorpusTarget:
             evidence_policy=target.evidence_policy,
             price_book=target.price_book,
             model_judges=target.model_judges,
+            application_evaluators=target.application_evaluators,
             limits=target.limits,
             capture_bounds=target.capture_bounds,
             workflow_spec=target.workflow_spec,
@@ -1033,6 +1060,7 @@ def _copy_corpus_target(target: CorpusTarget) -> CorpusTarget:
         evidence_policy=target.evidence_policy,
         price_book=target.price_book,
         model_judges=target.model_judges,
+        application_evaluators=target.application_evaluators,
         limits=target.limits,
         external_process=target.external_process,
     )
@@ -1186,6 +1214,7 @@ def _compile_prepared_corpus_suite(
             expected_pricing_profile=validated_corpus.pricing_profile,
             trusted_pricing_identity=trusted_pricing_identity,
             trusted_model_judges=tuple(trusted_model_judges),
+            application_evaluators=validated_target.application_evaluators,
         )
     )
     compiled_input_chars = 0

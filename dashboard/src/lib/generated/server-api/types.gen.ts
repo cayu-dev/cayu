@@ -3016,6 +3016,36 @@ export type ApplicationDefaultsManifest = {
 };
 
 /**
+ * ApplicationEvaluatorAssertionSpec
+ *
+ * Authority-free call to an evaluator the trusted target registers by key.
+ */
+export type ApplicationEvaluatorAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Evaluator Key
+     */
+    evaluator_key: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'application_evaluator';
+    /**
+     * Params
+     */
+    params?: {
+        [key: string]: unknown;
+    };
+};
+
+/**
  * ApprovalArgumentsRevision
  *
  * Runtime evidence that a person approved a call with changed arguments.
@@ -5875,7 +5905,7 @@ export type EvalAdditionCommitRequest = {
     /**
      * Assertions
      */
-    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec> | null;
+    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec | ApplicationEvaluatorAssertionSpec> | null;
     /**
      * Case Id
      */
@@ -5990,7 +6020,7 @@ export type EvalAdditionRequest = {
     /**
      * Assertions
      */
-    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec> | null;
+    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec | ApplicationEvaluatorAssertionSpec> | null;
     /**
      * Case Id
      */
@@ -6759,7 +6789,7 @@ export type EvalCaseSpec = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec | ApplicationEvaluatorAssertionSpec>;
     /**
      * Description
      */
@@ -6900,7 +6930,7 @@ export type EvalCorpusDocument = {
     /**
      * Schema Version
      */
-    schema_version?: 4;
+    schema_version?: 5;
     /**
      * Suites
      */
@@ -16650,6 +16680,55 @@ export type PublicJudgeReferenceV1 = {
 };
 
 /**
+ * PublishedApplicationEvaluatorDetail
+ *
+ * Public identity, parameters, and observation of one application evaluator.
+ */
+export type PublishedApplicationEvaluatorDetail = {
+    /**
+     * Evaluator Implementation Revision
+     */
+    evaluator_implementation_revision: string;
+    /**
+     * Evaluator Key
+     */
+    evaluator_key: string;
+    /**
+     * Kind
+     */
+    kind?: 'application_evaluator';
+    observation?: PublishedApplicationEvaluatorObservationV1 | null;
+    /**
+     * Params
+     */
+    params: {
+        [key: string]: unknown;
+    };
+    /**
+     * Threshold
+     */
+    threshold?: number | null;
+};
+
+/**
+ * PublishedApplicationEvaluatorObservationV1
+ *
+ * Bounded, redacted message and metadata from one scored evaluator result.
+ */
+export type PublishedApplicationEvaluatorObservationV1 = {
+    /**
+     * Message
+     */
+    message?: string;
+    /**
+     * Metadata
+     */
+    metadata?: {
+        [key: string]: unknown;
+    };
+};
+
+/**
  * PublishedArtifactDetail
  */
 export type PublishedArtifactDetail = {
@@ -16762,7 +16841,9 @@ export type PublishedAssertionResult = {
         kind: 'model_judge';
     } & PublishedModelJudgeDetail) | ({
         kind: 'structured_model_judge';
-    } & PublishedStructuredModelJudgeDetail);
+    } & PublishedStructuredModelJudgeDetail) | ({
+        kind: 'application_evaluator';
+    } & PublishedApplicationEvaluatorDetail);
     /**
      * Message
      */
@@ -16866,7 +16947,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 10;
+    schema_version: 11;
     /**
      * Score
      */

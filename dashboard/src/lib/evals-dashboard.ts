@@ -312,8 +312,8 @@ export async function preflightEvalCorpusFile(file: Blob): Promise<void> {
     throw new Error("The selected file is not valid JSON.")
   }
 
-  if (!isRecord(parsed) || parsed.schema_version !== 4) {
-    throw new Error("The selected file is not a Cayu eval corpus v4 document.")
+  if (!isRecord(parsed) || parsed.schema_version !== 5) {
+    throw new Error("The selected file is not a Cayu eval corpus v5 document.")
   }
   if (
     typeof parsed.revision !== "string" ||

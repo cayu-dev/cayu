@@ -6242,6 +6242,48 @@
         "title": "ApplicationDefaultsManifest",
         "type": "object"
       },
+      "ApplicationEvaluatorAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Authority-free call to an evaluator the trusted target registers by key.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "evaluator_key": {
+            "title": "Evaluator Key",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "application_evaluator",
+            "default": "application_evaluator",
+            "title": "Kind",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "evaluator_key"
+        ],
+        "title": "ApplicationEvaluatorAssertionSpec",
+        "type": "object"
+      },
       "ApprovalArgumentsRevision": {
         "additionalProperties": false,
         "description": "Runtime evidence that a person approved a call with changed arguments.\n\n``changed_fields`` names only top-level properties the tool's schema\ndeclares; it never carries argument values. The digests identify the\nproposed and approved versions with HMAC-SHA256 under the session store's\npublic-authority alias key ``digest_key_id``, so they cannot be confirmed\nby guessing; all three are ``None`` when the store has no alias keyring.",
@@ -12062,6 +12104,7 @@
                 "items": {
                   "discriminator": {
                     "mapping": {
+                      "application_evaluator": "#/components/schemas/ApplicationEvaluatorAssertionSpec",
                       "artifact": "#/components/schemas/ArtifactAssertionSpec",
                       "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                       "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
@@ -12145,6 +12188,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/StructuredModelJudgeAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ApplicationEvaluatorAssertionSpec"
                     }
                   ]
                 },
@@ -12366,6 +12412,7 @@
                 "items": {
                   "discriminator": {
                     "mapping": {
+                      "application_evaluator": "#/components/schemas/ApplicationEvaluatorAssertionSpec",
                       "artifact": "#/components/schemas/ArtifactAssertionSpec",
                       "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                       "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
@@ -12449,6 +12496,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/StructuredModelJudgeAssertionSpec"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ApplicationEvaluatorAssertionSpec"
                     }
                   ]
                 },
@@ -14364,6 +14414,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "application_evaluator": "#/components/schemas/ApplicationEvaluatorAssertionSpec",
                   "artifact": "#/components/schemas/ArtifactAssertionSpec",
                   "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                   "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
@@ -14447,6 +14498,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/StructuredModelJudgeAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ApplicationEvaluatorAssertionSpec"
                 }
               ]
             },
@@ -14715,8 +14769,8 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 4,
-            "default": 4,
+            "const": 5,
+            "default": 5,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -33860,6 +33914,79 @@
         "title": "PublicJudgeReferenceV1",
         "type": "object"
       },
+      "PublishedApplicationEvaluatorDetail": {
+        "additionalProperties": false,
+        "description": "Public identity, parameters, and observation of one application evaluator.",
+        "properties": {
+          "evaluator_implementation_revision": {
+            "title": "Evaluator Implementation Revision",
+            "type": "string"
+          },
+          "evaluator_key": {
+            "title": "Evaluator Key",
+            "type": "string"
+          },
+          "kind": {
+            "const": "application_evaluator",
+            "default": "application_evaluator",
+            "title": "Kind",
+            "type": "string"
+          },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedApplicationEvaluatorObservationV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          },
+          "threshold": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Threshold"
+          }
+        },
+        "required": [
+          "evaluator_key",
+          "evaluator_implementation_revision",
+          "params"
+        ],
+        "title": "PublishedApplicationEvaluatorDetail",
+        "type": "object"
+      },
+      "PublishedApplicationEvaluatorObservationV1": {
+        "additionalProperties": false,
+        "description": "Bounded, redacted message and metadata from one scored evaluator result.",
+        "properties": {
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "title": "Metadata",
+            "type": "object"
+          }
+        },
+        "title": "PublishedApplicationEvaluatorObservationV1",
+        "type": "object"
+      },
       "PublishedArtifactDetail": {
         "additionalProperties": false,
         "properties": {
@@ -34013,6 +34140,7 @@
           "detail": {
             "discriminator": {
               "mapping": {
+                "application_evaluator": "#/components/schemas/PublishedApplicationEvaluatorDetail",
                 "artifact": "#/components/schemas/PublishedArtifactDetail",
                 "child_status": "#/components/schemas/PublishedChildStatusDetail",
                 "final_output_contains": "#/components/schemas/PublishedFinalOutputContainsDetail",
@@ -34096,6 +34224,9 @@
               },
               {
                 "$ref": "#/components/schemas/PublishedStructuredModelJudgeDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedApplicationEvaluatorDetail"
               }
             ],
             "title": "Detail"
@@ -34313,7 +34444,7 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 10,
+            "const": 11,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -38729,7 +38860,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "72",
+            "default": "73",
             "title": "Contract Version",
             "type": "string"
           },
@@ -46450,7 +46581,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "72",
+            "default": "73",
             "title": "Contract Version",
             "type": "string"
           }

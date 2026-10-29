@@ -8,11 +8,16 @@ from functools import partial
 from cayu.applications import CayuApp
 from cayu.artifacts import ArtifactScope
 from cayu.budgets.pricing import PriceBook, copy_price_book
+from cayu.evals.application_evaluators import (
+    ApplicationEvaluator,
+    _CompiledApplicationEvaluatorAssertion,
+)
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.corpus import (
     _MODEL_JUDGE_RESULT_METADATA_KEY,
     _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
     EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS,
+    ApplicationEvaluatorAssertionSpec,
     ArtifactAssertionSpec,
     AssertionSpec,
     EvaluationEvidencePolicySpec,
@@ -502,6 +507,15 @@ def _blocked_portable_assertion_result(
             )
         )
     if type(assertion) is _CompiledStructuredModelJudgeAssertion:
+        return assertion._with_public_contract(
+            EvalAssertionResult(
+                name=assertion.name,
+                assertion_revision=assertion.assertion_revision,
+                outcome=outcome,
+                message=message,
+            )
+        )
+    if type(assertion) is _CompiledApplicationEvaluatorAssertion:
         return assertion._with_public_contract(
             EvalAssertionResult(
                 name=assertion.name,
@@ -1019,10 +1033,16 @@ def _prepare_portable_assertion_evidence(
         for assertion in assertions
         if type(assertion) is _CompiledStructuredModelJudgeAssertion
     )
+    application_evaluator_assertions = tuple(
+        assertion
+        for assertion in assertions
+        if type(assertion) is _CompiledApplicationEvaluatorAssertion
+    )
     compiled = (
         *portable_assertions,
         *model_judge_assertions,
         *structured_model_judge_assertions,
+        *application_evaluator_assertions,
     )
     if not compiled:
         return None
@@ -1165,6 +1185,10 @@ def compile_assertion_spec(
         StructuredModelJudgeAssertionSpec,
     }:
         raise ValueError("Portable model judges require a trusted CorpusTarget evaluator binding.")
+    if type(validated_spec) is ApplicationEvaluatorAssertionSpec:
+        raise ValueError(
+            "Portable application evaluators require a trusted CorpusTarget evaluator binding."
+        )
     pricing_binding = (
         _compiled_pricing_binding(trusted_pricing)
         if type(validated_spec) is MaxEstimatedCostAssertionSpec
@@ -1187,6 +1211,7 @@ def _compile_corpus_assertion_specs(
     expected_pricing_profile: PricingProfileIdentityV1 | None,
     trusted_pricing_identity: PricingProfileIdentityV1 | None = None,
     trusted_model_judges: Sequence[_TrustedModelJudgeBinding] = (),
+    application_evaluators: Sequence[ApplicationEvaluator] = (),
 ) -> tuple[EvalAssertion, ...]:
     """Compile one corpus suite with a single shared pricing binding."""
 
@@ -1232,6 +1257,15 @@ def _compile_corpus_assertion_specs(
         if binding.key in model_judge_bindings:
             raise ValueError("Trusted model judge keys must be unique.")
         model_judge_bindings[binding.key] = binding
+    evaluators_by_key: dict[str, ApplicationEvaluator] = {}
+    for evaluator in application_evaluators:
+        if type(evaluator) is not ApplicationEvaluator:
+            raise TypeError(
+                "application_evaluators must contain exact ApplicationEvaluator values."
+            )
+        if evaluator.key in evaluators_by_key:
+            raise ValueError("Application evaluator keys must be unique.")
+        evaluators_by_key[evaluator.key] = evaluator
     uses_pricing = any(type(spec) is MaxEstimatedCostAssertionSpec for spec in validated_specs)
     pricing_binding = _NO_PRICING
     if uses_pricing:
@@ -1275,6 +1309,20 @@ def _compile_corpus_assertion_specs(
                 _CompiledStructuredModelJudgeAssertion(
                     spec,
                     binding=binding,
+                    app=app,
+                    evidence_policy=validated_policy,
+                )
+            )
+        elif type(spec) is ApplicationEvaluatorAssertionSpec:
+            evaluator = evaluators_by_key.get(spec.evaluator_key)
+            if evaluator is None:
+                raise ValueError(
+                    f"Eval corpus requires application evaluator {spec.evaluator_key!r}."
+                )
+            compiled.append(
+                _CompiledApplicationEvaluatorAssertion(
+                    spec,
+                    evaluator=evaluator,
                     app=app,
                     evidence_policy=validated_policy,
                 )

@@ -28,9 +28,14 @@ from cayu.evals.capture_policy import (
     WorkflowFailureCapture,
 )
 from cayu.evals.corpus import (
+    _APPLICATION_EVALUATOR_RESULT_METADATA_KEY,
     _CURRENCY_PATTERN,
     _MODEL_JUDGE_RESULT_METADATA_KEY,
+    _RESERVED_RESULT_METADATA_PREFIX,
     _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
+    EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_BYTES,
+    EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_CHARS,
+    EVAL_APPLICATION_EVALUATOR_MAX_METADATA_BYTES,
     EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS,
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_CASES,
@@ -51,6 +56,7 @@ from cayu.evals.corpus import (
     EVIDENCE_MAX_MODEL_STEPS,
     EVIDENCE_MAX_TOOL_CALLS,
     EVIDENCE_MAX_TOTAL_TOKENS,
+    ApplicationEvaluatorAssertionSpec,
     ArtifactAssertionSpec,
     AssertionSpec,
     ChildStatusAssertionSpec,
@@ -128,7 +134,7 @@ from cayu.evals.trial_policy import (
 )
 from cayu.failure_evidence import FailureEvidence
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 10
+PUBLISHED_EVAL_SCHEMA_VERSION = 11
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -1128,6 +1134,71 @@ class PublishedStructuredModelJudgeDetail(_PublishedAssertionDetail):
         return self
 
 
+class PublishedApplicationEvaluatorObservationV1(_PortableModel):
+    """Bounded, redacted message and metadata from one scored evaluator result."""
+
+    message: StrictStr = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str, info) -> str:
+        value = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_CHARS,
+            nonblank=False,
+            clean=False,
+        )
+        if compact_json_utf8_size(value) > EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_BYTES:
+            raise ValueError("Application evaluator observation message exceeds its bound.")
+        return value
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def validate_metadata(cls, value: object, info) -> dict[str, Any]:
+        copied = copy_eval_tool_json_object(value, info.field_name)
+        if any(key.startswith(_RESERVED_RESULT_METADATA_PREFIX) for key in copied):
+            raise ValueError("Application evaluator observations cannot carry reserved metadata.")
+        if not json_utf8_size_within_limit(
+            copied, EVAL_APPLICATION_EVALUATOR_MAX_METADATA_BYTES, ensure_ascii=False
+        ):
+            raise ValueError("Application evaluator observation metadata exceeds its bound.")
+        return copied
+
+
+class PublishedApplicationEvaluatorDetail(_PublishedAssertionDetail):
+    """Public identity, parameters, and observation of one application evaluator."""
+
+    kind: Literal["application_evaluator"] = "application_evaluator"
+    evaluator_key: StrictStr
+    evaluator_implementation_revision: StrictStr
+    params: dict[str, Any]
+    threshold: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    observation: PublishedApplicationEvaluatorObservationV1 | None = None
+
+    @field_validator("evaluator_key")
+    @classmethod
+    def validate_evaluator_key(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("evaluator_implementation_revision")
+    @classmethod
+    def validate_evaluator_implementation_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("params", mode="before")
+    @classmethod
+    def validate_params(cls, value: object, info) -> dict[str, Any]:
+        return copy_eval_tool_json_object(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> PublishedApplicationEvaluatorDetail:
+        if self.observation is None and self.threshold is not None:
+            raise ValueError("Only an observed application evaluator result has a threshold.")
+        return self
+
+
 PublishedAssertionDetail: TypeAlias = Annotated[
     PublishedRootStatusDetail
     | PublishedChildStatusDetail
@@ -1148,7 +1219,8 @@ PublishedAssertionDetail: TypeAlias = Annotated[
     | PublishedMaxTotalTokensDetail
     | PublishedMaxEstimatedCostDetail
     | PublishedModelJudgeDetail
-    | PublishedStructuredModelJudgeDetail,
+    | PublishedStructuredModelJudgeDetail
+    | PublishedApplicationEvaluatorDetail,
     Field(discriminator="kind"),
 ]
 
@@ -1195,6 +1267,13 @@ class PublishedAssertionResult(_PortableModel):
                 Decimal(self.detail.aggregate_score or "0")
             ):
                 raise ValueError("Published structured score does not match its aggregate.")
+        elif isinstance(self.detail, PublishedApplicationEvaluatorDetail):
+            if self.score is None:
+                raise ValueError("Scored published application evaluators require a score.")
+            threshold = 1.0 if self.detail.threshold is None else self.detail.threshold
+            expected_outcome = "passed" if self.score >= threshold else "failed"
+            if self.outcome != expected_outcome:
+                raise ValueError("Published application-evaluator score is inconsistent.")
         elif self.score != (1.0 if self.outcome == "passed" else 0.0):
             raise ValueError("Published deterministic assertion score is inconsistent.")
         if self.code != self.outcome or self.message != _ASSERTION_MESSAGE[self.outcome]:
@@ -1454,7 +1533,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[10]
+    schema_version: Literal[11]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -1745,6 +1824,8 @@ def _detail_has_observation(detail: PublishedAssertionDetail) -> bool:
         return detail.diagnostic == "judgment_recorded"
     if isinstance(detail, PublishedStructuredModelJudgeDetail):
         return detail.diagnostic == "judgment_recorded"
+    if isinstance(detail, PublishedApplicationEvaluatorDetail):
+        return detail.observation is not None
     return True
 
 
@@ -1778,7 +1859,14 @@ def _detail_expected_pass(detail: PublishedAssertionDetail) -> bool | None:
         if detail.unpriced_model_steps:
             return None
         return Decimal(detail.estimated_cost) <= Decimal(detail.maximum)
-    if isinstance(detail, (PublishedModelJudgeDetail, PublishedStructuredModelJudgeDetail)):
+    if isinstance(
+        detail,
+        (
+            PublishedModelJudgeDetail,
+            PublishedStructuredModelJudgeDetail,
+            PublishedApplicationEvaluatorDetail,
+        ),
+    ):
         return None
     if isinstance(detail, PublishedToolsCalledInOrderDetail):
         return detail.matched
@@ -1872,6 +1960,8 @@ def _detail_evidence_area(detail: PublishedAssertionDetail) -> str:
         return "cost"
     if isinstance(detail, (PublishedModelJudgeDetail, PublishedStructuredModelJudgeDetail)):
         return "model-judge"
+    if isinstance(detail, PublishedApplicationEvaluatorDetail):
+        return "application-evaluator"
     raise AssertionError("Unreachable published assertion detail type.")
 
 
@@ -1998,6 +2088,13 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
             detail.evidence.include_final_output,
             detail.evidence.include_transcript,
         )
+    elif isinstance(detail, PublishedApplicationEvaluatorDetail):
+        static_detail = (
+            detail.kind,
+            detail.evaluator_key,
+            detail.evaluator_implementation_revision,
+            detail.params,
+        )
     else:
         raise AssertionError("Unreachable published assertion detail type.")
     return assertion.assertion_id, assertion.assertion_revision, *static_detail
@@ -2095,6 +2192,8 @@ def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
             spec.evidence.include_final_output,
             spec.evidence.include_transcript,
         )
+    if type(spec) is ApplicationEvaluatorAssertionSpec:
+        return (*base, spec.evaluator_key, spec.params)
     raise AssertionError("Unreachable portable assertion specification type.")
 
 
@@ -2104,14 +2203,29 @@ def _published_assertion_matches_spec(
 ) -> bool:
     """Check that published assertion settings retain the corpus's portable contract.
 
-    A model-judge implementation revision is resolved from the execution target and
-    deliberately retained in published results for comparison.  It is not part of
-    the portable corpus assertion, so it must not prevent that result from being
-    bound to the corpus that requested the evaluator key and rubric.
+    A model-judge or application-evaluator implementation revision is resolved from
+    the execution target and deliberately retained in published results for
+    comparison.  It is not part of the portable corpus assertion, so it must not
+    prevent that result from being bound to the corpus that requested the evaluator.
     """
 
-    if type(spec) not in {ModelJudgeAssertionSpec, StructuredModelJudgeAssertionSpec}:
+    if type(spec) not in {
+        ModelJudgeAssertionSpec,
+        StructuredModelJudgeAssertionSpec,
+        ApplicationEvaluatorAssertionSpec,
+    }:
         return _assertion_contract(assertion) == _assertion_spec_contract(spec)
+    if type(spec) is ApplicationEvaluatorAssertionSpec:
+        detail = assertion.detail
+        if type(detail) is not PublishedApplicationEvaluatorDetail:
+            return False
+        return (
+            assertion.assertion_id,
+            assertion.assertion_revision,
+            detail.kind,
+            detail.evaluator_key,
+            detail.params,
+        ) == _assertion_spec_contract(spec)
     if type(spec) is StructuredModelJudgeAssertionSpec:
         detail = assertion.detail
         if type(detail) is not PublishedStructuredModelJudgeDetail:
@@ -2216,7 +2330,11 @@ def _validate_trial_observations(
         detail = assertion.detail
         if assertion.outcome != "error" and not isinstance(
             detail,
-            (PublishedModelJudgeDetail, PublishedStructuredModelJudgeDetail),
+            (
+                PublishedModelJudgeDetail,
+                PublishedStructuredModelJudgeDetail,
+                PublishedApplicationEvaluatorDetail,
+            ),
         ):
             area = _detail_evidence_area(detail)
             availability_by_area.setdefault(area, set()).add(_detail_has_observation(detail))
@@ -2790,6 +2908,33 @@ def _published_detail(
             aggregate_score=aggregate_score,
             usage=usage,
             cost=cost,
+        )
+    if type(spec) is ApplicationEvaluatorAssertionSpec:
+        raw = result.metadata.get(_APPLICATION_EVALUATOR_RESULT_METADATA_KEY)
+        if type(raw) is not dict:
+            raise ValueError(
+                "Internal application-evaluator result did not record its public contract."
+            )
+        if raw.get("evaluator_key") != spec.evaluator_key:
+            raise ValueError("Internal application-evaluator identity does not match the corpus.")
+        scored = result.outcome.value in {"passed", "failed"}
+        return PublishedApplicationEvaluatorDetail(
+            evaluator_key=spec.evaluator_key,
+            evaluator_implementation_revision=raw.get("implementation_revision"),
+            params=spec.params,
+            threshold=result.threshold if scored else None,
+            observation=(
+                PublishedApplicationEvaluatorObservationV1(
+                    message=result.message,
+                    metadata={
+                        key: value
+                        for key, value in result.metadata.items()
+                        if key != _APPLICATION_EVALUATOR_RESULT_METADATA_KEY
+                    },
+                )
+                if scored
+                else None
+            ),
         )
     raise AssertionError("Unreachable portable assertion detail type.")
 

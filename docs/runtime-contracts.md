@@ -2677,6 +2677,36 @@ candidate score. Published eval schema V4 retains only typed criterion evidence
 and safe identities plus bounded observed judge usage and exact
 priced-or-unavailable cost state, never raw prompts, raw outputs, credentials,
 private options, or private truth.
+
+Corpus schema V5 adds `ApplicationEvaluatorAssertionSpec`: a portable evaluator
+key plus one bounded JSON parameter object (16 KiB, 24 levels, 1,024 nodes). The
+corpus names no import path, callable, or revision. A trusted `CorpusTarget` or
+`WorkflowEvalTarget` registers `ApplicationEvaluator(key, implementation_revision,
+factory)` values in `application_evaluators`; keys are unique and must cross the
+target app's redaction boundary unchanged. Compilation resolves each key before
+candidate dispatch and calls the factory once per assertion with a detached copy
+of the parameters. An unknown key, a factory exception, or a factory result that
+is not an `EvalAssertion` fails compilation; the error names the key, assertion
+ID, and exception type but never repeats the exception message. Because CLI
+validation, server import, run admission, and each worker compile the corpus,
+factories must be deterministic and side-effect free. The built assertion
+receives the ordinary `EvalContext`; Cayu fixes its result name to the spec ID
+and its revision to the spec content revision, honors its declared probes and
+output-only or failed-session scope, and replaces any result metadata whose key
+starts with `cayu.` with the trusted evaluator identity. The application declares
+`implementation_revision` as a `sha256:` revision because Cayu cannot fingerprint
+Python behavior. Published eval schema V11 adds
+`PublishedApplicationEvaluatorDetail` with the key, that revision, the
+parameters, an optional graded threshold, and—for passed or failed outcomes
+only—an observation of at most 2,048 message characters and bounded metadata,
+both after the target app's secret redaction. An exception, oversized
+observation, or invalid result becomes an error that still records the
+evaluator identity. The implementation revision is part of the published
+assertion comparison contract but not the corpus revision, so one corpus stays
+reusable across evaluator rollouts while comparisons reject results produced by
+different evaluator implementations. Offline rescoring paths
+(`evaluate_assertion_spec`, captured-session scoring, saved workflow captures,
+and benchmark rescoring) have no trusted target and reject the kind.
 `EvalCaseComparison` and `EvalRunComparison` scores are optional finite values in
 the inclusive range from 0 through 1, matching their source eval results.
 `compare_eval_runs` accepts finite nonnegative score tolerances and rejects
@@ -18536,7 +18566,7 @@ attribution is scoreable. Unavailable, truncated, contradictory, changed, or
 indeterminate evidence produces an unavailable assertion result rather than a
 false failure. Reference-backed structured judges remain the semantic layer,
 and repeated fixed-candidate memory experiments remain the causal layer.
-Portable corpus schema version 4 admits this new closed assertion kind; earlier
+Portable corpus schema version 4 admitted this closed assertion kind; earlier
 corpus versions are rejected rather than widened implicitly.
 
 Native private memory-ablation reports preserve missing trials and terminal trials
@@ -18570,7 +18600,7 @@ workspace observations, at most 256 content-minimized artifact observations,
 and per-scope completeness. It omits workspace bytes, artifact/store/session/
 environment identities, timestamps, arbitrary artifact metadata, and binary
 content. `EvalRun.schema_version == 11`, trajectory schema version 5, and
-`PublishedEvalRun.schema_version == 10` bind the new evidence and typed result
+`PublishedEvalRun.schema_version == 11` bind the new evidence and typed result
 details. Result compatibility continues to use exact assertion revisions and
 the admitted evidence-policy revision, so digest/text changes or policy changes
 cannot compare as the same contract. Server/dashboard contract version 40
@@ -18770,7 +18800,7 @@ distinct from a recall-off spec, a no-match receipt, and `truncated`,
 
 Runtime-native Evals carry that attribution across both fresh and captured
 publication. `AssertionEvidenceView.schema_version == 5`,
-`EvalRun.schema_version == 11`, `PublishedEvalRun.schema_version == 10`, and
+`EvalRun.schema_version == 11`, `PublishedEvalRun.schema_version == 11`, and
 `CorpusExecutionResult.schema_version == 3` each require the same nested
 `EvalMemoryAttributionEvidenceV1`. The nested section is independently
 versioned and content-addressed. It binds a fixed capture-policy revision,

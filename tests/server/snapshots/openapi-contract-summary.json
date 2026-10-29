@@ -19567,6 +19567,79 @@
       "title": "ProviderStatePart",
       "type": "object"
     },
+    "PublishedApplicationEvaluatorDetail": {
+      "additionalProperties": false,
+      "description": "Public identity, parameters, and observation of one application evaluator.",
+      "properties": {
+        "evaluator_implementation_revision": {
+          "title": "Evaluator Implementation Revision",
+          "type": "string"
+        },
+        "evaluator_key": {
+          "title": "Evaluator Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "application_evaluator",
+          "default": "application_evaluator",
+          "title": "Kind",
+          "type": "string"
+        },
+        "observation": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/PublishedApplicationEvaluatorObservationV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "params": {
+          "additionalProperties": true,
+          "title": "Params",
+          "type": "object"
+        },
+        "threshold": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Threshold"
+        }
+      },
+      "required": [
+        "evaluator_key",
+        "evaluator_implementation_revision",
+        "params"
+      ],
+      "title": "PublishedApplicationEvaluatorDetail",
+      "type": "object"
+    },
+    "PublishedApplicationEvaluatorObservationV1": {
+      "additionalProperties": false,
+      "description": "Bounded, redacted message and metadata from one scored evaluator result.",
+      "properties": {
+        "message": {
+          "default": "",
+          "title": "Message",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        }
+      },
+      "title": "PublishedApplicationEvaluatorObservationV1",
+      "type": "object"
+    },
     "PublishedArtifactDetail": {
       "additionalProperties": false,
       "properties": {
@@ -19720,6 +19793,7 @@
         "detail": {
           "discriminator": {
             "mapping": {
+              "application_evaluator": "#/components/schemas/PublishedApplicationEvaluatorDetail",
               "artifact": "#/components/schemas/PublishedArtifactDetail",
               "child_status": "#/components/schemas/PublishedChildStatusDetail",
               "final_output_contains": "#/components/schemas/PublishedFinalOutputContainsDetail",
@@ -19803,6 +19877,9 @@
             },
             {
               "$ref": "#/components/schemas/PublishedStructuredModelJudgeDetail"
+            },
+            {
+              "$ref": "#/components/schemas/PublishedApplicationEvaluatorDetail"
             }
           ],
           "title": "Detail"
@@ -20020,7 +20097,7 @@
           "type": "string"
         },
         "schema_version": {
-          "const": 10,
+          "const": 11,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -23366,7 +23443,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "72",
+          "default": "73",
           "title": "Contract Version",
           "type": "string"
         },
@@ -30489,7 +30566,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "72",
+          "default": "73",
           "title": "Contract Version",
           "type": "string"
         }

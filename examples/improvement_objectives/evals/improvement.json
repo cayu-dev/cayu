@@ -55,8 +55,8 @@
     "schema_version": 1
   },
   "pricing_profile": null,
-  "revision": "sha256:daea662a2477402b036467996c0f205144c0faa271ff8e9799bca7c87071b421",
-  "schema_version": 4,
+  "revision": "sha256:12233e2e74eb74165f80fdabf827a8d8547328e502adbc56bb096f3002f4006b",
+  "schema_version": 5,
   "suites": [
     {
       "description": null,

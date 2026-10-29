@@ -21,7 +21,12 @@ from cayu.evals.corpus import (
     load_eval_corpus,
     merge_eval_corpus_files,
 )
-from cayu.evals.execution import CorpusExecutionResult, CorpusTarget, WorkflowEvalTarget
+from cayu.evals.execution import (
+    CorpusExecutionResult,
+    CorpusTarget,
+    WorkflowEvalTarget,
+    _validate_corpus_target_compatibility,
+)
 from cayu.evals.execution_comparison import compare_eval_results
 from cayu.evals.execution_reporting import (
     CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES,
@@ -232,10 +237,21 @@ def add_eval_parser(subparsers: Any) -> None:
         "validate",
         help="Validate a portable eval corpus.",
         description=(
-            "Validate one bounded portable eval corpus without loading an application target."
+            "Validate one bounded portable eval corpus. Without a target, no application "
+            "code is loaded. With a target, the corpus is also compiled against that "
+            "target's trusted CorpusTarget or WorkflowEvalTarget, which rejects unknown "
+            "model-judge and application-evaluator keys."
         ),
     )
     validate.add_argument("corpus", metavar="CORPUS_JSON")
+    validate.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "Optional Python target that returns a corpus-target or workflow-target "
+            "EvalPlan, in the same module:attribute form as `cayu eval run`."
+        ),
+    )
     add_output_options(validate, formats=("json", "table"), default="table")
 
     inspect_parser = inner.add_parser(
@@ -858,14 +874,35 @@ def _validate_corpus(args: argparse.Namespace) -> int:
         outputs=(("--output", args.output),),
         protected=(("corpus input", args.corpus),),
     )
-    inspection = inspect_eval_corpus(load_eval_corpus(args.corpus))
+    corpus = load_eval_corpus(args.corpus)
+    inspection = inspect_eval_corpus(corpus)
+    target_note = ""
+    if args.target is not None:
+        target_key = asyncio.run(_validate_corpus_for_target(corpus, args.target))
+        target_note = f" for target {target_key}"
     output = (
         eval_corpus_inspection_to_json(inspection)
         if args.output_format == "json"
-        else f"Valid eval corpus {inspection.revision}\n"
+        else f"Valid eval corpus {inspection.revision}{target_note}\n"
     )
     _write_or_print(output, args.output)
     return 0
+
+
+async def _validate_corpus_for_target(corpus: EvalCorpusDocument, target: str) -> str:
+    """Compile every runnable suite against the trusted target an eval plan returns."""
+
+    project = resolve_eval_project(target, command="cayu eval validate")
+    with project_context(project.root):
+        plan = await _load_eval_plan(project.target, label="Command-line eval target")
+        portable_target = plan.corpus_target or plan.workflow_target
+        if portable_target is None:
+            raise ValueError(
+                "Corpus validation requires an EvalPlan configured with corpus_target or "
+                "workflow_target."
+            )
+        _validate_corpus_target_compatibility(corpus, portable_target)
+        return portable_target.key
 
 
 def _inspect_corpus(args: argparse.Namespace) -> int:

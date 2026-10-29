@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import cast
 
 from cayu.evals.corpus import (
+    ApplicationEvaluatorAssertionSpec,
     ArtifactAssertionSpec,
     AssertionSpec,
     ChildStatusAssertionSpec,
@@ -676,6 +677,10 @@ def _evaluate_validated_assertion_outcome(
         StructuredModelJudgeAssertionSpec,
     }:
         raise ValueError("Portable model judges require a trusted CorpusTarget evaluator binding.")
+    if type(validated_spec) is ApplicationEvaluatorAssertionSpec:
+        raise ValueError(
+            "Portable application evaluators require a trusted CorpusTarget evaluator binding."
+        )
     if type(validated_spec) is RootStatusAssertionSpec:
         return _evaluate_root_status(
             name=validated_spec.id,

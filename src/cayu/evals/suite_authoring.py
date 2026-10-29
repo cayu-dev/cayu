@@ -561,7 +561,10 @@ class _EvalCaseAuthoringMaterialV2(_EvalCaseAuthoringBase):
         cls,
         value: tuple[EvalSuiteAuthoringAssertionSpecV2, ...],
     ) -> tuple[EvalSuiteAuthoringAssertionSpecV2, ...]:
-        return tuple(_validated_assertion_spec(assertion) for assertion in value)
+        return tuple(
+            cast("EvalSuiteAuthoringAssertionSpecV2", _validated_assertion_spec(assertion))
+            for assertion in value
+        )
 
     @model_validator(mode="after")
     def validate_assertion_ids(self) -> _EvalCaseAuthoringMaterialV2:
