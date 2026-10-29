@@ -93,6 +93,13 @@ class _WaitingEvidence:
     complete: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _StateEvidence:
+    status: SessionOverviewStatus
+    pending: _PendingEvidence
+    complete: bool
+
+
 class SessionOverviewUnavailable(RuntimeError):
     """An incomplete source cannot establish a truthful overview or count."""
 
@@ -162,11 +169,6 @@ class SessionOverviewReader:
         return affected
 
     async def read(self, session_ids: tuple[str, ...]) -> tuple[SessionOverviewFacts, ...]:
-        return await self._read(session_ids, accounting=True)
-
-    async def _read(
-        self, session_ids: tuple[str, ...], *, accounting: bool
-    ) -> tuple[SessionOverviewFacts, ...]:
         """Summarize the sessions from reads made after the scan.
 
         The scan read session rows only to find their verified parents,
@@ -185,19 +187,13 @@ class SessionOverviewReader:
         if not sessions:
             return ()
         query = EventQuery(session_ids=tuple(session.id for session in sessions))
-        usage = (
-            await self._store.read_usage_accounting(query, by_session=True) if accounting else None
-        )
+        usage = await self._store.read_usage_accounting(query, by_session=True)
         cost = (
             None
-            if self._pricing is None or not accounting
+            if self._pricing is None
             else await self._store.read_cost_accounting(query, self._pricing, by_session=True)
         )
-        usage_by_session = (
-            {}
-            if usage is None
-            else {summary.session_id: summary for summary in usage.session_summaries}
-        )
+        usage_by_session = {summary.session_id: summary for summary in usage.session_summaries}
         cost_by_session = (
             {} if cost is None else {totals.session_id: totals for totals in cost.session_totals}
         )
@@ -257,11 +253,11 @@ class SessionOverviewReader:
             eligible = [session for session in page.sessions if session.created_at < until]
             reached_until = len(eligible) != len(page.sessions)
             expected = {session.id: session.instance_id for session in eligible}
-            facts = await self._read(tuple(expected), accounting=False)
+            self._loaded.clear()
             accounting_sessions: dict[str, str | None] = {}
-            for fact in facts:
-                session = fact.session
-                if session.instance_id != expected.get(session.id):
+            for session_id, instance_id in expected.items():
+                session = await self._load(session_id)
+                if session is None or session.instance_id != instance_id:
                     continue
                 identity = session_run_id(session)
                 if identity in seen:
@@ -269,17 +265,25 @@ class SessionOverviewReader:
                 seen.add(identity)
                 if session.created_at >= until:
                     continue
-                if (not include_eval and is_eval_trial(session)) or (
-                    not include_forks and fact.forked
-                ):
+                if not include_eval and is_eval_trial(session):
+                    continue
+                if not include_forks:
+                    lineage = await resolve_fork_lineage_async(session, self._load)
+                    if lineage.forked:
+                        continue
+                state = await self._state(session)
+                # Pending and lineage joins may outlive this incarnation. Match
+                # the full overview selection fence before including its facts.
+                current = await self._store.load(session.id)
+                if current is None or current.instance_id != session.instance_id:
                     continue
                 accounting_sessions[session.id] = session.instance_id
-                if not fact.pending_complete:
+                if not state.complete:
                     raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
-                if fact.status is SessionOverviewStatus.RUNNING:
+                if state.status is SessionOverviewStatus.RUNNING:
                     running += 1
                 if session.created_at >= since:
-                    counts[fact.status] += 1
+                    counts[state.status] += 1
             if accounting_sessions:
                 accounting_query = EventQuery(
                     session_ids=tuple(accounting_sessions), since=since, until=until
@@ -340,16 +344,16 @@ class SessionOverviewReader:
             cost_complete,
         )
 
-    async def _pending(self, session_id: str) -> _PendingEvidence:
+    async def _pending(self, session: Session) -> _PendingEvidence:
         actions: list[PendingActionRecord] = []
-        complete = True
+        complete = session.instance_id is not None
         cursor = None
         seen: set[str] = set()
         cursors: set[str] = set()
         while True:
             page = await self._store.query_pending_actions(
                 PendingActionQuery(
-                    session_id=session_id,
+                    session_id=session.id,
                     limit=200,
                     cursor=cursor,
                     max_result_bytes=MAX_PENDING_ACTION_RESULT_BYTES,
@@ -358,6 +362,15 @@ class SessionOverviewReader:
             if page.issues:
                 complete = False
             for action in page.actions:
+                # A pending query is keyed by reusable ID. Never attach another
+                # incarnation's actions to the session this reader selected.
+                if (
+                    session.instance_id is None
+                    or action.session.id != session.id
+                    or action.session.instance_id != session.instance_id
+                ):
+                    complete = False
+                    continue
                 if action.attention_id is None:
                     actions.append(action)
                 elif action.attention_id not in seen:
@@ -392,8 +405,15 @@ class SessionOverviewReader:
                 and (child := await self._delegated_child(session, action)) is not None
             ):
                 child_waiting = await self._waiting_kinds(
-                    child, await self._pending(child.id), depth + 1
+                    child, await self._pending(child), depth + 1
                 )
+                # The retained wait was verified before the recursive awaits.
+                # Even an empty or correctly bound page can outlive its child;
+                # use an uncached fence before contributing any descendant state.
+                current = await self._store.load(child.id)
+                if current is None or current.instance_id != child.instance_id:
+                    complete = False
+                    continue
                 kinds |= child_waiting.kinds
                 complete = complete and child_waiting.complete
         return _WaitingEvidence(frozenset(kinds), complete)
@@ -433,6 +453,21 @@ class SessionOverviewReader:
         release = None if not markers else recorded_release_identity(markers[0].event.payload)
         return None if release is None else release.id
 
+    async def _state(self, session: Session) -> _StateEvidence:
+        """Shared state evidence without outcome or display-only joins."""
+        waiting = (
+            await self._pending(session)
+            if session.status in _PENDING_ACTION_STATUSES
+            else _PendingEvidence()
+        )
+        waiting_kinds = await self._waiting_kinds(session, waiting, 0)
+        status = _run_status(
+            session.status,
+            waiting_kinds.kinds,
+            delegated=any(action.delegated_action is not None for action in waiting.actions),
+        )
+        return _StateEvidence(status, waiting, waiting_kinds.complete)
+
     async def _run(
         self,
         session: Session,
@@ -449,21 +484,11 @@ class SessionOverviewReader:
             if current is None or current.instance_id != session.instance_id:
                 return None
             raise
-        waiting = (
-            await self._pending(session.id)
-            if session.status in _PENDING_ACTION_STATUSES
-            else _PendingEvidence()
-        )
-        waiting_kinds = await self._waiting_kinds(session, waiting, 0)
-        status = _run_status(
-            session.status,
-            waiting_kinds.kinds,
-            delegated=any(action.delegated_action is not None for action in waiting.actions),
-        )
+        state = await self._state(session)
         lineage = await resolve_fork_lineage_async(session, self._load)
         return SessionOverviewFacts(
             session=session,
-            status=status,
+            status=state.status,
             outcome=outcome,
             usage=usage,
             cost=cost,
@@ -473,10 +498,10 @@ class SessionOverviewReader:
             waiting=tuple(
                 [
                     (action, await self._delegated_child(session, action))
-                    for action in waiting.actions
+                    for action in state.pending.actions
                 ]
             ),
-            pending_complete=waiting_kinds.complete,
+            pending_complete=state.complete,
         )
 
 

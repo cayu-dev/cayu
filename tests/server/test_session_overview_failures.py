@@ -148,7 +148,7 @@ def test_counts_stop_at_upper_creation_boundary_before_enrichment(monkeypatch):
         boundary = await pending("boundary")
         await pending("newer")
         original = store.list_sessions
-        outcome = store.summarize_outcome
+        load = store.load
         calls = []
         enriched = []
 
@@ -167,15 +167,15 @@ def test_counts_stop_at_upper_creation_boundary_before_enrichment(monkeypatch):
                 )
             return page
 
-        async def bounded_outcome(session_id):
+        async def bounded_load(session_id):
             enriched.append(session_id)
             assert session_id not in {"boundary", "newer"}, (
                 "outside population must not be enriched"
             )
-            return await outcome(session_id)
+            return await load(session_id)
 
         monkeypatch.setattr(store, "list_sessions", growing_pages)
-        monkeypatch.setattr(store, "summarize_outcome", bounded_outcome)
+        monkeypatch.setattr(store, "load", bounded_load)
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(
                 app=create_server(app, config=ServerConfig.local_development()),

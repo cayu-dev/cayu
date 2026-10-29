@@ -408,7 +408,7 @@ function DashboardShell() {
             <Kbd>⌘K</Kbd>
           </form>
           <nav className="min-h-0 flex-1 overflow-y-auto px-3 pb-3" aria-label="Main">
-            {sections.map((section, index) => (
+            {sections.map((section) => (
               <div key={section.label ?? "main"} className="space-y-0.5 pt-2">
                 {section.label && (
                   <h2 className="px-2 pt-2 pb-1 text-xs font-medium text-muted-foreground">
@@ -461,14 +461,6 @@ function DashboardShell() {
                       </Link>
                     )
                   })}
-                {index === 0 && available(DASHBOARD_ROUTE_REQUIREMENTS["/run"]) && (
-                  <Link
-                    to="/run"
-                    className="flex rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-sidebar-accent"
-                  >
-                    Start a session
-                  </Link>
-                )}
               </div>
             ))}
           </nav>
