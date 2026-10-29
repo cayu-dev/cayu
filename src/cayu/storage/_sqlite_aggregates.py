@@ -5,6 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from typing import Any
 
+from cayu._time_buckets import time_buckets
 from cayu.budgets.aggregates import (
     _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE,
     _BEDROCK_AGGREGATE_REQUEST_EVIDENCE,
@@ -27,6 +28,8 @@ from cayu.budgets.aggregates import (
     UsageSessionAggregateBreakdown,
     UsageSessionAggregateGroup,
     UsageSessionAggregateRemainder,
+    UsageTimeBucket,
+    UsageTimeSeries,
     aggregate_identity_value,
     build_aggregate_usage_metrics,
 )
@@ -35,7 +38,20 @@ from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage._reported_costs import reported_cost_page, reported_cost_statement
 from cayu.storage._session_store_sql import SessionQuerySqlPlan
 
-_RESULT_SQL = """
+# Match aggregate_hosted_tool_usage_metrics_from_event_payload: progress is not usage.
+# Reuse across headline/groups, series, per-session totals and pricing populations.
+_HOSTED_USAGE_ELIGIBILITY_SQL = """(
+          event.event_type != 'model.hosted_tool_call'
+          OR (
+              event.event_type = 'model.hosted_tool_call'
+              AND json_extract(event.payload_json, '$.tool_type') = 'web_search'
+              AND json_extract(event.payload_json, '$.status') IN (
+                  'completed', 'incomplete', 'failed', 'outcome_unknown'
+              )
+          )
+      )"""
+
+_USAGE_EVENTS_SQL = """
 WITH
 scope(group_limit, as_of, identity_trim) AS (
     SELECT ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?
@@ -122,8 +138,11 @@ usage_events AS MATERIALIZED (
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
+      AND {hosted_usage_eligibility}
 ),
-overall_grouped AS (
+"""
+
+_USAGE_TOTALS_SQL = """
     SELECT
         COUNT(DISTINCT session_id) AS session_count,
         COALESCE(SUM(event_type = 'model.completed'), 0) AS model_steps,
@@ -132,6 +151,13 @@ overall_grouped AS (
         COALESCE(SUM(event_type = 'tool.call.started'), 0) AS tool_calls,
         {overall_usage_sum} AS usage_sums
     FROM usage_events
+"""
+
+_RESULT_SQL = (
+    _USAGE_EVENTS_SQL
+    + "overall_grouped AS ("
+    + _USAGE_TOTALS_SQL
+    + """
 ),
 overall AS (
     SELECT
@@ -318,6 +344,7 @@ SELECT
     web_search_outcome_unknown, group_count, NULL, 0, NULL, NULL, 0, 0, NULL
 FROM model_remainder
 """
+)
 
 # Keep both pricing projections bounded by type/time even when a small requested
 # session set makes SQLite prefer an unbounded session-history index scan.
@@ -344,16 +371,7 @@ pricing_candidates AS (
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
       )
-      AND (
-          event.event_type != 'model.hosted_tool_call'
-          OR (
-              event.event_type = 'model.hosted_tool_call'
-              AND json_extract(event.payload_json, '$.tool_type') = 'web_search'
-              AND json_extract(event.payload_json, '$.status') IN (
-                  'completed', 'incomplete', 'failed', 'outcome_unknown'
-              )
-          )
-      )
+      AND {hosted_usage_eligibility}
 ),
 measured_candidates AS (
     SELECT
@@ -432,16 +450,7 @@ pricing_candidates AS (
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
       )
-      AND (
-          event.event_type != 'model.hosted_tool_call'
-          OR (
-              event.event_type = 'model.hosted_tool_call'
-              AND json_extract(event.payload_json, '$.tool_type') = 'web_search'
-              AND json_extract(event.payload_json, '$.status') IN (
-                  'completed', 'incomplete', 'failed', 'outcome_unknown'
-              )
-          )
-      )
+      AND {hosted_usage_eligibility}
 ),
 measured_candidates AS (
     SELECT
@@ -540,6 +549,7 @@ usage_events AS MATERIALIZED (
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
+      AND {hosted_usage_eligibility}
 ),
 session_grouped_raw AS (
     SELECT
@@ -746,12 +756,21 @@ def aggregate_session_usage(
                 )
                 if session_pricing.truncated:
                     break
+        series = None
+        if query.series is not None:
+            series_sql, series_params = usage_series_statement(
+                session_plan=session_plan, query=query
+            )
+            series = _series_from_rows(
+                connection.execute(series_sql, series_params).fetchall(), query
+            )
         result = _result_from_rows(
             rows,
             query=query,
             pricing=pricing.result(),
             session_pricing=session_pricing.result(),
             session_breakdown=session_breakdown,
+            series=series,
         )
         cost_rows = connection.execute(
             reported_cost_statement(session_plan.filter_where_sql, "sqlite"),
@@ -774,8 +793,15 @@ def usage_rollup_statement(
 ) -> tuple[str, tuple[object, ...]]:
     """Build the exact SQLite statement used by the aggregate read path."""
 
-    sql = _RESULT_SQL.format(
+    return _format_usage_statement(_RESULT_SQL, session_plan=session_plan, query=query)
+
+
+def _format_usage_statement(
+    template: str, *, session_plan: SessionQuerySqlPlan, query: UsageRollupQuery
+) -> tuple[str, tuple[object, ...]]:
+    sql = template.format(
         session_where_sql=session_plan.filter_where_sql,
+        hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
         **{name: _nonnegative_json_integer(path) for name, path in _TOKEN_PATHS.items()},
         web_search_calls=_web_search_terminal_count(),
         web_search_outcome_unknown=_web_search_unknown_count(),
@@ -796,6 +822,55 @@ def usage_rollup_statement(
     )
 
 
+def usage_series_statement(
+    *, session_plan: SessionQuerySqlPlan, query: UsageRollupQuery
+) -> tuple[str, tuple[object, ...]]:
+    if query.series is None:
+        raise ValueError("A usage series must be requested.")
+    buckets = time_buckets(query.start_at, query.end_at, query.series)
+    cases = " ".join(f"WHEN timestamp < ? THEN {i}" for i in range(len(buckets) - 1))
+    index = f"CASE {cases} ELSE {len(buckets) - 1} END" if cases else "0"
+    bucketed = f"bucketed_events AS (SELECT *, {index} AS bucket_index FROM usage_events),\n"
+    selection = _USAGE_TOTALS_SQL.replace("SELECT", "SELECT bucket_index,", 1).replace(
+        "FROM usage_events", "FROM bucketed_events"
+    )
+    grouped = selection + " GROUP BY bucket_index"
+    template = (
+        _USAGE_EVENTS_SQL
+        + bucketed
+        + "series_grouped AS ("
+        + grouped
+        + ") SELECT bucket_index, session_count, model_steps, model_steps_with_usage, tool_calls, {usage_sum_projection} FROM series_grouped"
+    )
+    sql, params = _format_usage_statement(template, session_plan=session_plan, query=query)
+    return sql, (*params, *(bucket.end_at.isoformat() for bucket in buckets[:-1]))
+
+
+def _series_from_rows(rows, query: UsageRollupQuery) -> UsageTimeSeries:
+    assert query.series is not None
+    by_index = {int(row["bucket_index"]): row for row in rows}
+    return UsageTimeSeries(
+        unit=query.series.unit,
+        timezone=query.series.timezone,
+        buckets=tuple(
+            UsageTimeBucket(
+                start_at=bucket.start_at,
+                end_at=bucket.end_at,
+                totals=_totals_from_row(by_index[index])
+                if index in by_index
+                else UsageAggregateTotals(
+                    session_count=0,
+                    model_steps=0,
+                    model_steps_with_usage=0,
+                    tool_calls=0,
+                    usage=build_aggregate_usage_metrics(),
+                ),
+            )
+            for index, bucket in enumerate(time_buckets(query.start_at, query.end_at, query.series))
+        ),
+    )
+
+
 def session_breakdown_statement(
     *,
     session_plan: SessionQuerySqlPlan,
@@ -805,6 +880,7 @@ def session_breakdown_statement(
         raise ValueError("session_group_limit is required for a session breakdown.")
     sql = _SESSION_BREAKDOWN_SQL.format(
         session_where_sql=session_plan.filter_where_sql,
+        hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
         **{name: _nonnegative_json_integer(path) for name, path in _TOKEN_PATHS.items()},
         web_search_calls=_web_search_terminal_count(),
         web_search_outcome_unknown=_web_search_unknown_count(),
@@ -835,6 +911,7 @@ def pricing_input_statement(
     return (
         _PRICING_INPUT_SQL.format(
             session_where_sql=session_plan.filter_where_sql,
+            hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
             usage_metrics_projection=_sqlite_usage_metrics_projection(),
             billing_identity_projection=_sqlite_billing_identity_projection("$.billing_identity"),
         ),
@@ -866,6 +943,7 @@ def session_pricing_input_statement(
         _SESSION_PRICING_INPUT_SQL.format(
             requested_session_values=", ".join("(?)" for _ in session_ids),
             session_where_sql=session_plan.filter_where_sql,
+            hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
             usage_metrics_projection=_sqlite_usage_metrics_projection(),
             billing_identity_projection=_sqlite_billing_identity_projection("$.billing_identity"),
         ),
@@ -1063,6 +1141,7 @@ def _result_from_rows(
     pricing: tuple[tuple[UsagePricingInput, ...], int, AggregateAccuracy],
     session_pricing: tuple[tuple[UsagePricingInput, ...], int, AggregateAccuracy],
     session_breakdown: UsageSessionAggregateBreakdown | None,
+    series: UsageTimeSeries | None = None,
 ) -> UsageRollupStoreResult:
     overall = next(row for row in rows if row["section"] == "overall")
     provider_rows = _ordered_group_rows([row for row in rows if row["section"] == "provider"])
@@ -1083,6 +1162,7 @@ def _result_from_rows(
     ) = session_pricing
 
     return UsageRollupStoreResult(
+        series=series,
         as_of=datetime.fromisoformat(overall["as_of"]).astimezone(UTC),
         start_at=query.start_at,
         end_at=query.end_at,

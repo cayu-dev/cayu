@@ -24,6 +24,7 @@ from pydantic import (
 )
 
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
+from cayu._time_buckets import TimeSeriesSpec, time_buckets
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     json_utf8_size_within_limit,
@@ -39,6 +40,7 @@ from cayu.budgets.aggregates import (
     UsageCostRollup,
     UsageSessionAggregateBreakdown,
     UsageSessionCostBreakdown,
+    UsageTimeSeries,
 )
 from cayu.budgets.pricing import (
     CausalBudgetCostSummary,
@@ -205,7 +207,7 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
     TaskExecutionSource,
 )
-from cayu.sessions.overview import SessionOverviewStatus
+from cayu.sessions.overview import SessionOverviewStatus, SessionStartSeries
 from cayu.sessions.pending_action_contracts import DelegatedActionReference
 from cayu.sessions.queries import SessionAggregateFilter
 from cayu.sessions.summaries import SessionOperationalSnapshot
@@ -354,6 +356,7 @@ class UsageRollupRequest(ApiBaseModel):
 
     start_at: datetime
     end_at: datetime
+    series: TimeSeriesSpec | None = None
     session_filter: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
     group_limit: StrictInt = Field(
         default=20,
@@ -486,6 +489,8 @@ class UsageRollupRequest(ApiBaseModel):
             raise ValueError(
                 f"Usage rollup window cannot exceed {MAX_USAGE_ROLLUP_WINDOW.days} days."
             )
+        if self.series is not None:
+            time_buckets(self.start_at, self.end_at, self.series)
         if self.pricing is None:
             return self
         for price in self.pricing.prices:
@@ -612,6 +617,7 @@ def _bounded_raw_sequence(
 
 
 class UsageRollupResponse(ApiBaseModel):
+    series: UsageTimeSeries | None = None
     reported_costs: ReportedCostPage | None = None
     scope: Literal["configured_session_store"]
     time_basis: Literal["event.timestamp"]
@@ -2230,6 +2236,7 @@ class SessionOverviewResponse(ApiBaseModel):
 
 
 class SessionOverviewCountsResponse(ApiBaseModel):
+    series: SessionStartSeries | None = None
     since: datetime
     until: datetime
     running_now: AggregateCount = Field(ge=0)

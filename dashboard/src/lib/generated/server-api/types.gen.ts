@@ -4767,6 +4767,7 @@ export type ControlPlaneSurfaceCapabilities = {
     session_followups?: OptionalSurfaceCapability | null;
     session_overview?: OptionalSurfaceCapability | null;
     session_overview_queries?: OptionalSurfaceCapability | null;
+    session_overview_series?: OptionalSurfaceCapability | null;
     session_trace?: OptionalSurfaceCapability | null;
     structured_output_transcript?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
@@ -4778,6 +4779,7 @@ export type ControlPlaneSurfaceCapabilities = {
     tool_inventory?: OptionalSurfaceCapability | null;
     tool_usage?: OptionalSurfaceCapability | null;
     usage: OptionalSurfaceCapability;
+    usage_series?: OptionalSurfaceCapability | null;
     workflow?: OptionalSurfaceCapability | null;
 };
 
@@ -19904,6 +19906,7 @@ export type SessionOverviewCountsResponse = {
      * Running Now
      */
     running_now: string;
+    series?: SessionStartSeries | null;
     /**
      * Since
      */
@@ -20139,6 +20142,48 @@ export type SessionRollupQuery = {
      * Until
      */
     until?: string | null;
+};
+
+/**
+ * SessionStartBucket
+ */
+export type SessionStartBucket = {
+    /**
+     * End At
+     */
+    end_at: string;
+    /**
+     * Failed
+     */
+    failed: string;
+    /**
+     * Start At
+     */
+    start_at: string;
+    /**
+     * Total Count
+     */
+    total_count: string;
+};
+
+/**
+ * SessionStartSeries
+ *
+ * Current state of sessions grouped by their creation time, not failure time.
+ */
+export type SessionStartSeries = {
+    /**
+     * Buckets
+     */
+    buckets: Array<SessionStartBucket>;
+    /**
+     * Timezone
+     */
+    timezone?: string;
+    /**
+     * Unit
+     */
+    unit: 'hour' | 'day' | 'week';
 };
 
 /**
@@ -21684,6 +21729,20 @@ export type TieredPricing = {
 };
 
 /**
+ * TimeSeriesSpec
+ */
+export type TimeSeriesSpec = {
+    /**
+     * Timezone
+     */
+    timezone?: string;
+    /**
+     * Unit
+     */
+    unit: 'hour' | 'day' | 'week';
+};
+
+/**
  * ToolApprovalBody
  *
  * Body for resolving a pending tool approval.
@@ -23002,6 +23061,7 @@ export type UsageRollupRequest = {
      * Maximum canonical price-input groups, applied independently to the shared projection and, when session_group_limit is present, the session-aware projection.
      */
     pricing_input_limit?: number;
+    series?: TimeSeriesSpec | null;
     session_filter?: SessionAggregateFilter;
     /**
      * Session Group Limit
@@ -23048,6 +23108,7 @@ export type UsageRollupResponse = {
      * Scope
      */
     scope: 'configured_session_store';
+    series?: UsageTimeSeries | null;
     session_breakdown?: UsageSessionAggregateBreakdown | null;
     session_cost_breakdown?: UsageSessionCostBreakdown | null;
     /**
@@ -23208,6 +23269,41 @@ export type UsageSessionCostSummary = {
      * Unpriced Reasons
      */
     unpriced_reasons: Array<UsageUnpricedReason>;
+};
+
+/**
+ * UsageTimeBucket
+ */
+export type UsageTimeBucket = {
+    /**
+     * End At
+     */
+    end_at: string;
+    /**
+     * Start At
+     */
+    start_at: string;
+    totals: UsageAggregateTotals;
+};
+
+/**
+ * UsageTimeSeries
+ *
+ * Event-time activity counters; distinct sessions are not additive across buckets.
+ */
+export type UsageTimeSeries = {
+    /**
+     * Buckets
+     */
+    buckets: Array<UsageTimeBucket>;
+    /**
+     * Timezone
+     */
+    timezone?: string;
+    /**
+     * Unit
+     */
+    unit: 'hour' | 'day' | 'week';
 };
 
 /**
@@ -28029,6 +28125,30 @@ export type GetSessionOverviewCountsApiSessionsOverviewCountsGetData = {
          * Include Forks
          */
         include_forks?: boolean;
+        /**
+         * Agent Name
+         */
+        agent_name?: string | null;
+        /**
+         * Environment Name
+         */
+        environment_name?: string | null;
+        /**
+         * Provider Name
+         */
+        provider_name?: string | null;
+        /**
+         * Model
+         */
+        model?: string | null;
+        /**
+         * Bucket Unit
+         */
+        bucket_unit?: 'hour' | 'day' | 'week' | null;
+        /**
+         * Timezone
+         */
+        timezone?: string;
     };
     url: '/api/sessions/overview/counts';
 };

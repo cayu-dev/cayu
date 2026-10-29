@@ -230,6 +230,8 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     session_display_metadata: OptionalSurfaceCapability | None = None
     app_info: OptionalSurfaceCapability | None = None
     session_overview: OptionalSurfaceCapability | None = None
+    session_overview_series: OptionalSurfaceCapability | None = None
+    usage_series: OptionalSurfaceCapability | None = None
     session_overview_queries: OptionalSurfaceCapability | None = None
     dashboard: OptionalSurfaceCapability
     workflow: OptionalSurfaceCapability | None = None

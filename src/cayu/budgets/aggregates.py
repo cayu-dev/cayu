@@ -24,6 +24,7 @@ from pydantic import (
 )
 from pydantic_core import PydanticSerializationError
 
+from cayu._time_buckets import MAX_TIME_BUCKETS, TimeBucket, TimeSeriesSpec, time_buckets
 from cayu._validation import (
     JsonUtf8SizeCounter,
     json_utf8_size_within_limit,
@@ -462,6 +463,35 @@ def usage_pricing_metrics_key(metrics: UsageMetrics | None) -> str | None:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+class UsageTimeBucket(TimeBucket):
+    totals: UsageAggregateTotals
+
+    @field_validator("totals", mode="before")
+    @classmethod
+    def copy_totals(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageAggregateTotals)
+
+
+class UsageTimeSeries(TimeSeriesSpec):
+    """Event-time activity counters; distinct sessions are not additive across buckets."""
+
+    buckets: tuple[UsageTimeBucket, ...] = Field(min_length=1, max_length=MAX_TIME_BUCKETS)
+
+    @field_validator("buckets", mode="before")
+    @classmethod
+    def copy_buckets(cls, value: object) -> object:
+        return revalidate_model_inputs(value, UsageTimeBucket)
+
+    @model_validator(mode="after")
+    def contiguous(self) -> UsageTimeSeries:
+        if any(
+            left.end_at != right.start_at
+            for left, right in zip(self.buckets, self.buckets[1:], strict=False)
+        ):
+            raise ValueError("Usage buckets must be ordered and contiguous.")
+        return self
 
 
 class UsageAggregateGroup(BaseModel):
@@ -1049,6 +1079,7 @@ class UsageRollupStoreResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reported_costs: ReportedCostPage | None = None
+    series: UsageTimeSeries | None = None
 
     as_of: datetime
     start_at: datetime
@@ -1094,6 +1125,7 @@ class UsageRollupStoreResult(BaseModel):
         "pricing_inputs_accuracy",
         "session_pricing_inputs_accuracy",
         "reported_costs",
+        "series",
         mode="before",
     )
     @classmethod
@@ -1105,6 +1137,7 @@ class UsageRollupStoreResult(BaseModel):
             UsageAggregateBreakdown,
             UsageSessionAggregateBreakdown,
             ReportedCostPage,
+            UsageTimeSeries,
         )
 
     @field_validator("pricing_inputs", "session_pricing_inputs", mode="before")
@@ -1143,6 +1176,22 @@ class UsageRollupStoreResult(BaseModel):
 
         if self.start_at >= self.end_at:
             raise ValueError("Usage rollup start_at must be before end_at.")
+        if self.series is not None:
+            summed = _sum_usage_aggregate_totals(bucket.totals for bucket in self.series.buckets)
+            if summed.model_dump(exclude={"session_count"}) != self.totals.model_dump(
+                exclude={"session_count"}
+            ):
+                raise ValueError("Usage series must conserve all additive totals.")
+            if any(
+                bucket.totals.session_count > self.totals.session_count
+                for bucket in self.series.buckets
+            ):
+                raise ValueError(
+                    "A bucket cannot contain more active sessions than the full window."
+                )
+            if summed.session_count < self.totals.session_count:
+                raise ValueError("Usage series must account for every active session.")
+
         if self.pricing_input_group_count < len(self.pricing_inputs):
             raise ValueError("pricing_input_group_count cannot be smaller than returned groups.")
         if (
@@ -1325,6 +1374,18 @@ class UsageRollupStoreResult(BaseModel):
     def _validate_query_contract(self, query: UsageRollupQuery) -> None:
         """Check requested opt-ins and limits before publishing a store result."""
 
+        if (self.series is None) != (query.series is None):
+            raise UsageRollupInconsistent("Usage series does not match the requested projection.")
+        if self.series is not None and query.series is not None:
+            expected = time_buckets(query.start_at, query.end_at, query.series)
+            actual = tuple(
+                TimeBucket(start_at=b.start_at, end_at=b.end_at) for b in self.series.buckets
+            )
+            if (self.series.unit, self.series.timezone) != (
+                query.series.unit,
+                query.series.timezone,
+            ) or actual != expected:
+                raise UsageRollupInconsistent("Usage series boundaries do not match the query.")
         if self.start_at != query.start_at or self.end_at != query.end_at:
             raise UsageRollupInconsistent(
                 "Usage rollup result window does not match the requested window."

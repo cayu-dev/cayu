@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from cayu._time_buckets import TimeSeriesSpec, bucket_index, time_buckets
 from cayu.budgets.aggregates import (
     EXACT_AGGREGATE,
     AggregateAccuracy,
@@ -33,6 +34,8 @@ from cayu.budgets.aggregates import (
     UsageSessionAggregateBreakdown,
     UsageSessionAggregateGroup,
     UsageSessionAggregateRemainder,
+    UsageTimeBucket,
+    UsageTimeSeries,
     add_aggregate_usage,
     aggregate_hosted_tool_usage_metrics_from_event_payload,
     aggregate_usage_metrics_from_event_payload,
@@ -54,6 +57,7 @@ class UsageRollupQuery(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    series: TimeSeriesSpec | None = None
     start_at: datetime
     end_at: datetime
     sessions: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
@@ -77,6 +81,8 @@ class UsageRollupQuery(BaseModel):
             raise ValueError(
                 f"Usage rollup window cannot exceed {MAX_USAGE_ROLLUP_WINDOW.days} days."
             )
+        if self.series is not None:
+            time_buckets(self.start_at, self.end_at, self.series)
         return self
 
 
@@ -318,6 +324,12 @@ def _usage_rollup_from_session_records(
 ) -> UsageRollupStoreResult:
     reported = ReportedCostCollector()
     totals = _UsageAccumulator()
+    buckets = (
+        () if query.series is None else time_buckets(query.start_at, query.end_at, query.series)
+    )
+    starts = tuple(bucket.start_at for bucket in buckets)
+    bucket_totals = [_UsageAccumulator() for _ in buckets]
+    bucket_tools = [0 for _ in buckets]
     pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
     session_pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
     provider_candidates = _InMemoryUsageGroupCandidates()
@@ -329,6 +341,7 @@ def _usage_rollup_from_session_records(
 
     for session_id, status, records in session_records():
         session_has_activity = False
+        active_buckets: set[int] = set()
         session_accumulator = (
             None
             if query.session_group_limit is None
@@ -339,6 +352,8 @@ def _usage_rollup_from_session_records(
             event_timestamp = normalize_aggregate_event_timestamp(event.timestamp)
             if event_timestamp < query.start_at or event_timestamp >= query.end_at:
                 continue
+            index = bucket_index(starts, event_timestamp) if buckets else None
+            bucket_total = None if index is None else bucket_totals[index]
             if event.type == EventType.MODEL_COMPLETED:
                 reported.add(
                     session_id=session_id,
@@ -351,6 +366,9 @@ def _usage_rollup_from_session_records(
             if event.type == EventType.TOOL_CALL_STARTED:
                 session_has_activity = True
                 tool_calls += 1
+                if index is not None:
+                    bucket_tools[index] += 1
+                    active_buckets.add(index)
                 continue
             if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
                 metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
@@ -358,6 +376,10 @@ def _usage_rollup_from_session_records(
                     continue
                 session_has_activity = True
                 totals.add_usage_only(metrics)
+                if bucket_total is not None:
+                    bucket_total.add_usage_only(metrics)
+                    assert index is not None
+                    active_buckets.add(index)
                 provider_candidates.observe(
                     _usage_group_key(metrics, dimension="provider"),
                     metrics,
@@ -385,6 +407,13 @@ def _usage_rollup_from_session_records(
             session_has_activity = True
             metrics = aggregate_usage_metrics_from_event_payload(event.payload)
             model_step = event.type == EventType.MODEL_COMPLETED
+            if bucket_total is not None:
+                assert index is not None
+                active_buckets.add(index)
+                if model_step:
+                    bucket_total.add(metrics)
+                elif metrics is not None:
+                    bucket_total.add_usage_only(metrics)
             if model_step:
                 totals.add(metrics)
             elif metrics is not None:
@@ -410,6 +439,8 @@ def _usage_rollup_from_session_records(
                 occurrences=1,
                 payload=event.payload,
             )
+        for index in active_buckets:
+            bucket_totals[index].session_count += 1
         if session_has_activity:
             activity_session_count += 1
         if session_accumulator is not None:
@@ -455,6 +486,18 @@ def _usage_rollup_from_session_records(
 
     totals.session_count = activity_session_count
     return UsageRollupStoreResult(
+        series=None
+        if query.series is None
+        else UsageTimeSeries(
+            unit=query.series.unit,
+            timezone=query.series.timezone,
+            buckets=tuple(
+                UsageTimeBucket(
+                    start_at=b.start_at, end_at=b.end_at, totals=total.totals(tool_calls=tools)
+                )
+                for b, total, tools in zip(buckets, bucket_totals, bucket_tools, strict=True)
+            ),
+        ),
         reported_costs=reported.page(),
         as_of=as_of,
         start_at=query.start_at,

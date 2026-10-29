@@ -465,6 +465,7 @@ class SessionStore(ABC):
     session_continuation_version: ClassVar[int] = 0
     external_wait_version: ClassVar[int] = 0
     _producer_attachment_version: ClassVar[int] = 0
+    supports_usage_series: ClassVar[bool] = False
     supports_usage_aggregates: ClassVar[bool] = False
     supports_private_argument_continuity: ClassVar[bool] = False
     supports_mcp_manifest_history: ClassVar[bool] = False

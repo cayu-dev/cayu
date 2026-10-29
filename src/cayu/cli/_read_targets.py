@@ -114,6 +114,29 @@ def run_read_command(
     from cayu.cli._output import output_destination, terminal_safe
     from cayu.cli.session import _safe_error
 
+    # Cloud authentication reads the effective context, including implicit selection.
+    # Check before opening output; this also protects task/knowledge inspection.
+    if args.output is not None and args.application is not None:
+        from cayu.cli.cloud import CloudCommandError, _active_config_path, _selected_context_path
+
+        try:
+            context = _selected_context_path(args.context)
+            output = Path(args.output).expanduser()
+            sources = (context, _active_config_path())
+            for source in sources:
+                if source is not None and (
+                    output.resolve() == source.resolve()
+                    or (output.exists() and source.exists() and output.samefile(source))
+                ):
+                    print("error: output must not refer to an input file.", file=sys.stderr)
+                    return 1
+        except (OSError, ValueError, CloudCommandError):
+            print(
+                "error: could not safely resolve the Cloud context before writing output.",
+                file=sys.stderr,
+            )
+            return 1
+
     try:
         with output_destination(args.output):
             dsn: str | None = None

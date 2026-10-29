@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, LiteralString, cast
 
+from cayu._time_buckets import time_buckets
 from cayu.budgets.aggregates import (
     _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE,
     _BEDROCK_AGGREGATE_REQUEST_EVIDENCE,
@@ -26,6 +27,8 @@ from cayu.budgets.aggregates import (
     UsageSessionAggregateGroup,
     UsageSessionAggregateRemainder,
     UsageSessionStatus,
+    UsageTimeBucket,
+    UsageTimeSeries,
     aggregate_identity_value,
     build_aggregate_usage_metrics,
 )
@@ -34,7 +37,20 @@ from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage._reported_costs import reported_cost_page, reported_cost_statement
 from cayu.storage._session_store_sql import SessionQuerySqlPlan
 
-_RESULT_SQL = """
+# Match aggregate_hosted_tool_usage_metrics_from_event_payload: progress is not usage.
+# Reuse across headline/groups, series, per-session totals and pricing populations.
+_HOSTED_USAGE_ELIGIBILITY_SQL = """(
+          event.event_type != 'model.hosted_tool_call'
+          OR (
+              event.event_type = 'model.hosted_tool_call'
+              AND event.payload ->> 'tool_type' = 'web_search'
+              AND event.payload ->> 'status' IN (
+                  'completed', 'incomplete', 'failed', 'outcome_unknown'
+              )
+          )
+      )"""
+
+_USAGE_EVENTS_SQL = """
 WITH
 scope(group_limit, identity_trim) AS (
     SELECT %s::integer, %s::text
@@ -117,8 +133,11 @@ usage_events AS MATERIALIZED (
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
+      AND {hosted_usage_eligibility}
 ),
-overall AS (
+"""
+
+_USAGE_TOTALS_SQL = """
     SELECT
         COUNT(DISTINCT session_id) AS session_count,
         COUNT(*) FILTER (WHERE event_type = 'model.completed') AS model_steps,
@@ -151,6 +170,13 @@ overall AS (
         COALESCE(SUM(web_search_calls), 0) AS web_search_calls,
         COALESCE(SUM(web_search_outcome_unknown), 0) AS web_search_outcome_unknown
     FROM usage_events
+"""
+
+_RESULT_SQL = (
+    _USAGE_EVENTS_SQL
+    + "overall AS ("
+    + _USAGE_TOTALS_SQL
+    + """
 ),
 provider_grouped AS (
     SELECT
@@ -360,6 +386,7 @@ SELECT
     web_search_outcome_unknown, group_count, NULL, 0, NULL, NULL, 0, 0
 FROM model_remainder
 """
+)
 
 _PRICING_INPUT_SQL = """
 WITH
@@ -384,16 +411,7 @@ pricing_candidates AS (
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
       )
-      AND (
-          event.event_type != 'model.hosted_tool_call'
-          OR (
-              event.event_type = 'model.hosted_tool_call'
-              AND event.payload ->> 'tool_type' = 'web_search'
-              AND event.payload ->> 'status' IN (
-                  'completed', 'incomplete', 'failed', 'outcome_unknown'
-              )
-          )
-      )
+      AND {hosted_usage_eligibility}
 ),
 measured_candidates AS (
     SELECT
@@ -469,16 +487,7 @@ pricing_candidates AS (
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
       )
-      AND (
-          event.event_type != 'model.hosted_tool_call'
-          OR (
-              event.event_type = 'model.hosted_tool_call'
-              AND event.payload ->> 'tool_type' = 'web_search'
-              AND event.payload ->> 'status' IN (
-                  'completed', 'incomplete', 'failed', 'outcome_unknown'
-              )
-          )
-      )
+      AND {hosted_usage_eligibility}
 ),
 measured_candidates AS (
     SELECT
@@ -576,6 +585,7 @@ usage_events AS MATERIALIZED (
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
+      AND {hosted_usage_eligibility}
 ),
 session_grouped AS (
     SELECT
@@ -860,6 +870,16 @@ async def aggregate_session_usage(
                 if row is None:
                     break
                 _add_session_pricing_input_from_values(session_pricing, row)
+    series = None
+    if query.series is not None:
+        series_sql, series_params = usage_series_statement(session_plan=session_plan, query=query)
+        async with connection.cursor() as cursor:
+            await cursor.execute(cast("LiteralString", series_sql), series_params)
+            raw_series = await cursor.fetchall()
+            names = [column.name for column in cursor.description]
+        series = _series_from_rows(
+            [dict(zip(names, row, strict=True)) for row in raw_series], query
+        )
     result = _result_from_rows(
         rows,
         query=query,
@@ -867,6 +887,7 @@ async def aggregate_session_usage(
         pricing=pricing.result(),
         session_pricing=session_pricing.result(),
         session_breakdown=session_breakdown,
+        series=series,
     )
     async with connection.cursor() as cursor:
         await cursor.execute(
@@ -886,8 +907,15 @@ def usage_rollup_statement(
 ) -> tuple[str, tuple[object, ...]]:
     """Build the exact PostgreSQL statement used by the aggregate read path."""
 
-    sql = _RESULT_SQL.format(
+    return _format_usage_statement(_RESULT_SQL, session_plan=session_plan, query=query)
+
+
+def _format_usage_statement(
+    template: str, *, session_plan: SessionQuerySqlPlan, query: UsageRollupQuery
+) -> tuple[str, tuple[object, ...]]:
+    sql = template.format(
         session_where_sql=session_plan.filter_where_sql,
+        hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
         **{name: _nonnegative_json_integer(path) for name, path in _TOKEN_PATHS.items()},
         web_search_calls=_web_search_terminal_count(),
         web_search_outcome_unknown=_web_search_unknown_count(),
@@ -904,6 +932,48 @@ def usage_rollup_statement(
     )
 
 
+def usage_series_statement(
+    *, session_plan: SessionQuerySqlPlan, query: UsageRollupQuery
+) -> tuple[str, tuple[object, ...]]:
+    if query.series is None:
+        raise ValueError("A usage series must be requested.")
+    buckets = time_buckets(query.start_at, query.end_at, query.series)
+    cases = " ".join(f"WHEN timestamp < %s::timestamptz THEN {i}" for i in range(len(buckets) - 1))
+    index = f"CASE {cases} ELSE {len(buckets) - 1} END" if cases else "0"
+    bucketed = f"bucketed_events AS (SELECT *, {index} AS bucket_index FROM usage_events)\n"
+    selection = _USAGE_TOTALS_SQL.replace("SELECT", "SELECT bucket_index,", 1).replace(
+        "FROM usage_events", "FROM bucketed_events"
+    )
+    template = _USAGE_EVENTS_SQL + bucketed + selection + " GROUP BY bucket_index"
+    sql, params = _format_usage_statement(template, session_plan=session_plan, query=query)
+    return sql, (*params, *(bucket.end_at for bucket in buckets[:-1]))
+
+
+def _series_from_rows(rows, query: UsageRollupQuery) -> UsageTimeSeries:
+    assert query.series is not None
+    by_index = {int(row["bucket_index"]): row for row in rows}
+    return UsageTimeSeries(
+        unit=query.series.unit,
+        timezone=query.series.timezone,
+        buckets=tuple(
+            UsageTimeBucket(
+                start_at=bucket.start_at,
+                end_at=bucket.end_at,
+                totals=_totals_from_row(by_index[index])
+                if index in by_index
+                else UsageAggregateTotals(
+                    session_count=0,
+                    model_steps=0,
+                    model_steps_with_usage=0,
+                    tool_calls=0,
+                    usage=build_aggregate_usage_metrics(),
+                ),
+            )
+            for index, bucket in enumerate(time_buckets(query.start_at, query.end_at, query.series))
+        ),
+    )
+
+
 def session_breakdown_statement(
     *,
     session_plan: SessionQuerySqlPlan,
@@ -914,6 +984,7 @@ def session_breakdown_statement(
     return (
         _SESSION_BREAKDOWN_SQL.format(
             session_where_sql=session_plan.filter_where_sql,
+            hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
             session_id_max_bytes=MAX_USAGE_ROLLUP_SESSION_ID_BYTES,
             **{name: _nonnegative_json_integer(path) for name, path in _TOKEN_PATHS.items()},
             web_search_calls=_web_search_terminal_count(),
@@ -939,6 +1010,7 @@ def pricing_input_statement(
     return (
         _PRICING_INPUT_SQL.format(
             session_where_sql=session_plan.filter_where_sql,
+            hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
             usage_metrics_projection=_postgres_usage_metrics_projection(),
             billing_identity_projection=_postgres_billing_identity_projection(
                 ("billing_identity",)
@@ -971,6 +1043,7 @@ def session_pricing_input_statement(
     return (
         _SESSION_PRICING_INPUT_SQL.format(
             session_where_sql=session_plan.filter_where_sql,
+            hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
             usage_metrics_projection=_postgres_usage_metrics_projection(),
             billing_identity_projection=_postgres_billing_identity_projection(
                 ("billing_identity",)
@@ -1151,6 +1224,7 @@ def _result_from_rows(
     pricing: tuple[tuple[UsagePricingInput, ...], int, AggregateAccuracy],
     session_pricing: tuple[tuple[UsagePricingInput, ...], int, AggregateAccuracy],
     session_breakdown: UsageSessionAggregateBreakdown | None,
+    series: UsageTimeSeries | None = None,
 ) -> UsageRollupStoreResult:
     overall = next(row for row in rows if row["section"] == "overall")
     provider_rows = _ordered_group_rows([row for row in rows if row["section"] == "provider"])
@@ -1171,6 +1245,7 @@ def _result_from_rows(
     ) = session_pricing
 
     return UsageRollupStoreResult(
+        series=series,
         as_of=as_of.astimezone(UTC),
         start_at=query.start_at,
         end_at=query.end_at,

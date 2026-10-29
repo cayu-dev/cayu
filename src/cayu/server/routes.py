@@ -4721,6 +4721,7 @@ def create_router(
         knowledge_configured=knowledge_store is not None,
         dashboard_pricing_configured=dashboard_pricing_configured,
         session_usage_aggregates_supported=session_store.supports_usage_aggregates,
+        session_usage_series_supported=session_store.supports_usage_series,
         session_topology_supported=session_store.supports_session_topology,
         evaluation_promotion_configured=evaluation_promotion is not None,
         terminal_session_evidence_supported=session_store.supports_terminal_session_evidence,
@@ -5368,7 +5369,10 @@ def create_router(
 
     async def get_usage_rollup(body: UsageRollupRequest, response: Response):
         response.headers["Cache-Control"] = "private, no-store"
+        if body.series is not None and not session_store.supports_usage_series:
+            raise HTTPException(501, detail="Usage series are unsupported by this deployment.")
         query = UsageRollupQuery(
+            series=body.series,
             start_at=body.start_at,
             end_at=body.end_at,
             sessions=body.session_filter,
@@ -5417,6 +5421,7 @@ def create_router(
             else estimate_usage_session_cost_breakdown(result, body.pricing)
         )
         response_value = UsageRollupResponse(
+            series=result.series,
             scope="configured_session_store",
             time_basis="event.timestamp",
             session_filter_basis="current_session_attributes",

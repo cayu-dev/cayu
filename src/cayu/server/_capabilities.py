@@ -45,6 +45,7 @@ class ControlPlaneCapabilitySnapshot:
     task_graph_creation_supported: bool = False
     task_creation_supported: bool = False
     tool_usage_supported: bool = False
+    session_usage_series_supported: bool = False
     session_overview_supported: bool = False
     eval_suite_views_supported: bool = False
     eval_reports_supported: bool = False
@@ -113,6 +114,15 @@ class ControlPlaneCapabilitySnapshot:
                 structured_output_transcript=_optional_surface(True, mutation_supported=False),
                 session_display_metadata=_optional_surface(True, mutation_supported=False),
                 app_info=_optional_surface(True, mutation_supported=False),
+                usage_series=_optional_surface(
+                    True,
+                    read_supported=self.session_usage_aggregates_supported
+                    and self.session_usage_series_supported,
+                    mutation_supported=False,
+                ),
+                session_overview_series=_optional_surface(
+                    True, read_supported=self.session_overview_supported, mutation_supported=False
+                ),
                 session_overview_queries=_optional_surface(
                     True, read_supported=self.session_overview_supported, mutation_supported=False
                 ),
@@ -226,6 +236,7 @@ def inspect_control_plane_capabilities(
     task_graph_creation_supported: bool = False,
     task_creation_supported: bool = False,
     tool_usage_supported: bool = False,
+    session_usage_series_supported: bool = False,
     session_overview_supported: bool = False,
     eval_suite_views_supported: bool = False,
     eval_reports_supported: bool = False,
@@ -258,6 +269,7 @@ def inspect_control_plane_capabilities(
         ("task_creation_supported", task_creation_supported),
         ("task_graph_creation_supported", task_graph_creation_supported),
         ("tool_usage_supported", tool_usage_supported),
+        ("session_usage_series_supported", session_usage_series_supported),
         ("session_overview_supported", session_overview_supported),
         ("session_topology_supported", session_topology_supported),
         ("evaluation_promotion_configured", evaluation_promotion_configured),
@@ -287,6 +299,7 @@ def inspect_control_plane_capabilities(
         task_creation_supported=task_creation_supported,
         task_graph_creation_supported=task_graph_creation_supported,
         tool_usage_supported=tool_usage_supported,
+        session_usage_series_supported=session_usage_series_supported,
         session_overview_supported=session_overview_supported,
         cayu_version=_cayu_distribution_version(),
         dashboard_configured=dashboard_configured,

@@ -7475,6 +7475,16 @@
             }
           ]
         },
+        "session_overview_series": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_trace": {
           "anyOf": [
             {
@@ -7570,6 +7580,16 @@
         },
         "usage": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
+        "usage_series": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "workflow": {
           "anyOf": [
@@ -23443,7 +23463,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "73",
+          "default": "74",
           "title": "Contract Version",
           "type": "string"
         },
@@ -24667,6 +24687,16 @@
           "title": "Running Now",
           "type": "string"
         },
+        "series": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/SessionStartSeries"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "since": {
           "format": "date-time",
           "title": "Since",
@@ -25151,6 +25181,76 @@
         }
       },
       "title": "SessionRollupQuery",
+      "type": "object"
+    },
+    "SessionStartBucket": {
+      "additionalProperties": false,
+      "properties": {
+        "end_at": {
+          "format": "date-time",
+          "title": "End At",
+          "type": "string"
+        },
+        "failed": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Failed",
+          "type": "string"
+        },
+        "start_at": {
+          "format": "date-time",
+          "title": "Start At",
+          "type": "string"
+        },
+        "total_count": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Total Count",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_at",
+        "end_at",
+        "total_count",
+        "failed"
+      ],
+      "title": "SessionStartBucket",
+      "type": "object"
+    },
+    "SessionStartSeries": {
+      "additionalProperties": false,
+      "description": "Current state of sessions grouped by their creation time, not failure time.",
+      "properties": {
+        "buckets": {
+          "items": {
+            "$ref": "#/components/schemas/SessionStartBucket"
+          },
+          "maxItems": 512,
+          "minItems": 1,
+          "title": "Buckets",
+          "type": "array"
+        },
+        "timezone": {
+          "default": "UTC",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Timezone",
+          "type": "string"
+        },
+        "unit": {
+          "enum": [
+            "hour",
+            "day",
+            "week"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit",
+        "buckets"
+      ],
+      "title": "SessionStartSeries",
       "type": "object"
     },
     "SessionStateResponse": {
@@ -27576,6 +27676,32 @@
       "title": "TieredPricing",
       "type": "object"
     },
+    "TimeSeriesSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "timezone": {
+          "default": "UTC",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Timezone",
+          "type": "string"
+        },
+        "unit": {
+          "enum": [
+            "hour",
+            "day",
+            "week"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit"
+      ],
+      "title": "TimeSeriesSpec",
+      "type": "object"
+    },
     "ToolApprovalBody": {
       "description": "Body for resolving a pending tool approval.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``: the resumed run inherits the original run's configuration\npersisted on the pending approval. Explicit values are accepted only when\nthey preserve the invocation's frozen execution profile.",
       "properties": {
@@ -29683,6 +29809,16 @@
           "title": "Pricing Input Limit",
           "type": "integer"
         },
+        "series": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/TimeSeriesSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_filter": {
           "$ref": "#/components/schemas/SessionAggregateFilter"
         },
@@ -29773,6 +29909,16 @@
           "const": "configured_session_store",
           "title": "Scope",
           "type": "string"
+        },
+        "series": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageTimeSeries"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "session_breakdown": {
           "anyOf": [
@@ -30084,6 +30230,68 @@
         "unpriced_reasons"
       ],
       "title": "UsageSessionCostSummary",
+      "type": "object"
+    },
+    "UsageTimeBucket": {
+      "additionalProperties": false,
+      "properties": {
+        "end_at": {
+          "format": "date-time",
+          "title": "End At",
+          "type": "string"
+        },
+        "start_at": {
+          "format": "date-time",
+          "title": "Start At",
+          "type": "string"
+        },
+        "totals": {
+          "$ref": "#/components/schemas/UsageAggregateTotals"
+        }
+      },
+      "required": [
+        "start_at",
+        "end_at",
+        "totals"
+      ],
+      "title": "UsageTimeBucket",
+      "type": "object"
+    },
+    "UsageTimeSeries": {
+      "additionalProperties": false,
+      "description": "Event-time activity counters; distinct sessions are not additive across buckets.",
+      "properties": {
+        "buckets": {
+          "items": {
+            "$ref": "#/components/schemas/UsageTimeBucket"
+          },
+          "maxItems": 512,
+          "minItems": 1,
+          "title": "Buckets",
+          "type": "array"
+        },
+        "timezone": {
+          "default": "UTC",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Timezone",
+          "type": "string"
+        },
+        "unit": {
+          "enum": [
+            "hour",
+            "day",
+            "week"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit",
+        "buckets"
+      ],
+      "title": "UsageTimeSeries",
       "type": "object"
     },
     "UsageUnpricedReason": {
@@ -30566,7 +30774,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "73",
+          "default": "74",
           "title": "Contract Version",
           "type": "string"
         }
@@ -34433,6 +34641,59 @@
         "parameters": [
           {
             "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "bucket_unit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "hour",
+                    "day",
+                    "week"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Bucket Unit"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Environment Name"
+            }
+          },
+          {
+            "in": "query",
             "name": "include_eval",
             "required": false,
             "schema": {
@@ -34453,6 +34714,38 @@
           },
           {
             "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Provider Name"
+            }
+          },
+          {
+            "in": "query",
             "name": "since",
             "required": false,
             "schema": {
@@ -34466,6 +34759,16 @@
                 }
               ],
               "title": "Since"
+            }
+          },
+          {
+            "in": "query",
+            "name": "timezone",
+            "required": false,
+            "schema": {
+              "default": "UTC",
+              "title": "Timezone",
+              "type": "string"
             }
           },
           {

@@ -762,6 +762,7 @@ class InMemorySessionStore(
                 self._session_closure_tombstones[(root_id, plan_id, child_id)] = tombstone
             return tuple(tombstones)
 
+    supports_usage_series: ClassVar[bool] = True
     supports_usage_aggregates: ClassVar[bool] = True
     supports_private_argument_continuity: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True

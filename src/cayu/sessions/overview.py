@@ -12,9 +12,18 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from pydantic import Field, model_validator
+
+from cayu._time_buckets import (
+    MAX_TIME_BUCKETS,
+    TimeBucket,
+    TimeSeriesSpec,
+    bucket_index,
+    time_buckets,
+)
 from cayu._validation import revalidate_model_input
 from cayu.budgets.pricing import PriceBook, SessionCostTotals, add_cost_amounts
-from cayu.budgets.usage import SessionUsageSummary
+from cayu.budgets.usage import AggregateCount, SessionUsageSummary
 from cayu.releases import recorded_release_identity
 from cayu.sessions._foreground_child_checkpoint import foreground_child_state_from_checkpoint
 from cayu.sessions._run_identity import (
@@ -32,7 +41,12 @@ from cayu.sessions.pending_action_contracts import (
     PendingActionQuery,
     PendingActionRecord,
 )
-from cayu.sessions.queries import SessionOrder, SessionQuery
+from cayu.sessions.queries import (
+    SessionAggregateFilter,
+    SessionOrder,
+    _session_matches,
+    session_query_from_aggregate_filter,
+)
 from cayu.sessions.records import PendingActionKind, Session, SessionStatus
 
 if TYPE_CHECKING:
@@ -104,6 +118,23 @@ class SessionOverviewUnavailable(RuntimeError):
     """An incomplete source cannot establish a truthful overview or count."""
 
 
+class SessionStartBucket(TimeBucket):
+    total_count: AggregateCount = Field(ge=0)
+    failed: AggregateCount = Field(ge=0)
+
+    @model_validator(mode="after")
+    def failures_are_subset(self) -> SessionStartBucket:
+        if self.failed > self.total_count:
+            raise ValueError("Failed starts cannot exceed total starts.")
+        return self
+
+
+class SessionStartSeries(TimeSeriesSpec):
+    """Current state of sessions grouped by their creation time, not failure time."""
+
+    buckets: tuple[SessionStartBucket, ...] = Field(min_length=1, max_length=MAX_TIME_BUCKETS)
+
+
 @dataclass(frozen=True, slots=True)
 class SessionOverviewCounts:
     since: datetime
@@ -116,6 +147,7 @@ class SessionOverviewCounts:
     tokens_complete: bool
     cost: Decimal | None
     cost_complete: bool
+    series: SessionStartSeries | None = None
 
     @property
     def total_count(self) -> int:
@@ -220,6 +252,8 @@ class SessionOverviewReader:
         until: datetime | None = None,
         include_eval: bool = False,
         include_forks: bool = False,
+        filters: SessionAggregateFilter | None = None,
+        series: TimeSeriesSpec | None = None,
     ) -> SessionOverviewCounts:
         """Complete current-read counts, not a cross-store atomic snapshot.
 
@@ -233,6 +267,16 @@ class SessionOverviewReader:
             raise ValueError("Overview counts require aware since < until.")
         if type(include_eval) is not bool or type(include_forks) is not bool:
             raise TypeError("Overview inclusion flags must be bools.")
+        filters = (
+            SessionAggregateFilter()
+            if filters is None
+            else SessionAggregateFilter.model_validate(filters.model_dump())
+        )
+        filter_query = session_query_from_aggregate_filter(filters)
+        buckets = () if series is None else time_buckets(since, until, series)
+        starts = tuple(bucket.start_at for bucket in buckets)
+        start_counts = [0 for _ in buckets]
+        failed_counts = [0 for _ in buckets]
         counts = dict.fromkeys(SessionOverviewStatus, 0)
         input_tokens = output_tokens = cached_tokens = 0
         tokens_complete = True
@@ -244,10 +288,8 @@ class SessionOverviewReader:
         seen: set[str] = set()
         while True:
             page = await self._store.list_sessions(
-                SessionQuery(
-                    limit=200,
-                    cursor=cursor,
-                    order_by=SessionOrder.CREATED_AT_ASC,
+                filter_query.model_copy(
+                    update={"limit": 200, "cursor": cursor, "order_by": SessionOrder.CREATED_AT_ASC}
                 )
             )
             eligible = [session for session in page.sessions if session.created_at < until]
@@ -257,7 +299,11 @@ class SessionOverviewReader:
             accounting_sessions: dict[str, str | None] = {}
             for session_id, instance_id in expected.items():
                 session = await self._load(session_id)
-                if session is None or session.instance_id != instance_id:
+                if (
+                    session is None
+                    or session.instance_id != instance_id
+                    or not _session_matches(session, filter_query)
+                ):
                     continue
                 identity = session_run_id(session)
                 if identity in seen:
@@ -275,7 +321,11 @@ class SessionOverviewReader:
                 # Pending and lineage joins may outlive this incarnation. Match
                 # the full overview selection fence before including its facts.
                 current = await self._store.load(session.id)
-                if current is None or current.instance_id != session.instance_id:
+                if (
+                    current is None
+                    or current.instance_id != session.instance_id
+                    or not _session_matches(current, filter_query)
+                ):
                     continue
                 accounting_sessions[session.id] = session.instance_id
                 if not state.complete:
@@ -284,6 +334,10 @@ class SessionOverviewReader:
                     running += 1
                 if session.created_at >= since:
                     counts[state.status] += 1
+                    if buckets:
+                        index = bucket_index(starts, session.created_at)
+                        start_counts[index] += 1
+                        failed_counts[index] += int(state.status is SessionOverviewStatus.FAILED)
             if accounting_sessions:
                 accounting_query = EventQuery(
                     session_ids=tuple(accounting_sessions), since=since, until=until
@@ -313,7 +367,11 @@ class SessionOverviewReader:
                 # must not donate consumption to the selected incarnation.
                 for session_id, instance_id in accounting_sessions.items():
                     current = await self._store.load(session_id)
-                    if current is None or current.instance_id != instance_id:
+                    if (
+                        current is None
+                        or current.instance_id != instance_id
+                        or not _session_matches(current, filter_query)
+                    ):
                         raise SessionOverviewUnavailable("Session changed during accounting.")
                 input_tokens += summary.usage.input_tokens
                 output_tokens += summary.usage.output_tokens
@@ -342,6 +400,18 @@ class SessionOverviewReader:
             tokens_complete,
             cost,
             cost_complete,
+            None
+            if series is None
+            else SessionStartSeries(
+                unit=series.unit,
+                timezone=series.timezone,
+                buckets=tuple(
+                    SessionStartBucket(
+                        start_at=b.start_at, end_at=b.end_at, total_count=count, failed=failed
+                    )
+                    for b, count, failed in zip(buckets, start_counts, failed_counts, strict=True)
+                ),
+            ),
         )
 
     async def _pending(self, session: Session) -> _PendingEvidence:

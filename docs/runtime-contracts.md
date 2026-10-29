@@ -10126,6 +10126,23 @@ configured secret redaction would alter a retained session identity, the
 endpoint fails closed with `409` instead of returning a redacted identity that
 could collide with another session or become an invalid drill-down target.
 
+An optional usage `series` requests up to 512 contiguous hour/day/week buckets
+with exact UTC bounds and the same normalized event families as the headline.
+Calendar arithmetic is shared across Memory, SQLite and PostgreSQL; each SQL
+backend uses one additional indexed range aggregate inside the existing read
+snapshot, independent of the number of buckets. Memory assigns each qualifying
+event during its aggregate scan. Empty buckets are explicit zeros. Additive
+counters must conserve the full-window totals; distinct activity-session counts
+are independently computed per bucket and are not additive. The response does
+not attach estimated costs to these counter buckets or change headline pricing.
+Custom stores advertise `supports_usage_series` separately from
+`supports_usage_aggregates`; its default is false. The server rejects unsupported
+series requests and validates returned series against the exact requested
+unit, timezone, boundaries and totals before publication. Requests without a
+series keep their existing aggregate path. See the
+[control-plane time-window contract](control-plane.md#usage-windows-and-series)
+for calendar/DST and filtered session-start histogram semantics.
+
 Windows are limited to 366 days and the SQL stores execute database-side
 totals/breakdown aggregates over the event-type/time index rather than loading
 session histories into the server process. When pricing is requested,

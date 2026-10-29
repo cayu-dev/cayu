@@ -471,6 +471,42 @@ writes are a separate API; this read does not infer titles from messages or
 change the session metadata mutation contract.
 
 
+
+### Usage windows and series
+
+`POST /api/usage/rollup` accepts an optional `series` object with `unit`
+(`hour`, `day` or `week`) and an IANA `timezone` (default `UTC`). Check
+`capabilities.surfaces.usage_series.read.enabled` before requesting it. The
+response includes ordered buckets with explicit UTC `start_at`, `end_at` and
+usage `totals`; omitted `series` returns null and performs no series query.
+Buckets contain activity counters, not estimated costs. Existing headline
+pricing remains independent.
+
+Event windows are half-open. A session created earlier still contributes its
+recent activity. Tokens, model steps and tool calls sum across buckets; distinct
+activity sessions do not, because one session can appear in several buckets.
+Each series has at most 512 buckets within the existing 366-day window; overly
+fine resolutions are rejected rather than silently widened. Hours advance in
+elapsed time, including both repeated hours at a daylight-saving transition.
+Days follow local midnight and weeks are seven calendar days anchored to the
+first local date. First and last buckets are clipped to the requested window.
+A repeated midnight uses its first occurrence; a nonexistent midnight uses its
+corresponding next real instant. Fully skipped calendar days have no bucket.
+
+`GET /api/sessions/overview/counts` also accepts exact `agent_name`,
+`environment_name`, `provider_name` and `model` filters against current session
+attributes. Optional `bucket_unit` and `timezone` request a batched `series` of
+`total_count` and `failed` per creation-time bucket. Check
+`capabilities.surfaces.session_overview_series.read.enabled` for these options.
+Failures describe the current state of those session starts, not failure events
+occurring in the bucket. Existing eval/fork exclusions and older `running_now`
+sessions remain unchanged. This live overview observation is separate from the
+store snapshot used by the event-usage rollup.
+
+`cayu usage rollup` and `cayu usage counts` expose the same data through a running
+local server (`--server-url`) or Cloud Agent (`--application`). See
+[Session inspection](session-inspection.md#event-window-usage-and-start-counts).
+
 ### Home and Inbox
 
 Home reads its last-day sessions, failures, tokens and cost from the authoritative

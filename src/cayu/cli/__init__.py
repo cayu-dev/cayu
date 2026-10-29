@@ -51,6 +51,7 @@ def _command_specs() -> tuple[
     from cayu.cli.session import add_session_parser, run_session
     from cayu.cli.storage import add_storage_parser, run_storage
     from cayu.cli.task import add_task_parser, run_task
+    from cayu.cli.usage import add_usage_parser, run_usage
     from cayu.cli.worker import add_worker_parser, run_worker
 
     return (
@@ -78,6 +79,7 @@ def _command_specs() -> tuple[
         ("session", add_session_parser, run_session),
         ("storage", add_storage_parser, run_storage),
         ("task", add_task_parser, run_task),
+        ("usage", add_usage_parser, run_usage),
         ("worker", add_worker_parser, run_worker),
     )
 

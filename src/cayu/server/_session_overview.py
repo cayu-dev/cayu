@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import ValidationError
 
+from cayu._time_buckets import BucketUnit, TimeSeriesSpec
 from cayu.artifacts.base import (
     ArtifactListResult,
     ArtifactScope,
@@ -47,7 +48,7 @@ from cayu.sessions.overview import (
     SessionOverviewStatus,
     SessionOverviewUnavailable,
 )
-from cayu.sessions.queries import SessionOrder, SessionQuery
+from cayu.sessions.queries import SessionAggregateFilter, SessionOrder, SessionQuery
 from cayu.sessions.records import Session
 from cayu.sessions.store import SessionStore
 from cayu.tools._browser_usage import has_retained_browser_usage
@@ -272,6 +273,12 @@ def register_session_overview_counts(
         until: datetime | None = None,
         include_eval: bool = False,
         include_forks: bool = False,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        provider_name: str | None = None,
+        model: str | None = None,
+        bucket_unit: BucketUnit | None = None,
+        timezone: str = "UTC",
     ) -> SessionOverviewCountsResponse:
         try:
             counts = await SessionOverviewReader(service.store, pricing=service.pricing).counts(
@@ -279,10 +286,20 @@ def register_session_overview_counts(
                 until=until,
                 include_eval=include_eval,
                 include_forks=include_forks,
+                filters=SessionAggregateFilter(
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    provider_name=provider_name,
+                    model=model,
+                ),
+                series=None
+                if bucket_unit is None
+                else TimeSeriesSpec(unit=bucket_unit, timezone=timezone),
             )
         except ValueError:
             raise HTTPException(
-                422, detail="Overview counts require aware since < until."
+                422,
+                detail="Overview counts require valid filters, an aware window and a bounded series.",
             ) from None
         except (
             SessionOverviewUnavailable,
@@ -293,6 +310,7 @@ def register_session_overview_counts(
             raise overview_http_error(exc) from exc
         response.headers["Cache-Control"] = "private, no-store"
         return SessionOverviewCountsResponse(
+            series=counts.series,
             since=counts.since,
             until=counts.until,
             running_now=counts.running_now,

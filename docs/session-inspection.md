@@ -7,6 +7,41 @@ without requiring operators to know Cayu table names or JSON paths. The
 resolution command talks to the authenticated Cayu server; it never mutates the
 store directly.
 
+
+## Event-window usage and start counts
+
+Use `cayu usage` to read the Developer dashboard's aggregate data from a running
+local server or a Cloud Agent. This is separate from `cayu session rollup`,
+which selects sessions by creation time and summarizes their retained activity.
+The usage rollup selects events by time, including recent work in older sessions.
+
+```bash
+cayu usage rollup --server-url http://localhost:8000 \
+  --since 2026-10-01T00:00:00Z --until 2026-10-08T00:00:00Z \
+  --bucket day --timezone Asia/Bishkek --agent writer --json
+
+cayu usage counts --application accounting-agent \
+  --since 2026-10-01T00:00:00Z --until 2026-10-08T00:00:00Z \
+  --bucket day --agent writer --table
+```
+
+Both commands accept `--agent`, `--environment`, `--provider` and `--model` as
+exact current-session filters. `--server-url` supports mounted APIs; authenticated
+servers read the complete Authorization header from `CAYU_API_AUTHORIZATION`
+or the variable named by `--authorization-env`. Cloud uses the existing login
+and optional `--context` file. These commands do not open database files directly.
+
+`rollup` optionally accepts `--price-book FILE` for the existing estimated
+headline cost and `--top-sessions N` for the current token-ranked session detail.
+Without a price book, costs are not requested. Counter buckets never claim to
+be cost buckets; partial or unevaluated headline pricing remains explicit in
+JSON. `counts` groups sessions by start time and reports their current failures,
+excluding evaluation trials and forks unless `--include-eval` or
+`--include-forks` is supplied. Older running sessions remain in `running_now`.
+Activity-session counts cannot be summed across usage buckets. Explicit windows
+and the optional hour/day/week series follow the
+[control-plane contract](control-plane.md#usage-windows-and-series).
+
 ## Developer dashboard list
 
 Open `/cayu/sessions` to browse canonical session state and agent-authored titles and

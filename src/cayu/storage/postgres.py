@@ -609,6 +609,7 @@ class PostgresSessionStore(
             labels = await self._load_labels(cur, session_id)
             return require_clause_admitted(bounds, pg_support.session_from_row(row, labels=labels))
 
+    supports_usage_series: ClassVar[bool] = True
     supports_usage_aggregates: ClassVar[bool] = True
     supports_private_argument_continuity: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
