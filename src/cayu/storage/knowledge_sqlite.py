@@ -270,7 +270,15 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
         access_scope: KnowledgeAccessScope | None = None,
         clock: Callable[[], datetime] | None = None,
+        read_only: bool = False,
     ) -> None:
+        """Open the knowledge store at ``path``.
+
+        ``read_only=True`` opens an existing database for inspection (as ``cayu
+        knowledge`` does): listing, loading entries and reading chunks work, writes and
+        exact-revision search don't, and it requires ``schema_mode=SchemaMode.VALIDATE``.
+        """
+
         require_sqlite_store_allowed("SQLiteKnowledgeStore")
         if isinstance(path, Path):
             db_path = path
@@ -280,6 +288,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             raise TypeError("SQLiteKnowledgeStore path must be a string or Path.")
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be a bool.")
+        if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
+            raise ValueError("read_only SQLite stores require schema_mode=validate.")
         self.path = db_path
         self._default_access_scope = (
             None if access_scope is None else copy_knowledge_access_scope(access_scope)
@@ -287,14 +299,19 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         self._clock = utc_clock(clock)
         self._schema_mode = schema_mode
         self._lock = TimedStoreLock()
-        self._connection = sqlite_connection.connect(db_path)
+        if not read_only:
+            self._connection = sqlite_connection.connect(db_path)
+        elif sqlite_support.current_diagnostic_store_inspection() is not None:
+            self._connection = sqlite_connection.connect_read_only_inspection(db_path)
+        else:
+            self._connection = sqlite_connection.connect(db_path, read_only=True)
         try:
             sqlite_support.reconcile_schema(
                 self._connection,
                 schema_mode,
                 app_min_supported=_SQLITE_MIN_REQUIRED_REVISION,
             )
-            if sqlite_support.current_diagnostic_store_inspection() is None:
+            if not read_only and sqlite_support.current_diagnostic_store_inspection() is None:
                 self._connection.execute(
                     f"""
                     CREATE VIRTUAL TABLE temp.{_EXACT_REVISION_FTS_TABLE}

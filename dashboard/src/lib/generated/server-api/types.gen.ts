@@ -12574,6 +12574,122 @@ export type JudgeProfileIdentityV1 = {
 };
 
 /**
+ * KeptKnowledgeDetailResponse
+ *
+ * One kept entry (`GET /api/knowledge/{entry_id}`), shaped like a pending one.
+ */
+export type KeptKnowledgeDetailResponse = {
+    /**
+     * Aspects
+     */
+    aspects: Array<string>;
+    /**
+     * Chunk Limit
+     */
+    chunk_limit: number;
+    /**
+     * Chunk Max Bytes
+     */
+    chunk_max_bytes: number;
+    /**
+     * Chunks
+     */
+    chunks: Array<ApiKnowledgeChunk>;
+    /**
+     * Confidence
+     */
+    confidence: string | null;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Created By
+     */
+    created_by: string | null;
+    /**
+     * Created By Type
+     */
+    created_by_type: string;
+    /**
+     * Entry Id
+     */
+    entry_id: string;
+    /**
+     * Expires At
+     */
+    expires_at: string | null;
+    /**
+     * Impact Targets
+     */
+    impact_targets: Array<string>;
+    /**
+     * Importance
+     */
+    importance: string | null;
+    /**
+     * Importance Source
+     */
+    importance_source: string | null;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Labels
+     */
+    labels: {
+        [key: string]: string;
+    };
+    /**
+     * Metadata
+     */
+    metadata: {
+        [key: string]: unknown;
+    };
+    /**
+     * Namespace
+     */
+    namespace: string;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Source Id
+     */
+    source_id: string | null;
+    /**
+     * Source Type
+     */
+    source_type: string | null;
+    /**
+     * Source Uri
+     */
+    source_uri: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Text
+     */
+    text: string;
+    /**
+     * Title
+     */
+    title: string | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Visibility
+     */
+    visibility: string;
+};
+
+/**
  * KeptKnowledgeListResponse
  */
 export type KeptKnowledgeListResponse = {
@@ -26771,6 +26887,18 @@ export type KeptKnowledgeApiKnowledgeGetData = {
          * Max Bytes
          */
         max_bytes?: number;
+        /**
+         * Namespace
+         */
+        namespace?: string | null;
+        /**
+         * Kind
+         */
+        kind?: Array<string> | null;
+        /**
+         * Label
+         */
+        label?: Array<string> | null;
     };
     url: '/api/knowledge';
 };
@@ -26792,6 +26920,45 @@ export type KeptKnowledgeApiKnowledgeGetResponses = {
 };
 
 export type KeptKnowledgeApiKnowledgeGetResponse = KeptKnowledgeApiKnowledgeGetResponses[keyof KeptKnowledgeApiKnowledgeGetResponses];
+
+export type KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Entry Id
+         */
+        entry_id: string;
+    };
+    query?: {
+        /**
+         * Max Chunks
+         */
+        max_chunks?: number;
+        /**
+         * Max Bytes
+         */
+        max_bytes?: number;
+    };
+    url: '/api/knowledge/kept/{entry_id}';
+};
+
+export type KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetError = KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetErrors[keyof KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetErrors];
+
+export type KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: KeptKnowledgeDetailResponse;
+};
+
+export type KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetResponse = KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetResponses[keyof KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetResponses];
 
 export type ListPendingKnowledgeApiKnowledgePendingGetData = {
     body?: never;

@@ -3353,6 +3353,10 @@ class PendingKnowledgeDetailResponse(ApiKnowledgeEntryBase):
     chunk_max_bytes: StrictInt = Field(ge=1)
 
 
+class KeptKnowledgeDetailResponse(PendingKnowledgeDetailResponse):
+    """One kept entry (`GET /api/knowledge/{entry_id}`), shaped like a pending one."""
+
+
 STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
         "description": (

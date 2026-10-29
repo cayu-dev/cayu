@@ -3,19 +3,16 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
-import sys
 from typing import Any, cast
 
-from cayu.cli._cloud_agent_api import CayuApiError, open_cloud_agent_api
+from cayu.cli._cloud_agent_api import open_cloud_agent_api
 from cayu.cli._output import (
     add_output_options,
-    output_destination,
     print_table,
     terminal_safe,
 )
-from cayu.cli._read_targets import ReadTarget, add_read_target_options, resolve_read_target
+from cayu.cli._read_targets import ReadTarget, add_read_target_options, run_read_command
 from cayu.cli._task_readers import (
     MAX_TASK_PAGE,
     ApiTaskReader,
@@ -23,7 +20,7 @@ from cayu.cli._task_readers import (
     TaskReader,
     open_store_task_reader,
 )
-from cayu.cli.session import _redact_sensitive, _safe_error
+from cayu.cli.session import _redact_sensitive
 from cayu.tasks.records import TaskStatus
 
 CLI_SCHEMA_VERSION = "1"
@@ -91,24 +88,12 @@ def add_task_parser(subparsers: Any) -> None:
 
 
 def run_task(args: argparse.Namespace) -> int:
-    try:
-        with output_destination(args.output):
-            return _run_task(args)
-    except OSError as exc:
-        print(f"error: could not write output: {exc}", file=sys.stderr)
-        return 1
-
-
-def _run_task(args: argparse.Namespace) -> int:
-    dsn: str | None = None
-    try:
-        target = resolve_read_target(args)
-        dsn = None if target.store is None else target.store.postgres_dsn
-        return asyncio.run(_run_task_command(args, target))
-    except Exception as exc:
-        # Driver and SQLite failures have backend-specific types; keep DSNs out of output.
-        _render_error(args.output_format, _safe_error(str(exc), dsn), _category(exc))
-        return 1
+    return run_read_command(
+        args,
+        _run_task_command,
+        error_code="TASK_INSPECTION_FAILED",
+        schema_version=CLI_SCHEMA_VERSION,
+    )
 
 
 async def _run_task_command(args: argparse.Namespace, target: ReadTarget) -> int:
@@ -359,26 +344,6 @@ def _print_task(payload: dict[str, Any]) -> None:
                     keep_lines=True,
                 )
             )
-
-
-def _render_error(output_format: str, message: str, category: str | None) -> None:
-    if output_format in {"json", "jsonl"}:
-        error: dict[str, Any] = {"code": "TASK_INSPECTION_FAILED", "message": message}
-        if category is not None:
-            error["category"] = category
-        print(
-            json.dumps(
-                {"schema_version": CLI_SCHEMA_VERSION, "error": error},
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-        )
-        return
-    print(f"error: {terminal_safe(message)}", file=sys.stderr)
-
-
-def _category(exc: Exception) -> str | None:
-    return exc.category if isinstance(exc, CayuApiError) else None
 
 
 def _page_limit(value: str) -> int:

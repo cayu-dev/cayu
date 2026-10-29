@@ -9,7 +9,11 @@ read through its own Cayu API (`cayu.cli._cloud_agent_api`).
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import math
+import sys
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,6 +76,52 @@ def resolve_read_target(args: argparse.Namespace) -> ReadTarget:
         context=args.context,
         timeout_seconds=args.timeout_seconds,
     )
+
+
+def run_read_command(
+    args: argparse.Namespace,
+    command: Callable[[argparse.Namespace, ReadTarget], Coroutine[object, object, int]],
+    *,
+    error_code: str,
+    schema_version: str,
+) -> int:
+    """Resolve the target and run ``command``, rendering any failure the same way.
+
+    JSON output gets ``{"schema_version", "error": {"code", "message", "category"?}}``;
+    table output gets ``error: ...`` on stderr. Postgres DSNs never reach either.
+    """
+
+    from cayu.cli._cloud_agent_api import CayuApiError
+    from cayu.cli._output import output_destination, terminal_safe
+    from cayu.cli.session import _safe_error
+
+    try:
+        with output_destination(args.output):
+            dsn: str | None = None
+            try:
+                target = resolve_read_target(args)
+                dsn = None if target.store is None else target.store.postgres_dsn
+                return asyncio.run(command(args, target))
+            except Exception as exc:
+                # Driver and SQLite failures have backend-specific types.
+                message = _safe_error(str(exc), dsn)
+                if args.output_format not in {"json", "jsonl"}:
+                    print(f"error: {terminal_safe(message)}", file=sys.stderr)
+                    return 1
+                error: dict[str, str] = {"code": error_code, "message": message}
+                if isinstance(exc, CayuApiError):
+                    error["category"] = exc.category
+                print(
+                    json.dumps(
+                        {"schema_version": schema_version, "error": error},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return 1
+    except OSError as exc:
+        print(f"error: could not write output: {exc}", file=sys.stderr)
+        return 1
 
 
 def _positive_seconds(value: str) -> float:

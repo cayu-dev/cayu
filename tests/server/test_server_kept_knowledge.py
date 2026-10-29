@@ -761,3 +761,25 @@ def test_kept_cursor_error_names_knowledge_listing(configured_key, invalid_kind,
         assert "Restart the knowledge listing." in result.json()["detail"]
         assert "inbox listing" not in result.json()["detail"]
         assert result.headers["cache-control"] == "private, no-store"
+
+
+def test_kept_entry_leaves_out_a_chunk_cut_inside_a_multibyte_character(monkeypatch):
+    from cayu.server import _kept_knowledge
+
+    # A 64-byte read window; the entry's one chunk is 65 bytes and ends in a 3-byte
+    # character, so the store's UTF-8 cut returns 62 bytes, short of the window.
+    monkeypatch.setattr(_kept_knowledge, "_CHUNK_READ_BYTES", 64)
+    scope = KnowledgeAccessScope.privileged()
+    store = InMemoryKnowledgeStore(
+        [KnowledgeEntry(id="kept", text="a" * 62 + "€", status=KnowledgeStatus.ACTIVE)],
+        access_scope=scope,
+    )
+    with TestClient(
+        create_server(
+            CayuApp(knowledge_store=store, knowledge_access_scope=scope, enable_logging=False),
+            config=ServerConfig.local_development(),
+        )
+    ) as client:
+        response = client.get("/api/knowledge/kept/kept")
+        assert response.status_code == 200
+        assert response.json()["chunks"] == []

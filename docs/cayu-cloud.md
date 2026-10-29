@@ -967,7 +967,8 @@ The older environment-wide `AUTH_USER`/`AUTH_PASS` pair Cloud also injects is de
 
 Read commands that inspect durable state take `--application NAME` to read an Agent on
 Cayu Cloud instead of a local store, for example `cayu task list --application my-agent`
-([inspecting tasks](project-workers.md#inspect-tasks)). The CLI signs in as `cayu cloud`
+([inspecting tasks](project-workers.md#inspect-tasks)) and `cayu knowledge list
+--application my-agent` ([kept knowledge](control-plane.md#kept-knowledge)). The CLI signs in as `cayu cloud`
 does (`cayu cloud login`, `--context PATH`, or `CAYU_CLOUD_API_KEY`), asks Cloud for the
 Agent's Cayu address and its [Developer dashboard login](#agent-developer-dashboard-credentials),
 and reads the Agent's own Cayu API with that login, so the same people who can read the

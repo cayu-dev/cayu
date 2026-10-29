@@ -7216,3 +7216,32 @@ def test_postgres_revision_migration_refuses_unversioned_knowledge_before_ddl(
         asyncio.run(run())
     finally:
         asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_read_only_knowledge_store_refuses_writes(postgres_dsn: str) -> None:
+    async def run() -> None:
+        from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        scope = KnowledgeAccessScope.privileged()
+        writable = PostgresKnowledgeStore(
+            postgres_dsn, min_size=1, max_size=2, schema_mode=SchemaMode.CREATE, access_scope=scope
+        )
+        # Stores open on first use; this read creates the schema.
+        assert await writable.get_entry("written") is None
+        await writable.close()
+        inspector = PostgresKnowledgeStore(
+            postgres_dsn, min_size=1, max_size=2, read_only=True, access_scope=scope
+        )
+        try:
+            with pytest.raises(Exception, match="read-only transaction"):
+                await inspector.create_entry(
+                    KnowledgeEntry(
+                        id="written", text="must not land", status=KnowledgeStatus.ACTIVE
+                    )
+                )
+            assert await inspector.get_entry("written") is None
+        finally:
+            await inspector.close()
+
+    asyncio.run(run())

@@ -647,6 +647,14 @@ configured knowledge namespace, labels and access scope. Members can read this
 route. Pending proposals still use `/api/knowledge/pending` and the existing
 Keep/Drop decisions.
 
+`namespace`, `kind` and `label` (`key=value`) narrow the list; `kind` and `label`
+repeat, and every label must match. They stay inside the configured scope: a
+`namespace` or `label` value that conflicts with it answers 422 saying which.
+`GET /api/knowledge/kept/{entry_id}` returns one kept entry with its text, metadata and
+chunks (`max_chunks` up to 50, `max_bytes` up to 128,000), shaped like
+`GET /api/knowledge/pending/{entry_id}`. An entry that isn't active, is outside the
+scope, or is hidden from the caller answers 404 the same way.
+
 Each entry includes its existing provenance fields and a public preview. A
 registered model actor supplies `specialist`; a matching retained source session
 supplies `source_session_id`. Missing or conflicting evidence leaves these fields
@@ -662,7 +670,10 @@ are bound to the authenticated subject, tenant and configured knowledge scope.
 An access-filtered page can be empty and still have a continuation. `total_count`
 is always null; a page is not a total or a stable cross-request snapshot. An entry
 that cannot fit or a response exceeding the public metadata bound returns 413
-instead of an incomplete successful page.
+instead of an incomplete successful page. An invalid query parameter answers 422
+naming it and its rule, for example `Invalid control-plane request: query parameter
+limit must be at most 100.`, as every bounded control-plane route does for its
+query, path and header parameters (body failures still don't say which field).
 
 `lookups` is a decimal string counting each namespace/entry identity once per
 retained `knowledge.lookup` event. `last_used_at` is the latest such timestamp.
@@ -683,6 +694,26 @@ operation does not promise idempotent acknowledgement replay: after a lost
 response, inspect canonical state; repeating the old revision can return 409.
 Members cannot retire entries. Retirement does not replace Keep or Drop for
 pending proposals.
+
+`cayu knowledge list` and `cayu knowledge show ENTRY_ID` read the same entries
+from the command line, from a local store (`--sqlite`, `--postgres`, or the
+project's store, opened read-only with every namespace visible) or from a Cayu
+Cloud Agent through these routes (`--application NAME`, see
+[reading an Agent's state](cayu-cloud.md#reading-an-agents-state-from-the-cli)):
+
+```bash
+cayu knowledge list --kind denial --label agent=reviewer
+cayu knowledge list --status pending --namespace reviews --json
+cayu knowledge show ENTRY_ID
+```
+
+`--status` is `active` (kept, the default) or `pending`, and `archived` from a
+local store. `--kind` repeats for any of several kinds and `--label KEY=VALUE`
+repeats to require several labels. A page with more after it prints the
+`--cursor` to continue with. `show` prints an entry of any status with its text,
+and `--json` adds its chunks. The CLI applies the filters to what an Agent
+returns too, so an Agent on a Cayu without these filters still answers
+correctly.
 
 ### Inspecting specialists and tools
 

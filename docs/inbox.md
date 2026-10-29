@@ -362,7 +362,7 @@ settles an item, not only on the inbox routes.
 | Route | A hidden item |
 | --- | --- |
 | `GET /api/inbox`, `GET /api/pending-actions`, `GET /api/knowledge/pending` | Isn't listed |
-| `GET /api/inbox/{item_id}`, `GET /api/knowledge/pending/{entry_id}` | 404 |
+| `GET /api/inbox/{item_id}`, `GET /api/knowledge/pending/{entry_id}`, `GET /api/knowledge/kept/{entry_id}` | 404 |
 | `POST /api/inbox/{item_id}/settle`, `POST /api/tool-approvals/resolve`, `POST /api/tool-approvals/recover`, `POST /api/tool-rounds/recover`, `POST /api/user-input/resolve`, `POST /api/user-input/recover`, `POST /api/tool-authorization-grants/approve`, `POST /api/knowledge/{entry_id}/approve` and `/reject` | 404, before anything is replayed or changed |
 | `GET /api/sessions/{id}/human-review` | 403 |
 | `GET /api/human-attention/{attention_id}` | `unavailable` |

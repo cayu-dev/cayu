@@ -673,7 +673,7 @@ class _PostgresStoreBase:
                 separators=(",", ":"),
             )
         if read_only and not self._supports_read_only and not diagnostic_inspection:
-            raise ValueError("read_only is only supported by PostgresSessionStore.")
+            raise ValueError(f"read_only is not supported by {type(self).__name__}.")
         if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
             raise ValueError("Read-only Postgres stores require schema_mode=VALIDATE.")
         self._schema_mode = schema_mode

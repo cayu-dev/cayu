@@ -58,13 +58,17 @@ def test_read_only_connection_policy_is_transaction_scoped() -> None:
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize(
-    "store_type",
-    (PostgresTaskStore, PostgresKnowledgeStore, PostgresEventWatcherStore),
-)
+@pytest.mark.parametrize("store_type", (PostgresTaskStore, PostgresEventWatcherStore))
 def test_read_only_is_rejected_for_unsupported_postgres_stores(store_type: type) -> None:
-    with pytest.raises(ValueError, match="only supported by PostgresSessionStore"):
+    with pytest.raises(ValueError, match=f"not supported by {store_type.__name__}"):
         store_type("postgresql://example/cayu", read_only=True)
+
+
+def test_read_only_postgres_knowledge_store_guards_every_transaction() -> None:
+    # `cayu knowledge` inspects through it; every connection goes through `_connection()`.
+    store = PostgresKnowledgeStore("postgresql://example/cayu", read_only=True)
+
+    assert store._read_only is True
 
 
 def test_explicit_read_only_postgres_session_declares_read_only_durability() -> None:

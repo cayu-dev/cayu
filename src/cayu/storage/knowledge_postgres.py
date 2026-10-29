@@ -20,7 +20,6 @@ from cayu.knowledge._activation_rules import (
 from cayu.knowledge.access import runtime_knowledge_operation
 from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_support as pg_support
-from cayu.storage._phase_timing import PostgresTimingScope
 
 if TYPE_CHECKING:
     from cayu.knowledge.maintenance_governance import (
@@ -397,6 +396,8 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
     resource_knowledge_access_version = 1
 
     _min_required_revision = 78
+    # Inspection (`cayu knowledge`) reads through a store whose every transaction is read-only.
+    _supports_read_only = True
 
     def __init__(
         self,
@@ -449,7 +450,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             chunks=copied_chunks,
         )
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     # Every mutation acquires identity categories in the same
@@ -526,7 +527,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=expected_revision)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_entry(cur, entry.id)
@@ -563,7 +564,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         if max_bytes is not None:
             _validate_positive_int(max_bytes, "max_bytes")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             access_now = datetime.now(UTC)
             if max_bytes is None:
@@ -633,7 +634,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_entry(cur, entry_id)
@@ -714,7 +715,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         if type(hard) is not bool:
             raise ValueError("`hard` must be a boolean.")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_entry(cur, entry_id)
@@ -840,7 +841,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             else ""
         )
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -952,7 +953,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
                 access_scope=scope,
             )
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_write_identities(cur, operation_ids=(operation_id,))
@@ -1139,7 +1140,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             receipt = await self._load_publication_receipt_in_scope(cur, operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
@@ -1155,7 +1156,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         entry_id = _knowledge_entry_id(entry_id)
         _validate_knowledge_revision(revision, "revision")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             await cur.execute(
                 "SELECT operation_id FROM cayu_knowledge_activation_receipts "
@@ -1182,7 +1183,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             receipt = await self._load_activation_receipt(
                 cur,
@@ -1212,7 +1213,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_write_identities(
@@ -1371,7 +1372,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             operation_id=operation_id,
         )
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_relation_write_identities(
@@ -1540,7 +1541,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_relation_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             receipt = await self._load_relation_receipt(
                 cur,
                 operation_id,
@@ -1561,7 +1562,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         fingerprint = _knowledge_relation_query_fingerprint(query, scope)
         cursor = _decode_knowledge_relation_cursor(query.cursor, fingerprint=fingerprint)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             reference = await self._load_entry_in_scope(
                 cur,
@@ -1651,7 +1652,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         )
         cursor = _decode_knowledge_lineage_cursor(query.cursor, fingerprint=fingerprint)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             access_now = datetime.now(UTC)
             reference_exact = await self._load_entry(
@@ -1877,7 +1878,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         operation = "publish_maintenance_proposal"
         _require_knowledge_entry_access(scope, copied_entry, operation=operation)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_write_identities(
@@ -2048,7 +2049,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             await cur.execute(
                 "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
@@ -2143,7 +2144,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             raise KnowledgeAccessDenied("record_maintenance_governance_route")
         proposal = copied.request.proposal
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_write_identities(
@@ -2276,7 +2277,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             return await self._load_maintenance_governance_route(
                 cur,
                 operation_id,
@@ -2308,7 +2309,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             raise KnowledgeAccessDenied("record_semantic_watch_outcome")
         operation_id = copied.invocation.operation_id
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_semantic_watch_write_identities(
@@ -2403,7 +2404,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_semantic_watch_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             return await self._load_semantic_watch_receipt(
                 cur,
                 operation_id,
@@ -2426,7 +2427,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         )
         operation = "apply_maintenance_decision"
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_maintenance_write_identities(
@@ -2735,7 +2736,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             await cur.execute(
                 "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
@@ -2781,7 +2782,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             record = await self._load_maintenance_record(
                 cur,
                 operation_id,
@@ -2800,7 +2801,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             record = await self._load_maintenance_record(
                 cur,
                 operation_id,
@@ -2990,7 +2991,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         _validate_positive_int(max_records, "max_records")
         _validate_positive_int(max_bytes, "max_bytes")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             entry = await self._load_entry_in_scope(
                 cur,
@@ -3046,7 +3047,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             scope,
         )
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             await cur.execute(
                 cast(
@@ -3122,7 +3123,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             scope,
         )
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     state = await self._lock_or_create_change_consumer(
@@ -3258,7 +3259,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         _validate_knowledge_change_sequence(baseline_sequence, "baseline_sequence")
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -3303,7 +3304,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         claim_sha256 = _knowledge_change_claim_sha256(claim)
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     state = await self._load_change_consumer(
@@ -3371,7 +3372,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         claim = copy_knowledge_change_claim(claim)
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     state = await self._load_change_consumer(
@@ -3416,7 +3417,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             state = await self._load_change_consumer(
                 cur,
                 consumer_id,
@@ -3447,7 +3448,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         identity_sha256 = _knowledge_embedding_identity_sha256(update.identity)
         update_sha256 = _knowledge_index_readiness_update_sha256(update)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -3607,7 +3608,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         identity = copy_knowledge_embedding_identity(identity)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             if not await self._index_identity_is_accessible(cur, scope, identity):
                 return None
@@ -3664,7 +3665,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         """
         access_params = [*exact_access_params, *current_access_params]
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             await cur.execute(
                 cast(
@@ -3772,7 +3773,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         _validate_knowledge_positive_int(max_chunks, "max_chunks")
         _validate_knowledge_positive_int(max_bytes, "max_bytes")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             entry = await self._load_entry_in_scope(
                 cur,
@@ -3811,7 +3812,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             return await self._keyword_search_in_snapshot(
                 cur,
@@ -3840,7 +3841,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             return await self._keyword_search_in_snapshot(
                 cur,
@@ -3870,7 +3871,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             return await self._keyword_search_in_snapshot(
                 cur,
@@ -3949,7 +3950,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         where_sql += access_sql
         params.extend(access_params)
         await self._ensure_ready()
-        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             total_entries_known = await self._count_list_entries(cur, where_sql, params)
             await cur.execute(

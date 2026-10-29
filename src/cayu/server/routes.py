@@ -199,6 +199,7 @@ from cayu.server._judge_calibration_routes import register_judge_calibration_rou
 from cayu.server._kept_knowledge import register_kept_knowledge
 from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._request_timing import RequestTimingRecorder
+from cayu.server._request_validation import invalid_parameters_detail
 from cayu.server._scenario_routes import (
     register_scenario_authoring_routes,
     register_scenario_launch_routes,
@@ -496,10 +497,16 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
     def _invalid_request_response(self) -> JSONResponse:
         return _private_no_store_error_response(422, self.invalid_request_detail)
 
+    def _invalid_parameters_response(self, error: RequestValidationError) -> JSONResponse | None:
+        """A response naming invalid declared parameters, or None to stay generic."""
+
+        return None
+
     def get_route_handler(self):
         route_handler = super().get_route_handler()
         max_request_bytes = self.max_request_bytes
         invalid_request_response = self._invalid_request_response
+        invalid_parameters_response = self._invalid_parameters_response
         oversized_request_detail = self.oversized_request_detail
         reject_duplicate_json_keys = self.reject_duplicate_json_keys
         preparse_auth_dependency = (
@@ -658,6 +665,9 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
                 size_detail = _authored_size_error(exc)
                 if size_detail is not None:
                     return _private_no_store_error_response(422, size_detail)
+                named = invalid_parameters_response(exc)
+                if named is not None:
+                    return named
                 return invalid_request_response()
             except HTTPException as exc:
                 headers = dict(exc.headers or {})
@@ -843,6 +853,14 @@ class _BoundedControlPlaneRequestRoute(_BoundedPrivateJsonBodyRoute):
     invalid_request_detail = "Invalid control-plane request."
     oversized_request_detail = "Control-plane request exceeds the server byte limit."
     reject_duplicate_json_keys = True
+
+    def _invalid_parameters_response(self, error: RequestValidationError) -> JSONResponse | None:
+        detail = invalid_parameters_detail(error)
+        if detail is None:
+            return None
+        return _private_no_store_error_response(
+            422, f"{self.invalid_request_detail.removesuffix('.')}: {detail}."
+        )
 
 
 class _BoundedEvaluationPromotionRoute(_BoundedPrivateJsonBodyRoute):
@@ -9481,6 +9499,10 @@ def create_router(
         seal=inbox_cursor,
         optional_auth_context=optional_auth_context,
         serialize_item=_serialize_knowledge_list_item,
+        serialize_detail=_serialize_knowledge_detail,
+        serialize_chunk=_serialize_knowledge_chunk,
+        parse_labels=_parse_knowledge_label_filters,
+        parse_strings=_parse_knowledge_string_filters,
     )
 
     register_inbox_routes(
