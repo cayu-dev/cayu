@@ -119,6 +119,10 @@ from cayu.sessions.authority import (
     SessionRunFenced,
     checkpoint_value_authority,
 )
+from cayu.sessions.environment_activity import (
+    EnvironmentActivityQuery,
+    EnvironmentActivitySnapshot,
+)
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectDelivery,
@@ -465,6 +469,7 @@ class SessionStore(ABC):
     session_continuation_version: ClassVar[int] = 0
     external_wait_version: ClassVar[int] = 0
     _producer_attachment_version: ClassVar[int] = 0
+    supports_environment_activity: ClassVar[bool] = False
     supports_usage_series: ClassVar[bool] = False
     supports_usage_aggregates: ClassVar[bool] = False
     supports_private_argument_continuity: ClassVar[bool] = False
@@ -5139,6 +5144,17 @@ class SessionStore(ABC):
         raise NotImplementedError(
             "This SessionStore does not support child-session lifecycle projections."
         )
+
+    async def aggregate_environment_activity(
+        self, query: EnvironmentActivityQuery
+    ) -> EnvironmentActivitySnapshot:
+        """Read exact retained-session counts/activity for a bounded set of environments.
+
+        Optional: stores advertise supports_environment_activity before implementing
+        a single snapshot with one ordered row for every requested name, including
+        zero rows. No eval/fork/status exclusions or history reads are implied.
+        """
+        raise NotImplementedError("Environment activity snapshots are unsupported.")
 
     async def aggregate_operational_snapshot(
         self,

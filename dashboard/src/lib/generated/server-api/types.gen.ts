@@ -559,9 +559,17 @@ export type ApiArtifactSummary = {
  */
 export type ApiEnvironmentSummary = {
     /**
+     * Activity As Of
+     */
+    activity_as_of?: string | null;
+    /**
      * Artifact Store Id
      */
     artifact_store_id: string | null;
+    /**
+     * Artifact Store Kind
+     */
+    artifact_store_kind?: 'local_disk' | 's3' | 'unknown' | null;
     /**
      * Binding Type
      */
@@ -581,11 +589,19 @@ export type ApiEnvironmentSummary = {
      * Knowledge Store Type
      */
     knowledge_store_type: string | null;
+    /**
+     * Last Activity At
+     */
+    last_activity_at?: string | null;
     lifecycle_policy: EnvironmentLifecyclePolicy | null;
     /**
      * Mcp Server Count
      */
     mcp_server_count: number;
+    /**
+     * Mcp Server Names
+     */
+    mcp_server_names?: Array<string>;
     /**
      * Metadata
      */
@@ -604,6 +620,10 @@ export type ApiEnvironmentSummary = {
      * Runner Type
      */
     runner_type: string | null;
+    /**
+     * Session Count
+     */
+    session_count?: string | null;
     /**
      * Vault Type
      */
@@ -4753,6 +4773,7 @@ export type ControlPlaneSurfaceCapabilities = {
     artifacts: OptionalSurfaceCapability;
     browser_recordings?: OptionalSurfaceCapability | null;
     dashboard: OptionalSurfaceCapability;
+    environment_details?: OptionalSurfaceCapability | null;
     eval_reported_views?: OptionalSurfaceCapability | null;
     eval_suite_views?: OptionalSurfaceCapability | null;
     evals: OptionalSurfaceCapability;

@@ -261,6 +261,10 @@ from cayu.sessions.authority import (
     SessionRunFenced,
     checkpoint_root_field_projection_from_storage,
 )
+from cayu.sessions.environment_activity import (
+    EnvironmentActivityQuery,
+    EnvironmentActivitySnapshot,
+)
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectDelivery,
@@ -1095,6 +1099,7 @@ class SQLiteSessionStore(
 
         return await self._run_read(snapshot)
 
+    supports_environment_activity: ClassVar[bool] = True
     supports_usage_series: ClassVar[bool] = True
     supports_usage_aggregates: ClassVar[bool] = True
     supports_private_argument_continuity: ClassVar[bool] = True
@@ -6851,6 +6856,11 @@ class SQLiteSessionStore(
         query: ChildSessionLifecycleQuery,
     ) -> ChildSessionLifecyclePage:
         return await session_queries.query_child_session_lifecycle(self._run_read, query)
+
+    async def aggregate_environment_activity(
+        self, query: EnvironmentActivityQuery
+    ) -> EnvironmentActivitySnapshot:
+        return await session_queries.aggregate_environment_activity(self._run_read, query)
 
     async def aggregate_operational_snapshot(
         self,

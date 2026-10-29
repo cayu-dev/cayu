@@ -40,6 +40,12 @@ from cayu.sessions._tool_round_publication_rules import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     _validate_tool_round_call_ids,
 )
+from cayu.sessions.environment_activity import (
+    EnvironmentActivityQuery,
+    EnvironmentActivitySnapshot,
+    copy_environment_activity_query,
+    environment_activity_snapshot,
+)
 from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge, copy_event_query
 from cayu.sessions.inspection import SESSION_INSPECTION_LABEL_LIMIT, SessionInspectionIdentity
 from cayu.sessions.interactions import _validate_interaction_page
@@ -1306,6 +1312,40 @@ async def query_child_session_lifecycle(
             return read_snapshot(connection)
         finally:
             connection.rollback()
+
+    return await run_read(read)
+
+
+async def aggregate_environment_activity(
+    run_read: SQLiteOperationRunner, query: EnvironmentActivityQuery
+) -> EnvironmentActivitySnapshot:
+    query = copy_environment_activity_query(query)
+    placeholders = ", ".join("?" for _ in query.environment_names)
+
+    def read(connection: sqlite3.Connection) -> EnvironmentActivitySnapshot:
+        rows = connection.execute(
+            f"""
+            WITH snapshot(as_of) AS (SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            activity AS (
+                SELECT environment_name, COUNT(*) AS session_count, MAX(last_activity_at) AS last_activity_at
+                FROM cayu_sessions WHERE environment_name IN ({placeholders})
+                GROUP BY environment_name
+            )
+            SELECT snapshot.as_of, activity.* FROM snapshot LEFT JOIN activity ON TRUE
+        """,
+            query.environment_names,
+        ).fetchall()
+        values = {
+            row["environment_name"]: (
+                row["session_count"],
+                sqlite_records.parse_datetime(row["last_activity_at"]),
+            )
+            for row in rows
+            if row["environment_name"] is not None
+        }
+        return environment_activity_snapshot(
+            query, sqlite_records.parse_datetime(rows[0]["as_of"]), values
+        )
 
     return await run_read(read)
 

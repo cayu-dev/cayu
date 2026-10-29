@@ -282,6 +282,10 @@ from cayu.sessions.authority import (
     SessionRunFenced,
     checkpoint_root_field_projection_from_storage,
 )
+from cayu.sessions.environment_activity import (
+    EnvironmentActivityQuery,
+    EnvironmentActivitySnapshot,
+)
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectDelivery,
@@ -609,6 +613,7 @@ class PostgresSessionStore(
             labels = await self._load_labels(cur, session_id)
             return require_clause_admitted(bounds, pg_support.session_from_row(row, labels=labels))
 
+    supports_environment_activity: ClassVar[bool] = True
     supports_usage_series: ClassVar[bool] = True
     supports_usage_aggregates: ClassVar[bool] = True
     supports_private_argument_continuity: ClassVar[bool] = True
@@ -6118,6 +6123,12 @@ class PostgresSessionStore(
         return await session_queries.query_child_session_lifecycle(
             self._ready_connection, query, load_session=self._load
         )
+
+    async def aggregate_environment_activity(
+        self, query: EnvironmentActivityQuery
+    ) -> EnvironmentActivitySnapshot:
+        await self._ensure_ready()
+        return await session_queries.aggregate_environment_activity(self._connection, query)
 
     async def aggregate_operational_snapshot(
         self,

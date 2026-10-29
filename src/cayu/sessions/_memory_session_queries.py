@@ -37,6 +37,12 @@ from cayu.sessions.authority import (
     CheckpointRootFieldGuard,
     checkpoint_root_field_projection,
 )
+from cayu.sessions.environment_activity import (
+    EnvironmentActivityQuery,
+    EnvironmentActivitySnapshot,
+    copy_environment_activity_query,
+    environment_activity_snapshot,
+)
 from cayu.sessions.lineage import (
     SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
     SessionLineageNode,
@@ -340,6 +346,25 @@ async def aggregate_operational_snapshot(
             counts_by_status=SessionStatusCounts.model_validate(counts),
             accuracy=EXACT_AGGREGATE.model_copy(),
         )
+
+
+async def aggregate_environment_activity(
+    read: LockedSessionQuery, query: EnvironmentActivityQuery
+) -> EnvironmentActivitySnapshot:
+    query = copy_environment_activity_query(query)
+    names = set(query.environment_names)
+    async with read() as state:
+        values: dict[str, tuple[int, datetime]] = {}
+        as_of = state.ownership_clock()
+        for index, session in enumerate(state.sessions.values(), start=1):
+            name = session.environment_name
+            if name in names:
+                assert name is not None
+                count, latest = values.get(name, (0, session.last_activity_at))
+                values[name] = (count + 1, max(latest, session.last_activity_at))
+            if index % _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL == 0:
+                await _cooperate_with_in_memory_aggregate_cancellation()
+        return environment_activity_snapshot(query, as_of, values)
 
 
 async def aggregate_usage(

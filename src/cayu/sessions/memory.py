@@ -159,6 +159,10 @@ from cayu.sessions.authority import (
     SessionRunFenced,
     checkpoint_root_field_projection,
 )
+from cayu.sessions.environment_activity import (
+    EnvironmentActivityQuery,
+    EnvironmentActivitySnapshot,
+)
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectDelivery,
@@ -762,6 +766,7 @@ class InMemorySessionStore(
                 self._session_closure_tombstones[(root_id, plan_id, child_id)] = tombstone
             return tuple(tombstones)
 
+    supports_environment_activity: ClassVar[bool] = True
     supports_usage_series: ClassVar[bool] = True
     supports_usage_aggregates: ClassVar[bool] = True
     supports_private_argument_continuity: ClassVar[bool] = True
@@ -6821,6 +6826,13 @@ class InMemorySessionStore(
         query: ChildSessionLifecycleQuery,
     ) -> ChildSessionLifecyclePage:
         return await memory_session_queries.query_child_session_lifecycle(
+            self._read_session_query_state, query
+        )
+
+    async def aggregate_environment_activity(
+        self, query: EnvironmentActivityQuery
+    ) -> EnvironmentActivitySnapshot:
+        return await memory_session_queries.aggregate_environment_activity(
             self._read_session_query_state, query
         )
 

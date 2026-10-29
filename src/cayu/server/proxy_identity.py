@@ -146,7 +146,7 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/evals/suite-views/{suite_key}",
             "/evals/run-views/{run_key}",
             "/environments",
-            "/environments/{environment_name}",
+            "/environments/{environment_name:path}",
             "/health",
             "/human-attention/{attention_id}",
             "/inbox",

@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any
+from typing import Any, ClassVar, Literal
 from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_context, set_exception_context
@@ -100,6 +100,9 @@ class S3ArtifactStore(ArtifactStore):
     matching ETag, so a deletion S3 applies late cannot remove a later
     publication of the same identity.
     """
+
+    # Public diagnostic metadata; subclasses changing backend must override it.
+    storage_kind: ClassVar[Literal["local_disk", "s3", "unknown"]] = "s3"
 
     def __init__(
         self,

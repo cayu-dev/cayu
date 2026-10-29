@@ -20771,3 +20771,26 @@ and includes nullable `display` on each `ApiToolSummary`. Public projection may
 replace a label with a redaction marker. Consumers treat it as text, never HTML
 or execution authority. `tool_display.read` is available on every server with
 this contract; it grants no mutation capability.
+
+### Environment inventory activity
+
+`SessionStore.supports_environment_activity` defaults to false. An implementing
+store provides `aggregate_environment_activity(EnvironmentActivityQuery)` and
+returns an `EnvironmentActivitySnapshot` from one store-owned read snapshot.
+The query contains 1–500 distinct, clean environment names. The result contains
+one row in request order for every name, including empty groups; each row counts
+all currently retained sessions whose stored `environment_name` matches and
+reports the maximum stored `last_activity_at`. It applies no status, eval-trial
+or fork exclusions and does not hydrate session histories. Counts and timestamps
+must agree: zero sessions implies no activity timestamp, and a nonempty group
+has one. The HTTP boundary validates the exact requested population before
+publishing a result. Custom stores may leave this optional interface unsupported.
+
+`ArtifactStore.storage_kind` is optional diagnostic metadata: `local_disk`, `s3`
+or `unknown` (the base default). The built-in local and S3 stores declare their
+kind. A subclass changing its storage backend must override the declaration;
+custom stores can retain `unknown`. An unrecognized or malformed declaration is
+reported as unknown without serializing the value. The declaration grants no
+storage, access or execution capability and inspection does not contact the
+backend. See [environment inventory](control-plane.md#environment-inventory)
+for the HTTP and CLI projections.

@@ -46,6 +46,12 @@ from cayu.sessions._tool_round_publication_rules import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     _validate_tool_round_call_ids,
 )
+from cayu.sessions.environment_activity import (
+    EnvironmentActivityQuery,
+    EnvironmentActivitySnapshot,
+    copy_environment_activity_query,
+    environment_activity_snapshot,
+)
 from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge, copy_event_query
 from cayu.sessions.inspection import SESSION_INSPECTION_LABEL_LIMIT, SessionInspectionIdentity
@@ -1256,6 +1262,34 @@ async def query_child_session_lifecycle(
             await conn.rollback()
             raise
     return result
+
+
+async def aggregate_environment_activity(
+    connect: PostgresConnection, query: EnvironmentActivityQuery
+) -> EnvironmentActivitySnapshot:
+    query = copy_environment_activity_query(query)
+    async with connect() as conn:
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    WITH snapshot AS (SELECT statement_timestamp() AS as_of),
+                    activity AS (
+                        SELECT environment_name, COUNT(*) AS session_count, MAX(last_activity_at) AS last_activity_at
+                        FROM cayu_sessions WHERE environment_name = ANY(%s::text[])
+                        GROUP BY environment_name
+                    )
+                    SELECT snapshot.as_of, activity.* FROM snapshot LEFT JOIN activity ON TRUE
+                """,
+                    (list(query.environment_names),),
+                )
+                rows = await cursor.fetchall()
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+    values = {row[1]: (row[2], row[3]) for row in rows if row[1] is not None}
+    return environment_activity_snapshot(query, rows[0][0], values)
 
 
 async def aggregate_usage(

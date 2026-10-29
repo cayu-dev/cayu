@@ -2819,6 +2819,11 @@ class ApiWorkspaceBranchLifecycle(ApiBaseModel):
 
 
 class ApiEnvironmentSummary(ApiBaseModel):
+    mcp_server_names: list[str] = Field(default_factory=list)
+    artifact_store_kind: Literal["local_disk", "s3", "unknown"] | None = None
+    session_count: AggregateCount | None = None
+    last_activity_at: datetime | None = None
+    activity_as_of: datetime | None = None
     name: str
     metadata: dict[str, Any]
     is_factory: StrictBool

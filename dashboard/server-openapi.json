@@ -957,6 +957,18 @@
       "ApiEnvironmentSummary": {
         "additionalProperties": false,
         "properties": {
+          "activity_as_of": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Activity As Of"
+          },
           "artifact_store_id": {
             "anyOf": [
               {
@@ -967,6 +979,22 @@
               }
             ],
             "title": "Artifact Store Id"
+          },
+          "artifact_store_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "local_disk",
+                  "s3",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Store Kind"
           },
           "binding_type": {
             "anyOf": [
@@ -1016,6 +1044,18 @@
             ],
             "title": "Knowledge Store Type"
           },
+          "last_activity_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Activity At"
+          },
           "lifecycle_policy": {
             "anyOf": [
               {
@@ -1030,6 +1070,13 @@
             "minimum": 0.0,
             "title": "Mcp Server Count",
             "type": "integer"
+          },
+          "mcp_server_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Mcp Server Names",
+            "type": "array"
           },
           "metadata": {
             "additionalProperties": true,
@@ -1061,6 +1108,18 @@
               }
             ],
             "title": "Runner Type"
+          },
+          "session_count": {
+            "anyOf": [
+              {
+                "pattern": "^(0|[1-9]\\d*)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Count"
           },
           "vault_type": {
             "anyOf": [
@@ -9727,6 +9786,16 @@
           },
           "dashboard": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
+          },
+          "environment_details": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "eval_reported_views": {
             "anyOf": [
@@ -38881,7 +38950,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "75",
+            "default": "76",
             "title": "Contract Version",
             "type": "string"
           },
@@ -46790,7 +46859,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "75",
+            "default": "76",
             "title": "Contract Version",
             "type": "string"
           }

@@ -32,18 +32,21 @@ class ReadTarget:
     timeout_seconds: float = 30.0
 
 
-def add_read_target_options(parser: argparse.ArgumentParser) -> None:
+def add_read_target_options(parser: argparse.ArgumentParser, *, allow_store: bool = True) -> None:
     """Add ``--sqlite``/``--postgres``/``--application`` and the Cloud options."""
 
-    target = parser.add_mutually_exclusive_group()
+    target = parser.add_mutually_exclusive_group(required=not allow_store)
     target.add_argument("--server-url", help="Read the running Cayu server at this mount URL.")
     parser.add_argument(
         "--authorization-env",
         default="CAYU_API_AUTHORIZATION",
         help="Authorization header environment variable for --server-url.",
     )
-    target.add_argument("--sqlite", metavar="PATH", help="Read this SQLite database.")
-    target.add_argument("--postgres", metavar="DSN", help="Read this Postgres database.")
+    if allow_store:
+        target.add_argument("--sqlite", metavar="PATH", help="Read this SQLite database.")
+        target.add_argument("--postgres", metavar="DSN", help="Read this Postgres database.")
+    else:
+        parser.set_defaults(sqlite=None, postgres=None)
     target.add_argument(
         "--application",
         metavar="NAME",

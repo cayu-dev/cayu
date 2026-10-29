@@ -180,6 +180,7 @@ from cayu.server._corpus_routes import (
     register_corpus_management_routes,
 )
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
+from cayu.server._environment_details import artifact_storage_kind, environment_activity_details
 from cayu.server._eval_addition_routes import register_eval_addition_routes
 from cayu.server._eval_report_routes import reporting_router
 from cayu.server._eval_view_routes import register_eval_view_routes
@@ -3633,12 +3634,16 @@ def _serialize_environment(cayu_app: Any, record: Any) -> dict[str, Any]:
         "workspace_branch_capabilities": _workspace_branch_capabilities(cayu_app, workspace),
         "workspace_branch_lifecycle": _workspace_branch_lifecycle(workspace),
         "artifact_store_id": _object_id(artifact_store),
+        "artifact_store_kind": artifact_storage_kind(artifact_store),
         "runner_type": _object_type_name(environment.runner),
         "binding_type": _object_type_name(environment.binding),
         "vault_type": _object_type_name(environment.vault),
         "proxy_type": _object_type_name(environment.proxy),
         "knowledge_store_type": _object_type_name(environment.knowledge_store),
         "mcp_server_count": len(environment.mcp_servers),
+        "mcp_server_names": _redact_control_plane_json(
+            cayu_app, [server.name for server in environment.mcp_servers], "mcp_server_names"
+        ),
         "workspace_checkpoint_policy": (
             None
             if record.spec.workspace_checkpoint_policy is None
@@ -4744,6 +4749,7 @@ def create_router(
         dashboard_pricing_configured=dashboard_pricing_configured,
         session_usage_aggregates_supported=session_store.supports_usage_aggregates,
         session_usage_series_supported=session_store.supports_usage_series,
+        environment_activity_supported=session_store.supports_environment_activity,
         session_topology_supported=session_store.supports_session_topology,
         evaluation_promotion_configured=evaluation_promotion is not None,
         terminal_session_evidence_supported=session_store.supports_terminal_session_evidence,
@@ -7091,17 +7097,25 @@ def create_router(
         response_model=EnvironmentsResponse,
         dependencies=protected,
     )
-    async def list_environments():
+    async def list_environments(response: Response):
+        response.headers["Cache-Control"] = "private, no-store"
         records = cayu_app.list_environment_registrations()
-        environments = [_serialize_environment(cayu_app, record) for record in records]
+        activity = await environment_activity_details(
+            session_store, tuple(record.spec.name for record in records)
+        )
+        environments = [
+            {**_serialize_environment(cayu_app, record), **activity[record.spec.name]}
+            for record in records
+        ]
         return {"environments": environments, "total_count": len(environments)}
 
     @router.get(
-        "/environments/{environment_name}",
+        "/environments/{environment_name:path}",
         response_model=EnvironmentsResponse,
         dependencies=protected,
     )
-    async def get_environment(environment_name: NonBlankString):
+    async def get_environment(environment_name: NonBlankString, response: Response):
+        response.headers["Cache-Control"] = "private, no-store"
         record = next(
             (
                 item
@@ -7112,7 +7126,13 @@ def create_router(
         )
         if record is None:
             raise HTTPException(status_code=404, detail="Environment not found")
-        return {"environments": [_serialize_environment(cayu_app, record)], "total_count": 1}
+        activity = await environment_activity_details(session_store, (record.spec.name,))
+        return {
+            "environments": [
+                {**_serialize_environment(cayu_app, record), **activity[record.spec.name]}
+            ],
+            "total_count": 1,
+        }
 
     @router.get(
         "/artifacts",

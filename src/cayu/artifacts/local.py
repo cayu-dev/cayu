@@ -18,7 +18,7 @@ from contextlib import contextmanager, suppress
 from contextvars import copy_context
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_context, set_exception_context
@@ -131,6 +131,9 @@ def _detach_redundant_cleanup_context(
 @model_store_surface("artifacts")
 class LocalArtifactStore(ArtifactStore):
     """Local filesystem implementation of ArtifactStore."""
+
+    # Public diagnostic metadata; subclasses changing backend must override it.
+    storage_kind: ClassVar[Literal["local_disk", "s3", "unknown"]] = "local_disk"
 
     def __init__(self, root: str | Path, *, store_id: str | None = None) -> None:
         if not isinstance(root, str | PathLike):

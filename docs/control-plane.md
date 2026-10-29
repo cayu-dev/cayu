@@ -945,3 +945,40 @@ spec = ToolSpec(
     display=ToolDisplay(verb="Queried", noun="ledger"),
 )
 ```
+
+## Environment inventory
+
+`GET /api/environments` and `GET /api/environments/{environment_name}` expose
+registered environments without starting their runners or factories, connecting
+to MCP servers, or reading files from artifact storage. Encode the environment
+name in the detail URL. Existing authentication and read-only role permissions
+apply; responses use `Cache-Control: private, no-store`.
+
+Each environment includes `mcp_server_names` from its registered MCP declarations
+alongside `mcp_server_count`. The names pass through the agent's secret redaction;
+commands, connection URLs, environment variables and headers are not included.
+`artifact_store_kind` is `local_disk` or `s3` when the store declares that kind,
+`unknown` for a configured store without recognized metadata, and `null` when no
+artifact store is configured. It is a storage description, not an availability
+check. The server does not infer the kind from a class name, store ID or path.
+
+`session_count` is the exact number of currently retained sessions with that
+stored environment name, serialized as a decimal string. It includes all
+statuses, eval trials and forks. Deleted sessions are absent. This inventory
+count is distinct from the Home start-window count and its default exclusions.
+`last_activity_at` is the maximum durable session activity timestamp; a metadata
+edit's `updated_at` alone does not advance it. Empty environments have count
+`"0"` and no last activity. `activity_as_of` identifies the store snapshot.
+
+Native stores aggregate at most 500 requested environment names per read without
+loading session histories. Larger catalogs use several batches; each row keeps
+its own batch's timestamp. These are consistent per-batch observations, not a
+claim of one atomic snapshot across an arbitrarily large catalog. If a configured
+store lacks activity support, all three activity fields are `null`; missing data
+is never shown as zero. A failed supported read fails the whole response, rather
+than publishing a partial catalog with incomplete counts.
+
+`capabilities.surfaces.environment_details.read.enabled` advertises native
+activity support. MCP and storage declarations remain available independently.
+Use `cayu environment list` or `cayu environment show NAME` with `--server-url`
+or `--application` for the same data, in JSON or table form.

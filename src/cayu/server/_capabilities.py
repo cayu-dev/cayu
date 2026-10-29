@@ -45,6 +45,7 @@ class ControlPlaneCapabilitySnapshot:
     task_graph_creation_supported: bool = False
     task_creation_supported: bool = False
     tool_usage_supported: bool = False
+    environment_activity_supported: bool = False
     session_usage_series_supported: bool = False
     session_overview_supported: bool = False
     eval_suite_views_supported: bool = False
@@ -89,6 +90,11 @@ class ControlPlaneCapabilitySnapshot:
                 else ServerContractActor(subject=actor.subject, tenant=actor.tenant)
             ),
             surfaces=ControlPlaneSurfaceCapabilities(
+                environment_details=_optional_surface(
+                    True,
+                    read_supported=self.environment_activity_supported,
+                    mutation_supported=False,
+                ),
                 task_index=_optional_surface(
                     self.tasks_configured,
                     read_supported=self.task_index_supported,
@@ -236,6 +242,7 @@ def inspect_control_plane_capabilities(
     task_graph_creation_supported: bool = False,
     task_creation_supported: bool = False,
     tool_usage_supported: bool = False,
+    environment_activity_supported: bool = False,
     session_usage_series_supported: bool = False,
     session_overview_supported: bool = False,
     eval_suite_views_supported: bool = False,
@@ -270,6 +277,7 @@ def inspect_control_plane_capabilities(
         ("task_graph_creation_supported", task_graph_creation_supported),
         ("tool_usage_supported", tool_usage_supported),
         ("session_usage_series_supported", session_usage_series_supported),
+        ("environment_activity_supported", environment_activity_supported),
         ("session_overview_supported", session_overview_supported),
         ("session_topology_supported", session_topology_supported),
         ("evaluation_promotion_configured", evaluation_promotion_configured),
@@ -300,6 +308,7 @@ def inspect_control_plane_capabilities(
         task_graph_creation_supported=task_graph_creation_supported,
         tool_usage_supported=tool_usage_supported,
         session_usage_series_supported=session_usage_series_supported,
+        environment_activity_supported=environment_activity_supported,
         session_overview_supported=session_overview_supported,
         cayu_version=_cayu_distribution_version(),
         dashboard_configured=dashboard_configured,

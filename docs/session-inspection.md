@@ -680,3 +680,25 @@ human wait is still increasing; active duration excludes that wait.
 - Oversized result: `transcript --sizes` reports exact serialized message
   and part sizes without printing the 500 KB result. Use an explicitly bounded
   `--include-content` only when the content itself is needed.
+
+### Inspect environments
+
+Read an agent's registered environments and retained-session activity from its
+running server or Cayu Cloud:
+
+```bash
+cayu environment list --server-url http://127.0.0.1:8000 --table
+cayu environment show local --server-url http://127.0.0.1:8000 --json
+cayu environment list --application my-agent --context ./cloud-context.json --json
+```
+
+The output includes declared MCP server names, the artifact store kind, exact
+retained-session counts, last activity and each activity snapshot's time.
+Unsupported activity reads are unavailable, not zero. The count includes eval
+trials and forks and has no time-window restriction. See
+[environment inventory](control-plane.md#environment-inventory) for the details.
+
+Environment declarations belong to the running agent, so these commands require
+`--server-url` or `--application`. `cayu inspect --environment NAME` remains the
+static source-manifest inspection command. File output uses the shared CLI
+protection for explicit, environment-selected and saved Cloud context files.

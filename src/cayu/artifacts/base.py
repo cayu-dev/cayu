@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Self
+from typing import Any, ClassVar, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -335,6 +335,9 @@ def _require_matching_artifact(
 
 class ArtifactStore(ABC):
     """Durable uploaded/generated file storage for an environment."""
+
+    # Public diagnostic metadata; subclasses changing backend must override it.
+    storage_kind: ClassVar[Literal["local_disk", "s3", "unknown"]] = "unknown"
 
     id: str
 
