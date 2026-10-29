@@ -161,3 +161,16 @@ test("native Usage series reads are available to members only with server suppor
     false,
   )
 })
+
+test("members can read usage cost details without gaining mutation access", () => {
+  const read = { kind: "surface", surface: "usage_cost_details" }
+  assert.equal(applyViewerAccess(available, read, member).enabled, true)
+  assert.equal(
+    applyViewerAccess(available, { ...read, operation: "mutate" }, member).enabled,
+    false,
+  )
+  assert.equal(
+    applyViewerAccess({ enabled: false, unavailable_reason: "unsupported" }, read, member).enabled,
+    false,
+  )
+})

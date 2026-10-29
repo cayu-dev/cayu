@@ -551,6 +551,15 @@ headline and session unpriced accounting remain available. The existing session 
 aligns with the selected session order and retains its aggregate remainder.
 Neither this report nor its ordering changes budget admission.
 
+The Usage dashboard requests cost order when this capability is enabled, including
+for member viewers. It shows provider/model estimates and the returned session
+titles and specialists without per-session reads. Currency codes, partial coverage
+and omitted-group estimates remain visible; missing estimates are unavailable,
+not zero. When the capability is disabled, the page requests token order and
+explains that cost ranking is unsupported. Authorization denials discard cached
+Usage reports and histograms until a fresh successful read; ordinary transient
+refresh failures retain the last authorized snapshot with a stale-data warning.
+
 The same data is available through `cayu usage rollup --server-url URL` or
 `--application NAME`. Add `--price-book prices.json --top-sessions 20
 --session-order cost`; JSON preserves the HTTP result and table output labels

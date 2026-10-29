@@ -5012,10 +5012,31 @@ async def _exercise_usage_page(page: Page, base_url: str) -> None:
     await expect(raw).to_contain_text("us-east-1")
     await expect(raw).to_contain_text("dashboard-browser-contract")
 
+    ranking = data["session_ranking"]
+    require_equal(ranking["requested_order"], "cost", "Usage requests global cost ranking")
+    await expect(
+        page.get_by_role(
+            "heading", name=f"Top sessions by {ranking['effective_order']}", exact=True
+        )
+    ).to_be_visible()
+
     filters = urlencode([("agent_name", AGENT_NAME), ("label", "stage=initial")])
-    await page.goto(f"{base_url}/cayu/usage?{filters}", wait_until="networkidle")
+    async with page.expect_request(
+        lambda request: (
+            request.method == "POST" and urlsplit(request.url).path.endswith("/api/usage/rollup")
+        )
+    ) as filtered:
+        await page.goto(f"{base_url}/cayu/usage?{filters}", wait_until="networkidle")
+    filtered_body = (await filtered.value).post_data_json
+    assert isinstance(filtered_body, dict)
+    require_equal(
+        filtered_body["session_filter"]["agent_name"], AGENT_NAME, "Usage specialist filter"
+    )
+    require_equal(
+        filtered_body["session_filter"]["labels"], {"stage": "initial"}, "Usage exact-label filter"
+    )
     await expect(page.get_by_label("Specialist", exact=True)).to_have_value(AGENT_NAME)
-    await expect(page.get_by_text("stage=initial", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Label: stage=initial", exact=True)).to_be_visible()
     await page.reload(wait_until="networkidle")
     require_equal(
         parse_qs(urlsplit(page.url).query).get("label"), ["stage=initial"], "repeat label URL"

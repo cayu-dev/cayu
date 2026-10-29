@@ -34,9 +34,11 @@ import type {
   UsageAggregateTotals,
   UsageBreakdownItem,
   UsageCostRollup,
+  UsageDimensionCostBreakdown,
   UsageSessionAggregateBreakdown,
   UsageSessionCostBreakdown,
   UsageSessionCostSummary,
+  UsageSessionRanking,
   UsageTimeSeries,
 } from "@/lib/generated/server-api"
 import { resolveUsageWindow } from "@/lib/usage-rollup"
@@ -397,12 +399,14 @@ function usageBreakdown(
 ): UsageAggregateBreakdown {
   const groups = groupBy(acts.filter(active), (a) =>
     withModel
-      ? `${a.s.session.provider_name}/${a.s.session.model}`
+      ? JSON.stringify([a.s.session.provider_name, a.s.session.model])
       : `${a.s.session.provider_name}`,
   )
   const rest = groups.slice(limit)
   return {
-    accuracy: EXACT,
+    accuracy: rest.length
+      ? { kind: "truncated", reason: "Other groups are included in the remainder.", limit }
+      : EXACT,
     groups: groups.slice(0, limit).map((list) => ({
       provider_name: list[0]?.s.session.provider_name ?? null,
       model: withModel ? (list[0]?.s.session.model ?? null) : null,
@@ -415,7 +419,7 @@ function usageBreakdown(
 }
 
 function costSummary(acts: Activity[]): UsageSessionCostSummary {
-  const priced = acts.filter((a) => a.cost !== null)
+  const priced = acts.filter((a) => a.cost !== null && a.steps > 0)
   const pricedSteps = priced.reduce((n, a) => n + a.steps, 0)
   const unpriced = acts.reduce((n, a) => n + a.steps, 0) - pricedSteps
   return {
@@ -487,14 +491,28 @@ function usageWindow(body: Record<string, unknown>, context: LegacyContext) {
   }
 }
 
-function sessionBreakdown(acts: Activity[], limit: number): UsageSessionAggregateBreakdown {
-  const ranked = acts.filter(active).sort((a, b) => (b.tokens.total > a.tokens.total ? 1 : -1))
+function sessionBreakdown(
+  acts: Activity[],
+  limit: number,
+  order: "tokens" | "cost",
+): UsageSessionAggregateBreakdown {
+  const ranked = [...acts].sort((a, b) => {
+    if (order === "cost" && a.cost !== b.cost) return (b.cost ?? 0) - (a.cost ?? 0)
+    if (a.tokens.total !== b.tokens.total) return b.tokens.total > a.tokens.total ? 1 : -1
+    return b.steps - a.steps || a.s.session.id.localeCompare(b.s.session.id)
+  })
   const rest = ranked.slice(limit)
-  const isActive = (a: Activity) => sessionStatus(a.s) === "running"
+  const isActive = (a: Activity) =>
+    ["running", "pending", "interrupting"].includes(sessionStatus(a.s))
   return {
-    accuracy: EXACT,
+    order,
+    accuracy: rest.length
+      ? { kind: "truncated", reason: "Matching sessions exceed session_group_limit.", limit }
+      : EXACT,
     groups: ranked.slice(0, limit).map((a) => ({
       session_id: a.s.session.id,
+      title: a.s.overview.title ?? null,
+      agent_name: a.s.session.agent_name,
       status: sessionStatus(a.s),
       active: isActive(a),
       totals: totalsOf([a]),
@@ -504,6 +522,38 @@ function sessionBreakdown(acts: Activity[], limit: number): UsageSessionAggregat
           group_count: String(rest.length),
           active_session_count: String(rest.filter(isActive).length),
           totals: totalsOf(rest),
+        }
+      : null,
+  }
+}
+
+/** Fake estimates use the seed's made-up costs, not a second pricing engine. */
+function dimensionCosts(
+  acts: Activity[],
+  breakdown: UsageAggregateBreakdown,
+  seed: AppSeed,
+  withModel: boolean,
+): UsageDimensionCostBreakdown {
+  const selected = new Set<Activity>()
+  const groups = breakdown.groups.map((group) => {
+    const rows = acts.filter(
+      (a) =>
+        active(a) &&
+        (a.s.session.provider_name ?? null) === group.provider_name &&
+        (!withModel || (a.s.session.model ?? null) === group.model),
+    )
+    for (const row of rows) selected.add(row)
+    return { provider_name: group.provider_name, model: group.model, cost: costSummary(rows) }
+  })
+  return {
+    accuracy: breakdown.accuracy,
+    price_book_version: PRICE_BOOK,
+    price_book_generated_at: seed.now,
+    groups,
+    remainder: breakdown.remainder
+      ? {
+          group_count: breakdown.remainder.group_count,
+          cost: costSummary(acts.filter((a) => active(a) && !selected.has(a))),
         }
       : null,
   }
@@ -537,14 +587,33 @@ function usageRollup({ body: raw }: LegacyRequest, context: LegacyContext): Usag
   const groupLimit = Math.max(1, Number(body.group_limit) || 20)
   const sessionLimit = Number(body.session_group_limit) || 0
   const costs = seedHasCosts(seed)
-  const sessions = sessionLimit > 0 ? sessionBreakdown(acts, sessionLimit) : null
+  const requestedOrder = body.session_order === "cost" ? "cost" : "tokens"
+  const currencies = new Set(
+    acts.filter((a) => a.steps > 0 && a.cost !== null).map((a) => a.currency),
+  )
+  const reason: UsageSessionRanking["unavailable_reason"] =
+    requestedOrder === "tokens"
+      ? null
+      : !costs
+        ? "pricing_not_configured"
+        : matching.length > 1000
+          ? "candidate_limit"
+          : acts.some((a) => a.steps > 0 && a.cost === null)
+            ? "prices_incomplete"
+            : currencies.size > 1
+              ? "mixed_currencies"
+              : null
+  const order = requestedOrder === "cost" && reason === null ? "cost" : "tokens"
+  const sessions = sessionLimit > 0 ? sessionBreakdown(acts, sessionLimit, order) : null
+  const providers = usageBreakdown(acts, groupLimit, false)
+  const models = usageBreakdown(acts, groupLimit, true)
   // Like the server, session costs cover the same sessions, in the same order, as session usage.
   const alignedCosts = (usage: UsageSessionAggregateBreakdown): UsageSessionCostBreakdown => {
     const kept = new Set(usage.groups.map((g) => g.session_id))
     const byId = new Map(acts.map((a) => [a.s.session.id, a]))
-    const rest = acts.filter((a) => active(a) && !kept.has(a.s.session.id))
+    const rest = acts.filter((a) => !kept.has(a.s.session.id))
     return {
-      accuracy: EXACT,
+      accuracy: usage.accuracy,
       price_book_version: PRICE_BOOK,
       price_book_generated_at: seed.now,
       groups: usage.groups.flatMap((g) => {
@@ -567,8 +636,18 @@ function usageRollup({ body: raw }: LegacyRequest, context: LegacyContext): Usag
     includes_active_sessions: true,
     totals: totalsOf(acts),
     series,
-    provider_breakdown: usageBreakdown(acts, groupLimit, false),
-    model_breakdown: usageBreakdown(acts, groupLimit, true),
+    provider_breakdown: providers,
+    model_breakdown: models,
+    provider_cost_breakdown: costs ? dimensionCosts(acts, providers, seed, false) : null,
+    model_cost_breakdown: costs ? dimensionCosts(acts, models, seed, true) : null,
+    session_ranking: sessions
+      ? {
+          requested_order: requestedOrder,
+          effective_order: order,
+          unavailable_reason: reason,
+          currency: order === "cost" ? ([...currencies][0] ?? null) : null,
+        }
+      : null,
     cost: costs ? costRollup(acts, seed) : null,
     reported_costs: { records: [], truncated: false },
     session_breakdown: sessions,

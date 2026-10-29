@@ -1,9 +1,9 @@
 /**
  * What the agent used over a time range: cost (or tokens), sessions, model steps and tool
- * calls; sessions per day; tokens per model; and the sessions that used the most. Window
+ * calls; sessions per day; provider/model costs; and the sessions that used the most. Window
  * bounds, accuracy and pricing coverage sit in Debug.
  */
-import { hashKey, useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
+import { hashKey, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useSearch } from "@tanstack/react-router"
 import { Info, RefreshCw, X } from "lucide-react"
 import { type ReactNode, useEffect, useRef, useState } from "react"
@@ -12,7 +12,7 @@ import { retryAggregateRequest } from "@/lib/aggregate-query"
 import { fetchUsageRollup, type UsageRollup, type UsageRollupBody } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
 import { useEnvironments } from "@/lib/environment-query"
-import { formatCount, formatCurrency } from "@/lib/format"
+import { formatCount, formatCurrencyWithCode } from "@/lib/format"
 import type {
   SessionStartSeries,
   UsageAggregateGroup,
@@ -26,7 +26,6 @@ import type { UsageRollupSearch } from "@/lib/usage-rollup-search"
 import { cn } from "@/lib/utils"
 import { useSpecialists } from "../app/queries"
 import { useApi, useNow, useServices } from "../app/services"
-import { sessionDisplayTitle } from "../app/session-model"
 import {
   EmptyState,
   ErrorState,
@@ -41,6 +40,13 @@ import {
   useRowClick,
 } from "./common"
 import { SessionsChart } from "./usage/sessions-chart"
+import {
+  partialCost,
+  rankingExplanation,
+  usageCostText,
+  validateCostRanking,
+} from "./usage/usage-costs"
+import { readUsage } from "./usage/usage-query"
 import { histogramRequest, joinedSeriesBuckets } from "./usage/usage-series"
 import {
   formatWhen,
@@ -65,15 +71,16 @@ const compact = (value: string | number) => {
   return Number.isFinite(n) ? compactFormat.format(n) : "–"
 }
 const money = (currencies: UsageCurrencyCost[]) =>
-  currencies.map((c) => formatCurrency(c.total_cost, c.currency)).join(" · ")
-const partialSummary = (cost: UsageSessionCostSummary) =>
-  cost.unpriced_model_steps !== "0" ||
-  cost.unevaluated_model_steps !== "0" ||
-  cost.accuracy.kind !== "exact"
+  currencies.map((c) => formatCurrencyWithCode(c.total_cost, c.currency)).join(" · ")
+const partialSummary = partialCost
 
 export function UsagePage() {
   const search = useSearch({ from: "/usage" })
-  const { usageSeriesEnabled = false, sessionOverviewSeriesEnabled = false } = useServices()
+  const {
+    usageCostDetailsEnabled = false,
+    usageSeriesEnabled = false,
+    sessionOverviewSeriesEnabled = false,
+  } = useServices()
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
   const go = useGo()
   const now = useNow()
@@ -109,48 +116,57 @@ export function UsagePage() {
       search,
       !!dashboardConfig.priceBook,
       usageSeriesEnabled,
+      usageCostDetailsEnabled,
       timezone,
     ],
-    queryFn: async ({ signal }) => {
-      const requestedWindow = resolveWindow(range, search.start_at, search.end_at, anchor.current)
-      if ("error" in requestedWindow) throw new Error(requestedWindow.error)
-      const requested = usageRollupRequestState(
-        {
-          ...search,
-          range: "custom",
-          start_at: requestedWindow.startAt,
-          end_at: requestedWindow.endAt,
-        },
-        { pricing: dashboardConfig.priceBook },
-      )
-      if (!requested.ok) throw new Error(requested.error)
-      const requestedBody: UsageRollupBody = {
-        ...requested.request,
-        session_group_limit: TOP_SESSIONS,
-        ...(usageSeriesEnabled ? { series: { unit: requestedWindow.unit, timezone } } : {}),
-      }
-      return {
-        data: await fetchUsageRollup(requestedBody, signal),
-        body: requestedBody,
-        window: requestedWindow,
-      }
-    },
+    queryFn: ({ signal, queryKey }) =>
+      readUsage(queryClient, queryKey, signal, async () => {
+        const requestedWindow = resolveWindow(range, search.start_at, search.end_at, anchor.current)
+        if ("error" in requestedWindow) throw new Error(requestedWindow.error)
+        const requested = usageRollupRequestState(
+          {
+            ...search,
+            range: "custom",
+            start_at: requestedWindow.startAt,
+            end_at: requestedWindow.endAt,
+          },
+          { pricing: dashboardConfig.priceBook },
+        )
+        if (!requested.ok) throw new Error(requested.error)
+        const requestedBody: UsageRollupBody = {
+          ...requested.request,
+          session_group_limit: TOP_SESSIONS,
+          ...(usageCostDetailsEnabled ? { session_order: "cost" as const } : {}),
+          ...(usageSeriesEnabled ? { series: { unit: requestedWindow.unit, timezone } } : {}),
+        }
+        const result = await fetchUsageRollup(requestedBody, signal)
+        return {
+          data: usageCostDetailsEnabled ? validateCostRanking(result) : result,
+          body: requestedBody,
+          window: requestedWindow,
+        }
+      }),
     enabled: body !== null,
     retry: retryAggregateRequest,
     refetchOnWindowFocus: false,
   })
   // Headline values retain their successful request when a refresh fails.
-  const shownWindow = rollup.data?.window ?? window
-  const shownBody = rollup.data?.body ?? body
+  const shownWindow = rollup.data?.value?.window ?? window
+  const shownBody = rollup.data?.value?.body ?? body
   const countsRequest =
     shownBody && shownWindow ? histogramRequest(shownBody, shownWindow.unit, timezone) : null
+  const countsQueryKey = ["usage", "counts", countsRequest, sessionOverviewSeriesEnabled]
   const counts = useQuery({
-    queryKey: ["usage", "counts", countsRequest, sessionOverviewSeriesEnabled],
-    queryFn: ({ signal }) => api.overviewCounts(countsRequest!, signal),
+    queryKey: countsQueryKey,
+    queryFn: ({ signal, queryKey }) =>
+      readUsage(queryClient, queryKey, signal, () => api.overviewCounts(countsRequest!, signal)),
     enabled: !!countsRequest && sessionOverviewSeriesEnabled,
     retry: retryAggregateRequest,
     refetchOnWindowFocus: false,
   })
+  const countsData = counts.data?.value
+  const rollupError = rollup.data?.denied ?? rollup.error
+  const countsError = counts.data?.denied ?? counts.error
   // A relative refresh changes exact bounds without changing the selected scope.
   // Retain the previous successful histogram, with its own bounds, until its replacement
   // arrives. Filters, range, timezone and capability changes must never borrow that data.
@@ -163,36 +179,53 @@ export function UsagePage() {
   const countsKey = hashKey([countsRequest])
   const [previousHistogram, setPreviousHistogram] = useState<{
     scope: string
+    cacheKey: typeof countsQueryKey
+    entry: NonNullable<typeof counts.data>
     key: string
     request: NonNullable<typeof countsRequest>
     data: Awaited<ReturnType<typeof api.overviewCounts>>
   } | null>(null)
   useEffect(() => {
     setPreviousHistogram((previous) => {
-      if (!sessionOverviewSeriesEnabled || !countsRequest) return null
-      if (!counts.data?.series) return previous?.scope === histogramScope ? previous : null
+      if (!sessionOverviewSeriesEnabled || !countsRequest || counts.data?.denied) return null
+      if (!countsData?.series) return previous?.scope === histogramScope ? previous : null
       if (
         previous?.scope === histogramScope &&
         previous.key === countsKey &&
-        previous.data === counts.data
+        previous.data === countsData
       )
         return previous
-      return { scope: histogramScope, key: countsKey, request: countsRequest, data: counts.data }
+      return {
+        scope: histogramScope,
+        key: countsKey,
+        cacheKey: ["usage", "counts", countsRequest, sessionOverviewSeriesEnabled],
+        entry: counts.data!,
+        request: countsRequest,
+        data: countsData,
+      }
     })
-  }, [counts.data, countsRequest, countsKey, histogramScope, sessionOverviewSeriesEnabled])
+  }, [
+    counts.data,
+    countsData,
+    countsRequest,
+    countsKey,
+    histogramScope,
+    sessionOverviewSeriesEnabled,
+  ])
   const histogram =
-    sessionOverviewSeriesEnabled && countsRequest
-      ? counts.data?.series
-        ? { key: countsKey, request: countsRequest, data: counts.data }
-        : previousHistogram?.scope === histogramScope
+    sessionOverviewSeriesEnabled && countsRequest && !counts.data?.denied
+      ? countsData?.series
+        ? { key: countsKey, request: countsRequest, data: countsData }
+        : previousHistogram?.scope === histogramScope &&
+            queryClient.getQueryData(previousHistogram.cacheKey) === previousHistogram.entry
           ? previousHistogram
           : null
       : null
   const starts = histogram?.data.series
   const previousWindow = histogram && histogram.key !== countsKey ? histogram.request : null
   // Even identical calendar labels are not proof of equal exact bounds.
-  const activity = usageSeriesEnabled && !previousWindow ? rollup.data?.data.series : null
-  const data = rollup.data?.data
+  const activity = usageSeriesEnabled && !previousWindow ? rollup.data?.value?.data.series : null
+  const data = rollup.data?.value?.data
 
   const refresh = () => {
     anchor.current = now()
@@ -233,15 +266,15 @@ export function UsagePage() {
           </p>
         )}
 
-        {rollup.error && !data && (
+        {rollupError && !data && (
           <div className="mt-4 space-y-2">
-            <ErrorState error={rollup.error} />
-            <Button variant="outline" size="sm" onClick={() => void rollup.refetch()}>
+            <ErrorState error={rollupError} />
+            <Button variant="outline" size="sm" onClick={refresh}>
               Try again
             </Button>
           </div>
         )}
-        {rollup.error && data && (
+        {rollupError && data && (
           <p role="status" className="mt-4 text-sm text-muted-foreground">
             Couldn't refresh; showing the last numbers loaded.
           </p>
@@ -265,7 +298,7 @@ export function UsagePage() {
               <DayChart
                 starts={starts}
                 activity={activity}
-                error={counts.error}
+                error={countsError}
                 pending={counts.isFetching}
                 previousWindow={previousWindow}
                 unavailable={
@@ -625,33 +658,11 @@ function PricingNote({ data }: { data: UsageRollup }) {
   const cost = data.cost
   if (!cost)
     return <Note>Costs aren't shown because this agent has no price list. {HOW_TO_PRICE}</Note>
-  const steps = BigInt(cost.evaluated_model_steps) + BigInt(cost.unevaluated_model_steps)
-  // Unevaluated steps weren't priced at all, usually because the range has more usage than
-  // one estimate reads; a price book change can't help with those.
-  if (cost.unevaluated_model_steps !== "0")
-    return (
-      <Note>
-        {cost.evaluated_model_steps === "0"
-          ? "Costs weren't worked out for this range"
-          : `Costs cover ${formatCount(cost.priced_model_steps)} of ${formatCount(steps.toString())} model steps`}{" "}
-        because it has more usage than one estimate can read
-        {cost.accuracy.reason ? ` (${cost.accuracy.reason})` : ""}. Pick a shorter range or narrow
-        the filters to see the full cost.
-      </Note>
-    )
-  if (cost.currencies.length === 0 && steps > 0n)
-    return (
-      <Note>
-        None of the models used in this range have a price in the price list, so only tokens are
-        shown. Add them to your price book to see costs.
-      </Note>
-    )
   if (!partialSummary(cost)) return null
   return (
     <Note>
-      Costs cover {formatCount(cost.priced_model_steps)} of {formatCount(steps.toString())} model
-      steps. The rest used models without a price in the price list, so the real total is higher.
-      Add those models to your price book to include them.
+      Some usage could not be priced completely. Amounts shown are partial estimates. Check pricing
+      coverage in Debug, or narrow the range and filters.
     </Note>
   )
 }
@@ -735,6 +746,17 @@ function DayChart({
   )
 }
 
+function CostValue({ cost }: { cost?: UsageSessionCostSummary | null }) {
+  return (
+    <span
+      className="inline-block min-w-20 whitespace-nowrap"
+      title={cost?.accuracy.reason ?? undefined}
+    >
+      {usageCostText(cost)}
+    </span>
+  )
+}
+
 /* ---------- models ---------- */
 
 type ProviderGroup = {
@@ -764,19 +786,21 @@ function ModelSplit({ data, search }: { data: UsageRollup; search: UsageSearch }
   const total = Number(data.totals.usage.total_tokens) || 1
   const scope = usageRollupSessionSearch(search)
   const rest = data.model_breakdown.remainder
+  const showCost = data.cost != null
   return (
     <Section title="Models">
       {groups.length === 0 ? (
         <EmptyState title="No model calls in this range" />
       ) : (
         <div className="overflow-x-auto rounded-xl border border-border">
-          <table className="w-full text-sm">
+          <table aria-label="Cost and usage by provider and model" className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-left text-xs text-muted-foreground">
                 <th className="px-3 py-2 font-medium">Provider and model</th>
                 <th className="px-3 py-2 text-right font-medium">Sessions</th>
                 <th className="hidden px-3 py-2 text-right font-medium sm:table-cell">Steps</th>
                 <th className="px-3 py-2 text-right font-medium">Tokens</th>
+                {showCost && <th className="px-3 py-2 text-right font-medium">Estimated cost</th>}
                 <th className="hidden w-32 px-3 py-2 font-medium sm:table-cell">
                   <span className="sr-only">Share of tokens</span>
                 </th>
@@ -784,7 +808,14 @@ function ModelSplit({ data, search }: { data: UsageRollup; search: UsageSearch }
             </thead>
             <tbody>
               {groups.map((g) => (
-                <ProviderRows key={g.provider ?? "unknown"} group={g} total={total} scope={scope} />
+                <ProviderRows
+                  key={g.provider ?? "unknown"}
+                  group={g}
+                  total={total}
+                  scope={scope}
+                  data={data}
+                  showCost={showCost}
+                />
               ))}
               {rest && (
                 <tr className="border-t border-border text-muted-foreground">
@@ -792,12 +823,32 @@ function ModelSplit({ data, search }: { data: UsageRollup; search: UsageSearch }
                     {formatCount(rest.group_count)} other model
                     {rest.group_count === "1" ? "" : "s"}
                   </td>
-                  <Numbers totals={rest.totals} total={total} />
+                  <Numbers
+                    totals={rest.totals}
+                    total={total}
+                    showCost={showCost}
+                    cost={data.model_cost_breakdown?.remainder?.cost}
+                  />
                 </tr>
               )}
             </tbody>
           </table>
         </div>
+      )}
+      {data.provider_breakdown.remainder && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          {formatCount(data.provider_breakdown.remainder.group_count)} other providers ·{" "}
+          {compact(data.provider_breakdown.remainder.totals.usage.total_tokens)} tokens
+          {showCost && ` · ${usageCostText(data.provider_cost_breakdown?.remainder?.cost)}`}
+        </p>
+      )}
+      {(data.provider_breakdown.accuracy.kind !== "exact" ||
+        data.model_breakdown.accuracy.kind !== "exact" ||
+        (data.provider_cost_breakdown && data.provider_cost_breakdown.accuracy.kind !== "exact") ||
+        (data.model_cost_breakdown && data.model_cost_breakdown.accuracy.kind !== "exact")) && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Showing a limited model and provider breakdown. See Debug for coverage.
+        </p>
       )}
     </Section>
   )
@@ -807,12 +858,16 @@ function ProviderRows({
   group,
   total,
   scope,
+  data,
+  showCost,
 }: {
+  data: UsageRollup
+  showCost: boolean
   group: ProviderGroup
   total: number
   scope: ReturnType<typeof usageRollupSessionSearch>
 }) {
-  const showProviderTotals = group.totals && group.models.length !== 1
+  const showProviderTotals = group.totals && (showCost || group.models.length !== 1)
   return (
     <>
       <tr className="border-b border-border bg-muted/30">
@@ -831,10 +886,19 @@ function ProviderRows({
           )}
         </td>
         {showProviderTotals && group.totals ? (
-          <Numbers totals={group.totals} total={total} muted />
+          <Numbers
+            totals={group.totals}
+            total={total}
+            muted
+            showCost={showCost}
+            cost={
+              data.provider_cost_breakdown?.groups.find((p) => p.provider_name === group.provider)
+                ?.cost
+            }
+          />
         ) : (
           <>
-            <td colSpan={2} />
+            <td colSpan={showCost ? 3 : 2} />
             <td colSpan={2} className="hidden sm:table-cell" />
           </>
         )}
@@ -855,7 +919,16 @@ function ProviderRows({
               <span className="text-muted-foreground">Unknown model</span>
             )}
           </td>
-          <Numbers totals={m.totals} total={total} />
+          <Numbers
+            totals={m.totals}
+            total={total}
+            showCost={showCost}
+            cost={
+              data.model_cost_breakdown?.groups.find(
+                (p) => p.provider_name === m.provider_name && p.model === m.model,
+              )?.cost
+            }
+          />
         </tr>
       ))}
     </>
@@ -866,7 +939,11 @@ function Numbers({
   totals,
   total,
   muted,
+  showCost,
+  cost,
 }: {
+  showCost: boolean
+  cost?: UsageSessionCostSummary | null
   totals: UsageAggregateTotals
   total: number
   muted?: boolean
@@ -884,6 +961,11 @@ function Numbers({
       >
         {compact(totals.usage.total_tokens)}
       </td>
+      {showCost && (
+        <td className="px-3 py-2 text-right tabular-nums">
+          <CostValue cost={cost} />
+        </td>
+      )}
       <td className="hidden px-3 py-2 sm:table-cell">
         <div className="flex items-center gap-2">
           <div className="h-1.5 w-20 overflow-hidden rounded-full bg-muted">
@@ -904,52 +986,40 @@ function Numbers({
 /* ---------- top sessions ---------- */
 
 function TopSessions({ data }: { data: UsageRollup }) {
-  const { overviewQueriesEnabled = true } = useServices()
-  const api = useApi()
+  const { usageCostDetailsEnabled = false } = useServices()
   const rowClick = useRowClick()
   const groups = data.session_breakdown?.groups ?? []
-  const ids = groups.map((g) => g.session_id)
-  const overviews = useQuery({
-    queryKey: ["usage", "session-titles", ids],
-    queryFn: () => api.overviews(ids),
-    enabled: overviewQueriesEnabled && ids.length > 0,
-  })
-  const details = useQueries({
-    queries: ids.map((id) => ({ queryKey: ["session", id], queryFn: () => api.session(id) })),
-  })
-  const overview = new Map(
-    (overviewQueriesEnabled ? (overviews.data ?? []) : []).map((o) => [o.session_id, o]),
-  )
+  const title =
+    data.session_ranking?.effective_order === "cost"
+      ? "Top sessions by cost"
+      : "Top sessions by tokens"
+  const explanation = rankingExplanation(data, usageCostDetailsEnabled)
   const costs = new Map(
     (data.session_cost_breakdown?.groups ?? []).map((g) => [g.session_id, g.cost]),
   )
-  const showCost = costs.size > 0
+  const showCost = data.cost != null
   const rest = data.session_breakdown?.remainder
   if (!data.session_breakdown) return null
   return (
-    <Section title="Sessions that used the most">
+    <Section title={title}>
+      {explanation && <p className="mb-2 text-xs text-muted-foreground">{explanation}</p>}
       {groups.length === 0 ? (
-        <EmptyState title="No sessions did any work in this range" />
+        <EmptyState title="No matching sessions in this range" />
       ) : (
         <div className="overflow-x-auto rounded-xl border border-border">
-          <table className="w-full text-sm">
+          <table aria-label={title} className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-left text-xs text-muted-foreground">
                 <th className="px-3 py-2 font-medium">Session</th>
                 <th className="hidden px-3 py-2 font-medium sm:table-cell">Specialist</th>
                 <th className="px-3 py-2 text-right font-medium">Tokens</th>
-                {showCost && <th className="px-3 py-2 text-right font-medium">Cost</th>}
+                {showCost && <th className="px-3 py-2 text-right font-medium">Estimated cost</th>}
               </tr>
             </thead>
             <tbody>
-              {groups.map((g, i) => {
-                const o = overview.get(g.session_id)
-                const detail = details[i]?.data
-                const fallback = detail ? sessionDisplayTitle(detail, null, null) : null
-                const title =
-                  o?.title?.trim() ||
-                  (fallback && fallback !== g.session_id ? fallback : null) ||
-                  (overviews.isFetching || details[i]?.isPending ? "…" : "Untitled session")
+              {groups.map((g) => {
+                const title = g.title?.trim() || "Untitled session"
+                const specialist = g.agent_name?.trim() || "Unknown specialist"
                 const cost = costs.get(g.session_id)
                 return (
                   <tr
@@ -959,7 +1029,11 @@ function TopSessions({ data }: { data: UsageRollup }) {
                   >
                     <td className="w-full max-w-0 px-3 py-2">
                       <div className="flex min-w-0 items-center gap-2">
-                        <StateDot state={o?.state} />
+                        <StateDot
+                          state={
+                            g.status === "completed" || g.status === "failed" ? g.status : undefined
+                          }
+                        />
                         <NavLink
                           {...sessionRoute(g.session_id)}
                           className={cn("truncate", ROW_LINK_CLASS)}
@@ -968,11 +1042,11 @@ function TopSessions({ data }: { data: UsageRollup }) {
                         </NavLink>
                       </div>
                       <div className="truncate pl-4 text-xs text-muted-foreground sm:hidden">
-                        {detail?.agent_name}
+                        {specialist}
                       </div>
                     </td>
                     <td className="hidden px-3 py-2 whitespace-nowrap text-muted-foreground sm:table-cell">
-                      {detail?.agent_name ?? "–"}
+                      {specialist}
                     </td>
                     <td
                       className="px-3 py-2 text-right tabular-nums"
@@ -981,19 +1055,8 @@ function TopSessions({ data }: { data: UsageRollup }) {
                       {compact(g.totals.usage.total_tokens)}
                     </td>
                     {showCost && (
-                      <td className="px-3 py-2 text-right whitespace-nowrap tabular-nums">
-                        {cost && cost.currencies.length > 0 ? (
-                          <span
-                            title={partialSummary(cost) ? "Some steps have no price" : undefined}
-                          >
-                            {money(cost.currencies)}
-                            {partialSummary(cost) && (
-                              <span className="text-muted-foreground">+</span>
-                            )}
-                          </span>
-                        ) : (
-                          <span className="text-muted-foreground">–</span>
-                        )}
+                      <td className="px-3 py-2 text-right tabular-nums">
+                        <CostValue cost={cost} />
                       </td>
                     )}
                   </tr>
@@ -1004,9 +1067,13 @@ function TopSessions({ data }: { data: UsageRollup }) {
         </div>
       )}
       <p className="mt-2 text-xs text-muted-foreground">
-        Ranked by tokens used in this range.
+        {data.session_breakdown.accuracy.kind !== "exact" &&
+          "Session detail is limited; see Debug for coverage. "}
         {rest &&
           ` ${formatCount(rest.group_count)} more session${rest.group_count === "1" ? "" : "s"} used ${compact(rest.totals.usage.total_tokens)} tokens.`}
+        {rest &&
+          showCost &&
+          ` Estimated cost of the other sessions: ${usageCostText(data.session_cost_breakdown?.remainder?.cost)}.`}
       </p>
     </Section>
   )

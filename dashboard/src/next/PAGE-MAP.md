@@ -108,16 +108,19 @@ current behavior rather than outstanding proposals.
 
 The production and prototype pages retain the following explicit limitations.
 Usage now reads one filtered, batched start/failure histogram and event-activity
-token details in the same window and viewer time zone. Environments show declared
-MCP names and file storage kind, plus native retained-session counts and activity
-observations without per-row session reads. Other backend additions are still pending.
-The UI does not infer missing values or claim an exact result from a partial read.
+token details in the same window and viewer time zone. With pricing, provider and
+model rows show estimates with separate currencies and explicit partial coverage.
+A supporting agent ranks sessions globally by cost and returns their titles and
+specialists in the same snapshot. If costs cannot be compared completely, the
+page labels the token ranking and explains why; it does not price or sort rows
+locally. Environments show declared MCP names and file storage kind, plus native
+retained-session counts and activity observations without per-row session reads.
+Other backend additions are still pending. The UI does not infer missing values
+or claim an exact result from a partial read.
 
 | Page | Remaining work | Current behavior |
 | --- | --- | --- |
 | Usage | Start counts for labels, parent sessions and causal budgets | Headline keeps these filters; chart explicitly unavailable because the histogram API cannot apply them |
-| Usage | Cost per model and provider | Models table shows tokens only |
-| Usage | Session breakdown ranked by cost, with the specialist | Ranked by tokens; one session read per row for the specialist |
 | Artifacts | Text search and sort | `q` filters the loaded page; newest first only |
 | Artifacts | Session titles on artifact rows | One overview read per page |
 | System | Deployment kind (local, Cloud, embedded) | Shows the deployment name and whether sign-in is required |

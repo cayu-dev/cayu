@@ -150,6 +150,8 @@ function IdentityGate() {
             serverContract.capabilities.surfaces.session_overview_queries?.read.enabled === true,
           environmentDetailsEnabled:
             serverContract.capabilities.surfaces.environment_details?.read.enabled === true,
+          usageCostDetailsEnabled:
+            serverContract.capabilities.surfaces.usage_cost_details?.read.enabled === true,
           usageSeriesEnabled:
             serverContract.capabilities.surfaces.usage_series?.read.enabled === true,
           sessionOverviewSeriesEnabled:

@@ -210,6 +210,11 @@ export const CONTRACT: ServerContract = {
           unavailable_reason: "unsupported",
         },
       },
+      usage_cost_details: {
+        configured: true,
+        read: { enabled: true, unavailable_reason: null },
+        mutate: { enabled: false, unavailable_reason: "unsupported" },
+      },
       usage_series: {
         configured: true,
         read: { enabled: true, unavailable_reason: null },

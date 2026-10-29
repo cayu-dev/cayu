@@ -33,6 +33,7 @@ function App() {
       api,
       now: api.now,
       environmentDetailsEnabled: true,
+      usageCostDetailsEnabled: true,
       usageSeriesEnabled: true,
       sessionOverviewSeriesEnabled: true,
       prototype: {

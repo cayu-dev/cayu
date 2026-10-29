@@ -51,6 +51,7 @@ const MEMBER_READ_SURFACES = new Set([
   "tasks",
   "usage",
   "environment_details",
+  "usage_cost_details",
   "usage_series",
   "session_overview_series",
   "workflow",

@@ -18,6 +18,7 @@ type Services = {
   prototype?: PrototypeControls
   overviewQueriesEnabled?: boolean
   environmentDetailsEnabled?: boolean
+  usageCostDetailsEnabled?: boolean
   usageSeriesEnabled?: boolean
   sessionOverviewSeriesEnabled?: boolean
   artifactsEnabled?: boolean
