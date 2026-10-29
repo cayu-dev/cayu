@@ -10,7 +10,6 @@ from typing import Any
 
 from cayu._validation import MAX_DURABLE_JSON_ENVELOPE_NESTING, copy_durable_json_object
 from cayu.events import Event
-from cayu.messages import Message
 from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
     _apply_runtime_publication_checkpoint_mutation,
@@ -91,6 +90,8 @@ from cayu.storage import _sqlite_model_stage as model_stage_ops
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_session_queries as session_queries
 from cayu.storage import _sqlite_transcript as transcript_ops
+from cayu.storage import _sqlite_transcript_content as transcript_content
+from cayu.storage import _transcript_tool_results as transcript_tool_results
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 from cayu.storage._sqlite_event_publication import EventWriter
 from cayu.storage._sqlite_transcript import ClosureOwners
@@ -148,7 +149,9 @@ def load_material(
             receipt.transcript_end_cursor,
         ),
     ).fetchall()
-    transcript = [Message(**json.loads(row["message_json"])) for row in transcript_rows]
+    transcript = transcript_content.messages(
+        connection, receipt.session_id, [row["message_json"] for row in transcript_rows]
+    )
     transcript_interaction_ids = [row["interaction_id"] for row in transcript_rows]
 
     referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
@@ -566,11 +569,20 @@ async def publish_runtime(
 
             transcript_rows = [
                 sqlite_records.transcript_row(
-                    session_id, request.interaction_id, message, message_payload
+                    session_id,
+                    request.interaction_id,
+                    message,
+                    message_payload,
+                    stored_payload=stored_payload,
                 )
-                for message, message_payload in zip(
+                for message, message_payload, stored_payload in zip(
                     request.transcript_messages,
                     prepared.transcript_payloads,
+                    transcript_tool_results.reference_event_contents(
+                        prepared.transcript_payloads,
+                        prepared.event_payloads,
+                        durable_referenced_events.values(),
+                    ),
                     strict=True,
                 )
             ]
@@ -938,9 +950,17 @@ async def publish_checkpoint_events(
                             TranscriptRecord(
                                 index=row["transcript_index"],
                                 interaction_id=row["interaction_id"],
-                                message=Message(**json.loads(row["message_json"])),
+                                message=message,
                             )
-                            for row in rows
+                            for row, message in zip(
+                                rows,
+                                transcript_content.messages(
+                                    connection,
+                                    session_id,
+                                    [row["message_json"] for row in rows],
+                                ),
+                                strict=True,
+                            )
                         )
                     session_exports.validate_publication(
                         session=loaded,

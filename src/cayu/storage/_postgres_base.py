@@ -945,7 +945,9 @@ class _PostgresStoreBase:
                         if current_state.revision >= 128:
                             await postgres_task_schema._validate_task_retry_keys(cur)
                         if current_state.revision >= 129:
-                            await postgres_transcript_schema._validate_transcript_message_bytes(cur)
+                            await postgres_transcript_schema._validate_transcript_message_bytes(
+                                cur, event_content_references=current_state.revision >= 134
+                            )
                         if current_state.revision >= 120:
                             await validate_postgres_agent_snapshot_schema(cur)
                         if self._min_required_revision >= 36:
@@ -1347,7 +1349,9 @@ class _PostgresStoreBase:
         if state.revision >= 128:
             await postgres_task_schema._validate_task_retry_keys(cur)
         if state.revision >= 129:
-            await postgres_transcript_schema._validate_transcript_message_bytes(cur)
+            await postgres_transcript_schema._validate_transcript_message_bytes(
+                cur, event_content_references=state.revision >= 134
+            )
         if state.revision >= 120:
             await validate_postgres_agent_snapshot_schema(cur)
         if state.revision >= 93:
@@ -1512,6 +1516,10 @@ class _PostgresStoreBase:
             await postgres_task_schema._validate_task_retry_keys(cur)
         if revision.revision == 129:
             await postgres_transcript_schema._validate_transcript_message_bytes(cur)
+        if revision.revision == 134:
+            await postgres_transcript_schema._validate_transcript_message_bytes(
+                cur, event_content_references=True
+            )
         if revision.revision == 120:
             await validate_postgres_agent_snapshot_schema(cur)
         if revision.revision == 102:

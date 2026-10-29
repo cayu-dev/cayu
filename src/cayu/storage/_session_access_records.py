@@ -115,8 +115,14 @@ async def sqlite_read(
             session = bounds.require_read(sqlite_records.load_session(connection, session_id))
             if kind == "checkpoint":
                 bounds.require_action(session, "inspect_state")
+            # A transcript row's recorded size includes a tool result read from its event.
+            size = (
+                "COALESCE(message_bytes, length(CAST(message_json AS BLOB)))"
+                if kind == "transcript"
+                else f"length(CAST({payload} AS BLOB))"
+            )
             sizes = connection.execute(
-                f"SELECT length(CAST({payload} AS BLOB)) FROM {table} WHERE session_id = ?{restriction} ORDER BY {order} LIMIT ? OFFSET ?",
+                f"SELECT {size} FROM {table} WHERE session_id = ?{restriction} ORDER BY {order} LIMIT ? OFFSET ?",
                 (session_id, limit + 1, offset),
             ).fetchall()
             if sum(row[0] for row in sizes) > max_bytes:
@@ -125,12 +131,20 @@ async def sqlite_read(
                 f"SELECT {columns} FROM {table} WHERE session_id = ?{restriction} ORDER BY {order} LIMIT ? OFFSET ?",
                 (session_id, limit + 1, offset),
             ).fetchall()
-            records = [
-                sqlite_records.event_from_row(row).model_dump(mode="json")
-                if kind == "events"
-                else json.loads(row[0])
-                for row in rows
-            ]
+            if kind == "transcript":
+                from cayu.storage import _sqlite_transcript_content as transcript_content
+
+                decode = transcript_content.document_decoder(
+                    connection, session_id, [row[0] for row in rows]
+                )
+                records = [decode(row[0]) for row in rows]
+            else:
+                records = [
+                    sqlite_records.event_from_row(row).model_dump(mode="json")
+                    if kind == "events"
+                    else json.loads(row[0])
+                    for row in rows
+                ]
             return page(records, offset=offset, limit=limit, max_bytes=max_bytes)
         finally:
             connection.rollback()
@@ -150,8 +164,13 @@ async def postgres_read(
         session = bounds.require_read(await store._load(cur, session_id))
         if kind == "checkpoint":
             bounds.require_action(session, "inspect_state")
+        size = (
+            "COALESCE(message_bytes, octet_length(message::text))"
+            if kind == "transcript"
+            else f"octet_length({payload}::text)"
+        )
         await cur.execute(
-            f"SELECT octet_length({payload}::text) FROM {table} WHERE session_id = %s{restriction} ORDER BY {order} LIMIT %s OFFSET %s",
+            f"SELECT {size} FROM {table} WHERE session_id = %s{restriction} ORDER BY {order} LIMIT %s OFFSET %s",
             (session_id, limit + 1, offset),
         )
         if sum(row[0] for row in await cur.fetchall()) > max_bytes:
@@ -161,6 +180,10 @@ async def postgres_read(
             (session_id, limit + 1, offset),
         )
         records = [row[0] for row in await cur.fetchall()]
+        if kind == "transcript":
+            from cayu.storage import _postgres_transcript_content as transcript_content
+
+            records = await transcript_content.message_documents(cur, session_id, records)
         return page(records, offset=offset, limit=limit, max_bytes=max_bytes)
 
 

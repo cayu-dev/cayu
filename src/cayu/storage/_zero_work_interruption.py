@@ -7,7 +7,6 @@ from itertools import islice
 from typing import TYPE_CHECKING
 
 from cayu.events import Event
-from cayu.messages import Message
 from cayu.runtime._zero_work_interruption import (
     MAX_EVIDENCE_ITEMS,
     ZeroWorkInterruptionPublication,
@@ -64,6 +63,7 @@ async def sqlite_terminalize(
     store: SQLiteSessionStore, request: ZeroWorkInterruptionRequest
 ) -> ZeroWorkInterruptionPublication | None:
     from cayu.storage import _sqlite_records as sqlite_records
+    from cayu.storage import _sqlite_transcript_content as sqlite_transcript_content
     from cayu.storage.sqlite import _append_events_in_transaction
 
     sid = request.session.id
@@ -95,13 +95,17 @@ async def sqlite_terminalize(
                         (sid, MAX_EVIDENCE_ITEMS + 1),
                     )
                 ],
-                messages=[
-                    Message.model_validate(json.loads(r[0]))
-                    for r in conn.execute(
-                        "SELECT message_json FROM cayu_transcript_messages WHERE session_id = ? ORDER BY sequence LIMIT ?",
-                        (sid, MAX_EVIDENCE_ITEMS + 1),
-                    )
-                ],
+                messages=sqlite_transcript_content.messages(
+                    conn,
+                    sid,
+                    [
+                        r[0]
+                        for r in conn.execute(
+                            "SELECT message_json FROM cayu_transcript_messages WHERE session_id = ? ORDER BY sequence LIMIT ?",
+                            (sid, MAX_EVIDENCE_ITEMS + 1),
+                        )
+                    ],
+                ),
                 operations={
                     r[0]: json.loads(r[1])
                     for r in conn.execute(
@@ -155,6 +159,7 @@ async def sqlite_terminalize(
 async def postgres_terminalize(
     store: PostgresSessionStore, request: ZeroWorkInterruptionRequest
 ) -> ZeroWorkInterruptionPublication | None:
+    from cayu.storage import _postgres_transcript_content as postgres_transcript_content
     from cayu.storage._postgres_support import _dumps, _json_obj
 
     sid = request.session.id
@@ -192,7 +197,9 @@ async def postgres_terminalize(
                     "SELECT message FROM cayu_transcript_messages WHERE session_id = %s ORDER BY session_order LIMIT %s",
                     (sid, MAX_EVIDENCE_ITEMS + 1),
                 )
-                messages = [Message.model_validate(_json_obj(r[0])) for r in await cur.fetchall()]
+                messages = await postgres_transcript_content.messages(
+                    cur, sid, [r[0] for r in await cur.fetchall()]
+                )
                 await cur.execute(
                     "SELECT idempotency_key, record FROM cayu_session_operations WHERE session_id = %s LIMIT %s",
                     (sid, MAX_EVIDENCE_ITEMS + 1),

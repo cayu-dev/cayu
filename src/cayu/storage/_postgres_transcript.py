@@ -60,6 +60,7 @@ from cayu.sessions.transcript_queries import (
     validate_bounded_transcript_window,
 )
 from cayu.storage import _postgres_support as pg_support
+from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._participant_bindings_schema import PARTICIPANT_BINDING_PROJECTION
 
 PostgresConnection = Callable[[], AbstractAsyncContextManager[Any]]
@@ -228,10 +229,9 @@ async def replace_initial_transcript_messages(
                     require_initial_execution_input(
                         session,
                         None if binding_row is None else reconstruct(binding_row, session),
-                        [
-                            Message.model_validate(pg_support._json_obj(row[0]))
-                            for row in current_rows
-                        ],
+                        await transcript_content.messages(
+                            cur, session_id, [row[0] for row in current_rows]
+                        ),
                         expected,
                     )
                     await cur.execute(
@@ -482,8 +482,9 @@ async def load_transcript(
     access_bounds = await current_data_bounds()
     session_id = require_clean_nonblank(session_id, "session_id")
     async with connect() as conn, conn.cursor() as cur:
+        # One snapshot for the rows and the tool events their results live in.
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         if access_bounds is not None:
-            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             access_bounds.require_read(await load_session(cur, session_id))
         await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
         if await cur.fetchone() is None:
@@ -498,7 +499,7 @@ async def load_transcript(
             (session_id,),
         )
         rows = await cur.fetchall()
-        return [Message(**pg_support._json_obj(row[0])) for row in rows]
+        return await transcript_content.messages(cur, session_id, [row[0] for row in rows])
 
 
 async def load_transcript_snapshot(
@@ -509,8 +510,9 @@ async def load_transcript_snapshot(
     access_bounds = await current_data_bounds()
     session_id = require_clean_nonblank(session_id, "session_id")
     async with connect() as conn, conn.cursor() as cur:
+        # One snapshot for the rows and the tool events their results live in.
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         if access_bounds is not None:
-            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             access_bounds.require_read(await load_session(cur, session_id))
         await cur.execute(
             """
@@ -529,12 +531,15 @@ async def load_transcript_snapshot(
         rows = await cur.fetchall()
         if not rows:
             raise KeyError(f"Session not found: {session_id}")
+        decode = await transcript_content.decoder(
+            cur, session_id, [row[3] for row in rows if row[1] is not None]
+        )
         return TranscriptSnapshot(
             records=[
                 TranscriptRecord(
                     index=row[1],
                     interaction_id=row[2],
-                    message=Message(**pg_support._json_obj(row[3])),
+                    message=decode(row[3]),
                 )
                 for row in rows
                 if row[1] is not None
@@ -563,6 +568,8 @@ async def load_latest_transcript_message(
     if not isinstance(role, MessageRole):
         raise TypeError("role must be a MessageRole.")
     async with connect() as conn, conn.cursor() as cur:
+        # One snapshot for the row and the tool events its results live in.
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         await cur.execute(
             """
             SELECT session.id,
@@ -590,7 +597,7 @@ async def load_latest_transcript_message(
         return TranscriptRecord(
             index=row[1],
             interaction_id=row[2],
-            message=Message(**pg_support._json_obj(row[3])),
+            message=await transcript_content.message(cur, session_id, row[3]),
         )
 
 
@@ -725,8 +732,9 @@ async def load_transcript_window(
         raise ValueError("limit must be between 1 and 5000.")
 
     async with connect() as conn, conn.cursor() as cur:
+        # One snapshot for the rows and the tool events their results live in.
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         if access_bounds is not None:
-            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             access_bounds.require_read(await load_session(cur, session_id))
         await cur.execute(
             """
@@ -747,12 +755,15 @@ async def load_transcript_window(
         rows = await cur.fetchall()
         if not rows:
             raise KeyError(f"Session not found: {session_id}")
+        decode = await transcript_content.decoder(
+            cur, session_id, [row[3] for row in rows if row[1] is not None]
+        )
         return TranscriptSnapshot(
             records=[
                 TranscriptRecord(
                     index=row[1],
                     interaction_id=row[2],
-                    message=Message(**pg_support._json_obj(row[3])),
+                    message=decode(row[3]),
                 )
                 for row in rows
                 if row[1] is not None
@@ -823,8 +834,12 @@ async def load_bounded_transcript_window(
                 "SELECT sequence, message FROM cayu_transcript_messages WHERE sequence = ANY(%s)",
                 (sequences,),
             )
-            for sequence, message in await cur.fetchall():
-                messages[sequence] = Message(**pg_support._json_obj(message))
+            loaded_rows = await cur.fetchall()
+            decode = await transcript_content.decoder(
+                cur, session_id, [message for _, message in loaded_rows]
+            )
+            for sequence, message in loaded_rows:
+                messages[sequence] = decode(message)
         await conn.rollback()
     return BoundedTranscriptWindow(
         records=[
@@ -859,8 +874,9 @@ async def query_transcript(
     filter_clause = " AND " + " AND ".join(filters) if filters else ""
 
     async with connect() as conn, conn.cursor() as cur:
+        # One snapshot for the rows and the tool events their results live in.
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         if access_bounds is not None:
-            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             access_bounds.require_read(await load_session(cur, query.session_id))
         await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (query.session_id,))
         if await cur.fetchone() is None:
@@ -890,11 +906,12 @@ async def query_transcript(
             [query.session_id, *filter_params, query.limit, query.offset],
         )
         rows = await cur.fetchall()
+        decode = await transcript_content.decoder(cur, query.session_id, [row[2] for row in rows])
         records = [
             TranscriptRecord(
                 index=row[0],
                 interaction_id=row[1],
-                message=Message(**pg_support._json_obj(row[2])),
+                message=decode(row[2]),
             )
             for row in rows
         ]

@@ -60,6 +60,7 @@ from cayu.storage import _sqlite_session_queries as session_queries
 from cayu.storage import _sqlite_terminal_evidence as terminal_evidence_ops
 from cayu.storage import _sqlite_tool_grants as tool_grants_ops
 from cayu.storage import _sqlite_transcript as transcript_ops
+from cayu.storage import _sqlite_transcript_content as transcript_content
 from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMixin
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
@@ -417,7 +418,7 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 129
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 134
 _T = TypeVar("_T")
 
 
@@ -1802,11 +1803,14 @@ class SQLiteSessionStore(
                     "ORDER BY session_order",
                     (session_id, pointer.source_transcript_cursor, end),
                 ).fetchall()
+                decode = transcript_content.decoder(
+                    connection, session_id, [row["message_json"] for row in rows]
+                )
                 records = tuple(
                     TranscriptRecord(
                         index=row["session_order"] - 1,
                         interaction_id=row["interaction_id"],
-                        message=Message.model_validate_json(row["message_json"]),
+                        message=decode(row["message_json"]),
                     )
                     for row in rows
                 )
@@ -3354,7 +3358,9 @@ class SQLiteSessionStore(
                         require_initial_execution_input(
                             loaded,
                             reconstruct(dict(binding_row), loaded),
-                            [Message.model_validate_json(row[0]) for row in transcript_rows],
+                            transcript_content.messages(
+                                self._connection, session_id, [row[0] for row in transcript_rows]
+                            ),
                             list(admission.source_messages),
                         )
                 transition_metadata = transition_profile_metadata
@@ -3366,10 +3372,11 @@ class SQLiteSessionStore(
                     ).fetchall()
                     _validate_session_model_transition(
                         loaded,
-                        [
-                            Message.model_validate(json.loads(row["message_json"]))
-                            for row in transcript_rows
-                        ],
+                        transcript_content.messages(
+                            self._connection,
+                            session_id,
+                            [row["message_json"] for row in transcript_rows],
+                        ),
                         transcript_ops.transcript_cursor(self._connection, session_id),
                         prepared_model_transition,
                     )
@@ -5986,18 +5993,22 @@ class SQLiteSessionStore(
                 )
             ),
         )
+        transcript_rows = connection.execute(
+            "SELECT session_order, interaction_id, message_json FROM cayu_transcript_messages WHERE session_id = ? ORDER BY session_order LIMIT ?",
+            (session_id, max_records + 1),
+        ).fetchall()
+        decode_document = transcript_content.document_decoder(
+            connection, session_id, [row["message_json"] for row in transcript_rows]
+        )
         builder.add_class(
             "transcript",
             (
                 {
                     "transcript_index": row["session_order"] - 1,
                     "interaction_id": row["interaction_id"],
-                    "message": json.loads(row["message_json"]),
+                    "message": decode_document(row["message_json"]),
                 }
-                for row in connection.execute(
-                    "SELECT session_order, interaction_id, message_json FROM cayu_transcript_messages WHERE session_id = ? ORDER BY session_order LIMIT ?",
-                    (session_id, max_records + 1),
-                )
+                for row in transcript_rows
             ),
         )
         checkpoint = _load_checkpoint_state(connection, session_id)
@@ -6191,12 +6202,15 @@ class SQLiteSessionStore(
                     (session_id,),
                 )
                 while page := rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    decode = transcript_content.decoder(
+                        connection, session_id, [row["message_json"] for row in page]
+                    )
                     for row in page:
                         builder.message(
                             TranscriptRecord(
                                 index=row["session_order"] - 1,
                                 interaction_id=row["interaction_id"],
-                                message=Message(**json.loads(row["message_json"])),
+                                message=decode(row["message_json"]),
                             )
                         )
                 row = connection.execute(

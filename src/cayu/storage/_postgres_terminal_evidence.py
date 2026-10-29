@@ -13,7 +13,6 @@ from typing import LiteralString, cast
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event
-from cayu.messages import Message
 from cayu.runtime.evidence_spool import EvidenceSpool
 from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.records import (
@@ -38,6 +37,7 @@ from cayu.sessions.terminal_evidence import (
     _validate_runner_observed_event_identity_snapshot,
 )
 from cayu.storage import _postgres_support as pg_support
+from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._postgres_transcript import PostgresConnection, SessionLoader
 
 
@@ -157,8 +157,9 @@ async def _load_evidence(
         return canonical_limit + (canonical_limit + 1) // 2
 
     event_transport_bytes = f"{jsonb_transport_bytes('event')} + octet_length(sequence::text)"
+    # message_bytes is the full message, including a tool result read from its event.
     transcript_transport_bytes = (
-        f"{jsonb_transport_bytes('message')} "
+        "COALESCE(message_bytes, octet_length(message::text)) + 1 "
         "+ octet_length(session_order::text) "
         "+ COALESCE(octet_length(interaction_id), 0)"
     )
@@ -649,13 +650,16 @@ async def _load_evidence(
                         spool.observe_page(
                             records=len(rows), transport_bytes=sum(row[3] for row in rows)
                         )
+                        decode = await transcript_content.decoder(
+                            cur, session_id, [row[2] for row in rows]
+                        )
                         for row in rows:
                             spool.append(
                                 "transcript",
                                 TranscriptRecord(
                                     index=row[0] - 1,
                                     interaction_id=row[1],
-                                    message=Message(**pg_support._json_obj(row[2])),
+                                    message=decode(row[2]),
                                 ),
                             )
                         after_index = rows[-1][0]
@@ -697,11 +701,14 @@ async def _load_evidence(
                     )
                     for row in event_rows
                 )
+                decode = await transcript_content.decoder(
+                    cur, session_id, [row[2] for row in transcript_rows]
+                )
                 transcript = tuple(
                     TranscriptRecord(
                         index=row[0],
                         interaction_id=row[1],
-                        message=Message(**pg_support._json_obj(row[2])),
+                        message=decode(row[2]),
                     )
                     for row in transcript_rows
                 )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cayu.storage._session_closure_sql import stored_column_size
+
 
 def export_size_statement(*, postgres: bool) -> tuple[str, int]:
     placeholder = "%s" if postgres else "?"
@@ -27,7 +29,9 @@ def export_size_statement(*, postgres: bool) -> tuple[str, int]:
                 "event_type",
             ),
         ),
-        ("cayu_transcript_messages", "session_id", ("message",) if postgres else ("message_json",)),
+        # message_bytes is the full message size; a tool result stored in its
+        # tool event is read back into the message, so count it here too.
+        ("cayu_transcript_messages", "session_id", ("message_bytes",)),
         ("cayu_checkpoints", "session_id", ("state",) if postgres else ("state_json",)),
         (
             "cayu_deferred_interaction_inputs",
@@ -43,12 +47,7 @@ def export_size_statement(*, postgres: bool) -> tuple[str, int]:
     ]
     selects = []
     for table, identity, columns in tables:
-        lengths = [
-            f"COALESCE(octet_length({column}::text), 0)"
-            if postgres
-            else f"COALESCE(length(CAST({column} AS BLOB)), 0)"
-            for column in columns
-        ]
+        lengths = [stored_column_size(column, postgres=postgres) for column in columns]
         selects.append(
             f"SELECT {' + '.join(lengths)} AS size FROM {table} WHERE {identity} = {placeholder}"
         )

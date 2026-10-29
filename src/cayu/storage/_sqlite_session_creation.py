@@ -6,7 +6,6 @@ in one native transaction. Store composition supplies explicit capabilities.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from asyncio import Lock
 from collections.abc import Callable, Iterable
@@ -75,6 +74,7 @@ from cayu.storage import _creation_fence
 from cayu.storage import _sqlite_event_delivery as event_delivery_ops
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_transcript as transcript_ops
+from cayu.storage import _sqlite_transcript_content as transcript_content
 
 
 async def create(
@@ -608,9 +608,11 @@ async def create_fork(
                     (source_transcript_cursor if transcript_cursor is None else transcript_cursor),
                 ),
             ).fetchall()
-            copied_messages = [
-                Message(**json.loads(row["message_json"])) for row in selected_transcript_rows
-            ]
+            copied_messages = transcript_content.messages(
+                connection,
+                source_session_id,
+                [row["message_json"] for row in selected_transcript_rows],
+            )
             copied_interaction_ids = [row["interaction_id"] for row in selected_transcript_rows]
             source_transcript_snapshot = (
                 None

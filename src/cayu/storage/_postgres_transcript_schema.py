@@ -95,7 +95,15 @@ async def _validate_transcript_search_document_column(cur: Any, *, tokenizer_ver
         )
 
 
-async def _validate_transcript_message_bytes(cur: Any) -> None:
+async def _validate_transcript_message_bytes(
+    cur: Any, *, event_content_references: bool = False
+) -> None:
+    """Check the size column and the trigger that fills it.
+
+    From revision 134 the trigger keeps a writer-supplied size for a row whose
+    tool results are stored in their tool event.
+    """
+
     await cur.execute(
         """
             SELECT data_type, is_nullable, is_generated
@@ -132,6 +140,11 @@ async def _validate_transcript_message_bytes(cur: Any) -> None:
         or (
             "new.message_bytes := octet_length((new.message)::text)" not in function
             and "new.message_bytes := octet_length(new.message::text)" not in function
+        )
+        or (
+            event_content_references
+            and "or not jsonb_path_exists(new.message, '$.content[*].cayu_event_content')"
+            not in function
         )
     ):
         raise RuntimeError("Postgres transcript message size trigger is missing or conflicting.")

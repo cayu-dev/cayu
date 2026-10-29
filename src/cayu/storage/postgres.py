@@ -62,6 +62,7 @@ from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_terminal_evidence as terminal_evidence_ops
 from cayu.storage import _postgres_tool_grants as tool_grants_ops
 from cayu.storage import _postgres_transcript as transcript_ops
+from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
@@ -422,7 +423,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 129
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 134
 
 
 def _targeted_tool_grant_from_postgres(value: object) -> TargetedToolGrantRecord:
@@ -1193,11 +1194,12 @@ class PostgresSessionStore(
                 (session_id, pointer.source_transcript_cursor, end),
             )
             rows = await cur.fetchall()
+            decode = await transcript_content.decoder(cur, session_id, [row[2] for row in rows])
             records = tuple(
                 TranscriptRecord(
                     index=row[0] - 1,
                     interaction_id=row[1],
-                    message=Message.model_validate(pg_support._json_obj(row[2])),
+                    message=decode(row[2]),
                 )
                 for row in rows
             )
@@ -2768,10 +2770,9 @@ class PostgresSessionStore(
                             require_initial_execution_input(
                                 loaded,
                                 reconstruct(binding_row, loaded),
-                                [
-                                    Message.model_validate(pg_support._json_obj(row[0]))
-                                    for row in transcript_rows
-                                ],
+                                await transcript_content.messages(
+                                    cur, session_id, [row[0] for row in transcript_rows]
+                                ),
                                 list(admission.source_messages),
                             )
                     transition_metadata = transition_profile_metadata
@@ -2784,7 +2785,9 @@ class PostgresSessionStore(
                         transcript_rows = await cur.fetchall()
                         _validate_session_model_transition(
                             loaded,
-                            [Message.model_validate(row[0]) for row in transcript_rows],
+                            await transcript_content.messages(
+                                cur, session_id, [row[0] for row in transcript_rows]
+                            ),
                             await transcript_ops.transcript_cursor(cur, session_id),
                             prepared_model_transition,
                         )
@@ -5626,6 +5629,22 @@ class PostgresSessionStore(
         for name, statement, convert in queries:
             builder.add_class(name, ())
             await cur.execute(statement, (session_id, max_records + 1))
+            if name == "transcript":
+                # Tool results stored in their tool event are read back here.
+                rows = await cur.fetchall()
+                decode = await transcript_content.document_decoder(
+                    cur, session_id, [row[2] for row in rows]
+                )
+                for row in rows:
+                    builder.add_record(
+                        name,
+                        {
+                            "transcript_index": row[0] - 1,
+                            "interaction_id": row[1],
+                            "message": decode(row[2]),
+                        },
+                    )
+                continue
             while rows := await cur.fetchmany(100):
                 for row in rows:
                     builder.add_record(name, convert(row))
@@ -5716,12 +5735,15 @@ class PostgresSessionStore(
                     (session_id,),
                 )
                 while page := await rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
+                    decode = await transcript_content.decoder(
+                        cur, session_id, [row[2] for row in page]
+                    )
                     for row in page:
                         builder.message(
                             TranscriptRecord(
                                 index=row[0] - 1,
                                 interaction_id=row[1],
-                                message=Message(**pg_support._json_obj(row[2])),
+                                message=decode(row[2]),
                             )
                         )
             await cur.execute(

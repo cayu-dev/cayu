@@ -685,6 +685,23 @@ MIGRATION_RECEIPTS_TABLE_DDL = """
 """
 
 
+# Revision 134 trigger: a stored transcript message records its own size unless
+# its writer supplied the size of the full message it stands for, which it does
+# when tool results are stored in their tool event.
+POSTGRES_TRANSCRIPT_MESSAGE_BYTES_FUNCTION = """
+        CREATE OR REPLACE FUNCTION cayu_record_transcript_message_bytes()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.message_bytes IS NULL
+                OR NOT jsonb_path_exists(NEW.message, '$.content[*].cayu_event_content')
+            THEN
+                NEW.message_bytes := octet_length(NEW.message::text);
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """
+
 # Per-revision forward-migration DDL, keyed by revision number. The baseline
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
@@ -747,6 +764,9 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_event_retry_key "
         "ON cayu_tasks ((invocation->>'event_retry_key'), status)",
     ),
+    # A row whose tool results are stored in their tool event records the size
+    # of its full message, which the writer supplies.
+    134: (POSTGRES_TRANSCRIPT_MESSAGE_BYTES_FUNCTION,),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

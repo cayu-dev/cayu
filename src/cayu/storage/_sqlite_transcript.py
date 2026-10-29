@@ -62,6 +62,7 @@ from cayu.sessions.transcript_queries import (
     validate_bounded_transcript_window,
 )
 from cayu.storage import _sqlite_records as sqlite_records
+from cayu.storage import _sqlite_transcript_content as transcript_content
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 
 
@@ -292,7 +293,9 @@ async def replace_initial_transcript_messages(
                 require_initial_execution_input(
                     session,
                     None if binding_row is None else reconstruct(dict(binding_row), session),
-                    [Message.model_validate_json(row[0]) for row in current_rows],
+                    transcript_content.messages(
+                        connection, session_id, [row[0] for row in current_rows]
+                    ),
                     expected,
                 )
                 connection.execute(
@@ -580,12 +583,19 @@ async def load_transcript(run_read: SQLiteOperationRunner, session_id: str) -> l
             """,
             (session_id,),
         ).fetchall()
-        return [Message(**json.loads(row["message_json"])) for row in rows]
+        return transcript_content.messages(
+            connection, session_id, [row["message_json"] for row in rows]
+        )
 
     from cayu.storage._session_access_records import sqlite_owner_read
 
     return await run_read(
-        lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        lambda connection: sqlite_owner_read(
+            connection,
+            access_bounds,
+            session_id,
+            lambda connection: transcript_content.read_snapshot(connection, query),
+        )
     )
 
 
@@ -614,12 +624,17 @@ async def load_transcript_snapshot(
         ).fetchall()
         if not rows:
             raise KeyError(f"Session not found: {session_id}")
+        decode = transcript_content.decoder(
+            connection,
+            session_id,
+            [row["message_json"] for row in rows if row["transcript_index"] is not None],
+        )
         return TranscriptSnapshot(
             records=[
                 TranscriptRecord(
                     index=row["transcript_index"],
                     interaction_id=row["interaction_id"],
-                    message=Message(**json.loads(row["message_json"])),
+                    message=decode(row["message_json"]),
                 )
                 for row in rows
                 if row["transcript_index"] is not None
@@ -630,7 +645,12 @@ async def load_transcript_snapshot(
     from cayu.storage._session_access_records import sqlite_owner_read
 
     return await run_read(
-        lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        lambda connection: sqlite_owner_read(
+            connection,
+            access_bounds,
+            session_id,
+            lambda connection: transcript_content.read_snapshot(connection, query),
+        )
     )
 
 
@@ -667,10 +687,12 @@ async def load_latest_transcript_message(
         return TranscriptRecord(
             index=row["transcript_index"],
             interaction_id=row["interaction_id"],
-            message=Message(**json.loads(row["message_json"])),
+            message=transcript_content.message(connection, session_id, row["message_json"]),
         )
 
-    return await run_read(query_latest)
+    return await run_read(
+        lambda connection: transcript_content.read_snapshot(connection, query_latest)
+    )
 
 
 async def load_latest_transcript_text(
@@ -826,12 +848,17 @@ async def load_transcript_window(
         ).fetchall()
         if not rows:
             raise KeyError(f"Session not found: {session_id}")
+        decode = transcript_content.decoder(
+            connection,
+            session_id,
+            [row["message_json"] for row in rows if row["transcript_index"] is not None],
+        )
         return TranscriptSnapshot(
             records=[
                 TranscriptRecord(
                     index=row["transcript_index"],
                     interaction_id=row["interaction_id"],
-                    message=Message(**json.loads(row["message_json"])),
+                    message=decode(row["message_json"]),
                 )
                 for row in rows
                 if row["transcript_index"] is not None
@@ -842,7 +869,12 @@ async def load_transcript_window(
     from cayu.storage._session_access_records import sqlite_owner_read
 
     return await run_read(
-        lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        lambda connection: sqlite_owner_read(
+            connection,
+            access_bounds,
+            session_id,
+            lambda connection: transcript_content.read_snapshot(connection, query),
+        )
     )
 
 
@@ -901,12 +933,16 @@ async def load_bounded_transcript_window(
         messages: dict[int, Message] = {}
         if sequences:
             placeholders = ", ".join("?" for _ in sequences)
-            for loaded in connection.execute(
+            loaded_rows = connection.execute(
                 "SELECT sequence, message_json FROM cayu_transcript_messages "
                 f"WHERE sequence IN ({placeholders})",
                 sequences,
-            ):
-                messages[loaded["sequence"]] = Message(**json.loads(loaded["message_json"]))
+            ).fetchall()
+            decode = transcript_content.decoder(
+                connection, session_id, [loaded["message_json"] for loaded in loaded_rows]
+            )
+            for loaded in loaded_rows:
+                messages[loaded["sequence"]] = decode(loaded["message_json"])
         return BoundedTranscriptWindow(
             records=[
                 BoundedTranscriptRecord(
@@ -982,11 +1018,14 @@ async def query_transcript(
             """,
             page_params,
         ).fetchall()
+        decode = transcript_content.decoder(
+            connection, query.session_id, [row["message_json"] for row in rows]
+        )
         records = [
             TranscriptRecord(
                 index=row["transcript_index"],
                 interaction_id=row["interaction_id"],
-                message=Message(**json.loads(row["message_json"])),
+                message=decode(row["message_json"]),
             )
             for row in rows
         ]
@@ -998,7 +1037,12 @@ async def query_transcript(
     from cayu.storage._session_access_records import sqlite_owner_read
 
     return await run_read(
-        lambda connection: sqlite_owner_read(connection, access_bounds, query.session_id, run_query)
+        lambda connection: sqlite_owner_read(
+            connection,
+            access_bounds,
+            query.session_id,
+            lambda connection: transcript_content.read_snapshot(connection, run_query),
+        )
     )
 
 
@@ -1057,8 +1101,10 @@ async def search_transcript(
             )
 
         candidates: list[tuple[int, sqlite3.Row, Message]] = []
-        for row in rows:
-            message = Message.model_validate(json.loads(row["message_json"]))
+        decoded = transcript_content.messages_by_session(
+            connection, [(row["session_id"], row["message_json"]) for row in rows]
+        )
+        for row, message in zip(rows, decoded, strict=True):
             document = transcript_search_document(message)
             if row["transcript_search_document"] != document:
                 raise RuntimeError("SQLite transcript search document is inconsistent.")
@@ -1136,4 +1182,6 @@ async def search_transcript(
             next_cursor=next_cursor,
         )
 
-    return await run_read(run_search)
+    return await run_read(
+        lambda connection: transcript_content.read_snapshot(connection, run_search)
+    )

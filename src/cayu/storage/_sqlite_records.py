@@ -418,19 +418,29 @@ def transcript_row(
     interaction_id: Any,
     message: Message,
     payload: dict[str, Any] | None = None,
+    *,
+    stored_payload: dict[str, Any] | None = None,
 ) -> tuple[str, str, Any, str, str, int]:
-    """Values for one ``cayu_transcript_messages`` insert, including its stored size."""
+    """Values for one ``cayu_transcript_messages`` insert, including its stored size.
+
+    ``stored_payload`` is the form written when tool results reference their
+    tool event. The recorded size stays that of the full message, so bounded
+    reads budget for what a read returns.
+    """
 
     from cayu.sessions.transcript_queries import transcript_search_document
 
     message_json = json_dumps(message.model_dump(mode="json") if payload is None else payload)
+    message_bytes = len(message_json.encode("utf-8"))
+    if stored_payload is not None and stored_payload is not payload:
+        message_json = json_dumps(stored_payload)
     return (
         session_id,
         str(message.role),
         interaction_id,
         message_json,
         transcript_search_document(message),
-        len(message_json.encode("utf-8")),
+        message_bytes,
     )
 
 

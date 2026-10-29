@@ -46,8 +46,8 @@ def test_revision_129_is_additive_and_required_by_session_stores() -> None:
     assert revision.kind is schema.RevisionKind.ADDITIVE
     assert revision.compatible_from == schema.revision(128).compatible_from
     assert revision.revision <= schema.LATEST_REVISION
-    assert sqlite._SQLITE_SESSION_MIN_REQUIRED_REVISION == 129
-    assert postgres._POSTGRES_SESSION_MIN_REQUIRED_REVISION == 129
+    assert sqlite._SQLITE_SESSION_MIN_REQUIRED_REVISION >= 129
+    assert postgres._POSTGRES_SESSION_MIN_REQUIRED_REVISION >= 129
 
 
 def test_sqlite_revision_129_backfills_sizes_fills_old_writers_and_indexes_trees(

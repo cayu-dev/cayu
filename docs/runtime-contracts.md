@@ -9925,7 +9925,9 @@ A row over `max_record_bytes` is returned as a `BoundedTranscriptRecord` with
 `message=None` and its `stored_bytes`. SQLite and PostgreSQL read the stored size
 from `cayu_transcript_messages.message_bytes` (storage revision 129), which
 writers set on insert and the database fills for writers that omit it, so the
-check reads no message bodies. The window ends before the first row that
+check reads no message bodies. For a tool message whose result is stored once,
+in its tool event (storage revision 134), the size is that of the full message
+the read returns. The window ends before the first row that
 fits the per-record bound but not the bytes left, so the first row always
 returns and the next window starts where this one stopped. Rows, sizes,
 messages and the append cursor come from one read snapshot. Memory, SQLite and

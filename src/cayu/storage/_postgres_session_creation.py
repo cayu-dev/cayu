@@ -74,6 +74,7 @@ from cayu.storage import _creation_fence
 from cayu.storage import _postgres_event_delivery as event_delivery_ops
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript as transcript_ops
+from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._postgres_transcript import AuthorityRegistrar, PostgresConnection
 
 
@@ -607,9 +608,9 @@ async def create_fork(
                     ),
                 )
                 selected_transcript_rows = await cur.fetchall()
-                copied_messages = [
-                    Message(**pg_support._json_obj(row[1])) for row in selected_transcript_rows
-                ]
+                copied_messages = await transcript_content.messages(
+                    cur, source_session_id, [row[1] for row in selected_transcript_rows]
+                )
                 copied_interaction_ids = [row[2] for row in selected_transcript_rows]
                 source_transcript_snapshot = (
                     None

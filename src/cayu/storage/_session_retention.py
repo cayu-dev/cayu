@@ -46,6 +46,7 @@ from cayu.sessions._runtime_publication_rules import (
 )
 from cayu.storage import _retention_sql as audit
 from cayu.storage import _sqlite_records as sqlite_records
+from cayu.storage import _transcript_tool_results as transcript_tool_results
 from cayu.storage._retention_sql import (
     PostgresRetentionSql,
     RetentionSql,
@@ -1396,10 +1397,11 @@ def compacted_tool_output_marker(content: str) -> str:
     """The text that replaces a compacted tool-output body in a stored event."""
 
     encoded = content.encode("utf-8")
-    return (
-        f"[cayu storage retention removed {len(encoded)} bytes of tool output; "
-        f"sha256 {hashlib.sha256(encoded).hexdigest()}]"
-    )
+    return _tool_output_marker(len(encoded), hashlib.sha256(encoded).hexdigest())
+
+
+def _tool_output_marker(byte_count: int, sha256: str) -> str:
+    return f"[cayu storage retention removed {byte_count} bytes of tool output; sha256 {sha256}]"
 
 
 def _compact_document(document: Any) -> tuple[Any, int] | None:
@@ -1447,6 +1449,84 @@ def _compact_message(document: Any, min_bytes: int) -> tuple[dict[str, Any], int
         sqlite_records.json_dumps(compacted).encode("utf-8")
     )
     return compacted, saved
+
+
+async def _referencing_transcript_rows(
+    backend: SessionRetentionBackend, sql: RetentionSql, session_id: str
+) -> dict[int, tuple[int | None, Any, list[str]]]:
+    """Tool messages whose results are stored in their tool event, by sequence."""
+
+    message = backend.transcript_message
+    contains = f"strpos(({message})::text, ?) > 0" if sql.postgres else f"instr({message}, ?) > 0"
+    referenced: dict[int, tuple[int | None, Any, list[str]]] = {}
+    for sequence, session_order, stored in await sql.all(
+        f"SELECT sequence, session_order, {message} FROM cayu_transcript_messages "
+        f"WHERE session_id = ? AND {backend.transcript_role} = ? AND {contains} "
+        "ORDER BY sequence",
+        (session_id, "tool", f'"{transcript_tool_results.CONTENT_REFERENCE_KEY}"'),
+    ):
+        document = sql.read_json(stored)
+        event_ids = transcript_tool_results.referenced_event_ids(document)
+        if event_ids:
+            referenced[int(sequence)] = (session_order, document, event_ids)
+    return referenced
+
+
+async def _tool_event_contents(
+    sql: RetentionSql, session_id: str, event_ids: Collection[str]
+) -> dict[str, Any]:
+    if sql.postgres:
+        content = "payload->'result'->>'content'"
+        is_text = "jsonb_typeof(payload->'result'->'content') = 'string'"
+    else:
+        content = "json_extract(payload_json, '$.result.content')"
+        is_text = "json_type(payload_json, '$.result.content') = 'text'"
+    contents: dict[str, Any] = {}
+    for chunk in chunks(sorted(event_ids)):
+        for event_id, value in await sql.all(
+            f"SELECT event_id, {content} FROM cayu_events WHERE session_id = ? "
+            f"AND event_id IN ({marks(chunk)}) AND event_type IN (?, ?) AND {is_text}",
+            (session_id, *chunk, *_TOOL_OUTPUT_EVENT_TYPES),
+        ):
+            contents[event_id] = value
+    return contents
+
+
+def _transcript_rewrites(
+    candidates: Mapping[int, tuple[int, Any]],
+    rewritten_events: Collection[str],
+    contents: Mapping[str, Any],
+    min_bytes: int,
+) -> list[_TranscriptRewrite]:
+    """Rewrites of candidate tool messages, given the events being compacted.
+
+    A reference to a compacted event becomes the same marker the event gets.
+    Any other reference in a rewritten row is restored inline, so a rewritten
+    row never depends on an event body.
+    """
+
+    rewrites: list[_TranscriptRewrite] = []
+    for sequence, (session_order, document) in sorted(candidates.items()):
+        marked, references_compacted = transcript_tool_results.compact_referenced_parts(
+            document, rewritten_events, _tool_output_marker
+        )
+        try:
+            resolved = transcript_tool_results.resolve_message_document(marked, contents)
+        except ValueError:
+            continue  # Unreadable material stays as it is, and so do its events.
+        compacted = _compact_message(resolved, min_bytes)
+        if compacted is None and not references_compacted:
+            continue
+        message = resolved if compacted is None else compacted[0]
+        Message.model_validate(message)  # It must stay a valid transcript message.
+        saved = len(sqlite_records.json_dumps(document).encode("utf-8")) - len(
+            sqlite_records.json_dumps(message).encode("utf-8")
+        )
+        if saved <= 0 and not references_compacted:
+            continue
+        # Replacing a reference with a marker can add a few bytes; report none.
+        rewrites.append(_TranscriptRewrite(sequence, session_order, message, max(saved, 0)))
+    return rewrites
 
 
 async def _session_receipts(
@@ -1589,36 +1669,57 @@ async def _compaction_plan(
         if saved <= 0:
             continue
         rewrites.append(_EventRewrite(int(sequence), event_id, new_payload, new_event, saved))
-    transcript_rewrites: list[_TranscriptRewrite] = []
+    # A tool result stored once in its event is referenced from the transcript.
+    # Such an event is rewritten only together with the transcript row that
+    # references it, so the transcript never reads back different text.
+    referenced = await _referencing_transcript_rows(backend, sql, session_id)
+    referenced_events = {event_id for _, _, ids in referenced.values() for event_id in ids}
+    candidates: dict[int, tuple[int, Any]] = {}
+    contents: dict[str, Any] = {}
     if transcript_level:
         message_size = sql.size(backend.transcript_message)
-        for sequence, session_order, message in await sql.all(
-            f"SELECT sequence, session_order, {backend.transcript_message} "
-            f"FROM cayu_transcript_messages WHERE session_id = ? "
-            f"AND {backend.transcript_role} = ? AND {message_size} >= ? ORDER BY sequence",
-            (session_id, "tool", min_bytes),
-        ):
+        rows = [
+            (int(sequence), session_order, sql.read_json(message))
+            for sequence, session_order, message in await sql.all(
+                f"SELECT sequence, session_order, {backend.transcript_message} "
+                f"FROM cayu_transcript_messages WHERE session_id = ? "
+                f"AND {backend.transcript_role} = ? AND {message_size} >= ? ORDER BY sequence",
+                (session_id, "tool", min_bytes),
+            )
+        ]
+        rows.extend(
+            (sequence, session_order, document)
+            for sequence, (session_order, document, _) in referenced.items()
+        )
+        for sequence, session_order, document in rows:
             # Only runtime-published tool results are rewritten. Messages no
             # receipt covers, such as caller-supplied initial input that a
             # session-start input contract digests, are left alone.
-            if session_order is None or not any(
+            if session_order is not None and any(
                 bound.covers(int(session_order)) for bound in receipts
             ):
-                continue
-            compacted_message = _compact_message(sql.read_json(message), min_bytes)
-            if compacted_message is None or compacted_message[1] <= 0:
-                continue
-            transcript_rewrites.append(
-                _TranscriptRewrite(
-                    int(sequence), int(session_order), compacted_message[0], compacted_message[1]
-                )
-            )
+                candidates.setdefault(sequence, (int(session_order), document))
+        if referenced_events:
+            contents = await _tool_event_contents(sql, session_id, referenced_events)
     # Rewrite only material whose receipt verifies now; a receipt that already
     # fails keeps its material untouched so the failure stays diagnosable.
     verified: dict[str, bool] = {}
     while True:
-        orders = {rewrite.session_order for rewrite in transcript_rewrites}
         rewritten_events = {rewrite.event_id for rewrite in rewrites}
+        transcript_rewrites = _transcript_rewrites(
+            candidates, rewritten_events, contents, min_bytes
+        )
+        rewritten_rows = {rewrite.sequence for rewrite in transcript_rewrites}
+        pinned = rewritten_events & {
+            event_id
+            for sequence, (_, _, ids) in referenced.items()
+            if sequence not in rewritten_rows
+            for event_id in ids
+        }
+        if pinned:
+            rewrites = [rewrite for rewrite in rewrites if rewrite.event_id not in pinned]
+            continue
+        orders = {rewrite.session_order for rewrite in transcript_rewrites}
         affected = [
             bound
             for bound in receipts
@@ -1633,11 +1734,11 @@ async def _compaction_plan(
                 failing.append(bound)
         if not failing:
             break
-        transcript_rewrites = [
-            rewrite
-            for rewrite in transcript_rewrites
-            if not any(bound.covers(rewrite.session_order) for bound in failing)
-        ]
+        candidates = {
+            sequence: candidate
+            for sequence, candidate in candidates.items()
+            if not any(bound.covers(candidate[0]) for bound in failing)
+        }
         rewrites = [
             rewrite
             for rewrite in rewrites

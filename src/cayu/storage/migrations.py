@@ -561,6 +561,9 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=132, kind=RevisionKind.ADDITIVE, compatible_from=127),
     # Every worker must preserve and enforce the durable event execution budget.
     Revision(revision=133, kind=RevisionKind.BREAKING, compatible_from=133),
+    # A transcript tool result may be stored once, in its tool event, and
+    # referenced from the transcript. Older binaries cannot read the reference.
+    Revision(revision=134, kind=RevisionKind.BREAKING, compatible_from=134),
 )
 
 #: The revision an empty database is initialized to.

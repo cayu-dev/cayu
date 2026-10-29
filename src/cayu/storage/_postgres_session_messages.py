@@ -71,6 +71,7 @@ from cayu.sessions.transcript_input import (
 from cayu.storage import _postgres_event_delivery as event_delivery_ops
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript as transcript_ops
+from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._postgres_transcript import AuthorityRegistrar, PostgresConnection
 
 
@@ -152,8 +153,9 @@ async def _source_snapshot(
             rows = await cur.fetchall()
             if not rows:
                 break
+            decode = await transcript_content.decoder(cur, session.id, [row[1] for row in rows])
             for row in rows:
-                hasher.add(row[0] - 1, Message.model_validate(pg_support._json_obj(row[1])))
+                hasher.add(row[0] - 1, decode(row[1]))
             after = rows[-1][0]
         transcript_digest = hasher.hexdigest()
     checkpoint = None
@@ -201,6 +203,8 @@ async def snapshot_session_message_source(
         raise TypeError("Snapshot digest flags must be bool.")
     await ensure_ready()
     async with connect() as conn, conn.cursor() as cur:
+        # One snapshot for the transcript rows and the tool events their results live in.
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         session = await _read_session(cur, session_id, load_labels=load_labels)
         require_resource_session(session, "read")
         message_queue.require_authorized_session_instance(

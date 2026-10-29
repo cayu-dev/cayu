@@ -74,6 +74,7 @@ from cayu.sessions.transcript_input import (
 from cayu.storage import _sqlite_event_delivery as event_delivery_ops
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_transcript as transcript_ops
+from cayu.storage import _sqlite_transcript_content as transcript_content
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 from cayu.storage._sqlite_transcript import ClosureOwners
 
@@ -262,12 +263,15 @@ def _source_snapshot(
     transcript_digest = None
     if include_transcript_digest:
         hasher = message_queue.SourceTranscriptHasher(cursor)
-        for row in connection.execute(
+        rows = connection.execute(
             "SELECT session_order, message_json FROM cayu_transcript_messages "
             "WHERE session_id = ? ORDER BY session_order",
             (session.id,),
-        ):
-            hasher.add(row[0] - 1, Message.model_validate_json(row[1]))
+        )
+        while page := rows.fetchmany(256):
+            decode = transcript_content.decoder(connection, session.id, [row[1] for row in page])
+            for row in page:
+                hasher.add(row[0] - 1, decode(row[1]))
         transcript_digest = hasher.hexdigest()
     checkpoint = None
     if include_checkpoint_digest:

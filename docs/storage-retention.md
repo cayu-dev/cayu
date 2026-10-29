@@ -84,9 +84,17 @@ tool output from its stored event, is no longer possible.
 | `events` (default) | Nothing else. The transcript, including the tool results the model saw, is unchanged. |
 | `transcript` | Replaces each `tool_result` body of at least `compact_tool_output_min_bytes` in the transcript's tool messages with the same marker. The tool name, call id, `structured` result, artifacts and error flag stay. |
 
-A tool result is stored twice, once in its `tool.call.completed` event and once
-in the transcript, so the `events` level halves a large tool output's footprint
-and `transcript` removes the rest. The transcript level rewrites only tool
+From storage revision 134, a tool result of at least 1 KiB that the runtime
+publishes is stored once, in its `tool.call.completed` or `tool.call.failed`
+event. The transcript's tool message keeps the tool name, call id, `structured`
+result, artifacts and error flag, plus a reference that names the event and
+records the result's size and SHA-256; every transcript read restores the body
+from the event and fails if it no longer matches. The `events` level leaves
+such an event alone, because the transcript reads its result from it, and the
+`transcript` level replaces the body in both places with the same marker.
+Sessions stored before revision 134, and smaller results, keep a copy in each
+place: there the `events` level halves a large tool output's footprint and
+`transcript` removes the rest. The transcript level rewrites only tool
 messages that a runtime-publication receipt covers, which is every tool result
 the runtime published; messages the caller supplied, such as initial input
 that a session's input contract digests, are left alone. After compaction at
@@ -113,6 +121,16 @@ check for those receipts.
 
 Transcript retention by message count remains the separate
 `compact_transcript(keep_last=...)` operation.
+
+### What the session tables hold
+
+| Table | What it holds | What shrinks it |
+| --- | --- | --- |
+| `cayu_events` | Every event of every session. A tool's terminal event carries its result body. | `compact` removes text and thinking deltas and replaces large tool-result bodies (see above); `delete`. |
+| `cayu_transcript_messages` | The messages the model sees. A tool result stored once in its event is a reference here. | `compact` at the `transcript` level replaces large tool-result bodies; `delete`. |
+| `cayu_session_operations` | Exactly-once records, described below. | `delete` only. |
+| `cayu_checkpoints` | One row per session: the latest runtime checkpoint. | `delete`. |
+| `cayu_sessions`, `cayu_session_labels` | The session record, metadata and labels. | `delete`. |
 
 ### What `cayu_session_operations` holds
 

@@ -7,7 +7,6 @@ import sqlite3
 from typing import Any, cast
 
 from cayu._validation import require_clean_nonblank, require_execution_unit_id
-from cayu.messages import Message
 from cayu.sessions.transcript_queries import (
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     transcript_search_document,
@@ -17,6 +16,7 @@ from cayu.sessions.transcript_queries import (
 
 def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
     from cayu.sessions.pending_actions import pending_action_lookup_key
+    from cayu.storage._sqlite_transcript_content import search_document_message
 
     def lookup_key(value: object) -> str | None:
         return pending_action_lookup_key(value) if type(value) is str else None
@@ -43,8 +43,8 @@ def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
         if type(message_json) is not str:
             raise ValueError("Transcript message JSON must be text.")
         try:
-            payload = json.loads(message_json)
-            message = Message.model_validate(payload)
+            # Narrative text only: a tool result that references its event adds none.
+            message = search_document_message(message_json)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("Transcript message JSON is invalid.") from exc
         return transcript_search_document(message)

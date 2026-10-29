@@ -13,7 +13,6 @@ import sqlite3
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event
-from cayu.messages import Message
 from cayu.runtime.evidence_spool import EvidenceSpool
 from cayu.sessions.records import (
     EventRecord,
@@ -38,6 +37,7 @@ from cayu.sessions.terminal_evidence import (
     _validate_runner_observed_event_identity_snapshot,
 )
 from cayu.storage import _sqlite_records as sqlite_records
+from cayu.storage import _sqlite_transcript_content as transcript_content
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 
 
@@ -159,7 +159,8 @@ async def _load_evidence(
         (
             "length(CAST(session_order AS TEXT))",
             "COALESCE(length(CAST(interaction_id AS BLOB)), 0)",
-            "length(CAST(message_json AS BLOB))",
+            # The full message size, including a tool result read from its tool event.
+            "COALESCE(message_bytes, length(CAST(message_json AS BLOB)))",
         )
     )
 
@@ -607,13 +608,16 @@ async def _load_evidence(
                         records=len(rows),
                         transport_bytes=sum(row["transport_bytes"] for row in rows),
                     )
+                    decode = transcript_content.decoder(
+                        connection, session_id, [row["message_json"] for row in rows]
+                    )
                     for row in rows:
                         spool.append(
                             "transcript",
                             TranscriptRecord(
                                 index=row["transcript_index"],
                                 interaction_id=row["interaction_id"],
-                                message=Message(**json.loads(row["message_json"])),
+                                message=decode(row["message_json"]),
                             ),
                         )
                 cursor.close()
@@ -647,11 +651,14 @@ async def _load_evidence(
                 EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
                 for row in event_rows
             )
+            decode = transcript_content.decoder(
+                connection, session_id, [row["message_json"] for row in transcript_rows]
+            )
             transcript = tuple(
                 TranscriptRecord(
                     index=row["transcript_index"],
                     interaction_id=row["interaction_id"],
-                    message=Message(**json.loads(row["message_json"])),
+                    message=decode(row["message_json"]),
                 )
                 for row in transcript_rows
             )

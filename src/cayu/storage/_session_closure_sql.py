@@ -159,11 +159,9 @@ def closure_size_statement(*, postgres: bool) -> tuple[str, int]:
                 "event_type",
             ),
         ),
-        (
-            "cayu_transcript_messages",
-            "session_id",
-            ("message" if postgres else "message_json", "interaction_id"),
-        ),
+        # message_bytes is the full message size, including a tool result
+        # that is stored in its tool event and read back into the message.
+        ("cayu_transcript_messages", "session_id", ("message_bytes", "interaction_id")),
         ("cayu_checkpoints", "session_id", ("state" if postgres else "state_json",)),
         (
             "cayu_session_message_queue",
@@ -206,11 +204,7 @@ def closure_size_statement(*, postgres: bool) -> tuple[str, int]:
     )
     selects = []
     for index, (table, identity, columns) in enumerate(sources):
-        sizes = (
-            [f"COALESCE(octet_length({column}::text), 0)" for column in columns]
-            if postgres
-            else [f"COALESCE(length(CAST({column} AS BLOB)), 0)" for column in columns]
-        )
+        sizes = [stored_column_size(column, postgres=postgres) for column in columns]
         selects.append(
             f"SELECT size FROM (SELECT {' + '.join(sizes)} AS size FROM {table} "
             f"WHERE {identity} = {parameter} LIMIT {parameter}) AS source_{index}"
@@ -221,3 +215,17 @@ def closure_size_statement(*, postgres: bool) -> tuple[str, int]:
         + ") AS closure_sizes",
         len(sources),
     )
+
+
+def stored_column_size(column: str, *, postgres: bool) -> str:
+    """SQL for one column's stored bytes; ``message_bytes`` is a transcript row's full size."""
+
+    if column == "message_bytes":
+        return (
+            "COALESCE(message_bytes, octet_length(message::text), 0)"
+            if postgres
+            else "COALESCE(message_bytes, length(CAST(message_json AS BLOB)), 0)"
+        )
+    if postgres:
+        return f"COALESCE(octet_length({column}::text), 0)"
+    return f"COALESCE(length(CAST({column} AS BLOB)), 0)"

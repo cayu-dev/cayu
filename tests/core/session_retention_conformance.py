@@ -869,22 +869,44 @@ def _tool_message_content(transcript) -> str:
 async def assert_event_compaction_keeps_receipts_verifiable(harness: RetentionHarness) -> None:
     """Compacting tool events of a real session keeps its publication receipts valid."""
 
+    from cayu.storage import _transcript_tool_results as transcript_tool_results
+
     store = harness.store
+    minimum = transcript_tool_results.MIN_REFERENCED_CONTENT_BYTES
     with tempfile.TemporaryDirectory() as directory:
-        await run_read_file_session(harness, Path(directory), "events")
-    transcript_before = await store.load_transcript("events")
+        # A session written before tool results were stored once keeps its
+        # result inline in both the event and the transcript.
+        transcript_tool_results.MIN_REFERENCED_CONTENT_BYTES = 2**62
+        try:
+            await run_read_file_session(harness, Path(directory) / "inline", "events")
+        finally:
+            transcript_tool_results.MIN_REFERENCED_CONTENT_BYTES = minimum
+        await run_read_file_session(harness, Path(directory) / "stored", "stored-once")
+    transcripts_before = {
+        session_id: await store.load_transcript(session_id)
+        for session_id in ("events", "stored-once")
+    }
     await assert_receipts_verify(harness, "events")
     await harness.age()
 
     applied = await store.apply_retention_policy(policy(dry_run=False))
-    [item] = applied.items
-    assert item.counts["tool_outputs_compacted"] == 1
-    assert "transcript_tool_results_compacted" not in item.counts
+    items = {item.item_id: item for item in applied.items}
+    assert items["events"].counts["tool_outputs_compacted"] == 1
+    assert "transcript_tool_results_compacted" not in items["events"].counts
     events = await store.load_events("events")
     [completed] = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
     assert completed.payload["result"]["content"].startswith("[cayu storage retention removed ")
-    assert await store.load_transcript("events") == transcript_before
-    await assert_receipts_verify(harness, "events")
+    # The transcript reads a result stored once from its event, so the event
+    # level leaves that event as it is.
+    assert items["stored-once"].counts["tool_outputs_compacted"] == 0
+    events = await store.load_events("stored-once")
+    [completed] = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
+    assert completed.payload["result"]["content"] == _tool_message_content(
+        transcripts_before["stored-once"]
+    )
+    for session_id, transcript in transcripts_before.items():
+        assert await store.load_transcript(session_id) == transcript
+        await assert_receipts_verify(harness, session_id)
 
 
 async def assert_transcript_compaction_replaces_tool_results(harness: RetentionHarness) -> None:
@@ -910,7 +932,8 @@ async def assert_transcript_compaction_replaces_tool_results(harness: RetentionH
         )
         [item] = applied.items
         assert (item.counts, item.bytes) == (planned.counts, planned.bytes)
-        assert item.bytes > 2 * READ_FILE_BYTES
+        # The result is stored once, in its event; the transcript references it.
+        assert item.bytes > READ_FILE_BYTES
         encoded = original.encode("utf-8")
         assert _tool_message_content(await store.load_transcript("reader")) == (
             f"[cayu storage retention removed {len(encoded)} bytes of tool output; "

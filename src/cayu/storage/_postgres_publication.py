@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from datetime import datetime
@@ -9,7 +10,6 @@ from typing import Any, Protocol
 
 from cayu._validation import MAX_DURABLE_JSON_ENVELOPE_NESTING, copy_durable_json_object
 from cayu.events import Event
-from cayu.messages import Message
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
@@ -93,6 +93,8 @@ from cayu.storage import _postgres_public_authority as public_authority_ops
 from cayu.storage import _postgres_session_queries as session_queries
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript as transcript_ops
+from cayu.storage import _postgres_transcript_content as transcript_content
+from cayu.storage import _transcript_tool_results as transcript_tool_results
 from cayu.storage._postgres_transcript import PostgresConnection
 
 
@@ -156,7 +158,9 @@ async def load_material(
         ),
     )
     transcript_rows = await cur.fetchall()
-    transcript = [Message(**pg_support._json_obj(row[1])) for row in transcript_rows]
+    transcript = await transcript_content.messages(
+        cur, receipt.session_id, [row[1] for row in transcript_rows]
+    )
     transcript_interaction_ids = [row[0] for row in transcript_rows]
 
     referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
@@ -594,16 +598,26 @@ async def publish_runtime(
                     )
                     stored_target_checkpoint = checkpoint_codec.encode(loaded, checkpoint)
 
+                # A tool result is stored once, in its tool event. Its row
+                # records the size of the full message it stands for.
                 transcript_rows = [
                     (
                         session_id,
                         request.interaction_id,
-                        pg_support._dumps(message_payload),
+                        pg_support._dumps(stored_payload),
                         transcript_ops.index_document(session_id, message),
+                        None
+                        if stored_payload is message_payload
+                        else pg_support._dumps(message_payload),
                     )
-                    for message, message_payload in zip(
+                    for message, message_payload, stored_payload in zip(
                         request.transcript_messages,
                         prepared.transcript_payloads,
+                        transcript_tool_results.reference_event_contents(
+                            prepared.transcript_payloads,
+                            prepared.event_payloads,
+                            durable_references.values(),
+                        ),
                         strict=True,
                     )
                 ]
@@ -680,17 +694,34 @@ async def publish_runtime(
                 order_row = await cur.fetchone()
                 if order_row is None:
                     raise KeyError(f"Session not found: {session_id}")
-                if transcript_rows:
-                    await cur.executemany(
-                        """
-                            INSERT INTO cayu_transcript_messages (
-                                session_id, interaction_id, message,
-                                transcript_search_document
-                            )
-                            VALUES (%s, %s, %s, %s)
-                            """,
-                        transcript_rows,
-                    )
+                # Rows keep their order, which assigns session_order. Only a row
+                # that references its tool event supplies its full size; the
+                # trigger measures every other row.
+                for referencing, group in itertools.groupby(
+                    transcript_rows, key=lambda row: row[4] is not None
+                ):
+                    if referencing:
+                        await cur.executemany(
+                            """
+                                INSERT INTO cayu_transcript_messages (
+                                    session_id, interaction_id, message,
+                                    transcript_search_document, message_bytes
+                                )
+                                VALUES (%s, %s, %s, %s, octet_length((%s::jsonb)::text))
+                                """,
+                            list(group),
+                        )
+                    else:
+                        await cur.executemany(
+                            """
+                                INSERT INTO cayu_transcript_messages (
+                                    session_id, interaction_id, message,
+                                    transcript_search_document
+                                )
+                                VALUES (%s, %s, %s, %s)
+                                """,
+                            [row[:4] for row in group],
+                        )
                 if checkpoint_values is not None:
                     await cur.execute(
                         """
@@ -1001,13 +1032,17 @@ async def publish_checkpoint_events(
                                 "ORDER BY session_order",
                                 (session_id, [index + 1 for index in indices]),
                             )
+                            transcript_rows = await cur.fetchall()
+                            decode = await transcript_content.decoder(
+                                cur, session_id, [row[2] for row in transcript_rows]
+                            )
                             selected_rows = tuple(
                                 TranscriptRecord(
                                     index=row[0],
                                     interaction_id=row[1],
-                                    message=Message(**pg_support._json_obj(row[2])),
+                                    message=decode(row[2]),
                                 )
-                                for row in await cur.fetchall()
+                                for row in transcript_rows
                             )
                         session_exports.validate_publication(
                             session=loaded,
