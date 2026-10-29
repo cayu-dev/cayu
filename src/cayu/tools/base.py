@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
 from math import isfinite
@@ -1221,6 +1222,7 @@ class ToolContext(BaseModel):
     _runtime_artifact_store_authority: Any = PrivateAttr(default=None)
     _runtime_causal_budget_limits: tuple[Any, ...] = PrivateAttr(default=())
     _runtime_inference: InferenceInvoker | None = PrivateAttr(default=None)
+    _runtime_clock: Callable[[], datetime] | None = PrivateAttr(default=None)
     _runtime_knowledge_publication_scope: KnowledgePublicationScope | None = PrivateAttr(
         default=None
     )
@@ -1230,6 +1232,16 @@ class ToolContext(BaseModel):
         """Optional runtime-owned inference handle, valid only during this tool call."""
 
         return self._runtime_inference
+
+    def _bind_runtime_clock(self, clock: Callable[[], datetime]) -> None:
+        if self._runtime_clock is not None:
+            raise RuntimeError("Runtime clock is already bound.")
+        self._runtime_clock = clock
+
+    def _runtime_now(self) -> datetime | None:
+        """The application's trusted clock for this call; ``None`` outside the runtime."""
+
+        return None if self._runtime_clock is None else self._runtime_clock()
 
     def _bind_runtime_inference(self, inference: InferenceInvoker) -> None:
         if self._runtime_inference is not None:

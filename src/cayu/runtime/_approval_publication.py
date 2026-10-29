@@ -39,6 +39,8 @@ PendingActionPublicationKind = Literal[
     "approval-close",
     "user-input-open",
     "user-input-close",
+    "wake-open",
+    "wake-close",
 ]
 
 
@@ -80,6 +82,8 @@ def prepare_pending_action_publication(
         "approval-close",
         "user-input-open",
         "user-input-close",
+        "wake-open",
+        "wake-close",
     }:
         raise ValueError("Unsupported pending-action publication kind.")
     if type(expected_statuses) not in (set, frozenset) or not expected_statuses:

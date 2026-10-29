@@ -204,12 +204,14 @@ class CloudWaitingItem(_ContractModel):
     """One item a run waits on, without its question, arguments or payload.
 
     ``kind`` is ``tool_approval``, ``user_input``, ``manual_recovery``,
-    ``delegated_action`` or ``external_event``. A delegated action points at
-    the child session whose own item a person settles; it has no
+    ``delegated_action``, ``external_event`` or ``wake``. A delegated action
+    points at the child session whose own item a person settles; it has no
     ``attention_id``. An external event is a run parked until an outside
     system answers or its deadline passes; ``external_wait`` describes it and
-    is ``None`` for every other kind. ``requested_at`` is when the run began
-    waiting on it.
+    is ``None`` for every other kind. A wake is a session asleep in
+    ``sleep_until``: no person settles it, it has no ``attention_id``, and
+    ``wake_at`` says when it continues on its own. ``requested_at`` is when
+    the run began waiting on it.
     """
 
     kind: str
@@ -219,6 +221,7 @@ class CloudWaitingItem(_ContractModel):
     child_session_id: str | None
     child_run_id: str | None
     external_wait: CloudExternalWait | None = None
+    wake_at: datetime | None = None
 
 
 class CloudRun(_ContractModel):
@@ -708,6 +711,7 @@ def _waiting_item(
             if reference is None
             else app.project_session_id_for_exposure(reference.child_session_id)
         ),
+        wake_at=action.wake_at,
     )
 
 

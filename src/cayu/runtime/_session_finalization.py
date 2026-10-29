@@ -57,6 +57,10 @@ from cayu.approvals.user_input import (
     user_input_lifecycle_authority_from_checkpoint,
     user_input_supersession_intent_for,
 )
+from cayu.approvals.wakes import (
+    PENDING_WAKE_CHECKPOINT_KEY,
+    pending_session_wake_from_checkpoint,
+)
 from cayu.budgets.base import (
     BudgetCheck,
     BudgetReservationResult,
@@ -898,6 +902,15 @@ def _checkpoint_with_pending_session_interrupt(
         else:
             pending_user_input = None
             resolution_intent = None
+        # An operator stop supersedes a sleeping call like any pause, in this same
+        # transition, whether the session is still running or already asleep.
+        sleeping = (
+            pending_session_wake_from_checkpoint(copied_checkpoint)
+            if pending_user_input is None and ambiguous_user_input is None
+            else None
+        )
+        if sleeping is not None:
+            pending_user_input = sleeping.continuation
         if (
             expected_ambiguous_user_input is not None
             and session.status is SessionStatus.INTERRUPTED
@@ -974,7 +987,20 @@ def _checkpoint_with_pending_session_interrupt(
             transition_payload[USER_INPUT_SUPERSESSION_INTENT_KEY] = supersession_intent.model_dump(
                 mode="json", exclude_none=True
             )
-            copied_checkpoint.pop(PENDING_USER_INPUT_CHECKPOINT_KEY)
+            if (
+                sleeping is not None
+                and terminal_decision is not None
+                and terminal_decision.terminal_payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+                != transition_payload[USER_INPUT_SUPERSESSION_INTENT_KEY]
+            ):
+                # The elected stop must bind the same supersession it persists;
+                # a sleep that opened after the decision makes the stop decide again.
+                raise SessionRunFenced("A sleeping call opened after the stop was decided.")
+            copied_checkpoint.pop(
+                PENDING_WAKE_CHECKPOINT_KEY
+                if sleeping is not None
+                else PENDING_USER_INPUT_CHECKPOINT_KEY
+            )
             copied_checkpoint.pop(USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
         elif (
             ambiguous_user_input is not None
@@ -1174,6 +1200,8 @@ def _pending_interaction_action_kind(
 
     if foreground_child_state_from_checkpoint(checkpoint)[0] is not None:
         return "waiting_on_child_action"
+    if checkpoint is not None and checkpoint.get(PENDING_WAKE_CHECKPOINT_KEY) is not None:
+        return PendingActionKind.WAKE.value
 
     # Preserve short-circuit reads: lower-priority checkpoint state must not
     # change the existing lifecycle summary or its validation/error order.

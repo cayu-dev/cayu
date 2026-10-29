@@ -7,6 +7,7 @@ from typing import Any
 from cayu.approvals.user_input import (
     user_input_lifecycle_authority_from_checkpoint,
 )
+from cayu.approvals.wakes import require_no_pending_wake
 from cayu.runtime import _prompt_transition, _session_operation_state
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
@@ -76,6 +77,7 @@ def _reject_unresumable_session_checkpoint(
         is not None
     ):
         raise RuntimeError("Session has a pending tool approval.")
+    require_no_pending_wake(checkpoint)
     pending_user_input, _ = user_input_lifecycle_authority_from_checkpoint(
         checkpoint,
         redactor=redactor,

@@ -247,6 +247,11 @@ class PendingActionRecord(BaseModel):
     options: list[str] = Field(default_factory=list)
     arguments: dict[str, Any] | None = None
     delegated_action: DelegatedActionReference | None = None
+    # A WAKE action's sleeping call: ``wake_id`` names it for
+    # ``session_wake_attempts`` and ``deliver_session_wake``, and ``wake_at`` is
+    # when the session continues on its own. No person acts on it.
+    wake_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    wake_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="before")
     @classmethod
@@ -265,7 +270,10 @@ class PendingActionRecord(BaseModel):
         Delegated rows are navigation only. Query the child-owned action.
         Legacy/custom projections without an incarnation remain unavailable.
         """
-        if self.session.instance_id is None or self.kind is PendingActionKind.DELEGATED_ACTION:
+        if self.session.instance_id is None or self.kind in {
+            PendingActionKind.DELEGATED_ACTION,
+            PendingActionKind.WAKE,
+        }:
             return None
         if self.kind is PendingActionKind.USER_INPUT:
             discriminator = self.input_id

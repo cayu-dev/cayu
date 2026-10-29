@@ -25,6 +25,7 @@ from cayu._validation import (
     require_clean_nonblank,
 )
 from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
+from cayu.approvals.wakes import require_no_pending_wake
 from cayu.budgets.base import BudgetPolicy
 from cayu.configuration import RunDefaults
 from cayu.context.base import validate_context_messages
@@ -263,6 +264,7 @@ def _validate_fork_source_checkpoint_state(
         raise RuntimeError(
             "Interrupted session cannot be forked because checkpoint state is missing."
         )
+    require_no_pending_wake(source_checkpoint)
     pending_user_input, _ = user_input_lifecycle_authority_from_checkpoint(
         source_checkpoint,
         redactor=redactor,

@@ -71,6 +71,21 @@ class UserInputRecoveryEvidence:
             session.id,
             f"user-input-open:{input_id}",
         )
+        if receipt is None:
+            handover = await self._session_store.load_runtime_publication_receipt(
+                session.id, f"wake-close:{input_id}"
+            )
+            if handover is not None:
+                return await self._require_exact_wake_handover(
+                    session=session, input_id=input_id, pending=pending, receipt=handover
+                )
+            opening = await self._session_store.load_runtime_publication_receipt(
+                session.id, f"wake-open:{input_id}"
+            )
+            if opening is not None:
+                return await self._require_exact_wake_opening(
+                    session=session, input_id=input_id, pending=pending, receipt=opening
+                )
         identity_fields = {
             "schema_version",
             "session_id",
@@ -399,6 +414,119 @@ class UserInputRecoveryEvidence:
                 "User-input closure event conflicts with its receipt."
             )
         return event
+
+    async def _require_exact_wake_handover(
+        self,
+        *,
+        session: Session,
+        input_id: str,
+        pending: PendingUserInput | None,
+        receipt: RuntimePublicationReceipt,
+    ) -> RuntimePublicationReceipt:
+        """Authenticate the ``wake-close`` that opened a woken sleep's continuation."""
+
+        identity_fields = {
+            "schema_version",
+            "session_id",
+            "session_instance_id",
+            "source_interaction_id",
+            "source_run_epoch",
+            "input_id",
+            "tool_call_id",
+            "tool_round_id",
+            "model_step_id",
+            "model_attempt_id",
+            "execution_profile_fingerprint",
+            "pause_digest",
+        }
+        expected_identity = pending_user_input_identity(pending) if pending is not None else None
+        if (
+            receipt.session_id != session.id
+            or receipt.publication_id != f"wake-close:{input_id}"
+            or receipt.kind != "wake-close"
+            or receipt.source_status is not SessionStatus.INTERRUPTED
+            or set(receipt.intent)
+            != identity_fields | {"wake_pause_digest", "transition", "event_ids"}
+            or receipt.intent.get("session_id") != session.id
+            or receipt.intent.get("session_instance_id") != session.instance_id
+            or receipt.intent.get("input_id") != input_id
+            or receipt.interaction_id != receipt.intent.get("source_interaction_id")
+            or receipt.transcript_start_cursor != receipt.transcript_end_cursor
+            or receipt.referenced_events
+            or (pending is not None and pending.wake is None)
+            or (
+                expected_identity is not None
+                and any(
+                    receipt.intent.get(key) != value for key, value in expected_identity.items()
+                )
+            )
+            or receipt.intent.get("event_ids") != list(receipt.appended_event_ids)
+            or len(receipt.appended_event_ids) != 1
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Woken sleep has no exact durable handover receipt."
+            )
+        [event_id] = receipt.appended_event_ids
+        candidates = await self._session_store.query_events(
+            EventQuery(session_id=session.id, event_id=event_id, limit=2)
+        )
+        if (
+            len(candidates) != 1
+            or candidates[0].event.type is not EventType.SESSION_CHECKPOINTED
+            or candidates[0].event.payload.get("input_id") != input_id
+            or candidates[0].event.payload.get("pause_digest") != receipt.intent["pause_digest"]
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Woken sleep handover event conflicts with its receipt."
+            )
+        return receipt
+
+    async def _require_exact_wake_opening(
+        self,
+        *,
+        session: Session,
+        input_id: str,
+        pending: PendingUserInput | None,
+        receipt: RuntimePublicationReceipt,
+    ) -> RuntimePublicationReceipt:
+        """Authenticate a still-asleep wake's opening as its round's pause authority.
+
+        Only an interruption supersedes a wake before it wakes. The returned view
+        names the round's shared pause: its ``input_id`` is the wake id and its
+        ``pause_digest`` is the continuation's, as the supersession binds them.
+        """
+
+        intent = receipt.intent
+        if (
+            receipt.session_id != session.id
+            or receipt.publication_id != f"wake-open:{input_id}"
+            or receipt.kind != "wake-open"
+            or receipt.source_status is not SessionStatus.RUNNING
+            or intent.get("session_id") != session.id
+            or intent.get("session_instance_id") != session.instance_id
+            or intent.get("wake_id") != input_id
+            or receipt.interaction_id != intent.get("source_interaction_id")
+            or receipt.transcript_start_cursor != receipt.transcript_end_cursor
+            or receipt.referenced_events
+            or intent.get("event_ids") != list(receipt.appended_event_ids)
+            or len(receipt.appended_event_ids) != 1
+            or (pending is not None and pending.wake is None)
+        ):
+            raise SessionRuntimePublicationConflict("Sleeping call has no exact opening receipt.")
+        projected = {
+            key: value
+            for key, value in intent.items()
+            if key not in {"wake_id", "pause_digest", "continuation_pause_digest"}
+        }
+        projected.update(input_id=input_id, pause_digest=intent.get("continuation_pause_digest"))
+        if pending is not None and any(
+            projected.get(key) != value
+            for key, value in pending_user_input_identity(pending).items()
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Sleeping call conflicts with its opening receipt."
+            )
+        return receipt.model_copy(update={"intent": projected})
 
     async def classify_pause(
         self,

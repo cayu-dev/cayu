@@ -178,6 +178,8 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "pending_tool_approval",
     "pending_tool_round",
     "pending_user_input",
+    "pending_wake",
+    "continuation",
     "action",
     "active_taint_labels",
     "active_operation_id",
@@ -541,6 +543,7 @@ _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
         "pending_tool_approval",
         "pending_tool_round",
         "pending_user_input",
+        "pending_wake",
         "session_operations",
         "usage_triggered_context",
         "workspace_observations",
@@ -911,6 +914,25 @@ def _runtime_session_checkpoint_values(
         "user_input_resolution_intent",
         INVOCATION_CONFIGURATION_CHECKPOINT_KEY,
     )
+    wake_candidate = (
+        value.get("pending_wake")
+        if not path and type(value) is dict
+        else value
+        if path == ("pending_wake",)
+        else None
+    )
+    wake_paths: set[tuple[tuple[str, ...], str]] = set()
+    if type(wake_candidate) is dict:
+        # A wake pause wraps the round it resumes; the same runtime session
+        # supplies its identities.
+        wake_paths = {
+            (("pending_wake", "continuation", *trusted_path[1:]), trusted_value)
+            for trusted_path, trusted_value in _runtime_session_checkpoint_values(
+                wake_candidate.get("continuation"),
+                path=("pending_user_input",),
+                runtime_session=runtime_session,
+            )
+        }
     candidates = (
         [(root, value.get(root)) for root in roots]
         if not path and type(value) is dict
@@ -946,7 +968,7 @@ def _runtime_session_checkpoint_values(
             # Their payloads, results and all other identities stay subject to
             # their own validation; this grants no tool-publication authority.
             trusted.add(((root, "staged_terminals", "event", "session_id"), runtime_session.id))
-    return frozenset(trusted)
+    return frozenset(trusted | wake_paths)
 
 
 def _targeted_tool_reference_authority(

@@ -368,6 +368,7 @@ class PendingActionKind(StrEnum):
     USER_INPUT = "user_input"
     MANUAL_RECOVERY = "manual_recovery"
     DELEGATED_ACTION = "delegated_action"
+    WAKE = "wake"
 
 
 class SessionRuntimeIdentity(BaseModel):

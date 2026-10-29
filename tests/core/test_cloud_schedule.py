@@ -265,6 +265,7 @@ def test_a_run_parked_on_an_external_event_reports_it_without_content(
             "source": "renderer",
             "deadline": deadline.astimezone(UTC).isoformat().replace("+00:00", "Z"),
         },
+        "wake_at": None,
     }
     assert item.requested_at == run.ended_at
     for page in (parked, delivered):

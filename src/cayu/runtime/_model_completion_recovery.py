@@ -16,6 +16,10 @@ from cayu.approvals.user_input import (
     pending_user_input_identity,
     user_input_lifecycle_authority_from_checkpoint,
 )
+from cayu.approvals.wakes import (
+    WAKE_SCHEDULED_INTERRUPTION_TYPE,
+    pending_session_wake_from_checkpoint,
+)
 from cayu.budgets.base import BudgetPolicy, copy_budget_policy
 from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -891,6 +895,14 @@ class ModelCompletionRecovery:
             current_run_epoch=session.run_epoch,
             runtime_session=session,
         )
+        asleep = pending_session_wake_from_checkpoint(checkpoint)
+        if asleep is not None:
+            if pending_user_input is not None:
+                raise RuntimeError(
+                    "The checkpoint contains conflicting wake and user-input pauses."
+                )
+            # A sleeping call keeps its round in the wake's continuation.
+            pending_user_input = asleep.continuation
         if pending_approval is not None and pending_user_input is not None:
             raise RuntimeError(
                 "The checkpoint contains conflicting pending approval and user-input pauses."
@@ -1634,7 +1646,10 @@ class ModelCompletionRecovery:
                     raise RuntimeError(
                         "Durable approval continuations contain conflicting decisions."
                     )
-            elif event.payload.get("interruption_type") != _INTERRUPTION_TYPE_USER_INPUT_REQUIRED:
+            elif event.payload.get("interruption_type") not in {
+                _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                WAKE_SCHEDULED_INTERRUPTION_TYPE,
+            }:
                 raise RuntimeError(
                     "Durable user-input continuation has the wrong interruption type."
                 )
@@ -1648,6 +1663,10 @@ class ModelCompletionRecovery:
             user_input_open_receipt = await self._session_store.load_runtime_publication_receipt(
                 session.id,
                 f"user-input-open:{pause_id}",
+            ) or await self._session_store.load_runtime_publication_receipt(
+                # A woken sleep's continuation opens under its wake handover.
+                session.id,
+                f"wake-close:{pause_id}",
             )
             user_input_close_receipt = await self._session_store.load_runtime_publication_receipt(
                 session.id,
@@ -1656,7 +1675,7 @@ class ModelCompletionRecovery:
             if (
                 user_input_open_receipt is None
                 or user_input_close_receipt is None
-                or user_input_open_receipt.kind != "user-input-open"
+                or user_input_open_receipt.kind not in {"user-input-open", "wake-close"}
                 or user_input_close_receipt.kind != "user-input-close"
                 or user_input_open_receipt.intent.get("input_id") != pause_id
                 or user_input_close_receipt.intent.get("input_id") != pause_id
@@ -1668,12 +1687,17 @@ class ModelCompletionRecovery:
                     "Durable user-input continuation has no exact publication authority."
                 )
 
+        woken = user_input_open_receipt is not None and user_input_open_receipt.kind == "wake-close"
         expected_interruption_type = (
             _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED
             if pause_kind == "approval"
+            else WAKE_SCHEDULED_INTERRUPTION_TYPE
+            if woken
             else _INTERRUPTION_TYPE_USER_INPUT_REQUIRED
         )
-        expected_origin_field = "approval" if pause_kind == "approval" else "user_input"
+        expected_origin_field = (
+            "approval" if pause_kind == "approval" else "continuation" if woken else "user_input"
+        )
         expected_calls = [
             {
                 "tool_call_id": call.tool_call_id,

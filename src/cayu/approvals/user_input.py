@@ -255,6 +255,108 @@ class UserInputResponse(BaseModel):
         return validate_loop_policies(value, field_name="loop_policies")
 
 
+class SessionWakeTimer(BaseModel):
+    """Durable timer half of a pause opened by ``sleep_until``.
+
+    The pause itself is an ordinary pending tool-call pause, so it keeps the
+    user-input publication, claim, supersession and recovery contracts. Only the
+    session's wake task, never a person's answer, resolves it, and never before
+    ``deadline``. ``resolved_at`` is the runtime clock reading that turned the
+    request into ``deadline``; both stay fixed, so every delivery produces the
+    same tool result.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    task_id: str = Field(max_length=256)
+    requested: dict[str, Any]
+    deadline: datetime
+    resolved_at: datetime
+
+    @field_validator("task_id")
+    @classmethod
+    def validate_task_id(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "task_id")
+
+    @field_validator("requested", mode="before")
+    @classmethod
+    def copy_requested(cls, value: dict[str, Any]) -> dict[str, Any]:
+        copied = copy_durable_json_value(value, "requested")
+        if type(copied) is not dict or len(copied) != 1:
+            raise ValueError("requested must name exactly one wake request form.")
+        ((form, requested_value),) = copied.items()
+        if form == "duration_seconds":
+            if type(requested_value) not in (int, float) or not requested_value > 0:
+                raise ValueError("requested duration_seconds must be a positive number.")
+        elif form != "until" or type(requested_value) is not str:
+            raise ValueError("requested must be duration_seconds or until.")
+        return copied
+
+    @field_validator("deadline", "resolved_at")
+    @classmethod
+    def normalize_utc(cls, value: datetime, info) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_deadline_order(self) -> SessionWakeTimer:
+        if self.deadline <= self.resolved_at:
+            raise ValueError("A pending wake deadline must be later than its resolution time.")
+        return self
+
+
+SESSION_WAKE_TASK_ID_PREFIX = "cayu-session-wake-"
+
+
+def session_wake_task_id(wake_id: str) -> str:
+    """Return the deterministic wake-task identity for one wake id."""
+
+    return SESSION_WAKE_TASK_ID_PREFIX + require_durable_clean_nonblank(wake_id, "wake_id")
+
+
+def session_wake_tool_result(pending: PendingUserInput) -> str:
+    """Return the deterministic ``sleep_until`` result for one exact wake pause."""
+
+    wake = pending.wake
+    if wake is None:
+        raise ValueError("Pending user input is not a session wake.")
+    return session_wake_result_text(
+        wake_id=pending.input_id,
+        requested=wake.requested,
+        deadline=wake.deadline,
+        resolved_at=wake.resolved_at,
+        status="woke",
+    )
+
+
+def session_wake_result_text(
+    *,
+    wake_id: str | None,
+    requested: dict[str, Any],
+    deadline: datetime,
+    resolved_at: datetime,
+    status: Literal["woke", "deadline_already_reached"],
+) -> str:
+    """Render the bounded timer result that becomes the ``sleep_until`` call's output."""
+
+    return canonical_durable_json_bytes(
+        {
+            "status": status,
+            "wake_id": wake_id,
+            "requested": requested,
+            "deadline": _utc_text(deadline),
+            "deadline_resolved_at": _utc_text(resolved_at),
+        },
+        "sleep_until result",
+    ).decode()
+
+
+def _utc_text(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 class PendingUserInput(BaseModel):
     """Durable checkpoint state for a session paused on an ``ask_user`` question.
 
@@ -313,11 +415,20 @@ class PendingUserInput(BaseModel):
     run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
+    wake: SessionWakeTimer | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def validate_step_limit_authority(self):
         if self.max_steps_unbounded is True and self.max_steps is not None:
             raise ValueError("Unlimited-step authority cannot also carry a step cap.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_wake_scope(self):
+        if self.wake is not None and (
+            self.task_id is not None or self.wake.task_id != session_wake_task_id(self.input_id)
+        ):
+            raise ValueError("A session wake must belong to a root session and its own task.")
         return self
 
     @field_validator(
@@ -869,6 +980,7 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
         retry_policy=copy_retry_policy(pending.retry_policy)
         if pending.retry_policy is not None
         else None,
+        wake=pending.wake,
     )
 
 

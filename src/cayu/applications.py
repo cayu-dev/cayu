@@ -692,6 +692,7 @@ from cayu.sessions.requests import (
 from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_input import system_prompt_messages_sha256
 from cayu.sessions.transcript_queries import TranscriptSnapshot
+from cayu.tasks import session_wakes as _session_wakes
 from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptClaimRenewalRequest,
@@ -1220,6 +1221,8 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             if not isinstance(getattr(closure_store, "store_id", None), str):
                 raise TypeError("session_closure_stores must expose a string store_id.")
         self._task_store = task_store
+        # Set when an agent registers a wake tool; task workers then reconcile wakes.
+        self._uses_session_wakes = False
         self._recovery_task_store = task_store
         self._knowledge_store = knowledge_store
         owned_store_ids = list(closure_stores)
@@ -1571,6 +1574,11 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
             apply_limit_evaluation=self._session_finalization.apply_tool_round_limit,
             close_interrupted_round=self._pending_tool_round_recovery.close_interrupted_tool_round,
+            publish_session_wake=(
+                (lambda pending: _session_wakes._publish_session_wake(self, pending))
+                if task_store is not None and task_store.supports_task_scheduling is True
+                else None
+            ),
         )
 
         self._manual_model_completion_recovery = ManualModelCompletionRecovery(
@@ -1736,6 +1744,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             get_registered_environment_for_session=self._get_registered_environment_for_session,
             model_completion_recovery=self._model_completion_recovery,
             user_input_evidence=self._user_input_evidence,
+            cancel_session_wake=partial(_session_wakes._cancel_session_wake, self),
         )
 
         self._session_engine = SessionEngine(
@@ -4622,9 +4631,14 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
 
         By default only completed or failed sessions qualify. Running sessions or
         incomplete cleanup raise ValueError. Missing sessions return None.
+        Deleting a session asleep in ``sleep_until`` cancels its wake task.
         See ``cayu guide anatomy#process-scoped-application-graph``.
         """
-        return await delete_app_session(self, session_id, finished_only=finished_only)
+        wake_id = await _session_wakes._open_wake_id(self, session_id)
+        report = await delete_app_session(self, session_id, finished_only=finished_only)
+        if wake_id is not None and await self.session_store.load(session_id) is None:
+            await _session_wakes._cancel_session_wake_attempts(self, wake_id)
+        return report
 
     @_tracked_entrance
     async def validate_session_closure(
@@ -5921,6 +5935,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             default_thinking_source=self._config_sources["run.thinking"],
             registration_site=_registration_site(),
             tools=tools,
+            pause_check=partial(_session_wakes._require_servable_pause, self),
             tool_effect_reconcilers=tool_effect_reconcilers,
             mcp_toolsets=mcp_toolsets,
             hosted_tools=hosted_tools,
@@ -9064,6 +9079,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         response: UserInputResponse,
         *,
         participant_context: CollaborationAccessContext | None = None,
+        wake_delivery: bool = False,
     ) -> AsyncGenerator[Event, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
@@ -9110,6 +9126,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             on_admitted=admission.observe,
             response=response,
             participant_context=participant_context,
+            wake_delivery=wake_delivery,
             before_mutation=lambda: self._require_continuation_recovery_execution(
                 participant_context=participant_context,
                 session_id=session_id,

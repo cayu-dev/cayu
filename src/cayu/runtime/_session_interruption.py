@@ -18,6 +18,7 @@ from cayu.approvals.user_input import (
     user_input_lifecycle_authority_from_checkpoint,
     user_input_supersession_intent_for,
 )
+from cayu.approvals.wakes import pending_session_wake_from_checkpoint
 from cayu.events import Event, EventType
 from cayu.observability.hooks import RuntimeHookPhase
 from cayu.runtime import _approval_support as approval_support
@@ -156,6 +157,13 @@ def _store_time_checkpoint_with_claimed_pending_session_interrupt(
     return transform
 
 
+def _sleeping_call(checkpoint: dict[str, Any] | None) -> PendingUserInput | None:
+    """The round a still-asleep wake parks; an interruption supersedes it like a pause."""
+
+    wake = pending_session_wake_from_checkpoint(checkpoint)
+    return None if wake is None else wake.continuation
+
+
 class SessionInterruption:
     """Own explicit stops, exact interruption evidence and terminal delivery."""
 
@@ -181,6 +189,7 @@ class SessionInterruption:
         ],
         model_completion_recovery: ModelCompletionRecovery,
         user_input_evidence: UserInputRecoveryEvidence,
+        cancel_session_wake: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.session_store = session_store
         self._event_writer = event_writer
@@ -199,6 +208,7 @@ class SessionInterruption:
         self._get_registered_environment_for_session = get_registered_environment_for_session
         self._model_completion_recovery = model_completion_recovery
         self._user_input_evidence = user_input_evidence
+        self._cancel_session_wake = cancel_session_wake
 
     async def interrupt_session(
         self,
@@ -225,6 +235,12 @@ class SessionInterruption:
                 field_name=field_name,
                 redactor=self._secret_redactor,
             )
+        if self._cancel_session_wake is not None:
+            # Once the request is admitted, a sleep's pending attempts are cancelled
+            # before the interruption proceeds, so stopping it never depends on how
+            # far the caller reads. The interruption itself supersedes the sleeping
+            # round atomically; an attempt that runs anyway finds it closed.
+            await self._cancel_session_wake(loaded_session.id)
         interrupted_pending_user_input = None
         interrupted_ambiguous_user_input = None
         interrupted_foreground_wait = None
@@ -277,6 +293,8 @@ class SessionInterruption:
                         runtime_session=loaded_session,
                     )
                 )
+                if interrupted_pending_user_input is None:
+                    interrupted_pending_user_input = _sleeping_call(interrupted_checkpoint)
             if accepted_delegated_gate_kind == "input":
                 # The answer is already accepted and executing. Stop its exact
                 # delegated interaction; do not supersede or re-answer the gate.
@@ -549,6 +567,8 @@ class SessionInterruption:
                         interrupt_checkpoint, current_run_epoch=loaded_session.run_epoch
                     )
                 )
+                if decision_input is None:
+                    decision_input = _sleeping_call(interrupt_checkpoint)
                 if decision_input is None or decision_input != interrupted_pending_user_input:
                     raise SessionRunFenced("User-input stop lost its exact pending action.")
                 interrupt_payload[USER_INPUT_SUPERSESSION_INTENT_KEY] = (
@@ -556,6 +576,18 @@ class SessionInterruption:
                         decision_input, resolution_intent=decision_resolution
                     ).model_dump(mode="json", exclude_none=True)
                 )
+            elif loaded_session.status is SessionStatus.RUNNING:
+                # A sleep can open while the session still runs; the elected stop
+                # binds its supersession exactly as the stop transition persists it.
+                sleeping = _sleeping_call(interrupt_checkpoint)
+                if sleeping is None:
+                    interrupt_payload.pop(USER_INPUT_SUPERSESSION_INTENT_KEY, None)
+                else:
+                    interrupt_payload[USER_INPUT_SUPERSESSION_INTENT_KEY] = (
+                        user_input_supersession_intent_for(
+                            sleeping, resolution_intent=None
+                        ).model_dump(mode="json", exclude_none=True)
+                    )
             decision_wait, _ = foreground_child_state_from_checkpoint(interrupt_checkpoint)
             if (
                 decision_wait is None

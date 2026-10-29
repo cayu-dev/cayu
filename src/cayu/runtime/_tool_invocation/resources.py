@@ -282,6 +282,7 @@ class ToolInvocationResources:
             mcp_servers=_mcp_servers(registered_environment),
             metadata=ctx_metadata,
         )
+        tool_context._bind_runtime_clock(self._clock)
         tool_context._bind_runtime_causal_budget_limits(
             tuple(
                 _copy_budget_limit_definition(limit)

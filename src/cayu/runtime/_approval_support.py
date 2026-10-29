@@ -787,7 +787,8 @@ def user_input_resume_events(events: list[Event], input_id: str) -> list[Event]:
     the same ids — are excluded.
 
     The boundary is the FIRST event that marks this pause: either ``session.awaiting_user_input``
-    (payload ``input_id``) or a ``session.interrupted`` carrying ``user_input.input_id`` for it.
+    (payload ``input_id``) or a ``session.interrupted`` carrying ``user_input.input_id`` for it
+    (or, for a sleep, the ``wake_id`` of its ``wake_scheduled`` stop).
     Both are accepted because a bounded recovery window may begin at the terminal
     ``session.interrupted`` evidence rather than the earlier atomic open publication. The
     ``pending_user_input`` checkpoint and awaiting event cannot split: the exact user-input-open
@@ -805,7 +806,10 @@ def _event_marks_user_input_pause(event: Event, input_id: str) -> bool:
         return event.payload.get("input_id") == input_id
     if event.type == EventType.SESSION_INTERRUPTED:
         user_input = event.payload.get("user_input")
-        return isinstance(user_input, dict) and user_input.get("input_id") == input_id
+        # A sleep opens its pause with its own ``wake_scheduled`` stop.
+        return (
+            isinstance(user_input, dict) and user_input.get("input_id") == input_id
+        ) or event.payload.get("wake_id") == input_id
     return False
 
 

@@ -26,6 +26,7 @@ class UserInputTool(Tool):
     # Decoupled marker the runtime checks (via getattr) to recognize a pausing tool
     # without importing this class — cayu.tools depends on cayu.runtime, not the reverse.
     pauses_session = True
+    pause_kind = "user_input"
 
     spec = ToolSpec(
         display=ToolDisplay(verb="Asked", noun="question"),

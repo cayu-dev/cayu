@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Annotated, Any, Literal, cast
 
 from pydantic import (
@@ -2627,6 +2628,16 @@ class SessionsSummaryResponse(ApiBaseModel):
     provider_breakdown: tuple[UsageBreakdownItem, ...] = Field(default_factory=tuple)
     model_breakdown: tuple[UsageBreakdownItem, ...] = Field(default_factory=tuple)
     cost: AggregateCostSummary | None
+
+
+# Pending actions the control-plane API lists: the ones a person settles or follows.
+# A session asleep in sleep_until waits on its timer, not on a person, so its
+# runtime ``wake`` action is never listed here.
+class PendingActionKind(StrEnum):
+    TOOL_APPROVAL = "tool_approval"
+    USER_INPUT = "user_input"
+    MANUAL_RECOVERY = "manual_recovery"
+    DELEGATED_ACTION = "delegated_action"
 
 
 class ApiPendingAction(ApiBaseModel):

@@ -178,5 +178,134 @@ For a next occurrence, the application chooses a durable completion boundary and
 creates a new one-shot with a deterministic occurrence ID and explicit timestamp.
 It owns retrying that publication after crashes, bounded catch-up, approval, and
 spend decisions. There is no automatic cron loop or recurring-series definition.
-This primitive does not keep a session asleep, resolve a pending timer tool call,
-or guarantee exactly-once external side effects.
+This primitive alone does not keep a session asleep or guarantee exactly-once
+external side effects; `sleep_until`, below, builds the session wake on it.
+
+## Let an agent sleep and continue later
+
+Three kinds of waiting look alike but differ in what survives a crash:
+
+| Wait | How | What stays alive | After a crash |
+| --- | --- | --- | --- |
+| Live blocking wait | `exec_command` running `sleep 600`, at most 600 seconds | the worker, runner, command and environment | lost |
+| Durable one-shot self-wake | the `sleep_until` tool | nothing | the same session continues on time |
+| Recurring schedule | the application creates each next one-shot task, or a host schedule such as Cloud `[[schedules]]` | nothing | the application's own publication retry |
+
+`SleepUntilTool` is opt-in. Register it on the agents that may schedule their own
+continuation; registration refuses it unless the application has a task store that
+supports scheduling:
+
+```python
+from datetime import timedelta
+from cayu.tools import SleepUntilTool
+
+app.register_agent(agent, tools=[SleepUntilTool(max_sleep=timedelta(days=7))])
+```
+
+The model passes exactly one of `duration_seconds` or `until`, an ISO 8601
+timestamp with an offset. The application clock turns it into one UTC deadline
+once. A deadline further away than `max_sleep` (30 days by default), a missing
+offset, or a non-finite or non-positive duration is refused as an error result. A
+deadline that has already passed, including exactly now, returns at once.
+
+For a future deadline the runtime parks the call before the tool runs, as its own
+`pending_wake` pause opened under the `wake-open:{wake_id}` receipt. It then creates
+task `cayu-session-wake-<wake id>` of type `cayu.session-wake.v1`, due at the
+deadline, and interrupts the session with `interruption_type="wake_scheduled"`.
+Creating that task is idempotent: a retry or a racing reconciliation converges on
+the same task. No worker slot, lease, process or provider stream is held while
+the session sleeps.
+
+`run_task_worker` runs wake tasks itself, beside the application's handler, so no
+handler needs to know about them; a worker whose `query` leaves out their type does
+not claim them. When it starts, and then on its expired-lease reclaim cadence, it
+runs `reconcile_session_wakes(app)`, which gives every open wake a live attempt; a
+damaged session is logged and skipped. When the store makes the task due, the
+runtime closes the wake once under `wake-close:{wake_id}`, resolves the original
+`sleep_until` call with a fixed timer result (`status`, `wake_id`, `requested`,
+`deadline`, `deadline_resolved_at`) and continues the same session to its next
+pause or end. The continuation's `session.resumed` event carries
+`interruption_type="wake_scheduled"`, so supervision and Cloud never count it as a
+person's answer. No user message is added, and the call and its result stay in
+provider order. Other tools from the same round run then, after the deadline,
+against the limits and budget projection made when the round paused.
+
+"Continues once" holds across failures: the continuation is claimed and
+published exactly once, and duplicate, late or competing deliveries settle as
+`already_delivered` without calling the model again. A delivery that fails (for
+example a missing provider, a changed execution profile, or application and
+store clocks more than five minutes apart) fails only that attempt task, whose
+error stays on the task, and schedules the next attempt after 30 seconds,
+doubling to at most an hour. Attempts continue for `SESSION_WAKE_RETRY_WINDOW`
+(24 hours), counted from the deadline or, if no worker ran the first attempt on
+time, from when one did; an attempt whose worker lost its lease or was fenced is
+replaced too. After the window, each reconciliation pass logs one warning naming
+the spent wakes, and you continue the session directly. A crash during the woken
+continuation itself, after the call received its result, leaves the session
+`running` and its attempt fenced, which Cloud task health shows. After
+`app.recover_abandoned_sessions()` the session is `interrupted` with no pending
+action, and an ordinary `resume` continues it. The sleeping call keeps its one
+timer result, and the wake never continues the session a second time.
+
+If the process dies while another tool from the woken round runs, that tool has
+started with no result and cannot be run again safely. The next attempt settles
+as `manual_recovery_required`, no further attempt is created, and the session's
+pending action is a `manual_recovery` naming that tool's `tool_call_id`. Settle
+it with `app.recover_user_input(UserInputRecoveryRequest(...))`, giving the
+sleeping call's accepted timer answer (`answer` and the wake's `resolved_by`, as the
+delivery sent them) and the tool's verified outcome. A subagent from the woken
+round that pauses for a person is an ordinary delegated action: the wake has
+already delivered, and the round continues when the subagent ends. A wake's id is the
+`wake_id` of its pending action, from
+`app.session_store.query_pending_actions(PendingActionQuery(kind=PendingActionKind.WAKE))`
+(both in `cayu.sessions`), and the `wake_id` in its `session.interrupted` event's
+`wake` payload. These helpers are public in `cayu.tasks`:
+
+```python
+from cayu.tasks import deliver_session_wake, session_wake_attempts
+
+for attempt in await session_wake_attempts(app, wake_id):
+    print(attempt.input["attempt"], attempt.status, attempt.error)
+await deliver_session_wake(app, session_id=session_id, wake_id=wake_id)
+```
+
+A wake never resumes before its deadline.
+
+Once an interruption of a sleeping session is admitted, it cancels the wake's
+pending attempts, whether or not the caller reads its events, and closes the
+sleep in the same atomic step that stops the session, even while the sleep is
+still opening. Deleting the session cancels the attempts too. A wake attempt that
+runs anyway finds the pause closed, settles as `closed`, and leaves the session
+alone. A delivery whose continuation stops before the call gets its result (for
+example, its environment cannot reconnect) fails that attempt, and the next
+attempt retries it.
+`resume`, `fork` and `resolve_user_input` refuse a sleeping session.
+
+A sleep is not a request for anyone's input. Inside the runtime its pending action
+has kind `wake`, no `attention_id`, and `wake_at`; the inbox, human-attention
+notifications, user-input queries and the server's `/api/pending-actions` never
+list it, and the session's status stays `interrupted`. Cayu Cloud activity reports
+it as `waiting_for.kind = "wake"` with `wake_at` and no content. Sleep time is left
+out of run-scoped `RunLimits` and budgets, and of a run-default execution deadline,
+as a human wait is. Session-scoped limits (`RunLimits(scope="session")`) stay
+wall-clock, so a long sleep spends them. The session keeps its original execution
+profile; reconstructed applications need stable provider and tool identities, as
+for any resumed pause.
+
+`sleep_until` declares `ToolEffect.NONE`: the runtime schedules the wake before the
+tool runs, and `run` itself only reports a refusal or an already-passed deadline,
+so replaying it after a crash is safe. A tool policy that should gate sleeping
+names `sleep_until` rather than relying on its effect.
+
+This version writes checkpoint schema 12 for every session it touches, sleeping
+or not. An older runtime refuses those sessions as
+`checkpoint_schema_version_too_new` instead of misreading them, so rolling back
+across this version is not supported (see
+[checkpoint versions](runtime-contracts.md)).
+
+This first slice sleeps only top-level sessions that no task owns, in rounds where
+no tool needed approval. In a child session, a task-owned session, or a round
+that paused for approval (including approval of `sleep_until` itself),
+`sleep_until` returns an error result instead of sleeping. The environment
+follows its ordinary lifecycle while the session sleeps; in-memory process state
+is not kept.

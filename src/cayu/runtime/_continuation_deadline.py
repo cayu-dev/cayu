@@ -54,7 +54,11 @@ if TYPE_CHECKING:
 
 ContinuationRequest = ResumeRequest | ToolApprovalRequest | UserInputResponse
 
-HUMAN_WAIT_INTERRUPTIONS = frozenset({"tool_approval_required", "user_input_required"})
+# Pauses whose wait does not spend a run-default execution deadline; a sleep in
+# sleep_until is one, though no person ends it.
+HUMAN_WAIT_INTERRUPTIONS = frozenset(
+    {"tool_approval_required", "user_input_required", "wake_scheduled"}
+)
 _LIFECYCLE_EVENTS = (
     EventType.SESSION_STARTED,
     EventType.SESSION_RESUMED,

@@ -156,6 +156,10 @@ sweep, so a run only sees pauses that exist when it starts: also start the
 worker after a session pauses, and `ABANDONED_AFTER` after one stalls.
 Deep guide: [task scheduling](https://github.com/cayu-dev/cayu/blob/main/docs/task-scheduling.md).
 
+For the agent itself to wait, register `SleepUntilTool()`. The session sleeps with
+nothing running, and `run_task_worker` continues the same tool call when its wake
+task is due; a shell `sleep` holds a worker and is lost on a crash.
+
 ## Event retry policy
 
 Choose the event's completion contract before setting timeouts. A service that

@@ -1,6 +1,14 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "SESSION_WAKE_RETRY_WINDOW": ("cayu.tasks.session_wakes", "SESSION_WAKE_RETRY_WINDOW"),
+    "SESSION_WAKE_TASK_TYPE": ("cayu.tasks.session_wakes", "SESSION_WAKE_TASK_TYPE"),
+    "SessionWakeNotContinued": ("cayu.tasks.session_wakes", "SessionWakeNotContinued"),
+    "SessionWakeNotDue": ("cayu.tasks.session_wakes", "SessionWakeNotDue"),
+    "SessionWakeOutcome": ("cayu.tasks.session_wakes", "SessionWakeOutcome"),
+    "deliver_session_wake": ("cayu.tasks.session_wakes", "deliver_session_wake"),
+    "reconcile_session_wakes": ("cayu.tasks.session_wakes", "reconcile_session_wakes"),
+    "session_wake_attempts": ("cayu.tasks.session_wakes", "session_wake_attempts"),
     "TaskTypeSpec": ("cayu.tasks.types", "TaskTypeSpec"),
     "TaskCreationOperation": ("cayu.tasks.operations", "TaskCreationOperation"),
     "TaskCreationConflict": ("cayu.tasks.operations", "TaskCreationConflict"),
@@ -358,6 +366,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "SESSION_WAKE_RETRY_WINDOW",
+    "SESSION_WAKE_TASK_TYPE",
+    "SessionWakeNotContinued",
+    "SessionWakeNotDue",
+    "SessionWakeOutcome",
+    "deliver_session_wake",
+    "reconcile_session_wakes",
+    "session_wake_attempts",
     "requeue_restartable_task",
     "TaskGroupCreate",
     "TaskGroupQuiescencePolicy",

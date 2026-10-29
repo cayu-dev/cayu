@@ -26,7 +26,9 @@ from cayu.approvals.user_input import (
     AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
     AmbiguousUserInputSupersessionIntent,
     PendingUserInput,
+    SessionWakeTimer,
     event_with_ambiguous_user_input_supersession_authority,
+    session_wake_task_id,
 )
 from cayu.budgets.base import (
     BudgetReconciliation,
@@ -2036,6 +2038,30 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
         },
     )
 
+    wake_continuation = user_input.model_copy(
+        update={
+            "wake": SessionWakeTimer(
+                task_id=session_wake_task_id(user_input.input_id),
+                requested={"duration_seconds": 60},
+                deadline=datetime(2027, 1, 1, 0, 1, tzinfo=UTC),
+                resolved_at=datetime(2027, 1, 1, tzinfo=UTC),
+            )
+        }
+    )
+    wake_event = Event(
+        type=EventType.SESSION_INTERRUPTED,
+        session_id="session",
+        payload={
+            "interruption_type": "wake_scheduled",
+            "wake_id": user_input.input_id,
+            "tool_call_id": user_input.tool_call_id,
+            "tool_round_id": user_input.tool_round_id,
+            "model_step_id": user_input.model_step_id,
+            "model_attempt_id": user_input.model_attempt_id,
+            "continuation": wake_continuation.model_dump(mode="json"),
+        },
+    )
+
     for container_name, event, field_names in (
         (
             "approval",
@@ -2043,8 +2069,14 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
             event_schema._PENDING_APPROVAL_FIELD_NAMES,
         ),
         (
+            # A question carries no timer; the sleeping call below covers ``wake``.
             "user_input",
             input_event,
+            event_schema._PENDING_USER_INPUT_FIELD_NAMES - {"wake"},
+        ),
+        (
+            "continuation",
+            wake_event,
             event_schema._PENDING_USER_INPUT_FIELD_NAMES,
         ),
     ):

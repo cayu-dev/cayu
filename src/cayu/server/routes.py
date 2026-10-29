@@ -302,6 +302,7 @@ from cayu.server.contracts import (
     UsageRollupRequest,
     UsageRollupResponse,
 )
+from cayu.server.contracts import PendingActionKind as ApiPendingActionKind
 from cayu.server.eval_report_auth import EvalReportingAccess
 from cayu.server.evals_registry import (
     generated_eval_target_registry,
@@ -7334,7 +7335,7 @@ def create_router(
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
         session_id: Annotated[str | None, Query()] = None,
         q: Annotated[str | None, Query()] = None,
-        kind: PendingActionKind | None = None,
+        kind: ApiPendingActionKind | None = None,
         agent_name: Annotated[str | None, Query()] = None,
         environment_name: Annotated[str | None, Query()] = None,
         cursor: Annotated[str | None, Query()] = None,
@@ -7380,7 +7381,7 @@ def create_router(
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         query = PendingActionQuery(
             session_id=requested_session_id,
-            kind=kind,
+            kind=None if kind is None else PendingActionKind(kind.value),
             agent_name=requested_agent_name,
             environment_name=requested_environment_name,
             q=search,
@@ -7411,6 +7412,31 @@ def create_router(
             ) from exc
         except PendingActionResultTooLarge as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
+        # A sleeping session waits on its timer, not on a person: it is not listed,
+        # and the total leaves out every wake the store counted, not only this page's.
+        if query.kind is None:
+            total_count = result.total_count
+            # Only an application with a wake tool can have wakes to leave out.
+            if total_count is not None and cayu_app._uses_session_wakes:
+                counted = await cayu_app._runtime_session_store.query_pending_actions(
+                    query.model_copy(
+                        # The store's total was exact, so the wakes fit one page of it.
+                        update={"kind": PendingActionKind.WAKE, "cursor": None}
+                    )
+                )
+                total_count = (
+                    None if counted.total_count is None else total_count - counted.total_count
+                )
+            result = result.model_copy(
+                update={
+                    "actions": [
+                        action
+                        for action in result.actions
+                        if action.kind is not PendingActionKind.WAKE
+                    ],
+                    "total_count": total_count,
+                }
+            )
         execution_profiles = None
         if include is not None and "execution_profile" in include:
             execution_profiles = [

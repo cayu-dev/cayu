@@ -30,7 +30,14 @@ from cayu.approvals.user_input import (
     UserInputPauseState,
     ambiguous_pending_user_input_from_checkpoint,
     pending_user_input_interruption_payload,
+    public_pending_user_input_event_payload,
     user_input_lifecycle_authority_from_checkpoint,
+)
+from cayu.approvals.wakes import (
+    WAKE_SCHEDULED_INTERRUPTION_TYPE,
+    pending_session_wake_digest,
+    pending_session_wake_from_checkpoint,
+    public_pending_wake_payload,
 )
 from cayu.budgets.base import (
     BudgetPolicy,
@@ -3688,6 +3695,7 @@ class IncompleteSessionRecovery:
             runtime_session=session,
         )
         pending_tool_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
+        pending_wake = pending_session_wake_from_checkpoint(checkpoint)
         if pending_user_input is not None:
             pause_state = await self._user_input_evidence.classify_pause(
                 session=session,
@@ -3713,6 +3721,7 @@ class IncompleteSessionRecovery:
             and pending_tool_round is None
             and pending_approval is None
             and pending_user_input is None
+            and pending_wake is None
         ):
             from cayu.runtime._producer_completion_replay import prepare_producer_completion_replay
 
@@ -3964,6 +3973,24 @@ class IncompleteSessionRecovery:
                     "tool_round_id": pending_user_input.tool_round_id,
                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                     **pending_user_input_interruption_payload(pending_user_input),
+                    "recovered": True,
+                    "reason": reason,
+                    "metadata": metadata,
+                }
+            elif pending_wake is not None:
+                # A crash after the sleep opened: settle it asleep, as the run would have.
+                continuation = pending_wake.continuation
+                interrupt_payload = {
+                    "model_step_id": continuation.model_step_id,
+                    "model_attempt_id": continuation.model_attempt_id,
+                    "tool_round_id": continuation.tool_round_id,
+                    "interruption_type": WAKE_SCHEDULED_INTERRUPTION_TYPE,
+                    "wake_id": pending_wake.wake_id,
+                    "tool_call_id": continuation.tool_call_id,
+                    "source_run_epoch": continuation.source_run_epoch,
+                    "pause_digest": pending_session_wake_digest(pending_wake),
+                    "wake": public_pending_wake_payload(pending_wake),
+                    "continuation": public_pending_user_input_event_payload(continuation),
                     "recovered": True,
                     "reason": reason,
                     "metadata": metadata,
@@ -4433,6 +4460,8 @@ class IncompleteSessionRecovery:
                     if pending_child_ids
                     else "External effect remains unresolved; explicit receipt reconciliation is required."
                     if unresolved_effect
+                    else "Session is waiting for its wake; its wake task continues it."
+                    if pending_user_input.wake is not None
                     else "Session is awaiting user input; answer it with UserInputResponse."
                 ),
             )

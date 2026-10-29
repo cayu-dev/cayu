@@ -133,6 +133,7 @@ from cayu.approvals.tools import (
 from cayu.approvals.user_input import (
     user_input_lifecycle_authority_from_checkpoint,
 )
+from cayu.approvals.wakes import require_no_pending_wake
 from cayu.budgets._run_limit_accounting import (
     RunLimitAccountingContext,
     has_run_limit_accounting_authority,
@@ -374,6 +375,7 @@ from cayu.runtime._tool_effect_state import (
 )
 from cayu.runtime._tool_invocation.admission import ToolApprovalRequired
 from cayu.runtime._tool_round_executor import (
+    SessionWakeScheduled,
     ToolRoundExecutor,
     UserInputRequired,
 )
@@ -4325,6 +4327,7 @@ class SessionEngine:
                     "Session has a pending tool approval. Resolve it with "
                     "resolve_tool_approval(...) before resuming with new messages."
                 )
+            require_no_pending_wake(updated_checkpoint)
             pending_user_input, _ = user_input_lifecycle_authority_from_checkpoint(
                 updated_checkpoint,
                 redactor=self._secret_redactor,
@@ -8725,6 +8728,16 @@ class SessionEngine:
         except ToolApprovalRequired as exc:
             async with contextlib.aclosing(
                 self._session_outcomes.pause_for_tool_approval(
+                    outcome_context(),
+                    exc=exc,
+                    materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
+                )
+            ) as outcome_stream:
+                async for event in outcome_stream:
+                    yield event
+        except SessionWakeScheduled as exc:
+            async with contextlib.aclosing(
+                self._session_outcomes.pause_for_wake(
                     outcome_context(),
                     exc=exc,
                     materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,

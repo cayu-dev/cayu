@@ -216,6 +216,7 @@ class ApplicationAgentRegistry:
         default_thinking_source: CayuConfigSource = "framework",
         registration_site: tuple[str | None, str | None] = (None, None),
         tools: Iterable[Tool] | None = None,
+        pause_check: Callable[[Tool], None] | None = None,
         tool_effect_reconcilers: Mapping[str, ToolEffectReconciliationRegistration] | None = None,
         mcp_toolsets: Iterable[McpToolset] | None = None,
         hosted_tools: Iterable[OpenAIWebSearch] | None = None,
@@ -419,6 +420,8 @@ class ApplicationAgentRegistry:
         for tool in agent_tools:
             if not isinstance(tool, Tool):
                 raise TypeError("Agent tools must be Tool instances.")
+            if pause_check is not None:
+                pause_check(tool)
             registered_tool = _validate_registered_tool(
                 tool,
                 redactor=self._secret_redactor,

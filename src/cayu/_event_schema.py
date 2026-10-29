@@ -890,8 +890,14 @@ _PENDING_USER_INPUT_FIELD_NAMES = frozenset(
         "tool_calls",
         "tool_name",
         "tool_round_id",
+        "wake",
         "workspace_id",
     }
+)
+
+
+_PENDING_WAKE_FIELD_NAMES = frozenset(
+    {"deadline", "requested", "resolved_at", "schema_version", "task_id"}
 )
 
 
@@ -921,6 +927,12 @@ _APPROVAL_NESTED_SCHEMA_PATHS = _pause_schema_paths(
 _USER_INPUT_NESTED_SCHEMA_PATHS = _pause_schema_paths(
     "user_input",
     _PENDING_USER_INPUT_FIELD_NAMES,
+) | frozenset(
+    {
+        *(("user_input", "wake", field_name) for field_name in _PENDING_WAKE_FIELD_NAMES),
+        ("user_input", "wake", "requested", "duration_seconds"),
+        ("user_input", "wake", "requested", "until"),
+    }
 )
 
 
@@ -2619,7 +2631,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "provider_cancellation_failures "
         "recovered requested_by resolved_by tool_call_id tool_call_metadata_truncated "
         "session_run_operation_id tool_evidence_conflict tool_name tool_round_id "
-        "source_run_epoch usage_summary user_input user_input_supersession_intent "
+        "source_run_epoch usage_summary user_input user_input_supersession_intent wake wake_id "
+        "continuation "
         "ambiguous_user_input_supersession_intent " + terminal_finalization_keys,
         owned_nested_paths=terminal_finalization_owned_paths
         | failure_evidence_owned_paths
@@ -2627,7 +2640,17 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         | _APPROVAL_NESTED_SCHEMA_PATHS
         | _USER_INPUT_NESTED_SCHEMA_PATHS
         | _USER_INPUT_SUPERSESSION_NESTED_SCHEMA_PATHS
-        | _AMBIGUOUS_USER_INPUT_SUPERSESSION_NESTED_SCHEMA_PATHS,
+        | _AMBIGUOUS_USER_INPUT_SUPERSESSION_NESTED_SCHEMA_PATHS
+        | frozenset(
+            ("wake", field_name)
+            for field_name in ("wake_id", "tool_call_id", "tool_name", "deadline", "task_id")
+        )
+        | _pause_schema_paths("continuation", _PENDING_USER_INPUT_FIELD_NAMES)
+        | frozenset(
+            ("continuation", *path[1:])
+            for path in _USER_INPUT_NESTED_SCHEMA_PATHS
+            if path[1:2] == ("wake",)
+        ),
         aliased_authority_keys={
             "child_session_id",
             "action_id",
@@ -2654,6 +2677,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "policy_metadata",
             "provider_cancellation_failures",
             "user_input",
+            "continuation",
         }
         | terminal_finalization_containers,
     )
@@ -2701,8 +2725,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "pause_digest previous_compacted_transcript_cursor provider_count_context_window_tokens "
         "provider_count_input_tokens reason recent_message_count request_id "
         "reserved_output_tokens resolution_request_digest result_transcript_cursor source_run_epoch "
-        "source_transcript_cursor tool_call_id tool_round_id "
-        "transition trigger_estimated_context_tokens",
+        "source_transcript_cursor task_id tool_call_id tool_name tool_round_id "
+        "transition trigger_estimated_context_tokens wake_id deadline",
         authority_keys={
             "execution_profile_fingerprint",
             "pause_digest",

@@ -7053,6 +7053,9 @@ class SQLiteSessionStore(
             filters.append("(cayu_checkpoints.pending_action_flags & 2) <> 0")
         elif query.kind == PendingActionKind.DELEGATED_ACTION:
             filters.append("(cayu_checkpoints.pending_action_flags & 8) <> 0")
+        elif query.kind == PendingActionKind.WAKE:
+            # Asleep or handed over, a wake sets its own bit.
+            filters.append("(cayu_checkpoints.pending_action_flags & 16) <> 0")
         if query.cursor is not None:
             cursor_dt, cursor_id = decode_session_cursor(query.cursor)
             cursor_value = sqlite_records.format_datetime(cursor_dt)
@@ -7122,6 +7125,11 @@ class SQLiteSessionStore(
                     json_extract(
                         cayu_checkpoints.state_json,
                         '$.foreground_child_wait'
+                    ),
+                    'pending_wake',
+                    json_extract(
+                        cayu_checkpoints.state_json,
+                        '$.pending_wake'
                     )
                 ) AS pending_state_json
             FROM cayu_checkpoints
@@ -7237,6 +7245,18 @@ class SQLiteSessionStore(
                 WHERE json_type(
                     pending_state_json,
                     '$.pending_user_input.input_id'
+                ) = 'text'
+                UNION
+                SELECT id,
+                    cayu_pending_action_lookup_key(
+                        json_extract(
+                            pending_state_json, '$.pending_wake.continuation.input_id'
+                        )
+                    )
+                FROM candidates
+                WHERE json_type(
+                    pending_state_json,
+                    '$.pending_wake.continuation.input_id'
                 ) = 'text'
                 UNION
                 SELECT tool_scope.session_id,

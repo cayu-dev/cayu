@@ -37,6 +37,15 @@ def _validate_user_input_checkpoint_mutation(
 ) -> None:
     """Validate the closed atomic publication contract for user-input pauses."""
 
+    if request.kind in {"wake-open", "wake-close"}:
+        _validate_wake_checkpoint_mutation(
+            request,
+            checkpoint,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+            current_run_epoch=current_run_epoch,
+        )
+        return
     if request.kind not in {"user-input-open", "user-input-close"}:
         return
     from cayu.approvals.user_input import (
@@ -402,3 +411,155 @@ def _validate_user_input_checkpoint_mutation(
             or event.payload.get("model_attempt_id") != intent["model_attempt_id"]
         ):
             raise ValueError("User-input publication event conflicts with its authority tuple.")
+
+
+def _validate_wake_checkpoint_mutation(
+    request: RuntimePublicationRequest,
+    checkpoint: dict[str, Any] | None,
+    *,
+    session_id: str,
+    session_instance_id: str,
+    current_run_epoch: int,
+) -> None:
+    """Validate the closed atomic publication contract for ``sleep_until`` pauses.
+
+    ``wake-open`` replaces exactly one pending tool round with ``pending_wake``.
+    ``wake-close`` replaces exactly that ``pending_wake`` with its continuation
+    under ``pending_user_input``, which the shared resolution then claims.
+    """
+
+    from cayu.approvals.user_input import (
+        PENDING_USER_INPUT_CHECKPOINT_KEY,
+        USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
+        USER_INPUT_SUPERSESSION_INTENT_KEY,
+        pending_user_input_identity,
+    )
+    from cayu.approvals.wakes import (
+        PENDING_WAKE_CHECKPOINT_KEY,
+        PendingSessionWake,
+        pending_session_wake_digest,
+        pending_session_wake_identity,
+    )
+
+    if request.operation_record_mutations or request.transcript_messages:
+        raise ValueError("A wake publication cannot mutate records or the transcript.")
+    if request.referenced_events:
+        raise ValueError("A wake publication cannot reference other events.")
+    operations = {operation.key: operation for operation in request.mutation.operations}
+    schema_operation = operations.pop(CHECKPOINT_SCHEMA_VERSION_KEY, None)
+    if schema_operation is not None and (
+        schema_operation.action != "set"
+        or schema_operation.value != CURRENT_CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise ValueError("Wake checkpoint schema publication is invalid.")
+    opening = request.kind == "wake-open"
+    source_key = (
+        tool_publication_rules._PENDING_TOOL_ROUND_CHECKPOINT_KEY
+        if opening
+        else PENDING_WAKE_CHECKPOINT_KEY
+    )
+    target_key = PENDING_WAKE_CHECKPOINT_KEY if opening else PENDING_USER_INPUT_CHECKPOINT_KEY
+    if set(operations) != {source_key, target_key}:
+        raise ValueError(f"A {request.kind} publication must replace {source_key} only.")
+    current = {} if checkpoint is None else checkpoint
+    if any(
+        key in current
+        for key in (
+            target_key,
+            USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
+            USER_INPUT_SUPERSESSION_INTENT_KEY,
+        )
+    ) or (opening and PENDING_USER_INPUT_CHECKPOINT_KEY in current):
+        raise SessionRuntimePublicationConflict("A session already carries pause authority.")
+    raw_source = current.get(source_key)
+    source_operation, target_operation = operations[source_key], operations[target_key]
+    if (
+        type(raw_source) is not dict
+        or source_operation.action != "delete"
+        or source_operation.expected_value_digest
+        != runtime_publication_checkpoint_value_digest(raw_source)
+        or target_operation.action != "set"
+        or target_operation.expected_value_digest is not None
+        or type(target_operation.value) is not dict
+    ):
+        raise ValueError("Wake publication is not bound to its exact source state.")
+    try:
+        wake = PendingSessionWake.model_validate(target_operation.value if opening else raw_source)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Wake publication checkpoint is malformed.") from exc
+    pending = wake.continuation
+    if not opening and target_operation.value != pending.model_dump(mode="json"):
+        raise ValueError("Wake closure must hand over its exact continuation.")
+    intent = request.intent
+    # Closing opens the continuation's shared pause, so its receipt carries that
+    # pause's identity and binds the wake it closes.
+    identity = (
+        pending_session_wake_identity(wake)
+        if opening
+        else {
+            **pending_user_input_identity(pending),
+            "wake_pause_digest": pending_session_wake_digest(wake),
+        }
+    )
+    expected_fields = set(identity) | {"event_ids"}
+    expected_fields |= {"source_round_digest"} if opening else {"transition"}
+    if (
+        set(intent) != expected_fields
+        or any(intent.get(key) != value for key, value in identity.items())
+        or request.publication_id != f"{request.kind}:{wake.wake_id}"
+        or request.interaction_id != pending.source_interaction_id
+        or pending.session_id != session_id
+        or pending.session_instance_id != session_instance_id
+    ):
+        raise ValueError("Wake publication identity conflicts with its session.")
+    if opening:
+        if (
+            intent["source_round_digest"] != runtime_publication_checkpoint_value_digest(raw_source)
+            or pending.source_run_epoch != current_run_epoch
+            or raw_source.get("tool_round_id") != pending.tool_round_id
+            or raw_source.get("model_step_id") != pending.model_step_id
+            or raw_source.get("model_attempt_id") != pending.model_attempt_id
+            or raw_source.get("source_run_epoch") != pending.source_run_epoch
+            or raw_source.get("execution_profile_fingerprint")
+            != pending.execution_profile_fingerprint
+        ):
+            raise ValueError("Wake opening conflicts with its pending round.")
+        active_profile = active_invocation_execution_profile_from_checkpoint(current)
+        if (
+            active_profile is None
+            or not active_invocation_execution_profile_matches_session_epoch(
+                active_profile,
+                session_id=session_id,
+                run_epoch=current_run_epoch,
+            )
+            or active_profile.interaction_id != pending.source_interaction_id
+            or active_profile.profile.fingerprint != pending.execution_profile_fingerprint
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Wake opening has no exact active invocation authority."
+            )
+        transition = "asleep"
+    else:
+        transition = intent["transition"]
+        if transition != "woke":
+            raise ValueError("Wake closure transition is invalid.")
+    event_ids = intent.get("event_ids")
+    if (
+        len(request.events) != 1
+        or event_ids != [event.id for event in request.events]
+        or request.events[0].type is not EventType.SESSION_CHECKPOINTED
+    ):
+        raise ValueError("A wake publication requires exactly one checkpoint event.")
+    event = request.events[0]
+    if (
+        event.session_id != session_id
+        or event.interaction_id != request.interaction_id
+        or event.payload.get("checkpoint") != PENDING_WAKE_CHECKPOINT_KEY
+        or event.payload.get("transition") != transition
+        or event.payload.get("wake_id") != wake.wake_id
+        or event.payload.get("tool_call_id") != pending.tool_call_id
+        or event.payload.get("pause_digest") != identity["pause_digest"]
+        or event.payload.get("source_run_epoch") != pending.source_run_epoch
+        or (not opening and event.payload.get("input_id") != pending.input_id)
+    ):
+        raise ValueError("Wake publication event conflicts with its authority.")

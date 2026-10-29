@@ -270,6 +270,14 @@ from cayu.tasks.scheduling import TaskSchedulePolicy as TaskSchedulePolicy
 from cayu.tasks.scheduling import TaskScheduleReceipt as TaskScheduleReceipt
 from cayu.tasks.scheduling import TaskScheduleState as TaskScheduleState
 from cayu.tasks.scheduling import TaskScheduleWakeup as TaskScheduleWakeup
+from cayu.tasks.session_wakes import SESSION_WAKE_RETRY_WINDOW as SESSION_WAKE_RETRY_WINDOW
+from cayu.tasks.session_wakes import SESSION_WAKE_TASK_TYPE as SESSION_WAKE_TASK_TYPE
+from cayu.tasks.session_wakes import SessionWakeNotContinued as SessionWakeNotContinued
+from cayu.tasks.session_wakes import SessionWakeNotDue as SessionWakeNotDue
+from cayu.tasks.session_wakes import SessionWakeOutcome as SessionWakeOutcome
+from cayu.tasks.session_wakes import deliver_session_wake as deliver_session_wake
+from cayu.tasks.session_wakes import reconcile_session_wakes as reconcile_session_wakes
+from cayu.tasks.session_wakes import session_wake_attempts as session_wake_attempts
 from cayu.tasks.store import TaskStore as TaskStore
 from cayu.tasks.terminalization import TaskTerminalizationConflict as TaskTerminalizationConflict
 from cayu.tasks.terminalization import TaskTerminalizationReceipt as TaskTerminalizationReceipt

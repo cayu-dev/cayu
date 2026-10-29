@@ -19,6 +19,12 @@ from cayu._validation import (
 from cayu.approvals.user_input import (
     event_with_pending_user_input_authority,
     pending_user_input_interruption_payload,
+    public_pending_user_input_event_payload,
+)
+from cayu.approvals.wakes import (
+    WAKE_SCHEDULED_INTERRUPTION_TYPE,
+    pending_session_wake_digest,
+    public_pending_wake_payload,
 )
 from cayu.context.base import (
     automatic_compaction_failure_payload,
@@ -115,6 +121,7 @@ from cayu.runtime._terminal_event_publication import (
 )
 from cayu.runtime._tool_invocation.admission import ToolApprovalRequired
 from cayu.runtime._tool_round_executor import (
+    SessionWakeScheduled,
     UserInputRequired,
 )
 from cayu.runtime._work_attempt_session_mutation import (
@@ -738,6 +745,87 @@ class SessionOutcomePublication:
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
+        ):
+            yield event
+
+    async def pause_for_wake(
+        self,
+        context: SessionOutcomeContext,
+        exc: SessionWakeScheduled,
+        materialize_deferred_messages_after_failure: Callable[[], Awaitable[None]],
+    ) -> AsyncGenerator[Event, None]:
+        """Settle a ``sleep_until`` pause as an interruption no person needs to act on."""
+
+        state = context.state
+        registered_agent = context.registered_agent
+        environment_name = context.environment_name
+        invocation_context = context.invocation_context
+        wake = exc.wake
+        pending = wake.continuation
+
+        await materialize_deferred_messages_after_failure()
+        (
+            state.session,
+            interaction_paused_event,
+            _,
+        ) = await self._session_finalization.publish_sibling_interaction_transition(
+            session=state.session,
+            invocation_context=invocation_context,
+            registered_agent=registered_agent,
+            registered_environment=context.registered_environment,
+            environment_name=environment_name,
+            to_status=SessionStatus.INTERRUPTED,
+            execution_profile=context.execution_profile,
+        )
+        if interaction_paused_event is not None:
+            yield interaction_paused_event
+        for event in await self._session_finalization.emit_turn_completed_once(
+            session=state.session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            status=SessionStatus.INTERRUPTED,
+            run_started_at=context.run_started_at,
+            usage_tracker=context.turn_usage_tracker,
+            active_run=context.active_run,
+            invocation_context=invocation_context,
+        ):
+            yield event
+        async for event in self._terminal_event_publication.emit(
+            event=event_with_runtime_payload_authority(
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=state.session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "interruption_type": WAKE_SCHEDULED_INTERRUPTION_TYPE,
+                        "model_step_id": pending.model_step_id,
+                        "model_attempt_id": pending.model_attempt_id,
+                        "tool_round_id": pending.tool_round_id,
+                        "wake_id": wake.wake_id,
+                        "tool_call_id": pending.tool_call_id,
+                        "source_run_epoch": pending.source_run_epoch,
+                        "pause_digest": pending_session_wake_digest(wake),
+                        "execution_profile_fingerprint": pending.execution_profile_fingerprint,
+                        "wake": public_pending_wake_payload(wake),
+                        # The round this wake resumes, as recovery evidence for its
+                        # continuation; it is not a request for anyone's input.
+                        "continuation": public_pending_user_input_event_payload(pending),
+                    },
+                ),
+                "model_step_id",
+                "model_attempt_id",
+                "tool_round_id",
+                "wake_id",
+                "tool_call_id",
+                "execution_profile_fingerprint",
+            ),
+            phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+            session=state.session,
+            registered_agent=registered_agent,
+            registered_environment=context.registered_environment,
+            execution_profile=context.execution_profile,
             invocation_context=invocation_context,
         ):
             yield event

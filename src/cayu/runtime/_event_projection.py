@@ -169,6 +169,7 @@ _INTERRUPTION_TYPES = frozenset(
         "tool_approval_required",
         "user_input_required",
         "waiting_on_child_action",
+        "wake_scheduled",
     }
 )
 _POLICY_DENIAL_DECISIONS = {
@@ -285,6 +286,7 @@ _SESSION_CHECKPOINT_VALUES = frozenset(
         "context_compaction",
         "pending_tool_approval",
         "pending_user_input",
+        "pending_wake",
         "usage_triggered_context",
     }
 )
@@ -519,6 +521,8 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ): _WORKSPACE_PATH_CHANGE_VALUES,
         ("user_input", "arguments_state"): frozenset({"quarantined"}),
         ("user_input", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
+        ("continuation", "arguments_state"): frozenset({"quarantined"}),
+        ("continuation", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
         ("ambiguous_user_input_supersession_intent", "state"): frozenset({"ambiguous"}),
         ("user_input_supersession_intent", "state"): frozenset({"active", "answering"}),
     },
@@ -762,7 +766,7 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     },
     EventType.SESSION_CHECKPOINTED: {
         ("checkpoint",): _SESSION_CHECKPOINT_VALUES,
-        ("transition",): frozenset({"answered"}),
+        ("transition",): frozenset({"answered", "asleep", "woke"}),
     },
     EventType.SESSION_MESSAGE_QUEUED: {("delivery_mode",): frozenset({"next_turn", "on_idle"})},
     EventType.SESSION_MESSAGE_DELIVERED: {("delivery_mode",): frozenset({"next_turn", "on_idle"})},
@@ -1344,7 +1348,8 @@ def _quarantine_pre_execution_tool_arguments(
             for call in tool_calls:
                 quarantine_descriptor(call)
         return
-    for field_name in ("approval", "user_input"):
+    # A sleeping call's ``continuation`` is the same pause round as ``user_input``.
+    for field_name in ("approval", "user_input", "continuation"):
         pause = payload.get(field_name)
         quarantine_descriptor(pause)
         if type(pause) is dict and type(pause.get("tool_calls")) is list:

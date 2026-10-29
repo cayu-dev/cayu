@@ -31,7 +31,7 @@ RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY = "runtime_authored_user_message"
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION = 1
 AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY = "ambiguous_pending_user_input"
 BROWSER_CONTROLS_CHECKPOINT_KEY = "browser_controls"
-CURRENT_CHECKPOINT_SCHEMA_VERSION = 11
+CURRENT_CHECKPOINT_SCHEMA_VERSION = 12
 MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION = 1
 _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES = 256
@@ -411,9 +411,20 @@ def _migrate_checkpoint_v10_to_v11(checkpoint: dict[str, Any]) -> dict[str, Any]
     return migrated
 
 
+def _migrate_checkpoint_v11_to_v12(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Old application JSON must never become a sleeping tool call's wake authority."""
+    migrated = copy_durable_json_object(checkpoint, "checkpoint")
+    migrated.pop("pending_wake", None)
+    migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 12
+    return migrated
+
+
 _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
     current_version=CURRENT_CHECKPOINT_SCHEMA_VERSION,
     migrations=(
+        CheckpointMigration(
+            source_version=11, target_version=12, migrate=_migrate_checkpoint_v11_to_v12
+        ),
         CheckpointMigration(
             source_version=10, target_version=11, migrate=_migrate_checkpoint_v10_to_v11
         ),
@@ -583,12 +594,20 @@ def runtime_checkpoint_writer_view(
     )
     if writer_version == CURRENT_CHECKPOINT_SCHEMA_VERSION:
         return current
-    if writer_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
+    if writer_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
         raise ValueError("Staged runtime publication uses an unsupported writer schema.")
 
     # Decoding already admitted and detached this private snapshot. Projection
     # only consumes it locally; copying and validating it again adds no boundary.
     projected: dict[str, Any] = current
+    handed_over = projected.get("pending_user_input")
+    if "pending_wake" in projected or (
+        type(handed_over) is dict and handed_over.get("wake") is not None
+    ):
+        raise ValueError("A sleeping tool call cannot be represented by an older writer.")
+    if writer_version == 11:
+        projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 11
+        return projected
     if "execution_snapshots" in projected:
         raise ValueError("Execution snapshot authority cannot be represented by an older writer.")
     if writer_version == 10:

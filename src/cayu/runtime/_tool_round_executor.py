@@ -12,12 +12,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
-from typing import Any, Literal, Never, TypeVar, cast
+from typing import Any, Literal, Never, Protocol, TypeVar, cast
 from uuid import uuid4
 
 from cayu._exception_groups import (
@@ -41,13 +42,23 @@ from cayu.approvals.tools import (
 from cayu.approvals.user_input import (
     PENDING_USER_INPUT_CHECKPOINT_KEY,
     PendingUserInput,
+    SessionWakeTimer,
     copy_pending_user_input,
     event_with_pending_user_input_authority,
     pending_user_input_digest,
     pending_user_input_identity,
     public_pending_user_input_event_payload,
     public_pending_user_input_prompt,
+    session_wake_task_id,
     user_input_lifecycle_authority_from_checkpoint,
+)
+from cayu.approvals.wakes import (
+    PENDING_WAKE_CHECKPOINT_KEY,
+    PendingSessionWake,
+    copy_pending_session_wake,
+    pending_session_wake_digest,
+    pending_session_wake_identity,
+    public_pending_wake_payload,
 )
 from cayu.budgets._run_limit_accounting import (
     RunLimitAccountingContext,
@@ -207,6 +218,9 @@ from cayu.vaults.redaction import SecretRedactor
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
 
 
+_logger = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
 class ToolRoundLimitRequest:
     evaluation: LimitEvaluation
@@ -237,6 +251,14 @@ class UserInputRequired(Exception):
         self.pending = copy_pending_user_input(pending)
 
 
+class SessionWakeScheduled(Exception):
+    """Internal control signal for a durably checkpointed ``sleep_until`` pause."""
+
+    def __init__(self, wake: PendingSessionWake) -> None:
+        super().__init__(f"Tool call sleeps until {wake.timer.deadline.isoformat()}")
+        self.wake = copy_pending_session_wake(wake)
+
+
 class ToolRoundExecutor:
     """Plan, schedule and close ordinary tool rounds.
 
@@ -259,6 +281,7 @@ class ToolRoundExecutor:
         checkpoint_transform: CheckpointTransformFactory,
         apply_limit_evaluation: LimitEventStream,
         close_interrupted_round: InterruptedRoundEventStream,
+        publish_session_wake: Callable[[PendingUserInput], Awaitable[None]] | None = None,
     ) -> None:
         self.invocation = invocation
         self._session_store = session_store
@@ -271,6 +294,7 @@ class ToolRoundExecutor:
         self._checkpoint_transform = checkpoint_transform
         self._apply_limit_evaluation = apply_limit_evaluation
         self._close_interrupted_round = close_interrupted_round
+        self._publish_session_wake = publish_session_wake
 
     def create_run(
         self,
@@ -454,6 +478,7 @@ class ToolRoundExecutor:
         question: str,
         options: list[str],
         tool_round_identity: ToolRoundIdentity,
+        wake_plan: _WakePlan | None = None,
     ) -> tuple[PendingUserInput, list[Event]]:
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
         redactor = _redactor_for_tool_calls(
@@ -507,12 +532,13 @@ class ToolRoundExecutor:
         if execution_profile_fingerprint is None:
             raise RuntimeError("Pending user input has no execution-profile authority.")
 
+        input_id = str(uuid4())
         pending = PendingUserInput(
             session_id=session.id,
             session_instance_id=session.instance_id,
             source_interaction_id=active_profile.interaction_id,
             source_run_epoch=session.run_epoch,
-            input_id=str(uuid4()),
+            input_id=input_id,
             tool_round_id=tool_round_identity.tool_round_id,
             model_step_id=tool_round_identity.model_step_id,
             model_attempt_id=tool_round_identity.model_attempt_id,
@@ -550,7 +576,29 @@ class ToolRoundExecutor:
                 copy_request_budget_limits(budget_limits) if budget_limits is not None else None
             ),
             retry_policy=copy_retry_policy(retry_policy) if retry_policy is not None else None,
+            wake=(
+                None
+                if wake_plan is None
+                else SessionWakeTimer(
+                    task_id=session_wake_task_id(input_id),
+                    requested=wake_plan.requested,
+                    deadline=wake_plan.deadline,
+                    resolved_at=wake_plan.resolved_at,
+                )
+            ),
         )
+        if wake_plan is not None:
+            wake = PendingSessionWake(continuation=pending)
+            wake_events = await self._publish_pending_wake(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                checkpoint=checkpoint,
+                wake=wake,
+                redactor=redactor,
+                tool_round_identity=tool_round_identity,
+            )
+            return wake.continuation, wake_events
         pending_payload = _require_secret_free_durable_object(
             pending.model_dump(mode="json"),
             redactor=redactor,
@@ -662,6 +710,92 @@ class ToolRoundExecutor:
         if cancellation is not None:
             raise cancellation
         return pending, list(prepared.request.events)
+
+    async def _publish_pending_wake(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        checkpoint: dict[str, Any],
+        wake: PendingSessionWake,
+        redactor: SecretRedactor,
+        tool_round_identity: ToolRoundIdentity,
+    ) -> list[Event]:
+        """Replace the round with its own ``pending_wake`` pause under ``wake-open``."""
+
+        pending = wake.continuation
+        wake_payload = _require_secret_free_durable_object(
+            wake.model_dump(mode="json"),
+            redactor=redactor,
+            field_name=PENDING_WAKE_CHECKPOINT_KEY,
+            schema_root=PENDING_WAKE_CHECKPOINT_KEY,
+            runtime_session=session,
+        )
+        source_round_payload = copy_json_value(
+            checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
+            "pending_tool_round",
+        )
+        target_checkpoint = copy_durable_record(checkpoint, "checkpoint")
+        target_checkpoint.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+        target_checkpoint[PENDING_WAKE_CHECKPOINT_KEY] = wake_payload
+        target_checkpoint = _require_secret_free_durable_object(
+            target_checkpoint,
+            redactor=redactor,
+            field_name="checkpoint",
+            runtime_session=session,
+        )
+        checkpoint_event = _redact_event_for_invocation(
+            _event_with_tool_round_authority(
+                Event(
+                    type=EventType.SESSION_CHECKPOINTED,
+                    session_id=session.id,
+                    interaction_id=pending.source_interaction_id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    tool_name=pending.tool_name,
+                    payload={
+                        "checkpoint": PENDING_WAKE_CHECKPOINT_KEY,
+                        "transition": "asleep",
+                        "source_run_epoch": pending.source_run_epoch,
+                        "pause_digest": pending_session_wake_digest(wake),
+                        **public_pending_wake_payload(wake),
+                        **tool_round_identity.payload(),
+                    },
+                ),
+                tool_round_identity,
+                "wake_id",
+                "tool_call_id",
+            ),
+            redactor=redactor,
+        )
+        events = [checkpoint_event]
+        prepared = approval_publication.prepare_pending_action_publication(
+            session_id=session.id,
+            publication_id=f"wake-open:{wake.wake_id}",
+            kind="wake-open",
+            intent={
+                **pending_session_wake_identity(wake),
+                "source_round_digest": runtime_publication_checkpoint_value_digest(
+                    source_round_payload
+                ),
+                "event_ids": [event.id for event in events],
+            },
+            source_checkpoint=checkpoint,
+            target_checkpoint=target_checkpoint,
+            events=events,
+            expected_statuses={SessionStatus.RUNNING},
+            expected_run_epoch=session.run_epoch,
+            expected_transcript_cursor=await self._session_store.load_transcript_cursor(session.id),
+        )
+        cancellation = await approval_publication.publish_pending_action_with_exact_replay(
+            prepared,
+            session_store=self._session_store,
+            event_writer=self._event_writer,
+        )
+        if cancellation is not None:
+            raise cancellation
+        return list(prepared.request.events)
 
     @timed_phase("admission")
     async def checkpoint_with_pending_tool_round(
@@ -1199,6 +1333,10 @@ class ToolRoundRun:
         self.stopped_for_limit = False
         self.user_input_pause_superseded = False
 
+    def _wake_allowed(self) -> bool:
+        # The first slice parks only root sessions that no task owns.
+        return self._task_id is None and self._session.parent_session_id is None
+
     @property
     def execution_profile(self) -> ExecutionProfileIdentity | None:
         """Return the exact immutable profile resolved for this invocation."""
@@ -1402,14 +1540,16 @@ class ToolRoundRun:
         policy_evidence_by_id = {
             outcome.call.id: outcome.evidence for outcome in policy_plan.outcomes
         }
-        user_input_pause = _first_user_input_tool_call(
+        user_input_pause = _first_pausing_tool_call(
             self._registered_agent,
             tool_calls,
             policy_results_by_id,
             policy_evidence_by_id,
+            wake_allowed=self._wake_allowed(),
+            now=executor._clock,
         )
         if user_input_pause is not None:
-            user_input_call, question, options = user_input_pause
+            user_input_call, question, options, wake_plan = user_input_pause
             try:
                 pending_input, pause_events = await executor.checkpoint_pending_user_input(
                     session=session,
@@ -1429,6 +1569,7 @@ class ToolRoundRun:
                     question=question,
                     options=options,
                     tool_round_identity=tool_round_identity,
+                    wake_plan=wake_plan,
                 )
             except (RuntimeError, ValueError):
                 # A remote worker may claim interruption after the policy
@@ -1439,16 +1580,33 @@ class ToolRoundRun:
                 raise
             for pause_event in pause_events:
                 yield pause_event
+            if pending_input.wake is not None:
+                if executor._publish_session_wake is None:
+                    raise RuntimeError("Session wakes require a task store.")
+                # The committed pause is the durable intent. Creating its task is
+                # idempotent; reconciliation repeats it after a crash or failure here.
+                try:
+                    await executor._publish_session_wake(pending_input)
+                except Exception:
+                    _logger.warning(
+                        "Session %s is asleep but its wake task was not created; "
+                        "reconcile_session_wakes creates it.",
+                        session.id,
+                        exc_info=True,
+                    )
             try:
                 await executor._session_control.raise_if_interrupted(session.id)
             except SessionInterruptedByRequest:
                 # The pause committed, but a remote interruption atomically
-                # superseded it while persisted side effects were delivered.
-                # The pending round no longer exists, so let the outer run owner
-                # finish the operator interruption without treating the pause as
-                # an interrupted ordinary round.
+                # superseded it while persisted side effects were delivered (for
+                # a sleep, also while its wake task was created). The pending
+                # round no longer exists, so let the outer run owner finish the
+                # operator interruption without treating the pause as an
+                # interrupted ordinary round.
                 self.user_input_pause_superseded = True
                 return
+            if pending_input.wake is not None:
+                raise SessionWakeScheduled(PendingSessionWake(continuation=pending_input))
             raise UserInputRequired(pending_input)
 
         if planned_round is None:
@@ -2263,12 +2421,32 @@ def ordered_tool_result_messages(
     )
 
 
-def _first_user_input_tool_call(
+class _WakePlanner(Protocol):
+    def plan_wake(self, arguments: dict[str, Any], *, now: datetime) -> Any: ...
+
+
+@dataclass(frozen=True)
+class _WakePlan:
+    requested: dict[str, Any]
+    deadline: datetime
+    resolved_at: datetime
+
+
+def _first_pausing_tool_call(
     registered_agent: runtime_records.RegisteredAgentState,
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_results_by_id: dict[str, ToolPolicyResult | None],
     policy_evidence_by_id: Mapping[str, ToolPolicyEvidence],
-) -> tuple[runtime_records.ToolCallRequest, str, list[str]] | None:
+    *,
+    wake_allowed: bool,
+    now: Callable[[], datetime],
+) -> tuple[runtime_records.ToolCallRequest, str, list[str], _WakePlan | None] | None:
+    """Return the first call whose tool pauses this round, dispatched by pause kind.
+
+    A call that cannot pause falls through to ordinary execution, where the tool
+    reports why it did not pause.
+    """
+
     for tool_call in tool_calls:
         registered_tool = registered_agent.executable_tool(tool_call.name)
         if registered_tool is None or not getattr(registered_tool.tool, "pauses_session", False):
@@ -2278,10 +2456,41 @@ def _first_user_input_tool_call(
         policy_result = policy_results_by_id.get(tool_call.id)
         if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
             continue
+        if getattr(registered_tool.tool, "pause_kind", "user_input") == "wake":
+            if not wake_allowed:
+                continue
+            wake_plan = _wake_plan(registered_tool.tool, tool_call, now=now())
+            if wake_plan is not None:
+                return tool_call, _wake_question(wake_plan), [], wake_plan
+            continue
         question, options = _user_input_prompt(tool_call)
         if question:
-            return tool_call, question, options
+            return tool_call, question, options, None
     return None
+
+
+def _wake_plan(
+    tool: object,
+    tool_call: runtime_records.ToolCallRequest,
+    *,
+    now: datetime,
+) -> _WakePlan | None:
+    try:
+        plan = cast("_WakePlanner", tool).plan_wake(dict(tool_call.arguments), now=now)
+    except ValueError:
+        return None
+    if plan.deadline <= plan.resolved_at:
+        return None
+    return _WakePlan(
+        requested=dict(plan.requested),
+        deadline=plan.deadline,
+        resolved_at=plan.resolved_at,
+    )
+
+
+def _wake_question(plan: _WakePlan) -> str:
+    deadline = plan.deadline.isoformat().replace("+00:00", "Z")
+    return f"Sleeping until {deadline}; the session continues on its own then."
 
 
 def _user_input_prompt(

@@ -6318,6 +6318,9 @@ class PostgresSessionStore(
             filters.append("(cayu_checkpoints.pending_action_flags & 2) <> 0")
         elif query.kind == PendingActionKind.DELEGATED_ACTION:
             filters.append("(cayu_checkpoints.pending_action_flags & 8) <> 0")
+        elif query.kind == PendingActionKind.WAKE:
+            # Asleep or handed over, a wake sets its own bit.
+            filters.append("(cayu_checkpoints.pending_action_flags & 16) <> 0")
         if query.cursor is not None:
             cursor_dt, cursor_id = decode_session_cursor(query.cursor)
             filters.append(
@@ -6363,7 +6366,9 @@ class PostgresSessionStore(
                     'pending_tool_round',
                     cayu_checkpoints.state -> 'pending_tool_round',
                     'foreground_child_wait',
-                    cayu_checkpoints.state -> 'foreground_child_wait'
+                    cayu_checkpoints.state -> 'foreground_child_wait',
+                    'pending_wake',
+                    cayu_checkpoints.state -> 'pending_wake'
                 )) AS pending_state
             FROM cayu_checkpoints
             WHERE cayu_checkpoints.session_id = ANY(%s)
@@ -6444,6 +6449,15 @@ class PostgresSessionStore(
                 FROM candidates
                 WHERE jsonb_typeof(
                     pending_state #> '{{pending_user_input,input_id}}'
+                ) = 'string'
+                UNION
+                SELECT id, encode(sha256(convert_to(
+                    pending_state #>> '{{pending_wake,continuation,input_id}}',
+                    'UTF8'
+                )), 'hex')
+                FROM candidates
+                WHERE jsonb_typeof(
+                    pending_state #> '{{pending_wake,continuation,input_id}}'
                 ) = 'string'
                 UNION
                 SELECT tool_scope.session_id, encode(sha256(convert_to(

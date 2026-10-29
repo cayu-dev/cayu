@@ -643,6 +643,7 @@ async def run_task_worker(
             "The generic task worker requires complete idempotent ordinary-task "
             "cancellation reconciliation before it can claim work."
         )
+    handler = await _with_session_wakes(app, task_store, handler)
     materialized_work_contract_queue_supported = (
         task_store.supports_verified_work_contracts
         or type(task_store).hold_claimed_work_contract_task
@@ -751,6 +752,8 @@ async def run_task_worker(
         reclaim_bound = {"max_reclaims": _RECLAIM_BATCH_SIZE} if until_idle is not None else {}
 
         async def reclaim_expired_tasks() -> int:
+            # The same cadence restores wake attempts a crash or failure left out.
+            await _reconcile_session_wakes(app, task_store)
             if materialized_work_contract_queue_supported:
                 reclaim_outcome = await capture_task_store_operation(
                     lambda: task_store.reclaim_expired(query=query, **reclaim_bound),
@@ -1172,6 +1175,36 @@ async def run_task_worker(
         return sum(slot.result() for slot in slots)
     finally:
         lag_monitor.stop()
+
+
+async def _reconcile_session_wakes(app: CayuApp, task_store: TaskStore) -> None:
+    """Give open ``sleep_until`` wakes a live attempt; never stop the worker over it."""
+
+    from cayu.tasks.session_wakes import reconcile_session_wakes
+
+    if not app._uses_session_wakes or task_store is not app.task_store:
+        return
+    try:
+        await reconcile_session_wakes(app)
+    except Exception as exc:
+        logger.warning("Reconciling session wakes failed (%s); retrying later.", type(exc).__name__)
+
+
+async def _with_session_wakes(
+    app: CayuApp, task_store: TaskStore, handler: TaskHandler
+) -> TaskHandler:
+    """Run ``sleep_until`` wake tasks here, so no application handler has to."""
+
+    from cayu.tasks.session_wakes import SESSION_WAKE_TASK_TYPE, _handle_session_wake_task
+
+    await _reconcile_session_wakes(app, task_store)
+
+    async def handle(app: CayuApp, task: Task, worker_id: str):
+        if task.type == SESSION_WAKE_TASK_TYPE:
+            return await _handle_session_wake_task(app, task, worker_id)
+        return await handler(app, task, worker_id)
+
+    return handle
 
 
 async def _handle_with_heartbeat(

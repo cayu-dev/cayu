@@ -211,6 +211,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SearchKnowledgeTool": ("cayu.tools.knowledge", "SearchKnowledgeTool"),
     "SearchTextTool": ("cayu.tools.search", "SearchTextTool"),
     "SessionReadAccess": ("cayu.tools.session_reads", "SessionReadAccess"),
+    "SleepUntilTool": ("cayu.tools.sleep_until", "SleepUntilTool"),
     "SharedArtifactAudience": ("cayu.tools.shared_artifacts", "SharedArtifactAudience"),
     "SharedArtifactAuthorizationError": (
         "cayu.tools.shared_artifacts",
@@ -582,6 +583,7 @@ PUBLIC_NAMES = [
     "SearchKnowledgeTool",
     "SearchTextTool",
     "SessionReadAccess",
+    "SleepUntilTool",
     "SharedArtifactAudience",
     "SharedArtifactAuthorizationError",
     "SharedArtifactGrant",

@@ -87,12 +87,14 @@ from cayu.approvals.user_input import (
     pending_user_input_identity,
     pending_user_input_interruption_payload,
     require_resolution_intent_matches_pending,
+    session_wake_tool_result,
     user_input_answer_request_digest,
     user_input_decision_reason,
     user_input_lifecycle_authority_from_checkpoint,
     user_input_resolution_request_digest,
     user_input_supersession_intent_for,
 )
+from cayu.approvals.wakes import WAKE_SCHEDULED_INTERRUPTION_TYPE
 from cayu.budgets._run_limit_accounting import (
     RunLimitAccountingContext,
     rebase_run_limit_accounting_context,
@@ -1285,6 +1287,7 @@ class RecoveryCoordinator:
         on_admitted: Callable[[Session], None] | None = None,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
         participant_context: CollaborationAccessContext | None = None,
+        wake_delivery: bool = False,
     ) -> AsyncGenerator[Event, None]:
         from cayu.runtime._run_limit_stream import settled_continuation_deadline_outcome
 
@@ -1292,6 +1295,7 @@ class RecoveryCoordinator:
             owned = self._resolve_user_input_owned(
                 response,
                 participant_context=participant_context,
+                wake_delivery=wake_delivery,
                 before_mutation=before_mutation,
                 after_admission=after_admission,
                 on_admitted=on_admitted,
@@ -1316,6 +1320,7 @@ class RecoveryCoordinator:
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
         foreground_gate: GateReplay | None = None,
         participant_context: CollaborationAccessContext | None = None,
+        wake_delivery: bool = False,
     ) -> AsyncGenerator[Event | ContinuationDeadlineStart, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
@@ -1394,6 +1399,13 @@ class RecoveryCoordinator:
             raise RuntimeError("Session has no pending user input.")
         if pending.input_id != response.input_id:
             raise ValueError(f"User input id does not match pending input: {response.input_id}")
+        _require_wake_authority(
+            pending,
+            response,
+            wake_delivery=wake_delivery or _replays_wake_delivery(foreground_gate, pending),
+            claimed=candidate_intent is not None,
+            now=self._clock(),
+        )
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         if (
             pending.session_id != loaded_session.id
@@ -3916,7 +3928,7 @@ class RecoveryCoordinator:
                                 payload={
                                     "run_epoch": session.run_epoch,
                                     **tool_round_identity.payload(),
-                                    "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                                    "interruption_type": _resumed_pause_type(pending),
                                     "input_id": pending.input_id,
                                     "tool_call_id": pending.tool_call_id,
                                     "resolved_by": resolution_actor_payload(response.resolved_by),
@@ -6348,7 +6360,7 @@ class RecoveryCoordinator:
                         payload={
                             "run_epoch": session.run_epoch,
                             **tool_round_identity.payload(),
-                            "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                            "interruption_type": _resumed_pause_type(pending),
                             "input_id": pending.input_id,
                             "tool_call_id": pending.tool_call_id,
                             "resolved_by": resolution_actor_payload(request.resolved_by),
@@ -9590,6 +9602,60 @@ def _effective_tool_round_invocation_semantics(
         structured_output=copy_structured_output_spec(structured_output),
         thinking=request.thinking if request.thinking is not None else pending_round.thinking,
     )
+
+
+def _resumed_pause_type(pending: PendingUserInput) -> str:
+    """A woken sleep resumes as a wake, never as a person's answer."""
+
+    return (
+        _INTERRUPTION_TYPE_USER_INPUT_REQUIRED
+        if pending.wake is None
+        else WAKE_SCHEDULED_INTERRUPTION_TYPE
+    )
+
+
+def _replays_wake_delivery(foreground_gate: GateReplay | None, pending: PendingUserInput) -> bool:
+    """A subagent in the woken round paused and ended; its replay is this pause's wake.
+
+    The store-resolved replay carries the request the wake delivery itself
+    retained when it continued the round, so it keeps that authority. Nothing
+    a person sends reaches this path.
+    """
+
+    return (
+        foreground_gate is not None
+        and pending.wake is not None
+        and foreground_gate.record.get("kind") == "input"
+        and foreground_gate.record.get("action_id") == pending.input_id
+    )
+
+
+def _require_wake_authority(
+    pending: PendingUserInput,
+    response: UserInputResponse | UserInputRecoveryRequest,
+    *,
+    wake_delivery: bool,
+    claimed: bool,
+    now: datetime,
+) -> None:
+    """Only a due wake delivery, with the exact timer result, answers a sleep."""
+
+    if pending.wake is None:
+        if wake_delivery:
+            raise SessionRuntimePublicationConflict("The pending pause is not a session wake.")
+        return
+    if isinstance(response, UserInputRecoveryRequest):
+        if not claimed:
+            raise ValueError("A sleeping session resumes only when its wake task runs.")
+    elif not wake_delivery:
+        raise ValueError(
+            "This tool call belongs to a sleep_until wake; only its wake task "
+            "continues it. Interrupt the session to stop waiting."
+        )
+    if response.answer != session_wake_tool_result(pending):
+        raise SessionRuntimePublicationConflict("Session wake result conflicts with its pause.")
+    if now < pending.wake.deadline:
+        raise SessionRuntimePublicationConflict("Session wake is not due yet.")
 
 
 def _effective_user_input_max_steps(

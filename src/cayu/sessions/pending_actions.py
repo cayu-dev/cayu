@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 from typing import Any
 
@@ -61,7 +62,7 @@ _PENDING_ACTION_TOOL_STATE_KEYS = (
     "pending_tool_round",
 )
 PENDING_ACTION_CHECKPOINT_KEYS = frozenset(
-    (*_PENDING_ACTION_TOOL_STATE_KEYS, "foreground_child_wait")
+    (*_PENDING_ACTION_TOOL_STATE_KEYS, "foreground_child_wait", "pending_wake")
 )
 _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS = frozenset(
     {"model_step_id", "model_attempt_id", "tool_round_id"}
@@ -92,6 +93,8 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
             "tool_name",
             "approval",
             "user_input",
+            "wake_id",
+            "wake",
             tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY,
         }
     )
@@ -383,11 +386,15 @@ def pending_action_checkpoint_metrics(
     if not checkpoint_has_pending_action_candidate(checkpoint):
         return None, 0, 0
     assert checkpoint is not None
+    # A wake, asleep or handed over to the shared pause, sets only its own bit:
+    # it never counts as input a person is waited on for.
+    wake = checkpoint.get("pending_wake") is not None or _checkpoint_wake_id(checkpoint) is not None
     flags = (
         (1 if checkpoint.get("pending_tool_approval") is not None else 0)
-        | (2 if checkpoint.get("pending_user_input") is not None else 0)
+        | (2 if checkpoint.get("pending_user_input") is not None and not wake else 0)
         | (4 if checkpoint.get("pending_tool_round") is not None else 0)
         | (8 if checkpoint.get("foreground_child_wait") is not None else 0)
+        | (16 if wake else 0)
     )
     projected = {
         key: checkpoint[key]
@@ -453,6 +460,9 @@ def _pending_action_checkpoint_index_state(
             evidence_round = _pending_action_evidence_round(approval, pending_input, pending_round)
 
     identifiers: set[str] = set()
+    wake_id = _checkpoint_wake_id(checkpoint)
+    if wake_id is not None:
+        identifiers.add(wake_id)
     if approval is not None:
         identifiers.add(approval.approval_id)
     if pending_input is not None:
@@ -485,6 +495,7 @@ def pending_action_event_lookup_id(event: Event) -> str | None:
         _optional_payload_string(approval, "approval_id"),
         _optional_payload_string(payload, "input_id"),
         _optional_payload_string(user_input, "input_id"),
+        _optional_payload_string(payload, "wake_id"),
         _optional_payload_string(payload, "tool_call_id"),
         _optional_payload_string(payload, "tool_round_id"),
     ):
@@ -594,9 +605,14 @@ def _pending_action_event_payload_view(event: Event) -> dict[str, Any]:
         elif key == "user_input":
             projected = _project_payload_object_view(
                 value,
-                frozenset({"input_id", "tool_call_id", "question", "options"}),
+                frozenset({"input_id", "tool_call_id", "tool_name", "question", "options", "wake"}),
             )
             if projected is not None:
+                # A handed-over sleep keeps only when it is due: its timer's other
+                # fields restate the call's arguments, which stay private.
+                timer = _object_payload(projected.pop("wake", None))
+                if timer is not None and type(timer.get("deadline")) is str:
+                    projected["wake"] = {"deadline": timer["deadline"]}
                 payload[key] = projected
         else:
             payload[key] = value
@@ -936,6 +952,8 @@ def _action_from_record(
     arguments: dict[str, Any] | None = None,
     delegated_action: DelegatedActionReference | None = None,
     source_linkage: dict[str, _PendingActionSourceLinkage] | None = None,
+    wake_id: str | None = None,
+    wake_at: datetime | None = None,
 ) -> PendingActionRecord:
     # Pending actions are public control-plane projections. Their private
     # checkpoints retain executable arguments, but no invocation has yet
@@ -970,6 +988,8 @@ def _action_from_record(
         options=options or [],
         arguments=arguments,
         delegated_action=delegated_action,
+        wake_id=wake_id,
+        wake_at=wake_at,
     )
 
 
@@ -1264,6 +1284,93 @@ def _tool_round_manual_recovery_action(
     )
 
 
+def _checkpoint_wake_id(checkpoint: dict[str, Any] | None) -> str | None:
+    """Name the sleeping call, asleep or handed over but not yet continued."""
+
+    if checkpoint is None:
+        return None
+    wake = _object_payload(checkpoint.get("pending_wake"))
+    pending = (
+        _object_payload(wake.get("continuation"))
+        if wake is not None
+        else _object_payload(checkpoint.get("pending_user_input"))
+    )
+    if pending is None or (wake is None and _object_payload(pending.get("wake")) is None):
+        return None
+    return _optional_payload_string(pending, "input_id")
+
+
+def _payload_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def woken_round_needs_manual_recovery(records_desc: list[EventRecord], wake_id: str) -> bool:
+    """Whether the woken round last stopped on a tool a person must settle.
+
+    A handed-over wake whose continuation started a tool without a terminal
+    result no longer waits on its timer: it is a manual recovery of that tool.
+    """
+
+    for record in records_desc:
+        if str(record.event.type) != "session.interrupted":
+            continue
+        payload = record.event.payload
+        round_pause = _object_payload(payload.get("user_input"))
+        return (
+            round_pause is not None
+            and round_pause.get("input_id") == wake_id
+            and payload.get("manual_recovery_required") is True
+        )
+    return False
+
+
+def _wake_action_from_records(
+    session: PendingActionSession,
+    records_desc: list[EventRecord],
+    wake_id: str,
+) -> PendingActionRecord | None:
+    """A sleeping session waits on its timer, never on a person."""
+
+    if session.status != SessionStatus.INTERRUPTED:
+        return None
+    for record in records_desc:
+        event = record.event
+        payload = event.payload
+        if str(event.type) != "session.interrupted":
+            continue
+        # The sleep's own stop, or a later stop of its handed-over round, such
+        # as a woken continuation whose environment could not reconnect.
+        wake = _object_payload(payload.get("wake"))
+        round_pause = _object_payload(payload.get("user_input"))
+        if wake is not None and wake.get("wake_id") == wake_id:
+            timer = wake
+        elif round_pause is not None and round_pause.get("input_id") == wake_id:
+            timer = _object_payload(round_pause.get("wake")) or {}
+            wake = round_pause
+        else:
+            continue
+        deadline = _payload_datetime(_optional_payload_string(timer, "deadline"))
+        return _action_from_record(
+            session=session,
+            record=record,
+            action_kind=PendingActionKind.WAKE,
+            title="Sleeping",
+            detail=None if deadline is None else f"Continues on its own at {deadline.isoformat()}.",
+            tool_name=_optional_payload_string(wake, "tool_name") or event.tool_name,
+            round_id=_optional_payload_string(payload, "tool_round_id"),
+            tool_call_id=_optional_payload_string(wake, "tool_call_id"),
+            wake_id=wake_id,
+            wake_at=deadline,
+        )
+    return None
+
+
 def pending_action_from_records(
     session: PendingActionSession,
     records_desc: list[EventRecord],
@@ -1273,6 +1380,9 @@ def pending_action_from_records(
     delegated = _delegated_action_from_records(session, records_desc, checkpoint)
     if delegated is not None:
         return delegated
+    wake_id = _checkpoint_wake_id(checkpoint)
+    if wake_id is not None and not woken_round_needs_manual_recovery(records_desc, wake_id):
+        return _wake_action_from_records(session, records_desc, wake_id)
     if session.status == SessionStatus.INTERRUPTED:
         for record in records_desc:
             event = record.event

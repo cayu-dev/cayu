@@ -324,6 +324,7 @@ from cayu.tools.shared_artifacts import (
     authorize_shared_artifact_materialization as authorize_shared_artifact_materialization,
 )
 from cayu.tools.shared_artifacts import revoke_shared_artifact_grant as revoke_shared_artifact_grant
+from cayu.tools.sleep_until import SleepUntilTool as SleepUntilTool
 from cayu.tools.structured_commands import RUN_COMMAND_RESULT_SCHEMA as RUN_COMMAND_RESULT_SCHEMA
 from cayu.tools.structured_commands import (
     STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA as STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA,

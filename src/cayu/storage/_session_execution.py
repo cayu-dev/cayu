@@ -185,17 +185,17 @@ class MemorySessionExecutionMixin:
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            from cayu.sessions.pending_actions import pending_action_checkpoint_metrics
+
             checkpoint = self._checkpoints.get(session_id) or {}
             return execution_state(
                 session_id=session.id,
                 session_instance_id=session.instance_id,
                 run_epoch=session.run_epoch,
                 status=session.status,
+                # The same approval/input bits the SQL stores read; a wake is neither.
                 waiting=include_waits
-                and any(
-                    checkpoint.get(name) is not None
-                    for name in ("pending_user_input", "pending_tool_approval")
-                ),
+                and bool(pending_action_checkpoint_metrics(checkpoint)[2] & 3),
                 waiting_for_child=include_waits
                 and checkpoint.get("foreground_child_wait") is not None,
                 owner=self._execution_owners.get(session_id),

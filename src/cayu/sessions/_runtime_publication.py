@@ -60,6 +60,8 @@ RuntimePublicationKind = Literal[
     "approval-close",
     "user-input-open",
     "user-input-close",
+    "wake-open",
+    "wake-close",
     "workspace-observation",
 ]
 
