@@ -526,7 +526,10 @@ def test_real_request_cancellation_keeps_dispatched_sqlite_publication_fenced(
                     replayed = await async_client.post(url, headers=headers, json=body)
                     assert replayed.status_code == 201, replayed.text
                     assert replayed.json()["plan"] == plan
-                    assert not store._lock.locked()
+                    # The eval run coordinator may hold the lock on its own schedule; a lock
+                    # the cancelled publication leaked would never come free.
+                    await asyncio.wait_for(store._lock.acquire(), timeout=10)
+                    store._lock.release()
                 finally:
                     release.set()
                     await asyncio.gather(
@@ -1036,7 +1039,11 @@ def test_failed_sqlite_settlement_never_replays_uncommitted_receipt(
                     assert leaves(propagated) == [primary, rollback_error] + (
                         [close_error] if close_failure else []
                     )
-                    assert not store._lock.locked()
+                    # The server's eval run coordinator takes this lock on its own schedule,
+                    # so it may hold it right now; a lock the failed publication leaked would
+                    # never come free.
+                    await asyncio.wait_for(store._lock.acquire(), timeout=10)
+                    store._lock.release()
                 finally:
                     release.set()
                     await asyncio.gather(owner, return_exceptions=True)
