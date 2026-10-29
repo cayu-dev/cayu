@@ -23,6 +23,7 @@ from cayu._task_wait import (
     consume_pending_task_cancellation,
 )
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_json_value,
 )
 from cayu.approvals.tools import (
@@ -919,9 +920,11 @@ class ToolInvocation:
             quarantine_output=quarantine_pre_execution_publication,
         ):
             yield hook_event, None
+        # Python container equality conflates JSON booleans with numbers.
         effective_tool_call = (
             execution_tool_call
-            if before_resolution.arguments == execution_tool_call.arguments
+            if canonical_durable_json_bytes(before_resolution.arguments, "modified_arguments")
+            == canonical_durable_json_bytes(execution_tool_call.arguments, "tool_call.arguments")
             else replace(execution_tool_call, arguments=before_resolution.arguments)
         )
         # ``effective_arguments`` records hook changes only; a person's edit is
