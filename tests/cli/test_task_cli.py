@@ -316,7 +316,12 @@ def test_application_falls_back_to_cayu_serve_api_path(
         (
             lambda cloud: cloud.service.update(status="stopped"),
             "not_serving",
-            "serves no Cayu address (its service is stopped)",
+            "service is stopped, so it can't be read",
+        ),
+        (
+            lambda cloud: cloud.service.update(cayu_url=None),
+            "no_address",
+            "serves no Cayu address",
         ),
         (
             lambda cloud: setattr(cloud, "agent_status", 401),

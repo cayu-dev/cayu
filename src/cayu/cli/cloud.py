@@ -47,6 +47,7 @@ from cayu.cli._cloud_project import (
 )
 from cayu.cli._cloud_settings import CloudSettingsError, add_settings_parser, settings_command
 from cayu.cli._cloud_task_health import fenced_tasks_warning
+from cayu.cli._output import terminal_safe
 
 _DEPLOYMENT_FAILURES = {"cancelled", "destroyed", "failed"}
 _DEPLOYMENT_IN_PROGRESS = {
@@ -2048,6 +2049,9 @@ def _deploy(
         reference=arguments.application or project.manifest.application,
         name=project.manifest.name,
     )
+    running_tasks = _running_tasks_before_deploy(
+        arguments, client=client, application=application, project=project
+    )
     repository = project.repository
     revision = project.revision
     if project.bundle is not None:
@@ -2442,12 +2446,20 @@ def _deploy(
         result["not_applied"] = not_applied
     if deploy_check is not None:
         result["deploy_check"] = deploy_check
+    if running_tasks is not None:
+        result["running_tasks"] = running_tasks
     safe_result = recorder.redact(result)
     response: dict[str, Any] = {
         "evidence_id": None,
         "operation": "deploy",
         "result": safe_result,
     }
+    if running_tasks is not None:
+        from cayu.cli._cloud_deploy_tasks import running_tasks_warning
+
+        warning = running_tasks_warning(running_tasks, application_id=str(application["id"]))
+        if warning is not None:
+            response["warnings"] = [warning]
     try:
         evidence_path = recorder.record(
             "deploy",
@@ -2463,6 +2475,44 @@ def _deploy(
     else:
         response["evidence_id"] = evidence_path.name
     return response
+
+
+def _running_tasks_before_deploy(
+    arguments: argparse.Namespace,
+    *,
+    client: CloudApiClient,
+    application: dict[str, Any],
+    project: ResolvedCloudProject,
+) -> dict[str, Any] | None:
+    """Read and report the tasks a published release would interrupt, before uploading.
+
+    None for a candidate (`--no-promote` publishes nothing), a release without processes,
+    or an Agent with no selected release yet (nothing of it runs).
+    """
+
+    if (
+        _requested_candidate(arguments) is not None
+        or project.manifest.runtime_payload() is None
+        or ("current_deployment_id" in application and not application["current_deployment_id"])
+    ):
+        return None
+    application_id = str(application["id"])
+    from cayu.cli._cloud_deploy_tasks import (
+        read_running_tasks,
+        running_tasks_warning,
+        unavailable_notice,
+    )
+
+    report = read_running_tasks(
+        client, application_id, timeout_seconds=getattr(arguments, "timeout_seconds", 30.0)
+    )
+    for notice in (
+        running_tasks_warning(report, application_id=application_id),
+        unavailable_notice(report),
+    ):
+        if notice is not None:
+            print(f"cayu cloud: {terminal_safe(notice)}", file=sys.stderr)
+    return report
 
 
 def _existing_source_deployment(

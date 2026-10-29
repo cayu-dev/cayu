@@ -111,7 +111,8 @@ class CandidateCloud:
         return [
             (method, path)
             for method, path, _ in self.requests
-            if path.endswith("/promote") or path.endswith("/service")
+            # A read of the service (deploy's running-task check) publishes nothing.
+            if method != "GET" and (path.endswith("/promote") or path.endswith("/service"))
         ]
 
 

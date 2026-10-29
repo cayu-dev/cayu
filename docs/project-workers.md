@@ -138,7 +138,9 @@ requeued only when their handler stops within the grace. On Cayu Cloud,
 `[worker] stop_grace_seconds` gives the worker up to 120 seconds and raises
 `--shutdown-grace-seconds` to match
 ([how the worker stops](cayu-cloud.md#how-the-worker-stops)), and
-`cayu cloud service status` reports fenced tasks.
+`cayu cloud service status` reports fenced tasks, and `cayu cloud deploy` lists the
+tasks the current workers are running before it uploads
+([how](cayu-cloud.md#how-the-worker-stops)).
 
 When this is the only worker process for its tasks, say so and it settles them
 itself:

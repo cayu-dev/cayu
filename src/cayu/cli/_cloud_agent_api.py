@@ -20,12 +20,15 @@ import ipaddress
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlsplit
 
 import httpx
 
 from cayu.cli._cloud_diagnostics import safe_text
+
+if TYPE_CHECKING:
+    from cayu.cli._cloud_api import CloudApiClient
 
 # FastAPI's answer for a path no route serves, as opposed to a route's own "not found".
 _ROUTE_NOT_FOUND = "Not Found"
@@ -269,35 +272,62 @@ def open_cloud_agent_api(
     """The Cayu API of the Cayu Cloud Agent ``application`` (its slug or name).
 
     Signs in to Cayu Cloud the way `cayu cloud` does, with ``context`` standing for its
-    ``--context``. Raises ``CayuApiError`` with Cloud's category when Cloud refuses, and
-    ``"not_serving"`` when the Agent has no running web process to answer.
+    ``--context``, then reads it as `cloud_agent_api` does.
     """
 
     from cayu.cli._cloud_api import CloudApiError
     from cayu.cli._cloud_auth import CloudAuthError
-    from cayu.cli.cloud import (
-        CloudCommandError,
-        cloud_client,
-        operator_credentials,
-        resolve_application_id,
-    )
+    from cayu.cli.cloud import CloudCommandError, cloud_client, resolve_application_id
 
     try:
         client = cloud_client(context=context, timeout_seconds=timeout_seconds)
         application_id = resolve_application_id(client, application)
+    except (CloudApiError, CloudAuthError, CloudCommandError) as exc:
+        raise CayuApiError(exc.category, str(exc)) from None
+    return cloud_agent_api(client, application_id, timeout_seconds=timeout_seconds, http=http)
+
+
+def cloud_agent_api(
+    client: CloudApiClient,
+    application_id: str,
+    *,
+    timeout_seconds: float = 30.0,
+    wake_timeout_seconds: float = 60.0,
+    http: httpx.Client | None = None,
+) -> CayuApi:
+    """The Cayu API of the Agent ``application_id``, found with a signed-in ``client``.
+
+    Raises ``CayuApiError`` with Cloud's category (and HTTP status) when Cloud refuses,
+    ``"not_serving"`` when the Agent's service is stopped or failing, and ``"no_address"``
+    when it serves no Cayu address (an Agent without a web process).
+    """
+
+    from cayu.cli._cloud_api import CloudApiError
+    from cayu.cli._cloud_auth import CloudAuthError
+    from cayu.cli.cloud import CloudCommandError, operator_credentials
+
+    try:
         service = client.request("GET", f"/v1/applications/{quote(application_id)}/service")
         status = service.get("status")
         cayu_url = service.get("cayu_url")
-        if not isinstance(cayu_url, str) or not cayu_url or status in _NOT_SERVING_STATUSES:
-            state = f" (its service is {status})" if isinstance(status, str) else ""
+        if status in _NOT_SERVING_STATUSES:
             raise CayuApiError(
                 "not_serving",
-                f"The Agent {application_id} serves no Cayu address{state}, so it can't be "
-                "read. `cayu cloud service status` shows why.",
+                f"The Agent {application_id}'s service is {status}, so it can't be read. "
+                "`cayu cloud service status` shows why.",
+            )
+        if not isinstance(cayu_url, str) or not cayu_url:
+            # For example a worker-only Agent, whose worker may still be running tasks.
+            raise CayuApiError(
+                "no_address",
+                f"The Agent {application_id} serves no Cayu address, so its Cayu API can't be "
+                "read; an Agent without a [web] process has none.",
             )
         login = operator_credentials(client, application_id=application_id)
         authorization = basic_authorization(login["username"], login["password"])
-    except (CloudApiError, CloudAuthError, CloudCommandError) as exc:
+    except CloudApiError as exc:
+        raise CayuApiError(exc.category, str(exc), status_code=exc.status_code) from None
+    except (CloudAuthError, CloudCommandError) as exc:
         raise CayuApiError(exc.category, str(exc)) from None
     return CayuApi(
         cayu_url,
@@ -305,6 +335,7 @@ def open_cloud_agent_api(
         description=f"The Agent {application_id}",
         http=http,
         timeout_seconds=timeout_seconds,
+        wake_timeout_seconds=wake_timeout_seconds,
     )
 
 

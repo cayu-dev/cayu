@@ -190,7 +190,8 @@ def test_reused_selected_sleeping_release_succeeds_without_waking(
             transient_read
             and method == "GET"
             and path.endswith("/service")
-            and client.count("GET", "/service") == 0
+            # The first read is the deploy's check for running tasks, before the upload.
+            and client.count("GET", "/service") == 1
         ):
             client.requests.append((method, path))
             raise CloudApiError(

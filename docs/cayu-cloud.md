@@ -202,6 +202,19 @@ A task the worker can't finish or hand back within the grace stays fenced; see
 [a deploy during a long task](project-workers.md#a-deploy-during-a-long-task).
 `cayu cloud service status` reports such tasks (below).
 
+Before it uploads anything, `cayu cloud deploy` reads the Agent's claimed and running
+tasks through the Agent's own task API
+([reading an Agent's state](#reading-an-agents-state-from-the-cli)) and, when there
+are any, prints a warning to standard error naming them (up to 20 of each) and adds
+it to the JSON `warnings`. The JSON `result.running_tasks` has the list (`status`
+`read`, with `complete` false when there were more), `not_running` when the service
+is stopped or absent, or `unavailable` with the reason the read failed, which never
+stops the deploy. An Agent without a `[web]` process has no Cayu API to read, so its
+tasks are reported `unavailable` (`no_address`): its worker may still be running them. The deploy doesn't
+wait for these tasks or drain the worker; to keep their work, let them finish first.
+A candidate release (`--no-promote`) and an Agent with no selected release skip the
+check. Reading an asleep Agent wakes its web process.
+
 ### Schedules
 
 `expression` uses Amazon EventBridge Scheduler's syntax and is evaluated in UTC:
@@ -924,8 +937,9 @@ and reads the Agent's own Cayu API with that login, so the same people who can r
 login can use these commands. It reads `/cayu/api/` first and `/api/` when the Agent runs
 `cayu serve`. A sleeping Agent is woken by the read. Nothing is stored locally.
 
-A failure names its cause in `error.category`: `not_serving` when the Agent has no running
-web process, `credentials_rejected` when the Agent doesn't accept its Developer dashboard
+A failure names its cause in `error.category`: `not_serving` when the Agent's service is
+stopped or failing, `no_address` when it serves no Cayu address (an Agent without a `[web]`
+process), `credentials_rejected` when the Agent doesn't accept its Developer dashboard
 login, `not_served` when it doesn't serve Cayu's API, and `unsupported` when its Cayu is
 older than the command needs.
 
