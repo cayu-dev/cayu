@@ -6773,10 +6773,6 @@ class EnvironmentLifecycle:
                 # exact-owner retry state is now safe to discard even if
                 # validating or publishing the resulting snapshot later fails.
                 setup_owner.cleanup_release_safe = True
-            await _finish_environment_lifecycle(
-                progress_reporter,
-                status=EnvironmentLifecycleProgressStatus.COMPLETED,
-            )
         except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
             progress_failure: BaseException | None = None
             try:
@@ -7028,6 +7024,15 @@ class EnvironmentLifecycle:
                     events=events,
                 )
 
+        progress_publication_error: BaseException | None = None
+        try:
+            # Finalization has settled; progress publication must not rearm binding effects.
+            await _finish_environment_lifecycle(
+                progress_reporter,
+                status=EnvironmentLifecycleProgressStatus.COMPLETED,
+            )
+        except BaseException as exc:
+            progress_publication_error = exc
         completion_publication_error: BaseException | None = None
         try:
             retained_allocation = park_for_egress_adoption or preserve_factory_allocation
@@ -7124,6 +7129,7 @@ class EnvironmentLifecycle:
             (phase, error)
             for phase, error in (
                 ("finalize_started_event", start_publication_error),
+                ("finalize_completed_progress", progress_publication_error),
                 ("finalize_completed_event", completion_publication_error),
             )
             if error is not None
