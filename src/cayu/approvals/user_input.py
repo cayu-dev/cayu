@@ -425,10 +425,8 @@ class PendingUserInput(BaseModel):
 
     @model_validator(mode="after")
     def validate_wake_scope(self):
-        if self.wake is not None and (
-            self.task_id is not None or self.wake.task_id != session_wake_task_id(self.input_id)
-        ):
-            raise ValueError("A session wake must belong to a root session and its own task.")
+        if self.wake is not None and self.wake.task_id != session_wake_task_id(self.input_id):
+            raise ValueError("A session wake must name its own wake task.")
         return self
 
     @field_validator(

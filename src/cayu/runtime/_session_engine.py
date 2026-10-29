@@ -7411,6 +7411,7 @@ class SessionEngine:
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
                 run_limit_accounting=run_limit_accounting,
+                task_worker_id=task_worker_id,
             )
 
             def model_completion_recovery_context(

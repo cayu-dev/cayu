@@ -43,8 +43,11 @@ class SleepUntilTool(Tool):
     once. Deadlines further away than ``max_sleep`` are refused. A deadline that
     has already passed returns at once without pausing.
 
-    The first slice pauses only root sessions that no task owns, in a round where
-    no other tool waits for approval; anywhere else the call returns an error.
+    In a session a task owns, the task's worker hands the task off parked on the
+    wake: no other continuation claims it, and the wake continues the session under
+    the same task. The tool pauses only top-level sessions that no task owns or
+    that a task worker runs, in a round where no other tool waits for approval;
+    anywhere else the call returns an error.
     """
 
     # Decoupled markers the runtime checks (via getattr) to recognize a pausing tool
@@ -166,9 +169,9 @@ class SleepUntilTool(Tool):
         return ToolResult(
             content=(
                 "sleep_until did not pause: it can pause only a top-level session that "
-                "no task owns, in a round where no tool needed approval, including "
-                "sleep_until itself. Continue without waiting, or call sleep_until "
-                "again in a later round without other tools."
+                "no task owns or that a task worker runs, in a round where no tool "
+                "needed approval, including sleep_until itself. Continue without "
+                "waiting, or call sleep_until again in a later round without other tools."
             ),
             is_error=True,
         )

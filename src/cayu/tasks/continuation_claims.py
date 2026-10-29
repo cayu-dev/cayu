@@ -12,6 +12,7 @@ from cayu._validation import (
     revalidate_model_input,
 )
 from cayu.sessions.invocation import SessionInvocationBinding
+from cayu.tasks.handoff import TaskParkedWait
 from cayu.tasks.records import Task, TaskClaimLost
 
 
@@ -24,6 +25,8 @@ class TaskContinuationExpectation(BaseModel):
 
     The operation digest includes the selecting owner's exact pause and decision
     tuple. It binds acknowledgement replay; the runtime still owns pause admission.
+    ``parked_wait`` is the wait a parked handoff names; only a claim presenting it
+    may continue that handoff. It is left out of the digest when unset.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -33,6 +36,7 @@ class TaskContinuationExpectation(BaseModel):
     session_instance_id: str
     prior_handoff_id: str
     operation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    parked_wait: TaskParkedWait | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("task_id", "session_id", "prior_handoff_id")
     @classmethod

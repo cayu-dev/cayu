@@ -24,7 +24,7 @@ from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import PendingActionKind, SessionStatus
 from cayu.sessions.requests import InterruptSessionRequest
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus, session_wakes
+from cayu.tasks import InMemoryTaskStore, TaskStatus, session_wakes
 from cayu.tasks.scheduling import TaskScheduleCancelRequest
 from cayu.tasks.session_wakes import (
     SESSION_WAKE_TASK_TYPE,
@@ -446,31 +446,6 @@ def test_sleep_is_left_out_of_run_limits_but_not_session_limits(scope) -> None:
             # Session-scope limits stay wall-clock: an hour asleep spends the budget.
             assert session.status is not SessionStatus.COMPLETED
             assert len(calls) == 1
-
-    asyncio.run(scenario())
-
-
-def test_task_owned_session_refuses_to_sleep_for_now() -> None:
-    async def scenario() -> None:
-        clock = _Clock()
-        sessions, tasks = InMemorySessionStore(), InMemoryTaskStore(clock=clock)
-        app = _app(sessions, tasks, clock)
-        task = await tasks.create_task(TaskCreate(type="job"))
-        events = [
-            event
-            async for event in app.run(
-                RunRequest(
-                    agent_name="sleeper",
-                    session_id="s_task",
-                    task_id=task.id,
-                    messages=[Message.text("user", "wait")],
-                )
-            )
-        ]
-        assert events[-1].type is EventType.SESSION_COMPLETED
-        [result] = _sleep_results(await sessions.load_transcript("s_task"))
-        assert result.is_error is True and "did not pause" in result.content
-        assert [task.type for task in await tasks.list_tasks()] == ["job"]
 
     asyncio.run(scenario())
 

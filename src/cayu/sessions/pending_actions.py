@@ -1701,6 +1701,11 @@ def pending_action_source_is_invalid(
         if evidence.scope_conflicting:
             return True
         if evidence.started_without_terminal_ids:
+            if action is not None and action.kind is PendingActionKind.WAKE:
+                # A woken round that died inside a tool still waits on its wake
+                # (projected from this checkpoint): the next attempt settles it as
+                # manual recovery, never runs it again.
+                return False
             return action is None or action.kind not in {
                 PendingActionKind.MANUAL_RECOVERY,
                 PendingActionKind.DELEGATED_ACTION,

@@ -732,6 +732,9 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
             json_extract(invocation_json, '$."root_session_id"'), created_at DESC, id
         );
     """,
+    137: """CREATE INDEX IF NOT EXISTS idx_cayu_task_handoff_receipts_parked
+        ON cayu_task_interrupted_handoff_receipts(task_id, handoff_id)
+        WHERE json_extract(request_json, '$.parked') IS NOT NULL;""",
     133: """CREATE INDEX IF NOT EXISTS idx_cayu_tasks_event_retry_key
         ON cayu_tasks(json_extract(invocation_json, '$.event_retry_key'), status);""",
     136: SQLITE_TASK_STEP_DDL,

@@ -284,6 +284,8 @@ from cayu.tasks.handoff import (
     prepare_interrupted_task_handoff,
     prepare_interrupted_task_handoff_candidate_page,
     prepare_interrupted_task_handoff_receipt_lookup,
+    prepare_parked_handoff_page,
+    require_parked_continuation_trigger,
 )
 from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
 from cayu.tasks.queries import (
@@ -382,7 +384,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 135
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 137
 
 
 @model_store_surface("tasks")
@@ -514,6 +516,7 @@ class SQLiteTaskStore(TaskStore):
     supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_exact_interrupted_task_handoffs: ClassVar[bool] = True
     supports_bound_interrupted_task_handoffs: ClassVar[bool] = True
+    supports_parked_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_task_retry_keys: ClassVar[bool] = True
@@ -5476,6 +5479,39 @@ class SQLiteTaskStore(TaskStore):
             ).fetchone()
             return None if row is None else sqlite_records.task_from_row(row)
 
+    async def list_parked_interrupted_task_handoffs(
+        self,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> list[TaskInterruptedHandoffReceipt]:
+        after, limit = prepare_parked_handoff_page(after=after, limit=limit)
+        async with self._lock:
+            rows = self._connection.execute(
+                "SELECT receipt.task_id, receipt.handoff_id, receipt.request_sha256, "
+                "receipt.request_json, receipt.task_json, receipt.committed_at "
+                "FROM cayu_task_interrupted_handoff_receipts AS receipt "
+                "JOIN cayu_tasks AS task ON task.id = receipt.task_id "
+                "AND task.interrupted_handoff_id = receipt.handoff_id "
+                "WHERE json_extract(receipt.request_json, '$.parked') IS NOT NULL "
+                "AND task.status = ? AND task.worker_id IS NULL "
+                "AND task.lease_expires_at IS NULL AND receipt.task_id > ? "
+                "ORDER BY receipt.task_id LIMIT ?",
+                (str(TaskStatus.RUNNING), after or "", limit),
+            ).fetchall()
+        receipts = []
+        for row in rows:
+            try:
+                receipts.append(
+                    _sqlite_interrupted_task_handoff_receipt(
+                        task_id=row["task_id"], handoff_id=row["handoff_id"], row=row
+                    )
+                )
+            except TaskInterruptedHandoffConflict:
+                # A malformed receipt is left to the claim that rejects it.
+                continue
+        return receipts
+
     async def claim_interrupted_task_continuation(
         self,
         worker_id: str,
@@ -5575,12 +5611,15 @@ class SQLiteTaskStore(TaskStore):
                     after_params = (cursor[0], cursor[0], cursor[1])
                 task_id_sql = "" if task_id is None else "AND id = ? "
                 task_id_params: tuple[str, ...] = () if task_id is None else (task_id,)
+                # A parked handoff is continued only by its own bound trigger.
+                parked_sql = "" if expected is not None else _SQLITE_UNPARKED_HANDOFF_SQL
                 rows = self._connection.execute(
                     "SELECT * FROM cayu_tasks WHERE status = ? "
                     "AND session_id IS NOT NULL AND session_instance_id IS NOT NULL "
                     "AND status_reason IS NULL "
                     "AND worker_id IS NULL AND lease_expires_at IS NULL "
                     "AND interrupted_handoff_id IS NOT NULL "
+                    f"{parked_sql}"
                     f"{task_id_sql}"
                     f"{after_sql}"
                     "ORDER BY created_at ASC, id ASC LIMIT ?",
@@ -5637,6 +5676,9 @@ class SQLiteTaskStore(TaskStore):
                     if receipt is None or receipt.task != observed:
                         rejected += 1
                         continue
+                    require_parked_continuation_trigger(
+                        receipt, None if expected is None else expected.parked_wait
+                    )
                     self._connection.execute(
                         "INSERT INTO cayu_task_interrupted_continuation_claims ("
                         "handoff_id_sha256, task_id, worker_id, claimed_at, expected_sha256"
@@ -7669,6 +7711,14 @@ def _sqlite_task_terminalization_receipt(
         )
     except Exception as exc:
         raise TaskTerminalizationConflict("Task terminalization receipt is malformed.") from exc
+
+
+_SQLITE_UNPARKED_HANDOFF_SQL = (
+    "AND NOT EXISTS (SELECT 1 FROM cayu_task_interrupted_handoff_receipts AS parked "
+    "WHERE parked.task_id = cayu_tasks.id "
+    "AND parked.handoff_id = cayu_tasks.interrupted_handoff_id "
+    "AND json_extract(parked.request_json, '$.parked') IS NOT NULL) "
+)
 
 
 def _sqlite_interrupted_task_handoff_receipt(

@@ -267,6 +267,13 @@ def test_step_revision_is_additive_and_only_step_stores_require_it(tmp_path) -> 
     assert revision.kind is schema.RevisionKind.ADDITIVE
     assert revision.compatible_from == schema.revision(TASK_STEPS_REVISION - 1).compatible_from
 
+    # Task stores never use the step table: one validates a current database without it.
+    current = tmp_path / "current-without-steps.sqlite"
+    asyncio.run(SQLiteTaskStore(current).close())
+    with sqlite3.connect(current) as connection:
+        connection.execute("DROP TABLE cayu_task_steps")
+    asyncio.run(SQLiteTaskStore(current, schema_mode=schema.SchemaMode.VALIDATE).close())
+
     path = tmp_path / "revision-before-steps.sqlite"
     asyncio.run(SQLiteTaskStore(path).close())
     with sqlite3.connect(path) as connection:
@@ -276,10 +283,18 @@ def test_step_revision_is_additive_and_only_step_stores_require_it(tmp_path) -> 
         )
         connection.execute(f"PRAGMA user_version = {TASK_STEPS_REVISION - 1}")
 
-    # A task store still opens the older database; a step store asks for a migration.
-    asyncio.run(SQLiteTaskStore(path, schema_mode=schema.SchemaMode.VALIDATE).close())
-    with pytest.raises(schema.SchemaTooOld):
+    # A step store asks for the step revision itself. A task store's floor comes
+    # only from a later breaking revision, never from the step table.
+    with pytest.raises(schema.SchemaTooOld, match=f"requires >= {TASK_STEPS_REVISION}\\."):
         SQLiteTaskStepStore(path)
+    task_floor = next(
+        candidate.revision
+        for candidate in reversed(schema.REVISIONS)
+        if candidate.kind is schema.RevisionKind.BREAKING
+    )
+    assert task_floor > TASK_STEPS_REVISION
+    with pytest.raises(schema.SchemaTooOld, match=f"requires >= {task_floor}\\."):
+        asyncio.run(SQLiteTaskStore(path, schema_mode=schema.SchemaMode.VALIDATE).close())
 
     async def migrate_and_use() -> object:
         await SQLiteTaskStore(path, schema_mode=schema.SchemaMode.MIGRATE).close()

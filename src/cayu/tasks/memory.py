@@ -265,6 +265,8 @@ from cayu.tasks.handoff import (
     prepare_interrupted_task_handoff,
     prepare_interrupted_task_handoff_candidate_page,
     prepare_interrupted_task_handoff_receipt_lookup,
+    prepare_parked_handoff_page,
+    require_parked_continuation_trigger,
 )
 from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
 from cayu.tasks.queries import (
@@ -474,6 +476,7 @@ class InMemoryTaskStore(TaskStore):
     supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_exact_interrupted_task_handoffs: ClassVar[bool] = True
     supports_bound_interrupted_task_handoffs: ClassVar[bool] = True
+    supports_parked_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_task_retry_keys: ClassVar[bool] = True
@@ -3573,6 +3576,38 @@ class InMemoryTaskStore(TaskStore):
                 return None
             return copy_task(task)
 
+    async def list_parked_interrupted_task_handoffs(
+        self,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> list[TaskInterruptedHandoffReceipt]:
+        after, limit = prepare_parked_handoff_page(after=after, limit=limit)
+        async with self._lock:
+            listed = [
+                _copy_interrupted_task_handoff_receipt(receipt)
+                for task in sorted(self._tasks.values(), key=lambda task: task.id)
+                if (after is None or task.id > after)
+                and task.status is TaskStatus.RUNNING
+                and task.worker_id is None
+                and task.lease_expires_at is None
+                and task.interrupted_handoff_id is not None
+                and (
+                    receipt := self._interrupted_handoff_receipts.get(
+                        (task.id, task.interrupted_handoff_id)
+                    )
+                )
+                is not None
+                and receipt.request.parked is not None
+            ]
+        return listed[:limit]
+
+    def _handoff_is_parked(self, task: Task) -> bool:
+        if task.interrupted_handoff_id is None:
+            return False
+        receipt = self._interrupted_handoff_receipts.get((task.id, task.interrupted_handoff_id))
+        return receipt is not None and receipt.request.parked is not None
+
     async def claim_interrupted_task_continuation(
         self,
         worker_id: str,
@@ -3650,6 +3685,8 @@ class InMemoryTaskStore(TaskStore):
                 and task.worker_id is None
                 and task.lease_expires_at is None
                 and (after is None or (task.created_at, task.id) > after)
+                # A parked handoff is continued only by its own bound trigger.
+                and (expected is not None or not self._handoff_is_parked(task))
             ]
             page = _sort_tasks(candidates, TaskOrder.CREATED_AT_ASC)[:scan_limit]
             active_keys = self._live_concurrency_keys(now)
@@ -3674,6 +3711,9 @@ class InMemoryTaskStore(TaskStore):
                 if type(receipt) is not TaskInterruptedHandoffReceipt or receipt.task != task:
                     rejected += 1
                     continue
+                require_parked_continuation_trigger(
+                    receipt, None if expected is None else expected.parked_wait
+                )
                 claimed = task.model_copy(
                     update={
                         "worker_id": worker_id,

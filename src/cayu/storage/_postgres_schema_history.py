@@ -761,6 +761,11 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "UPDATE cayu_transcript_messages SET message_bytes = octet_length(message::text) "
         "WHERE message_bytes IS NULL",
     ),
+    137: (
+        "CREATE INDEX IF NOT EXISTS idx_cayu_task_handoff_receipts_parked "
+        "ON cayu_task_interrupted_handoff_receipts (task_id, handoff_id) "
+        "WHERE request_json ? 'parked'",
+    ),
     133: (
         "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_event_retry_key "
         "ON cayu_tasks ((invocation->>'event_retry_key'), status)",

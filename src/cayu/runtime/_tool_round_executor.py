@@ -318,6 +318,7 @@ class ToolRoundExecutor:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         run_limit_accounting: RunLimitAccountingContext | None = None,
+        task_worker_id: str | None = None,
     ) -> ToolRoundRun:
         return ToolRoundRun(
             self,
@@ -340,6 +341,7 @@ class ToolRoundExecutor:
             execution_profile=execution_profile,
             invocation_context=invocation_context,
             run_limit_accounting=run_limit_accounting,
+            task_worker_id=task_worker_id,
         )
 
     @timed_phase("authorization")
@@ -1300,8 +1302,10 @@ class ToolRoundRun:
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None,
         run_limit_accounting: RunLimitAccountingContext | None = None,
+        task_worker_id: str | None = None,
     ) -> None:
         self._executor = executor
+        self._task_worker_id = task_worker_id
         self._session = session
         self._registered_agent = registered_agent
         self._registered_environment = registered_environment
@@ -1334,8 +1338,15 @@ class ToolRoundRun:
         self.user_input_pause_superseded = False
 
     def _wake_allowed(self) -> bool:
-        # The first slice parks only root sessions that no task owns.
-        return self._task_id is None and self._session.parent_session_id is None
+        if self._session.parent_session_id is not None:
+            return False
+        if self._task_id is None:
+            return True
+        # Only a worker's task run is handed off, parked until its wake continues
+        # it; a direct task-backed run or an admitted work attempt has no handoff.
+        return self._task_worker_id is not None and (
+            self._invocation_context is None or self._invocation_context.work_attempt is None
+        )
 
     @property
     def execution_profile(self) -> ExecutionProfileIdentity | None:

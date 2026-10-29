@@ -3057,7 +3057,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         },
     )
     policies[EventType.TASK_INTERRUPTED_HANDOFF] = _observed_policy(
-        "attempt handoff_id handoff_status progress_sequence session_run_epoch task_id",
+        "attempt handoff_id handoff_status parked_wait_id parked_wait_kind progress_sequence "
+        "session_run_epoch task_id",
         authority_keys={"handoff_id", "task_id"},
     )
 

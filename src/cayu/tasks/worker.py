@@ -152,6 +152,7 @@ from cayu.tasks.handoff import (
     TaskInterruptedHandoffConflict,
     TaskInterruptedHandoffReceipt,
     TaskInterruptedHandoffRequest,
+    TaskParkedWait,
     interrupted_task_handoff_request,
     new_interrupted_task_continuation_handoff_id,
     prepare_interrupted_task_handoff,
@@ -804,9 +805,20 @@ async def run_task_worker(
         # An until-idle run names the bound so it can tell when one call left more.
         reclaim_bound = {"max_reclaims": _RECLAIM_BATCH_SIZE} if until_idle is not None else {}
 
+        def rescan_continuations() -> None:
+            nonlocal continuation_after, next_interrupted_continuation_scan_at
+            # Newly handed-off work may sort behind the scan cursor, and an
+            # until-idle run that already scanned must scan again before returning.
+            next_interrupted_continuation_scan_at = 0.0
+            if until_idle is not None and recovered_interrupted_task_handler is not None:
+                continuation_after = None
+                until_idle.continuations_scanned = False
+
         async def reclaim_expired_tasks() -> int:
-            # The same cadence restores wake attempts a crash or failure left out.
-            await _reconcile_session_wakes(app, task_store)
+            # The same cadence restores wake attempts a crash or failure left out,
+            # and releases parked tasks whose sleep has gone away.
+            if await _reconcile_session_wakes(app, task_store):
+                rescan_continuations()
             if materialized_work_contract_queue_supported:
                 reclaim_outcome = await capture_task_store_operation(
                     lambda: task_store.reclaim_expired(query=query, **reclaim_bound),
@@ -853,12 +865,9 @@ async def run_task_worker(
                 )
                 if recovery_page.recovered:
                     meaningful_activity = True
-                    next_interrupted_continuation_scan_at = 0.0
-                    if until_idle is not None and recovered_interrupted_task_handler is not None:
-                        # Recovery follows lease expiry and the scan creation
-                        # time, so a recovered task may sort behind the cursor.
-                        continuation_after = None
-                        until_idle.continuations_scanned = False
+                    # Recovery follows lease expiry and the scan creation time, so
+                    # a recovered task may sort behind the cursor.
+                    rescan_continuations()
                 if recovery_page.exhausted:
                     expired_handoff_after = None
                     next_interrupted_handoff_recovery_at = (
@@ -1119,8 +1128,13 @@ async def run_task_worker(
             finally:
                 poller.metrics.handler_finished()
             next_interrupted_continuation_scan_at = 0.0
-            if until_idle is not None and recovered_interrupted_task_handler is not None:
-                # The handler may have handed off its session for continuation.
+            if (
+                until_idle is not None
+                and recovered_interrupted_task_handler is not None
+                and await _may_await_continuation(task_store, task)
+            ):
+                # The handler may have handed off its session for continuation. A
+                # parked handoff is not: only its own trigger, a task, continues it.
                 until_idle.continuations_pending = True
             return DurableWorkerStep(
                 handled=handled_this_step + 1,
@@ -1230,17 +1244,29 @@ async def run_task_worker(
         lag_monitor.stop()
 
 
-async def _reconcile_session_wakes(app: CayuApp, task_store: TaskStore) -> None:
-    """Give open ``sleep_until`` wakes a live attempt; never stop the worker over it."""
+async def _reconcile_session_wakes(app: CayuApp, task_store: TaskStore) -> int:
+    """Give open ``sleep_until`` wakes a live attempt and release stale parked tasks.
 
-    from cayu.tasks.session_wakes import reconcile_session_wakes
+    Returns how many parked tasks it released for the generic continuation. It
+    never stops the worker over a failure.
+    """
+
+    from cayu.tasks.session_wakes import reconcile_parked_handoffs, reconcile_session_wakes
 
     if not app._uses_session_wakes or task_store is not app.task_store:
-        return
-    try:
-        await reconcile_session_wakes(app)
-    except Exception as exc:
-        logger.warning("Reconciling session wakes failed (%s); retrying later.", type(exc).__name__)
+        return 0
+    released = 0
+    for reconcile in (reconcile_session_wakes, reconcile_parked_handoffs):
+        try:
+            count = await reconcile(app)
+        except Exception as exc:
+            logger.warning(
+                "Reconciling session wakes failed (%s); retrying later.", type(exc).__name__
+            )
+            continue
+        if reconcile is reconcile_parked_handoffs:
+            released = count
+    return released
 
 
 async def _with_session_wakes(
@@ -3471,6 +3497,7 @@ async def _handoff_interrupted_session(
     request = interrupted_task_handoff_request(
         task,
         session_run_epoch=session.run_epoch,
+        parked=await _session_parked_wait(app, session.id),
     )
     try:
         await _settle_interrupted_task_handoff_with_retry(
@@ -3505,6 +3532,64 @@ async def _handoff_interrupted_session(
             )
             return
         raise
+
+
+async def _session_parked_wait(app: CayuApp, session_id: str) -> TaskParkedWait | None:
+    """Name the wait an interrupted session is parked on, if it has one of its own.
+
+    A woken round that stopped on a tool a person must settle waits on that person,
+    not on its timer, so its task is handed off unparked for them to continue.
+    """
+
+    from cayu.tasks.session_wakes import _needs_manual_recovery, _open_wake_id
+
+    wake_id = await _open_wake_id(app, session_id)
+    if wake_id is None or await _needs_manual_recovery(app, session_id, wake_id):
+        return None
+    return TaskParkedWait(kind="session_wake", wait_id=wake_id)
+
+
+async def _may_await_continuation(task_store: TaskStore, handled: Task) -> bool:
+    """Whether a handled task may have left a session for the generic continuation.
+
+    A wake task continues its session inside its own attempt, so only an owning
+    task it handed off unparked waits on a continuation. Any other task may, unless
+    it ended parked on a trigger of its own. An unreadable state counts as pending,
+    so the until-idle result asks for another run.
+    """
+
+    from cayu.tasks.session_wakes import SESSION_WAKE_TASK_TYPE
+
+    try:
+        if handled.type != SESSION_WAKE_TASK_TYPE:
+            return await _handoff_state(task_store, handled.id) != "parked"
+        owners = await task_store.list_tasks(
+            TaskQuery(
+                session_id=handled.input.get("session_id"), status=TaskStatus.RUNNING, limit=1
+            )
+        )
+        return bool(owners) and await _handoff_state(task_store, owners[0].id) == "unparked"
+    except Exception:
+        return True
+
+
+async def _handoff_state(
+    task_store: TaskStore, task_id: str
+) -> Literal["parked", "unparked"] | None:
+    """How a task was handed off for continuation; ``None`` when it was not."""
+
+    task = await task_store.load_task(task_id)
+    if (
+        task is None
+        or task.status is not TaskStatus.RUNNING
+        or task.worker_id is not None
+        or task.interrupted_handoff_id is None
+    ):
+        return None
+    receipt = await task_store.load_interrupted_task_handoff_receipt(
+        task.id, task.interrupted_handoff_id
+    )
+    return "parked" if receipt is not None and receipt.request.parked is not None else "unparked"
 
 
 async def _settle_interrupted_task_handoff_once(
@@ -3837,11 +3922,21 @@ async def _emit_interrupted_task_handoff_event(
                 "attempt": attempt,
                 "session_run_epoch": request.session_run_epoch,
                 **({} if progress_sequence is None else {"progress_sequence": progress_sequence}),
+                **(
+                    {}
+                    if request.parked is None
+                    else {
+                        "parked_wait_kind": request.parked.kind,
+                        "parked_wait_id": request.parked.wait_id,
+                    }
+                ),
             },
         )
     )
     event = event_with_runtime_envelope_authority(event, "session_id")
-    payload_authority = ["handoff_id"]
+    payload_authority = (
+        ["handoff_id"] if request.parked is None else ["handoff_id", "parked_wait_id"]
+    )
     if app.redact_json(request.task_id) == request.task_id:
         # The task identity is store-resolved, but its original value remains
         # application-authored. Preserve it as durable authority only after the
@@ -3941,6 +4036,7 @@ async def _recover_expired_interrupted_task_handoffs(
         request = interrupted_task_handoff_request(
             task,
             session_run_epoch=session.run_epoch,
+            parked=await _session_parked_wait(app, session.id),
         )
         try:
             await _settle_interrupted_task_handoff_with_retry(

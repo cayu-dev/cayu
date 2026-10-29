@@ -571,6 +571,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Saved task step results are a new table that older binaries never read
     # or write. Only the optional task step stores require it.
     Revision(revision=136, kind=RevisionKind.ADDITIVE, compatible_from=135),
+    # A parked interrupted-task handoff is continued only by its own bound
+    # trigger; every continuation claimant must leave it out of its scan.
+    Revision(revision=137, kind=RevisionKind.BREAKING, compatible_from=137),
 )
 
 #: The revision an empty database is initialized to.

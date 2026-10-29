@@ -193,7 +193,10 @@ Three kinds of waiting look alike but differ in what survives a crash:
 
 `SleepUntilTool` is opt-in. Register it on the agents that may schedule their own
 continuation; registration refuses it unless the application has a task store that
-supports scheduling:
+supports scheduling and declares bound and parked interrupted-task handoffs
+(`supports_bound_interrupted_task_handoffs` and
+`supports_parked_interrupted_task_handoffs` on the store's own class). The built-in
+memory, SQLite and PostgreSQL stores do:
 
 ```python
 from datetime import timedelta
@@ -248,9 +251,13 @@ action, and an ordinary `resume` continues it. The sleeping call keeps its one
 timer result, and the wake never continues the session a second time.
 
 If the process dies while another tool from the woken round runs, that tool has
-started with no result and cannot be run again safely. The next attempt settles
-as `manual_recovery_required`, no further attempt is created, and the session's
-pending action is a `manual_recovery` naming that tool's `tool_call_id`. Settle
+started with no result and cannot be run again safely. Until it is settled, the
+recovered session still waits on its wake; when the attempt died with its worker,
+`reconcile_session_wakes` replaces it on the worker's reclaim cadence. The next
+attempt settles as `manual_recovery_required` without running the tool again, no
+further attempt is created, and the session's pending action is a
+`manual_recovery` naming that tool's `tool_call_id`. A task that owns the session
+is then handed off unparked, for whoever settles the tool. Settle
 it with `app.recover_user_input(UserInputRecoveryRequest(...))`, giving the
 sleeping call's accepted timer answer (`answer` and the wake's `resolved_by`, as the
 delivery sent them) and the tool's verified outcome. A subagent from the woken
@@ -303,9 +310,84 @@ or not. An older runtime refuses those sessions as
 across this version is not supported (see
 [checkpoint versions](runtime-contracts.md)).
 
-This first slice sleeps only top-level sessions that no task owns, in rounds where
-no tool needed approval. In a child session, a task-owned session, or a round
-that paused for approval (including approval of `sleep_until` itself),
-`sleep_until` returns an error result instead of sleeping. The environment
-follows its ordinary lifecycle while the session sleeps; in-memory process state
-is not kept.
+`sleep_until` sleeps top-level sessions, including ones a task worker runs under a
+task. These cases don't sleep, and the call returns an error result saying it did
+not pause, so the model can continue without waiting:
+
+- a child (sub-agent) session (not supported yet);
+- a round that paused for approval first, including approval of `sleep_until`
+  itself: the approved round runs, and `sleep_until` reports that it did not pause
+  (not supported yet);
+- a task-backed run that no task worker owns, such as
+  `app.run(RunRequest(task_id=...))` without `task_worker_id`, and an admitted work
+  attempt: nothing would hand such a task off parked, so its wake could never
+  continue it. Run the task from a worker instead.
+
+The environment follows its ordinary lifecycle while the session sleeps; in-memory
+process state is not kept.
+
+### Sleeping inside a task
+
+A session that a worker runs under a task (`RunRequest(task_id=task.id,
+task_worker_id=..., task_lease_expires_at=...)`, see
+[project workers](project-workers.md)) can sleep too. Its handler returns
+`TaskHandlerOutcome.SESSION_INTERRUPTED` when the run ends interrupted, as for
+any pause. The worker then hands the task off **parked** on the wake:
+
+- The task stays `running` with no worker and no lease, and nothing renews or
+  expires while it sleeps. Its handoff receipt names the wait
+  (`TaskInterruptedHandoffReceipt.request.parked`, a `TaskParkedWait` with kind
+  `session_wake` and the wake id), and the `task.interrupted_handoff` event
+  carries `parked_wait_kind` and `parked_wait_id`.
+- No continuation scan claims a parked task, so a worker with a
+  `recovered_interrupted_task_handler` doesn't keep claiming it, back it off, or
+  fail it as unproductive. Only its wake claims it, through a bound claim that
+  presents the same wake; a claim presenting any other wait, or none, is refused.
+- When the wake is due, its attempt claims the task, gives the sleeping call its
+  timer result and continues the session under the task. The task completes or
+  fails with the session, or parks again if the session sleeps again. If the
+  worker that ran the session hasn't handed the task off yet, the attempt waits
+  up to five seconds for it and is otherwise retried like a failed one.
+- A worker lost before its handoff is recovered as usual once its lease
+  expires, and the recovered handoff is parked too.
+- `run_task_worker` runs `reconcile_parked_handoffs(app)` (public in
+  `cayu.tasks`) at start and on its expired-lease reclaim cadence, beside
+  `reconcile_session_wakes`. It lists parked handoffs
+  (`TaskStore.list_parked_interrupted_task_handoffs`) and releases each one whose
+  session no longer waits on that wait: the sleep was interrupted, even while its
+  worker was still handing the task off, or the woken round was left for manual
+  recovery. The release claims the handoff with its own wait and hands the task
+  off again for what the session waits on now, so no parked task is left without
+  a trigger.
+- `run_task_worker_until_idle` treats a parked task as not ready: it doesn't
+  set `continuations_pending` for it, and `next_available_at` reports the wake
+  through its ordinary delayed wake task.
+
+How the parked task meets task policy:
+
+| | While parked, and when the wake continues it |
+| --- | --- |
+| Lease | None while parked. The wake's continuation holds its own lease, renewed like any claim. |
+| `TaskRetryPolicy` | Applies to the owning task only. A failed wake attempt is retried as a wake, never as an attempt of the owning task. |
+| `max_tasks` | The wake task counts as one task. The continuation it runs is part of the owning task and is not counted again. |
+| Schedule policy | Expiry and `skip` apply only to pending tasks, so a running parked task never expires. The wake task uses the default `fire_once` policy and runs late rather than not at all. |
+| Cancellation | `cancel_task` cancels a parked task at once, since no worker holds it. When its wake is due, the wake finds the task ended and stops the sleep instead of continuing the session without it. |
+| Interrupting the session | Cancels the wake's attempts. On its reclaim cadence, a worker's `reconcile_parked_handoffs` finds the task parked on the closed sleep and hands it off unparked, so a `recovered_interrupted_task_handler` gets it like any interrupted task. |
+| Deleting the session | Refused while the task still runs, as for any session whose task is active, so the parked task is never left without its session. Cancel the task first, which settles a parked task at once, then delete the session; deletion cancels the wake's attempts. |
+
+#### Upgrading to storage revision 137
+
+Revision 137 adds the index that keeps parked handoffs out of the continuation
+scan, and it is a breaking writer boundary: a worker from an older version would
+claim parked tasks. Before you start this version:
+
+1. Stop every worker and server running an older version.
+2. Back up the database. `cayu storage migrate` keeps a SQLite backup by default.
+   On PostgreSQL, take an application-consistent backup first and pass exactly one
+   of `--backup-sha256 SHA256`, `--backup-managed` (an RDS snapshot or
+   point-in-time target) or the explicit operator waiver `--waive-backup`; see
+   [backup authority](session-store-targets.md#backup-authority).
+3. Run `cayu storage migrate`. On an existing database, acknowledge each breaking
+   revision it applies with `--acknowledge-breaking`, including
+   `--acknowledge-breaking 137`; the command names any it still needs.
+4. Start the new workers.

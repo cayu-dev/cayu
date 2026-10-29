@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from hashlib import sha256
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import (
@@ -29,6 +30,7 @@ from cayu.sessions.invocation import (
 from cayu.tasks.cancellation import _task_cancellation_requested, _task_retry_cancellation_requested
 from cayu.tasks.records import (
     Task,
+    TaskClaimLost,
     TaskStatus,
     _validate_positive_int,
     copy_task,
@@ -41,8 +43,32 @@ class TaskInterruptedHandoffConflict(ValueError):
     """An interrupted-task handoff conflicts with current durable authority."""
 
 
+class TaskParkedWait(BaseModel):
+    """What a parked handoff waits on; only that trigger may continue the task.
+
+    A parked handoff releases the worker like any interrupted handoff, but the
+    generic continuation scan never claims it. ``session_wake`` names the wake id
+    of a session asleep in ``sleep_until``; its wake task continues the task
+    through a bound claim that presents this same wait.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    kind: Literal["session_wake"]
+    wait_id: str
+
+    @field_validator("wait_id")
+    @classmethod
+    def validate_wait_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "wait_id")
+
+
 class TaskInterruptedHandoffRequest(BaseModel):
-    """Exact authority for releasing one interrupted task's worker ownership."""
+    """Exact authority for releasing one interrupted task's worker ownership.
+
+    ``parked`` is set when the session waits on a trigger of its own, such as a
+    wake; it is left out of the stored request and its digest when unset.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
@@ -53,6 +79,7 @@ class TaskInterruptedHandoffRequest(BaseModel):
     session_instance_id: str
     session_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     handoff_id: str
+    parked: TaskParkedWait | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("task_id", "worker_id", "session_id", "handoff_id")
     @classmethod
@@ -233,6 +260,7 @@ def prepare_interrupted_task_handoff(
         session_instance_id=request.session_instance_id,
         session_run_epoch=request.session_run_epoch,
         handoff_id=request.handoff_id,
+        parked=request.parked,
     )
     request_sha256 = _interrupted_task_handoff_request_sha256(copied)
     return copied, request_sha256
@@ -242,6 +270,7 @@ def interrupted_task_handoff_request(
     task: Task,
     *,
     session_run_epoch: int,
+    parked: TaskParkedWait | None = None,
 ) -> TaskInterruptedHandoffRequest:
     """Bind one running task snapshot to an exact interrupted-session handoff."""
 
@@ -277,7 +306,30 @@ def interrupted_task_handoff_request(
         session_instance_id=task.session_instance_id,
         session_run_epoch=session_run_epoch,
         handoff_id=handoff_id,
+        parked=parked,
     )
+
+
+def require_parked_continuation_trigger(
+    receipt: TaskInterruptedHandoffReceipt, parked_wait: TaskParkedWait | None
+) -> None:
+    """Refuse a continuation claim that is not the parked handoff's own trigger.
+
+    An unparked handoff accepts only claims that present no wait; a parked one
+    accepts only a bound claim presenting its exact wait.
+    """
+
+    if receipt.request.parked != parked_wait:
+        raise TaskClaimLost("Interrupted-task continuation is parked on another trigger.")
+
+
+def prepare_parked_handoff_page(*, after: str | None, limit: int) -> tuple[str | None, int]:
+    """Validate one task-id-ordered page of parked handoffs."""
+
+    limit = _validate_positive_int(limit, "limit")
+    if limit > _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE:
+        raise ValueError(f"limit must be <= {_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE}.")
+    return (None if after is None else require_clean_nonblank(after, "after")), limit
 
 
 def prepare_interrupted_task_handoff_receipt_lookup(

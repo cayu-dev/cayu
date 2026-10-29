@@ -158,7 +158,11 @@ Deep guide: [task scheduling](https://github.com/cayu-dev/cayu/blob/main/docs/ta
 
 For the agent itself to wait, register `SleepUntilTool()`. The session sleeps with
 nothing running, and `run_task_worker` continues the same tool call when its wake
-task is due; a shell `sleep` holds a worker and is lost on a crash.
+task is due; a shell `sleep` holds a worker and is lost on a crash. A session a
+worker runs under a task parks that task while it sleeps; return
+`TaskHandlerOutcome.SESSION_INTERRUPTED` from the handler, as for any pause. Child
+sessions, rounds that paused for approval, and task-backed runs without a task
+worker don't sleep: the call returns an error result instead.
 
 ## Event retry policy
 

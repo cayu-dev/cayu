@@ -4631,9 +4631,11 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
 
         By default only completed or failed sessions qualify. Running sessions or
         incomplete cleanup raise ValueError. Missing sessions return None.
-        Deleting a session asleep in ``sleep_until`` cancels its wake task.
+        Deleting a session asleep in ``sleep_until`` cancels its wake task; one
+        whose owning task still runs is refused until that task is cancelled.
         See ``cayu guide anatomy#process-scoped-application-graph``.
         """
+        await _session_wakes._require_deletable(self, session_id)
         wake_id = await _session_wakes._open_wake_id(self, session_id)
         report = await delete_app_session(self, session_id, finished_only=finished_only)
         if wake_id is not None and await self.session_store.load(session_id) is None:

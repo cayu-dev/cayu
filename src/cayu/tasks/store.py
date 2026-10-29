@@ -275,6 +275,9 @@ class TaskStore(ABC):
     supports_interrupted_task_handoffs: ClassVar[bool] = False
     supports_exact_interrupted_task_handoffs: ClassVar[bool] = False
     supports_bound_interrupted_task_handoffs: ClassVar[bool] = False
+    # Parked handoffs: continuation scans leave out a handoff whose receipt names a
+    # wait, and only a bound claim presenting that exact wait may claim it.
+    supports_parked_interrupted_task_handoffs: ClassVar[bool] = False
     supports_task_cancellation_reconciliation: ClassVar[bool] = False
     supports_task_retry_series: ClassVar[bool] = False
     # True only when create_task admits ``TaskCreate.retry_key`` atomically with
@@ -1187,6 +1190,21 @@ class TaskStore(ABC):
         raise NotImplementedError(
             "This TaskStore does not support exact interrupted-task handoff recovery."
         )
+
+    async def list_parked_interrupted_task_handoffs(
+        self,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> list[TaskInterruptedHandoffReceipt]:
+        """List one page of current parked handoffs, ordered by task id.
+
+        Each receipt is the one a running, workerless task currently names. Stores
+        that declare ``supports_parked_interrupted_task_handoffs`` implement it, so
+        reconciliation can release a parked handoff whose wait has gone away.
+        """
+
+        raise NotImplementedError("This TaskStore does not support parked handoff listings.")
 
     async def claim_interrupted_task_continuation(
         self,

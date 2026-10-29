@@ -172,6 +172,8 @@ from cayu.tasks.handoff import (
     prepare_interrupted_task_handoff,
     prepare_interrupted_task_handoff_candidate_page,
     prepare_interrupted_task_handoff_receipt_lookup,
+    prepare_parked_handoff_page,
+    require_parked_continuation_trigger,
 )
 from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
 from cayu.tasks.queries import (
@@ -261,7 +263,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 135
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 137
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -402,6 +404,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
     supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_exact_interrupted_task_handoffs: ClassVar[bool] = True
     supports_bound_interrupted_task_handoffs: ClassVar[bool] = True
+    supports_parked_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_task_retry_keys: ClassVar[bool] = True
@@ -3125,6 +3128,41 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             row = await cur.fetchone()
         return None if row is None else pg_support.task_from_row(row)
 
+    async def list_parked_interrupted_task_handoffs(
+        self,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> list[TaskInterruptedHandoffReceipt]:
+        after, limit = prepare_parked_handoff_page(after=after, limit=limit)
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT receipt.request_sha256, receipt.request_json, receipt.task_json, "
+                "receipt.committed_at, receipt.task_id, receipt.handoff_id "
+                "FROM cayu_task_interrupted_handoff_receipts AS receipt "
+                "JOIN cayu_tasks AS task ON task.id = receipt.task_id "
+                "AND task.interrupted_handoff_id = receipt.handoff_id "
+                "WHERE receipt.request_json ? 'parked' "
+                "AND task.status = %s AND task.worker_id IS NULL "
+                "AND task.lease_expires_at IS NULL AND receipt.task_id > %s "
+                "ORDER BY receipt.task_id LIMIT %s",
+                (str(TaskStatus.RUNNING), after or "", limit),
+            )
+            rows = await cur.fetchall()
+        receipts = []
+        for row in rows:
+            try:
+                receipts.append(
+                    _postgres_interrupted_task_handoff_receipt(
+                        task_id=row[4], handoff_id=row[5], row=row
+                    )
+                )
+            except TaskInterruptedHandoffConflict:
+                # A malformed receipt is left to the claim that rejects it.
+                continue
+        return receipts
+
     async def claim_interrupted_task_continuation(
         self,
         worker_id: str,
@@ -3266,6 +3304,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     after_params = [cursor[0], cursor[1]]
                 task_id_sql = "" if task_id is None else "AND task.id = %s"
                 task_id_params: list[object] = [] if task_id is None else [task_id]
+                # A parked handoff is continued only by its own bound trigger.
+                parked_sql = "" if expected is not None else _POSTGRES_UNPARKED_HANDOFF_SQL
                 await cur.execute(
                     f"""
                         SELECT {_TASK_RETURNING_COLUMNS}
@@ -3277,6 +3317,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                           AND worker_id IS NULL
                           AND lease_expires_at IS NULL
                           AND interrupted_handoff_id IS NOT NULL
+                          {parked_sql}
                           {task_id_sql}
                           {after_sql}
                         ORDER BY created_at ASC, id ASC
@@ -3337,6 +3378,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     if receipt is None or receipt.task != observed:
                         rejected += 1
                         continue
+                    require_parked_continuation_trigger(
+                        receipt, None if expected is None else expected.parked_wait
+                    )
                     await cur.execute(
                         "INSERT INTO cayu_task_interrupted_continuation_claims ("
                         "handoff_id_sha256, task_id, worker_id, claimed_at, expected_sha256"
@@ -5726,6 +5770,14 @@ def _postgres_task_terminalization_receipt(
         )
     except Exception as exc:
         raise TaskTerminalizationConflict("Task terminalization receipt is malformed.") from exc
+
+
+_POSTGRES_UNPARKED_HANDOFF_SQL = (
+    "AND NOT EXISTS (SELECT 1 FROM cayu_task_interrupted_handoff_receipts AS parked "
+    "WHERE parked.task_id = task.id "
+    "AND parked.handoff_id = task.interrupted_handoff_id "
+    "AND parked.request_json ? 'parked')"
+)
 
 
 def _postgres_interrupted_task_handoff_receipt(
