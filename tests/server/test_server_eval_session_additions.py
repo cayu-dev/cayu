@@ -533,7 +533,8 @@ def test_real_request_cancellation_keeps_dispatched_sqlite_publication_fenced(
                         owner, *([] if competitor is None else [competitor]), return_exceptions=True
                     )
 
-        asyncio.run(exercise())
+        # Run on the server's event loop: its eval run coordinator shares this store's lock.
+        client.portal.call(exercise)
 
 
 def test_member_and_unknown_roles_cannot_publish_or_resolve_private_sources(addition_environment):
@@ -661,8 +662,6 @@ def test_identical_portable_case_provenance_never_creates_an_operational_source_
 def test_memory_publication_rolls_back_late_failure_and_replays_exactly(
     addition_environment, monkeypatch
 ):
-    import asyncio
-
     from cayu.evals.read_views import EvalViewQuery
     from cayu.evals.store import InMemoryEvalStore
     from cayu.storage.evals_sqlite import SQLiteEvalStore
@@ -717,7 +716,8 @@ def test_memory_publication_rolls_back_late_failure_and_replays_exactly(
             assert len(history.items) == 1
             await memory.close()
 
-        asyncio.run(exercise())
+        # Run on the server's event loop: its eval run coordinator shares this store's lock.
+        client.portal.call(exercise)
 
 
 @pytest.mark.parametrize("backend", ["postgres"])
@@ -824,7 +824,8 @@ def test_concurrent_additions_fork_exact_parent_and_duplicate_keys_join(addition
                 assert replies[0].json() == replies[2].json()
                 return [reply.json()["plan"] for reply in replies[:2]]
 
-        plans = asyncio.run(exercise())
+        # Run on the server's event loop: its eval run coordinator shares this store's lock.
+        plans = client.portal.call(exercise)
         assert plans[0]["destination"] != plans[1]["destination"]
         assert (
             client.get(f"/api/evals/suite-views/{selector}", headers=_AUTH_HEADERS).json() == parent
@@ -1040,7 +1041,8 @@ def test_failed_sqlite_settlement_never_replays_uncommitted_receipt(
                     release.set()
                     await asyncio.gather(owner, return_exceptions=True)
 
-        asyncio.run(exercise())
+        # Run on the server's event loop: its eval run coordinator shares this store's lock.
+        client.portal.call(exercise)
         failed_client = TestClient(server, raise_server_exceptions=False)
         assert (
             failed_client.get(
@@ -1232,8 +1234,6 @@ def test_sequential_children_preserve_positive_case_sources(
 def test_memory_child_associations_rollback_and_replay_exactly(
     addition_environment, monkeypatch, source
 ):
-    import asyncio
-
     from cayu.evals.store import InMemoryEvalStore
     from cayu.storage.evals_sqlite import SQLiteEvalStore
 
@@ -1307,7 +1307,8 @@ def test_memory_child_associations_rollback_and_replay_exactly(
             )
             await memory.close()
 
-        asyncio.run(exercise())
+        # Run on the server's event loop: its eval run coordinator shares this store's lock.
+        client.portal.call(exercise)
 
 
 def test_corpus_child_preserves_other_suites_positive_sources(addition_environment):
