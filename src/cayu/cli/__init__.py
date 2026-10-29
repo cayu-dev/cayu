@@ -39,6 +39,7 @@ def _command_specs() -> tuple[
     )
     from cayu.cli.generate import add_generate_parser, run_generate
     from cayu.cli.guide import add_guide_parser, run_guide
+    from cayu.cli.inbox import add_inbox_parser, run_inbox
     from cayu.cli.inspect import add_inspect_parser, run_inspect
     from cayu.cli.keys import add_keys_parser, run_keys
     from cayu.cli.lambda_microvm import add_lambda_microvm_parser, run_lambda_microvm
@@ -64,6 +65,7 @@ def _command_specs() -> tuple[
         ("execution-profile", add_execution_profile_parser, run_execution_profile),
         ("generate", add_generate_parser, run_generate),
         ("guide", add_guide_parser, run_guide),
+        ("inbox", add_inbox_parser, run_inbox),
         ("inspect", add_inspect_parser, run_inspect),
         ("keys", add_keys_parser, run_keys),
         ("lambda-microvm", add_lambda_microvm_parser, run_lambda_microvm),

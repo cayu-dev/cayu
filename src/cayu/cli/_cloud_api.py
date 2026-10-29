@@ -54,15 +54,52 @@ _SAFE_API_ERROR_DETAILS = {
 }
 
 
+# Cayu Cloud's inbox refusals (`/v1/applications/{id}/inbox/...`), including the Agent's own
+# conflicts it passes on with the item's current state.
+_INBOX_REFUSALS = frozenset(
+    {
+        (403, "agent_not_yours"),
+        (403, "agent_refused"),
+        (403, "inbox_decision_forbidden"),
+        (403, "person_required"),
+        (403, "review_refused"),
+        (404, "item_not_found"),
+        (409, "agent_not_serving"),
+        (409, "agent_sign_in_required"),
+        (409, "already_settled"),
+        (409, "conflict"),
+        (409, "expired"),
+        (409, "identity_refused"),
+        (409, "not_settleable"),
+        (409, "operator_login_missing"),
+        (409, "not_reviewable"),
+        (409, "review_not_served"),
+        (409, "review_stale"),
+        (409, "superseded"),
+        (409, "unavailable"),
+        (422, "decision_refused"),
+        (422, "invalid_decision"),
+        (502, "decision_outcome_unknown"),
+        (503, "agent_sign_in_unavailable"),
+        (503, "agent_starting"),
+        (503, "inbox_unavailable"),
+        (503, "service_status_unavailable"),
+        (503, "timeout"),
+        (503, "unreachable"),
+    }
+)
+
 # Cloud's documented refusals of a candidate release, whose own message names the releases.
 CANDIDATE_REFUSAL_CODES = frozenset({"candidate_baseline_changed", "candidate_expired"})
 
 # Cloud's documented refusals whose code and own message the CLI reports, filtered like a
 # conflict's reason, since the message says what to fix: Compass's (`cayu cloud compass`),
-# a schedule run's (`cayu cloud schedule run`) and a settings change's (`cayu cloud
-# settings`), whose structured fields that command reads from `CloudApiError.body`.
+# a schedule run's (`cayu cloud schedule run`), a settings change's (`cayu cloud
+# settings`) and an inbox decision's (`cayu inbox`), whose structured fields (such as a
+# refused settle's `item`) that command reads from `CloudApiError.body`.
 _REPORTED_API_REFUSALS = frozenset(
     {
+        *_INBOX_REFUSALS,
         (403, "compass_disabled"),
         (403, "developer_required"),
         (404, "agent_not_watched"),

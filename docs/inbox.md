@@ -404,3 +404,43 @@ claim, and keeps or drops the same entry `POST /api/knowledge/{id}/approve` and
   `answer`) with the same `attention_id` and actor.
 - `GET /api/human-attention/{attention_id}` and the attention handoff report it
   `resolved` or `cancelled` once the Runtime closes it.
+
+## From the command line
+
+`cayu inbox` lists, shows and decides the same items from a terminal:
+
+```console
+$ cayu inbox list
+$ cayu inbox show inbox_...
+$ cayu inbox approve inbox_... --reason "Checked against the vendor master."
+$ cayu inbox deny inbox_... --reason "Wrong vendor."
+```
+
+Without `--application`, the commands open the project's application (`[tool.cayu]
+factory`, or `--target module:factory`) and its store in this process, and serve
+these same routes to themselves. A project with a public service (`[tool.cayu]
+service`) is opened through it, so its sessions continue with the policies
+`cayu serve` gives them. Decisions are recorded as `--reviewer`, by default
+`local:` followed by your user name. After an approval, the approved call and the
+rest of the turn run in this process, so `approve` returns when the session pauses
+again or ends and the work it continued (such as a parent an approved child resumes)
+has finished, or after `--wait-seconds` (default an hour), when what is left is
+stopped and can be resumed later.
+
+With `--application NAME`, they read a Cayu Cloud Agent through Cloud's inbox routes
+with your `cayu cloud login` (or `--context`). Cloud carries a decision to the Agent
+as you, so it needs Cloud sign-in on the Agent, and the Agent continues on its own.
+
+`show` prints the item and, for a pending approval or question, the
+[human review](human-review.md) the application's policy builds for you: the
+arguments it shows, the calls the decision covers, and its guidance. It never shows
+more than that policy allows, and with no policy it says that no arguments can be
+shown. `--full` reads values the review shows only in part, whole. `--purpose`
+selects the review purpose (the application's own by default, or `approvals` for a
+Cloud Agent). When the application has a policy, `approve` and `deny` ask for a
+fresh review and send its `review_reference` with the decision; a review that
+withholds the call's content can only be denied. For a session whose task worker let
+it go while it waits, `--claim-task` sends `task_continuation: "claim"`.
+
+The output is a table by default and JSON with `--json`, with a `schema_version`.
+An item someone else settled first is reported with who decided and when.
