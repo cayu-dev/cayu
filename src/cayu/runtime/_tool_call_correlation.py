@@ -9,7 +9,7 @@ from pydantic import SecretStr
 
 from cayu.events import Event
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions._correlation import tool_call_correlation_value
+from cayu.sessions._correlation import tool_call_correlation_value, tool_call_correlation_with
 
 # Stores without a configured keyring can still correlate one consumed stream.
 # This key never signs resolution authority and never enters a checkpoint.
@@ -38,3 +38,17 @@ def public_tool_call_correlation(
     one collected stream, not a durable application identifier.
     """
     return tool_call_correlation_value(event, codec or _PROCESS_CODEC)
+
+
+def public_tool_call_handle(
+    *,
+    session_id: str,
+    round_id: str,
+    call_id: str,
+    codec: PublicAuthorityAliasCodec | None,
+) -> str:
+    """The `tool_call_correlation_id` that call's public tool events carry."""
+
+    return tool_call_correlation_with(
+        codec or _PROCESS_CODEC, session_id=session_id, round_id=round_id, call_id=call_id
+    )

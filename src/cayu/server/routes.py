@@ -203,6 +203,7 @@ from cayu.server._scenario_routes import (
     register_scenario_authoring_routes,
     register_scenario_launch_routes,
 )
+from cayu.server._session_call_routes import register_session_call_routes
 from cayu.server._session_overview import (
     SessionOverviewService,
     overview_http_error,
@@ -8530,6 +8531,18 @@ def create_router(
             raise HTTPException(status_code=404, detail="Interaction not found")
         return _serialize_interaction_record(cayu_app, records[0])
 
+    register_session_call_routes(
+        router,
+        protected=protected,
+        store=session_store,
+        resolve_session=_resolve_public_session_id,
+        resolve_interaction=lambda session_id, value: _resolve_public_interaction_id(
+            session_id=session_id, value=value
+        ),
+        project_session=cayu_app.project_session_id_for_exposure,
+        redact=cayu_app.redact_json,
+        codec=lambda: cayu_app._public_authority_alias_codec,
+    )
     register_session_trace(
         router,
         protected=protected,

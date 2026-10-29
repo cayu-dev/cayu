@@ -20485,6 +20485,25 @@ See [Session overview](control-plane.md#session-overview) for public pagination
 and capability behavior. No store extension method or new persistent index is
 required.
 
+### Session model-call and tool-call views
+
+`GET /api/sessions/{session_id}/model-calls` and
+`GET /api/sessions/{session_id}/tool-calls` serve the rows `cayu session usage` and
+`cayu session tools` print for a local store, so a remote client such as
+`cayu session ... --application NAME` gets the same pairing without the private
+execution identity the session events endpoint withholds. Both are read-only, accept
+`offset` and `limit` (at most 1,000) plus the `after_sequence`, `before_sequence` and
+`interaction_id` event window, and answer 404 for an unknown session. They read only the
+events a view needs and answer 413 when the window holds more than 64 MiB of retained
+projections or 100,000 records; narrow the window.
+
+A tool call's `tool_call_id` is the call's `tool_call_correlation_id`, the value its tool
+events carry on the events endpoint. Model step, attempt and tool round ids are `null`,
+and so is `reservation_id` on budget reservations no model call claims. As on the events
+endpoint, arguments recorded before a call ran (its start, approval request or input
+request) show as `[quarantined]`; a terminal record's arguments are summarized after the
+application's secret redactor runs on them.
+
 ### Exact session trace reads
 
 Server contract 59 advertises `capabilities.surfaces.session_trace`.

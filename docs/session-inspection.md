@@ -445,6 +445,46 @@ cayu session transcript SESSION_ID --include-content 4096 --output json
 cayu session transcript SESSION_ID --interaction-id INTERACTION_ID
 ```
 
+### Sessions of a Cloud Agent
+
+Add `--application NAME` to `list`, `show`, `interactions`, `usage`, `tools`, `events` or
+`transcript` to read a Cayu Cloud Agent's sessions instead of a local store. `NAME` is the
+Agent's id, name or slug, as in `cayu cloud` commands. The CLI signs in the same way:
+`CAYU_CLOUD_API_KEY` or an API-key file, the selected private context (`--context PATH`,
+`CAYU_CLOUD_CONTEXT`, or `cayu cloud context use`), or `cayu cloud login`.
+
+```console
+cayu session list --application bug-hunter --status failed
+cayu session tools SESSION_ID --application bug-hunter --table
+cayu session events SESSION_ID --application bug-hunter --type tool.call.failed --include-payload
+```
+
+The CLI asks Cayu Cloud where the Agent serves Cayu and for its
+[Developer dashboard login](cayu-cloud.md#agent-operator-credentials), which only
+developers and admins may read, then reads the Agent's own `/api/sessions/...`
+endpoints. The login stays in memory and is never printed. A request to a sleeping Agent
+wakes it; the CLI waits up to 90 seconds while it starts. The Agent's Cayu API is found at
+`/cayu/api` (an application that mounts Cayu under `/cayu`) or `/api` (`cayu serve`).
+
+The commands print the same rows as for a local store, with what the Agent's public API
+withholds left out:
+
+- `list` and `show` report `run_epoch` as `null`; `list` also reports `last_activity_at`
+  as `null`. `show` reports record byte sizes, queue counts, `operation` and `budget` as
+  `null`.
+- `events` and `interactions` show the Agent's public view of each record: private ids
+  are record-scoped aliases such as `cayu_event_7:tool_call_id`, so payload sizes differ
+  from the store's.
+- `usage` and `tools` pair events by their private identity on the Agent
+  (`GET /api/sessions/{id}/model-calls` and `GET /api/sessions/{id}/tool-calls`). A
+  tool call's `tool_call_id` is its public `tool_call_correlation_id`, the value its
+  tool events carry; model step, attempt and round ids are `null`, and unclaimed budget
+  reservations have a `null` `reservation_id`. Arguments recorded before a call ran show
+  as `[quarantined]`, as the Agent's events endpoint shows them. An Agent whose Cayu predates these
+  endpoints answers that it doesn't serve them yet.
+
+`snapshots` and `resolve-provider-operation` read a local store or a server URL only.
+
 `fallback_retry` starts a new model attempt from the last durable Cayu
 boundary; it is not continuation of the unavailable provider operation. When
 `duplicate_request_risk=true`, the provider may already have accepted the old

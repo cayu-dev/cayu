@@ -61,9 +61,11 @@ _AUXILIARY_CORRELATION_EVENT_TYPES = frozenset(
 )
 
 
-def _tool_call_value(
+def tool_call_correlation_with(
     codec: PublicAuthorityAliasCodec, *, session_id: str, round_id: str, call_id: str
 ) -> str:
+    """The correlation of the call with this private session, round and call identity."""
+
     return codec.encode(
         json.dumps([round_id, call_id], ensure_ascii=False, separators=(",", ":")),
         field_name=TOOL_CALL_CORRELATION_DOMAIN,
@@ -80,7 +82,9 @@ def tool_call_correlation_value(event: Event, codec: PublicAuthorityAliasCodec) 
     round_id = _event_schema.private_event_linkage_value(event, field_name="tool_round_id")
     if call_id is None or round_id is None:
         return None
-    return _tool_call_value(codec, session_id=event.session_id, round_id=round_id, call_id=call_id)
+    return tool_call_correlation_with(
+        codec, session_id=event.session_id, round_id=round_id, call_id=call_id
+    )
 
 
 def _schema_identity(event: Event, field_name: str) -> str | None:
@@ -172,7 +176,7 @@ def supervision_correlation_ids(
             []
             if tool_round_id is None
             else [
-                _tool_call_value(
+                tool_call_correlation_with(
                     codec, session_id=session_id, round_id=tool_round_id, call_id=call_id
                 )
                 for call_id in tool_call_ids

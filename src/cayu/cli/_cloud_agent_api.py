@@ -25,8 +25,12 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from cayu.cli._cloud_diagnostics import safe_text
+
 # FastAPI's answer for a path no route serves, as opposed to a route's own "not found".
 _ROUTE_NOT_FOUND = "Not Found"
+# The most bytes one answer may carry; a full page of session events with payloads fits.
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _MAX_DETAIL_CHARS = 512
 # Agent states in which its web process can't answer; Cloud wakes a sleeping one.
 _NOT_SERVING_STATUSES = frozenset({"stopping", "stopped", "deleting", "archived", "failed"})
@@ -141,11 +145,7 @@ class CayuApi:
         deadline = self._monotonic() + self._wake_timeout_seconds
         while True:
             try:
-                response = self._client().get(
-                    self._origin + base + path,
-                    params=None if query is None else dict(query),
-                    headers=self._headers,
-                )
+                response = self._bounded_get(self._origin + base + path, query, resource)
             except httpx.TimeoutException as exc:
                 raise CayuApiError(
                     "timeout", f"{self.description} did not answer in time."
@@ -165,6 +165,36 @@ class CayuApi:
                 self._sleep(_retry_after_seconds(response.headers["retry-after"]))
                 continue
             return self._body(response, resource)
+
+    def _bounded_get(
+        self, url: str, query: Mapping[str, str | Sequence[str]] | None, resource: str
+    ) -> httpx.Response:
+        """GET ``url``, reading at most ``MAX_RESPONSE_BYTES`` of its (decoded) body."""
+
+        with self._client().stream(
+            "GET", url, params=None if query is None else dict(query), headers=self._headers
+        ) as response:
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                body.extend(chunk)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise CayuApiError(
+                        "too_large",
+                        f"{self.description}'s answer for {resource} is larger than the CLI "
+                        "reads at once; narrow the request.",
+                        status_code=response.status_code,
+                    )
+        # `iter_bytes` already decoded any Content-Encoding, so the rebuilt answer must not
+        # claim to be encoded.
+        return httpx.Response(
+            response.status_code,
+            headers=[
+                (key, value)
+                for key, value in response.headers.multi_items()
+                if key.lower() not in {"content-encoding", "content-length"}
+            ],
+            content=bytes(body),
+        )
 
     def _body(self, response: httpx.Response, resource: str) -> Any:
         established = self._base is not None
@@ -305,6 +335,9 @@ def _detail(response: httpx.Response) -> str | None:
     if not isinstance(detail, str) or not detail.strip():
         return None
     detail = " ".join(detail.split())
+    # Never repeat a detail that looks like it carries a credential or control characters.
+    if safe_text(detail, 64 * 1024) is None:
+        return None
     return detail if len(detail) <= _MAX_DETAIL_CHARS else detail[: _MAX_DETAIL_CHARS - 1] + "…"
 
 

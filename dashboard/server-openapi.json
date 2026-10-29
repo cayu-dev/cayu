@@ -3234,6 +3234,284 @@
         "title": "ApiSessionInvocation",
         "type": "object"
       },
+      "ApiSessionLedgerReservation": {
+        "additionalProperties": false,
+        "description": "A budget reservation no model call claims; its private id is never published.",
+        "properties": {
+          "actual_amount": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Amount"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "outcome": {
+            "enum": [
+              "open",
+              "reconciled",
+              "released"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "pricing_state": {
+            "enum": [
+              "priced",
+              "unpriced",
+              "unknown"
+            ],
+            "title": "Pricing State",
+            "type": "string"
+          },
+          "reservation_id": {
+            "title": "Reservation Id",
+            "type": "null"
+          },
+          "reserved_amount": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reserved Amount"
+          }
+        },
+        "required": [
+          "reserved_amount",
+          "actual_amount",
+          "currency",
+          "pricing_state",
+          "outcome"
+        ],
+        "title": "ApiSessionLedgerReservation",
+        "type": "object"
+      },
+      "ApiSessionModelCall": {
+        "additionalProperties": false,
+        "properties": {
+          "cache_read_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Read Tokens"
+          },
+          "cache_write_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write Tokens"
+          },
+          "cached_input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cached Input Tokens"
+          },
+          "input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Tokens"
+          },
+          "ledger": {
+            "items": {
+              "$ref": "#/components/schemas/ApiSessionLedgerReservation"
+            },
+            "title": "Ledger",
+            "type": "array"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Tokens"
+          },
+          "pricing_state": {
+            "title": "Pricing State",
+            "type": "string"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "reasoning_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Tokens"
+          },
+          "requested_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Model"
+          },
+          "resolved_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved Model"
+          },
+          "sequence": {
+            "minimum": 1.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "timestamp": {
+            "title": "Timestamp",
+            "type": "string"
+          },
+          "total_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Tokens"
+          },
+          "transcript_cursor": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript Cursor"
+          },
+          "uncached_input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uncached Input Tokens"
+          }
+        },
+        "required": [
+          "sequence",
+          "timestamp",
+          "provider",
+          "requested_model",
+          "resolved_model",
+          "input_tokens",
+          "output_tokens",
+          "total_tokens",
+          "reasoning_tokens",
+          "cache_read_tokens",
+          "cache_write_tokens",
+          "cached_input_tokens",
+          "uncached_input_tokens",
+          "transcript_cursor",
+          "pricing_state",
+          "ledger"
+        ],
+        "title": "ApiSessionModelCall",
+        "type": "object"
+      },
+      "ApiSessionModelCallAggregate": {
+        "additionalProperties": false,
+        "properties": {
+          "model_calls": {
+            "minimum": 0.0,
+            "title": "Model Calls",
+            "type": "integer"
+          },
+          "model_calls_with_usage": {
+            "minimum": 0.0,
+            "title": "Model Calls With Usage",
+            "type": "integer"
+          },
+          "tool_calls": {
+            "minimum": 0.0,
+            "title": "Tool Calls",
+            "type": "integer"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/AggregateUsageMetrics"
+          }
+        },
+        "required": [
+          "model_calls",
+          "model_calls_with_usage",
+          "tool_calls",
+          "usage"
+        ],
+        "title": "ApiSessionModelCallAggregate",
+        "type": "object"
+      },
       "ApiSessionOutcome": {
         "additionalProperties": false,
         "properties": {
@@ -3325,6 +3603,199 @@
           "events"
         ],
         "title": "ApiSessionSummaryItem",
+        "type": "object"
+      },
+      "ApiSessionToolCall": {
+        "additionalProperties": false,
+        "description": "One paired tool call. `tool_call_id` is the call's public `tool_call_correlation_id`,\nthe value its tool events carry; the private model step, attempt and round are withheld.",
+        "properties": {
+          "approval_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval State"
+          },
+          "argument_summary": {
+            "title": "Argument Summary",
+            "type": "string"
+          },
+          "arguments_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arguments State"
+          },
+          "artifact_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Bytes"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "model_attempt_id": {
+            "title": "Model Attempt Id",
+            "type": "null"
+          },
+          "model_step_id": {
+            "title": "Model Step Id",
+            "type": "null"
+          },
+          "parallel_round_width": {
+            "minimum": 1.0,
+            "title": "Parallel Round Width",
+            "type": "integer"
+          },
+          "rendered_content_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rendered Content Bytes"
+          },
+          "returned": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Returned"
+          },
+          "sequence": {
+            "minimum": 1.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "structured_result_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Structured Result Bytes"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Call Id"
+          },
+          "tool_round_id": {
+            "title": "Tool Round Id",
+            "type": "null"
+          },
+          "truncated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truncated"
+          }
+        },
+        "required": [
+          "sequence",
+          "tool",
+          "tool_call_id",
+          "parallel_round_width",
+          "arguments_state",
+          "argument_summary",
+          "started_at",
+          "completed_at",
+          "duration_ms",
+          "status",
+          "approval_state",
+          "rendered_content_bytes",
+          "structured_result_bytes",
+          "artifact_bytes",
+          "returned",
+          "truncated"
+        ],
+        "title": "ApiSessionToolCall",
         "type": "object"
       },
       "ApiSessionTopologyBranch": {
@@ -38637,6 +39108,95 @@
         "title": "SessionMessageTarget",
         "type": "object"
       },
+      "SessionModelCallsResponse": {
+        "additionalProperties": false,
+        "description": "`cayu session usage` for one session: pages of calls and unclaimed reservations.",
+        "properties": {
+          "aggregate": {
+            "$ref": "#/components/schemas/ApiSessionModelCallAggregate"
+          },
+          "calls": {
+            "items": {
+              "$ref": "#/components/schemas/ApiSessionModelCall"
+            },
+            "title": "Calls",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_offset": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Offset"
+          },
+          "offset": {
+            "minimum": 0.0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "total_calls": {
+            "minimum": 0.0,
+            "title": "Total Calls",
+            "type": "integer"
+          },
+          "unmatched_ledger": {
+            "items": {
+              "$ref": "#/components/schemas/ApiSessionLedgerReservation"
+            },
+            "title": "Unmatched Ledger",
+            "type": "array"
+          },
+          "unmatched_ledger_has_more": {
+            "title": "Unmatched Ledger Has More",
+            "type": "boolean"
+          },
+          "unmatched_ledger_next_offset": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unmatched Ledger Next Offset"
+          },
+          "unmatched_ledger_total": {
+            "minimum": 0.0,
+            "title": "Unmatched Ledger Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "calls",
+          "offset",
+          "next_offset",
+          "has_more",
+          "total_calls",
+          "unmatched_ledger",
+          "unmatched_ledger_total",
+          "unmatched_ledger_next_offset",
+          "unmatched_ledger_has_more",
+          "aggregate"
+        ],
+        "title": "SessionModelCallsResponse",
+        "type": "object"
+      },
       "SessionOperationalSnapshot": {
         "additionalProperties": false,
         "description": "Exact current session counts captured by one store-local read snapshot.",
@@ -39267,6 +39827,59 @@
           "usage"
         ],
         "title": "SessionSummaryResponse",
+        "type": "object"
+      },
+      "SessionToolCallsResponse": {
+        "additionalProperties": false,
+        "description": "`cayu session tools` for one session: a page of paired tool calls.",
+        "properties": {
+          "calls": {
+            "items": {
+              "$ref": "#/components/schemas/ApiSessionToolCall"
+            },
+            "title": "Calls",
+            "type": "array"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "next_offset": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Offset"
+          },
+          "offset": {
+            "minimum": 0.0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "total_calls": {
+            "minimum": 0.0,
+            "title": "Total Calls",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "calls",
+          "offset",
+          "next_offset",
+          "has_more",
+          "total_calls"
+        ],
+        "title": "SessionToolCallsResponse",
         "type": "object"
       },
       "SessionTopologyRequest": {
@@ -54778,6 +55391,128 @@
         "summary": "Update Session Metadata"
       }
     },
+    "/api/sessions/{session_id}/model-calls": {
+      "get": {
+        "description": "Per-model-call token usage, budget reservations no call claims, and aggregate counters for one session, as `cayu session usage` reports them. `offset` and `limit` page the calls and the reservations alike.",
+        "operationId": "get_session_model_calls_api_sessions__session_id__model_calls_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interaction_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Interaction Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionModelCallsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "The session does not exist."
+          },
+          "413": {
+            "description": "The event window holds more than one view reads; narrow it."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Model Calls"
+      }
+    },
     "/api/sessions/{session_id}/state": {
       "get": {
         "description": "Return bounded lifecycle state. The response carries a weak `ETag`; a matching `If-None-Match` returns `304` without a body.",
@@ -54899,6 +55634,128 @@
           }
         },
         "summary": "Session Replay Availability"
+      }
+    },
+    "/api/sessions/{session_id}/tool-calls": {
+      "get": {
+        "description": "One session's tool calls, each start paired with its outcome and approval, without result bodies, as `cayu session tools` reports them. `tool_call_id` is the call's `tool_call_correlation_id` from its tool events.",
+        "operationId": "get_session_tool_calls_api_sessions__session_id__tool_calls_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interaction_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Interaction Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionToolCallsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "The session does not exist."
+          },
+          "413": {
+            "description": "The event window holds more than one view reads; narrow it."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Tool Calls"
       }
     },
     "/api/sessions/{session_id}/tool-view": {

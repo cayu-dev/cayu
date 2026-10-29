@@ -218,7 +218,8 @@ external-receipt-to-native-approval adapter.
 `SessionStore` owns durable session identity, transcript, events, status,
 checkpoints, and pending actions. Use `RunRequest.session_id` when identity must
 be stable and the resume/interrupt/fork APIs for lifecycle changes. Inspect a
-configured store read-only with `cayu session`.
+configured store read-only with `cayu session`, or a Cayu Cloud Agent's sessions with
+`cayu session ... --application NAME`.
 
 ## context
 

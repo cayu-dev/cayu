@@ -1621,6 +1621,127 @@ export type ApiSessionInvocation = {
 };
 
 /**
+ * ApiSessionLedgerReservation
+ *
+ * A budget reservation no model call claims; its private id is never published.
+ */
+export type ApiSessionLedgerReservation = {
+    /**
+     * Actual Amount
+     */
+    actual_amount: string | null;
+    /**
+     * Currency
+     */
+    currency: string | null;
+    /**
+     * Outcome
+     */
+    outcome: 'open' | 'reconciled' | 'released';
+    /**
+     * Pricing State
+     */
+    pricing_state: 'priced' | 'unpriced' | 'unknown';
+    /**
+     * Reservation Id
+     */
+    reservation_id?: null;
+    /**
+     * Reserved Amount
+     */
+    reserved_amount: string | null;
+};
+
+/**
+ * ApiSessionModelCall
+ */
+export type ApiSessionModelCall = {
+    /**
+     * Cache Read Tokens
+     */
+    cache_read_tokens: number | null;
+    /**
+     * Cache Write Tokens
+     */
+    cache_write_tokens: number | null;
+    /**
+     * Cached Input Tokens
+     */
+    cached_input_tokens: number | null;
+    /**
+     * Input Tokens
+     */
+    input_tokens: number | null;
+    /**
+     * Ledger
+     */
+    ledger: Array<ApiSessionLedgerReservation>;
+    /**
+     * Output Tokens
+     */
+    output_tokens: number | null;
+    /**
+     * Pricing State
+     */
+    pricing_state: string;
+    /**
+     * Provider
+     */
+    provider: string | null;
+    /**
+     * Reasoning Tokens
+     */
+    reasoning_tokens: number | null;
+    /**
+     * Requested Model
+     */
+    requested_model: string | null;
+    /**
+     * Resolved Model
+     */
+    resolved_model: string | null;
+    /**
+     * Sequence
+     */
+    sequence: number;
+    /**
+     * Timestamp
+     */
+    timestamp: string;
+    /**
+     * Total Tokens
+     */
+    total_tokens: number | null;
+    /**
+     * Transcript Cursor
+     */
+    transcript_cursor: number | null;
+    /**
+     * Uncached Input Tokens
+     */
+    uncached_input_tokens: number | null;
+};
+
+/**
+ * ApiSessionModelCallAggregate
+ */
+export type ApiSessionModelCallAggregate = {
+    /**
+     * Model Calls
+     */
+    model_calls: number;
+    /**
+     * Model Calls With Usage
+     */
+    model_calls_with_usage: number;
+    /**
+     * Tool Calls
+     */
+    tool_calls: number;
+    usage: AggregateUsageMetrics;
+};
+
+/**
  * ApiSessionOutcome
  */
 export type ApiSessionOutcome = {
@@ -1659,6 +1780,91 @@ export type ApiSessionSummaryItem = {
     events: ApiEventSummary;
     outcome: ApiSessionOutcome;
     session: ApiSession;
+};
+
+/**
+ * ApiSessionToolCall
+ *
+ * One paired tool call. `tool_call_id` is the call's public `tool_call_correlation_id`,
+ * the value its tool events carry; the private model step, attempt and round are withheld.
+ */
+export type ApiSessionToolCall = {
+    /**
+     * Approval State
+     */
+    approval_state: string | null;
+    /**
+     * Argument Summary
+     */
+    argument_summary: string;
+    /**
+     * Arguments State
+     */
+    arguments_state: string | null;
+    /**
+     * Artifact Bytes
+     */
+    artifact_bytes: number | null;
+    /**
+     * Completed At
+     */
+    completed_at: string | null;
+    /**
+     * Duration Ms
+     */
+    duration_ms: number | null;
+    /**
+     * Model Attempt Id
+     */
+    model_attempt_id?: null;
+    /**
+     * Model Step Id
+     */
+    model_step_id?: null;
+    /**
+     * Parallel Round Width
+     */
+    parallel_round_width: number;
+    /**
+     * Rendered Content Bytes
+     */
+    rendered_content_bytes: number | null;
+    /**
+     * Returned
+     */
+    returned: number | null;
+    /**
+     * Sequence
+     */
+    sequence: number;
+    /**
+     * Started At
+     */
+    started_at: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Structured Result Bytes
+     */
+    structured_result_bytes: number | null;
+    /**
+     * Tool
+     */
+    tool: string | null;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id: string | null;
+    /**
+     * Tool Round Id
+     */
+    tool_round_id?: null;
+    /**
+     * Truncated
+     */
+    truncated: boolean | null;
 };
 
 /**
@@ -19133,6 +19339,55 @@ export type SessionMessageTarget = {
 };
 
 /**
+ * SessionModelCallsResponse
+ *
+ * `cayu session usage` for one session: pages of calls and unclaimed reservations.
+ */
+export type SessionModelCallsResponse = {
+    aggregate: ApiSessionModelCallAggregate;
+    /**
+     * Calls
+     */
+    calls: Array<ApiSessionModelCall>;
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Next Offset
+     */
+    next_offset: number | null;
+    /**
+     * Offset
+     */
+    offset: number;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Total Calls
+     */
+    total_calls: number;
+    /**
+     * Unmatched Ledger
+     */
+    unmatched_ledger: Array<ApiSessionLedgerReservation>;
+    /**
+     * Unmatched Ledger Has More
+     */
+    unmatched_ledger_has_more: boolean;
+    /**
+     * Unmatched Ledger Next Offset
+     */
+    unmatched_ledger_next_offset: number | null;
+    /**
+     * Unmatched Ledger Total
+     */
+    unmatched_ledger_total: number;
+};
+
+/**
  * SessionOperationalSnapshot
  *
  * Exact current session counts captured by one store-local read snapshot.
@@ -19459,6 +19714,38 @@ export type SessionSummaryResponse = {
     session: ApiSession;
     transcript: TranscriptSummary;
     usage: SessionUsageSummary;
+};
+
+/**
+ * SessionToolCallsResponse
+ *
+ * `cayu session tools` for one session: a page of paired tool calls.
+ */
+export type SessionToolCallsResponse = {
+    /**
+     * Calls
+     */
+    calls: Array<ApiSessionToolCall>;
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Next Offset
+     */
+    next_offset: number | null;
+    /**
+     * Offset
+     */
+    offset: number;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Total Calls
+     */
+    total_calls: number;
 };
 
 /**
@@ -28118,6 +28405,65 @@ export type UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponses = {
 
 export type UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponse = UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponses[keyof UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponses];
 
+export type GetSessionModelCallsApiSessionsSessionIdModelCallsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * Offset
+         */
+        offset?: number;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * After Sequence
+         */
+        after_sequence?: number | null;
+        /**
+         * Before Sequence
+         */
+        before_sequence?: number | null;
+        /**
+         * Interaction Id
+         */
+        interaction_id?: string | null;
+    };
+    url: '/api/sessions/{session_id}/model-calls';
+};
+
+export type GetSessionModelCallsApiSessionsSessionIdModelCallsGetErrors = {
+    /**
+     * The session does not exist.
+     */
+    404: unknown;
+    /**
+     * The event window holds more than one view reads; narrow it.
+     */
+    413: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionModelCallsApiSessionsSessionIdModelCallsGetError = GetSessionModelCallsApiSessionsSessionIdModelCallsGetErrors[keyof GetSessionModelCallsApiSessionsSessionIdModelCallsGetErrors];
+
+export type GetSessionModelCallsApiSessionsSessionIdModelCallsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionModelCallsResponse;
+};
+
+export type GetSessionModelCallsApiSessionsSessionIdModelCallsGetResponse = GetSessionModelCallsApiSessionsSessionIdModelCallsGetResponses[keyof GetSessionModelCallsApiSessionsSessionIdModelCallsGetResponses];
+
 export type GetSessionStateApiSessionsSessionIdStateGetData = {
     body?: never;
     path: {
@@ -28207,6 +28553,65 @@ export type SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponses 
 };
 
 export type SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponse = SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponses[keyof SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponses];
+
+export type GetSessionToolCallsApiSessionsSessionIdToolCallsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * Offset
+         */
+        offset?: number;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * After Sequence
+         */
+        after_sequence?: number | null;
+        /**
+         * Before Sequence
+         */
+        before_sequence?: number | null;
+        /**
+         * Interaction Id
+         */
+        interaction_id?: string | null;
+    };
+    url: '/api/sessions/{session_id}/tool-calls';
+};
+
+export type GetSessionToolCallsApiSessionsSessionIdToolCallsGetErrors = {
+    /**
+     * The session does not exist.
+     */
+    404: unknown;
+    /**
+     * The event window holds more than one view reads; narrow it.
+     */
+    413: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionToolCallsApiSessionsSessionIdToolCallsGetError = GetSessionToolCallsApiSessionsSessionIdToolCallsGetErrors[keyof GetSessionToolCallsApiSessionsSessionIdToolCallsGetErrors];
+
+export type GetSessionToolCallsApiSessionsSessionIdToolCallsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionToolCallsResponse;
+};
+
+export type GetSessionToolCallsApiSessionsSessionIdToolCallsGetResponse = GetSessionToolCallsApiSessionsSessionIdToolCallsGetResponses[keyof GetSessionToolCallsApiSessionsSessionIdToolCallsGetResponses];
 
 export type GetSessionToolViewApiSessionsSessionIdToolViewGetData = {
     body?: never;

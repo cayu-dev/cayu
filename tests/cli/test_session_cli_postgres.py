@@ -333,7 +333,7 @@ def test_session_tools_conflicting_approval_and_execution_is_unavailable_across_
     monkeypatch,
     capsys,
 ) -> None:
-    from cayu.cli import session as session_cli
+    from cayu.sessions import _call_inspection as call_inspection
 
     sqlite_path = tmp_path / "conflicting-tool-evidence.db"
     postgres_dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
@@ -481,7 +481,7 @@ def test_session_tools_conflicting_approval_and_execution_is_unavailable_across_
             await store.close()
 
     asyncio.run(prepare())
-    monkeypatch.setattr(session_cli, "_EVENT_QUERY_PAGE_SIZE", 2)
+    monkeypatch.setattr(call_inspection, "_EVENT_QUERY_PAGE_SIZE", 2)
     target = (
         ["--sqlite", str(sqlite_path)]
         if postgres_dsn is None

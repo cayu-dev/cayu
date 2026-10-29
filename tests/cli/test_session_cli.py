@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import cayu.sessions._call_inspection as call_inspection
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
 from cayu.approvals.user_input import PendingUserInput
@@ -1610,7 +1611,6 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
     capsys,
 ) -> None:
     import cayu.sessions.inspection as session_inspection
-    from cayu.cli import session as session_cli
 
     database = _write_project(tmp_path)
 
@@ -1638,7 +1638,7 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
 
     asyncio.run(seed())
 
-    monkeypatch.setattr(session_cli, "_MAX_COLLECTED_EVENT_BYTES", 512)
+    monkeypatch.setattr(call_inspection, "_MAX_COLLECTED_EVENT_BYTES", 512)
     assert (
         main(
             [
@@ -1686,7 +1686,7 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
     )
     assert "retained-event safety limit" in json.loads(capsys.readouterr().out)["error"]["message"]
 
-    monkeypatch.setattr(session_cli, "_MAX_COLLECTED_EVENT_RECORDS", 0)
+    monkeypatch.setattr(call_inspection, "_MAX_COLLECTED_EVENT_RECORDS", 0)
     assert (
         main(
             [
@@ -2008,9 +2008,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
 
     asyncio.run(seed())
 
-    from cayu.cli import session as session_cli
-
-    monkeypatch.setattr(session_cli, "_MAX_COLLECTED_EVENT_BYTES", 16 * 1024)
+    monkeypatch.setattr(call_inspection, "_MAX_COLLECTED_EVENT_BYTES", 16 * 1024)
 
     assert (
         main(
@@ -2095,7 +2093,8 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
 
 
 def test_session_tool_rows_keep_provider_reused_call_ids_in_distinct_rounds() -> None:
-    from cayu.cli.session import _tool_call_rows, _tool_inspection_record
+    from cayu.sessions._call_inspection import tool_call_rows as _tool_call_rows
+    from cayu.sessions._call_inspection import tool_inspection_record as _tool_inspection_record
     from cayu.sessions.records import EventRecord
 
     records: list[EventRecord] = []
@@ -2147,7 +2146,8 @@ def test_session_tool_rows_keep_provider_reused_call_ids_in_distinct_rounds() ->
 
 
 def test_session_tool_rows_do_not_guess_missing_execution_identity() -> None:
-    from cayu.cli.session import _tool_call_rows, _tool_inspection_record
+    from cayu.sessions._call_inspection import tool_call_rows as _tool_call_rows
+    from cayu.sessions._call_inspection import tool_inspection_record as _tool_inspection_record
     from cayu.sessions.records import EventRecord
 
     records = [
@@ -2231,9 +2231,7 @@ def test_session_events_filters_paginates_and_bounds_explicit_payloads(
 
     asyncio.run(seed())
 
-    from cayu.cli import session as session_cli
-
-    monkeypatch.setattr(session_cli, "_MAX_COLLECTED_EVENT_BYTES", 64)
+    monkeypatch.setattr(call_inspection, "_MAX_COLLECTED_EVENT_BYTES", 64)
 
     assert (
         main(
@@ -2375,9 +2373,7 @@ def test_session_transcript_sizes_find_large_records_without_dumping_content(
 
     asyncio.run(seed())
 
-    from cayu.cli import session as session_cli
-
-    monkeypatch.setattr(session_cli, "_MAX_COLLECTED_EVENT_BYTES", 64)
+    monkeypatch.setattr(call_inspection, "_MAX_COLLECTED_EVENT_BYTES", 64)
 
     assert (
         main(

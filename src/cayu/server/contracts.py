@@ -3034,6 +3034,95 @@ class ListSessionInteractionsResponse(ApiBaseModel):
     has_more: StrictBool
 
 
+class ApiSessionLedgerReservation(ApiBaseModel):
+    """A budget reservation no model call claims; its private id is never published."""
+
+    reservation_id: None = None
+    reserved_amount: str | None
+    actual_amount: str | None
+    currency: str | None
+    pricing_state: Literal["priced", "unpriced", "unknown"]
+    outcome: Literal["open", "reconciled", "released"]
+
+
+class ApiSessionModelCall(ApiBaseModel):
+    sequence: StrictInt = Field(ge=1)
+    timestamp: str
+    provider: str | None
+    requested_model: str | None
+    resolved_model: str | None
+    input_tokens: StrictInt | None
+    output_tokens: StrictInt | None
+    total_tokens: StrictInt | None
+    reasoning_tokens: StrictInt | None
+    cache_read_tokens: StrictInt | None
+    cache_write_tokens: StrictInt | None
+    cached_input_tokens: StrictInt | None
+    uncached_input_tokens: StrictInt | None
+    transcript_cursor: StrictInt | None
+    pricing_state: str
+    ledger: list[ApiSessionLedgerReservation]
+
+
+class ApiSessionModelCallAggregate(ApiBaseModel):
+    model_calls: StrictInt = Field(ge=0)
+    model_calls_with_usage: StrictInt = Field(ge=0)
+    tool_calls: StrictInt = Field(ge=0)
+    usage: AggregateUsageMetrics
+
+
+class SessionModelCallsResponse(ApiBaseModel):
+    """`cayu session usage` for one session: pages of calls and unclaimed reservations."""
+
+    session_id: str
+    calls: list[ApiSessionModelCall]
+    offset: StrictInt = Field(ge=0)
+    next_offset: StrictInt | None = Field(ge=0)
+    has_more: StrictBool
+    total_calls: StrictInt = Field(ge=0)
+    unmatched_ledger: list[ApiSessionLedgerReservation]
+    unmatched_ledger_total: StrictInt = Field(ge=0)
+    unmatched_ledger_next_offset: StrictInt | None = Field(ge=0)
+    unmatched_ledger_has_more: StrictBool
+    aggregate: ApiSessionModelCallAggregate
+
+
+class ApiSessionToolCall(ApiBaseModel):
+    """One paired tool call. `tool_call_id` is the call's public `tool_call_correlation_id`,
+    the value its tool events carry; the private model step, attempt and round are withheld."""
+
+    sequence: StrictInt = Field(ge=1)
+    tool: str | None
+    tool_call_id: str | None
+    model_step_id: None = None
+    model_attempt_id: None = None
+    tool_round_id: None = None
+    parallel_round_width: StrictInt = Field(ge=1)
+    arguments_state: str | None
+    argument_summary: str
+    started_at: str | None
+    completed_at: str | None
+    duration_ms: StrictInt | None = Field(ge=0)
+    status: str
+    approval_state: str | None
+    rendered_content_bytes: StrictInt | None = Field(ge=0)
+    structured_result_bytes: StrictInt | None = Field(ge=0)
+    artifact_bytes: StrictInt | None = Field(ge=0)
+    returned: StrictInt | None = Field(ge=0)
+    truncated: StrictBool | None
+
+
+class SessionToolCallsResponse(ApiBaseModel):
+    """`cayu session tools` for one session: a page of paired tool calls."""
+
+    session_id: str
+    calls: list[ApiSessionToolCall]
+    offset: StrictInt = Field(ge=0)
+    next_offset: StrictInt | None = Field(ge=0)
+    has_more: StrictBool
+    total_calls: StrictInt = Field(ge=0)
+
+
 class ApiStructuredOutputPart(ApiBaseModel):
     # Transcript readers consume extensible records; storage's Message part
     # remains closed and is validated before this read-only response projection.

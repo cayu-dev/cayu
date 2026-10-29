@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from cayu.cli.session import _tool_call_rows, _tool_inspection_record
 from cayu.events import Event, EventType
+from cayu.sessions._call_inspection import tool_call_rows as _tool_call_rows
+from cayu.sessions._call_inspection import tool_inspection_record as _tool_inspection_record
 from cayu.sessions.records import EventRecord
 from cayu.tools.base import ToolResult
 

@@ -929,6 +929,10 @@ web process, `credentials_rejected` when the Agent doesn't accept its Developer 
 login, `not_served` when it doesn't serve Cayu's API, and `unsupported` when its Cayu is
 older than the command needs.
 
+`cayu session list|show|interactions|usage|tools|events|transcript --application
+my-agent` reads the Agent's sessions the same way; see
+[Session inspection](session-inspection.md#sessions-of-a-cloud-agent).
+
 ## Signing in to an Agent
 
 `ProxyIdentityAuth` lets an Agent trust a sign-in proxy that authenticates people
