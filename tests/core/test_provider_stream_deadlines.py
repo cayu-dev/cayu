@@ -5,10 +5,12 @@ import gc
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import suppress
 
+import httpx
 import pytest
 
 import cayu.providers.deadlines as provider_deadlines_module
 from cayu.messages import Message
+from cayu.providers._http import post_json
 from cayu.providers.anthropic import AnthropicProvider
 from cayu.providers.base import (
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
@@ -2046,3 +2048,52 @@ async def test_caller_cancel_settles_only_preaccepted_bundled_terminal(observed,
                 await task
     finally:
         controller.close()
+
+
+@pytest.mark.parametrize(
+    ("timeout_s", "expected"),
+    [
+        (0.2, None),
+        (0.5, None),
+        (0.1, {"connect": 0.1, "read": 0.1, "write": 0.1, "pool": 0.1}),
+    ],
+    ids=["equal", "longer", "shorter"],
+)
+def test_final_json_leaves_redundant_http_timers_to_the_absolute_deadline(
+    timeout_s: float, expected: dict[str, float] | None
+) -> None:
+    """An HTTPX timer racing the absolute deadline can abort httpcore's close."""
+
+    seen: list[dict[str, float | None]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"ok": True})
+
+    async def run() -> None:
+        controller = ProviderStreamDeadlineController(
+            ProviderStreamDeadlines(absolute_stream_timeout_s=0.2)
+        )
+        token = bind_provider_deadline_controller(controller)
+        try:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+                assert await post_json(
+                    client=client,
+                    url="https://provider.invalid",
+                    headers={},
+                    payload={},
+                    timeout_s=timeout_s,
+                    request_label="Custom API",
+                    response_label="Custom",
+                    api_error=lambda message, **kwargs: RuntimeError(message),
+                    protocol_error=RuntimeError,
+                    error_response_text=lambda response: "",
+                ) == {"ok": True}
+        finally:
+            reset_provider_deadline_controller(token)
+            controller.close()
+
+    asyncio.run(run())
+
+    unbounded = {"connect": None, "read": None, "write": None, "pool": None}
+    assert seen == [unbounded if expected is None else expected]

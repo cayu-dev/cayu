@@ -622,6 +622,14 @@ async def _read_owned_json_response(
     """
     close_trace = _HttpResponseCloseTrace()
     request_kwargs = {**request_kwargs, "extensions": {"trace": close_trace}}
+    if request_kwargs["timeout"] >= controller.deadlines.absolute_stream_timeout_s:
+        # The controller's absolute deadline started before this request, so an
+        # HTTPX timer at least that long can never expire first. Running both
+        # only adds a race: when HTTPX's timer ends a read, httpcore starts its
+        # shielded connection close, and the controller's later Task.cancel()
+        # still interrupts it (AnyIO shields do not stop native cancellation).
+        # The socket then stays open in the pool until the client closes.
+        request_kwargs["timeout"] = None
     responses = _aiter_owned_stream_response(
         client.stream(method, url, **request_kwargs), controller, close_trace
     )

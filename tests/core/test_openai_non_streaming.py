@@ -406,8 +406,10 @@ async def test_final_response_default_wait_allows_silence_until_absolute_deadlin
         events = [event async for event in provider.runtime_stream(request)]
     assert events[-1].type.value == "completed"
     assert len(requests) == 1
-    assert requests[0].extensions["timeout"]["read"] == 600
-    assert provider.stream_deadlines.absolute_stream_timeout_s == 600
+    # The 600 s absolute deadline is the only timer on this request. An HTTPX
+    # timer of the same length could never expire first and would only race it.
+    assert requests[0].extensions["timeout"]["read"] is None
+    assert provider.timeout_s == provider.stream_deadlines.absolute_stream_timeout_s == 600
 
 
 def test_final_response_explicit_timeout_and_deadlines_remain_authoritative():

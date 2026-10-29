@@ -11568,6 +11568,9 @@ path. This mode avoids intermediate SSE ordering and supplies no incremental
 progress before the response arrives. With no explicit timeout configuration,
 the HTTP request and idle clocks use the existing 600-second absolute limit,
 so expected silence does not expire at the streaming 300-second idle limit.
+When `timeout_s` is at least the absolute limit, the absolute deadline is the
+request's only timer: an HTTP timer that long can never expire first, and
+running it alongside the deadline could interrupt the HTTP connection close.
 Streaming keeps its existing defaults. Explicit `timeout_s` and
 `stream_deadlines` remain authoritative; an explicitly shorter semantic limit
 can still expire a final-response wait. Absolute and execution deadlines,
