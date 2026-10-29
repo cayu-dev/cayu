@@ -3563,6 +3563,44 @@ class CodingImageReceipt:
     trusted_build_context_sha256: str
 
 
+# Tests set this to build the app against a stand-in image instead of the one
+# docker-coding-image.json records. The app then runs on the docker backend and
+# never asks Docker about the image, so it builds on a machine without Docker,
+# the receipt or the built image. tests/conftest.py sets
+# placeholder_image_receipt() for every test not marked coding_image. Sessions
+# still start their containers from this image, so a test that runs one needs
+# the real image.
+TEST_IMAGE_RECEIPT: CodingImageReceipt | None = None
+
+
+def placeholder_image_receipt() -> CodingImageReceipt:
+    """A stand-in receipt for TEST_IMAGE_RECEIPT; no Docker daemon holds this image."""
+
+    return CodingImageReceipt(
+        image_identity=DockerImageIdentity(
+            reference="__PROJECT_NAME__-cayu-coding:placeholder",
+            content_digest="sha256:" + "0" * 64,
+        ),
+        profile_revision="placeholder",
+        platform_architecture="amd64",
+        dependency_inputs=(),
+        trusted_build_context_sha256="sha256:" + "0" * 64,
+    )
+
+
+def coding_image_unavailable_reason() -> str | None:
+    """Why the recorded image can't run sessions here, or None when it can.
+
+    tests/conftest.py skips tests marked coding_image with this reason.
+    """
+
+    try:
+        verify_local_docker_image(read_coding_image_receipt().image_identity)
+    except RuntimeError as error:
+        return str(error)
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class CodingComposition:
     """Owned runtime components shared by the app and product front doors."""
@@ -3884,10 +3922,19 @@ def _coding_backend(
     receipt: CodingImageReceipt,
     *,
     environ: Mapping[str, str] | None = None,
-    verify_local_image: bool = True,
+    verify_local_image: bool | None = None,
 ) -> CodingBackend:
-    """Docker locally; Cayu Cloud's broker when CAYU_CLOUD_* are set (or CAYU_CODING_BACKEND)."""
+    """Docker locally; Cayu Cloud's broker when CAYU_CLOUD_* are set (or CAYU_CODING_BACKEND).
 
+    While TEST_IMAGE_RECEIPT is set it is Docker without checking the local image,
+    unless ``environ`` or ``verify_local_image`` say otherwise.
+    """
+
+    testing = TEST_IMAGE_RECEIPT is not None
+    if verify_local_image is None:
+        verify_local_image = not testing
+    if environ is None and testing:
+        environ = {}
     return select_coding_backend(
         toolchain_profile=toolchain_profile,
         options={
@@ -3935,7 +3982,9 @@ def build_coding_composition(
     if not __CODING_ARTIFACTS_ENABLED__ and artifact_store is not None:
         raise ValueError("artifact_store requires the artifacts capability")
     LocalWorkspace.require_path_operations_supported()
-    receipt = read_coding_image_receipt()
+    receipt = (
+        read_coding_image_receipt() if TEST_IMAGE_RECEIPT is None else TEST_IMAGE_RECEIPT
+    )
     toolchain_profile = _python_toolchain_profile(receipt)
     backend = _coding_backend(toolchain_profile, receipt)
     # Docker reads the host checkout with host git and rg. Other backends build
@@ -4396,8 +4445,14 @@ uv run --no-sync pytest -q tests/test_coding_composition.py
 
 The Docker `test` check runs `tests/test_project.py`, the application-owned
 check target. Add workload tests there or extend the declared test paths. Run
-the host-side composition tests separately; they construct the Docker controller
-and use the image receipt that is deliberately excluded from the guest workspace.
+the host-side tests separately. They build the app against a stand-in image
+(`TEST_IMAGE_RECEIPT` in `operations/coding.py`, set by `tests/conftest.py`), so
+`uv run --no-sync pytest -q` passes without Docker, the image receipt (which is
+deliberately excluded from the guest workspace) or the built image. Mark a test
+that needs the real image, such as one that runs a session in its container,
+with `@pytest.mark.coding_image`: it uses the recorded image and is skipped with
+the reason when the local Docker daemon doesn't hold it. Set
+`CAYU_REQUIRE_CODING_IMAGE=1` to fail those tests instead.
 
 The trusted build may use network access to resolve only the reviewed pinned
 inputs and frozen lock. It captures Docker's build-produced immutable image ID,
@@ -4486,6 +4541,9 @@ Advance the check, command-policy, environment, binding, and primary-agent
 identities with their documented behavior, rebuild the pinned image, and run
 `uv run --no-sync cayu check --json` plus
 `uv run --no-sync pytest -q tests/test_coding_composition.py` after changes.
+Tests build the app against a stand-in image (`tests/conftest.py`); mark a test
+that needs the real image with `@pytest.mark.coding_image` instead of writing
+an image receipt or turning off image verification in the app.
 """
 
 
@@ -4495,6 +4553,69 @@ _DOCKER_PROJECT_TEST_PY = '''"""Application-owned deterministic check target."""
 def test_generated_project_smoke() -> None:
     assert True
 '''
+
+
+_DOCKER_TEST_CONFTEST_PY = '''"""Tests build the app without Docker or the built coding image.
+
+Every test builds the app against a stand-in image
+(operations.coding.TEST_IMAGE_RECEIPT), so it needs neither
+docker-coding-image.json nor a Docker daemon. A test that needs the real image,
+for example one that runs a session in its container, is marked
+@pytest.mark.coding_image: it uses the image build_coding_image.py recorded and
+is skipped, with the reason, when that image isn't available here. Set
+CAYU_REQUIRE_CODING_IMAGE=1 to fail those tests instead, for example in CI that
+builds the image first.
+"""
+
+import os
+
+import pytest
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "coding_image: needs the coding image build_coding_image.py recorded, "
+        "in the local Docker daemon",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _coding_image(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from operations import coding
+
+    if request.node.get_closest_marker("coding_image") is None:
+        monkeypatch.setattr(
+            coding, "TEST_IMAGE_RECEIPT", coding.placeholder_image_receipt()
+        )
+        return
+    reason = coding.coding_image_unavailable_reason()
+    if reason is None:
+        return
+    if os.environ.get("CAYU_REQUIRE_CODING_IMAGE") == "1":
+        pytest.fail(reason)
+    pytest.skip(reason)
+'''
+
+
+def _docker_agent_test_source(source: str) -> str:
+    """Mark the generated agent run: its session starts a container from the image."""
+
+    imported = source.replace("import asyncio\n\n", "import asyncio\n\nimport pytest\n", 1)
+    marked = imported.replace(
+        "\n\ndef test_agent_runs_through_the_runtime() -> None:\n",
+        (
+            "\n\n# The session runs in a container started from the recorded image.\n"
+            "@pytest.mark.coding_image\n"
+            "def test_agent_runs_through_the_runtime() -> None:\n"
+        ),
+        1,
+    )
+    if imported == source or marked == imported:
+        raise RuntimeError("generated agent test no longer has the expected layout")
+    return marked
 
 
 _DOCKER_SMOKE_TEST_PY = r'''"""Credential-free structural proof for Docker check execution."""
@@ -4743,14 +4864,15 @@ def _admit_test_image(
 ) -> None:
     """Use a recorded test image without asking a Docker daemon about it."""
 
-    monkeypatch.setattr(composition, "read_coding_image_receipt", lambda: _TEST_RECEIPT)
-    monkeypatch.setattr(
-        composition,
-        "_coding_backend",
-        lambda profile, receipt: _SELECT_CODING_BACKEND(
-            profile, receipt, environ=environ or {}, verify_local_image=False
-        ),
-    )
+    monkeypatch.setattr(composition, "TEST_IMAGE_RECEIPT", _TEST_RECEIPT)
+    if environ is not None:
+        monkeypatch.setattr(
+            composition,
+            "_coding_backend",
+            lambda profile, receipt: _SELECT_CODING_BACKEND(
+                profile, receipt, environ=environ
+            ),
+        )
     if custom_profile:
         monkeypatch.setattr(composition, "_python_toolchain_profile", _custom_toolchain_profile)
     monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
@@ -5055,7 +5177,6 @@ def test_docker_diagnostics_fail_before_provider_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
-    monkeypatch.setattr(composition, "read_coding_image_receipt", lambda: _TEST_RECEIPT)
     monkeypatch.setattr(
         composition,
         "_coding_backend",
@@ -5759,7 +5880,6 @@ _REDUCED_DOCKER_SMOKE_TEST_PY = '''"""Credential-free construction proof; does n
 
 import subprocess
 
-from cayu.runners import DockerImageIdentity
 from cayu.sessions import InMemorySessionStore
 from cayu.tasks import InMemoryTaskStore
 from app import build_app
@@ -5775,24 +5895,6 @@ def test_reduced_docker_profile_matches_the_declared_capabilities(
     subprocess.run(["git", "init", "-q", str(workspace)], check=True)
     monkeypatch.setattr(composition, "_STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
-    receipt = composition.CodingImageReceipt(
-        image_identity=DockerImageIdentity(
-            reference="generated:test", content_digest="sha256:" + "a" * 64,
-        ),
-        profile_revision="test-1",
-        platform_architecture="amd64",
-        dependency_inputs=(),
-        trusted_build_context_sha256="sha256:" + "c" * 64,
-    )
-    select = composition._coding_backend
-    monkeypatch.setattr(composition, "read_coding_image_receipt", lambda: receipt)
-    monkeypatch.setattr(
-        composition,
-        "_coding_backend",
-        lambda profile, receipt: select(
-            profile, receipt, environ={}, verify_local_image=False
-        ),
-    )
     app = build_app(
         session_store=InMemorySessionStore(),
         task_store=InMemoryTaskStore() if __CODING_TASKS_ENABLED__ else None,
@@ -6815,6 +6917,7 @@ def _docker_composition_source(source: str) -> str:
             "    DockerCodingBackendOptions,\n"
             "    register_coding_environment,\n"
             "    select_coding_backend,\n"
+            "    verify_local_docker_image,\n"
             ")\n"
             "from cayu.runners import DockerImageIdentity\n"
         ),
@@ -7041,6 +7144,8 @@ def coding_project_files(
                     _DOCKER_SMOKE_TEST_PY if full_profile else _REDUCED_DOCKER_SMOKE_TEST_PY
                 ),
                 "tests/test_project.py": _DOCKER_PROJECT_TEST_PY,
+                "tests/conftest.py": _DOCKER_TEST_CONFTEST_PY,
+                "tests/test_agent.py": _docker_agent_test_source(files["tests/test_agent.py"]),
             }
         )
         coding_files["README.md"] += coding_render(_DOCKER_README_APPEND)

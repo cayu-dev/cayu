@@ -567,10 +567,13 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         "domain/coding_product.py",
         "integrations/github.py",
         "integrations/remote_git.py",
+        "tests/conftest.py",
         "tests/test_project.py",
         "workflows/coding_product.py",
     }
     assert all((project / path).is_file() for path in expected_support)
+    agent_test = (project / "tests/test_agent.py").read_text(encoding="utf-8")
+    assert "@pytest.mark.coding_image\ndef test_agent_runs_through_the_runtime()" in agent_test
     private_cayu_imports = {
         path.relative_to(project).as_posix()
         for path in project.rglob("*.py")
@@ -770,27 +773,47 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         if inherited_pythonpath is None
         else os.pathsep.join((source_root, inherited_pythonpath))
     )
+    generated_environment.pop("CAYU_REQUIRE_CODING_IMAGE", None)
     generated_suite = subprocess.run(
         [
             sys.executable,
             "-m",
             "pytest",
             "-v",
+            "-rs",
             "-o",
             "faulthandler_timeout=60",
-            "tests/test_architecture.py",
-            "tests/test_coding_composition.py",
         ],
         cwd=project,
         env=generated_environment,
         check=False,
         capture_output=True,
         text=True,
-        # This runs the entire generated architecture and composition suite
-        # in another interpreter, alongside the outer CI shard.
+        # This runs the entire generated suite in another interpreter,
+        # alongside the outer CI shard.
         timeout=600,
     )
+    # The whole suite passes with no built image: only the test that runs a
+    # session in the image's container is skipped, and it says why.
     assert generated_suite.returncode == 0, generated_suite.stdout + generated_suite.stderr
+    assert "tests/test_application.py::" in generated_suite.stdout
+    skipped = [line for line in generated_suite.stdout.splitlines() if line.startswith("SKIPPED")]
+    assert len(skipped) == 1, generated_suite.stdout
+    assert "tests/test_agent.py" in skipped[0]
+    assert "docker-coding-image.json has no immutable image ID" in skipped[0]
+
+    generated_environment["CAYU_REQUIRE_CODING_IMAGE"] = "1"
+    required_image = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/test_agent.py"],
+        cwd=project,
+        env=generated_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert required_image.returncode != 0, required_image.stdout + required_image.stderr
+    assert "no immutable image ID" in required_image.stdout
 
 
 def test_generated_docker_builder_uses_one_immutable_input_snapshot(

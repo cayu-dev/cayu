@@ -662,11 +662,13 @@ def test_reduced_generated_project_tests_pass(tmp_path, execution, excluded):
     )
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
-    suites = ["tests/test_coding_composition.py", "tests/test_architecture.py"]
-    if execution != "docker":
-        # The ordinary Docker factory test requires a built/admitted image;
-        # the reduced Docker suite explicitly proves construction only.
-        suites.append("tests/test_application.py")
+    # The generated tests/conftest.py builds a Docker project against a stand-in
+    # image, so its factory test needs no built image either.
+    suites = [
+        "tests/test_coding_composition.py",
+        "tests/test_architecture.py",
+        "tests/test_application.py",
+    ]
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", *suites],
         cwd=project,
