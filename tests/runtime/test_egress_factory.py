@@ -1116,6 +1116,7 @@ class _RetryingLifecycleAdapter(_RecordingAdapter):
         super().__init__("lambda-microvm")
         self.finalize_calls = 0
         self.first_error = first_error or RuntimeError("suspend failed")
+        self.retry_started = asyncio.Event()
 
     async def finalize_runner(
         self,
@@ -1126,6 +1127,7 @@ class _RetryingLifecycleAdapter(_RecordingAdapter):
         self.finalize_calls += 1
         if self.finalize_calls == 1:
             raise self.first_error
+        self.retry_started.set()
         await runner.close()
         return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 
@@ -4423,9 +4425,11 @@ def test_app_lazily_retries_retained_egress_cleanup_before_new_environment_work(
                 )
             )
         ]
-        # Admission gives retained cleanup a deliberately small polling budget.
-        # Under a loaded event loop the successful retry may still be awaiting
-        # its final harvest when the unrelated run returns.
+        # Admission starts the retry but polls it for a deliberately small
+        # budget, so on a loaded worker the retry may not have reached the
+        # adapter yet when the unrelated run returns. Wait for the retry that
+        # run started; a drain would start one itself and prove nothing.
+        await asyncio.wait_for(adapter.retry_started.wait(), timeout=_SETTLED_DRAIN_TIMEOUT_S)
         assert adapter.finalize_calls == 2
         assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         assert_sync_resources_owned(
