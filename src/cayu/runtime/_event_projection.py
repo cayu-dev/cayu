@@ -55,8 +55,10 @@ from cayu.runtime.public_authority import (
 )
 from cayu.runtime.retry_policy import RetryDisposition, RetryReason, RetrySuppression
 from cayu.sessions._correlation import (
+    ARGUMENTS_CORRELATION_FIELD,
     TOOL_CALL_CORRELATION_EVENT_TYPES,
     TOOL_CALL_CORRELATION_FIELD,
+    arguments_correlation_value,
 )
 from cayu.sessions._terminal_evidence import (
     INTERRUPTION_ORIGIN_BACKGROUND_CASCADE,
@@ -1106,6 +1108,7 @@ def prepare_new_runtime_event(event: Event, *, redactor: SecretRedactor) -> Even
     if provider_failures is not None:
         payload["provider_cancellation_failures"] = [dict(item) for item in provider_failures]
     _quarantine_pre_execution_tool_arguments(event, payload=payload)
+    _drop_unattested_arguments_identity(event, payload=payload)
     _validate_new_terminal_tool_argument_projection(event, payload=payload)
     event = event.model_copy(update={"payload": payload})
     return _prepare_runtime_event(
@@ -1292,6 +1295,22 @@ _PRE_EXECUTION_ARGUMENT_EVENT_TYPES = frozenset(
         EventType.SESSION_INTERRUPTED,
     }
 )
+
+
+def _drop_unattested_arguments_identity(event: Event, *, payload: dict[str, Any]) -> None:
+    """Keep a start's private arguments digest only when the Runtime attested it.
+
+    Readers derive ``arguments_correlation_id`` from this digest, so a producer
+    must not be able to make two calls look identical or different.
+    """
+
+    field_name = tool_argument_publication.ARGUMENTS_IDENTITY_FIELD
+    if event.type != EventType.TOOL_CALL_STARTED or field_name not in payload:
+        return
+    if not event_payload_authority_is_runtime_generated(
+        event, field_name=field_name, value=payload[field_name]
+    ):
+        payload.pop(field_name)
 
 
 def _quarantine_pre_execution_tool_arguments(
@@ -1669,9 +1688,19 @@ def _project_runtime_event(
     # Existing event-scoped authority aliases keep their resolution semantics.
     if event.type in TOOL_CALL_CORRELATION_EVENT_TYPES:
         redacted_payload.pop(TOOL_CALL_CORRELATION_FIELD, None)
+    # Only a tool start can carry the arguments identity, so producer data never
+    # supplies it on any event, model events included.
+    redacted_payload.pop(ARGUMENTS_CORRELATION_FIELD, None)
     correlation = public_tool_call_correlation(event, public_authority_alias_codec)
     if correlation is not None:
         redacted_payload[TOOL_CALL_CORRELATION_FIELD] = correlation
+    # The arguments identity needs the store keyring and a durable record: a
+    # process-local key would change on restart, and a caller-supplied record
+    # could turn guessed digests into comparable values.
+    if trust_persisted_projection and public_authority_alias_codec is not None:
+        arguments_correlation = arguments_correlation_value(event, public_authority_alias_codec)
+        if arguments_correlation is not None:
+            redacted_payload[ARGUMENTS_CORRELATION_FIELD] = arguments_correlation
     # Only fixed validated discriminators are restored during exposure.
     redacted_payload.update(
         {

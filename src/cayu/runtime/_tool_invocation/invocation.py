@@ -632,6 +632,13 @@ class ToolInvocation:
                 "idempotency_key": idempotency_key,
                 **_targeted_tool_invocation_payload(tool_call),
                 **tool_argument_publication.quarantined_argument_fields(),
+                **tool_argument_publication.arguments_identity_fields(
+                    tool_call.arguments,
+                    session_id=session.id,
+                    publish_arguments=registered_tool is not None
+                    and registered_tool.publish_arguments,
+                    arguments_state=tool_call.arguments_state,
+                ),
                 **_published_argument_presence(
                     tool_call, registered_agent.executable_tool(tool_call.name)
                 ),
@@ -660,7 +667,9 @@ class ToolInvocation:
                     _event_with_tool_round_authority(
                         started,
                         tool_round_identity,
-                        *(field for field in ("approval_id", "input_id") if field in payload),
+                        "approval_id",
+                        "input_id",
+                        tool_argument_publication.ARGUMENTS_IDENTITY_FIELD,
                     ),
                     redactor=invocation_redactor,
                 )

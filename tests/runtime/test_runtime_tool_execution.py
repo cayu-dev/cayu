@@ -28,6 +28,7 @@ from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools._argument_publication import arguments_identity_fields
 from cayu.tools.base import (
     _POLICY_DENIAL_TEXT_MAX_BYTES,
     _POLICY_DENIAL_TRUNCATION_MARKER,
@@ -262,6 +263,9 @@ def test_cayu_app_executes_tool_call_and_records_result():
         "idempotency_key": private_events[3].payload["idempotency_key"],
         "effect": "external",
         "arguments_state": "quarantined",
+        **arguments_identity_fields(
+            {"text": "from tool"}, session_id="sess_tool", publish_arguments=True
+        ),
         "argument_presence": {"keys": ["text"], "key_count": 1, "unlisted_key_count": 0},
         EXECUTION_PROFILE_FINGERPRINT_FIELD: private_events[3].payload[
             EXECUTION_PROFILE_FINGERPRINT_FIELD

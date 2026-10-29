@@ -66,6 +66,7 @@ from cayu.sessions.requests import (
     RunRequest,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools._argument_publication import ARGUMENTS_IDENTITY_FIELD, arguments_identity_fields
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
@@ -664,6 +665,15 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
         and event.payload.get("tool_call_id") == "call_1"
     )
     assert started.payload["effect"] == ToolEffect.EXTERNAL.value
+    # The answered call's start records its arguments' private digest, which
+    # public reads publish only as a keyed value.
+    digest = arguments_identity_fields(
+        {"question": "Which env?"}, session_id="s_resume", publish_arguments=True
+    )
+    assert digest and digest.items() <= started.payload.items()
+    public_started = next(e for e in resume_events if e.type == EventType.TOOL_CALL_STARTED)
+    assert public_started.payload["arguments_correlation_id"]
+    assert ARGUMENTS_IDENTITY_FIELD not in public_started.payload
     completed = next(
         event
         for event in private_resume_events

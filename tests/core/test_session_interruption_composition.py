@@ -81,6 +81,9 @@ def test_public_interruption_and_replay_work_without_engine(
                 )
                 assert len(records) == 1
                 assert records[0].event.id == direct_replay[0].id
+                # The interruption's child cascade runs in the background and can still be
+                # running on a slow machine; wait for it before reading its settled status.
+                assert await app._background_interruption_coordinator.drain(timeout_s=10)
                 assert await app.interruption_cascade_status(session.id) == "none"
             finally:
                 await app.aclose()

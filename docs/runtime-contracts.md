@@ -8933,6 +8933,24 @@ boundary. Without a terminal event its status remains `INTERRUPTED`.
   durable application identifier. Older events without it can only be grouped
   when their supplied session/round/call IDs match; missing historical identity
   is never guessed from tool names or ordering.
+- Public `tool.call.started` events also include `arguments_correlation_id`
+  when the store has a configured keyring. Two starts in one session carry the
+  same value exactly when the model proposed the same arguments (canonical
+  JSON); values from different sessions are unrelated. Compare it together
+  with `tool_name`. The Runtime records a private SHA-256 of the session id
+  and the proposed arguments (`arguments_identity_digest`) on the durable
+  start, only for tools that publish their arguments. Public reads never show
+  the digest, only an HMAC of it under the store keyring's current key, so the
+  published value can't be checked against guessed arguments, and a key
+  rotation or a move to another store changes all of a session's values
+  together, so identical arguments keep matching. A reader of the raw store or
+  a session export could check a guess against the digest for that session;
+  those tools' terminals already record their redacted arguments. Approved
+  edits and hook changes do not alter it. Tools that don't publish arguments,
+  stores without a keyring, starts recorded before the digest existed, and
+  records a caller supplies rather than reads from the store carry no value. A producer-written `arguments_correlation_id` is
+  dropped, and a start whose digest the Runtime did not attest is stored
+  without one.
 - Replayed event IDs contribute once to derived values, while the full raw event
   tuple preserves every consumed occurrence. Recovery terminals need not have a
   start in the same stream. A newly resolved call contributes once to that

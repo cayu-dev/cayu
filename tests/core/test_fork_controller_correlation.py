@@ -78,6 +78,7 @@ CORRELATION_DOMAINS = (
     "model_step_correlation",
     "model_attempt_correlation",
     "auxiliary_operation_correlation",
+    "arguments_correlation",
 )
 CORRELATION_FIELDS = tuple(f"{domain}_id" for domain in CORRELATION_DOMAINS)
 TOOL_TERMINALS = {

@@ -522,7 +522,7 @@ correlation ids that can:
 
 | Event | Correlation fields in `payload` |
 | --- | --- |
-| `tool.call.started` | `tool_call_correlation_id`, `tool_round_correlation_id`, and the proposing attempt's `model_step_correlation_id` and `model_attempt_correlation_id` |
+| `tool.call.started` | `tool_call_correlation_id`, `tool_round_correlation_id`, the proposing attempt's `model_step_correlation_id` and `model_attempt_correlation_id`, and `arguments_correlation_id` |
 | `tool.call.completed`, `.failed`, `.blocked`, `.approval_denied`, `.approval_expired` | `tool_call_correlation_id`, `tool_round_correlation_id` |
 | `model.started`, `model.completed`, `model.error` | `model_step_correlation_id`, `model_attempt_correlation_id`; a completion that proposed tools also has `tool_round_correlation_id` |
 | `model.auxiliary.attempt_started`, `model.auxiliary.attempt_settled` | `auxiliary_operation_correlation_id`, `model_step_correlation_id`, `model_attempt_correlation_id` |
@@ -545,6 +545,12 @@ A ledger joins records with these values:
   in order and equal those calls' `tool_call_correlation_id`. Its round, step
   and attempt values equal the same fields on the session's tool and model
   events.
+- Two `tool.call.started` events in one session have the same
+  `arguments_correlation_id` exactly when the model proposed the same
+  arguments (canonical JSON), so together with `tool_name` it finds exact
+  repeats. It says nothing about what the arguments were, and values from
+  different sessions never match. Tools that don't publish their arguments,
+  and starts recorded before this field existed, have none.
 
 The rest of each record is the control plane's projection. `purpose` (for
 example `context_compaction`), `usage_metrics`, `timestamp` and `sequence`
@@ -552,19 +558,28 @@ survive. So do the auxiliary attempt's `auxiliary_inference.purpose`,
 `auxiliary_outcome` and `usage_metrics`, and a
 `session.execution_profile.decided` event's `decision` and
 `candidate_profile.fingerprint`. The private tool call, round, model step,
-model attempt and auxiliary operation ids never appear in controller-read
-output.
+model attempt and auxiliary operation ids, the tool arguments and their
+private digest never appear in controller-read output.
 
-SDK reads return the store's own records. `event_correlation_ids(record)` and
+SDK reads return the store's own records, including the private
+`arguments_identity_digest` on tool starts that controller HTTP reads never
+show. It is an unkeyed SHA-256 of the session id and the arguments, so an SDK
+reader could confirm a guessed argument for that session; it is recorded only
+for tools that publish their arguments, whose terminals carry the redacted
+arguments anyway. `event_correlation_ids(record)` and
 `supervision_correlation_ids(event)` on `ForkControllerAccess` return the same
 values the HTTP routes add.
 
-Each value is an HMAC of the session id and the private id under the host's
+Each value is an HMAC of the session id and the private id (for
+`arguments_correlation_id`, the private arguments digest) under the host's
 public authority alias keyring. Each kind has its own field name inside the
 value, so values of different kinds never match. The values are the same on
 every read and after a restart with the same key material. Rotating the active
 key changes them, so a reader that joins records rebuilds its joins after a
-rotation instead of mixing values from both keys.
+rotation instead of mixing values from both keys. Because every value is
+derived when it is read, all of a session's values change together: two starts
+with the same arguments still match after a rotation, including when one was
+recorded before it, and after a session is moved to another store.
 
 - Correlation ids carry no authority. No session, interaction, approval, input
   or linkage resolver accepts one, and approval and user-input resolution

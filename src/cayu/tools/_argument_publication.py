@@ -11,6 +11,7 @@ remain explicitly unavailable.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any, Literal
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
@@ -21,6 +22,13 @@ ARGUMENTS_FIELD = "arguments"
 # Terminal fields for the arguments that ran, published only beside ``arguments``.
 EXECUTED_ARGUMENTS_FIELDS = ("approved_arguments", "effective_arguments")
 ARGUMENTS_EXACT_FIELD = "arguments_exact"
+# Private start evidence for spotting exact repeats: a SHA-256 of the session id
+# and the model-proposed arguments. It is internal event authority, so no
+# public read shows it; correlated reads publish only an HMAC of it under the
+# store keyring's current key, so every start in a session moves together when
+# the key rotates.
+ARGUMENTS_IDENTITY_FIELD = "arguments_identity_digest"
+_ARGUMENTS_IDENTITY_DOMAIN = "cayu.tool-arguments-identity.v1"
 ArgumentPublicationState = Literal["quarantined", "finalized", "unavailable"]
 TERMINAL_ARGUMENT_STATES = frozenset({"finalized", "unavailable"})
 
@@ -66,6 +74,45 @@ def quarantined_argument_fields() -> dict[str, str]:
     """Return the only argument evidence safe before invocation dispatch."""
 
     return {ARGUMENTS_STATE_FIELD: "quarantined"}
+
+
+def arguments_identity_fields(
+    arguments: Any,
+    *,
+    session_id: str,
+    publish_arguments: bool,
+    arguments_state: str = "finalized",
+) -> dict[str, str]:
+    """Return the private digest of one call's arguments, or nothing.
+
+    The digest is a SHA-256 over a domain tag, the session id and the canonical
+    JSON of the arguments the model proposed, so a person's approved edit or a
+    hook's change does not alter it. It uses no key, so it stays the same
+    across alias-key rotation and when a session moves to another store; the
+    session id keeps one session's digests unrelated to another's.
+
+    Without a key, someone who can read the raw store, a session export or an
+    in-process SDK read could confirm a guessed argument for that session. So
+    a tool that doesn't publish its arguments gets no digest: its arguments
+    never reach the event log in any form. For a tool that does, its terminal
+    already records the redacted arguments. Calls whose arguments are
+    unavailable or can't be canonicalized get none either.
+    """
+
+    if not publish_arguments or arguments_state != "finalized" or type(arguments) is not dict:
+        return {}
+    try:
+        material = canonical_durable_json_bytes(
+            {
+                "domain": _ARGUMENTS_IDENTITY_DOMAIN,
+                "session_id": session_id,
+                "arguments": arguments,
+            },
+            "arguments identity",
+        )
+    except (TypeError, ValueError):
+        return {}
+    return {ARGUMENTS_IDENTITY_FIELD: f"sha256:{sha256(material).hexdigest()}"}
 
 
 def finalized_argument_projection(

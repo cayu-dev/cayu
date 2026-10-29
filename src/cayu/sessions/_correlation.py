@@ -8,11 +8,13 @@ runtime's process-local fallback key stays in ``cayu.runtime._tool_call_correlat
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from cayu import _event_schema
 from cayu.events import Event, EventType
+from cayu.tools._argument_publication import ARGUMENTS_IDENTITY_FIELD
 from cayu.tools.outcomes import _TOOL_CALL_TERMINAL_DISPOSITIONS
 
 if TYPE_CHECKING:
@@ -23,6 +25,7 @@ TOOL_ROUND_CORRELATION_FIELD = "tool_round_correlation_id"
 MODEL_STEP_CORRELATION_FIELD = "model_step_correlation_id"
 MODEL_ATTEMPT_CORRELATION_FIELD = "model_attempt_correlation_id"
 AUXILIARY_OPERATION_CORRELATION_FIELD = "auxiliary_operation_correlation_id"
+ARGUMENTS_CORRELATION_FIELD = "arguments_correlation_id"
 # Every payload field a correlated read may publish. Readers drop these names
 # from every payload before adding derived values, so producer data never
 # poses as correlation.
@@ -32,6 +35,7 @@ CORRELATION_FIELDS = (
     MODEL_STEP_CORRELATION_FIELD,
     MODEL_ATTEMPT_CORRELATION_FIELD,
     AUXILIARY_OPERATION_CORRELATION_FIELD,
+    ARGUMENTS_CORRELATION_FIELD,
 )
 # The codec field name is the domain: values of one kind never equal values of
 # another kind, and no resolver accepts any of these field names.
@@ -40,6 +44,8 @@ _TOOL_ROUND_DOMAIN = "tool_round_correlation"
 _MODEL_STEP_DOMAIN = "model_step_correlation"
 _MODEL_ATTEMPT_DOMAIN = "model_attempt_correlation"
 _AUXILIARY_OPERATION_DOMAIN = "auxiliary_operation_correlation"
+_ARGUMENTS_DOMAIN = "arguments_correlation"
+_ARGUMENTS_IDENTITY = re.compile(r"sha256:[0-9a-f]{64}")
 TOOL_CALL_CORRELATION_EVENT_TYPES = frozenset(
     {
         EventType.TOOL_CALL_STARTED,
@@ -87,6 +93,25 @@ def tool_call_correlation_value(event: Event, codec: PublicAuthorityAliasCodec) 
     )
 
 
+def arguments_correlation_value(event: Event, codec: PublicAuthorityAliasCodec) -> str | None:
+    """The session-scoped identity of one tool start's arguments, or ``None``.
+
+    Two starts in one session get the same value exactly when the model proposed
+    the same arguments (canonical JSON). The value is an HMAC of the private
+    digest under the store keyring's current key, so it can't be recomputed
+    from guessed arguments, every start in a session changes together when the
+    key rotates, and values from different sessions are unrelated. Starts recorded
+    before the digest existed, or with a malformed one, have no value.
+    """
+
+    if event.type is not EventType.TOOL_CALL_STARTED:
+        return None
+    digest = _schema_identity(event, ARGUMENTS_IDENTITY_FIELD)
+    if digest is None or _ARGUMENTS_IDENTITY.fullmatch(digest) is None:
+        return None
+    return codec.encode(digest, field_name=_ARGUMENTS_DOMAIN, session_id=event.session_id)
+
+
 def _schema_identity(event: Event, field_name: str) -> str | None:
     """Read one private identity the event's schema owns as authority, or nothing."""
 
@@ -117,7 +142,8 @@ def event_correlation_ids(event: Event, codec: PublicAuthorityAliasCodec) -> dic
     """Derive keyed correlation values from one private durable event.
 
     Tool starts and terminals carry their call and round, and a model
-    completion that proposed tools carries that round. Tool starts, model
+    completion that proposed tools carries that round. Tool starts also carry
+    the identity of their arguments. Tool starts, model
     starts, completions and errors, and auxiliary attempts carry their model
     step and attempt; auxiliary attempts also carry their operation. Values are
     session-scoped HMACs under the store keyring, so they are stable across
@@ -157,6 +183,7 @@ def event_correlation_ids(event: Event, codec: PublicAuthorityAliasCodec) -> dic
         domain=_AUXILIARY_OPERATION_DOMAIN,
         session_id=session_id,
     )
+    ids[ARGUMENTS_CORRELATION_FIELD] = arguments_correlation_value(event, codec)
     return {field: value for field, value in ids.items() if value is not None}
 
 

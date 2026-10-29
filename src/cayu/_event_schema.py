@@ -11,6 +11,7 @@ from cayu.egress.authority import EgressAuthorityTransitionState
 from cayu.events import SESSION_EXPORT_EVENT_FIELDS, SESSION_EXPORT_EVENT_TYPES, Event, EventType
 from cayu.providers._retry_decision import RetryDecision
 from cayu.releases import RELEASE_EVENT_PAYLOAD_KEY, ReleaseIdentity
+from cayu.tools._argument_publication import ARGUMENTS_IDENTITY_FIELD
 from cayu.tools._shared_artifact_result_schema import (
     SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
     SHARED_ARTIFACT_RESULT_EVENT_SCHEMA_PATHS,
@@ -2054,8 +2055,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         *tool_common,
         owned_nested_paths=_TOOL_RESULT_NESTED_PATHS | tool_actor_paths,
         authority_keys=(
-            _TOOL_LINKAGE_AUTHORITY_KEYS | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+            _TOOL_LINKAGE_AUTHORITY_KEYS
+            | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+            | {ARGUMENTS_IDENTITY_FIELD}
         ),
+        # The arguments digest is private start evidence, so public reads drop
+        # it; correlated reads publish only a session-scoped value of it.
+        internal_authority_keys={ARGUMENTS_IDENTITY_FIELD},
         public_authority_keys=(
             _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
             | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS

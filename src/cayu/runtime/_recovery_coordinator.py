@@ -4089,11 +4089,19 @@ class RecoveryCoordinator:
                         is_error=False,
                     )
                     await round_owner.record_continuation_scope(tool_call.id)
+                    arguments_identity = tool_argument_publication.arguments_identity_fields(
+                        tool_call.arguments,
+                        session_id=session.id,
+                        publish_arguments=registered_tool is not None
+                        and registered_tool.publish_arguments,
+                        arguments_state=tool_call.arguments_state,
+                    )
                     started_payload: dict[str, Any] = {
                         **tool_round_identity.payload(),
                         "tool_call_id": tool_call.id,
                         "idempotency_key": idempotency_key,
                         **tool_argument_publication.quarantined_argument_fields(),
+                        **arguments_identity,
                         "input_id": pending.input_id,
                     }
                     if registered_tool is not None:
@@ -4113,6 +4121,7 @@ class RecoveryCoordinator:
                                 "model_attempt_id",
                                 "tool_round_id",
                                 "input_id",
+                                *arguments_identity,
                             ),
                             execution_profile_snapshot.profile,
                         )
