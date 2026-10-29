@@ -45,6 +45,16 @@ from cayu.cli._cloud_project import (
     resolve_project,
     schedule_input_json,
 )
+from cayu.cli._cloud_releases import DEFAULT_LIMIT as _DEFAULT_RELEASE_LIMIT
+from cayu.cli._cloud_releases import add_output_argument as _add_release_output_argument
+from cayu.cli._cloud_releases import (
+    list_releases,
+    release_application_id,
+    release_limit,
+    render_application,
+    render_releases,
+    show_application,
+)
 from cayu.cli._cloud_settings import CloudSettingsError, add_settings_parser, settings_command
 from cayu.cli._cloud_task_health import fenced_tasks_warning
 from cayu.cli._output import terminal_safe
@@ -60,6 +70,8 @@ _DEPLOYMENT_IN_PROGRESS = {
 }
 _DEPLOYMENT_READY = {"smoke_tested", "promoted"}
 _DEPLOYMENT_STATUSES = _DEPLOYMENT_FAILURES | _DEPLOYMENT_IN_PROGRESS | _DEPLOYMENT_READY
+# `deployment` reads that find the release's Agent from a `dep_...` id without --application.
+_RELEASE_ID_ACTIONS = frozenset({"logs", "status", "timeline", "wait"})
 _SERVICE_FAILURES = {"degraded", "failed", "stopped"}
 _SERVICE_IN_PROGRESS = {"deleting", "deploying", "sleeping", "starting", "stopping"}
 _SERVICE_READY = {"running"}
@@ -802,7 +814,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     applications = commands.add_parser(
         "applications",
-        help="List deployed Agent applications.",
+        help="List or show deployed Agent applications.",
         description="List Agent applications deployed in the selected Cayu Cloud.",
     )
     application_commands = applications.add_subparsers(
@@ -843,6 +855,15 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         description="Show an Agent's lifecycle, revision and archive progress.",
     )
     archive_status.add_argument("application", type=_application_slug)
+    application_show = application_commands.add_parser(
+        "show",
+        description=(
+            "Show an Agent's selected release (when it was selected, its source revision and "
+            "the Cayu runtime its image is built with) and any candidate or in-flight release."
+        ),
+    )
+    application_show.add_argument("application", help="The Agent's slug or name.")
+    _add_release_output_argument(application_show, render_application)
 
     context = commands.add_parser(
         "context",
@@ -937,6 +958,22 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         dest="deployment_command",
         required=True,
     )
+    deployment_list = deployment_commands.add_parser(
+        "list",
+        description=(
+            "List an Agent's releases, newest first, with their status, when each was "
+            "created and selected, its source revision and Cayu runtime."
+        ),
+    )
+    deployment_list.add_argument("--application", required=True)
+    deployment_list.add_argument(
+        "--limit",
+        type=release_limit,
+        default=_DEFAULT_RELEASE_LIMIT,
+        metavar="N",
+        help=f"The newest N releases (default {_DEFAULT_RELEASE_LIMIT}).",
+    )
+    _add_release_output_argument(deployment_list, render_releases)
     deployment_descriptions = {
         "logs": "Read structured publication logs for one release.",
         "status": "Show the current publication status of one release.",
@@ -953,7 +990,13 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     for action, description in deployment_descriptions.items():
         operation = deployment_commands.add_parser(action, description=description)
         operation.add_argument("deployment_id")
-        operation.add_argument("--application", required=True)
+        if action in _RELEASE_ID_ACTIONS:
+            operation.add_argument(
+                "--application",
+                help="The Agent the release belongs to; a dep_... id finds it on its own.",
+            )
+        else:
+            operation.add_argument("--application", required=True)
         if action == "retry":
             operation.add_argument("--idempotency-key")
             _add_acknowledge_breaking_argument(operation)
@@ -3046,9 +3089,24 @@ def _deployment(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
+    if arguments.deployment_command == "list":
+        return {
+            "operation": "deployment.list",
+            "result": list_releases(
+                client, _application_id(client, arguments.application), limit=arguments.limit
+            ),
+        }
     if arguments.deployment_command == "wait":
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
-    application_id = _application_id(client, arguments.application)
+    if arguments.application is not None:
+        application_id = _application_id(client, arguments.application)
+    elif _cloud_deployment_id(arguments.deployment_id) is not None:
+        application_id = release_application_id(client, arguments.deployment_id)
+    else:
+        raise CloudCommandError(
+            "invalid_input",
+            f"{arguments.deployment_id} is not a release id (dep_...); pass --application.",
+        )
     base = f"/v1/applications/{application_id}/deployments/{arguments.deployment_id}"
     if arguments.deployment_command == "status":
         result = client.request("GET", base)
@@ -3389,6 +3447,11 @@ def _applications(
                 if arguments.lifecycle == "active"
                 else {"lifecycle": arguments.lifecycle},
             ),
+        }
+    if action == "show":
+        return {
+            "operation": "applications.show",
+            "result": show_application(client, _application_id(client, arguments.application)),
         }
     application_id = arguments.application
     path = f"/v1/applications/{application_id}"

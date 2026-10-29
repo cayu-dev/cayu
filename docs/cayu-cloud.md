@@ -9,9 +9,11 @@ commands from an Agent repository.
 cayu cloud login
 cayu cloud whoami
 cayu cloud deploy .
-cayu cloud deployment status DEPLOYMENT_ID --application my-agent
-cayu cloud deployment timeline DEPLOYMENT_ID --application my-agent
-cayu cloud deployment logs DEPLOYMENT_ID --application my-agent
+cayu cloud applications show my-agent
+cayu cloud deployment list --application my-agent
+cayu cloud deployment status DEPLOYMENT_ID
+cayu cloud deployment timeline DEPLOYMENT_ID
+cayu cloud deployment logs DEPLOYMENT_ID
 cayu cloud service status --application my-agent
 ```
 
@@ -20,11 +22,11 @@ cayu cloud service status --application my-agent
 `cayu cloud --help` is the authoritative summary. The top-level commands are:
 
 - `login`, `logout`, and `whoami` for interactive identity;
-- `applications list|archive|archive-status` for Agent discovery and archive;
+- `applications list|show|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
 - `init` and `deploy` for local project setup and publication;
-- `deployment logs|status|timeline|wait|promote|discard|retry` and `rollback` for immutable
-  releases, including [candidate releases](#candidate-releases);
+- `deployment list|logs|status|timeline|wait|promote|discard|retry` and `rollback` for
+  immutable releases, including [candidate releases](#candidate-releases);
 - `runtimes list|status` for retained runtime artifacts;
 - `service credentials|destroy|logs|pause|restart|resume|sleep|status|wake` for Agent
   infrastructure, and `schedule run` to run a schedule now;
@@ -64,6 +66,41 @@ Cloud reported one, `last_issue`: the last `web_not_ready` message, which includ
 long the web process has been starting. A timed-out service teardown similarly reports
 `service_deletion_still_running`; neither result marks the retained Cloud operation as
 failed.
+
+## What an Agent runs
+
+`applications show NAME` shows what an Agent runs now: its selected release, when it was
+selected (promoted, or rolled back to), its source repository and revision, and the Cayu
+runtime its image is built with, then any candidate or in-flight release.
+`deployment list --application NAME [--limit N]` lists the Agent's releases newest first
+(20 by default) with their status, when each was created and selected, the source revision
+and the Cayu runtime. Both print a table; `--json` prints the usual envelope, whose
+`result` carries `schema_version` 1.
+
+```console
+$ cayu cloud applications show my-agent
+Agent: My Agent (my-agent)
+Lifecycle: active
+Selected release: dep_8k2m (version 1.4.0, promoted)
+  Selected at: 2026-10-28 21:03Z
+  Created at: 2026-10-28 20:51Z
+  Source: https://github.com/acme/my-agent @ 3f2a9c1d0b7e4a5f6c8d9e0f1a2b3c4d5e6f7a8b
+  Cayu runtime: cayu 0.16.1
+  Cayu installed from: registry https://pypi.org/simple
+Candidate or in-flight releases: none
+```
+
+Cayu Cloud reads the runtime version when it admits a release's source: every image is
+built with `uv sync --frozen` from the source's root `uv.lock`, so the `cayu` version
+that lock pins is the one the release runs. `deployment status` returns it as
+`cayu_runtime` (`version`, `source` and `lock_digest`). Releases admitted before Cloud
+recorded it, or whose lock pins no single `cayu` version, show "not recorded".
+
+`deployment status|logs|timeline|wait` take a release id (`dep_...`) on its own: the CLI
+asks Cloud which Agent the release belongs to, so `--application` is optional for them. A
+Cloud from before that lookup still finds a release an Agent currently selects, and asks
+for `--application` for any other release. `promote`, `discard`, `retry` and `rollback`
+still require `--application`.
 
 ## Initialize an Agent project
 
