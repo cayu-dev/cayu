@@ -13,6 +13,7 @@ import {
   evalComparisonReasonText,
   evalLaunchFailureIsDefinitive,
   evalLaunchNotice,
+  evalProcessLocalIdentityText,
   evalRunCanCancel,
   evalRunHasResult,
   evalRunIsActive,
@@ -486,4 +487,22 @@ test("late scenario settlement cannot clear a new intent after explicit abandonm
   assert.equal(newOwner.keyFor(identity), newKey)
   newOwner.resolve(identity, newKey)
   assert.notEqual(newOwner.keyFor(identity), newKey)
+})
+
+test("process-local comparison diagnostics explain the fix and name components", () => {
+  assert.equal(evalProcessLocalIdentityText([]), null)
+  const text = evalProcessLocalIdentityText(["tool:agent/lookup", "provider:custom"])
+  assert.match(text, /tool agent\/lookup, provider custom/)
+  assert.match(text, /execution_profile_identity/)
+  assert.match(text, /new baseline/)
+  assert.match(evalComparisonReasonText("process_local_execution_identity"), /undeclared/)
+})
+
+test("identity diagnostics explicitly label bounded component previews", () => {
+  assert.match(
+    evalProcessLocalIdentityText(["tool:agent/lookup"], true),
+    /incomplete component preview/,
+  )
+  assert.match(evalProcessLocalIdentityText([], true), /run cayu check/)
+  assert.doesNotMatch(evalProcessLocalIdentityText([], true), /different agent instances/)
 })

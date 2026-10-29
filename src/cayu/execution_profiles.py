@@ -13,6 +13,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictStr,
     field_validator,
     model_validator,
 )
@@ -47,6 +48,67 @@ EXECUTION_PROFILE_SCHEMA_VERSION = 6
 EXECUTION_PROFILE_FINGERPRINT_FIELD = "execution_profile_fingerprint"
 EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS = 4096
 EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS = 256
+
+
+class ProcessLocalExecutionIdentity(BaseModel):
+    """Public-safe diagnostic evidence for undeclared tool/provider behavior.
+
+    A scope commitment explains drift; it never grants execution or comparison
+    authority. The runtime fingerprint remains the authoritative identity.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    component: StrictStr = Field(min_length=1, max_length=1024)
+    process_scope: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("component")
+    @classmethod
+    def validate_component(cls, value: str) -> str:
+        value = require_durable_clean_nonblank(value, "component")
+        if not value.startswith(("tool:", "provider:")):
+            raise ValueError("Execution identity diagnostics require a tool or provider name.")
+        return value
+
+
+PROCESS_LOCAL_IDENTITY_PREVIEW_MAX_ITEMS = 8
+PROCESS_LOCAL_IDENTITY_PREVIEW_MAX_BYTES = 2048
+
+
+def bounded_process_local_identities(
+    identities: Iterable[ProcessLocalExecutionIdentity],
+) -> tuple[tuple[ProcessLocalExecutionIdentity, ...], bool]:
+    """Retain whole component scope sets in a small deterministic name preview.
+
+    Never truncate a component's scope set: doing so could manufacture disjoint
+    scopes during comparison. Diagnostic size is independent of catalogue size.
+    """
+    groups: dict[str, set[ProcessLocalExecutionIdentity]] = {}
+    for identity in identities:
+        groups.setdefault(identity.component, set()).add(identity)
+    selected: tuple[ProcessLocalExecutionIdentity, ...] = ()
+    truncated = False
+    for component in sorted(groups):
+        candidate = selected + tuple(sorted(groups[component], key=lambda item: item.process_scope))
+        material = [item.model_dump(mode="json") for item in candidate]
+        if (
+            len(candidate) > PROCESS_LOCAL_IDENTITY_PREVIEW_MAX_ITEMS
+            or len(canonical_durable_json_bytes(material, "identity preview"))
+            > PROCESS_LOCAL_IDENTITY_PREVIEW_MAX_BYTES
+        ):
+            truncated = True
+            continue
+        selected = candidate
+    return selected, truncated
+
+
+def validate_process_local_identity_preview(
+    identities: tuple[ProcessLocalExecutionIdentity, ...],
+) -> tuple[ProcessLocalExecutionIdentity, ...]:
+    preview, truncated = bounded_process_local_identities(identities)
+    if truncated or preview != identities:
+        raise ValueError("Execution identity preview must be bounded, unique, and sorted.")
+    return identities
 
 
 class ExecutionProfileComponentClass(StrEnum):

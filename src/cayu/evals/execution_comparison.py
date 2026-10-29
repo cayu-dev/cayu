@@ -56,6 +56,7 @@ from cayu.evals.results import (
     eval_result_projection,
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.execution_profiles import ProcessLocalExecutionIdentity
 
 
 class CorpusComparisonReason(StrEnum):
@@ -70,6 +71,7 @@ class CorpusComparisonReason(StrEnum):
     PRICING_PROFILE_FINGERPRINT_MISMATCH = "pricing_profile_fingerprint_mismatch"
     TRIAL_POLICY_REVISION_MISMATCH = "trial_policy_revision_mismatch"
     ACCEPTED_EXPOSURE_CONTRACT_MISMATCH = "accepted_exposure_contract_mismatch"
+    PROCESS_LOCAL_EXECUTION_IDENTITY = "process_local_execution_identity"
     CASE_CONTRACT_MISMATCH = "case_contract_mismatch"
     ASSERTION_CONTRACT_MISMATCH = "assertion_contract_mismatch"
 
@@ -573,6 +575,8 @@ class CorpusComparisonCompatibility(BaseModel):
     current_result_revision: StrictStr
     comparable: StrictBool
     reasons: tuple[CorpusComparisonReason, ...] = ()
+    process_local_components: tuple[StrictStr, ...] = Field(default=(), max_length=8)
+    process_local_components_truncated: StrictBool = False
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -599,6 +603,12 @@ class CorpusComparisonCompatibility(BaseModel):
             raise ValueError("Comparison reasons must be unique and in canonical order.")
         if self.comparable == bool(self.reasons):
             raise ValueError("Comparison comparable state contradicts its reasons.")
+        if bool(self.process_local_components) != (
+            CorpusComparisonReason.PROCESS_LOCAL_EXECUTION_IDENTITY in self.reasons
+        ):
+            raise ValueError("Process-local comparison reason requires component names.")
+        if self.process_local_components != tuple(sorted(set(self.process_local_components))):
+            raise ValueError("Process-local component names must be unique and sorted.")
         return self
 
 
@@ -1117,6 +1127,8 @@ class _ExecutionProjection:
     trial_policy_revision: str
     accepted_exposure_revision: str | None
     accepted_exposure_comparison_revision: str | None
+    process_local_identities: tuple[ProcessLocalExecutionIdentity, ...]
+    process_local_identities_truncated: bool
     uses_pricing: bool
     case_contract: tuple[tuple[str, str], ...]
     assertion_contract: tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]
@@ -1481,6 +1493,8 @@ def _validated_projection(
         trial_policy_revision=projection.trial_policy_revision,
         accepted_exposure_revision=projection.accepted_exposure_revision,
         accepted_exposure_comparison_revision=(projection.accepted_exposure_comparison_revision),
+        process_local_identities=projection.process_local_identities,
+        process_local_identities_truncated=projection.process_local_identities_truncated,
         uses_pricing=projection.uses_pricing,
         case_contract=case_contract,
         assertion_contract=assertion_contract,
@@ -1494,6 +1508,7 @@ def _compatibility_from_projections(
     current: _ExecutionProjection,
 ) -> CorpusComparisonCompatibility:
     reasons: set[CorpusComparisonReason] = set()
+    process_local_components: tuple[str, ...] = ()
     if baseline.target_key != current.target_key:
         reasons.add(CorpusComparisonReason.TARGET_KEY_MISMATCH)
     if baseline.external_target_revision != current.external_target_revision:
@@ -1518,6 +1533,23 @@ def _compatibility_from_projections(
         != current.accepted_exposure_comparison_revision
     ):
         reasons.add(CorpusComparisonReason.ACCEPTED_EXPOSURE_CONTRACT_MISMATCH)
+        # Retain the general mismatch: other execution changes can coexist.
+        # Missing evidence or same-scope changes never prove a restart cause.
+        baseline_scopes: dict[str, set[str]] = {}
+        current_scopes: dict[str, set[str]] = {}
+        for identity in baseline.process_local_identities:
+            baseline_scopes.setdefault(identity.component, set()).add(identity.process_scope)
+        for identity in current.process_local_identities:
+            current_scopes.setdefault(identity.component, set()).add(identity.process_scope)
+        process_local_components = tuple(
+            sorted(
+                component
+                for component in baseline_scopes.keys() & current_scopes.keys()
+                if baseline_scopes[component].isdisjoint(current_scopes[component])
+            )
+        )
+        if process_local_components:
+            reasons.add(CorpusComparisonReason.PROCESS_LOCAL_EXECUTION_IDENTITY)
     if baseline.case_contract != current.case_contract:
         reasons.add(CorpusComparisonReason.CASE_CONTRACT_MISMATCH)
     if baseline.assertion_contract != current.assertion_contract:
@@ -1528,6 +1560,14 @@ def _compatibility_from_projections(
         current_result_revision=current.result_revision,
         comparable=not ordered_reasons,
         reasons=ordered_reasons,
+        process_local_components=process_local_components,
+        process_local_components_truncated=(
+            CorpusComparisonReason.ACCEPTED_EXPOSURE_CONTRACT_MISMATCH in reasons
+            and (
+                baseline.process_local_identities_truncated
+                or current.process_local_identities_truncated
+            )
+        ),
     )
 
 

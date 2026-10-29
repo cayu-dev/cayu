@@ -7611,6 +7611,20 @@
           "title": "Current Result Revision",
           "type": "string"
         },
+        "process_local_components": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Process Local Components",
+          "type": "array"
+        },
+        "process_local_components_truncated": {
+          "default": false,
+          "title": "Process Local Components Truncated",
+          "type": "boolean"
+        },
         "reasons": {
           "default": [],
           "items": {
@@ -7646,6 +7660,7 @@
         "pricing_profile_fingerprint_mismatch",
         "trial_policy_revision_mismatch",
         "accepted_exposure_contract_mismatch",
+        "process_local_execution_identity",
         "case_contract_mismatch",
         "assertion_contract_mismatch"
       ],
@@ -11912,6 +11927,20 @@
             }
           ],
           "title": "Maximum Judge Total Tokens"
+        },
+        "process_local_identities": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/ProcessLocalExecutionIdentity"
+          },
+          "maxItems": 8,
+          "title": "Process Local Identities",
+          "type": "array"
+        },
+        "process_local_identities_truncated": {
+          "default": false,
+          "title": "Process Local Identities Truncated",
+          "type": "boolean"
         },
         "revision": {
           "title": "Revision",
@@ -19321,6 +19350,29 @@
       "title": "PricingResourceMapping",
       "type": "object"
     },
+    "ProcessLocalExecutionIdentity": {
+      "additionalProperties": false,
+      "description": "Public-safe diagnostic evidence for undeclared tool/provider behavior.\n\nA scope commitment explains drift; it never grants execution or comparison\nauthority. The runtime fingerprint remains the authoritative identity.",
+      "properties": {
+        "component": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Component",
+          "type": "string"
+        },
+        "process_scope": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Process Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "process_scope"
+      ],
+      "title": "ProcessLocalExecutionIdentity",
+      "type": "object"
+    },
     "Provenance": {
       "additionalProperties": false,
       "description": "Where model or pricing facts came from and when they were checked.",
@@ -23314,7 +23366,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "69",
+          "default": "71",
           "title": "Contract Version",
           "type": "string"
         },
@@ -30437,7 +30489,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "69",
+          "default": "71",
           "title": "Contract Version",
           "type": "string"
         }

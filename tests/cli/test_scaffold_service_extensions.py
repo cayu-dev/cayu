@@ -71,7 +71,6 @@ def _wire_extension(project, capability):
                 "tools/registration.py": (
                     ("    if False:\n        tools.extend(", "    if True:\n        tools.extend("),
                     ('("remember_knowledge",) if False', '("remember_knowledge",) if True'),
-                    ("    if False\n", "    if True\n"),
                 ),
                 "configuration/storage.py": (
                     ("if not False and knowledge_scope", "if not True and knowledge_scope"),

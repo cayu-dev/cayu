@@ -286,6 +286,8 @@ const COMPARISON_REASON_TEXT: Record<CorpusComparisonReason, string> = {
   trial_policy_revision_mismatch: "The suite trial decision policy changed between runs.",
   accepted_exposure_contract_mismatch:
     "The comparison-relevant execution, maximum work, or cost contract changed between runs.",
+  process_local_execution_identity:
+    "These runs used different agent instances with undeclared tool or provider identities.",
   case_contract_mismatch: "At least one case contract changed between runs.",
   assertion_contract_mismatch: "At least one assertion contract changed between runs.",
 }
@@ -330,4 +332,18 @@ export function evalErrorMessage(error: unknown, fallback: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+export function evalProcessLocalIdentityText(
+  components: readonly string[],
+  truncated = false,
+): string | null {
+  if (!components.length && !truncated) return null
+  const names = components.map((component) => component.replace(/^(tool|provider):/, "$1 "))
+  const cause = components.length
+    ? `These runs used different agent instances, for example after a restart or deploy. Stable execution identities are missing for ${names.join(", ")}. Declare their execution_profile_identity, then run and approve a new baseline. Other contract differences may also apply.`
+    : "Some execution identity details could not be included in this comparison."
+  return truncated
+    ? `${cause} This is an incomplete component preview; run cayu check for all missing declarations.`
+    : cause
 }

@@ -2431,6 +2431,56 @@ the complete effective request and enforces target ceilings again during
 compilation and execution. Tool-effect metadata neither grants nor denies
 authority.
 
+### Comparing baselines across restarts and deploys
+
+A custom tool or model provider needs a stable execution identity for its eval
+runs to remain comparable after the agent restarts. Without one, Cayu binds its
+behavior to the current agent instance. Runs in that instance can compare, but
+a new instance cannot prove that the undeclared behavior stayed the same and
+safely refuses the comparison. `cayu check` names these components with the
+`EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL` warning. Comparison results retain the
+general exposure mismatch and add `process_local_execution_identity` with the
+component names when recorded process scopes differ.
+
+For a custom tool, declare the identity on its `ToolSpec`:
+
+```python
+from cayu import ToolSpec
+from cayu.runtime import ExecutionProfileBehaviorIdentity
+
+spec = ToolSpec(
+    name="lookup",
+    description="Look up a record",
+    input_schema={"type": "object", "additionalProperties": False},
+    execution_profile_identity=ExecutionProfileBehaviorIdentity(
+        name="my-agent:lookup",
+        behavior_version="1",
+        implementation_version="1",
+    ),
+)
+```
+
+Run comparisons show a bounded preview of affected components. If it is incomplete,
+run `cayu check` to see all missing declarations. This preview never replaces the
+full runtime fingerprint or permits comparison across an incompatible contract.
+
+For a custom provider, override its `execution_profile_identity` property to
+return an `ExecutionProfileBehaviorIdentity` with the provider's own name and
+versions. Keep the same declaration across restarts of the same implementation;
+change `implementation_version` when its implementation changes, and
+`behavior_version` when its observable behavior changes. These declarations
+are assertions you maintain, not automatic hashes of your code. Cayu's supported
+built-in adapters can supply runtime-owned identities; custom subclasses and
+opaque wrappers may still need declarations.
+
+After adding identities, run the suite again and approve a new baseline. This
+does not make previously recorded undeclared runs comparable retroactively.
+Other execution, evidence, work-limit, pricing, or private target-material
+changes can still make two runs incompatible; declaring an identity does not
+bypass those checks. Private configuration can also remain process-bound for
+confidentiality even when behavior identities are declared.
+
+
 Every fresh launch also carries the execution-profile revision shown by its
 server preflight. HTTP can select that exact revision and narrow its published
 ceilings; it cannot submit or alter provider, model, environment, fixture,

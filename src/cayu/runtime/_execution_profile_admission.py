@@ -271,17 +271,12 @@ def resolve_execution_profile_identity(
     tool_implementations_process_local = False
     tool_implementations_application_versioned = False
     for index, tool in enumerate(registered_agent.tools.values()):
-        profile_tool = runtime_replay_profile_source(tool.tool)
-        entry, process_local = _behavior_identity_material(
-            identity=tool.execution_profile_identity,
-            value=profile_tool,
+        entry, process_local = tool_execution_behavior_material(
+            tool,
+            index=index,
             runtime_version=runtime_version,
             process_identity=process_identity,
-            slot=f"tool:{index}:{tool.name}",
-            cayu_owned_material=_secret_safe_cayu_owned_material(
-                _cayu_tool_material(profile_tool),
-                redactor=redactor,
-            ),
+            redactor=redactor,
         )
         implementation_material = {"implementation": entry}
         if tool.effect_reconciler is not None:
@@ -960,6 +955,72 @@ def prepare_execution_profile_continuation(
             candidate,
         ),
         model_failover=model_failover,
+    )
+
+
+def tool_execution_behavior_material(
+    tool: runtime_records.RegisteredTool,
+    *,
+    index: int,
+    runtime_version: str | None,
+    process_identity: str,
+    redactor: SecretRedactor,
+) -> tuple[dict[str, Any], bool]:
+    """Single runtime classification used by admission and read-only diagnostics."""
+    profile_tool = runtime_replay_profile_source(tool.tool)
+    return _behavior_identity_material(
+        identity=tool.execution_profile_identity,
+        value=profile_tool,
+        runtime_version=runtime_version,
+        process_identity=process_identity,
+        slot=f"tool:{index}:{tool.name}",
+        cayu_owned_material=_secret_safe_cayu_owned_material(
+            _cayu_tool_material(profile_tool),
+            redactor=redactor,
+        ),
+    )
+
+
+def undeclared_execution_identity_components(
+    *,
+    registered_agent: runtime_records.RegisteredAgentState | None,
+    registered_provider: runtime_records.RegisteredProvider | None,
+    runtime_version: str | None,
+    process_identity: str,
+    redactor: SecretRedactor,
+) -> tuple[tuple[str, str], ...]:
+    """Public registration names and scope commitments, never implementation material.
+
+    Only positive `process_local_unverifiable` evidence qualifies. Private built-in
+    configuration is a different cause and must not be called a missing declaration.
+    """
+    entries: list[tuple[str, dict[str, Any]]] = []
+    if registered_agent is not None:
+        for index, tool in enumerate(registered_agent.tools.values()):
+            material, _ = tool_execution_behavior_material(
+                tool,
+                index=index,
+                runtime_version=runtime_version,
+                process_identity=process_identity,
+                redactor=redactor,
+            )
+            entries.append((f"tool:{registered_agent.spec.name}/{tool.name}", material))
+    if registered_provider is not None:
+        material, _, _ = _provider_adapter_material(
+            registered_provider=registered_provider,
+            provider_name=registered_provider.name,
+            runtime_version=runtime_version,
+            process_identity=process_identity,
+            redactor=redactor,
+        )
+        entries.append((f"provider:{registered_provider.name}", material))
+    return tuple(
+        sorted(
+            (name, material["process_scope"])
+            for name, material in entries
+            if material.get("kind") == "process_local_unverifiable"
+            and redactor.redact_text(name) == name
+        )
     )
 
 

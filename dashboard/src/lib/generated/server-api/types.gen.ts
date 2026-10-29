@@ -4812,6 +4812,14 @@ export type CorpusComparisonCompatibility = {
      */
     current_result_revision: string;
     /**
+     * Process Local Components
+     */
+    process_local_components?: Array<string>;
+    /**
+     * Process Local Components Truncated
+     */
+    process_local_components_truncated?: boolean;
+    /**
      * Reasons
      */
     reasons?: Array<CorpusComparisonReason>;
@@ -4826,7 +4834,7 @@ export type CorpusComparisonCompatibility = {
  *
  * Stable reason that two published executions cannot be compared as one contract.
  */
-export type CorpusComparisonReason = 'target_key_mismatch' | 'external_target_revision_mismatch' | 'corpus_revision_mismatch' | 'suite_id_mismatch' | 'suite_revision_mismatch' | 'evidence_policy_revision_mismatch' | 'pricing_profile_fingerprint_mismatch' | 'trial_policy_revision_mismatch' | 'accepted_exposure_contract_mismatch' | 'case_contract_mismatch' | 'assertion_contract_mismatch';
+export type CorpusComparisonReason = 'target_key_mismatch' | 'external_target_revision_mismatch' | 'corpus_revision_mismatch' | 'suite_id_mismatch' | 'suite_revision_mismatch' | 'evidence_policy_revision_mismatch' | 'pricing_profile_fingerprint_mismatch' | 'trial_policy_revision_mismatch' | 'accepted_exposure_contract_mismatch' | 'process_local_execution_identity' | 'case_contract_mismatch' | 'assertion_contract_mismatch';
 
 /**
  * CorpusComparisonResultSummary
@@ -7048,6 +7056,14 @@ export type EvalExecutionProfileV1 = {
      * Label
      */
     label: string;
+    /**
+     * Process Local Identities
+     */
+    process_local_identities?: Array<ProcessLocalExecutionIdentity>;
+    /**
+     * Process Local Identities Truncated
+     */
+    process_local_identities_truncated?: boolean;
     /**
      * Profile Id
      */
@@ -9965,6 +9981,14 @@ export type EvalSuiteRunExposureV1 = {
      * Maximum Judge Total Tokens
      */
     maximum_judge_total_tokens?: number | null;
+    /**
+     * Process Local Identities
+     */
+    process_local_identities?: Array<ProcessLocalExecutionIdentity>;
+    /**
+     * Process Local Identities Truncated
+     */
+    process_local_identities_truncated?: boolean;
     /**
      * Revision
      */
@@ -16302,6 +16326,25 @@ export type ProcessEventsInOrderAssertionSpec = {
      * Kind
      */
     kind?: 'process_events_in_order';
+};
+
+/**
+ * ProcessLocalExecutionIdentity
+ *
+ * Public-safe diagnostic evidence for undeclared tool/provider behavior.
+ *
+ * A scope commitment explains drift; it never grants execution or comparison
+ * authority. The runtime fingerprint remains the authoritative identity.
+ */
+export type ProcessLocalExecutionIdentity = {
+    /**
+     * Component
+     */
+    component: string;
+    /**
+     * Process Scope
+     */
+    process_scope: string;
 };
 
 /**

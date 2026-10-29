@@ -610,3 +610,23 @@ time, so work running in the background during a request, such as an agent
 run, is charged to it. Measure idle cost while no agent work is running.
 Timing adds about 15 microseconds of CPU per request (measured on an Apple M1
 Pro with Python 3.14), under 0.1% of one CPU at 50 requests per second.
+
+## EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL
+
+A registered tool or model provider has no stable execution identity. Its eval
+baselines can compare within the same agent instance, but cannot prove unchanged
+behavior after a restart or deploy. The warning names each affected component.
+
+For tools, set `ToolSpec(execution_profile_identity=ExecutionProfileBehaviorIdentity(...))`.
+For providers, return that declaration from the provider's
+`execution_profile_identity` property. Import `ExecutionProfileBehaviorIdentity`
+from `cayu.runtime`; supply a stable `name`, `behavior_version`, and
+`implementation_version`. Keep versions stable for identical implementations;
+update them when their respective contracts change. Then run and approve a new
+baseline. Existing undeclared baselines are not retroactively repaired, and
+other compatibility checks still apply.
+
+Verify with `cayu check --json`. The warning does not block the default check;
+`--fail-on warning` treats it as a failure. Source import-safety checks still run
+before the agent is loaded. Names come from booted registration evidence;
+loading a serialized manifest alone cannot establish this diagnostic.

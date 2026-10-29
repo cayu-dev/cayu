@@ -120,7 +120,11 @@ def test_maintained_wrapper_preserves_exact_base_coverage(kind):
     tools = {tool.name: tool for tool in manifest.agents[0].tools}
     assert (tools["write_file"].policy_coverage, tools["run_command"].policy_coverage) == expected
     assert tools["write_file"].parameter_policy_decision == ("deny" if kind == "rules" else None)
-    assert AppManifest.model_validate_json(manifest.model_dump_json()) == manifest
+    # Booted diagnostic evidence is intentionally private and not reconstructed.
+    assert (
+        AppManifest.model_validate_json(manifest.model_dump_json()).model_dump()
+        == manifest.model_dump()
+    )
     diagnostics = check_manifest(manifest).diagnostics
     assert sum(d.code == "EXTERNAL_TOOL_COVERAGE_UNKNOWN" for d in diagnostics) == (
         2

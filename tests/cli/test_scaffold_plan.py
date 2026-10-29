@@ -240,8 +240,14 @@ def test_recovery_opt_out_changes_the_generated_runtime_profile() -> None:
     assert {
         "environments/local.py",
         "policies/tools.py",
-        "tools/registration.py",
     } <= changed
+    # Recovery changes policy/environment guarantees, not the tool's declared
+    # behavior identity, which also supports eval comparison without recovery.
+    assert selected["tools/registration.py"] == excluded["tools/registration.py"]
+    assert (
+        "_REMEMBER_KNOWLEDGE_IDENTITY = ExecutionProfileBehaviorIdentity("
+        in excluded["tools/registration.py"]
+    )
     for path in (
         "environments/local.py",
         "policies/tools.py",

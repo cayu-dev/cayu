@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictFloat,
     StrictInt,
     StrictStr,
@@ -22,6 +23,10 @@ from pydantic import (
 from cayu._eval_limits import EVAL_SUITE_MAX_CONCURRENCY
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
+from cayu.execution_profiles import (
+    ProcessLocalExecutionIdentity,
+    validate_process_local_identity_preview,
+)
 
 EVAL_SUITE_TRIAL_POLICY_SCHEMA_VERSION = 1
 EVAL_SUITE_RUN_EXPOSURE_SCHEMA_VERSION = 1
@@ -441,6 +446,15 @@ class EvalSuiteRunExposureV1(_PortablePolicyModel):
         min_length=1,
         max_length=1_000,
     )
+    process_local_identities: tuple[ProcessLocalExecutionIdentity, ...] = Field(
+        default=(), max_length=8
+    )
+    process_local_identities_truncated: StrictBool = False
+
+    _validate_identity_preview = field_validator("process_local_identities")(
+        validate_process_local_identity_preview
+    )
+
     judge_profiles: tuple[EvalJudgeProfileExposureV1, ...] = Field(default=(), max_length=64)
     candidate_trials: StrictInt = Field(ge=1, le=100_000)
     judge_evaluations: StrictInt = Field(ge=0, le=6_400_000)
@@ -555,7 +569,10 @@ class EvalSuiteRunExposureV1(_PortablePolicyModel):
         validated = EvalSuiteRunExposureV1.model_validate(
             self.model_dump(mode="python", round_trip=True, warnings="none")
         )
-        material = validated.model_dump(mode="json", exclude={"revision"})
+        material = validated.model_dump(
+            mode="json",
+            exclude={"revision", "process_local_identities", "process_local_identities_truncated"},
+        )
         material["execution_profiles"] = [
             {
                 "case_ids": list(item.case_ids),

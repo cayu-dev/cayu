@@ -50,6 +50,10 @@ from cayu.evals.published import (
 )
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.execution_profiles import (
+    ProcessLocalExecutionIdentity,
+    validate_process_local_identity_preview,
+)
 
 CAPTURED_EVALUATION_RESULT_SCHEMA_VERSION = 1
 CAPTURED_EVALUATION_RESULT_MAX_BYTES = 4 << 20
@@ -361,6 +365,14 @@ class EvalResultProjectionV2(EvalResultProjectionV1):
     trial_policy_revision: StrictStr
     accepted_exposure_revision: StrictStr | None = None
     accepted_exposure_comparison_revision: StrictStr | None = None
+    process_local_identities: tuple[ProcessLocalExecutionIdentity, ...] = Field(
+        default=(), max_length=8
+    )
+    process_local_identities_truncated: StrictBool = False
+
+    _validate_identity_preview = field_validator("process_local_identities")(
+        validate_process_local_identity_preview
+    )
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -382,6 +394,10 @@ class EvalResultProjectionV2(EvalResultProjectionV1):
 
     @model_validator(mode="after")
     def validate_exposure_origin(self) -> EvalResultProjectionV2:
+        if (
+            self.process_local_identities or self.process_local_identities_truncated
+        ) and self.accepted_exposure_revision is None:
+            raise ValueError("Process-local diagnostics require accepted execution exposure.")
         if (self.accepted_exposure_revision is None) != (
             self.accepted_exposure_comparison_revision is None
         ):
@@ -518,6 +534,16 @@ def eval_result_projection(
             ),
             accepted_exposure_comparison_revision=(
                 None if run.accepted_exposure is None else run.accepted_exposure.comparison_revision
+            ),
+            process_local_identities=(
+                ()
+                if run.accepted_exposure is None
+                else run.accepted_exposure.process_local_identities
+            ),
+            process_local_identities_truncated=(
+                False
+                if run.accepted_exposure is None
+                else run.accepted_exposure.process_local_identities_truncated
             ),
             uses_pricing=any(
                 assertion.detail.kind == "max_estimated_cost"

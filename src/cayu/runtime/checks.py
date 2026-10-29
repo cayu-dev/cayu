@@ -28,6 +28,7 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
     "AGENT_WORKFLOW_WORKSPACE_NOT_REGISTERED",
     "APP_NO_AGENTS",
+    "EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
     "EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
     "EVALS_PROJECT_STORE_NOT_CONFIGURED",
     "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED",
@@ -156,7 +157,20 @@ def check_manifest(
         names = ", ".join(sorted(unknown))
         raise ValueError(f"Unknown check tags: {names}.")
 
-    diagnostics: list[ProjectDiagnostic] = []
+    diagnostics: list[ProjectDiagnostic] = [
+        ProjectDiagnostic(
+            code="EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
+            severity=DiagnosticSeverity.WARNING,
+            subject=component,
+            path=f"{component}.execution_profile_identity",
+            message=f"{component} has no stable execution identity; eval baselines cannot be compared across agent restarts or deploys.",
+            hint="Declare execution_profile_identity=ExecutionProfileBehaviorIdentity(name=..., behavior_version=..., implementation_version=...) on ToolSpec, or expose the same identity from the provider execution_profile_identity property. Then run and approve a new baseline.",
+            tags=("authoring", "configuration", "deploy"),
+            documentation_anchor="cayu guide diagnostics#eval-execution-identity-process-local",
+            verification_command="cayu check --json",
+        )
+        for component in manifest._undeclared_execution_identities
+    ]
     if service_manifest is not None:
         diagnostics.extend(_check_public_service(service_manifest))
     if not manifest.agents:

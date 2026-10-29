@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from cayu.cli.scaffold_check import _check_import_inertness
@@ -156,8 +158,12 @@ def test_generated_composed_service(tmp_path):
     import subprocess
     import sys
 
+    from tests.cli.test_check_execution_identity import assert_subscription_identity_warning
+
+    import cayu
+
     environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
+    environment["PYTHONPATH"] = str(Path(cayu.__file__).resolve().parent.parent)
     environment["PRODUCT_AUTH_TOKENS_JSON"] = json.dumps(
         {"test-token": {"tenant_id": "test", "subject_id": "test"}}
     )
@@ -196,7 +202,7 @@ def test_generated_composed_service(tmp_path):
     registration = project / "agents/registration.py"
     registration.write_text("from tools.example import Example\n" + registration.read_text())
     check = ("check", "--deploy", "--fail-on", "warning", "--json")
-    assert json.loads(cli(*check, cwd=project))["diagnostics"] == []
+    assert_subscription_identity_warning(json.loads(cli(*check, cwd=project, expected=1)))
     marker = project / "executed"
     with (project / "domain/base.py").open("a") as stream:
         stream.write(f"    value: \"(open({str(marker)!r}, 'w').write('effect'), str)[1]\"\n")

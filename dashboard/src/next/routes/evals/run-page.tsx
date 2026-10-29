@@ -23,7 +23,11 @@ import {
   selectEvalBaseline,
   submitEvalScenarioApproval,
 } from "@/lib/api"
-import { evalRunCanCancel, evalRunIsActive } from "@/lib/evals-dashboard"
+import {
+  evalProcessLocalIdentityText,
+  evalRunCanCancel,
+  evalRunIsActive,
+} from "@/lib/evals-dashboard"
 import { evalResultRevisionIsValid } from "@/lib/evals-search"
 import type { EvalCaseResultView, EvalScenarioTrialProgress } from "@/lib/generated/server-api"
 import { fetchRunView, fetchSuiteView } from "../../api/eval-views"
@@ -560,6 +564,15 @@ export function EvalRunViewPage() {
             <LoadState error={history.error} pending={false} retry={history.refetch} />
             <p className="mt-2 text-xs text-muted-foreground">
               {comparisonLabel(detail.comparison)}
+              {detail.comparison.compatibility?.process_local_components?.length ||
+              detail.comparison.compatibility?.process_local_components_truncated ? (
+                <span className="mt-2 block break-words">
+                  {evalProcessLocalIdentityText(
+                    detail.comparison.compatibility.process_local_components ?? [],
+                    detail.comparison.compatibility.process_local_components_truncated,
+                  )}
+                </span>
+              ) : null}
               {detail.comparison.unavailable_reasons?.length
                 ? ` · ${detail.comparison.unavailable_reasons.join(" · ").replaceAll("_", " ")}`
                 : ""}

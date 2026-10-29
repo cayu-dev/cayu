@@ -9,7 +9,11 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import type { EvalResultComparison, EvalResultSummary } from "@/lib/api"
-import { evalComparisonReasonText, shortEvalIdentity } from "@/lib/evals-dashboard"
+import {
+  evalComparisonReasonText,
+  evalProcessLocalIdentityText,
+  shortEvalIdentity,
+} from "@/lib/evals-dashboard"
 import { formatCount, formatDateTime } from "@/lib/format"
 import type {
   CorpusReliabilityDistributionV1,
@@ -45,6 +49,15 @@ export function ComparisonSummary({ comparison }: { comparison: EvalResultCompar
             ? "These results are comparable."
             : "These results are not comparable as one regression contract."}
         </div>
+        {compatibility.process_local_components?.length ||
+        compatibility.process_local_components_truncated ? (
+          <p className="mt-2 break-words">
+            {evalProcessLocalIdentityText(
+              compatibility.process_local_components ?? [],
+              compatibility.process_local_components_truncated,
+            )}
+          </p>
+        ) : null}
         {!compatibility.comparable && reasons.length > 0 && (
           <ul className="mt-2 list-disc space-y-1 pl-5">
             {reasons.map((reason) => (

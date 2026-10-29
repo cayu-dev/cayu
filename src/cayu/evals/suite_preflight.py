@@ -30,6 +30,7 @@ from cayu.evals.trial_policy import (
     EvalSuiteRunExposureV1,
     EvalSuiteTrialPolicyV1,
 )
+from cayu.execution_profiles import bounded_process_local_identities
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,7 +221,29 @@ def compile_authored_suite_run_exposure(
             pricing_profile_fingerprints=tuple(sorted(judge_pricing)),
         )
 
+    # A truncated profile cannot establish absence of a component. Only retain
+    # names whose complete scope set is represented across every launch.
+    profiles = tuple(launch.execution_profile for launch in launches)
+    candidates = {
+        item.component for profile in profiles for item in profile.process_local_identities
+    }
+    for profile in profiles:
+        if profile.process_local_identities_truncated:
+            candidates.intersection_update(
+                item.component for item in profile.process_local_identities
+            )
+    identity_preview, preview_truncated = bounded_process_local_identities(
+        item
+        for profile in profiles
+        for item in profile.process_local_identities
+        if item.component in candidates
+    )
     return EvalSuiteRunExposureV1.create(
+        process_local_identities=identity_preview,
+        process_local_identities_truncated=(
+            preview_truncated
+            or any(profile.process_local_identities_truncated for profile in profiles)
+        ),
         selection_revision=selected.revision,
         trial_policy_revision=policy.revision,
         execution_profiles=tuple(

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.cli.test_check_execution_identity import assert_subscription_identity_warning
 
 from cayu.cli import main
 from cayu.cli.scaffold_check import _check_import_inertness
@@ -180,8 +181,8 @@ def test_generated_service_accepts_exception_and_tool_hierarchies(
     )
     monkeypatch.setenv("CAYU_OPERATOR_BEARER_TOKEN", "probe-operator-token")
     check = ["check", "--deploy", "--fail-on", "warning", "--json"]
-    assert main(check) == 0
-    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+    assert main(check) == 1
+    assert_subscription_identity_warning(json.loads(capsys.readouterr().out))
     _write_modules(
         project,
         {
@@ -190,8 +191,8 @@ def test_generated_service_accepts_exception_and_tool_hierarchies(
             "class RecoveryBlocked(ApplicationError):\n    pass\n"
         },
     )
-    assert main(check) == 0
-    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+    assert main(check) == 1
+    assert_subscription_identity_warning(json.loads(capsys.readouterr().out))
     _write_modules(
         project,
         {
@@ -201,8 +202,8 @@ def test_generated_service_accepts_exception_and_tool_hierarchies(
             "    async def run(self, args, ctx):\n        return 'lessons'\n",
         },
     )
-    assert main(check) == 0
-    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+    assert main(check) == 1
+    assert_subscription_identity_warning(json.loads(capsys.readouterr().out))
 
 
 @pytest.mark.parametrize(

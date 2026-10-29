@@ -123,6 +123,7 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
         "AGENT_WORKFLOW_WORKSPACE_NOT_REGISTERED",
         "APP_NO_AGENTS",
+        "EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
         "EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
         "EVALS_PROJECT_STORE_NOT_CONFIGURED",
         "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED",
@@ -198,8 +199,13 @@ def test_workflow_tool_references_must_match_that_agents_registered_tools() -> N
     assert [item.code for item in report.diagnostics] == [
         "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
         "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
+        *(["EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL"] * 4),
     ]
-    assert [item.parameters["workflow_tool"] for item in report.diagnostics] == [
+    assert [
+        item.parameters["workflow_tool"]
+        for item in report.diagnostics
+        if item.code == "AGENT_WORKFLOW_TOOL_NOT_REGISTERED"
+    ] == [
         "read_file",
         "write_file",
     ]
@@ -405,8 +411,11 @@ def test_unconstrained_tool_schema_is_an_actionable_authoring_warning() -> None:
 
     report = check_manifest(app.describe())
 
-    assert [item.code for item in report.diagnostics] == ["TOOL_INPUT_SCHEMA_UNCONSTRAINED"]
-    finding = report.diagnostics[0]
+    assert [item.code for item in report.diagnostics] == [
+        "EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
+        "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
+    ]
+    finding = report.diagnostics[1]
     assert finding.severity == "warning"
     assert finding.path == "agents.researcher.tools.lookup.input_schema"
     assert finding.tags == ("authoring", "deploy")
@@ -720,9 +729,10 @@ def test_external_tool_requires_effective_policy_coverage_for_that_tool() -> Non
 
     assert [item.code for item in report.diagnostics] == [
         "AGENT_PROVIDER_NOT_FOUND",
+        "EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
         "EXTERNAL_TOOL_UNGUARDED",
     ]
-    finding = report.diagnostics[1]
+    finding = report.diagnostics[2]
     assert finding.parameters["coverage"] == "allowed"
     assert finding.verification_command == "cayu inspect --json && cayu check --deploy --json"
 
@@ -733,7 +743,8 @@ def test_external_tool_requires_effective_policy_coverage_for_that_tool() -> Non
         tool_policy=AlwaysRequireApprovalToolPolicy(tools=["send"]),
     )
     assert [item.code for item in check_manifest(covered.describe()).diagnostics] == [
-        "AGENT_PROVIDER_NOT_FOUND"
+        "AGENT_PROVIDER_NOT_FOUND",
+        "EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
     ]
 
     conditional = CayuApp(enable_logging=False)
@@ -743,7 +754,8 @@ def test_external_tool_requires_effective_policy_coverage_for_that_tool() -> Non
         tool_policy=ParameterConstrainedToolPolicy({"send": [RequiredFieldRule("recipient")]}),
     )
     assert [item.code for item in check_manifest(conditional.describe()).diagnostics] == [
-        "AGENT_PROVIDER_NOT_FOUND"
+        "AGENT_PROVIDER_NOT_FOUND",
+        "EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
     ]
 
 
@@ -761,9 +773,10 @@ def test_custom_policy_subclasses_are_not_described_as_trusted_builtins() -> Non
     assert manifest.agents[0].tools[0].policy_coverage == "unknown"
     assert [item.code for item in report.diagnostics] == [
         "AGENT_PROVIDER_NOT_FOUND",
+        "EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
         "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
     ]
-    finding = report.diagnostics[1]
+    finding = report.diagnostics[2]
     assert finding.severity == "error"
     assert finding.parameters["coverage"] == "unknown"
     assert "statically describable policy" in finding.hint

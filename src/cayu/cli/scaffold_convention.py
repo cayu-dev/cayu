@@ -150,6 +150,7 @@ from cayu.providers import (
 )
 from cayu import CayuApp
 from cayu.evals import ScriptedModelProvider
+from cayu.runtime import ExecutionProfileBehaviorIdentity
 
 from configuration.settings import (
     configured_anthropic_api_key,
@@ -173,6 +174,14 @@ class _ScaffoldPlaceholderProvider(ScriptedModelProvider):
     def __init__(self, *, name: str, setup_error: str) -> None:
         super().__init__([], name=name)
         self._setup_error = setup_error
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="__PROJECT_NAME__.provider.setup-required",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     def preflight_model_target(self, *, model: str) -> None:
         del model
@@ -600,14 +609,10 @@ from cayu import Tool
 
 from knowledge.retrieval import KNOWLEDGE_NAMESPACE
 
-_REMEMBER_KNOWLEDGE_IDENTITY = (
-    ExecutionProfileBehaviorIdentity(
-        name="__PROJECT_NAME__.standard.remember_knowledge",
-        behavior_version="1",
-        implementation_version="1",
-    )
-    if __RECOVERY_ENABLED__
-    else None
+_REMEMBER_KNOWLEDGE_IDENTITY = ExecutionProfileBehaviorIdentity(
+    name="__PROJECT_NAME__.standard.remember_knowledge",
+    behavior_version="1",
+    implementation_version="1",
 )
 
 

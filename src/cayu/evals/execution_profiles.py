@@ -11,6 +11,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StrictStr,
     field_validator,
@@ -40,6 +41,9 @@ from cayu.evals.execution import (
 )
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
+    ProcessLocalExecutionIdentity,
+    bounded_process_local_identities,
+    validate_process_local_identity_preview,
 )
 from cayu.sessions.requests import copy_run_request
 
@@ -261,6 +265,14 @@ class EvalExecutionProfileV1(BaseModel):
     app_manifest_fingerprint: StrictStr = Field(min_length=64, max_length=64)
     candidate: EvalExecutionCandidateIdentityV1
     target_material: EvalExecutionTargetMaterialIdentityV1
+    process_local_identities: tuple[ProcessLocalExecutionIdentity, ...] = Field(
+        default=(), max_length=8
+    )
+    process_local_identities_truncated: StrictBool = False
+
+    _validate_identity_preview = field_validator("process_local_identities")(
+        validate_process_local_identity_preview
+    )
     fixture_strategy: Literal["none", "application_managed"]
     reset_strategy: Literal["fresh_session_only", "application_managed"]
     effect_posture: Literal[
@@ -329,6 +341,8 @@ class EvalExecutionProfileV1(BaseModel):
                 "source",
                 "application_release_id",
                 "app_manifest_fingerprint",
+                "process_local_identities",
+                "process_local_identities_truncated",
             },
         )
         return _revision(material, _EVAL_EXECUTION_PROFILE_COMPARISON_DOMAIN)
@@ -345,6 +359,8 @@ class EvalExecutionProfileV1(BaseModel):
         app_manifest_fingerprint: str,
         candidate: EvalExecutionCandidateIdentityV1,
         target_material: EvalExecutionTargetMaterialIdentityV1,
+        process_local_identities: tuple[ProcessLocalExecutionIdentity, ...] = (),
+        process_local_identities_truncated: bool = False,
         fixture_strategy: Literal["none", "application_managed"],
         reset_strategy: Literal["fresh_session_only", "application_managed"],
         effect_posture: Literal[
@@ -366,6 +382,8 @@ class EvalExecutionProfileV1(BaseModel):
             app_manifest_fingerprint=app_manifest_fingerprint,
             candidate=candidate,
             target_material=target_material,
+            process_local_identities=process_local_identities,
+            process_local_identities_truncated=process_local_identities_truncated,
             fixture_strategy=fixture_strategy,
             reset_strategy=reset_strategy,
             effect_posture=effect_posture,
@@ -513,6 +531,34 @@ async def prepare_eval_execution_profile(
     runtime_profile = ExecutionProfileIdentity.model_validate(
         prepared.execution_profile.model_dump(mode="json")
     )
+    from cayu.runtime._execution_profile_admission import undeclared_execution_identity_components
+
+    component_evidence = set(
+        undeclared_execution_identity_components(
+            registered_agent=prepared.registered_agent,
+            registered_provider=prepared.registered_provider,
+            runtime_version=prepared.session_identity.runtime_version,
+            process_identity=target.app._execution_profile_process_identity,
+            redactor=target.app._secret_redactor,
+        )
+    )
+    if runtime_profile.model_failover is not None:
+        for candidate in runtime_profile.model_failover.plan.candidates:
+            component_evidence.update(
+                undeclared_execution_identity_components(
+                    registered_agent=None,
+                    registered_provider=target.app._provider_registry.registrations[
+                        candidate.provider_name
+                    ],
+                    runtime_version=prepared.session_identity.runtime_version,
+                    process_identity=target.app._execution_profile_process_identity,
+                    redactor=target.app._secret_redactor,
+                )
+            )
+    process_local_identities, identities_truncated = bounded_process_local_identities(
+        ProcessLocalExecutionIdentity(component=name, process_scope=scope)
+        for name, scope in component_evidence
+    )
     snapshot = EvalExecutionProfileV1.create(
         profile_id=profile_id,
         label=label,
@@ -529,6 +575,8 @@ async def prepare_eval_execution_profile(
             runtime_execution_profile_fingerprint=runtime_profile.fingerprint,
         ),
         target_material=_eval_execution_target_material_identity(target),
+        process_local_identities=process_local_identities,
+        process_local_identities_truncated=identities_truncated,
         fixture_strategy=policy.fixture_strategy,
         reset_strategy=policy.reset_strategy,
         effect_posture=policy.effect_posture,

@@ -44,7 +44,7 @@
       },
       "execution_profile": {
         "schema_version": 1,
-        "revision": "sha256:047060657586a0c0ce0984ece68bbd0425088c745d9d7d8329f46cc2b9c0f881",
+        "revision": "sha256:edb6b16ee51fa219acc566e52ca06ba6cbe575fe2f311c5ee20c15bf680e40e2",
         "profile_id": "explicit",
         "label": "agent · Explicit",
         "source": "explicit",
@@ -65,6 +65,8 @@
           "fingerprint": "980a32e5350fea0534c16f41a9858f9c89f3287eaab76bdb056c0e74da690f89",
           "process_scope": null
         },
+        "process_local_identities": [],
+        "process_local_identities_truncated": false,
         "fixture_strategy": "none",
         "reset_strategy": "fresh_session_only",
         "effect_posture": "ordinary_application_authority",
@@ -105,7 +107,7 @@
       },
       "execution_profile_binding": {
         "schema_version": 1,
-        "profile_revision": "sha256:047060657586a0c0ce0984ece68bbd0425088c745d9d7d8329f46cc2b9c0f881",
+        "profile_revision": "sha256:edb6b16ee51fa219acc566e52ca06ba6cbe575fe2f311c5ee20c15bf680e40e2",
         "runtime_execution_profile": {
           "schema_version": 6,
           "fingerprint": "c5e7526a42a89db4e36a86f9bf2d2655bc3a4c4dc56da9219e01947d5cba0f3e",
@@ -305,7 +307,7 @@
       },
       "execution_profile": {
         "schema_version": 1,
-        "revision": "sha256:047060657586a0c0ce0984ece68bbd0425088c745d9d7d8329f46cc2b9c0f881",
+        "revision": "sha256:edb6b16ee51fa219acc566e52ca06ba6cbe575fe2f311c5ee20c15bf680e40e2",
         "profile_id": "explicit",
         "label": "agent · Explicit",
         "source": "explicit",
@@ -326,6 +328,8 @@
           "fingerprint": "980a32e5350fea0534c16f41a9858f9c89f3287eaab76bdb056c0e74da690f89",
           "process_scope": null
         },
+        "process_local_identities": [],
+        "process_local_identities_truncated": false,
         "fixture_strategy": "none",
         "reset_strategy": "fresh_session_only",
         "effect_posture": "ordinary_application_authority",
@@ -366,7 +370,7 @@
       },
       "execution_profile_binding": {
         "schema_version": 1,
-        "profile_revision": "sha256:047060657586a0c0ce0984ece68bbd0425088c745d9d7d8329f46cc2b9c0f881",
+        "profile_revision": "sha256:edb6b16ee51fa219acc566e52ca06ba6cbe575fe2f311c5ee20c15bf680e40e2",
         "runtime_execution_profile": {
           "schema_version": 6,
           "fingerprint": "c5e7526a42a89db4e36a86f9bf2d2655bc3a4c4dc56da9219e01947d5cba0f3e",

@@ -477,6 +477,9 @@ class AppManifest(_ManifestModel):
     schema_version: Literal["17"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
+    # Booted runtime evidence only; JSON manifests cannot establish this fact.
+    _undeclared_execution_identities: tuple[str, ...] = PrivateAttr(default=())
+
     providers: tuple[ProviderManifest, ...]
     environments: tuple[EnvironmentManifest, ...]
     stores: StoreManifest
@@ -677,6 +680,33 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
             tool._policy_allows_explicitly = (agent.name, tool.name) in explicit
             tool._terminal_payload_bound_undeclared = (agent.name, tool.name) in unbounded
             tool._knowledge_store_unavailable = (agent.name, tool.name) in without_knowledge
+    from cayu.runtime._execution_profile_admission import undeclared_execution_identity_components
+    from cayu.runtime._execution_profile_continuation import _runtime_version
+
+    identity_components = set()
+    for agent in app._agent_registry.registrations.values():
+        identity_components.update(
+            undeclared_execution_identity_components(
+                registered_agent=agent,
+                registered_provider=None,
+                runtime_version=_runtime_version(),
+                process_identity=app._execution_profile_process_identity,
+                redactor=app._secret_redactor,
+            )
+        )
+    for provider in app._provider_registry.registrations.values():
+        identity_components.update(
+            undeclared_execution_identity_components(
+                registered_agent=None,
+                registered_provider=provider,
+                runtime_version=_runtime_version(),
+                process_identity=app._execution_profile_process_identity,
+                redactor=app._secret_redactor,
+            )
+        )
+    manifest._undeclared_execution_identities = tuple(
+        sorted(name for name, _ in identity_components)
+    )
     return manifest
 
 

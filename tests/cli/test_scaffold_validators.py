@@ -241,8 +241,12 @@ def test_generated_service_validator_cli(tmp_path: Path) -> None:
     import subprocess
     import sys
 
+    from tests.cli.test_check_execution_identity import assert_subscription_identity_warning
+
+    import cayu
+
     environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
+    environment["PYTHONPATH"] = str(Path(cayu.__file__).resolve().parent.parent)
     environment["PRODUCT_AUTH_TOKENS_JSON"] = json.dumps(
         {"probe-customer-token": {"tenant_id": "probe-tenant", "subject_id": "probe-user"}}
     )
@@ -277,20 +281,20 @@ def test_generated_service_validator_cli(tmp_path: Path) -> None:
     assert not project.exists()
     cli(*command)
     check = ("check", "--deploy", "--fail-on", "warning", "--json")
-    assert json.loads(cli(*check, cwd=project))["diagnostics"] == []
+    assert_subscription_identity_warning(json.loads(cli(*check, cwd=project, expected=1)))
     model = project / "domain/model.py"
     model.write_text(GRANT)
     # Import the contract during actual app preparation as well as scanning it.
     registration = project / "agents/registration.py"
     registration.write_text("from domain.model import Grant\n" + registration.read_text())
-    report = json.loads(cli(*check, cwd=project))
-    assert report["diagnostics"] == []
+    report = json.loads(cli(*check, cwd=project, expected=1))
+    assert_subscription_identity_warning(report)
     assert report["manifest_fingerprint"] != "unavailable"
     # Moving the unchanged contract to its canonical policy owner also passes.
     model.unlink()
     (project / "policies/execution.py").write_text(GRANT)
     registration.write_text(registration.read_text().replace("domain.model", "policies.execution"))
-    assert json.loads(cli(*check, cwd=project))["diagnostics"] == []
+    assert_subscription_identity_warning(json.loads(cli(*check, cwd=project, expected=1)))
     marker = project / "executed"
     (project / "policies/execution.py").write_text(
         GRANT.replace(
