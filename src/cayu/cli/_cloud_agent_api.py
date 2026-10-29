@@ -35,24 +35,40 @@ _ROUTE_NOT_FOUND = "Not Found"
 # The most bytes one answer may carry; a full page of session events with payloads fits.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _MAX_DETAIL_CHARS = 512
+# The answers a Cayu route gives for success: 200 for a read, 201 for a created resource (an
+# imported eval corpus) and 202 for accepted asynchronous work (an eval run admitted or
+# cancelled).
+_SUCCESS_STATUSES = frozenset({200, 201, 202})
 # Agent states in which its web process can't answer; Cloud wakes a sleeping one.
 _NOT_SERVING_STATUSES = frozenset({"stopping", "stopped", "deleting", "archived", "failed"})
 
 
 class CayuApiError(RuntimeError):
-    """A Cayu API read that could not be answered, with a stable ``category``."""
+    """A Cayu API read that could not be answered, with a stable ``category``.
 
-    def __init__(self, category: str, message: str, *, status_code: int | None = None) -> None:
+    ``detail`` is the route's own bounded reason for refusing the request, when it gave one,
+    for callers that tell one refusal of a route from another.
+    """
+
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+        detail: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
+        self.detail = detail
 
 
 class CayuApiNotFound(CayuApiError):
     """The route answered that the requested resource does not exist."""
 
     def __init__(self, message: str) -> None:
-        super().__init__("not_found", message, status_code=404)
+        super().__init__("not_found", message, status_code=404, detail=message)
 
 
 class CayuApi:
@@ -122,10 +138,11 @@ class CayuApi:
         query: Mapping[str, str | Sequence[str]] | None = None,
         resource: str,
     ) -> Any:
-        """POST a JSON read request (such as a session rollup page) and return its answer.
+        """POST a JSON request that is safe to send again and return its answer.
 
-        Errors are reported as for ``get``; a server that predates the route answers
-        ``CayuApiError("unsupported")``.
+        That is a read (such as a session rollup page) or a write the server deduplicates
+        by its content (such as an eval corpus import). Errors are reported as for ``get``;
+        a server that predates the route answers ``CayuApiError("unsupported")``.
         """
 
         return self._request("POST", path, query, body, resource)
@@ -174,7 +191,7 @@ class CayuApi:
         try:
             return self._body(response, resource)
         except CayuApiError as exc:
-            if response.status_code == 200:
+            if response.status_code in _SUCCESS_STATUSES:
                 raise CayuApiError(
                     "outcome_unknown",
                     "The mutation returned no readable receipt; inspect its result before retrying.",
@@ -368,8 +385,9 @@ class CayuApi:
                 f"{self.description} rejected the {resource} request"
                 + (f": {detail}" if detail else f" (HTTP {status})."),
                 status_code=status,
+                detail=detail,
             )
-        if status != 200:
+        if status not in _SUCCESS_STATUSES:
             raise CayuApiError(
                 "server_error",
                 f"{self.description} answered HTTP {status} for {resource}.",

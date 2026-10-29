@@ -33,7 +33,9 @@ cayu cloud service status --application my-agent
 - `env list|set|unset` for Agent-owned configuration, and `settings list|set|unset`
   for the Agent's [managed settings](#agent-settings);
 - `compass agents|show|enroll|disable|verify|pass|job|missions|findings` for
-  [Compass](#compass); and
+  [Compass](#compass);
+- `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
+  read its eval runs; and
 - `evidence list|show|verify` for local content-free command records.
 
 `deployment timeline` shows the release pipeline milestones and whether a failed
@@ -1032,6 +1034,91 @@ older than the command needs.
 `cayu session list|show|interactions|usage|tools|events|transcript --application
 my-agent` reads the Agent's sessions the same way; see
 [Session inspection](session-inspection.md#sessions-of-a-cloud-agent).
+
+## Running an Agent's evals
+
+`cayu cloud eval` runs a suite of a portable [eval corpus](evals.md#portable-corpus-documents)
+on a deployed Agent and reads its eval runs. The run executes on the Agent's own eval worker,
+in the release it runs now, with its secrets, sandboxes and stores, and lands in the Agent's
+eval history beside the runs its Developer dashboard starts. The commands reach the Agent as
+[reading an Agent's state](#reading-an-agents-state-from-the-cli) does, with its Developer
+dashboard login, and fail with `evals_unavailable` when the Agent's Cayu serves no eval API
+(it predates it, or runs without a durable store).
+
+```console
+cayu cloud eval run --application my-agent --corpus evals.json --suite refund-regressions \
+  --output run.json
+cayu cloud eval runs list --application my-agent
+cayu cloud eval runs show --application my-agent RUN_ID
+cayu cloud eval runs cancel --application my-agent RUN_ID
+cayu cloud eval compare --application my-agent BASELINE_RUN_ID CURRENT_RUN_ID
+cayu cloud eval baseline --application my-agent RUN_ID
+```
+
+`eval run` reads the corpus file (at most 8 MiB) and checks the suite against the eval target
+the corpus names, as the Agent's current release publishes it (`GET /api/evals/targets`).
+Before importing anything it refuses a target the release doesn't have, naming the ones it
+has; a target whose execution profile isn't ready; and a suite the target can't run: more
+trials per case, cases or seconds per trial than the target allows, or a `--max-concurrency`
+(default 1) above the target's limit or the suite's trial policy. There is no `--trials`: the
+trial count is part of the suite's content, so a different count is a second suite in the
+corpus.
+
+It then states the run's bound on standard error, and in the JSON result as `bound`: cases ×
+trials per case = total trials, how many run at once, and each trial's model-step limit and
+timeout. `--max-cost AMOUNT` (with `--currency CODE`, `USD` by default) is a per-trial
+candidate cost threshold, `bound.candidate_cost_threshold`: it interrupts a trial's agent once
+its observed cost reaches the amount, and one model call can cross it before its cost is known.
+A target that publishes no pricing refuses `--max-cost`. It doesn't bound AI judges: when the
+suite has model-judge assertions, `bound.judges` lists each judge profile the suite uses, how
+many evaluations the run asks of it, and the limits its profile publishes on each one (cost,
+tokens and timeout, when the target's catalog states them), and the stated bound names them.
+A judge's cost limit is a stop threshold too: one judge call can exceed it before its cost is
+known.
+
+The command imports the corpus (importing the same content again changes nothing) and admits
+one run under an idempotency key: `--operation-id ID`, or a fresh one. Before admitting, it
+prints a continuation command that repeats the admission exactly, with that key and
+`--execution-profile-revision REV`, the eval target's execution-profile revision the request
+names. The Agent binds the key to the whole request, so when the command stops before it names
+the run, for example because the Agent's answer was lost (`outcome_unknown`), the continuation
+admits nothing new and continues with the run the first one admitted, also after a deploy has
+changed the target's current revision. A continuation skips the pre-admission checks and sends
+the admission first; it imports the corpus, and admits again under the same key, only when the
+Agent answers that it doesn't store the corpus, so a release that would refuse the corpus now
+still replays a run it admitted before. Errors carry the continuation as `commands.continue`,
+and the JSON result carries `execution_profile_revision`.
+
+When the key already admitted a different request, because the corpus file or an option changed
+since, the command fails with `operation_id_conflict`: that run still exists, and
+`commands.list` lists the eval target's runs. When the Agent's current release refuses the
+request and the key admitted nothing, the continuation fails with `eval_release_changed`: there
+is no run to continue, so start a new one without `--operation-id`.
+
+It waits for the run and prints its progress on standard error when it changes (`Run
+eval-...: running, 3/10 trials finished`), riding out reads the Agent can't answer for a
+while, as during a deploy. When the run completes it downloads the run's report and prints
+its status, score and trial outcomes; `--output FILE` writes the report, the JSON report the
+Developer dashboard downloads and a file `cayu eval compare` reads. A run that fails or is
+cancelled exits `2` with `eval_run_failed` (and the run's `failure_code`) or
+`eval_run_cancelled`. `--no-wait` returns once the run is admitted. A wait that reaches
+`--wait-seconds` (six hours by default, read every `--poll-seconds`, 5 by default) exits `2`
+with `eval_run_still_running`, the run id and the `runs show`, `runs cancel` and `continue`
+commands; the run goes on in the Agent.
+
+`runs list` lists one eval target's runs, newest first: the Agent's default target, or
+`--target-key KEY`, filtered by `--status` and limited by `--limit` (20 by default, at most
+200). `runs show` shows a run's status, trial progress and result, and `runs cancel` asks the
+Agent to stop it. `compare` compares two completed runs of the same suite on the Agent and
+lists the current run's regressions; for a pass/fail exit in CI, compare the downloaded
+reports with `cayu eval compare`. `baseline` approves a completed run's result as its suite's
+baseline, the result the Developer dashboard compares later runs with, over the baseline's
+current generation; approving the run that is already the baseline changes nothing. When its
+answer is lost, the error's `commands.continue` repeats the same decision with
+`--operation-id ID --expected-generation N`: the Agent answers the approval it already applied,
+or, when the baseline has moved past generation `N` since, refuses with
+`eval_baseline_conflict` instead of overriding the later approval. Each command prints text, or
+the JSON envelope with `--json`.
 
 ## Signing in to an Agent
 

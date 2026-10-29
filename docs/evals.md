@@ -375,6 +375,11 @@ compared with each other through the same compatibility projection and stable
 exit contract. These commands operate only on the supplied paths and do not
 perform project discovery.
 
+To run a corpus suite on a deployed Agent instead, on its own worker and in its current
+release, use `cayu cloud eval run --application NAME --corpus FILE --suite ID --output
+run.json`; see [Running an Agent's evals](cayu-cloud.md#running-an-agents-evals). Its
+`--output` report is a file `eval report` and `eval compare` read.
+
 ### Improvement objectives and evals
 
 An improvement loop proposes changes to an agent, runs evals on each candidate,

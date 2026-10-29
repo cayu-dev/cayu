@@ -35,6 +35,7 @@ from cayu.cli._cloud_auth import (
 from cayu.cli._cloud_compass import CompassWriteError, add_compass_parser, compass_command
 from cayu.cli._cloud_diagnostics import CloudDeploymentFailure as _CloudDeploymentFailure
 from cayu.cli._cloud_diagnostics import parse_build_failure, safe_text
+from cayu.cli._cloud_evals import CloudEvalError, add_eval_parser, eval_command
 from cayu.cli._cloud_evidence import EvidenceRecorder
 from cayu.cli._cloud_private_state import write_private_json as _write_private_json
 from cayu.cli._cloud_project import (
@@ -760,7 +761,9 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
         error.update(exc.details)
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
-    if isinstance(exc, (_CloudDeployCheckError, CompassWriteError, CloudSettingsError)):
+    if isinstance(
+        exc, (_CloudDeployCheckError, CompassWriteError, CloudSettingsError, CloudEvalError)
+    ):
         error.update(exc.details)
     if isinstance(
         exc,
@@ -1150,6 +1153,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     add_settings_parser(commands)
 
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
+
+    add_eval_parser(commands, seconds=_positive_finite_seconds)
 
     evidence = commands.add_parser(
         "evidence",
@@ -1945,6 +1950,13 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             is_transient=_transient_api_error,
             transient_limit=_SERVICE_POLL_TRANSIENT_LIMIT,
             validate_wait=_validate_wait,
+        )
+    if arguments.command == "eval":
+        return eval_command(
+            arguments,
+            client=client,
+            validate_wait=_validate_wait,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
         )
     raise CloudCommandError(
         "command_unavailable",

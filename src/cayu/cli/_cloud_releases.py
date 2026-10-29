@@ -57,13 +57,23 @@ def release_limit(value: str) -> int:
     return number
 
 
-def add_output_argument(parser: argparse.ArgumentParser, render: Callable[..., str]) -> None:
+def add_output_argument(
+    parser: argparse.ArgumentParser,
+    render: Callable[..., str],
+    *,
+    failure: Callable[..., str] | None = None,
+) -> None:
+    """Print ``render``'s text, or the JSON envelope with `--json`; ``failure`` renders errors."""
+
     parser.add_argument(
         "--json",
         action="store_true",
         help="Print the JSON envelope the other `cayu cloud` commands print.",
     )
-    parser.set_defaults(_cloud_render=render, _cloud_render_failure=render_failure)
+    parser.set_defaults(
+        _cloud_render=render,
+        _cloud_render_failure=render_failure if failure is None else failure,
+    )
 
 
 def show_application(client: CloudApiClient, application_id: str) -> dict[str, Any]:

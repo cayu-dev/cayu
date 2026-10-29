@@ -327,3 +327,47 @@ def test_reader_asks_an_agent_that_cant_price_rollups_again_without_pricing() ->
     # The first page tried the price book once; every later page goes straight to unpriced.
     # The key itself is left out: an older Agent rejects it whatever its value.
     assert ["pricing" in body for body in bodies] == [True, False, False]
+
+
+def test_client_reads_created_and_accepted_answers() -> None:
+    seen: list[tuple[str, str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.headers.get("idempotency-key")))
+        if request.url.path.endswith("/evals/corpora"):
+            return httpx.Response(201, json={"revision": "sha256:corpus"})
+        return httpx.Response(202, json={"status": "queued"})
+
+    api = _api(handler)
+
+    # An eval corpus import answers 201 Created, an eval run admission 202 Accepted.
+    assert api.post("/evals/corpora", {}, resource="eval corpus import") == {
+        "revision": "sha256:corpus"
+    }
+    assert api.mutate("/evals/runs", {}, resource="eval run", operation_id="admit-1") == {
+        "status": "queued"
+    }
+    assert seen == [
+        ("POST", "/cayu/api/evals/corpora", None),
+        ("POST", "/cayu/api/evals/runs", "admit-1"),
+    ]
+
+
+def test_accepted_mutation_without_a_readable_receipt_is_unknown() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"name": "agent"})
+        return httpx.Response(202, content=b"accepted")
+
+    with pytest.raises(CayuApiError, match="no readable receipt") as raised:
+        _api(handler).mutate("/evals/runs", {}, resource="eval run", operation_id="admit-1")
+    assert raised.value.category == "outcome_unknown"
+
+
+def test_other_successful_statuses_are_still_not_answers() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(204)
+
+    with pytest.raises(CayuApiError, match="answered HTTP 204") as raised:
+        _api(handler).get("/sessions", resource="sessions")
+    assert raised.value.category == "server_error"
