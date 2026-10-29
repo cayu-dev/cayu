@@ -1346,9 +1346,11 @@ cayu cloud compass enroll my-agent --agent my-agent
 cayu cloud compass verify my-agent --wait
 cayu cloud compass show my-agent
 cayu cloud compass pass my-agent --wait
-cayu cloud compass findings list my-agent --status proposed
+cayu cloud compass findings list my-agent --status proposed --limit 20
+cayu cloud compass findings list my-agent --summary
 cayu cloud compass findings accept my-agent FINDING --note "Worth trying"
 cayu cloud compass findings dismiss my-agent FINDING --note "Expected behavior"
+cayu cloud compass findings dismiss my-agent --rule repeated_tool --note "Paging, not repeats"
 cayu cloud compass missions my-agent
 cayu cloud compass disable my-agent
 ```
@@ -1383,8 +1385,31 @@ member is refused with `code` `developer_required`. They mirror Cloud's operator
   watched agent in `jobs`; `--agent` queues only that agent's. With `--wait`
   they wait until every job succeeds or fails, retrying brief API outages, and
   exit `2` with `wait_timeout` and a `compass job` command once
-  `--wait-seconds` pass. `findings list --agent NAME` lists one agent's
-  findings.
+  `--wait-seconds` pass.
+- **Reading findings.** `findings list` prints a table (`--json` prints the
+  JSON envelope) of the findings, strongest first. `--agent NAME`, `--rule`,
+  `--dimension`, `--min-score N` and `--tool NAME` narrow them, and
+  `--limit N` keeps the N strongest (correctness, then cost, time and
+  attention; the highest score first). A finding's tool is the tool its
+  ledger row is about: its calls, or the approval gate on it. `--summary`
+  counts the matching findings by rule and tool, with how many of each are
+  proposed, accepted and dismissed. Cloud filters the findings when it can; a
+  Cloud release from before that answers every finding, and the CLI filters
+  them itself.
+- **Dismissing findings in bulk.** `findings dismiss AGENT --rule RULE --note
+  TEXT` dismisses every proposed finding of the rule, narrowed by the same
+  options as `findings list`. It shows what it will dismiss and asks first;
+  `--yes` skips the question, and without a terminal it refuses with
+  `confirmation_required` unless `--yes` is given. Accepted and already
+  dismissed findings are left as they are, so repeating it dismisses nothing
+  more, and it reports how many it dismissed and how many it skipped. It
+  sends the findings in batches of 100 under one idempotency key, from which
+  Cloud derives one key per finding; a Cloud release without the bulk route
+  gets them one at a time, and the command says so. If it stops partway, the
+  error says how many it dismissed; repeating it with the same
+  `--idempotency-key` dismisses the rest. `findings list` and `findings
+  dismiss` print text; pass `--json` for the JSON envelope with
+  `idempotency_key`.
 - **Missions.** `missions` lists the Compound missions Compass made ready and
   why Cloud starts none now, if it doesn't. Cloud starts them on its own, and
   each waits for a person to approve its plan before it spends anything.

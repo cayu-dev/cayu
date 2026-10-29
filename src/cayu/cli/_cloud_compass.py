@@ -17,6 +17,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
+from cayu.cli import _cloud_compass_findings as findings_cli
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 
 WAIT_DEFAULT_POLL_SECONDS = 5.0
@@ -39,6 +40,8 @@ _ENROLL_FIELDS = (
 _ACCEPT_TEXT = ("note", "requirement", "hypothesis", "expected_effect", "risk")
 _MISSION_STATUSES = ("ready", "starting", "started", "failed", "unknown")
 _FINDING_STATUSES = ("proposed", "accepted", "dismissed")
+# `findings dismiss` options that pick findings by what they are rather than by id.
+_BULK_OPTIONS = ("rule", "agent", "dimension", "min_score", "tool")
 
 
 class CompassWriteError(CloudApiError):
@@ -46,7 +49,12 @@ class CompassWriteError(CloudApiError):
     it queued when only waiting for them failed."""
 
     def __init__(
-        self, error: CloudApiError, *, idempotency_key: str, job_ids: list[str] | None = None
+        self,
+        error: CloudApiError,
+        *,
+        idempotency_key: str,
+        job_ids: list[str] | None = None,
+        details: dict[str, object] | None = None,
     ) -> None:
         super().__init__(
             error.category,
@@ -62,6 +70,7 @@ class CompassWriteError(CloudApiError):
         self.details: dict[str, object] = {"idempotency_key": idempotency_key}
         if job_ids:
             self.details["job_ids"] = job_ids
+        self.details.update(details or {})
 
 
 def add_compass_parser(
@@ -182,18 +191,32 @@ def add_compass_parser(
 
     findings = actions.add_parser("findings", description="What Compass found, and its review.")
     finding_actions = findings.add_subparsers(dest="findings_command", required=True)
-    listing = finding_actions.add_parser("list", description="Findings, strongest first.")
+    listing = finding_actions.add_parser(
+        "list",
+        description=(
+            "Findings, strongest first, narrowed by the options given; --summary counts them "
+            "by rule and tool instead."
+        ),
+    )
     listing.add_argument("application", type=application)
     listing.add_argument("--status", choices=_FINDING_STATUSES)
-    listing.add_argument("--agent", help="Only this watched agent's findings.")
+    findings_cli.add_filter_arguments(listing)
+    findings_cli.add_list_arguments(listing)
+    findings_cli.add_output_argument(listing)
     for name, what in (
         ("show", "One finding."),
         ("accept", "Accept a finding, optionally sharpening it."),
-        ("dismiss", "Dismiss a finding, saying why."),
+        (
+            "dismiss",
+            "Dismiss a finding, saying why; or, with --rule instead of FINDING_ID, every "
+            "proposed finding of that rule (narrowed by the other options). A bulk dismiss "
+            "shows what it will dismiss and asks first, unless --yes. Findings already "
+            "reviewed are left as they are, so repeating it dismisses nothing more.",
+        ),
     ):
         finding = finding_actions.add_parser(name, description=what)
         finding.add_argument("application", type=application)
-        finding.add_argument("finding_id")
+        finding.add_argument("finding_id", nargs="?" if name == "dismiss" else None)
         if name == "accept":
             for option in _ACCEPT_TEXT:
                 finding.add_argument(f"--{option.replace('_', '-')}")
@@ -213,6 +236,11 @@ def add_compass_parser(
             )
         if name == "dismiss":
             finding.add_argument("--note", required=True)
+            findings_cli.add_filter_arguments(finding)
+            finding.add_argument(
+                "--yes", action="store_true", help="Dismiss them without asking first."
+            )
+            findings_cli.add_output_argument(finding)
         if name != "show":
             finding.add_argument("--idempotency-key")
 
@@ -288,8 +316,27 @@ def compass_command(
     finding_action = arguments.findings_command
     operation = f"findings.{finding_action}"
     if finding_action == "list":
-        query = _query(status=arguments.status, agent=arguments.agent)
-        return _answer(operation, client.request("GET", f"{path}/findings", query=query))
+        if arguments.summary and arguments.limit is not None:
+            raise ValueError("--summary counts every matching finding; leave out --limit.")
+        listed = findings_cli.list_findings(client, path, arguments, limit=arguments.limit)
+        if not arguments.summary:
+            return _answer(operation, listed)
+        summary = {"groups": findings_cli.summarize(listed["items"]), "total": listed["total"]}
+        return _answer("findings.summary", summary)
+    if finding_action == "dismiss":
+        bulk = [
+            f"--{option.replace('_', '-')}"
+            for option in _BULK_OPTIONS
+            if getattr(arguments, option) is not None
+        ]
+        if arguments.finding_id is not None and bulk:
+            raise ValueError(f"Give FINDING_ID or --rule, not both ({', '.join(bulk)}).")
+        if arguments.finding_id is None:
+            if arguments.rule is None:
+                raise ValueError(
+                    "Give FINDING_ID, or --rule to dismiss every proposed finding of a rule."
+                )
+            return _dismiss_by_rule(client, arguments, path)
     finding = f"{path}/findings/{quote(arguments.finding_id, safe='')}"
     if finding_action == "show":
         return _answer(operation, client.request("GET", finding))
@@ -302,6 +349,19 @@ def compass_command(
     else:
         review = {"note": arguments.note}
     return _write(client, operation, arguments, "POST", f"{finding}/{finding_action}", review)
+
+
+def _dismiss_by_rule(
+    client: CloudApiClient, arguments: argparse.Namespace, path: str
+) -> dict[str, Any]:
+    key = arguments.idempotency_key or f"compass-findings.dismiss-{secrets.token_hex(12)}"
+    try:
+        result = findings_cli.dismiss_by_rule(client, path, arguments, key=key)
+    except findings_cli.BulkDismissError as exc:
+        raise CompassWriteError(
+            exc, idempotency_key=key, details={"dismissed": exc.dismissed}
+        ) from None
+    return {**_answer("findings.dismiss", result), "idempotency_key": key}
 
 
 def _answer(operation: str, result: dict[str, Any]) -> dict[str, Any]:
