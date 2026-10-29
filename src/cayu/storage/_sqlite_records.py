@@ -153,7 +153,13 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
         int(task.restartable),
         task.restart_count,
         task.concurrency_key,
+        task.max_restarts,
+        restart_history_json(task),
     )
+
+
+def restart_history_json(task: Task) -> str:
+    return json_dumps([record.model_dump(mode="json") for record in task.restart_history])
 
 
 @validated_row_cache
@@ -165,6 +171,8 @@ def task_from_row(row: sqlite3.Row) -> Task:
         restartable=bool(row["restartable"]),
         restart_count=row["restart_count"],
         concurrency_key=row["concurrency_key"],
+        max_restarts=row["max_restarts"],
+        restart_history=tuple(json.loads(row["restart_history_json"])),
         graph_id=row["graph_id"],
         prerequisite_task_ids=tuple(json.loads(row["prerequisite_task_ids_json"])),
         id=row["id"],

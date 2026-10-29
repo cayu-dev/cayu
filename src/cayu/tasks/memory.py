@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         TaskGroupSnapshot,
     )
     from cayu.tasks.operations import TaskCreationOperation
+    from cayu.tasks.restart import AbandonedTaskRestartRequest
 from cayu._clock import normalize_utc_datetime, utc_clock
 from cayu._validation import copy_durable_json_object, revalidate_model_input
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
@@ -4302,6 +4303,22 @@ class InMemoryTaskStore(TaskStore):
             if task.session_id is not None:
                 self._retired_task_sessions.add(task.session_id)
             self._store_task(updated)
+            return updated.model_copy(deep=True)
+
+    async def restart_abandoned_task(self, request: AbandonedTaskRestartRequest) -> Task:
+        from cayu.tasks.restart import (
+            _abandoned_restarted_task,
+            copy_abandoned_task_restart_request,
+        )
+
+        request = copy_abandoned_task_restart_request(request)
+        async with self._lock:
+            task = self._require_task(request.task_id)
+            if request.task_id in self._latest_admission_id_by_task:
+                raise WorkAttemptExecutionClaimLost("Admitted work attempts cannot restart.")
+            updated = _abandoned_restarted_task(task, request, now=self._ownership_clock())
+            if updated is not task:
+                self._store_task(updated)
             return updated.model_copy(deep=True)
 
     async def release_task(

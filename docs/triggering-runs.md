@@ -380,6 +380,52 @@ fenced task held by a worker not in `live_worker_ids` at once, for an
 application that knows which workers are live some other way, for example from
 its platform's record of stopped containers.
 
+#### Restarting a restartable task after worker loss
+
+Cancelling throws away whatever the handler finished. A task created with
+`TaskCreate(restartable=True)` can run again instead, once the caller vouches
+that the old worker is gone, with the same evidence the cancellation takes:
+
+```python
+await run_task_worker(
+    app,
+    app.task_store,
+    handle_task,
+    worker_id=f"jobs-{socket.gethostname()}-{os.getpid()}",
+    query=TaskQuery(type="domain_job"),
+    reconcile_abandoned_after_s=120,
+    restart_abandoned=True,
+    stop=stop,
+)
+```
+
+`cayu worker --reconcile-abandoned-after-seconds 120 --restart-abandoned` does
+the same for a project worker, and `reconcile_abandoned_tasks(...,
+settlement="restart")` for an application that knows which workers are live.
+`restart_abandoned_task(task_store, task_id, validator_id=...,
+validator_version=..., evidence_id=...)` restarts one task, the way
+`reconcile_abandoned_task_cancellation` cancels one.
+
+The task goes back to `pending` and keeps its id and input. `restart_count` goes
+up by one, `restart_history` gains a `TaskRestartRecord` (when, the previous
+worker and lease, the validator and the evidence), and `status_payload["restart"]`
+carries the same details, so the next handler can tell it is a restart and decide
+what to reuse. Use new session ids on the new attempt, for example ones that
+include `restart_count`.
+
+Restarts after worker loss are capped: two by default, set with
+`max_abandoned_restarts=` on the worker, `max_restarts=` on
+`reconcile_abandoned_tasks` and `restart_abandoned_task`, or for one task with
+`TaskCreate(max_restarts=...)`, which wins. After the last allowed restart, the
+next loss cancels the task as before, with evidence id
+`restart-limit-reached:<cap>:lease-expired-at:...`, so a handler that crashes
+its worker every time doesn't loop forever. Requeues after a quiescent shutdown
+(below) don't count toward the cap. A task whose cancellation someone asked
+for (`cancel_task`, a handler time limit) before its worker was lost is
+cancelled, not restarted. Tasks that aren't restartable, and session-attached
+and retry-series tasks, are settled as they are without the option;
+`abandoned_task_settlement(task)` says why.
+
 ## What does *not* trigger a run
 
 `EventWatcher` watches Cayu's own event log — it does not receive external
@@ -424,7 +470,9 @@ behavior, and so does a restartable task that the worker is running as the
 continuation of an interrupted session: shutdown cancels it rather than
 requeueing it. Retry series, schedules, graph/group members, work contracts, and
 pre-attached or child tasks do not accept this flag. A crash or SIGKILL cannot
-prove handler quiescence and does not automatically restart a started job.
+prove handler quiescence and does not automatically restart a started job; once
+you can vouch that the worker is gone, [restart it after worker
+loss](#restarting-a-restartable-task-after-worker-loss).
 
 Custom workers can use `requeue_restartable_task(task_store, task, worker_id)`
 after stopping and fully joining the handler themselves. Keep the lease renewed

@@ -209,7 +209,13 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         task.restartable,
         task.restart_count,
         task.concurrency_key,
+        task.max_restarts,
+        restart_history_json(task),
     )
+
+
+def restart_history_json(task: Task) -> str:
+    return _dumps([record.model_dump(mode="json") for record in task.restart_history])
 
 
 TASK_COLUMNS = (
@@ -217,7 +223,8 @@ TASK_COLUMNS = (
     "assigned_agent_name, available_at, worker_id, lease_expires_at, interrupted_handoff_id, "
     "status_reason, status_payload, input, result, error, metadata, created_at, updated_at, "
     "started_at, completed_at, invocation, retry_series, work_contract, schedule, "
-    "graph_id, prerequisite_task_ids, restartable, restart_count, concurrency_key"
+    "graph_id, prerequisite_task_ids, restartable, restart_count, concurrency_key, "
+    "max_restarts, restart_history"
 )
 
 
@@ -226,6 +233,8 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         restartable=row[29],
         restart_count=row[30],
         concurrency_key=row[31],
+        max_restarts=row[32],
+        restart_history=tuple(_loads(row[33])),
         id=row[0],
         type=row[1],
         title=row[2],

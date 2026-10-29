@@ -644,6 +644,115 @@ async def run_once(app, stop):
     assert float((project / "declared.txt").read_text(encoding="utf-8")) == 120.0
 
 
+def test_worker_passes_the_restart_choice_to_task_workers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from cayu.tasks.abandoned import (
+        MAX_ABANDONED_RESTARTS_ENV,
+        RECONCILE_ABANDONED_AFTER_ENV,
+        RESTART_ABANDONED_ENV,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        """[tool.cayu]
+factory = "restart_worker:build_app"
+
+[tool.cayu.workers]
+once = "restart_worker:run_once"
+""",
+        encoding="utf-8",
+    )
+    (project / "restart_worker.py").write_text(
+        f"""import os
+from pathlib import Path
+
+from cayu import CayuApp
+
+
+def build_app():
+    return CayuApp(enable_logging=False)
+
+
+async def run_once(app, stop):
+    Path("restart.txt").write_text(
+        os.environ["{RESTART_ABANDONED_ENV}"] + " " + os.environ["{MAX_ABANDONED_RESTARTS_ENV}"],
+        encoding="utf-8",
+    )
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+    # Record each variable's absence so teardown removes what main() writes.
+    for name in (RECONCILE_ABANDONED_AFTER_ENV, RESTART_ABANDONED_ENV, MAX_ABANDONED_RESTARTS_ENV):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    sys.modules.pop("restart_worker", None)
+
+    assert (
+        main(
+            [
+                "worker",
+                "once",
+                "--reconcile-abandoned-after-seconds",
+                "120",
+                "--restart-abandoned",
+                "--max-abandoned-restarts",
+                "3",
+            ]
+        )
+        == 0
+    )
+    assert (project / "restart.txt").read_text(encoding="utf-8") == "1 3"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--restart-abandoned"], "--restart-abandoned needs --reconcile-abandoned-after-seconds"),
+        (
+            ["--reconcile-abandoned-after-seconds", "60", "--max-abandoned-restarts", "1"],
+            "--max-abandoned-restarts needs --restart-abandoned",
+        ),
+    ],
+)
+def test_worker_refuses_restart_options_without_what_they_need(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    arguments: list[str],
+    message: str,
+) -> None:
+    from cayu.tasks.abandoned import RECONCILE_ABANDONED_AFTER_ENV
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        """[tool.cayu]
+factory = "app:build_app"
+
+[tool.cayu.workers]
+once = "app:run_once"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+    monkeypatch.delenv(RECONCILE_ABANDONED_AFTER_ENV, raising=False)
+
+    assert main(["worker", "once", *arguments]) == 1
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["-1", "101", "two"])
+def test_worker_requires_a_restart_count_in_range(value: str) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["worker", "configured", "--max-abandoned-restarts", value])
+
+    assert excinfo.value.code == 2
+
+
 def test_worker_refuses_a_single_worker_declaration_with_several_processes(
     tmp_path: Path,
     monkeypatch,

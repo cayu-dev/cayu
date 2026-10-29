@@ -564,6 +564,10 @@ REVISIONS: tuple[Revision, ...] = (
     # A transcript tool result may be stored once, in its tool event, and
     # referenced from the transcript. Older binaries cannot read the reference.
     Revision(revision=134, kind=RevisionKind.BREAKING, compatible_from=134),
+    # A task's own cap on restarts after worker loss, and the record of those
+    # restarts. Terminalization receipts embed task snapshots that carry the new
+    # fields, which older Task models reject, so older binaries must not open it.
+    Revision(revision=135, kind=RevisionKind.BREAKING, compatible_from=135),
 )
 
 #: The revision an empty database is initialized to.

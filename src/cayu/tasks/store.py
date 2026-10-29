@@ -27,6 +27,7 @@ if TYPE_CHECKING:
         TaskGroupSnapshot,
     )
     from cayu.tasks.operations import TaskCreationOperation
+    from cayu.tasks.restart import AbandonedTaskRestartRequest
 from cayu._clock import normalize_utc_datetime
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerDemandPolicy,
@@ -1454,6 +1455,24 @@ class TaskStore(ABC):
         increment ``restart_count`` while preserving task identity and input.
         """
         raise NotImplementedError("This task store does not support restartable jobs.")
+
+    async def restart_abandoned_task(self, request: AbandonedTaskRestartRequest) -> Task:
+        """Atomically requeue a restartable task fenced after its worker was lost.
+
+        Require the exact fenced claim the request names, an expired lease by
+        the store's clock, an ordinary task without a session, created with
+        ``restartable=True``, a fence that worker loss left rather than an
+        explicit cancellation request, and fewer restarts after worker loss than
+        its cap (the task's ``max_restarts``, else the request's). Past the cap,
+        raise ``TaskRestartLimitReached`` and change nothing. When
+        ``restart_history`` already holds this request's evidence for the same
+        claim, return the task unchanged. Otherwise return the
+        task to ``pending`` with ``restart_count`` one higher and a restart
+        record appended to ``restart_history``, preserving identity and input.
+        """
+        raise NotImplementedError(
+            "This task store does not support restarting tasks after worker loss."
+        )
 
     @abstractmethod
     async def release_task(

@@ -31,7 +31,12 @@ from cayu.runtime._process_workers import (
     supervisor_watchdog,
     watch_supervisor,
 )
-from cayu.tasks.abandoned import RECONCILE_ABANDONED_AFTER_ENV
+from cayu.tasks.abandoned import (
+    MAX_ABANDONED_RESTARTS_ENV,
+    RECONCILE_ABANDONED_AFTER_ENV,
+    RESTART_ABANDONED_ENV,
+)
+from cayu.tasks.records import TASK_MAX_RESTARTS_LIMIT
 from cayu.tasks.until_idle import TaskWorkerIdleResult, _worker_until_idle_requested
 
 # A worker that used its whole grace still lets the app seal and report.
@@ -83,6 +88,24 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument(
+        "--restart-abandoned",
+        action="store_true",
+        help=(
+            "With --reconcile-abandoned-after-seconds, requeue a fenced task created with "
+            "restartable=True instead of cancelling it. Other tasks are still cancelled."
+        ),
+    )
+    parser.add_argument(
+        "--max-abandoned-restarts",
+        type=_restart_count,
+        default=None,
+        metavar="N",
+        help=(
+            "With --restart-abandoned, cancel a task once it was restarted N times after "
+            "worker loss, unless the task sets its own max_restarts (default: 2)."
+        ),
+    )
+    parser.add_argument(
         "--until-idle",
         action="store_true",
         help=(
@@ -114,9 +137,25 @@ def _run_worker(args: argparse.Namespace) -> int:
         until_idle = getattr(args, "until_idle", False)
         if processes > 1 and until_idle:
             raise WorkerError("--until-idle can't be combined with --processes.")
+        restart_abandoned = getattr(args, "restart_abandoned", False)
+        max_restarts = getattr(args, "max_abandoned_restarts", None)
+        if restart_abandoned and (
+            reconcile_after is None
+            and not os.environ.get(RECONCILE_ABANDONED_AFTER_ENV, "").strip()
+        ):
+            raise WorkerError(
+                "--restart-abandoned needs --reconcile-abandoned-after-seconds: only a "
+                "declared single worker settles fenced tasks itself."
+            )
+        if max_restarts is not None and not restart_abandoned:
+            raise WorkerError("--max-abandoned-restarts needs --restart-abandoned.")
         if reconcile_after is not None:
             # run_task_worker reads it when the worker doesn't pass the option itself.
             os.environ[RECONCILE_ABANDONED_AFTER_ENV] = repr(reconcile_after)
+        if restart_abandoned:
+            os.environ[RESTART_ABANDONED_ENV] = "1"
+        if max_restarts is not None:
+            os.environ[MAX_ABANDONED_RESTARTS_ENV] = str(max_restarts)
         if processes > 1:
             outcome = asyncio.run(
                 supervise_process_workers(
@@ -378,6 +417,16 @@ def _non_negative_seconds(value: str) -> float:
     if not isfinite(seconds) or seconds < 0:
         raise argparse.ArgumentTypeError("must be a finite, non-negative number of seconds.")
     return seconds
+
+
+def _restart_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a whole number.") from None
+    if not 0 <= count <= TASK_MAX_RESTARTS_LIMIT:
+        raise argparse.ArgumentTypeError(f"must be from 0 to {TASK_MAX_RESTARTS_LIMIT}.")
+    return count
 
 
 def _exit_after_shutdown_timeout(message: str) -> NoReturn:

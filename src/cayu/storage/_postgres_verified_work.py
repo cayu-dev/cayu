@@ -1108,7 +1108,8 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
                 worker_id = %s, lease_expires_at = %s,
                 status_reason = %s, status_payload = %s, result = %s, error = %s,
                 updated_at = %s, started_at = %s, completed_at = %s, retry_series = %s,
-                work_contract = %s, available_at = %s, schedule = %s, restart_count = %s
+                work_contract = %s, available_at = %s, schedule = %s, restart_count = %s,
+                restart_history = %s
             WHERE id = %s
             """,
             (
@@ -1135,6 +1136,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
                 if task.schedule is None
                 else json.dumps(task.schedule.model_dump(mode="json")),
                 task.restart_count,
+                pg_support.restart_history_json(task),
                 task.id,
             ),
         )

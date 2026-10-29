@@ -16,10 +16,13 @@ Each part works on its own:
 - ``TaskQuery(fenced_after_worker_loss=True)`` lists only them, and ``False``
   leaves them out, for example from an "is a run already queued?" check.
 - :func:`reconcile_abandoned_tasks` settles the ones held by workers the caller
-  knows are gone, through ``reconcile_abandoned_task_cancellation``.
+  knows are gone, through ``reconcile_abandoned_task_cancellation``, or with
+  ``settlement="restart"`` requeues the restartable ones through
+  ``restart_abandoned_task`` and cancels the rest.
 - ``run_task_worker(reconcile_abandoned_after_s=...)`` and ``cayu worker
   --reconcile-abandoned-after-seconds`` use it for a declared single-worker
-  deployment, and every task worker logs a warning for each fenced task it finds.
+  deployment (``restart_abandoned=True`` and ``--restart-abandoned`` choose the
+  restart), and every task worker logs a warning for each fenced task it finds.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import logging
 import os
 from collections.abc import Callable, Collection, Iterable
 from datetime import UTC, datetime
+from enum import StrEnum
 from hashlib import sha256
 from math import isfinite
 from time import monotonic
@@ -40,7 +44,15 @@ from cayu.tasks.cancellation import (
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
 )
 from cayu.tasks.queries import TaskOrder, TaskQuery, copy_task_query
-from cayu.tasks.records import Task, TaskClaimLost, TaskStatus
+from cayu.tasks.records import TASK_MAX_RESTARTS_LIMIT, Task, TaskClaimLost, TaskStatus
+from cayu.tasks.restart import (
+    DEFAULT_MAX_ABANDONED_RESTARTS,
+    TaskRestartLimitReached,
+    abandoned_restarts_used,
+    fenced_by_worker_loss,
+    restart_observed_abandoned_task,
+    task_restart_limit,
+)
 from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import TaskTerminalizationConflict
 
@@ -49,6 +61,10 @@ SINGLE_WORKER_VALIDATOR_ID = "cayu.task-worker.single-worker"
 SINGLE_WORKER_VALIDATOR_VERSION = "1"
 #: Set by ``cayu worker --reconcile-abandoned-after-seconds`` for the worker process.
 RECONCILE_ABANDONED_AFTER_ENV = "CAYU_WORKER_RECONCILE_ABANDONED_AFTER_S"
+#: Set by ``cayu worker --restart-abandoned`` for the worker process.
+RESTART_ABANDONED_ENV = "CAYU_WORKER_RESTART_ABANDONED"
+#: Set by ``cayu worker --max-abandoned-restarts`` for the worker process.
+MAX_ABANDONED_RESTARTS_ENV = "CAYU_WORKER_MAX_ABANDONED_RESTARTS"
 
 _FENCE_REASONS = frozenset(
     {_TASK_CANCELLATION_REQUESTED_REASON, _TASK_RETRY_CANCELLATION_REQUESTED_REASON}
@@ -59,6 +75,19 @@ _SCAN_PAGE = 100
 _SCAN_MAX = 1_000
 
 logger = logging.getLogger(__name__)
+
+
+class AbandonedTaskSettlement(StrEnum):
+    """How a task fenced after worker loss is settled once its worker is known gone.
+
+    ``CANCEL`` settles every such task as cancelled. ``RESTART`` requeues a task
+    created with ``restartable=True`` (see ``restart_abandoned_task``) while it
+    has restarts left, unless someone asked to cancel it, and cancels every
+    other task as ``CANCEL`` does.
+    """
+
+    CANCEL = "cancel"
+    RESTART = "restart"
 
 
 def is_fenced_after_worker_loss(task: Task, now: datetime | None = None) -> bool:
@@ -94,20 +123,34 @@ def has_cancellation_fence(task: Task) -> bool:
 
 
 def abandoned_task_settlement(task: Task) -> str:
-    """How the application settles a fenced task, in one sentence for logs and CLI output."""
+    """How the application settles a fenced task, in one sentence for logs and CLI output.
+
+    It also says why a task can't be restarted after worker loss, when it can't.
+    """
 
     if task.retry_series is not None:
         return (
-            "it is a retry-series attempt: settle it with "
-            "TaskStore.reconcile_task_retry_cancellation and retry-specific evidence"
+            "it is a retry-series attempt, which can't be restarted after worker loss: "
+            "settle it with TaskStore.reconcile_task_retry_cancellation and "
+            "retry-specific evidence"
         )
     if task.session_id is not None:
         return (
-            f"it is attached to session {task.session_id}: settle the session first, then "
-            "reconcile the task with TaskStore.reconcile_task_cancellation"
+            f"it is attached to session {task.session_id}, so it can't be restarted after "
+            "worker loss: settle the session first, then reconcile the task with "
+            "TaskStore.reconcile_task_cancellation"
+        )
+    if task.restartable:
+        return (
+            "once its worker's process is gone, restart it with restart_abandoned_task or "
+            "settle it with reconcile_abandoned_task_cancellation, or declare a "
+            "single-worker deployment with run_task_worker(reconcile_abandoned_after_s=..., "
+            "restart_abandoned=True) or cayu worker --reconcile-abandoned-after-seconds "
+            "--restart-abandoned"
         )
     return (
-        "once its worker's process is gone, settle it with "
+        "it wasn't created with restartable=True, so it can't be restarted after worker "
+        "loss: once its worker's process is gone, settle it with "
         "reconcile_abandoned_task_cancellation, or declare a single-worker deployment "
         "with run_task_worker(reconcile_abandoned_after_s=...) or "
         "cayu worker --reconcile-abandoned-after-seconds"
@@ -135,6 +178,68 @@ def reconcile_abandoned_after_from_environment(value: float | None) -> float | N
     except ValueError:
         raise ValueError(f"{RECONCILE_ABANDONED_AFTER_ENV} must be a number of seconds.") from None
     return validate_reconcile_abandoned_after_s(parsed, RECONCILE_ABANDONED_AFTER_ENV)
+
+
+def abandoned_task_settlement_choice(
+    value: AbandonedTaskSettlement | str,
+) -> AbandonedTaskSettlement:
+    """Return ``value`` as an :class:`AbandonedTaskSettlement`, or raise ``ValueError``."""
+
+    if not isinstance(value, str):
+        raise TypeError("settlement must be 'cancel' or 'restart'.")
+    try:
+        return AbandonedTaskSettlement(value)
+    except ValueError:
+        raise ValueError("settlement must be 'cancel' or 'restart'.") from None
+
+
+def validate_max_restarts(value: int, name: str) -> int:
+    """Return a restart cap between 0 and ``TASK_MAX_RESTARTS_LIMIT``, or raise ``ValueError``."""
+
+    if type(value) is not int or not 0 <= value <= TASK_MAX_RESTARTS_LIMIT:
+        raise ValueError(f"{name} must be an int from 0 to {TASK_MAX_RESTARTS_LIMIT}.")
+    return value
+
+
+def restart_abandoned_from_environment(
+    restart_abandoned: bool | None,
+    max_restarts: int | None,
+    *,
+    reconcile_abandoned_after_s: float | None,
+) -> tuple[AbandonedTaskSettlement, int]:
+    """The worker's settlement and restart cap, falling back to the ``cayu worker`` variables."""
+
+    if restart_abandoned is None:
+        raw = os.environ.get(RESTART_ABANDONED_ENV, "").strip().lower()
+        if raw in {"", "0", "false", "no"}:
+            restart_abandoned = False
+        elif raw in {"1", "true", "yes"}:
+            restart_abandoned = True
+        else:
+            raise ValueError(f"{RESTART_ABANDONED_ENV} must be 1 or 0.")
+    elif type(restart_abandoned) is not bool:
+        raise TypeError("restart_abandoned must be a bool or None.")
+    if max_restarts is None:
+        raw = os.environ.get(MAX_ABANDONED_RESTARTS_ENV, "").strip()
+        if raw:
+            try:
+                parsed = int(raw)
+            except ValueError:
+                raise ValueError(f"{MAX_ABANDONED_RESTARTS_ENV} must be a whole number.") from None
+            max_restarts = validate_max_restarts(parsed, MAX_ABANDONED_RESTARTS_ENV)
+    else:
+        max_restarts = validate_max_restarts(max_restarts, "max_abandoned_restarts")
+    if max_restarts is not None and not restart_abandoned:
+        raise ValueError("max_abandoned_restarts only applies with restart_abandoned=True.")
+    if restart_abandoned and reconcile_abandoned_after_s is None:
+        raise ValueError(
+            "restart_abandoned=True needs reconcile_abandoned_after_s: only a declared "
+            "single worker settles fenced tasks itself."
+        )
+    return (
+        AbandonedTaskSettlement.RESTART if restart_abandoned else AbandonedTaskSettlement.CANCEL,
+        DEFAULT_MAX_ABANDONED_RESTARTS if max_restarts is None else max_restarts,
+    )
 
 
 def fenced_task_scan_query(query: TaskQuery | None = None) -> TaskQuery:
@@ -185,6 +290,8 @@ async def reconcile_abandoned_tasks(
     validator_version: str,
     query: TaskQuery | None = None,
     reconciled_by: ResolutionActor | None = None,
+    settlement: AbandonedTaskSettlement | str = AbandonedTaskSettlement.CANCEL,
+    max_restarts: int = DEFAULT_MAX_ABANDONED_RESTARTS,
 ) -> list[Task]:
     """Settle fenced tasks held by workers the caller knows are gone; return the settled tasks.
 
@@ -199,6 +306,16 @@ async def reconcile_abandoned_tasks(
     time. Session-attached and retry-series tasks are left alone;
     :func:`abandoned_task_settlement` says how to settle them. A task another
     process settles or changes first is skipped.
+
+    With ``settlement="restart"``, a task created with ``restartable=True`` is
+    requeued through ``restart_abandoned_task`` instead, with the same validator
+    and evidence: it returns ``pending`` with ``restart_count`` one higher and a
+    record in ``restart_history``. ``max_restarts`` caps restarts after worker
+    loss for tasks that set no ``max_restarts`` of their own. A task past its
+    cap is settled as cancelled, with evidence id
+    ``restart-limit-reached:<cap>:lease-expired-at:...`` recording why. Other
+    tasks, and a restartable task whose cancellation someone asked for before
+    its worker was lost, are cancelled as with ``"cancel"``.
     """
 
     if isinstance(live_worker_ids, str):
@@ -206,6 +323,8 @@ async def reconcile_abandoned_tasks(
     live = frozenset(require_clean_nonblank(item, "live_worker_ids") for item in live_worker_ids)
     for name, value in (("validator_id", validator_id), ("validator_version", validator_version)):
         require_clean_nonblank(value, name)
+    settlement = abandoned_task_settlement_choice(settlement)
+    max_restarts = validate_max_restarts(max_restarts, "max_restarts")
     selected = copy_task_query(query)
     if selected.fenced_after_worker_loss is False:
         raise ValueError("reconcile_abandoned_tasks only considers fenced tasks.")
@@ -217,6 +336,8 @@ async def reconcile_abandoned_tasks(
         validator_id=validator_id,
         validator_version=validator_version,
         reconciled_by=reconciled_by,
+        settlement=settlement,
+        max_restarts=max_restarts,
     )
 
 
@@ -238,19 +359,50 @@ async def _settle_abandoned(
     validator_id: str,
     validator_version: str,
     reconciled_by: ResolutionActor | None,
+    settlement: AbandonedTaskSettlement,
+    max_restarts: int,
 ) -> list[Task]:
-    from cayu.tasks.worker import reconcile_abandoned_task_cancellation
+    from cayu.tasks.worker import _reconcile_observed_abandoned_task_cancellation
 
     settled: list[Task] = []
     for task in tasks:
         assert task.lease_expires_at is not None
+        evidence_id = f"lease-expired-at:{task.lease_expires_at.isoformat()}"
         try:
-            result = await reconcile_abandoned_task_cancellation(
+            if (
+                settlement is AbandonedTaskSettlement.RESTART
+                and task.restartable
+                and fenced_by_worker_loss(task)
+            ):
+                try:
+                    settled.append(
+                        await restart_observed_abandoned_task(
+                            task_store,
+                            task,
+                            validator_id=validator_id,
+                            validator_version=validator_version,
+                            evidence_id=evidence_id,
+                            max_restarts=max_restarts,
+                        )
+                    )
+                    continue
+                except TaskRestartLimitReached as exc:
+                    logger.warning(
+                        "Task %s (type %s) was already restarted %d time(s) after worker "
+                        "loss, its limit, so it is settled as cancelled.",
+                        task.id,
+                        task.type,
+                        exc.restarts,
+                    )
+                    evidence_id = f"restart-limit-reached:{exc.max_restarts}:{evidence_id}"
+            # Bound to the claim that was listed, so a claim that changed since
+            # (for example a replacement worker) is skipped, never cancelled.
+            result = await _reconcile_observed_abandoned_task_cancellation(
                 task_store,
-                task.id,
+                task,
                 validator_id=validator_id,
                 validator_version=validator_version,
-                evidence_id=f"lease-expired-at:{task.lease_expires_at.isoformat()}",
+                evidence_id=evidence_id,
                 reconciled_by=reconciled_by,
             )
         except (TaskTerminalizationConflict, TaskClaimLost) as exc:
@@ -283,12 +435,16 @@ class FencedTaskMonitor:
         query: TaskQuery | None,
         reconcile_abandoned_after_s: float | None,
         clock: Callable[[], float] = monotonic,
+        settlement: AbandonedTaskSettlement = AbandonedTaskSettlement.CANCEL,
+        max_restarts: int = DEFAULT_MAX_ABANDONED_RESTARTS,
     ) -> None:
         self._task_store = task_store
         self._worker_id = worker_id
         self._query = fenced_task_scan_query(query)
         self._after_s = reconcile_abandoned_after_s
         self._clock = clock
+        self._settlement = abandoned_task_settlement_choice(settlement)
+        self._max_restarts = validate_max_restarts(max_restarts, "max_restarts")
         self._next_offset = 0
         self._reported: set[tuple[str, datetime | None]] = set()
         self._first_seen: dict[tuple[str, datetime | None], float] = {}
@@ -327,10 +483,27 @@ class FencedTaskMonitor:
                 validator_id=SINGLE_WORKER_VALIDATOR_ID,
                 validator_version=SINGLE_WORKER_VALIDATOR_VERSION,
                 reconciled_by=_declaring_worker_actor(self._worker_id),
+                settlement=self._settlement,
+                max_restarts=self._max_restarts,
             )
             # Settled tasks left the list, so continue that many earlier.
             self._next_offset = max(self._next_offset - len(settled), 0)
             for task in settled:
+                if task.status is TaskStatus.PENDING:
+                    logger.warning(
+                        "Restarted task %s (type %s): it was fenced after its worker stopped "
+                        "renewing its lease, and worker %s is declared the only worker "
+                        "(reconcile_abandoned_after_s=%g). This is restart %d of %d after "
+                        "worker loss; the handler sees task.restart_count and "
+                        "task.status_payload['restart'].",
+                        task.id,
+                        task.type,
+                        self._worker_id,
+                        self._after_s,
+                        abandoned_restarts_used(task),
+                        task_restart_limit(task, self._max_restarts),
+                    )
+                    continue
                 logger.warning(
                     "Settled task %s (type %s) as cancelled: it was fenced after its worker "
                     "stopped renewing its lease, and worker %s is declared the only worker "
@@ -382,10 +555,30 @@ class FencedTaskMonitor:
                 "It is held under this worker's own id, so this worker will not settle it; "
                 "settle it with reconcile_abandoned_task_cancellation once its handler stopped"
             )
-        return (
-            f"This worker will settle it as cancelled once it has stayed fenced for "
-            f"{self._after_s:g} seconds"
-        )
+        wait = f"once it has stayed fenced for {self._after_s:g} seconds"
+        if self._settlement is AbandonedTaskSettlement.RESTART:
+            if not task.restartable:
+                return (
+                    f"This worker will settle it as cancelled {wait}; it wasn't created "
+                    "with restartable=True, so it can't be restarted"
+                )
+            if not fenced_by_worker_loss(task):
+                return (
+                    f"This worker will settle it as cancelled {wait}; its cancellation was "
+                    "requested, so it isn't restarted"
+                )
+            used = abandoned_restarts_used(task)
+            limit = task_restart_limit(task, self._max_restarts)
+            if used < limit:
+                return (
+                    f"This worker will restart it {wait} (restart {used + 1} of {limit} "
+                    "after worker loss)"
+                )
+            return (
+                f"This worker will settle it as cancelled {wait}: it was already restarted "
+                f"{used} time(s) after worker loss, its limit"
+            )
+        return f"This worker will settle it as cancelled {wait}"
 
 
 def _declaring_worker_actor(worker_id: str) -> ResolutionActor:
@@ -399,9 +592,12 @@ def _declaring_worker_actor(worker_id: str) -> ResolutionActor:
 
 
 __all__ = [
+    "MAX_ABANDONED_RESTARTS_ENV",
     "RECONCILE_ABANDONED_AFTER_ENV",
+    "RESTART_ABANDONED_ENV",
     "SINGLE_WORKER_VALIDATOR_ID",
     "SINGLE_WORKER_VALIDATOR_VERSION",
+    "AbandonedTaskSettlement",
     "abandoned_task_settlement",
     "has_cancellation_fence",
     "is_fenced_after_worker_loss",

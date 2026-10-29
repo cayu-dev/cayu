@@ -10,6 +10,7 @@ from cayu.tasks._terminalization import (
     settle_task_retry_attempt_with_retry as settle_task_retry_attempt_with_retry,
 )
 from cayu.tasks._terminalization import terminalize_task_with_retry as terminalize_task_with_retry
+from cayu.tasks.abandoned import AbandonedTaskSettlement as AbandonedTaskSettlement
 from cayu.tasks.abandoned import is_fenced_after_worker_loss as is_fenced_after_worker_loss
 from cayu.tasks.abandoned import reconcile_abandoned_tasks as reconcile_abandoned_tasks
 from cayu.tasks.admission import (
@@ -241,12 +242,17 @@ from cayu.tasks.queries import TaskQuery as TaskQuery
 from cayu.tasks.queries import TaskStatusCounts as TaskStatusCounts
 from cayu.tasks.records import Task as Task
 from cayu.tasks.records import TaskClaimLost as TaskClaimLost
+from cayu.tasks.records import TaskRestartReason as TaskRestartReason
+from cayu.tasks.records import TaskRestartRecord as TaskRestartRecord
 from cayu.tasks.records import TaskRetryPolicy as TaskRetryPolicy
 from cayu.tasks.records import TaskRetrySeriesDisposition as TaskRetrySeriesDisposition
 from cayu.tasks.records import TaskRetrySeriesSnapshot as TaskRetrySeriesSnapshot
 from cayu.tasks.records import TaskSessionClosureClaim as TaskSessionClosureClaim
 from cayu.tasks.records import TaskStatus as TaskStatus
+from cayu.tasks.restart import AbandonedTaskRestartRequest as AbandonedTaskRestartRequest
+from cayu.tasks.restart import TaskRestartLimitReached as TaskRestartLimitReached
 from cayu.tasks.restart import requeue_restartable_task as requeue_restartable_task
+from cayu.tasks.restart import restart_abandoned_task as restart_abandoned_task
 from cayu.tasks.retry import TaskRetryAttemptDisposition as TaskRetryAttemptDisposition
 from cayu.tasks.retry import TaskRetryAttemptReport as TaskRetryAttemptReport
 from cayu.tasks.retry import TaskRetryEvent as TaskRetryEvent

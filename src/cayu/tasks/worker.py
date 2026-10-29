@@ -126,7 +126,12 @@ from cayu.tasks._terminalization import (
     _terminalize_claimed_task_or_detect_peer_winner,
     settle_task_retry_attempt_with_retry,
 )
-from cayu.tasks.abandoned import FencedTaskMonitor, reconcile_abandoned_after_from_environment
+from cayu.tasks.abandoned import (
+    AbandonedTaskSettlement,
+    FencedTaskMonitor,
+    reconcile_abandoned_after_from_environment,
+    restart_abandoned_from_environment,
+)
 from cayu.tasks.cancellation import (
     _TASK_CANCELLATION_REQUESTED_REASON,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
@@ -332,6 +337,27 @@ async def reconcile_abandoned_task_cancellation(
         raise TaskTerminalizationConflict("Abandoned task cancellation lost its task.")
     if current.status is TaskStatus.CANCELLED:
         return current
+    return await _reconcile_observed_abandoned_task_cancellation(
+        task_store,
+        current,
+        validator_id=validator_id,
+        validator_version=validator_version,
+        evidence_id=evidence_id,
+        reconciled_by=reconciled_by,
+    )
+
+
+async def _reconcile_observed_abandoned_task_cancellation(
+    task_store: TaskStore,
+    current: Task,
+    *,
+    validator_id: str,
+    validator_version: str,
+    evidence_id: str,
+    reconciled_by: ResolutionActor | None,
+) -> Task:
+    """Cancel the exact fenced claim ``current`` shows; the store refuses a changed claim."""
+
     if current.session_id is not None:
         raise TaskTerminalizationConflict(
             "Session-attached tasks are not supported; interrupted-handoff recovery "
@@ -476,6 +502,8 @@ async def run_task_worker(
     reclaim: bool = True,
     reclaim_every_s: float = 60.0,
     reconcile_abandoned_after_s: float | None = None,
+    restart_abandoned: bool | None = None,
+    max_abandoned_restarts: int | None = None,
     recover_interrupted_handoffs: bool = True,
     interrupted_handoff_recovery_every_s: float = (_INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS),
     recovered_interrupted_task_handler: RecoveredInterruptedTaskHandler | None = None,
@@ -527,6 +555,17 @@ async def run_task_worker(
       --reconcile-abandoned-after-seconds`` set it for the process. Don't set
       it when several workers or processes claim the same tasks: a slow worker
       may still be running a task whose lease expired.
+    - ``restart_abandoned=True`` makes that declared single worker requeue a
+      task created with ``restartable=True`` instead of cancelling it, through
+      ``restart_abandoned_task``: the task returns to ``pending`` with
+      ``restart_count`` one higher and a record in ``restart_history``, and the
+      next handler sees ``task.status_payload["restart"]``. It requires
+      ``reconcile_abandoned_after_s``. Other tasks are still cancelled.
+      ``max_abandoned_restarts`` (2 by default) caps restarts after worker loss
+      for tasks that set no ``max_restarts`` of their own; a task past its cap
+      is cancelled as before, with evidence that says so. ``None`` for either
+      reads ``cayu worker --restart-abandoned`` and
+      ``--max-abandoned-restarts`` through their environment variables.
     - ``recover_interrupted_handoffs`` owns bounded recovery of expired attached
       task workers. Elect one such scanner for each shared task store.
     - ``interrupted_handoff_recovery_every_s`` controls the scanner's exhausted
@@ -611,6 +650,11 @@ async def run_task_worker(
     reconcile_abandoned_after_s = reconcile_abandoned_after_from_environment(
         reconcile_abandoned_after_s
     )
+    abandoned_settlement, max_abandoned_restarts = restart_abandoned_from_environment(
+        restart_abandoned,
+        max_abandoned_restarts,
+        reconcile_abandoned_after_s=reconcile_abandoned_after_s,
+    )
     if type(recover_interrupted_handoffs) is not bool:
         raise TypeError("recover_interrupted_handoffs must be a bool.")
     validate_worker_interval(
@@ -638,6 +682,13 @@ async def run_task_worker(
         )
     if max_tasks == 0 or _worker_should_stop(app, stop):
         return 0
+    if (
+        abandoned_settlement is AbandonedTaskSettlement.RESTART
+        and type(task_store).restart_abandoned_task is TaskStore.restart_abandoned_task
+    ):
+        raise NotImplementedError(
+            "restart_abandoned=True needs a task store that implements restart_abandoned_task."
+        )
     if not task_store_cancellation_reconciliation_capability_is_complete(task_store):
         raise NotImplementedError(
             "The generic task worker requires complete idempotent ordinary-task "
@@ -702,6 +753,8 @@ async def run_task_worker(
             worker_id=worker_id,
             query=query,
             reconcile_abandoned_after_s=reconcile_abandoned_after_s,
+            settlement=abandoned_settlement,
+            max_restarts=max_abandoned_restarts,
         )
         if reclaim or reconcile_abandoned_after_s is not None
         else None

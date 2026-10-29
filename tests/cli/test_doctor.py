@@ -897,11 +897,7 @@ def build_app():
     )
     worker_pid: int | None = None
     try:
-        deadline = time.monotonic() + 15
-        while not marker.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert marker.exists()
-        worker_pid = int(marker.read_text(encoding="utf-8"))
+        worker_pid = _read_worker_pid(marker, timeout_s=15)
 
         owner.terminate()
         owner.wait(timeout=3)
@@ -951,11 +947,7 @@ def build_app():
     )
     worker_pid: int | None = None
     try:
-        deadline = time.monotonic() + 30
-        while not marker.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert marker.exists()
-        worker_pid = int(marker.read_text(encoding="utf-8"))
+        worker_pid = _read_worker_pid(marker, timeout_s=30)
 
         os.kill(owner.pid, signal.SIGKILL)
         owner.wait(timeout=2)
@@ -1578,3 +1570,15 @@ def build_service(*, mode, project_context=None):
         with pytest.raises(ValueError, match="report is invalid") as rejected:
             validate_support_bundle_archive(tampered.getvalue())
         assert all(private_value not in str(rejected.value) for private_value in private_values)
+
+
+def _read_worker_pid(marker: Path, *, timeout_s: float) -> int:
+    """Wait for the worker to write its pid; the file exists before it is written."""
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        text = marker.read_text(encoding="utf-8") if marker.exists() else ""
+        if text.strip():
+            return int(text)
+        time.sleep(0.01)
+    raise AssertionError(f"The worker did not write its pid to {marker}.")

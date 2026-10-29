@@ -7891,6 +7891,31 @@ validator. Rechecks after a filtered listing only drop tasks without a
 cancellation fence; they never override the store's expiry decision with the
 local clock.
 
+With `restart_abandoned=True` (or `CAYU_WORKER_RESTART_ABANDONED`, which `cayu
+worker --restart-abandoned` sets; it requires the single-worker declaration)
+and with `reconcile_abandoned_tasks(..., settlement="restart")`, a fenced task
+created with `restartable=True` is requeued through
+`restart_abandoned_task` instead, with the same validator and evidence.
+`TaskStore.restart_abandoned_task(AbandonedTaskRestartRequest)` is the atomic
+store boundary: it requires the exact fenced claim (worker id and final lease
+expiry), an expired lease by the store's clock, an ordinary task without a
+session or admitted work attempt, a fence that worker loss left (its error code
+is one the worker or expired-claim reclamation records, so an explicit
+`cancel_task` or handler time limit is never undone), and fewer restarts after
+worker loss than its
+cap (`Task.max_restarts`, else the request's `max_restarts`, default 2). It
+returns the task to `pending`, clears its claim and dispatch evidence,
+increments `restart_count`, appends a `TaskRestartRecord` to
+`restart_history`, and sets `status_payload["restart"]`. Past the cap it raises
+`TaskRestartLimitReached` and changes nothing; the worker and
+`reconcile_abandoned_tasks` then cancel the task with evidence id
+`restart-limit-reached:<cap>:lease-expired-at:<lease expiry>`. A repeated request
+with evidence already in `restart_history` returns the task unchanged for the
+same claim and is refused for a different one. Graceful requeues
+through `requeue_restartable_task` increment `restart_count` but add no history
+record and don't count toward the cap. `max_restarts` and `restart_history` are
+stored in revision 135 columns and omitted from serialized tasks while unset. Revision 135 is breaking (`--acknowledge-breaking 135`): terminalization receipts embed task snapshots that can carry the new fields, which older binaries can't read.
+
 `reconcile_task_cancellation(...)` is the durable operator/application boundary
 for an ordinary cancellation whose owner was lost.
 `reconcile_abandoned_task_cancellation(task_store, task_id, validator_id=...,

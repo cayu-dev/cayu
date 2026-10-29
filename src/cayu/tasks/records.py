@@ -330,6 +330,52 @@ def _preflight_bounded_task_payloads(
         )
 
 
+#: The most restarts after worker loss a task or a caller may allow.
+TASK_MAX_RESTARTS_LIMIT = 100
+
+
+class TaskRestartReason(StrEnum):
+    """Why a restartable task went back to ``pending``."""
+
+    WORKER_LOST = "worker_lost"
+
+
+class TaskRestartRecord(BaseModel):
+    """One restart of a restartable task after its worker was lost.
+
+    ``previous_worker_id`` and ``previous_lease_expires_at`` identify the claim
+    that was abandoned; ``validator_id``, ``validator_version`` and
+    ``evidence_id`` name the check that vouched the worker was gone and the fact
+    it relied on.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    restarted_at: datetime
+    reason: TaskRestartReason
+    previous_worker_id: str
+    previous_lease_expires_at: datetime
+    previous_session_id: str | None = None
+    validator_id: str
+    validator_version: str
+    evidence_id: str
+
+    @field_validator("restarted_at", "previous_lease_expires_at")
+    @classmethod
+    def normalize_datetimes(cls, value: datetime, info) -> datetime:
+        return normalize_utc_datetime(value, info.field_name)
+
+    @field_validator("previous_worker_id", "validator_id", "validator_version", "evidence_id")
+    @classmethod
+    def validate_identities(cls, value: str, info) -> str:
+        return _validate_task_retry_reconciliation_identity(value, info.field_name)
+
+    @field_validator("previous_session_id")
+    @classmethod
+    def validate_previous_session_id(cls, value: str | None) -> str | None:
+        return None if value is None else require_clean_nonblank(value, "previous_session_id")
+
+
 class Task(BaseModel):
     """Durable unit of work.
 
@@ -345,6 +391,16 @@ class Task(BaseModel):
     concurrency_key: ConcurrencyKey = None
     restartable: StrictBool = False
     restart_count: StrictInt = Field(default=0, ge=0)
+    max_restarts: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=TASK_MAX_RESTARTS_LIMIT,
+        exclude_if=lambda value: value is None,
+    )
+    restart_history: tuple[TaskRestartRecord, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     title: str | None = None
     description: str | None = None
     status: TaskStatus = TaskStatus.PENDING
@@ -377,6 +433,10 @@ class Task(BaseModel):
     def validate_restart_policy(self) -> Task:
         if self.restart_count and not self.restartable:
             raise ValueError("A restart count requires restartable task policy.")
+        if self.max_restarts is not None and not self.restartable:
+            raise ValueError("max_restarts requires restartable task policy.")
+        if len(self.restart_history) > self.restart_count:
+            raise ValueError("Restart history can't hold more restarts than restart_count.")
         if self.restartable and any(
             value is not None
             for value in (
@@ -572,6 +632,8 @@ def copy_task(task: Task) -> Task:
         concurrency_key=task.concurrency_key,
         restartable=task.restartable,
         restart_count=task.restart_count,
+        max_restarts=task.max_restarts,
+        restart_history=task.restart_history,
         type=task.type,
         title=task.title,
         description=task.description,

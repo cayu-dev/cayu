@@ -154,7 +154,11 @@ def build_report_eval():
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CAYU_EVAL_REPORT_TOKEN", _TOKEN)
-    if not metadata_safe:
+    if metadata_safe:
+        # On GitHub Actions the runner's own metadata, such as a branch named
+        # "...-abandoned", can contain the redacted word "done".
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    else:
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         monkeypatch.setenv("GITHUB_HEAD_REF", "done")
     sent = []

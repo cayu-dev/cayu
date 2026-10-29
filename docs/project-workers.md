@@ -173,6 +173,22 @@ own worker ID (as in the example above), so a restarted worker doesn't share
 the dead one's ID. Otherwise settle fenced tasks yourself once you know the old
 process exited; see [when a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task).
 
+To run a task created with `TaskCreate(restartable=True)` again instead of
+cancelling it, add `--restart-abandoned`:
+
+```bash
+cayu worker dispatch --reconcile-abandoned-after-seconds 120 --restart-abandoned
+```
+
+The task goes back to `pending` with `restart_count` one higher and a record in
+`restart_history`, and the next handler sees `task.status_payload["restart"]`.
+After two restarts after worker loss (`--max-abandoned-restarts N`, or the task's
+own `max_restarts`), the next loss cancels it as before, so a handler that
+crashes its worker every time doesn't loop. Tasks that aren't restartable are
+still cancelled. The flags set `CAYU_WORKER_RESTART_ABANDONED` and
+`CAYU_WORKER_MAX_ABANDONED_RESTARTS`, which `run_task_worker` reads when the
+entrypoint doesn't pass `restart_abandoned` and `max_abandoned_restarts` itself.
+
 ## Inspect tasks
 
 `cayu task` reads tasks without starting the application. It opens the project's store

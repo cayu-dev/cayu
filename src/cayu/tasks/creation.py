@@ -13,6 +13,7 @@ from pydantic import (
     Field,
     PrivateAttr,
     StrictBool,
+    StrictInt,
     field_validator,
     model_validator,
 )
@@ -47,6 +48,7 @@ from cayu.tasks.contracts import (
     validate_work_completion_linked_id,
 )
 from cayu.tasks.records import (
+    TASK_MAX_RESTARTS_LIMIT,
     Task,
     TaskRetryPolicy,
     TaskStatus,
@@ -132,6 +134,12 @@ class TaskCreate(BaseModel):
     )
     concurrency_key: ConcurrencyKey = None
     restartable: StrictBool = Field(default=False, exclude_if=lambda value: value is False)
+    max_restarts: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=TASK_MAX_RESTARTS_LIMIT,
+        exclude_if=lambda value: value is None,
+    )
     work_contract: WorkContractRef | None = None
     invocation_origin: InvocationOriginClaim | None = None
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
@@ -153,6 +161,8 @@ class TaskCreate(BaseModel):
             )
         ):
             raise ValueError("Restartable tasks must be ordinary unattached root queue jobs.")
+        if self.max_restarts is not None and not self.restartable:
+            raise ValueError("max_restarts requires restartable=True.")
         return self
 
     @field_validator("schedule_policy", mode="before")
@@ -287,6 +297,7 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         task_id=request.task_id,
         concurrency_key=request.concurrency_key,
         restartable=request.restartable,
+        max_restarts=request.max_restarts,
         type=request.type,
         title=request.title,
         description=request.description,
@@ -667,6 +678,7 @@ def _task_from_create(
         status=TaskStatus.PENDING,
         concurrency_key=request.concurrency_key,
         restartable=request.restartable,
+        max_restarts=request.max_restarts,
         session_id=request.session_id,
         session_instance_id=(
             None

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
         TaskGroupSnapshot,
     )
     from cayu.tasks.operations import TaskCreationOperation
+    from cayu.tasks.restart import AbandonedTaskRestartRequest
 
 from pydantic import ValidationError
 
@@ -381,7 +382,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 133
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 135
 
 
 @model_store_surface("tasks")
@@ -1310,7 +1311,8 @@ class SQLiteTaskStore(TaskStore):
                 worker_id = ?, lease_expires_at = ?,
                 status_reason = ?, status_payload_json = ?, result_json = ?, error_json = ?,
                 updated_at = ?, started_at = ?, completed_at = ?, retry_series_json = ?,
-                work_contract_json = ?, available_at = ?, schedule_json = ?, restart_count = ?
+                work_contract_json = ?, available_at = ?, schedule_json = ?, restart_count = ?,
+                restart_history_json = ?
             WHERE id = ?
             """,
             (
@@ -1341,6 +1343,7 @@ class SQLiteTaskStore(TaskStore):
                 if task.schedule is None
                 else sqlite_records.json_dumps(task.schedule.model_dump(mode="json")),
                 task.restart_count,
+                sqlite_records.restart_history_json(task),
                 task.id,
             ),
         )
@@ -4140,9 +4143,10 @@ class SQLiteTaskStore(TaskStore):
                     invocation_json,
                     retry_series_json,
                     work_contract_json,
-                    schedule_json, restartable, restart_count, concurrency_key
+                    schedule_json, restartable, restart_count, concurrency_key,
+                    max_restarts, restart_history_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sqlite_records.task_to_row_values(task),
             )
@@ -5958,8 +5962,9 @@ class SQLiteTaskStore(TaskStore):
                             status_payload_json, input_json,
                             result_json, error_json, metadata_json, created_at, updated_at,
                             started_at, completed_at, invocation_json, retry_series_json,
-                            work_contract_json, schedule_json, restartable, restart_count, concurrency_key
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            work_contract_json, schedule_json, restartable, restart_count, concurrency_key,
+                            max_restarts, restart_history_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_records.task_to_row_values(successor),
                     )
@@ -6868,6 +6873,25 @@ class SQLiteTaskStore(TaskStore):
                     )
                 self._update_task_snapshot_unlocked(updated)
                 self._record_task_transition_unlocked(task, updated)
+                return updated.model_copy(deep=True)
+
+    async def restart_abandoned_task(self, request: AbandonedTaskRestartRequest) -> Task:
+        from cayu.tasks.restart import (
+            _abandoned_restarted_task,
+            copy_abandoned_task_restart_request,
+        )
+
+        request = copy_abandoned_task_restart_request(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                task = self._require_task_unlocked(request.task_id)
+                self._raise_if_governed_work_attempt_admission(
+                    request.task_id, "Admitted work attempts cannot restart."
+                )
+                updated = _abandoned_restarted_task(task, request, now=self._ownership_clock())
+                if updated is not task:
+                    self._update_task_snapshot_unlocked(updated)
+                    self._record_task_transition_unlocked(task, updated)
                 return updated.model_copy(deep=True)
 
     async def release_task(

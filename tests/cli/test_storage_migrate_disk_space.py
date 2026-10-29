@@ -219,7 +219,8 @@ def test_migrate_reserves_working_space_when_revisions_are_pending(tmp_path, mon
     # Room for the backup and the copy, but not for the working space.
     _fake_free_space(monkeypatch, 2 * size)
     command = ["storage", "migrate", "--sqlite", str(db), "--waive-backup"]
-    command += ["--acknowledge-breaking", str(schema.LATEST_REVISION)]
+    if schema.REVISIONS[-1].kind is schema.RevisionKind.BREAKING:
+        command += ["--acknowledge-breaking", str(schema.LATEST_REVISION)]
 
     assert main(command) == 1
 

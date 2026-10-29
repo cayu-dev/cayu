@@ -767,6 +767,12 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     # A row whose tool results are stored in their tool event records the size
     # of its full message, which the writer supplies.
     134: (POSTGRES_TRANSCRIPT_MESSAGE_BYTES_FUNCTION,),
+    135: (
+        "ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS max_restarts BIGINT "
+        "CHECK (max_restarts IS NULL OR max_restarts >= 0)",
+        "ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS restart_history JSONB "
+        "NOT NULL DEFAULT '[]'::jsonb",
+    ),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,
