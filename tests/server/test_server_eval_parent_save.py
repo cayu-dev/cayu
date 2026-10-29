@@ -307,7 +307,10 @@ def test_parent_save_cancellation_keeps_writer_fenced_until_real_dispatch_settle
                         owner, *([] if competitor is None else [competitor]), return_exceptions=True
                     )
 
-        asyncio.run(exercise())
+        # The lifespan's eval run coordinator polls this store on the client's
+        # loop. Racing requests from a second loop could bind the store lock
+        # to that loop and fail the competitor instead of fencing it.
+        client.portal.call(exercise)
         assert _source(client, child, case_id).status_code == 200
 
 
