@@ -738,10 +738,11 @@ def test_stdio_deep_inbound_is_typed_secret_safe_and_settles_every_waiter(
 
 def test_stdio_idle_timeout_is_typed_and_fences_uncertain_process() -> None:
     async def run() -> tuple[dict[int, Any], bool, int | None]:
-        session = await StdioMcpClient(
-            transport_limits=_limits(idle_timeout_s=0.1, total_call_timeout_s=0.5)
-        ).connect(_server_spec())
+        # Connect under the default limits: initialize also counts against them,
+        # and a server still starting on a busy runner can miss a 0.1 s idle gap.
+        session = await StdioMcpClient(transport_limits=_limits()).connect(_server_spec())
         assert isinstance(session, StdioMcpSession)
+        session.transport_limits = _limits(idle_timeout_s=0.1, total_call_timeout_s=0.5)
         try:
             with pytest.raises(McpIdleTimeoutError, match="idle timeout"):
                 await session.call_tool("echo", {"text": "idle", "defer_response": True})
@@ -765,9 +766,9 @@ def test_stdio_idle_timeout_is_typed_and_fences_uncertain_process() -> None:
 
 def test_stdio_active_byte_stream_still_hits_total_call_deadline() -> None:
     async def run() -> None:
-        session = await StdioMcpClient(
-            transport_limits=_limits(idle_timeout_s=0.1, total_call_timeout_s=0.15)
-        ).connect(_server_spec())
+        session = await StdioMcpClient(transport_limits=_limits()).connect(_server_spec())
+        assert isinstance(session, StdioMcpSession)
+        session.transport_limits = _limits(idle_timeout_s=0.1, total_call_timeout_s=0.15)
         try:
             with pytest.raises(McpCallDeadlineExceededError, match="timed out"):
                 await session.call_tool(
@@ -1547,13 +1548,9 @@ def test_stdio_malformed_or_closed_peer_is_fatal(
 
 def test_stdio_peer_closure_precedes_optional_stderr_enrichment_deadline() -> None:
     async def run() -> tuple[BaseException, int | None]:
-        session = await StdioMcpClient(
-            transport_limits=_limits(
-                idle_timeout_s=0.5,
-                total_call_timeout_s=0.1,
-            )
-        ).connect(_server_spec())
+        session = await StdioMcpClient(transport_limits=_limits()).connect(_server_spec())
         assert isinstance(session, StdioMcpSession)
+        session.transport_limits = _limits(idle_timeout_s=0.5, total_call_timeout_s=0.1)
         try:
             with pytest.raises(McpPeerClosedError) as exc_info:
                 await session.call_tool(
@@ -1579,12 +1576,10 @@ def test_contained_stdio_peer_closure_is_not_masked_by_anchor_ownership() -> Non
     async def run() -> tuple[BaseException, int | None]:
         session = await _StdioMcpClient(
             process_lifetime=StdioMcpProcessLifetime.PARENT_DEATH_CONTAINMENT,
-            transport_limits=_limits(
-                idle_timeout_s=0.5,
-                total_call_timeout_s=0.1,
-            ),
+            transport_limits=_limits(),
         ).connect(_server_spec())
         assert isinstance(session, StdioMcpSession)
+        session.transport_limits = _limits(idle_timeout_s=0.5, total_call_timeout_s=0.1)
         try:
             with pytest.raises(McpPeerClosedError) as exc_info:
                 await session.call_tool(
