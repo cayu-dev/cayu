@@ -15,6 +15,7 @@ OPTIONAL_EXTRA_MODULES = frozenset(
         "cayu.storage.knowledge_postgres",
         "cayu.storage.work_context_postgres",
         "cayu.storage.tasks_postgres",
+        "cayu.storage.task_steps_postgres",
         "cayu.storage.budget_postgres",
         "cayu.storage.collaboration_postgres",
         "cayu.storage.event_watchers_postgres",

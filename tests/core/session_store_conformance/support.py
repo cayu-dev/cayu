@@ -229,6 +229,7 @@ _POSTGRES_TABLES = (
     "cayu_agent_snapshot_lifecycle_operations",
     "cayu_agent_snapshot_gc_plans",
     "cayu_agent_snapshot_gc_receipts",
+    "cayu_task_steps",
     "cayu_schema_migrations",
 )
 _POSTGRES_DATA_TABLES = (

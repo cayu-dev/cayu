@@ -328,6 +328,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "PostgresSessionStore": ("cayu.storage.postgres", "PostgresSessionStore"),
     "PostgresTaskStore": ("cayu.storage.tasks_postgres", "PostgresTaskStore"),
+    "PostgresTaskStepStore": ("cayu.storage.task_steps_postgres", "PostgresTaskStepStore"),
     "PostgresToolAuthorizationGrantStore": (
         "cayu.storage.authorization_grants_postgres",
         "PostgresToolAuthorizationGrantStore",
@@ -373,6 +374,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "SQLiteSessionStore": ("cayu.storage.sqlite", "SQLiteSessionStore"),
     "SQLiteTaskStore": ("cayu.storage.tasks_sqlite", "SQLiteTaskStore"),
+    "SQLiteTaskStepStore": ("cayu.storage.task_steps_sqlite", "SQLiteTaskStepStore"),
     "SQLiteToolAuthorizationGrantStore": (
         "cayu.storage.authorization_grants_sqlite",
         "SQLiteToolAuthorizationGrantStore",
@@ -563,6 +565,7 @@ PUBLIC_NAMES = [
     "PostgresProductOperationStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
+    "PostgresTaskStepStore",
     "PostgresToolAuthorizationGrantStore",
     "RETENTION_ARTIFACT_SCOPES",
     "RETENTION_TERMINAL_EVAL_RUN_STATUSES",
@@ -590,6 +593,7 @@ PUBLIC_NAMES = [
     "SQLiteProductOperationStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
+    "SQLiteTaskStepStore",
     "SQLiteToolAuthorizationGrantStore",
     "SessionCompactionLevel",
     "SessionRetentionPolicy",

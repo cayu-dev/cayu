@@ -333,6 +333,8 @@ from cayu.storage.retention import WorkspaceRetentionPolicy as WorkspaceRetentio
 from cayu.storage.retention import storage_growth_warning as storage_growth_warning
 from cayu.storage.sqlite import SQLiteSessionStore as SQLiteSessionStore
 from cayu.storage.targets import configured_database_url as configured_database_url
+from cayu.storage.task_steps_postgres import PostgresTaskStepStore as PostgresTaskStepStore
+from cayu.storage.task_steps_sqlite import SQLiteTaskStepStore as SQLiteTaskStepStore
 from cayu.storage.tasks_postgres import PostgresTaskStore as PostgresTaskStore
 from cayu.storage.tasks_sqlite import SQLiteTaskStore as SQLiteTaskStore
 from cayu.storage.work_context_postgres import (
@@ -501,6 +503,7 @@ __all__ = [
     "SQLiteEventWatcherStore",
     "SQLiteKnowledgeStore",
     "SQLiteSessionStore",
+    "SQLiteTaskStepStore",
     "SQLiteTaskStore",
     "SQLiteToolAuthorizationGrantStore",
     "SessionCompactionLevel",

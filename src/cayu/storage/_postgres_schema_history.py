@@ -42,6 +42,7 @@ from cayu.storage._task_group_schema import (
     POSTGRES_TASK_GROUP_QUIESCENCE_DDL,
 )
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
+from cayu.storage._task_step_schema import POSTGRES_TASK_STEP_DDL
 
 # Postgres schema mirrors the SQLite store (both at ADR 0001 baseline revision 1)
 # but uses Postgres-native types: TEXT ids, JSONB payloads, TIMESTAMPTZ times,
@@ -773,6 +774,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS restart_history JSONB "
         "NOT NULL DEFAULT '[]'::jsonb",
     ),
+    136: POSTGRES_TASK_STEP_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

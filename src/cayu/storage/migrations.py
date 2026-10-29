@@ -568,6 +568,9 @@ REVISIONS: tuple[Revision, ...] = (
     # restarts. Terminalization receipts embed task snapshots that carry the new
     # fields, which older Task models reject, so older binaries must not open it.
     Revision(revision=135, kind=RevisionKind.BREAKING, compatible_from=135),
+    # Saved task step results are a new table that older binaries never read
+    # or write. Only the optional task step stores require it.
+    Revision(revision=136, kind=RevisionKind.ADDITIVE, compatible_from=135),
 )
 
 #: The revision an empty database is initialized to.

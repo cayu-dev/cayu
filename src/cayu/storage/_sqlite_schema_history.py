@@ -30,6 +30,7 @@ from cayu.storage._sqlite_closure_schema import SQLITE_CLOSURE_DDL
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
 from cayu.storage._task_group_schema import SQLITE_TASK_GROUP_DDL, SQLITE_TASK_GROUP_QUIESCENCE_DDL
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
+from cayu.storage._task_step_schema import SQLITE_TASK_STEP_DDL
 
 # Baseline-revision (ADR 0001 revision 1) DDL. Every table carries the cayu_ prefix
 # (Decision 5) so Cayu state never collides with an app's own tables. The
@@ -733,6 +734,7 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     """,
     133: """CREATE INDEX IF NOT EXISTS idx_cayu_tasks_event_retry_key
         ON cayu_tasks(json_extract(invocation_json, '$.event_retry_key'), status);""",
+    136: SQLITE_TASK_STEP_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

@@ -478,3 +478,42 @@ Custom workers can use `requeue_restartable_task(task_store, task, worker_id)`
 after stopping and fully joining the handler themselves. Keep the lease renewed
 until that point and pass its current snapshot. This standalone helper neither
 cancels work nor treats an expired lease as proof of quiescence.
+
+### Saved step results
+
+A restarted handler starts again from the top. To skip steps that already
+finished, save each step's result as it finishes, keyed by the task id and a
+step name you choose:
+
+```python
+from cayu.storage import SQLiteTaskStepStore
+from cayu.tasks import complete_managed_task, task_steps
+
+step_store = SQLiteTaskStepStore("app.db")  # the task store's database
+
+
+async def handle_task(app, task, worker_id):
+    steps = task_steps(step_store, task)
+    checkout = await steps.run("checkout", lambda: clone(task.input["repository"]))
+    proposed = []
+    for finding in await steps.run("rank", lambda: rank(checkout)):
+        proposed.append(await steps.run(f"propose:{finding['id']}", lambda f=finding: propose(f)))
+    await complete_managed_task(app.task_store, task, worker_id, {"proposed": proposed})
+    await steps.clear()  # optional, and only after the task is complete
+```
+
+`steps.run(name, fn)` returns the saved result when the step has one and
+otherwise calls `fn` (sync or async), saves what it returns and returns that.
+The first saved result for a step wins, so two runs racing on one step agree.
+Results are JSON values of at most 256 KiB; save a reference such as an
+artifact id or a commit sha for anything larger. An exception saves nothing,
+and `steps.forget(name)` deletes one step so the next run repeats it.
+
+`SQLiteTaskStepStore` and `PostgresTaskStepStore` keep results in their own
+table (storage revision 136) and work beside any task store; point them at the
+task store's database. `InMemoryTaskStepStore` is for tests. `TaskStepStore` is
+the contract for another backend. Nothing in the worker requires a step store,
+and the store does not check task ownership. A saved result does not make a
+step's external effect happen only once: the worker can be lost after the
+effect and before the save, so a step that writes to another system still needs
+an idempotency key there.
