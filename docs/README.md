@@ -18,6 +18,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Task event execution](task-event-execution.md): shared event identity, budgets and execution deadlines.
 
 - [Long-running jobs](../src/cayu/guides/long-running.md) (`cayu guide long-running`): approvals, outside replies, timers, spend caps and restart tests
+- [Task handlers that survive a lost worker](../src/cayu/guides/lost-worker.md) (`cayu guide lost-worker`): restart after worker loss, reuse finished sessions and saved steps, and repeatable external effects
 - [Human-attention notifications](../src/cayu/guides/human-attention.md) (`cayu guide human-attention`)
 - [Application UIs over sessions](../src/cayu/guides/app-ui.md) (`cayu guide app-ui`)
 - [A B2B application: several businesses on one agent](../src/cayu/guides/b2b.md) (`cayu guide b2b`)

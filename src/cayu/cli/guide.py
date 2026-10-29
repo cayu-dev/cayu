@@ -66,6 +66,10 @@ _GUIDES = {
         "long-running.md",
         "Approvals, outside replies, timers, spend caps and restart tests on one page.",
     ),
+    "lost-worker": (
+        "lost-worker.md",
+        "Task handlers that restart after a lost worker and skip finished steps.",
+    ),
     "providers": (
         "providers.md",
         "Primary integrations and compatible Chat Completions endpoints.",
@@ -124,7 +128,14 @@ _RELATED = {
     "evals-ai-quality": ("evals-first", "evals-production", "authoring"),
     "evals-first": ("evals-ai-quality", "evals-production", "authoring"),
     "evals-production": ("evals-first", "evals-ai-quality", "durable-operations"),
-    "long-running": ("restart-tests", "durable-operations", "human-attention", "references"),
+    "long-running": (
+        "restart-tests",
+        "lost-worker",
+        "durable-operations",
+        "human-attention",
+        "references",
+    ),
+    "lost-worker": ("long-running", "restart-tests", "tool-effects", "durable-operations"),
     "providers": ("thinking", "authoring", "diagnostics"),
     "thinking": ("providers", "authoring"),
     "references": ("authoring", "durable-operations"),
