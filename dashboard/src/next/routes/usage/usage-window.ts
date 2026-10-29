@@ -1,5 +1,5 @@
 /**
- * The Usage page's time window and chart buckets, in the viewer's local time. Preset
+ * The Usage page's time window and resolution, in the viewer's local time. Preset
  * ranges end now and start on a whole hour or day, so the headline numbers and the bars
  * cover exactly the same span.
  */
@@ -16,7 +16,6 @@ export type UsageWindow = {
   startAt: string
   endAt: string
   unit: BucketUnit
-  buckets: Bucket[]
 }
 
 export const DEFAULT_RANGE: UsageRangeId = DEFAULT_USAGE_RANGE
@@ -64,14 +63,6 @@ function step(ms: number, unit: BucketUnit, n = 1) {
   return d.getTime()
 }
 
-function bucketsBetween(first: number, start: number, end: number, unit: BucketUnit): Bucket[] {
-  const buckets: Bucket[] = []
-  for (let at = first; at < end; at = step(at, unit)) {
-    buckets.push({ start: Math.max(at, start), end: Math.min(step(at, unit), end) })
-  }
-  return buckets
-}
-
 export function resolveWindow(
   range: UsageRangeId,
   startAt: string | undefined,
@@ -88,7 +79,6 @@ export function resolveWindow(
       startAt: new Date(start).toISOString(),
       endAt: new Date(now).toISOString(),
       unit: "hour",
-      buckets: bucketsBetween(start, start, now, "hour"),
     }
   }
   if (range !== "custom") {
@@ -101,7 +91,6 @@ export function resolveWindow(
       startAt: new Date(start).toISOString(),
       endAt: new Date(now).toISOString(),
       unit,
-      buckets: bucketsBetween(start, start, now, unit),
     }
   }
   try {
@@ -113,10 +102,7 @@ export function resolveWindow(
     const end = Date.parse(exact.endAt)
     const unit: BucketUnit =
       end - start <= 2 * DAY ? "hour" : end - start <= 62 * DAY ? "day" : "week"
-    const first = unit === "hour" ? startOfHour(start) : startOfDay(start)
-    // Distinct legal microsecond bounds can occupy the same JavaScript millisecond.
-    const buckets = start === end ? [{ start, end }] : bucketsBetween(first, start, end, unit)
-    return { start, end, ...exact, unit, buckets }
+    return { start, end, ...exact, unit }
   } catch (error) {
     return { error: error instanceof Error ? error.message : "The usage window is invalid." }
   }

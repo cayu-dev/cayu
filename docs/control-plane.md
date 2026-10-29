@@ -541,6 +541,18 @@ occurring in the bucket. Existing eval/fork exclusions and older `running_now`
 sessions remain unchanged. This live overview observation is separate from the
 store snapshot used by the event-usage rollup.
 
+The Developer dashboard uses one batched start-count request for its Sessions
+chart and requests event activity in the headline rollup. Both use the same exact
+window, the viewer's IANA time zone, and the specialist, environment, provider and
+model filters. Bars show session starts and their current failed state; hover and
+accessible table details show **activity tokens**, including older sessions active
+in that period. These populations intentionally differ. There is no per-bucket
+cost estimate. Unsupported series capabilities leave the headline usable with an
+explicit chart/detail unavailable state. Label, parent-session and causal-budget
+filters still apply to the headline; the start chart is unavailable for those
+filters because its API cannot apply them. A failed refresh keeps the last
+successful numbers with a visible warning.
+
 `cayu usage rollup` and `cayu usage counts` expose the same data through a running
 local server (`--server-url`) or Cloud Agent (`--application`). See
 [Session inspection](session-inspection.md#event-window-usage-and-start-counts).

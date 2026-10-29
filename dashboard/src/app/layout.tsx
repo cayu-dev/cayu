@@ -148,6 +148,10 @@ function IdentityGate() {
           now: Date.now,
           overviewQueriesEnabled:
             serverContract.capabilities.surfaces.session_overview_queries?.read.enabled === true,
+          usageSeriesEnabled:
+            serverContract.capabilities.surfaces.usage_series?.read.enabled === true,
+          sessionOverviewSeriesEnabled:
+            serverContract.capabilities.surfaces.session_overview_series?.read.enabled === true,
           artifactsEnabled: serverContract.capabilities.surfaces.artifacts?.read.enabled === true,
           taskIndexEnabled: serverContract.capabilities.surfaces.task_index?.read.enabled === true,
           taskCreationEnabled:

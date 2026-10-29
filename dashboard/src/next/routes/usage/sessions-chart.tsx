@@ -4,7 +4,7 @@ import { type Bucket, type BucketUnit, bucketLabel, bucketSpan } from "./usage-w
 export type ChartBucket = Bucket & {
   total: number | null
   failed: number
-  /** Cost or tokens for the tooltip, already formatted. */
+  /** Event activity tokens for the same period, distinct from sessions started. */
   detail: string | null
 }
 
@@ -86,6 +86,7 @@ export function SessionsChart({ buckets, unit }: { buckets: ChartBucket[]; unit:
             <th>{per}</th>
             <th>Sessions</th>
             <th>Failed</th>
+            <th>Activity</th>
           </tr>
         </thead>
         <tbody>
@@ -94,6 +95,7 @@ export function SessionsChart({ buckets, unit }: { buckets: ChartBucket[]; unit:
               <td>{bucketSpan(b, unit)}</td>
               <td>{b.total ?? "loading"}</td>
               <td>{b.failed}</td>
+              <td>{b.detail ?? "Unavailable"}</td>
             </tr>
           ))}
         </tbody>

@@ -107,14 +107,14 @@ current behavior rather than outstanding proposals.
 ## Current page limitations
 
 The production and prototype pages retain the following explicit limitations.
-Usage series and filtered overview counts are available in the API; connecting
-them to these pages remains separate work. Other backend additions are still
-pending. The UI does not infer missing values or claim an exact result from a
+Usage now reads one filtered, batched start/failure histogram and event-activity
+token details in the same window and viewer time zone. Other backend additions
+are still pending. The UI does not infer missing values or claim an exact result from a
 partial read.
 
 | Page | Remaining work | Current behavior |
 | --- | --- | --- |
-| Usage | Connect the available usage series and filtered overview counts APIs | One `overview/counts` call per bar, unfiltered, with a caption saying so |
+| Usage | Start counts for labels, parent sessions and causal budgets | Headline keeps these filters; chart explicitly unavailable because the histogram API cannot apply them |
 | Usage | Cost per model and provider | Models table shows tokens only |
 | Usage | Session breakdown ranked by cost, with the specialist | Ranked by tokens; one session read per row for the specialist |
 | Environments | MCP server names | Shows the count only |

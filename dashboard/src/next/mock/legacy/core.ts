@@ -37,9 +37,12 @@ import type {
   UsageSessionAggregateBreakdown,
   UsageSessionCostBreakdown,
   UsageSessionCostSummary,
+  UsageTimeSeries,
 } from "@/lib/generated/server-api"
+import { resolveUsageWindow } from "@/lib/usage-rollup"
 import type { TaskInfo, TaskItem, TaskScheduleEvent } from "../../api/types"
 import type { AppSeed, SeedSession } from "../model"
+import { inMockTimeWindow, mockTimeBuckets } from "../time-series"
 import { CONTRACT } from "./contract"
 import { HttpError, type LegacyContext, type LegacyRequest, type LegacyRoute } from "./server"
 
@@ -327,20 +330,37 @@ type Activity = {
   currency: string
 }
 
-function activityOf(s: SeedSession, window?: { start: number; end: number }): Activity {
+function activityOf(s: SeedSession, window?: { start_at: string; end_at: string }): Activity {
   const inWindow = (e: ApiEventRecord) => {
     if (!window) return true
-    const at = Date.parse(e.timestamp)
-    return at >= window.start && at < window.end
+    return inMockTimeWindow(e.timestamp, window.start_at, window.end_at)
   }
   const steps = s.events.filter((e) => e.type === "model.completed")
   const stepsIn = steps.filter(inWindow).length
   const tools = s.events.filter((e) => e.type === "tool.call.started" && inWindow(e)).length
   const share = steps.length ? stepsIn / steps.length : 0
   const cost = s.overview.cost
+  const totalTokens = tokensOf(s.usage)
+  // Allocate integer remainders to stable synthetic events, so periods conserve totals.
+  const windowTokens = window
+    ? steps.reduce((sum, event, index) => {
+        if (!inWindow(event)) return sum
+        const before = scaleTokens(totalTokens, index, steps.length)
+        const after = scaleTokens(totalTokens, index + 1, steps.length)
+        return addTokens(sum, {
+          input: after.input - before.input,
+          output: after.output - before.output,
+          reasoning: after.reasoning - before.reasoning,
+          total: after.total - before.total,
+          cacheRead: after.cacheRead - before.cacheRead,
+          cached: after.cached - before.cached,
+          uncached: after.uncached - before.uncached,
+        })
+      }, NO_TOKENS)
+    : totalTokens
   return {
     s,
-    tokens: window ? scaleTokens(tokensOf(s.usage), stepsIn, steps.length) : tokensOf(s.usage),
+    tokens: windowTokens,
     steps: window ? stepsIn : (s.usage.model_steps ?? steps.length),
     tools: window ? tools : (s.usage.tool_calls ?? tools),
     cost: cost ? Math.round(cost.amount * 1e6 * (window ? share : 1)) : null,
@@ -448,12 +468,23 @@ const seedHasCosts = (seed: AppSeed) => seed.sessions.some((s) => s.overview.cos
 function usageWindow(body: Record<string, unknown>, context: LegacyContext) {
   const start = Date.parse(String(body.start_at))
   const end = Date.parse(String(body.end_at))
-  if (Number.isNaN(start) || Number.isNaN(end) || start >= end) {
+  try {
+    resolveUsageWindow({
+      range: "custom",
+      start_at: String(body.start_at),
+      end_at: String(body.end_at),
+    })
+  } catch {
     throw new HttpError(422, "start_at and end_at must be timestamps, with start before end.")
   }
-  const relative = Math.abs(end - Date.now()) < 10 * 60_000
+  const relative = !body.series && Math.abs(end - Date.now()) < 10 * 60_000
   const shift = relative ? context.now() - Date.now() : 0
-  return { start: start + shift, end: end + shift }
+  return {
+    start: start + shift,
+    end: end + shift,
+    start_at: shift ? iso(start + shift) : String(body.start_at),
+    end_at: shift ? iso(end + shift) : String(body.end_at),
+  }
 }
 
 function sessionBreakdown(acts: Activity[], limit: number): UsageSessionAggregateBreakdown {
@@ -485,6 +516,24 @@ function usageRollup({ body: raw }: LegacyRequest, context: LegacyContext): Usag
   const filter = filterFrom(body.session_filter)
   const matching = seed.sessions.filter((s) => sessionMatches(s, filter))
   const acts = matching.map((s) => activityOf(s, window))
+  const spec = record(body.series)
+  const series: UsageTimeSeries | null =
+    spec.unit === "hour" || spec.unit === "day" || spec.unit === "week"
+      ? {
+          unit: spec.unit,
+          timezone: typeof spec.timezone === "string" ? spec.timezone : "UTC",
+          buckets: mockTimeBuckets(
+            String(body.start_at),
+            String(body.end_at),
+            spec.unit,
+            typeof spec.timezone === "string" ? spec.timezone : "UTC",
+          ).map((bucket) => ({
+            start_at: bucket.start_at,
+            end_at: bucket.end_at,
+            totals: totalsOf(matching.map((session) => activityOf(session, bucket))),
+          })),
+        }
+      : null
   const groupLimit = Math.max(1, Number(body.group_limit) || 20)
   const sessionLimit = Number(body.session_group_limit) || 0
   const costs = seedHasCosts(seed)
@@ -510,13 +559,14 @@ function usageRollup({ body: raw }: LegacyRequest, context: LegacyContext): Usag
     time_basis: "event.timestamp",
     session_filter_basis: "current_session_attributes",
     as_of: iso(context.now()),
-    start_at: iso(window.start),
-    end_at: iso(window.end),
+    start_at: body.series ? String(body.start_at) : iso(window.start),
+    end_at: body.series ? String(body.end_at) : iso(window.end),
     accuracy: EXACT,
     matching_session_count: String(matching.length),
     active_session_count: String(matching.filter((s) => sessionStatus(s) === "running").length),
     includes_active_sessions: true,
     totals: totalsOf(acts),
+    series,
     provider_breakdown: usageBreakdown(acts, groupLimit, false),
     model_breakdown: usageBreakdown(acts, groupLimit, true),
     cost: costs ? costRollup(acts, seed) : null,

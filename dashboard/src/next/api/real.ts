@@ -68,7 +68,7 @@ export const realApi: Api = {
     return result
   },
   inboxCounts: (q = {}) => json(`/inbox/counts${query(q)}`),
-  overviewCounts: (q) => json(`/sessions/overview/counts${query(q)}`),
+  overviewCounts: (q, signal) => json(`/sessions/overview/counts${query(q)}`, { signal }),
   transcript: (id, q, signal) => fetchSessionTranscript(id, q, signal),
   trace: (id, q, signal) => fetchSessionTrace(id, q, signal),
   events: (id, q, signal) => fetchSessionEvents(id, q, signal),

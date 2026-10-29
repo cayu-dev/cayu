@@ -35,6 +35,7 @@ import {
 import type { AppSeed, SeedSession } from "./model"
 import { NotFound } from "./not-found"
 import { SEEDS } from "./seeds"
+import { inMockTimeWindow, mockTimeBuckets } from "./time-series"
 
 const LATENCY_MS = 120
 const wait = <T>(value: T, ms = LATENCY_MS) =>
@@ -648,16 +649,40 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
     },
     async overviewCounts(query) {
       const rows = data.sessions.filter(
-        (row) => !isEvalTrialMetadata(row.metadata) && !row.overview.forked,
+        (row) =>
+          !isEvalTrialMetadata(row.metadata) && !row.overview.forked && sessionMatches(row, query),
       )
-      const day = rows.filter(
-        (row) => row.overview.started_at >= query.since && row.overview.started_at < query.until,
+      const day = rows.filter((row) =>
+        inMockTimeWindow(row.session.created_at, query.since, query.until),
       )
       const counts: Record<string, string> = {}
       for (const row of day)
         counts[row.overview.state] = String(Number(counts[row.overview.state] ?? 0) + 1)
       return wait({
-        ...query,
+        since: query.since,
+        until: query.until,
+        series: query.bucket_unit
+          ? {
+              unit: query.bucket_unit,
+              timezone: query.timezone ?? "UTC",
+              buckets: mockTimeBuckets(
+                query.since,
+                query.until,
+                query.bucket_unit,
+                query.timezone ?? "UTC",
+              ).map((bucket) => {
+                const selected = day.filter((row) =>
+                  inMockTimeWindow(row.session.created_at, bucket.start_at, bucket.end_at),
+                )
+                return {
+                  start_at: bucket.start_at,
+                  end_at: bucket.end_at,
+                  total_count: String(selected.length),
+                  failed: String(selected.filter((row) => row.overview.state === "failed").length),
+                }
+              }),
+            }
+          : null,
         tokens: {
           input: String(day.reduce((total, row) => total + row.overview.tokens.input, 0)),
           output: String(day.reduce((total, row) => total + row.overview.tokens.output, 0)),

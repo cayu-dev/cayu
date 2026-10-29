@@ -3,10 +3,10 @@
  * calls; sessions per day; tokens per model; and the sessions that used the most. Window
  * bounds, accuracy and pricing coverage sit in Debug.
  */
-import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
+import { hashKey, useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useSearch } from "@tanstack/react-router"
 import { Info, RefreshCw, X } from "lucide-react"
-import { type ReactNode, useRef, useState } from "react"
+import { type ReactNode, useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { retryAggregateRequest } from "@/lib/aggregate-query"
 import {
@@ -18,17 +18,14 @@ import {
 import { dashboardConfig } from "@/lib/config"
 import { formatCount, formatCurrency } from "@/lib/format"
 import type {
-  SessionOverviewCountsResponse,
+  SessionStartSeries,
   UsageAggregateGroup,
   UsageAggregateTotals,
   UsageCurrencyCost,
   UsageSessionCostSummary,
+  UsageTimeSeries,
 } from "@/lib/generated/server-api"
-import {
-  usageRollupFilterCount,
-  usageRollupRequestState,
-  usageRollupSessionSearch,
-} from "@/lib/usage-rollup"
+import { usageRollupRequestState, usageRollupSessionSearch } from "@/lib/usage-rollup"
 import type { UsageRollupSearch } from "@/lib/usage-rollup-search"
 import { cn } from "@/lib/utils"
 import { useSpecialists } from "../app/queries"
@@ -47,7 +44,8 @@ import {
   useGo,
   useRowClick,
 } from "./common"
-import { type ChartBucket, SessionsChart } from "./usage/sessions-chart"
+import { SessionsChart } from "./usage/sessions-chart"
+import { histogramRequest, joinedSeriesBuckets } from "./usage/usage-series"
 import {
   formatWhen,
   localInputValue,
@@ -79,7 +77,8 @@ const partialSummary = (cost: UsageSessionCostSummary) =>
 
 export function UsagePage() {
   const search = useSearch({ from: "/usage" })
-  const { overviewQueriesEnabled = true } = useServices()
+  const { usageSeriesEnabled = false, sessionOverviewSeriesEnabled = false } = useServices()
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
   const go = useGo()
   const now = useNow()
   const api = useApi()
@@ -108,7 +107,14 @@ export function UsagePage() {
         ? requestState.error
         : null
   const rollup = useQuery({
-    queryKey: ["usage", "rollup", search, !!dashboardConfig.priceBook],
+    queryKey: [
+      "usage",
+      "rollup",
+      search,
+      !!dashboardConfig.priceBook,
+      usageSeriesEnabled,
+      timezone,
+    ],
     queryFn: async ({ signal }) => {
       const requestedWindow = resolveWindow(range, search.start_at, search.end_at, anchor.current)
       if ("error" in requestedWindow) throw new Error(requestedWindow.error)
@@ -122,7 +128,11 @@ export function UsagePage() {
         { pricing: dashboardConfig.priceBook },
       )
       if (!requested.ok) throw new Error(requested.error)
-      const requestedBody = { ...requested.request, session_group_limit: TOP_SESSIONS }
+      const requestedBody: UsageRollupBody = {
+        ...requested.request,
+        session_group_limit: TOP_SESSIONS,
+        ...(usageSeriesEnabled ? { series: { unit: requestedWindow.unit, timezone } } : {}),
+      }
       return {
         data: await fetchUsageRollup(requestedBody, signal),
         body: requestedBody,
@@ -133,24 +143,59 @@ export function UsagePage() {
     retry: retryAggregateRequest,
     refetchOnWindowFocus: false,
   })
-  // The chart, diagnostics and totals share the last successful request, including
-  // when refreshing a relative window fails. A changed filter owns a separate query.
+  // Headline values retain their successful request when a refresh fails.
   const shownWindow = rollup.data?.window ?? window
   const shownBody = rollup.data?.body ?? body
-  const counts = useQueries({
-    queries: (shownBody && overviewQueriesEnabled ? (shownWindow?.buckets ?? []) : []).map(
-      (b, index, buckets) => {
-        const since = index === 0 ? shownBody!.start_at : new Date(b.start).toISOString()
-        const until =
-          index === buckets.length - 1 ? shownBody!.end_at : new Date(b.end).toISOString()
-        return {
-          queryKey: ["usage", "counts", since, until],
-          queryFn: () => api.overviewCounts({ since, until }),
-          refetchOnWindowFocus: false,
-        }
-      },
-    ),
+  const countsRequest =
+    shownBody && shownWindow ? histogramRequest(shownBody, shownWindow.unit, timezone) : null
+  const counts = useQuery({
+    queryKey: ["usage", "counts", countsRequest, sessionOverviewSeriesEnabled],
+    queryFn: ({ signal }) => api.overviewCounts(countsRequest!, signal),
+    enabled: !!countsRequest && sessionOverviewSeriesEnabled,
+    retry: retryAggregateRequest,
+    refetchOnWindowFocus: false,
   })
+  // A relative refresh changes exact bounds without changing the selected scope.
+  // Retain the previous successful histogram, with its own bounds, until its replacement
+  // arrives. Filters, range, timezone and capability changes must never borrow that data.
+  const histogramScope = hashKey([
+    search,
+    timezone,
+    usageSeriesEnabled,
+    sessionOverviewSeriesEnabled,
+  ])
+  const countsKey = hashKey([countsRequest])
+  const [previousHistogram, setPreviousHistogram] = useState<{
+    scope: string
+    key: string
+    request: NonNullable<typeof countsRequest>
+    data: Awaited<ReturnType<typeof api.overviewCounts>>
+  } | null>(null)
+  useEffect(() => {
+    setPreviousHistogram((previous) => {
+      if (!sessionOverviewSeriesEnabled || !countsRequest) return null
+      if (!counts.data?.series) return previous?.scope === histogramScope ? previous : null
+      if (
+        previous?.scope === histogramScope &&
+        previous.key === countsKey &&
+        previous.data === counts.data
+      )
+        return previous
+      return { scope: histogramScope, key: countsKey, request: countsRequest, data: counts.data }
+    })
+  }, [counts.data, countsRequest, countsKey, histogramScope, sessionOverviewSeriesEnabled])
+  const histogram =
+    sessionOverviewSeriesEnabled && countsRequest
+      ? counts.data?.series
+        ? { key: countsKey, request: countsRequest, data: counts.data }
+        : previousHistogram?.scope === histogramScope
+          ? previousHistogram
+          : null
+      : null
+  const starts = histogram?.data.series
+  const previousWindow = histogram && histogram.key !== countsKey ? histogram.request : null
+  // Even identical calendar labels are not proof of equal exact bounds.
+  const activity = usageSeriesEnabled && !previousWindow ? rollup.data?.data.series : null
   const data = rollup.data?.data
 
   const refresh = () => {
@@ -216,23 +261,35 @@ export function UsagePage() {
             <Headline data={data} />
             <PricingNote data={data} />
             <Section
-              title={`Sessions per ${shownWindow.unit}`}
+              title={`Sessions per ${starts?.unit ?? shownWindow.unit}`}
               aside={
-                counts.length > 0 && counts.every((c) => c.data)
-                  ? `${formatCount(counts.reduce((n, c) => n + Number(c.data?.total_count ?? 0), 0))} started`
-                  : undefined
+                starts ? `${formatCount(histogram?.data.total_count ?? "0")} started` : undefined
               }
             >
               <DayChart
-                window={shownWindow}
-                counts={counts}
-                available={overviewQueriesEnabled}
-                filtered={usageRollupFilterCount(search) > 0}
+                starts={starts}
+                activity={activity}
+                error={counts.error}
+                pending={counts.isFetching}
+                previousWindow={previousWindow}
+                unavailable={
+                  !sessionOverviewSeriesEnabled
+                    ? "Session counts are unavailable for this agent."
+                    : !countsRequest
+                      ? "Session counts are unavailable for label, parent or budget filters."
+                      : null
+                }
               />
             </Section>
             <ModelSplit data={data} search={search} />
             <TopSessions data={data} />
-            <UsageDebug data={data} body={shownBody} window={shownWindow} counts={counts} />
+            <UsageDebug
+              data={data}
+              body={shownBody}
+              window={shownWindow}
+              starts={starts}
+              timezone={timezone}
+            />
           </div>
         )}
       </PageBody>
@@ -610,45 +667,77 @@ function PricingNote({ data }: { data: UsageRollup }) {
 /* ---------- chart ---------- */
 
 function DayChart({
-  window,
-  counts,
-  filtered,
-  available,
+  starts,
+  activity,
+  error,
+  pending,
+  unavailable,
+  previousWindow,
 }: {
-  available: boolean
-  window: UsageWindow
-  counts: { data?: SessionOverviewCountsResponse; error: unknown }[]
-  filtered: boolean
+  starts?: SessionStartSeries | null
+  activity?: UsageTimeSeries | null
+  error: unknown
+  pending: boolean
+  unavailable: string | null
+  previousWindow: ReturnType<typeof histogramRequest>
 }) {
-  const error = counts.find((c) => c.error)?.error
-  const buckets: ChartBucket[] = window.buckets.map((b, i) => {
-    const c = counts[i]?.data
-    const detail = c
-      ? c.cost
-        ? `${formatCurrency(c.cost.amount, c.cost.currency)}${c.cost.complete ? "" : " (partial)"}`
-        : `${compact(Number(c.tokens.input) + Number(c.tokens.output))} tokens`
-      : null
-    return {
-      ...b,
-      total: c ? Number(c.total_count) : null,
-      failed: c ? Number(c.failed) : 0,
-      detail,
-    }
-  })
+  const buckets = starts
+    ? joinedSeriesBuckets(starts, activity).map((bucket) => ({
+        ...bucket,
+        detail:
+          bucket.activityTokens === null
+            ? null
+            : `${compact(bucket.activityTokens)} activity tokens`,
+      }))
+    : []
   return (
     <div className="rounded-xl border border-border bg-card px-4 pt-4 pb-3">
-      {!available ? (
-        <p className="text-sm text-muted-foreground">
-          Session counts are unavailable for this agent.
-        </p>
+      {unavailable ? (
+        <p className="text-sm text-muted-foreground">{unavailable}</p>
+      ) : starts ? (
+        <>
+          {error && (
+            <p role="status" className="mb-3 text-sm text-muted-foreground">
+              Couldn't refresh session counts; showing the last counts loaded.
+            </p>
+          )}
+          {!error && pending && (
+            <p role="status" className="mb-3 text-sm text-muted-foreground">
+              Refreshing session counts; showing the last counts loaded.
+            </p>
+          )}
+          {previousWindow && (
+            <p role="status" className="mb-3 text-sm text-muted-foreground">
+              Session counts cover{" "}
+              <time dateTime={previousWindow.since} title={previousWindow.since}>
+                {formatWhen(Date.parse(previousWindow.since!))}
+              </time>{" "}
+              –{" "}
+              <time dateTime={previousWindow.until} title={previousWindow.until}>
+                {formatWhen(Date.parse(previousWindow.until!))}
+              </time>{" "}
+              ({previousWindow.timezone}). Usage totals above cover the refreshed range.
+            </p>
+          )}
+          <SessionsChart buckets={buckets} unit={starts.unit} />
+          {!buckets.some((bucket) => bucket.detail) && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Activity token detail is unavailable for this range.
+            </p>
+          )}
+        </>
       ) : error ? (
         <ErrorState error={error} />
       ) : (
-        <SessionsChart buckets={buckets} unit={window.unit} />
+        <p role="status" className="text-sm text-muted-foreground">
+          {pending ? "Loading session counts…" : "Session counts are unavailable for this range."}
+        </p>
       )}
       <p className="mt-2 text-xs text-muted-foreground">
-        Counts sessions by when they started, leaving out eval trials and forks.
-        {filtered && " The filters above don't apply to this chart yet."}
+        Counts sessions by when they started, leaving out eval trials and forks. Failures show their
+        current state.
+        {buckets.some((bucket) => bucket.detail) &&
+          " Activity tokens count events in each period, including sessions started earlier."}
       </p>
     </div>
   )
@@ -953,12 +1042,14 @@ function UsageDebug({
   data,
   body,
   window,
-  counts,
+  starts,
+  timezone,
 }: {
   data: UsageRollup
   body: UsageRollupBody | null
   window: UsageWindow
-  counts: { data?: unknown }[]
+  starts?: SessionStartSeries | null
+  timezone: string
 }) {
   const cost = data.cost
   const reported = data.reported_costs
@@ -975,7 +1066,7 @@ function UsageDebug({
           {data.as_of}
         </Row>
         <Row k="Chart buckets" mono>
-          {window.buckets.length} × {window.unit} · {counts.filter((c) => c.data).length} loaded
+          {starts?.buckets.length ?? 0} × {window.unit} · {timezone}
         </Row>
         <Row k="Scope" mono>
           {data.scope} · {data.time_basis} · {data.session_filter_basis}

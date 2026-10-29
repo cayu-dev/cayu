@@ -212,6 +212,17 @@ export type RecoveryRequest = {
 /** What the shell shows about the running app, from `GET /api/app` (backend item 8). */
 export type AppInfo = { name: string; runtime_version: string }
 
+export type OverviewCountsQuery = {
+  since: string
+  until: string
+  agent_name?: string
+  environment_name?: string
+  provider_name?: string
+  model?: string
+  bucket_unit?: "hour" | "day" | "week"
+  timezone?: string
+}
+
 export type Api = {
   app(): Promise<AppInfo>
   specialists(signal?: AbortSignal): Promise<AgentsPage>
@@ -243,7 +254,10 @@ export type Api = {
   resumeTask(id: string): Promise<TaskInfo>
   inbox(query?: InboxQuery, signal?: AbortSignal): Promise<InboxPage>
   inboxCounts(query?: Pick<InboxQuery, "session_id" | "agent_name" | "q">): Promise<InboxCounts>
-  overviewCounts(query: { since: string; until: string }): Promise<SessionOverviewCountsResponse>
+  overviewCounts(
+    query: OverviewCountsQuery,
+    signal?: AbortSignal,
+  ): Promise<SessionOverviewCountsResponse>
   /** `POST /api/inbox/{id}/settle`. Recovery items can't be settled here (409 `not_settleable`). */
   settle(itemId: string, body: InboxSettleRequest): Promise<InboxItemState>
   /**

@@ -32,6 +32,8 @@ function App() {
     () => ({
       api,
       now: api.now,
+      usageSeriesEnabled: true,
+      sessionOverviewSeriesEnabled: true,
       prototype: {
         seeds: api.seeds,
         seedId,

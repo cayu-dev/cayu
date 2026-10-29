@@ -202,6 +202,14 @@ export function resolveUsageWindow(
   }
 }
 
+/** Exact instant comparison shared by window validation and the synthetic API. */
+export function compareUsageTimestamps(left: string, right: string): number {
+  return compareParsedTimestamps(
+    parseAwareTimestamp(left, "Timestamp"),
+    parseAwareTimestamp(right, "Timestamp"),
+  )
+}
+
 function parseAwareTimestamp(value: string | undefined, label: string): ParsedAwareTimestamp {
   if (!value) throw new Error(`${label} is required.`)
   const parts = AWARE_TIMESTAMP_PATTERN.exec(value)

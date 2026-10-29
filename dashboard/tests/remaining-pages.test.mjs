@@ -15,19 +15,18 @@ test("Usage keeps the production default and explicit 30-day bookmarks", () => {
   )
 })
 
-test("aligned preset windows and chart buckets cover exactly the same span", () => {
+test("preset windows align the shared request span and choose a bounded series resolution", () => {
   for (const range of ["24h", "7d", "30d", "90d", "365d"]) {
     const window = resolveWindow(range, undefined, undefined, now)
     assert.ok(!("error" in window))
     assert.equal(window.startAt, new Date(window.start).toISOString())
     assert.equal(window.endAt, new Date(now).toISOString())
-    assert.equal(window.buckets[0].start, window.start)
-    assert.equal(window.buckets.at(-1).end, window.end)
-    for (let index = 1; index < window.buckets.length; index++)
-      assert.equal(window.buckets[index - 1].end, window.buckets[index].start)
     assert.equal(new Date(window.start).getMinutes(), 0)
     if (range !== "24h") assert.equal(new Date(window.start).getHours(), 0)
-    assert.ok(window.buckets.length <= 53)
+    assert.equal(
+      window.unit,
+      range === "24h" ? "hour" : ["90d", "365d"].includes(range) ? "week" : "day",
+    )
   }
 })
 
@@ -45,7 +44,9 @@ test("custom windows preserve timezone and microsecond boundaries before display
     now,
   )
   assert.ok(!("error" in tiny))
-  assert.equal(tiny.buckets.length, 1)
+  assert.equal(tiny.startAt, "2026-07-01T00:00:00.000001Z")
+  assert.equal(tiny.endAt, "2026-07-01T00:00:00.000002Z")
+  assert.equal(tiny.unit, "hour")
 })
 
 test("custom windows reject calendar normalization, missing timezone and excess bounds", () => {

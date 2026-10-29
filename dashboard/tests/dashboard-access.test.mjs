@@ -143,3 +143,21 @@ test("members read registered tool labels without gaining tool mutation authorit
     false,
   )
 })
+
+test("native Usage series reads are available to members only with server support", () => {
+  for (const surface of ["usage_series", "session_overview_series"]) {
+    const read = { kind: "surface", surface }
+    assert.equal(applyViewerAccess(available, read, member).enabled, true)
+    assert.equal(applyViewerAccess({ enabled: false }, read, member).enabled, false)
+    assert.equal(applyViewerAccess(available, read, null).enabled, false)
+    assert.equal(
+      applyViewerAccess(available, { ...read, operation: "mutate" }, member).enabled,
+      false,
+    )
+  }
+  assert.equal(
+    applyViewerAccess(available, { kind: "surface", surface: "system_diagnostics" }, member)
+      .enabled,
+    false,
+  )
+})
