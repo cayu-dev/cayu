@@ -142,6 +142,19 @@ requeued only when their handler stops within the grace. On Cayu Cloud,
 tasks the current workers are running before it uploads
 ([how](cayu-cloud.md#how-the-worker-stops)).
 
+On Cayu Cloud a worker can avoid the stop altogether. When its Release declares
+`[worker] drain_seconds` and the Agent has its provisioned database, a deploy
+keeps the old worker running beside the new one for up to that long. `cayu
+worker` asks Cloud every 30 seconds whether its Release is draining (through
+`CAYU_WORKER_DRAIN_URL`, with `CAYU_ATTENTION_HANDOFF_TOKEN` and
+`CAYU_RELEASE_ID`). Once it is, the worker sets the same `stop` event a SIGTERM
+sets, without the shutdown grace: `run_task_worker` claims nothing new, the
+tasks it holds finish, and the process exits with status 0. The new worker
+takes every new task meanwhile, and Cloud stops whatever is still running at
+the deadline. Outside Cayu Cloud, or with a control plane that doesn't answer
+the question, nothing is asked. A worker run by another command can ask the same
+endpoint itself.
+
 When this is the only worker process for its tasks, say so and it settles them
 itself:
 

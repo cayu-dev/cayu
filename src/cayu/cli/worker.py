@@ -16,6 +16,7 @@ from typing import Any, NoReturn, cast
 
 from cayu.applications import CayuApp
 from cayu.cli._targets import TargetResolutionError, load_target
+from cayu.cli._worker_drain import DrainRequest, drain_notice, watch_cloud_drain
 from cayu.cli.project import (
     _discover_configured_project,
     build_project_app,
@@ -268,10 +269,18 @@ async def _invoke_worker(
         else:
             loop_handlers.append(signum)
 
+    def request_drain(request: DrainRequest) -> None:
+        # Cayu Cloud kept this worker running past its replacement: stop claiming, as a
+        # SIGTERM would, but without the shutdown grace, so held tasks finish in their time.
+        if not stop.is_set():
+            print(drain_notice(request), file=sys.stderr, flush=True)
+        stop.set()
+
     worker_task: asyncio.Future[Any] | None = None
     idle_result: TaskWorkerIdleResult | None = None
     signal_wait: asyncio.Task[bool] | None = None
     supervisor_watch = asyncio.create_task(watch_supervisor(request_stop))
+    drain_watch = asyncio.create_task(watch_cloud_drain(request_drain))
     try:
         # A no-op outside Cayu Cloud; close_project_app stops it.
         await app.start_managed_settings(role="worker")
@@ -321,6 +330,10 @@ async def _invoke_worker(
         supervisor_watch.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await supervisor_watch
+        drain_watch.cancel()
+        # Asking Cloud only ever informs the worker; a failure of it never fails the worker.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await drain_watch
         if signal_wait is not None and not signal_wait.done():
             signal_wait.cancel()
             with contextlib.suppress(asyncio.CancelledError):
