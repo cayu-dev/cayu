@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from cayu._validation import (
@@ -90,6 +90,9 @@ from cayu.tools.exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     ResolvedToolExposureAuthority,
 )
+
+if TYPE_CHECKING:
+    from cayu.runtime._pending_profile_adoption import PendingProfileAdoption
 
 
 def _completed_tool_round_model_step(step: int | None, *, max_steps: int | None) -> int:
@@ -332,8 +335,14 @@ class RecoveryAdmission:
         after_admission: RecoveryAdmissionHook | None = None,
         on_admitted: Callable[[Session], None] | None = None,
         invocation_context: InvocationContext | None = None,
+        profile_adoption: PendingProfileAdoption | None = None,
     ) -> tuple[Session, Event | None]:
         """Claim a paused session without leaving cancellation outcome-uncertain.
+
+        With ``profile_adoption``, ``execution_profile_snapshot`` is the adopted
+        target and the checkpoint still holds the adoption's source profile; the
+        claim admits the continued interaction under the target instead of
+        rebinding the source.
 
         Session stores activate run fences in task-local context after the durable
         transition commits. Keeping the transition in a shielded child task lets it
@@ -344,6 +353,11 @@ class RecoveryAdmission:
         """
         if type(preserve_open_interaction_on_failure) is not bool:
             raise TypeError("preserve_open_interaction_on_failure must be a bool.")
+        if profile_adoption is not None and (
+            execution_profile_snapshot is None
+            or execution_profile_snapshot.profile is not profile_adoption.target.profile
+        ):
+            raise RuntimeError("Profile adoption conflicts with the claimed invocation profile.")
         if invocation_context is not None and (
             invocation_context.binding.session_id != loaded_session.id
             or invocation_context.binding.session_instance_id != loaded_session.instance_id
@@ -387,12 +401,16 @@ class RecoveryAdmission:
             )
             if execution_profile_snapshot is not None:
                 reconciled_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+                recorded_profile = (
+                    execution_profile_snapshot
+                    if profile_adoption is None
+                    else profile_adoption.source
+                )
                 if (
                     reconciled_profile is None
-                    or reconciled_profile.session_id != execution_profile_snapshot.session_id
-                    or reconciled_profile.interaction_id
-                    != execution_profile_snapshot.interaction_id
-                    or reconciled_profile.profile != execution_profile_snapshot.profile
+                    or reconciled_profile.session_id != recorded_profile.session_id
+                    or reconciled_profile.interaction_id != recorded_profile.interaction_id
+                    or reconciled_profile.profile != recorded_profile.profile
                 ):
                     raise RuntimeError(
                         "Active invocation profile changed during terminal-evidence recovery."
@@ -400,6 +418,8 @@ class RecoveryAdmission:
                 execution_profile_snapshot = execution_profile_snapshot.model_copy(
                     update={"run_epoch": reconciled_profile.run_epoch}
                 )
+                if profile_adoption is not None:
+                    profile_adoption = profile_adoption.at_run_epoch(reconciled_profile.run_epoch)
         session_id = loaded_session.id
         latest_events = await self._session_store.query_events(
             EventQuery(
@@ -439,8 +459,13 @@ class RecoveryAdmission:
             if checkpoint_transform is not None:
                 checkpoint = checkpoint_transform(current_session, checkpoint)
             if execution_profile_snapshot is not None:
+                recorded_profile = (
+                    execution_profile_snapshot
+                    if profile_adoption is None
+                    else profile_adoption.source
+                )
                 current_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-                if current_profile is None or current_profile != execution_profile_snapshot:
+                if current_profile is None or current_profile != recorded_profile:
                     raise SessionRunFenced(
                         "Active invocation profile changed before continuation claimed it."
                     )
@@ -450,7 +475,7 @@ class RecoveryAdmission:
                     interaction_id=interaction_id,
                     run_epoch=current_session.run_epoch + 1,
                     profile=execution_profile_snapshot.profile,
-                    expected=execution_profile_snapshot,
+                    expected=recorded_profile,
                 )
             return _checkpoint_with_session_run_operation(
                 checkpoint=checkpoint,
@@ -464,6 +489,7 @@ class RecoveryAdmission:
                 statuses=expected_statuses,
                 target_status=SessionStatus.RUNNING,
                 checkpoint_transform=reject_active_incomplete_recovery,
+                profile_adoption=profile_adoption,
             )
         )
         cancellation: asyncio.CancelledError | None = None
@@ -510,7 +536,11 @@ class RecoveryAdmission:
         rebound_invocation_context = (
             None
             if invocation_context is None or execution_profile_snapshot is None
-            else invocation_context.with_rebound_session(
+            else (
+                invocation_context.with_rebound_session
+                if profile_adoption is None
+                else invocation_context.with_adopted_session
+            )(
                 session,
                 active_profile=execution_profile_snapshot.model_copy(
                     update={"run_epoch": session.run_epoch}

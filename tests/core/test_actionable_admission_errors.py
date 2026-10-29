@@ -230,7 +230,8 @@ def test_continuation_boundary_withholds_adoption_advice() -> None:
     )
     message = str(error)
     assert error.boundary == "continuation"
-    assert "adoption is not available here" in message
+    assert "adoption is not available here, except for a tool approval" in message
+    assert "`profile_adoption` field of the ToolApprovalRequest" in message
     assert "Restore the previous code or identities" in message
     assert "profile_adoption=" not in message
     assert "Start a new session" in message

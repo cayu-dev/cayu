@@ -305,6 +305,16 @@ app.resolve_tool_approval(ToolApprovalRequest(..., execution_deadline=ExecutionD
 app.resolve_user_input(UserInputResponse(..., execution_deadline=ExecutionDeadline.after(3600)))
 ```
 
+An approval that was waiting while the application was upgraded keeps the
+execution profile its run started with. A Cayu-only upgrade is adopted when the
+person decides, unless the application configures an `ExecutionProfilePolicy`.
+Any other change needs `profile_adoption` on the request (the inbox answers 409
+`profile_changed` without it) and a policy that adopts it; the paused call is
+checked against the current tool and policy first. An approval whose agent
+gained, lost or redescribed a tool can only be settled by the version that
+proposed it. See
+`cayu guide diagnostics#execution-profile-mismatch`.
+
 When human review is configured, pass the current review reference; notifications
 cannot replace that authorization/content binding. The CLI demo treats its local
 operator as trusted. It is not an internet-facing authentication handler.

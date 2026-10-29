@@ -2241,6 +2241,14 @@ class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
+    profile_adoption: ExecutionProfileAdoptionBody | None = Field(
+        default=None,
+        description=(
+            "Adopt the current execution profile if it changed while the approval was "
+            "pending, for example after an upgrade. The application's "
+            "ExecutionProfilePolicy decides."
+        ),
+    )
 
     @field_validator("budget_limits", mode="before")
     @classmethod
@@ -2518,6 +2526,26 @@ def _request_resolution_actor(
     body_resolved_by: ResolutionActor | None,
 ) -> ResolutionActor | None:
     return _request_actor(auth_context, body_resolved_by, field_name="resolved_by")
+
+
+def _request_profile_adoption(
+    auth_context: AuthContext | None,
+    body: ExecutionProfileAdoptionBody | None,
+) -> ExecutionProfileAdoptionIntent | None:
+    """Build an adoption intent whose actor is the verified caller when auth is on."""
+    if body is None:
+        return None
+    requested_by = _request_actor(auth_context, body.requested_by, field_name="requested_by")
+    if requested_by is None:
+        raise HTTPException(
+            status_code=400,
+            detail="profile_adoption.requested_by is required when authentication is not configured.",
+        )
+    return ExecutionProfileAdoptionIntent(
+        idempotency_key=body.idempotency_key,
+        reason=body.reason,
+        requested_by=requested_by,
+    )
 
 
 def _request_interruption_actor(
@@ -5973,23 +6001,7 @@ def create_router(
                 detail=f"Session not found: {body.session_id}",
             )
 
-        profile_adoption = None
-        if body.profile_adoption is not None:
-            requested_by = _request_actor(
-                auth_context,
-                body.profile_adoption.requested_by,
-                field_name="requested_by",
-            )
-            if requested_by is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="profile_adoption.requested_by is required when authentication is not configured.",
-                )
-            profile_adoption = ExecutionProfileAdoptionIntent(
-                idempotency_key=body.profile_adoption.idempotency_key,
-                reason=body.profile_adoption.reason,
-                requested_by=requested_by,
-            )
+        profile_adoption = _request_profile_adoption(auth_context, body.profile_adoption)
 
         request = ResumeRequest(
             session_id=body.session_id,
@@ -6541,6 +6553,7 @@ def create_router(
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             thinking=body.thinking,
+            profile_adoption=_request_profile_adoption(auth_context, body.profile_adoption),
             loop_policies=await _continuation_loop_policies(session_id),
         )
 

@@ -15,9 +15,11 @@ from cayu._validation import (
 )
 from cayu.budgets.base import BudgetPolicy
 from cayu.execution_profiles import (
+    ExecutionProfileComponentClass,
     ExecutionProfileIdentity,
     direct_tool_capability_ceiling_component,
     execution_profile_provider_target_component,
+    execution_profile_runtime_component,
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
@@ -760,20 +762,55 @@ class InvocationContext:
     ) -> InvocationContext:
         """Carry the same live authority through one authenticated epoch rebind."""
 
+        return self._with_admitted_epoch(session, active_profile=active_profile, adopted=False)
+
+    def with_adopted_session(
+        self,
+        session: Session,
+        *,
+        active_profile: ActiveInvocationExecutionProfile,
+    ) -> InvocationContext:
+        """Carry this context's profile into pending work that just adopted it.
+
+        Unlike a rebind, the admission that adopted the profile may also have
+        recorded a new Cayu runtime identity; it must be the profile's own.
+        """
+
+        return self._with_admitted_epoch(session, active_profile=active_profile, adopted=True)
+
+    def _with_admitted_epoch(
+        self,
+        session: Session,
+        *,
+        active_profile: ActiveInvocationExecutionProfile,
+        adopted: bool,
+    ) -> InvocationContext:
         if type(session) is not Session:
             raise TypeError("session must be a Session.")
         if type(active_profile) is not ActiveInvocationExecutionProfile:
             raise TypeError("active_profile must be an ActiveInvocationExecutionProfile.")
         binding = self.binding
+        runtime_conflicts = (
+            self.profile.component(ExecutionProfileComponentClass.RUNTIME)
+            != execution_profile_runtime_component(
+                session.runtime_name,
+                session.runtime_version,
+                session.runtime_build_provenance,
+            )
+            if adopted
+            else (
+                session.runtime_name != binding.runtime_name
+                or session.runtime_version != binding.runtime_version
+                or session.runtime_build_provenance != binding.runtime_build_provenance
+            )
+        )
         if (
             session.id != binding.session_id
             or session.instance_id != binding.session_instance_id
             or session.agent_name != binding.agent_name
             or session.provider_name != binding.provider_name
             or session.model != binding.model
-            or session.runtime_name != binding.runtime_name
-            or session.runtime_version != binding.runtime_version
-            or session.runtime_build_provenance != binding.runtime_build_provenance
+            or runtime_conflicts
             or session.environment_name != binding.environment_name
             or active_profile.session_id != session.id
             or active_profile.interaction_id != binding.interaction_id

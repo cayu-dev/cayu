@@ -32,12 +32,17 @@ from cayu.approvals.user_input import (
     user_input_resolution_request_digest,
 )
 from cayu.events import EventType
+from cayu.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileComponentClass,
+)
 from cayu.knowledge.activation_contracts import KnowledgeActivationConflict
 from cayu.knowledge.publication_contracts import KnowledgePublicationConflict
 from cayu.knowledge.records import KnowledgeRevisionConflict, KnowledgeStatus
 from cayu.knowledge.search import decode_knowledge_list_cursor, encode_knowledge_list_cursor
 from cayu.runtime._approval_support import approval_resolution_request_digest
 from cayu.runtime._inbox_continuation import controlled_inbox_continuation
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.human_attention import (
     AttentionKind,
     HumanAttentionReference,
@@ -64,6 +69,7 @@ from cayu.server.inbox import (
     InboxItemStatus,
     InboxKnowledgeEntry,
     InboxPage,
+    InboxProfileAdoption,
     InboxSettledDecision,
     InboxSettlement,
     InboxSettleRequest,
@@ -338,6 +344,37 @@ def _inbox_actor(auth_context: AuthContext | None) -> ResolutionActor | None:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+_OPEN_ACCESS_ADOPTION_SUBJECT = "unauthenticated-local-development"
+
+
+def _inbox_profile_adoption(
+    auth_context: AuthContext | None, body: InboxProfileAdoption | None
+) -> ExecutionProfileAdoptionIntent | None:
+    """The adoption intent of the person settling, named the way the decision is."""
+
+    if body is None:
+        return None
+    if auth_context is not None and body.requested_by is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="profile_adoption.requested_by is the authenticated caller and cannot be supplied.",
+        )
+    # Without authentication the request names its requester, or is recorded as
+    # unauthenticated local development; it never claims verified provenance.
+    requested_by = (
+        _inbox_actor(auth_context)
+        if auth_context is not None
+        else ResolutionActor(
+            subject=body.requested_by or _OPEN_ACCESS_ADOPTION_SUBJECT,
+            source=ResolutionActorSource.REQUEST,
+        )
+    )
+    assert requested_by is not None
+    return ExecutionProfileAdoptionIntent(
+        idempotency_key=body.idempotency_key, reason=body.reason, requested_by=requested_by
+    )
 
 
 def _conflict(code: InboxConflictCode, message: str, item: InboxItemState | None) -> HTTPException:
@@ -734,6 +771,7 @@ def register_inbox_routes(
                 )
             ),
             resolved_by=actor,
+            profile_adoption=_inbox_profile_adoption(auth_context, body.profile_adoption),
             loop_policies=loop_policies,
         )
 
@@ -815,9 +853,19 @@ def register_inbox_routes(
             if current is None:
                 raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
             if current.pending is not None:
-                raise _conflict(
-                    "conflict", str(exc.detail), await session_item_state(current)
-                ) from exc
+                # Only an unadopted change can be settled again with profile_adoption.
+                # A refused adoption, or one already requested, stays a plain conflict.
+                # A changed tool set can't be adopted either way, so it isn't offered.
+                cause = exc.__cause__
+                code: InboxConflictCode = (
+                    "profile_changed"
+                    if type(cause) is ExecutionProfileMismatchError
+                    and body.profile_adoption is None
+                    and ExecutionProfileComponentClass.DIRECT_TOOLS
+                    not in cause.changed_component_classes
+                    else "conflict"
+                )
+                raise _conflict(code, str(exc.detail), await session_item_state(current)) from exc
             return await settled_answer(current, request)
         settled = await session_item_state(replace(item, pending=None))
         if settled.settlement is None or settled.settlement.decision == "expire":

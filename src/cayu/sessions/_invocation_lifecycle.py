@@ -597,7 +597,15 @@ class AdmitInvocationCommand(_InvocationCommandModel):
         if continues:
             if expected is None:
                 raise ValueError("Continued admission requires prior active authority.")
-            if expected.profile != target.profile:
+            # Pending work may move to a new profile only with the durable adoption
+            # decision that names both profiles, committed with this admission.
+            adopted = (
+                decision is not None
+                and decision.kind is ExecutionProfileDecisionKind.ADOPTED
+                and decision.expected_profile == expected.profile
+                and decision.candidate_profile == target.profile
+            )
+            if expected.profile != target.profile and not adopted:
                 raise ValueError("Continued admission cannot replace its execution profile.")
         return self
 

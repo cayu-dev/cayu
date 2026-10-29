@@ -183,6 +183,7 @@ from cayu.runtime._environment_lifecycle import (
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
 )
+from cayu.runtime._execution_profile_classification import ExecutionProfileClassifier
 from cayu.runtime._execution_profile_continuation import ExecutionProfileContinuation
 from cayu.runtime._foreground_child_wait import (
     ForegroundChildActionRequired,
@@ -207,6 +208,13 @@ from cayu.runtime._manual_recovery_publication import (
     reconcile_manual_recovery_persistence,
 )
 from cayu.runtime._paused_tool_round import ApprovalRoundPause, PausedToolRound, UserInputRoundPause
+from cayu.runtime._pending_profile_adoption import (
+    PendingProfileAdoption,
+    decide_pending_profile_adoption,
+    require_paused_round_exposure,
+    revalidate_paused_tool_calls,
+    tool_approval_adoption_request_fingerprint,
+)
 from cayu.runtime._pending_tool_round_recovery import (
     PendingToolRoundRecovery,
     RegisteredAgentResolver,
@@ -291,6 +299,7 @@ from cayu.runtime._tool_invocation.admission import (
 )
 from cayu.runtime._tool_invocation.invocation import ToolInvocation
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
@@ -664,7 +673,9 @@ class RecoveryCoordinator:
         human_review_policy: HumanReviewPolicy | None = None,
         runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...] = (),
         loop_policies: tuple[LoopPolicy, ...] = (),
+        profile_classifier: ExecutionProfileClassifier | None = None,
     ) -> None:
+        self._profile_classifier = profile_classifier
         self._ensure_session_environment = ensure_session_environment
         self._human_review_policy = human_review_policy
         self._recovery_admission = recovery_admission
@@ -1186,31 +1197,65 @@ class RecoveryCoordinator:
         structured_output: StructuredOutputSpec | None,
         request_loop_policies: tuple[LoopPolicy, ...],
         secret_resolution_scope: invocation_secrets.SecretResolutionScope,
-    ) -> tuple[ActiveInvocationExecutionProfile, InvocationContext]:
+        approval: ToolApprovalRequest | None = None,
+        paused_tool_exposure: ResolvedToolExposureAuthority | None = None,
+    ) -> tuple[ActiveInvocationExecutionProfile, InvocationContext, PendingProfileAdoption | None]:
         """Authenticate frozen runtime collaborators before a typed gate claim.
 
         Keep the validated checkpoint profile separate from the context's rebound
         profile. Callers retain their exact claim, receipt and resolution checks.
+        For an ``approval``, a changed profile that the execution-profile policy
+        adopts replaces the checkpoint profile; the claim then commits the adoption.
         """
         await self._ensure_session_environment(session)
         registered_agent = self._resolve_registered_agent(session.agent_name)
         registered_provider = self._resolve_registered_provider(session.provider_name)
         budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
-        execution_profile_snapshot = await self._execution_profile_continuation.validate(
-            session=session,
-            checkpoint=checkpoint,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            request_loop_policies=request_loop_policies,
-            budget_policy=budget_policy_snapshot,
-            request_budget_limits=semantics.budget_limits,
-            structured_output=semantics.structured_output,
-            thinking=semantics.thinking,
-            max_steps=semantics.max_steps,
-            limits=semantics.limits,
-            retry_policy=semantics.retry_policy,
-            invocation_semantics_available=True,
-        )
+        continuation_arguments: dict[str, Any] = {
+            "session": session,
+            "checkpoint": checkpoint,
+            "registered_agent": registered_agent,
+            "registered_provider": registered_provider,
+            "request_loop_policies": request_loop_policies,
+            "budget_policy": budget_policy_snapshot,
+            "request_budget_limits": semantics.budget_limits,
+            "structured_output": semantics.structured_output,
+            "thinking": semantics.thinking,
+            "max_steps": semantics.max_steps,
+            "limits": semantics.limits,
+            "retry_policy": semantics.retry_policy,
+            "invocation_semantics_available": True,
+        }
+        adoptable = approval is not None and self._profile_classifier is not None
+        adoption = None
+        try:
+            execution_profile_snapshot = await self._execution_profile_continuation.validate(
+                **continuation_arguments, record_rejection=not adoptable
+            )
+        except ExecutionProfileMismatchError:
+            if approval is None or self._profile_classifier is None:
+                raise
+            if approval.profile_adoption is not None:
+                require_paused_round_exposure(paused_tool_exposure, registered_agent)
+            adoption = await decide_pending_profile_adoption(
+                session=session,
+                plan=await self._execution_profile_continuation.inspect_plan(
+                    **continuation_arguments
+                ),
+                classifier=self._profile_classifier,
+                intent=approval.profile_adoption,
+                adoption_request_fingerprint=tool_approval_adoption_request_fingerprint(
+                    approval, redactor=self._secret_redactor
+                ),
+                session_store=self._session_store,
+                event_writer=self._event_writer,
+            )
+            execution_profile_snapshot = (
+                adoption.target
+                if adoption is not None
+                # Not adoptable: record the ordinary continuation rejection and raise.
+                else await self._execution_profile_continuation.validate(**continuation_arguments)
+            )
         _require_native_structured_output_support(
             structured_output, registered_provider=registered_provider
         )
@@ -1229,7 +1274,7 @@ class RecoveryCoordinator:
             budget_policy=budget_policy_snapshot,
             request_loop_policies=request_loop_policies,
         )
-        return execution_profile_snapshot, invocation_context
+        return execution_profile_snapshot, invocation_context, adoption
 
     async def resolve_user_input(
         self,
@@ -1420,7 +1465,7 @@ class RecoveryCoordinator:
             field_name="UserInputResponse.structured_output",
         )
 
-        execution_profile_snapshot, invocation_context = await self._prepare_gate_invocation(
+        execution_profile_snapshot, invocation_context, _ = await self._prepare_gate_invocation(
             session=loaded_session,
             checkpoint=checkpoint,
             semantics=invocation_semantics,
@@ -1748,7 +1793,7 @@ class RecoveryCoordinator:
                     model_attempt_id=pending.model_attempt_id,
                 ),
             )
-        execution_profile_snapshot, invocation_context = await self._prepare_gate_invocation(
+        execution_profile_snapshot, invocation_context, _ = await self._prepare_gate_invocation(
             session=loaded_session,
             checkpoint=checkpoint,
             semantics=invocation_semantics,
@@ -2142,6 +2187,7 @@ class RecoveryCoordinator:
         can_create_resolution_intent = True
         candidate_decision = request.decision
         candidate_requested_at: datetime | None = None
+        candidate_outcomes: dict[str, runtime_records.ToolCallOutcome] = {}
         try:
             candidate_events = await self._session_store.load_events(loaded_session.id)
             candidate_requested_at = next(
@@ -2199,13 +2245,19 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             field_name="ToolApprovalRequest.structured_output",
         )
-        execution_profile_snapshot, invocation_context = await self._prepare_gate_invocation(
+        (
+            execution_profile_snapshot,
+            invocation_context,
+            profile_adoption,
+        ) = await self._prepare_gate_invocation(
             session=loaded_session,
             checkpoint=checkpoint,
             semantics=invocation_semantics,
             structured_output=effective_structured_output,
             request_loop_policies=request.loop_policies,
             secret_resolution_scope=candidate_approval.secret_resolution_scope,
+            approval=request if foreground_gate is None else None,
+            paused_tool_exposure=candidate_round.tool_exposure,
         )
         registered_agent = invocation_context.registered_agent
         registered_provider = invocation_context.registered_provider
@@ -2229,6 +2281,20 @@ class RecoveryCoordinator:
             if candidate_intent is None and candidate_decision is ToolApprovalDecision.APPROVE
             else None
         )
+        if profile_adoption is not None and candidate_decision is ToolApprovalDecision.APPROVE:
+            # A retried claim runs the arguments its intent pinned, not the proposal.
+            pinned = None if candidate_intent is None else candidate_intent.approved_arguments
+            await revalidate_paused_tool_calls(
+                approval=candidate_approval,
+                request_metadata=candidate_round.request_metadata,
+                recorded_call_ids=candidate_outcomes.keys(),
+                gating_arguments=None if pinned is None else pinned.arguments,
+                gating_reauthorized=approved_arguments is not None,
+                session=loaded_session,
+                invocation_context=invocation_context,
+                admission=self._tool_invocation.admission,
+                redactor=self._secret_redactor,
+            )
         pending_approval: PendingToolApproval | None = None
         pending_round: pending_rounds.PendingToolRound | None = None
         claimed_intent: pending_approval_reader.ApprovalResolutionIntent | None = None
@@ -2332,6 +2398,7 @@ class RecoveryCoordinator:
                 after_admission=after_admission,
                 on_admitted=on_admitted,
                 invocation_context=invocation_context,
+                profile_adoption=profile_adoption,
             )
         except (InvocationLifecycleCommandConflict, SessionRunFenced) as claim_conflict:
             # A competing rebind can advance durable invocation authority before
@@ -2354,7 +2421,12 @@ class RecoveryCoordinator:
             raise RuntimeError("Tool approval claim completed without approval state.")
         if task_id != pending_approval.task_id:
             raise RuntimeError("Tool approval changed its attached task identity.")
-        invocation_context = invocation_context.with_rebound_session(
+        rebind = (
+            invocation_context.with_rebound_session
+            if profile_adoption is None
+            else invocation_context.with_adopted_session
+        )
+        invocation_context = rebind(
             session,
             active_profile=execution_profile_snapshot.model_copy(
                 update={"run_epoch": session.run_epoch}
@@ -2378,6 +2450,10 @@ class RecoveryCoordinator:
         authoritative_failure: BaseException | None = None
         abandoned = False
         try:
+            if profile_adoption is not None:
+                # Inside the cleanup boundary: the session is already claimed.
+                await self._event_writer.fan_out_persisted([profile_adoption.decision.event])
+                yield profile_adoption.decision.event
             if resumed_event is not None:
                 yield resumed_event
             async for event in continuation_stream:
@@ -2716,7 +2792,7 @@ class RecoveryCoordinator:
             approval=candidate_approval,
             tool_call_id=request.tool_call_id,
         )
-        execution_profile_snapshot, invocation_context = await self._prepare_gate_invocation(
+        execution_profile_snapshot, invocation_context, _ = await self._prepare_gate_invocation(
             session=loaded_session,
             checkpoint=checkpoint,
             semantics=invocation_semantics,

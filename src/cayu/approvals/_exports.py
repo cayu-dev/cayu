@@ -83,6 +83,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "TieredApprovalPolicy": ("cayu.approvals.business", "TieredApprovalPolicy"),
     "ToolApprovalArgumentsRefused": ("cayu.approvals.tools", "ToolApprovalArgumentsRefused"),
     "ToolApprovalDecision": ("cayu.approvals.tools", "ToolApprovalDecision"),
+    "ToolApprovalProfileAdoptionRefused": (
+        "cayu.approvals.tools",
+        "ToolApprovalProfileAdoptionRefused",
+    ),
     "ToolApprovalRecoveryOutcome": ("cayu.approvals.tools", "ToolApprovalRecoveryOutcome"),
     "ToolApprovalRecoveryRequest": ("cayu.approvals.tools", "ToolApprovalRecoveryRequest"),
     "ToolApprovalRequest": ("cayu.approvals.tools", "ToolApprovalRequest"),
@@ -260,6 +264,7 @@ PUBLIC_NAMES = [
     "TieredApprovalPolicy",
     "ToolApprovalArgumentsRefused",
     "ToolApprovalDecision",
+    "ToolApprovalProfileAdoptionRefused",
     "ToolApprovalRecoveryOutcome",
     "ToolApprovalRecoveryRequest",
     "ToolApprovalRequest",

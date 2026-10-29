@@ -70,8 +70,10 @@ def test_changed_identity_rejected_before_provider_or_effect(tmp_path: Path, opt
     assert "Class-level digest evidence" in output
     assert f"{expected_class} (" in output and "declared -> declared" in output
     assert "Process-local" not in output
-    # A pending approval is not an adoption boundary; the message says so.
-    assert "adoption is not available here" in output
+    # Without an explicit adoption the pending approval keeps its profile; the
+    # message names the approval's adoption field instead of a resume snippet.
+    assert "adoption is not available here, except for a tool approval" in output
+    assert "`profile_adoption` field of the ToolApprovalRequest" in output
     assert "profile_adoption=" not in output
     assert observations(state, "approve") == {"searches": 0, "provider_requests": 0}
     assert not (state / "effects.sqlite").exists()

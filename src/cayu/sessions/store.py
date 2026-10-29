@@ -1242,7 +1242,12 @@ class SessionStore(ABC):
             transition_kwargs["store_time_checkpoint_transform"] = bind_active_invocation_profile
         if admission.adopted_runtime_identity is not None:
             transition_kwargs["adopted_runtime_identity"] = admission.adopted_runtime_identity
-        if active_profile is not None and admission.interaction_started_event is not None:
+        if active_profile is not None and (
+            admission.interaction_started_event is not None
+            or admission.execution_profile_decision is not None
+        ):
+            # A continued interaction compares its profile only when a decision
+            # (pending work adopting a changed profile) is committed with it.
             transition_kwargs["execution_profile"] = admission.execution_profile
         if admission.result_checkpoint_transform is not None:
             transition_kwargs["result_checkpoint_transform"] = admission.result_checkpoint_transform

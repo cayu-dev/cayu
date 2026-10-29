@@ -28,14 +28,27 @@ from cayu.approvals.review import HumanReviewReference
 from cayu.approvals.revisions import ApprovalRevision
 from cayu.approvals.tools import copy_approved_tool_arguments
 from cayu.deadlines import ExecutionDeadlineReport
+from cayu.execution_profiles import (
+    EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS,
+    EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
+)
 from cayu.server.auth import AuthContext
 
 InboxItemKind = Literal["approval", "question", "recovery", "knowledge"]
 InboxDecision = Literal["approve", "deny", "answer", "keep", "drop"]
 InboxSettledDecision = Literal["approve", "deny", "expire", "answer", "recover", "keep", "drop"]
 InboxItemStatus = Literal["pending", "settled", "superseded", "unavailable"]
+# ``profile_changed``: the application changed while the approval was pending and
+# the decision did not adopt the current execution profile; settle it again with
+# ``profile_adoption``.
 InboxConflictCode = Literal[
-    "already_settled", "superseded", "expired", "unavailable", "not_settleable", "conflict"
+    "already_settled",
+    "superseded",
+    "expired",
+    "unavailable",
+    "not_settleable",
+    "conflict",
+    "profile_changed",
 ]
 InboxIssueCode = Literal[
     "source_too_large",
@@ -201,6 +214,35 @@ class InboxCounts(_InboxModel):
         return cls(unavailable_reason=reason)
 
 
+class InboxProfileAdoption(_InboxModel):
+    """Settle an approval after the application's execution profile changed.
+
+    A pending approval keeps the profile its run started with. After an upgrade
+    that changed more than the Cayu version, the decision settles only when the
+    application's ``ExecutionProfilePolicy`` adopts the current profile for this
+    explicit request. The person settling is the requester. Without
+    authentication, ``requested_by`` names them, and the request is otherwise
+    recorded as ``unauthenticated-local-development``. Use a new
+    ``idempotency_key`` for each adoption.
+    """
+
+    idempotency_key: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS)
+    reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
+    requested_by: str | None = Field(
+        default=None, max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS
+    )
+
+    @field_validator("idempotency_key", "requested_by")
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        return None if value is None else require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return require_durable_nonblank(value, "reason")
+
+
 class InboxSettleRequest(_InboxModel):
     """A person's decision on one inbox item.
 
@@ -209,8 +251,10 @@ class InboxSettleRequest(_InboxModel):
     ``approve`` can carry the changed ``arguments`` the tool runs with, or an
     ``approval_revision`` naming an edit the application stored itself.
     ``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge
-    proposal. ``review_reference`` is required when the application configures
-    a human-review policy; read it from ``GET /api/sessions/{id}/human-review``.
+    proposal. An approval can carry ``profile_adoption`` to settle after an
+    upgrade changed the application's execution profile. ``review_reference`` is
+    required when the application configures a human-review policy; read it from
+    ``GET /api/sessions/{id}/human-review``.
     Task-linked approvals and questions require ordinary worker/handoff authority,
     or explicit ``task_continuation="claim"`` to acquire a new workerless handoff.
     Controlled claims never borrow an active worker's authority.
@@ -225,6 +269,7 @@ class InboxSettleRequest(_InboxModel):
     task_worker_id: str | None = None
     task_handoff_id: str | None = None
     task_continuation: Literal["claim"] | None = None
+    profile_adoption: InboxProfileAdoption | None = None
 
     @field_validator("task_worker_id", "task_handoff_id")
     @classmethod
@@ -257,6 +302,8 @@ class InboxSettleRequest(_InboxModel):
             self.decision != "approve"
         ):
             raise ValueError("arguments and approval_revision require decision=approve.")
+        if self.profile_adoption is not None and self.decision not in {"approve", "deny"}:
+            raise ValueError("profile_adoption applies to approvals.")
         if (self.answer is not None) != (self.decision == "answer"):
             raise ValueError("answer is required for decision=answer and allowed only there.")
         if self.review_reference is not None and self.decision in {"keep", "drop"}:
@@ -327,6 +374,7 @@ __all__ = [
     "InboxItemState",
     "InboxKnowledgeEntry",
     "InboxPage",
+    "InboxProfileAdoption",
     "InboxSettleRequest",
     "InboxSettleResponse",
     "InboxSettledDecision",

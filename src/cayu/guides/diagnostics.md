@@ -515,11 +515,46 @@ process or `CayuApp` instance mismatches again, so declare identities first.
 
 When `error.boundary` is `"continuation"`, the session has pending work, such
 as an approval, user input, a tool round or an unfinished invocation, and that
-work must continue under the profile it started with. Adoption is not available
-there. Restore the previous code or identities and finish the pending work,
-then adopt on a later resume, or start a new session. Cayu never adopts a
-changed profile on its own, apart from the runtime-only and explicit
-`ModelTarget` cases above.
+work must continue under the profile it started with. Restore the previous code
+or identities and finish the pending work, then adopt on a later resume, or
+start a new session. Cayu never adopts a changed profile on its own, apart from
+the runtime-only and explicit `ModelTarget` cases above.
+
+A pending tool approval is the exception: it can adopt the current profile as
+it is settled, so an upgrade doesn't strand it. When only Cayu changed and no
+`ExecutionProfilePolicy` is configured, approving or denying adopts the new
+runtime on its own, as a resume does. For any other change, pass
+`profile_adoption` on the `ToolApprovalRequest` (or in the body of
+`POST /api/inbox/{id}/settle` or `POST /api/tool-approvals/resolve`), and the
+policy decides as it does for a resume. Before the approval is claimed, Cayu
+checks each paused call again against the current tool and `ToolPolicy`, with
+the paused round's own run context: a call that was allowed must still be
+allowed, and the approved call must be allowed or need exactly the approval it
+got. Anything else raises `ToolApprovalProfileAdoptionRefused`; the approval
+stays pending and no tool runs, so deny it and let the agent propose the call
+again. The inbox reports a settle that needs adoption as a 409 with code
+`profile_changed`.
+
+One change can't be adopted at all: adding, removing or redescribing one of the
+agent's tools. The paused round froze the tools the model saw, and settling it
+either way continues that round, so approving and denying with
+`profile_adoption` both raise `ToolApprovalProfileAdoptionRefused` before any
+policy runs (without it, the ordinary mismatch above is raised). Settle such
+approvals with the application version that proposed them before you deploy the
+new tool set.
+
+```python
+from cayu.approvals import ToolApprovalRequest
+
+async def approve_across_upgrade(app: CayuApp, approval: ToolApprovalRequest, key: str) -> None:
+    adopting = approval.model_copy(update={"profile_adoption": ExecutionProfileAdoptionIntent(
+        idempotency_key=key,
+        reason="Deployed the new bug-filing tool.",
+        requested_by=ResolutionActor(subject="priya", source=ResolutionActorSource.REQUEST),
+    )})
+    async for event in app.resolve_tool_approval(adopting):
+        print(event.type)
+```
 
 ## request-cost
 

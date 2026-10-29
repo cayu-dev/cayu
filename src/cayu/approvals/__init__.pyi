@@ -162,6 +162,9 @@ from cayu.approvals.tools import (
 )
 from cayu.approvals.tools import ToolApprovalArgumentsRefused as ToolApprovalArgumentsRefused
 from cayu.approvals.tools import ToolApprovalDecision as ToolApprovalDecision
+from cayu.approvals.tools import (
+    ToolApprovalProfileAdoptionRefused as ToolApprovalProfileAdoptionRefused,
+)
 from cayu.approvals.tools import ToolApprovalRecoveryOutcome as ToolApprovalRecoveryOutcome
 from cayu.approvals.tools import ToolApprovalRecoveryRequest as ToolApprovalRecoveryRequest
 from cayu.approvals.tools import ToolApprovalRequest as ToolApprovalRequest

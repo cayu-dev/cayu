@@ -7,7 +7,7 @@ import contextlib
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from uuid import uuid4
 
 from cayu._exception_groups import (
@@ -39,7 +39,9 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
 from cayu.runtime._invocation_lifecycle import (
+    AdmitInvocationCommand,
     InvocationContext,
+    RebindInvocationCommand,
     _release_invocation_command_with_cleanup_authority,
     prepare_rebind_invocation_command,
 )
@@ -121,6 +123,9 @@ from cayu.sessions.recovery import (
     _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.store import SessionStore
+
+if TYPE_CHECKING:
+    from cayu.runtime._pending_profile_adoption import PendingProfileAdoption
 
 _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
 
@@ -432,12 +437,15 @@ class RecoveryOwnership:
         statuses: set[SessionStatus],
         checkpoint_transform: CheckpointTransform,
         target_status: SessionStatus | None = None,
+        profile_adoption: PendingProfileAdoption | None = None,
     ) -> Session:
         """Advance one recovery epoch through the typed invocation seam.
 
         Sessions with positive active-invocation authority use the command
         protocol.  Its durable CAS rejects a stale preflight.  A session with
         no such authority remains an intentional pre-invocation recovery case.
+        A ``profile_adoption`` admits the paused invocation again under its
+        adopted profile instead of rebinding the recorded one.
         """
 
         session = await self._session_store.load(session_id)
@@ -458,13 +466,33 @@ class RecoveryOwnership:
                 to_status=target_status,
                 checkpoint_transform=checkpoint_transform,
             )
-        command = prepare_rebind_invocation_command(
-            session,
-            checkpoint,
-            expected_statuses=statuses,
-            checkpoint_transform=checkpoint_transform,
-            target_status=target_status,
-        )
+        if profile_adoption is not None:
+            from cayu.runtime._pending_profile_adoption import (
+                prepare_adopting_continuation_command,
+            )
+
+            if target_status is not SessionStatus.RUNNING:
+                raise ValueError("Profile adoption must admit the paused invocation to run.")
+            command: AdmitInvocationCommand | RebindInvocationCommand = (
+                prepare_adopting_continuation_command(
+                    session,
+                    checkpoint,
+                    expected_statuses=statuses,
+                    checkpoint_transform=checkpoint_transform,
+                    adoption=profile_adoption,
+                    deferred_input=await self._session_store.load_deferred_interaction_input(
+                        session_id
+                    ),
+                )
+            )
+        else:
+            command = prepare_rebind_invocation_command(
+                session,
+                checkpoint,
+                expected_statuses=statuses,
+                checkpoint_transform=checkpoint_transform,
+                target_status=target_status,
+            )
         result = await self._session_store.apply_invocation_lifecycle_command(command)
         if type(result) is not InvocationMutationResult:
             raise RuntimeError("Invocation rebind returned an incompatible result.")

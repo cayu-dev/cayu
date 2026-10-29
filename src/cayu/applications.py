@@ -1883,6 +1883,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             human_review_policy=human_review_policy,
             runtime_hooks=self._runtime_hooks,
             loop_policies=self._loop_policies,
+            profile_classifier=self._execution_profile_classifier,
         )
 
         self._session_recovery = SessionRecovery(

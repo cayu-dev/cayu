@@ -509,11 +509,21 @@ class SessionInvocationAdmission:
             raise ValueError(
                 "A continued interaction requires active invocation profile authority."
             )
-        if self.execution_profile_decision is not None:
+        active_profile = self.expected_active_invocation_profile
+        # Pending work (for example a settled tool approval) may adopt a changed
+        # profile only with the decision that names its exact source and target.
+        adopts_profile = decision is not None and (
+            decision.kind is ExecutionProfileDecisionKind.ADOPTED
+            and decision.expected_profile == active_profile.profile
+            and decision.candidate_profile == self.execution_profile
+        )
+        if decision is not None and not adopts_profile:
             raise ValueError("A continued interaction cannot adopt an execution profile.")
         if self.model_transition is not None:
             raise ValueError("A continued interaction cannot change its model target.")
-        if not self.defer_interaction_source:
+        if not self.defer_interaction_source and (
+            not adopts_profile or self.interaction_source_messages
+        ):
             raise ValueError("A continued interaction must defer its source messages.")
         continued_interaction_id = self.continued_interaction_id
         if continued_interaction_id is None:
@@ -522,12 +532,11 @@ class SessionInvocationAdmission:
             continued_interaction_id,
             "continued_interaction_id",
         )
-        active_profile = self.expected_active_invocation_profile
         if active_profile.interaction_id != continued_interaction_id:
             raise ValueError(
                 "Continued interaction identity conflicts with active profile authority."
             )
-        if active_profile.profile != self.execution_profile:
+        if active_profile.profile != self.execution_profile and not adopts_profile:
             raise ValueError("Continued execution profile conflicts with active profile authority.")
 
 

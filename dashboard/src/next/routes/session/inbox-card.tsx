@@ -15,6 +15,7 @@ import { dashboardConfig } from "@/lib/config"
 import { fetchSessionRecovery } from "@/lib/session-recovery"
 import { cn } from "@/lib/utils"
 import type { InboxItem, InboxSettleRequest, RecoveryRequest } from "../../api/types"
+import { isProfileChangedConflict, withProfileAdoption } from "../../app/inbox-adoption"
 import { useApi, useNow, useServices } from "../../app/services"
 import { relativeTime } from "../../app/session-model"
 import { ErrorState, NavLink, sessionRoute } from "../common"
@@ -139,6 +140,12 @@ export function InboxCard({
       ...extra,
     })
   }
+  // The application changed while this approval waited: offer the same decision again,
+  // asking the server to adopt the update.
+  const adoptAfterUpdate =
+    item.kind === "approval" && settleItem.variables && isProfileChangedConflict(settleItem.error)
+      ? settleItem.variables
+      : null
   const { icon: Icon, label } = KIND[item.kind]
   const busy =
     mutationBlocked ||
@@ -485,6 +492,27 @@ export function InboxCard({
       {settle.error && (
         <div className="px-3.5 pb-3">
           <ErrorState error={settle.error} />
+        </div>
+      )}
+      {adoptAfterUpdate && (
+        <div className="space-y-2 px-3.5 pb-3 text-xs">
+          <p className="text-muted-foreground">
+            The application was updated while this approval was waiting. Settling it under the
+            update checks the call against the current tool and policy first, and the application's
+            execution-profile policy decides.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() =>
+              settleItem.mutate(withProfileAdoption(adoptAfterUpdate, crypto.randomUUID()))
+            }
+          >
+            {adoptAfterUpdate.decision === "approve"
+              ? "Approve under the update"
+              : "Deny under the update"}
+          </Button>
         </div>
       )}
     </div>

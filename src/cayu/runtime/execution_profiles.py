@@ -628,7 +628,11 @@ class ExecutionProfileMismatchError(RuntimeError):
             return [
                 "Next steps: this session has pending work (an approval, user input, tool "
                 "round or unfinished invocation) that must continue under the profile it "
-                "started with, so adoption is not available here.",
+                "started with, so adoption is not available here, except for a tool approval.",
+                "- A pending tool approval can adopt the current profile as it is settled: "
+                "set the `profile_adoption` field of the ToolApprovalRequest (or of the "
+                "inbox settle or tool-approval resolve body), with an ExecutionProfilePolicy "
+                "that adopts explicit requests. Or",
                 "- Restore the previous code or identities and finish the pending work; a "
                 "later resume can then adopt the new profile. Or",
                 self._new_session_step(),

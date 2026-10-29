@@ -11876,7 +11876,7 @@ export type InboxConflict = {
     /**
      * Code
      */
-    code: 'already_settled' | 'superseded' | 'expired' | 'unavailable' | 'not_settleable' | 'conflict';
+    code: 'already_settled' | 'superseded' | 'expired' | 'unavailable' | 'not_settleable' | 'conflict' | 'profile_changed';
     item?: InboxItemState | null;
     /**
      * Message
@@ -12120,6 +12120,34 @@ export type InboxPage = {
 };
 
 /**
+ * InboxProfileAdoption
+ *
+ * Settle an approval after the application's execution profile changed.
+ *
+ * A pending approval keeps the profile its run started with. After an upgrade
+ * that changed more than the Cayu version, the decision settles only when the
+ * application's ``ExecutionProfilePolicy`` adopts the current profile for this
+ * explicit request. The person settling is the requester. Without
+ * authentication, ``requested_by`` names them, and the request is otherwise
+ * recorded as ``unauthenticated-local-development``. Use a new
+ * ``idempotency_key`` for each adoption.
+ */
+export type InboxProfileAdoption = {
+    /**
+     * Idempotency Key
+     */
+    idempotency_key: string;
+    /**
+     * Reason
+     */
+    reason: string;
+    /**
+     * Requested By
+     */
+    requested_by?: string | null;
+};
+
+/**
  * InboxSettleRequest
  *
  * A person's decision on one inbox item.
@@ -12129,8 +12157,10 @@ export type InboxPage = {
  * ``approve`` can carry the changed ``arguments`` the tool runs with, or an
  * ``approval_revision`` naming an edit the application stored itself.
  * ``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge
- * proposal. ``review_reference`` is required when the application configures
- * a human-review policy; read it from ``GET /api/sessions/{id}/human-review``.
+ * proposal. An approval can carry ``profile_adoption`` to settle after an
+ * upgrade changed the application's execution profile. ``review_reference`` is
+ * required when the application configures a human-review policy; read it from
+ * ``GET /api/sessions/{id}/human-review``.
  * Task-linked approvals and questions require ordinary worker/handoff authority,
  * or explicit ``task_continuation="claim"`` to acquire a new workerless handoff.
  * Controlled claims never borrow an active worker's authority.
@@ -12151,6 +12181,7 @@ export type InboxSettleRequest = {
      * Decision
      */
     decision: 'approve' | 'deny' | 'answer' | 'keep' | 'drop';
+    profile_adoption?: InboxProfileAdoption | null;
     /**
      * Reason
      */
@@ -20883,6 +20914,10 @@ export type ToolApprovalBody = {
     metadata?: {
         [key: string]: unknown;
     };
+    /**
+     * Adopt the current execution profile if it changed while the approval was pending, for example after an upgrade. The application's ExecutionProfilePolicy decides.
+     */
+    profile_adoption?: ExecutionProfileAdoptionBody | null;
     /**
      * Reason
      */

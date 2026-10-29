@@ -14742,7 +14742,8 @@
             "expired",
             "unavailable",
             "not_settleable",
-            "conflict"
+            "conflict",
+            "profile_changed"
           ],
           "title": "Code",
           "type": "string"
@@ -15246,9 +15247,43 @@
       "title": "InboxPage",
       "type": "object"
     },
+    "InboxProfileAdoption": {
+      "additionalProperties": false,
+      "description": "Settle an approval after the application's execution profile changed.\n\nA pending approval keeps the profile its run started with. After an upgrade\nthat changed more than the Cayu version, the decision settles only when the\napplication's ``ExecutionProfilePolicy`` adopts the current profile for this\nexplicit request. The person settling is the requester. Without\nauthentication, ``requested_by`` names them, and the request is otherwise\nrecorded as ``unauthenticated-local-development``. Use a new\n``idempotency_key`` for each adoption.",
+      "properties": {
+        "idempotency_key": {
+          "maxLength": 256,
+          "title": "Idempotency Key",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 4096,
+          "title": "Reason",
+          "type": "string"
+        },
+        "requested_by": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Requested By"
+        }
+      },
+      "required": [
+        "idempotency_key",
+        "reason"
+      ],
+      "title": "InboxProfileAdoption",
+      "type": "object"
+    },
     "InboxSettleRequest": {
       "additionalProperties": false,
-      "description": "A person's decision on one inbox item.\n\n``approve`` and ``deny`` settle an approval. Every decision accepts an optional\ndurable ``reason``.\n``approve`` can carry the changed ``arguments`` the tool runs with, or an\n``approval_revision`` naming an edit the application stored itself.\n``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge\nproposal. ``review_reference`` is required when the application configures\na human-review policy; read it from ``GET /api/sessions/{id}/human-review``.\nTask-linked approvals and questions require ordinary worker/handoff authority,\nor explicit ``task_continuation=\"claim\"`` to acquire a new workerless handoff.\nControlled claims never borrow an active worker's authority.",
+      "description": "A person's decision on one inbox item.\n\n``approve`` and ``deny`` settle an approval. Every decision accepts an optional\ndurable ``reason``.\n``approve`` can carry the changed ``arguments`` the tool runs with, or an\n``approval_revision`` naming an edit the application stored itself.\n``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge\nproposal. An approval can carry ``profile_adoption`` to settle after an\nupgrade changed the application's execution profile. ``review_reference`` is\nrequired when the application configures a human-review policy; read it from\n``GET /api/sessions/{id}/human-review``.\nTask-linked approvals and questions require ordinary worker/handoff authority,\nor explicit ``task_continuation=\"claim\"`` to acquire a new workerless handoff.\nControlled claims never borrow an active worker's authority.",
       "properties": {
         "answer": {
           "anyOf": [
@@ -15294,6 +15329,16 @@
           ],
           "title": "Decision",
           "type": "string"
+        },
+        "profile_adoption": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/InboxProfileAdoption"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "reason": {
           "anyOf": [
@@ -26139,6 +26184,17 @@
           "additionalProperties": true,
           "title": "Metadata",
           "type": "object"
+        },
+        "profile_adoption": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ExecutionProfileAdoptionBody"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Adopt the current execution profile if it changed while the approval was pending, for example after an upgrade. The application's ExecutionProfilePolicy decides."
         },
         "reason": {
           "anyOf": [

@@ -208,6 +208,7 @@ Content-Type: application/json
 | `review_reference` | `approve`, `deny`, `answer` | Required when the application configures a human-review policy; read it from `GET /api/sessions/{id}/human-review`. It can't be combined with `arguments`. |
 | `task_worker_id`, `task_handoff_id` | `approve`, `deny`, `answer` | Exact task continuation authority, as on the ordinary resolve routes. `task_handoff_id` requires `task_worker_id`. |
 | `task_continuation` | `approve`, `deny`, `answer` | Optional `"claim"` explicitly delegates a workerless interrupted task continuation to the runtime. Cannot be combined with worker/handoff IDs. |
+| `profile_adoption` | `approve`, `deny` | `{"idempotency_key", "reason"}`: settle an approval after an upgrade changed the application's execution profile (see below). The caller is the requester. Without authentication, `requested_by` names them, otherwise the request is recorded as `unauthenticated-local-development`. |
 
 With a configured `ControlPlaneRoles` policy, changed arguments and approval
 revisions require a role in that policy's `full_access` set. The maintained server
@@ -279,9 +280,27 @@ caller can show who decided instead:
 | `unavailable` | Its state can't be read right now; try again |
 | `not_settleable` | A recovery item; settle it in the Developer dashboard |
 | `conflict` | The Runtime refused this decision and the item is still pending, for example an edit its schema rejects |
+| `profile_changed` | The application changed while the approval waited and the decision didn't adopt the change; settle again with `profile_adoption` |
 
 An unknown id and an item the inbox access rule hides both answer 404, so the routes
 don't reveal what exists.
+
+### Approvals across an upgrade
+
+A pending approval keeps the execution profile its run started with. When only
+Cayu changed and the application has no `ExecutionProfilePolicy`, approving or
+denying adopts the new Cayu version on its own. Any other change, such as a new
+tool version, answers 409 `profile_changed` until the settle carries
+`profile_adoption` and the application's policy adopts it. A settle that already
+carried `profile_adoption` and was refused answers 409 `conflict`. Before anything runs,
+the paused call is checked against the current tool and policy; if they would no
+longer authorize it the same way, the settle answers 409 `conflict` and the
+approval stays pending, so deny it and let the agent propose the call again. A
+change to the agent's tool set (a tool added, removed or redescribed) can't be
+adopted: approving or denying answers 409 `conflict`, and only the application
+version that proposed the call can settle it. The
+Developer dashboard offers the same decision under the update after a
+`profile_changed` refusal. Use a new `idempotency_key` for each adoption.
 
 ### Repeating a settle
 

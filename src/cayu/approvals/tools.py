@@ -51,6 +51,10 @@ from cayu.context.structured_output import StructuredOutputSpec, copy_structured
 from cayu.context.thinking import ThinkingConfig
 from cayu.deadlines import ExecutionDeadline
 from cayu.events import Event, EventType
+from cayu.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    copy_execution_profile_adoption_intent,
+)
 from cayu.execution_units import ToolRoundIdentity
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
@@ -86,6 +90,17 @@ class ToolApprovalArgumentsRefused(ValueError):
     """
 
 
+class ToolApprovalProfileAdoptionRefused(ValueError):
+    """A pending approval can't move to the application's changed execution profile.
+
+    Raised before the approval is claimed, with the approval still pending and
+    no tool run. Either a paused call no longer passes the current tool and tool
+    policy the same way (deny it so the agent can propose the call again), or
+    the agent's tools were added, removed or redescribed since the call was
+    proposed (settle it with the application version that proposed it).
+    """
+
+
 class ToolApprovalRequest(BaseModel):
     """Caller decision for a pending tool approval.
 
@@ -97,6 +112,14 @@ class ToolApprovalRequest(BaseModel):
     like a new run's, before it continues; ``None`` keeps the stored one. A
     top-level session whose deadline was the default for runs started inside a
     task handler gets back the time it had left when it paused without it.
+
+    ``profile_adoption`` lets the decision settle after the application's
+    execution profile changed while the approval was pending, for example after
+    a Cayu upgrade. The configured ``ExecutionProfilePolicy`` decides, as it does
+    for ``ResumeRequest.profile_adoption``; a change to the Cayu runtime alone is
+    adopted without it when no policy is configured. Either way the paused calls
+    are first checked again against the current tools and tool policy, and the
+    approval still covers only the exact call and arguments it was requested for.
     """
 
     model_config = ConfigDict(
@@ -133,6 +156,10 @@ class ToolApprovalRequest(BaseModel):
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
+    # Adopt the current execution profile if it changed while the approval was pending.
+    profile_adoption: ExecutionProfileAdoptionIntent | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
         default_factory=tuple,
         exclude=True,
@@ -160,6 +187,15 @@ class ToolApprovalRequest(BaseModel):
             # would execute content the review never covered.
             raise ValueError("Approval cannot change the arguments of a human-reviewed proposal.")
         return self
+
+    @field_validator("profile_adoption", mode="before")
+    @classmethod
+    def copy_profile_adoption(cls, value: object) -> ExecutionProfileAdoptionIntent | None:
+        if value is None:
+            return None
+        if isinstance(value, ExecutionProfileAdoptionIntent):
+            return copy_execution_profile_adoption_intent(value)
+        return ExecutionProfileAdoptionIntent.model_validate(value)
 
     @field_validator("task_worker_id", "task_handoff_id")
     @classmethod
@@ -1000,6 +1036,11 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
             {}
             if request.execution_deadline is None
             else {"execution_deadline": request.execution_deadline}
+        ),
+        **(
+            {}
+            if request.profile_adoption is None
+            else {"profile_adoption": request.profile_adoption}
         ),
     )
 
