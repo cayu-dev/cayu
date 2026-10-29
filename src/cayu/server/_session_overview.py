@@ -201,11 +201,25 @@ class SessionOverviewService:
         session, usage, cost = facts.session, facts.usage, facts.cost
         metrics = None if usage is None else usage.usage
         tone = session.metadata.get(SUMMARY_TONE_METADATA_KEY)
+        reason = self._text(facts.outcome.reason, limit=1024) or "unknown"
+        if facts.status == "failed":
+            # Runtime outcome codes remain stable. Only this public display
+            # projection explains the error, after redacting the complete value
+            # so truncation cannot expose a prefix of a registered secret.
+            error = facts.outcome.details.get("error")
+            error = self.redact(error) if type(error) is str else None
+            text = " ".join(error.split()) if type(error) is str else ""
+            if len(text) > 1024:
+                text = text[:1023] + "…"
+            try:
+                reason = validate_display_text(text, limit=1024)
+            except ValueError:
+                reason = "This session failed."
         return SessionOverviewResponse(
             session_id=self.project_session(session.id),
             run_id=session_run_id(session),
             state=facts.status,
-            reason=self._text(facts.outcome.reason, limit=1024) or "unknown",
+            reason=reason,
             title=self.project_title(session),
             summary=self._text(
                 session.metadata.get(SUMMARY_METADATA_KEY), limit=MAX_SESSION_SUMMARY_LENGTH

@@ -24,6 +24,38 @@ def view_index_sql(query: EvalViewQuery, *, postgres: bool) -> tuple[str, tuple[
             target_params = query.target_keys
         else:
             predicate, target_params = "1 = 1", ()
+        authored_revision = (
+            "runs.invocation_json::jsonb ->> 'authored_suite_revision'"
+            if postgres
+            else "json_extract(runs.invocation_json, '$.authored_suite_revision')"
+        )
+        # The persisted admitted run links this exact corpus/suite to an authored
+        # document. Names are not lineage. Keep independent corpus usage visible.
+        authored_link = f"""EXISTS (
+            SELECT 1 FROM cayu_eval_authored_suites AS authored
+            WHERE authored.revision = {authored_revision}
+              AND authored.target_key = runs.target_key
+              AND authored.suite_id = runs.suite_id
+        )"""
+        corpus_runs = """runs.target_key = corpora.target_key
+            AND runs.corpus_revision = suites.corpus_revision AND runs.suite_id = suites.suite_id"""
+
+        def json_text(column: str, *path: str) -> str:
+            # These are fixed schema fields, not query values. SQLite's JSON1
+            # function also works on supported builds predating JSON arrows.
+            if postgres:
+                expression = f"{column}::jsonb"
+                for key in path[:-1]:
+                    expression += f" -> '{key}'"
+                return f"({expression}) ->> '{path[-1]}'"
+            return f"json_extract({column}, '$.{'.'.join(path)}')"
+
+        def addition_text(*path: str) -> str:
+            return json_text("additions.record_json", "receipt", "plan", *path)
+
+        def report_text(*path: str) -> str:
+            return json_text("reports.record_json", "report", *path)
+
         union = f"""
             SELECT 'authored' AS source, revision, NULL AS suite_id, created_at, target_key,
                    'authored:' || revision || ':' AS sort_key
@@ -34,6 +66,39 @@ def view_index_sql(query: EvalViewQuery, *, postgres: bool) -> tuple[str, tuple[
             FROM cayu_eval_suites AS suites
             JOIN cayu_eval_corpora AS corpora ON corpora.revision = suites.corpus_revision
             WHERE {predicate.replace("target_key", "corpora.target_key")}
+              AND (NOT EXISTS (
+                    SELECT 1 FROM cayu_eval_runs AS runs
+                    WHERE {corpus_runs} AND {authored_link}
+                  ) OR EXISTS (
+                    SELECT 1 FROM cayu_eval_runs AS runs
+                    WHERE {corpus_runs} AND NOT {authored_link}
+                  ) OR EXISTS (
+                    SELECT 1 FROM cayu_eval_result_records AS records
+                    WHERE records.target_key = corpora.target_key
+                      AND records.corpus_revision = suites.corpus_revision
+                      AND records.suite_id = suites.suite_id
+                      AND NOT EXISTS (SELECT 1 FROM cayu_eval_runs AS runs
+                                      WHERE runs.result_revision = records.revision)
+                  ) OR EXISTS (
+                    SELECT 1 FROM cayu_eval_session_additions AS additions
+                    JOIN cayu_eval_result_records AS records ON records.revision = additions.result_revision
+                    WHERE {addition_text("mode")} = 'score'
+                      AND {addition_text("captured_result_revision")} = records.revision
+                      AND records.origin = 'captured_session'
+                      AND records.target_key = corpora.target_key
+                      AND {addition_text("destination", "source")} = 'corpus'
+                      AND {addition_text("destination", "target_key")} = corpora.target_key
+                      AND {addition_text("destination", "revision")} = suites.corpus_revision
+                      AND {addition_text("destination", "suite_id")} = suites.suite_id
+                  ) OR EXISTS (
+                    SELECT 1 FROM cayu_eval_reports AS reports
+                    WHERE reports.target_key = corpora.target_key
+                      AND reports.association_key IS NOT NULL
+                      AND {report_text("target_key")} = corpora.target_key
+                      AND {report_text("evidence", "kind")} = 'corpus'
+                      AND {report_text("association", "corpus_revision")} = suites.corpus_revision
+                      AND {report_text("association", "suite_id")} = suites.suite_id
+                  ))
         """
         union += f""" UNION ALL
             SELECT 'reported_suite', selector_json, NULL, created_at, target_key,

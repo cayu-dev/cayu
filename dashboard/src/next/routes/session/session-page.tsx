@@ -1007,9 +1007,11 @@ export function SessionPage({
                       </Button>
                     )}
                     {state === "failed" && (
-                      <p className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                      <p className="flex min-w-0 items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
                         <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-                        {o?.reason ?? "This session failed."}
+                        <span className="min-w-0 [overflow-wrap:anywhere]">
+                          {o?.reason ?? "This session failed."}
+                        </span>
                       </p>
                     )}
                     {state === "interrupted" &&
@@ -1148,9 +1150,13 @@ export function SessionPage({
               {canExecute && !services.prototype && (
                 <div className="mb-2 space-y-2 text-sm">
                   {running && queue.unavailable && (
-                    <p className="text-muted-foreground">
-                      Queued messages require authenticated access and an application-configured
-                      session-message policy. They are unavailable for this session.
+                    <p className="text-muted-foreground [overflow-wrap:anywhere]">
+                      Sending messages while a session runs is off for this session. The agent owner
+                      needs to enable sign-in with{" "}
+                      <code>cayu serve --auth module:auth_dependency</code> instead of
+                      <code> --dev</code> and configure{" "}
+                      <code>CayuApp(session_message_access_policy=...)</code> to allow messages from
+                      signed-in users.
                     </p>
                   )}
                   {queue.inspection.error && !queue.unavailable && (

@@ -538,3 +538,44 @@ def test_overview_window_boundaries_batch_bound_and_configured_pricing():
         assert (
             client.get("/api/sessions", params=[("ids", "missing")] * 200).json()["sessions"] == []
         )
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        ("Provider returned 503: secret-canary", "Provider returned 503: [REDACTED_SECRET]"),
+        (None, "This session failed."),
+        ({"unsafe": "secret-canary"}, "This session failed."),
+        (" ", "This session failed."),
+        ("Provider failed\nTry again", "Provider failed Try again"),
+        ("x" * 1020 + "secret-canary", "x" * 1020 + "[RE…"),
+    ],
+)
+def test_failed_overview_explains_only_redacted_durable_error(error, expected):
+    from cayu.events import Event, EventType
+    from cayu.sessions.records import SessionStatus
+    from cayu.vaults.redaction import SecretRedactor
+
+    app = _app(secret_redactor=SecretRedactor(["secret-canary"]))
+    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+        client.portal.call(_start, app, "failure", "writer")
+        client.portal.call(
+            app.session_store.append_events,
+            "failure",
+            [
+                Event(
+                    session_id="failure",
+                    type=EventType.SESSION_FAILED,
+                    payload={"error": error, "error_type": "secret-canary"},
+                )
+            ],
+        )
+        client.portal.call(app.session_store.update_status, "failure", SessionStatus.FAILED)
+        response = client.get("/api/sessions", params={"include": "overview"})
+        assert response.status_code == 200, response.text
+        row = response.json()["overviews"][0]
+        assert row["state"] == "failed"
+        assert row["reason"] == expected
+        assert "secret-canary" not in response.text
+        assert len(row["reason"]) <= 1024
+        assert client.portal.call(app.session_store.summarize_outcome, "failure").reason == "failed"

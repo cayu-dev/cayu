@@ -15,6 +15,7 @@ from cayu.evals.read_views import (
     EvalRunCaseFilter,
     EvalRunViewDetail,
     EvalSuiteViewDetail,
+    EvalSuiteViewIdentity,
     EvalSuiteViewSummary,
     EvalViewPage,
     EvalViewQuery,
@@ -86,6 +87,20 @@ def register_eval_view_routes(
                 target_key=target_key, cursor=cursor, limit=limit, max_result_bytes=max_result_bytes
             )
             return enforce_view_bytes(await reader().catalog(query), max_result_bytes)
+
+    @router.get(
+        "/evals/suite-views/resolve-corpus",
+        response_model=EvalSuiteViewIdentity,
+        responses=EVALS_ENDPOINT_RESPONSES,
+        dependencies=protected,
+    )
+    async def resolve_corpus_suite_view(
+        corpus: Annotated[str, Query(pattern=r"^sha256:[0-9a-f]{64}$")],
+        suite: Annotated[str, Query(min_length=1, max_length=128)],
+        target: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    ):
+        with _view_errors():
+            return await reader().resolve_corpus_suite(corpus, suite, target)
 
     @router.get(
         "/evals/suite-views/{suite_key}",

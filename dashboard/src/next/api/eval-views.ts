@@ -5,9 +5,11 @@ import type {
   EvalReportedSuiteDetail,
   EvalRunViewDetail,
   EvalSuiteViewDetail,
+  EvalSuiteViewIdentity,
   EvalViewPageUnionEvalSuiteViewSummaryEvalReportedSuiteView,
 } from "@/lib/generated/server-api"
 import { isApiPayloadTooLarge, queryString, requestJson } from "../../lib/api.ts"
+import { suiteSelector } from "../app/eval-view-model.ts"
 export type EvalCaseFilter = "regressed" | "improved" | "failing" | "flaky"
 
 const VIEW_BYTE_LIMIT = 8 * 1024 * 1024
@@ -84,28 +86,16 @@ export function fetchRunView(
   )
 }
 
-/** Old corpus links omitted the target. Resolve it from the authoritative catalog. */
+/** Corpus links may omit the target; catalog visibility is not existence. */
 export async function resolveLegacyEvalSuite(
   corpus: string,
   suite: string,
   target: string | undefined,
   signal?: AbortSignal,
 ): Promise<string> {
-  let cursor: string | undefined
-  const seen = new Set<string>()
-  do {
-    const page = await fetchSuiteViews({ target_key: target, cursor }, signal)
-    const match = page.items.find(
-      (item) =>
-        item.identity.source === "corpus" &&
-        item.identity.revision === corpus &&
-        item.identity.suite_id === suite,
-    )
-    if (match) return match.id
-    if (!page.has_more || !page.next_cursor) break
-    if (seen.has(page.next_cursor)) throw new Error("The suite catalog returned a repeated cursor.")
-    seen.add(page.next_cursor)
-    cursor = page.next_cursor
-  } while (!signal?.aborted)
-  throw new Error("The linked suite is not available in this deployment.")
+  const identity = await requestJson<EvalSuiteViewIdentity>(
+    `/evals/suite-views/resolve-corpus${queryString({ corpus, suite, target })}`,
+    { signal },
+  )
+  return suiteSelector(identity)
 }

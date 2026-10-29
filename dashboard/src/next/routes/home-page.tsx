@@ -171,7 +171,12 @@ function HomeOverview() {
               now={now()}
               trace={failed(r)}
               right={
-                <span className={cn(failed(r) ? "text-destructive" : "text-warning")}>
+                <span
+                  className={cn(
+                    "min-w-0 [overflow-wrap:anywhere]",
+                    failed(r) ? "text-destructive" : "text-warning",
+                  )}
+                >
                   {failed(r) ? (r.overview?.reason ?? "Failed") : stateText(r.overview)}
                 </span>
               }

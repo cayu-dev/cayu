@@ -19,6 +19,7 @@ import {
 } from "@/lib/evals-dashboard"
 import { fetchSuiteView } from "../../api/eval-views"
 import {
+  baselineApprovalLabel,
   checkLabel,
   isNativeSuiteDetail,
   isReportedSuiteDetail,
@@ -315,13 +316,14 @@ export function EvalSuiteViewPage() {
                     </>
                   )}
                   <span className="text-muted-foreground">
-                    Approved by {s.baseline.updated_by}, <DateText value={s.baseline.updated_at} />
+                    {baselineApprovalLabel(s.baseline.updated_by)},{" "}
+                    <DateText value={s.baseline.updated_at} />
                   </span>
                 </div>
               ) : (
                 <p className="text-muted-foreground">
                   {s.baseline_scope === "execution_group"
-                    ? "Baselines belong to each execution group. Open a run to see or approve the baseline for its exact cases and configuration."
+                    ? "Open a run to see or approve a baseline for the same cases and configuration."
                     : "No baseline yet. Approve a finished run to compare later runs with it."}
                 </p>
               )}

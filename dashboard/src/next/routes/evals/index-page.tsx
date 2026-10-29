@@ -7,6 +7,8 @@ import { fetchEvalTargets } from "@/lib/api"
 import { EVAL_TARGET_QUERY_KEY } from "@/lib/evals-dashboard"
 import { fetchSuiteViews, resolveLegacyEvalSuite } from "../../api/eval-views"
 import {
+  baselineApprovalLabel,
+  evalTargetLabel,
   isReportedRun,
   runOrigin,
   runViewRoute,
@@ -112,7 +114,7 @@ export function EvalsIndexPage() {
               <option value="">All specialists</option>
               {targets.data.items.map((t) => (
                 <option key={t.target_key} value={t.target_key}>
-                  {t.target_key}
+                  {evalTargetLabel(t)}
                 </option>
               ))}
             </select>
@@ -195,12 +197,12 @@ export function EvalsIndexPage() {
                         <td className="max-w-56 px-3 py-2 text-xs text-muted-foreground">
                           {s.baseline ? (
                             <>
-                              {s.baseline.updated_by}
+                              {baselineApprovalLabel(s.baseline.updated_by)}
                               <br />
                               <DateText value={s.baseline.updated_at} />
                             </>
                           ) : s.baseline_scope === "execution_group" ? (
-                            "Per execution group"
+                            "See runs for baselines"
                           ) : s.source === "reported" ? (
                             "Unavailable for reports"
                           ) : (

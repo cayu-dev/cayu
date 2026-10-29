@@ -11,6 +11,7 @@ import { type EvalTarget, fetchEvalTargets } from "@/lib/api"
 import { EVAL_SETTINGS_TOOLS, type validateEvalSettingsSearch } from "@/lib/eval-settings-search"
 import { EVAL_TARGET_QUERY_KEY } from "@/lib/evals-dashboard"
 import { EVALS_READINESS_OPERATIONS, evalsReadinessReasonText } from "@/lib/evals-readiness"
+import { evalTargetLabel } from "../../app/eval-view-model"
 import { NavLink, PageBody, TopBar, useGo } from "../common"
 import { JudgeProfiles, JudgeSettings } from "./settings-judges"
 import { CorpusSettings } from "./settings-portability"
@@ -129,7 +130,7 @@ function SettingsTools() {
               {!target && <option value={selected}>Specialist unavailable</option>}
               {targets.data.items.map((item) => (
                 <option key={item.target_key} value={item.target_key}>
-                  {item.target_key}
+                  {evalTargetLabel(item)}
                 </option>
               ))}
             </select>
@@ -267,7 +268,7 @@ function ProfileSettings({
           Each trial starts a fresh session with the specialist as it is configured now.
         </p>
         <div className="rounded-xl border border-border px-3 py-2 text-sm break-words">
-          <p className="font-medium">{target.target_key}</p>
+          <p className="font-medium">{evalTargetLabel(target)}</p>
           <p className="text-muted-foreground">
             {target.execution_profile
               ? `${target.execution_profile.candidate.model} via ${target.execution_profile.candidate.provider_name}${target.execution_profile.candidate.environment_name ? ` · ${target.execution_profile.candidate.environment_name}` : ""}`

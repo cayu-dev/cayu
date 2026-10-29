@@ -446,11 +446,15 @@ def test_detail_running_queue_respects_policy_and_withdraws_exact_record(allowed
                     await page.goto(f"{base}/cayu/sessions/queue")
                     composer = page.locator("#session-composer")
                     if not allowed:
+                        await page.set_viewport_size({"width": 390, "height": 900})
                         await expect(
                             page.get_by_text(
-                                "Queued messages require authenticated access", exact=False
+                                "Sending messages while a session runs is off", exact=False
                             )
                         ).to_be_visible()
+                        assert await page.evaluate(
+                            "document.documentElement.scrollWidth <= innerWidth"
+                        )
                         await expect(composer).to_be_disabled()
                         assert mutations == []
                         return
@@ -2100,5 +2104,182 @@ def test_detail_legacy_event_link_opens_exact_evidence_and_retains_explicit_tabs
         finally:
             provider.release_direct()
             directory.cleanup()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("width", [390, 768, 1440])
+def test_failed_session_shows_redacted_error_without_overflow(width):
+    from playwright.async_api import expect
+
+    from cayu.events import Event, EventType
+    from cayu.sessions.records import SessionStatus
+    from cayu.vaults.redaction import SecretRedactor
+
+    async def run():
+        runtime = _app(secret_redactor=SecretRedactor(["provider-secret-canary"]))
+        await runtime.session_store.create(
+            RunRequest(
+                session_id="failed-display",
+                agent_name="writer",
+                title="Failed request",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake"),
+        )
+        error = "Provider returned 503: provider-secret-canary " + "x" * 1100
+        await runtime.session_store.append_events(
+            "failed-display",
+            [
+                Event(
+                    session_id="failed-display",
+                    type=EventType.SESSION_FAILED,
+                    payload={"error": error},
+                )
+            ],
+        )
+        await runtime.session_store.update_status("failed-display", SessionStatus.FAILED)
+        async with search_browser(runtime=runtime) as (page, base, _, _, _):
+            await page.set_viewport_size({"width": width, "height": 900})
+            await page.goto(f"{base}/cayu/sessions/failed-display")
+            banner = page.get_by_text("Provider returned 503: [REDACTED_SECRET]", exact=False).first
+            await expect(banner).to_be_visible()
+            assert "provider-secret-canary" not in await page.locator("body").inner_text()
+            assert await banner.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
+            assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+    asyncio.run(run())
+
+
+def test_evals_show_specialist_labels_and_plain_baseline_words(tmp_path):
+    from playwright.async_api import expect
+    from tests.server.test_server_eval_suite_authoring import _draft
+    from tests.server.test_server_evals import _evals_config, _provider, _target
+
+    from cayu.evals.suite_authoring import compile_eval_suite_authoring_draft
+    from cayu.server import DashboardConfig, OpenAccess, ServerConfig, create_server
+    from cayu.storage.evals_sqlite import SQLiteEvalStore
+
+    async def run():
+        target = _target(_provider(), key="eval.opaque-target")
+        store = SQLiteEvalStore(tmp_path / "labels.db")
+        try:
+            suite = compile_eval_suite_authoring_draft(
+                _draft().model_copy(update={"target_key": target.key})
+            )
+            await store.save_authored_suite(suite, redact_json=target.app.redact_json)
+
+            def configured(_app):
+                return create_server(
+                    target.app,
+                    config=ServerConfig(
+                        access=OpenAccess(trusted_local_development=True),
+                        dashboard=DashboardConfig(
+                            directory=os.environ.get("CAYU_SESSION_SEARCH_DIRECTORY")
+                        ),
+                        evals=_evals_config(target, store),
+                    ),
+                )
+
+            async with search_browser(runtime=target.app, wrapper=configured) as (
+                page,
+                base,
+                _,
+                _,
+                _,
+            ):
+                await page.goto(f"{base}/cayu/evals")
+                await expect(page.get_by_text("See runs for baselines", exact=True)).to_be_visible()
+                await page.goto(f"{base}/cayu/evals/settings?target={target.key}")
+                await expect(
+                    page.get_by_label("Settings specialist", exact=True).locator("option:checked")
+                ).to_have_text("agent · Explicit")
+                await expect(page.get_by_text("agent · Explicit", exact=True).last).to_be_visible()
+                await page.goto(f"{base}/cayu/evals/suites/new?target={target.key}")
+                await expect(page.get_by_label("Specialist", exact=True)).to_have_value(target.key)
+                await expect(
+                    page.get_by_label("Specialist", exact=True).locator("option:checked")
+                ).to_have_text("agent · Explicit")
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_member_targetless_derived_corpus_link_at_nested_mount(sqlite_resources):
+    import httpx
+    from playwright.async_api import expect
+    from tests.server.test_server_eval_suite_launch import _reviewed_body, _saved_suite, _server
+    from tests.server.test_server_evals import _AUTH_HEADERS, _evals_config
+
+    from cayu.server import (
+        AuthContext,
+        ControlPlaneRoles,
+        DashboardConfig,
+        ServerApiConfig,
+        ServerConfig,
+        create_server,
+    )
+
+    class MemberAuth:
+        control_plane_roles = ControlPlaneRoles()
+
+        def __call__(self, request):
+            context = AuthContext(subject="member", claims={"role": "member"})
+            self.control_plane_roles.require(request, context)
+            return context
+
+    async def run():
+        async with sqlite_resources as resources:
+            target, store, suite, _ = await _saved_suite(resources, scenario_count=0)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=_server(target, store)), base_url="http://test"
+            ) as client:
+                root = f"/api/evals/suites/{suite.revision}/runs"
+                body = await _reviewed_body(client, root)
+                response = await client.post(
+                    root, headers={**_AUTH_HEADERS, "Idempotency-Key": "nested-link"}, json=body
+                )
+                assert response.status_code == 202, response.text
+                spec = response.json()["runs"][0]["run"]["spec"]
+
+            def configured(_app):
+                return create_server(
+                    target.app,
+                    config=ServerConfig.protected(
+                        MemberAuth(),
+                        api=ServerApiConfig(path="/nested/api"),
+                        dashboard=DashboardConfig(
+                            path="/nested/dashboard",
+                            directory=os.environ.get("CAYU_SESSION_SEARCH_DIRECTORY"),
+                        ),
+                        evals=_evals_config(target, store),
+                    ),
+                )
+
+            async with search_browser(runtime=target.app, wrapper=configured) as (
+                page,
+                base,
+                _,
+                _,
+                _,
+            ):
+                catalog = await page.request.get(f"{base}/nested/api/evals/suite-views?limit=1")
+                assert catalog.status == 200
+                assert [item["source"] for item in (await catalog.json())["items"]] == ["authored"]
+                assert (await catalog.json())["has_more"] is False
+                query = f"corpus={spec['corpus_revision']}&suite={spec['suite_id']}"
+                for suffix in ("", f"&target={target.key}"):
+                    await page.goto(f"{base}/nested/dashboard/evals?{query}{suffix}")
+                    await page.wait_for_url("**/nested/dashboard/evals/suites/**")
+                    await expect(page.get_by_text("Runs", exact=True).first).to_be_visible()
+                    assert (
+                        "linked suite is not available"
+                        not in await page.locator("body").inner_text()
+                    )
+                unknown = await page.request.get(
+                    f"{base}/nested/api/evals/suite-views/resolve-corpus?corpus={spec['corpus_revision']}&suite=unknown"
+                )
+                assert unknown.status == 404
 
     asyncio.run(run())

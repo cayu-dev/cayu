@@ -357,7 +357,7 @@ def test_inbox_member_decides_without_arguments_and_counts_refresh(decision):
                 page.get_by_role("button", name="Approve", exact=True).first
             ).to_be_visible()
             await expect(
-                page.get_by_text("This app shows no arguments for approvals", exact=False).first
+                page.get_by_text("This agent shows no arguments for approvals", exact=False).first
             ).to_be_visible()
             await expect(page.get_by_label("Changed arguments", exact=True)).to_have_count(0)
             assert "/api/inbox/counts" in requests
@@ -427,6 +427,7 @@ def test_inbox_member_keeps_and_drops_knowledge_with_source_fields():
         ):
             await page.goto(base + "/cayu/inbox?kind=knowledge", wait_until="networkidle")
             await expect(page.get_by_role("button", name="Keep", exact=True)).to_have_count(2)
+            await expect(page.get_by_label("Knowledge awaiting review")).to_have_text("2")
             for label in [
                 "Namespace",
                 "Labels",
@@ -440,10 +441,12 @@ def test_inbox_member_keeps_and_drops_knowledge_with_source_fields():
             await page.get_by_label("Reason (optional)", exact=True).first.fill("Keep reviewed")
             await page.get_by_role("button", name="Keep", exact=True).first.click()
             await expect(page.get_by_role("button", name="Keep", exact=True)).to_have_count(1)
+            await expect(page.get_by_label("Knowledge awaiting review")).to_have_text("1")
             await page.get_by_text("Decision options", exact=True).first.click()
             await page.get_by_label("Reason (optional)", exact=True).first.fill("Drop reviewed")
             await page.get_by_role("button", name="Drop", exact=True).first.click()
             await expect(page.get_by_role("button", name="Keep", exact=True)).to_have_count(0)
+            await expect(page.get_by_label("Knowledge awaiting review")).to_have_count(0)
             await expect(page.get_by_label("Inbox total")).to_have_count(0)
             assert sum(request.endswith("/settle") for request in requests) == 2
             settlements = [
@@ -489,6 +492,7 @@ def test_inbox_follows_empty_sealed_pages_and_never_shows_hidden_counts(stale):
                 page.get_by_text("Counts unavailable: your access is limited.", exact=True)
             ).to_be_visible()
             await expect(page.get_by_label("Inbox total")).to_have_count(0)
+            await expect(page.get_by_label("Knowledge awaiting review")).to_have_count(0)
             await expect(page.locator("[data-inbox-item]")).to_have_count(1)
             await expect(
                 page.locator("[data-inbox-item]").get_by_role("link", name="visible", exact=True)

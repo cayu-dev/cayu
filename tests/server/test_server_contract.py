@@ -158,6 +158,7 @@ def test_openapi_contract_summary_matches_snapshot() -> None:
         path in schema["paths"]
         for path in (
             "/api/evals/suite-views",
+            "/api/evals/suite-views/resolve-corpus",
             "/api/evals/suite-views/{suite_key}",
             "/api/evals/run-views/{run_key}",
             "/api/evals/reports",

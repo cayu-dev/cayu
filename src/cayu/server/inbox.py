@@ -114,9 +114,9 @@ class InboxItem(_InboxModel):
         default=None,
         description=(
             "Why an approval or recovery item shows no arguments. no_review_policy: the "
-            "app configured no human review policy, so it shows no arguments for "
+            "agent configured no human review policy, so it shows no arguments for "
             "approvals; configure one such as ToolArgumentReview. quarantined: the "
-            "inbox never lists them, and the app's review policy decides what protected "
+            "inbox never lists them, and the agent's review policy decides what protected "
             "human review shows."
         ),
     )

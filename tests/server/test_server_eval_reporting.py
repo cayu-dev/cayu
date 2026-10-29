@@ -350,6 +350,32 @@ def test_http_report_exact_corpus_association_keeps_both_comparison_directions_u
                 )
                 assert absent.status_code == 409, absent.text
                 await store.save_corpus(corpus, redact_json=target.app.redact_json)
+                from tests.server.test_server_eval_suite_authoring import _draft
+
+                from cayu.evals.store import EvalRunInvocation
+                from cayu.evals.suite_authoring import compile_eval_suite_authoring_draft
+
+                authored = compile_eval_suite_authoring_draft(
+                    _draft().model_copy(
+                        update={"target_key": target.key, "id": corpus.suites[0].id}
+                    )
+                )
+                await store.save_authored_suite(authored, redact_json=target.app.redact_json)
+                await store.admit_run(
+                    _request(
+                        corpus, run_id="authored-report-source", key="authored-report-source"
+                    ).model_copy(
+                        update={
+                            "invocation": EvalRunInvocation(
+                                authored_suite_revision=authored.revision,
+                                authored_suite_selection_revision="sha256:" + "a" * 64,
+                            )
+                        }
+                    ),
+                    redact_json=target.app.redact_json,
+                )
+                before = await client.get("/api/evals/suite-views", headers=_AUTH_HEADERS)
+                assert [item["source"] for item in before.json()["items"]] == ["authored"]
                 created = await client.post(
                     "/api/evals/reports", json=payload, headers=_REPORT_HEADERS
                 )
@@ -378,6 +404,31 @@ def test_http_report_exact_corpus_association_keeps_both_comparison_directions_u
                 )
                 assert history.status_code == 200, history.text
                 assert history.json()["runs"]["items"][0]["id"] == external
+                cursor, entries = None, []
+                while True:
+                    catalog = await client.get(
+                        "/api/evals/suite-views",
+                        headers=_AUTH_HEADERS,
+                        params={"limit": 1, **({"cursor": cursor} if cursor else {})},
+                    )
+                    page = catalog.json()
+                    entries.extend(page["items"])
+                    if not page["has_more"]:
+                        break
+                    cursor = page["next_cursor"]
+                combined = next((item for item in entries if item["id"] == identity.id), None)
+                assert combined is not None, entries
+                assert combined["last_run"]["id"] == external
+                authored_identity = EvalSuiteViewIdentity(
+                    source="authored", target_key=target.key, revision=authored.revision
+                )
+                authored_history = await client.get(
+                    f"/api/evals/suite-views/{authored_identity.id}", headers=_AUTH_HEADERS
+                )
+                assert [
+                    item["native_run_id"] for item in authored_history.json()["runs"]["items"]
+                ] == ["authored-report-source"]
+                await store.request_cancel("authored-report-source")
                 await store.admit_run(
                     _request(corpus, run_id="native", key="native"),
                     redact_json=target.app.redact_json,

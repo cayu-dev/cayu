@@ -142,6 +142,7 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/causal-budgets/{causal_budget_id}/usage",
             "/contract",
             "/evals/suite-views",
+            "/evals/suite-views/resolve-corpus",
             "/evals/suite-views/{suite_key}",
             "/evals/run-views/{run_key}",
             "/environments",

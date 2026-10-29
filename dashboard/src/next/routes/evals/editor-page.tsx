@@ -8,6 +8,7 @@ import { fetchEvalTargets } from "@/lib/api"
 import { EVAL_TARGET_QUERY_KEY } from "@/lib/evals-dashboard"
 import { fetchSuiteView } from "../../api/eval-views"
 import {
+  evalTargetLabel,
   isNativeSuiteDetail,
   isReportedSuiteDetail,
   nativeRunSelector,
@@ -116,11 +117,13 @@ function EditorPage() {
               }
             >
               {!knownTarget && (
-                <option value={target ?? ""}>{target ?? "Choose specialist"}</option>
+                <option value={target ?? ""}>
+                  {target ? "Specialist unavailable" : "Choose specialist"}
+                </option>
               )}
               {targets.data?.items.map((item) => (
                 <option key={item.target_key} value={item.target_key}>
-                  {item.target_key}
+                  {evalTargetLabel(item)}
                 </option>
               ))}
             </select>

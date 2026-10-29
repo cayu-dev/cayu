@@ -439,15 +439,23 @@ function DashboardShell() {
                       >
                         <Icon className="size-4 text-muted-foreground" aria-hidden="true" />
                         <span>{label}</span>
-                        {to === "/inbox" &&
+                        {(to === "/inbox" || to === "/knowledge") &&
+                          available({ kind: "surface", surface: "inbox_queries" }) &&
+                          !inboxCounts.isError &&
                           inboxCounts.data?.complete === true &&
-                          (inboxCounts.data.total_count ?? 0) > 0 && (
+                          (to === "/inbox"
+                            ? (inboxCounts.data.total_count ?? 0)
+                            : (inboxCounts.data.counts?.knowledge ?? 0)) > 0 && (
                             <span
                               role="status"
-                              aria-label="Inbox total"
+                              aria-label={
+                                to === "/inbox" ? "Inbox total" : "Knowledge awaiting review"
+                              }
                               className="ml-auto rounded-full bg-warning/15 px-1.5 text-xs tabular-nums"
                             >
-                              {inboxCounts.data?.total_count}
+                              {to === "/inbox"
+                                ? inboxCounts.data.total_count
+                                : inboxCounts.data.counts?.knowledge}
                             </span>
                           )}
                       </Link>

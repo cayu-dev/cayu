@@ -12298,7 +12298,7 @@ export type InboxItem = {
     /**
      * Arguments Unavailable Reason
      *
-     * Why an approval or recovery item shows no arguments. no_review_policy: the app configured no human review policy, so it shows no arguments for approvals; configure one such as ToolArgumentReview. quarantined: the inbox never lists them, and the app's review policy decides what protected human review shows.
+     * Why an approval or recovery item shows no arguments. no_review_policy: the agent configured no human review policy, so it shows no arguments for approvals; configure one such as ToolArgumentReview. quarantined: the inbox never lists them, and the agent's review policy decides what protected human review shows.
      */
     arguments_unavailable_reason?: 'quarantined' | 'no_review_policy' | null;
     /**
@@ -26375,6 +26375,58 @@ export type ListSuiteViewsApiEvalsSuiteViewsGetResponses = {
 };
 
 export type ListSuiteViewsApiEvalsSuiteViewsGetResponse = ListSuiteViewsApiEvalsSuiteViewsGetResponses[keyof ListSuiteViewsApiEvalsSuiteViewsGetResponses];
+
+export type ResolveCorpusSuiteViewApiEvalsSuiteViewsResolveCorpusGetData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Corpus
+         */
+        corpus: string;
+        /**
+         * Suite
+         */
+        suite: string;
+        /**
+         * Target
+         */
+        target?: string | null;
+    };
+    url: '/api/evals/suite-views/resolve-corpus';
+};
+
+export type ResolveCorpusSuiteViewApiEvalsSuiteViewsResolveCorpusGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ResolveCorpusSuiteViewApiEvalsSuiteViewsResolveCorpusGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalSuiteViewIdentity;
+};
+
+export type ResolveCorpusSuiteViewApiEvalsSuiteViewsResolveCorpusGetResponse = ResolveCorpusSuiteViewApiEvalsSuiteViewsResolveCorpusGetResponses[keyof ResolveCorpusSuiteViewApiEvalsSuiteViewsResolveCorpusGetResponses];
 
 export type GetSuiteViewApiEvalsSuiteViewsSuiteKeyGetData = {
     body?: never;

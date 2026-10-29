@@ -3961,6 +3961,8 @@ class InMemoryEvalStore(EvalStore):
             EvalViewQuery,
             bounded_view_index,
         )
+        from cayu.evals.reported import EvalReportRecord
+        from cayu.evals.session_additions import EvalAdditionRecord
 
         query = _exact_model(query, EvalViewQuery, "query")
         boundary = query.boundary()
@@ -3972,7 +3974,69 @@ class InMemoryEvalStore(EvalStore):
 
         async with self._lock:
             items = []
+            reports = [
+                EvalReportRecord.model_validate_json(payload) for payload in self._reports.values()
+            ]
             if query.suite is None:
+                authored_corpora = set()
+                independent_corpora = set()
+                for state in self._runs.values():
+                    request = state.request
+                    identity = (request.target_key, request.corpus_revision, request.suite_id)
+                    authored_revision = request.invocation.authored_suite_revision
+                    document = (
+                        None
+                        if authored_revision is None
+                        else self._authored_suites.get(authored_revision)
+                    )
+                    if (
+                        document is not None
+                        and document.target_key == request.target_key
+                        and document.id == request.suite_id
+                    ):
+                        authored_corpora.add(identity)
+                    else:
+                        independent_corpora.add(identity)
+                native_results = {
+                    state.result.revision
+                    for state in self._runs.values()
+                    if state.result is not None
+                }
+                independent_corpora.update(
+                    (
+                        state.record.target.target_key,
+                        state.record.corpus_revision,
+                        state.record.suite_id,
+                    )
+                    for state in self._results.values()
+                    if state.record.revision not in native_results
+                )
+                # A captured run may execute in a separate one-case corpus but
+                # belong to this corpus's history through an atomic score receipt.
+                for payload in self._session_additions.values():
+                    plan = EvalAdditionRecord.model_validate_json(payload).receipt.plan
+                    state = (
+                        None
+                        if plan.captured_result_revision is None
+                        else self._results.get(plan.captured_result_revision)
+                    )
+                    destination = plan.destination
+                    if (
+                        plan.mode == "score"
+                        and destination.source == "corpus"
+                        and state is not None
+                        and state.record.origin == EvalResultOrigin.CAPTURED_SESSION
+                        and state.record.target.target_key == destination.target_key
+                    ):
+                        independent_corpora.add(
+                            (destination.target_key, destination.revision, destination.suite_id)
+                        )
+                independent_corpora.update(
+                    (record.report.target_key, association.corpus_revision, association.suite_id)
+                    for record in reports
+                    if (association := record.report.association) is not None
+                )
+                derived_only = authored_corpora - independent_corpora
                 items.extend(
                     EvalViewIndexEntry(
                         source="authored",
@@ -3995,6 +4059,7 @@ class InMemoryEvalStore(EvalStore):
                                 created_at=corpus.created_at,
                             )
                             for item in suites
+                            if (corpus.target_key, revision, item.id) not in derived_only
                         )
             elif query.suite.source != "reported":
                 scope = query.suite
@@ -4031,8 +4096,6 @@ class InMemoryEvalStore(EvalStore):
                                     created_at=record.created_at,
                                 )
                             )
-                from cayu.evals.session_additions import EvalAdditionRecord
-
                 present = {(item.source, item.revision) for item in items}
                 for payload in self._session_additions.values():
                     addition = EvalAdditionRecord.model_validate_json(payload)
@@ -4057,11 +4120,9 @@ class InMemoryEvalStore(EvalStore):
                         )
                         present.add(("result", state.record.revision))
             from cayu.evals._report_publication import report_association_selector
-            from cayu.evals.reported import EvalReportRecord
 
             series_seen = set()
-            for payload in self._reports.values():
-                report = EvalReportRecord.model_validate_json(payload)
+            for report in reports:
                 if not accepts_target(report.report.target_key):
                     continue
                 if query.suite is None:

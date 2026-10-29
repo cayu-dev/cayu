@@ -415,8 +415,9 @@ export function InboxCard({
         )}
         {item.arguments_unavailable_reason === "no_review_policy" && (
           <p className="text-xs text-muted-foreground">
-            This app shows no arguments for approvals. To show selected ones, the app can configure
-            a human review policy such as <code className="font-mono">ToolArgumentReview</code>.
+            This agent shows no arguments for approvals. To show selected ones, the agent can
+            configure a human review policy such as{" "}
+            <code className="font-mono">ToolArgumentReview</code>.
           </p>
         )}
         {item.arguments_unavailable_reason === "quarantined" && (

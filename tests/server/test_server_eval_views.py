@@ -315,6 +315,35 @@ def test_member_views_are_read_only_and_auth_precedes_query_validation(tmp_path,
                 assert auth.calls == 1
                 assert response.headers["cache-control"] == "private, no-store"
                 suite = response.json()["items"][0]
+                resolved = await client.get(
+                    "/api/evals/suite-views/resolve-corpus",
+                    params={
+                        "corpus": suite["identity"]["revision"],
+                        "suite": suite["identity"]["suite_id"],
+                    },
+                    headers=_AUTH_HEADERS,
+                )
+                assert resolved.status_code == 200, resolved.text
+                assert resolved.json() == suite["identity"]
+                raw = await client.get(
+                    f"/api/evals/corpora/{suite['identity']['revision']}", headers=_AUTH_HEADERS
+                )
+                assert raw.status_code == 403
+                denied_resolution = await client.get(
+                    "/api/evals/suite-views/resolve-corpus?corpus=invalid&suite=unknown"
+                )
+                assert denied_resolution.status_code == 401
+                store.suite_views = False
+                unavailable = await client.get(
+                    "/api/evals/suite-views/resolve-corpus",
+                    params={
+                        "corpus": suite["identity"]["revision"],
+                        "suite": suite["identity"]["suite_id"],
+                    },
+                    headers=_AUTH_HEADERS,
+                )
+                assert unavailable.status_code == 409
+                store.suite_views = True
                 for path in (
                     f"/api/evals/suite-views/{suite['id']}",
                     f"/api/evals/run-views/{suite['last_run']['id']}",
@@ -615,6 +644,16 @@ def test_postgres_suite_views_public_http(postgres_dsn):
                 )
                 assert response.status_code == 200, response.text
                 suite = response.json()["items"][0]
+                resolved = await client.get(
+                    "/api/evals/suite-views/resolve-corpus",
+                    params={
+                        "corpus": suite["identity"]["revision"],
+                        "suite": suite["identity"]["suite_id"],
+                    },
+                    headers=_AUTH_HEADERS,
+                )
+                assert resolved.status_code == 200, resolved.text
+                assert resolved.json() == suite["identity"]
                 response = await client.get(
                     f"/api/evals/suite-views/{suite['id']}", headers=_AUTH_HEADERS
                 )

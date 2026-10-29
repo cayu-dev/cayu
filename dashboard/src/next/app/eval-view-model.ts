@@ -129,3 +129,15 @@ export function isNativeSuiteDetail(
     value !== undefined && (value.suite.source === "authored" || value.suite.source === "corpus")
   )
 }
+
+/** Display names never replace the opaque target key used for requests. */
+export function evalTargetLabel(target: {
+  label?: string | null
+  agent_name?: string | null
+}): string {
+  return target.label?.trim() || target.agent_name?.trim() || "Specialist unavailable"
+}
+
+export function baselineApprovalLabel(actor: string): string {
+  return actor === "cayu:trusted-local-development" ? "Approved locally" : `Approved by ${actor}`
+}

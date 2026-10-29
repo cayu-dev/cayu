@@ -514,3 +514,15 @@ def test_isolated_search_example_bounds_output_before_dispatch() -> None:
     result = handler.run(None, {"query": "\x01" * 8192})
     assert not result.is_error
     assert tool_result_payload_bytes(result) <= 256 * 1024
+
+
+def test_local_queued_message_setup_names_auth_dependency_and_scoped_policy() -> None:
+    section = _heading_section(
+        _REPO_ROOT / "docs" / "session-message-lifecycle.md",
+        heading="Messages in the local dashboard",
+    )
+    assert "cayu serve --auth module:auth_dependency" in section
+    assert "import path of your authentication dependency" in section
+    assert "CayuApp(session_message_access_policy=policy)" in section
+    assert "`inspect` and `enqueue`" in section
+    assert "Authentication alone does not grant access" in section

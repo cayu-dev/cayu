@@ -256,3 +256,60 @@ test("catalog page byte adaptation preserves target and continuation scope", asy
     globalThis.fetch = originalFetch
   }
 })
+
+test("specialist labels and baseline attribution keep opaque identities out of display", () => {
+  assert.equal(
+    model.evalTargetLabel({ target_key: "eval.opaque", label: "Reporter", agent_name: "reporter" }),
+    "Reporter",
+  )
+  assert.equal(
+    model.evalTargetLabel({ target_key: "eval.opaque", label: " ", agent_name: "reporter" }),
+    "reporter",
+  )
+  assert.equal(
+    model.evalTargetLabel({ target_key: "eval.opaque", label: null, agent_name: null }),
+    "Specialist unavailable",
+  )
+  assert.equal(model.baselineApprovalLabel("cayu:trusted-local-development"), "Approved locally")
+  assert.equal(model.baselineApprovalLabel("Ada"), "Approved by Ada")
+  assert.equal(model.baselineApprovalLabel("cayu:other-actor"), "Approved by cayu:other-actor")
+})
+
+test("target-less corpus links resolve exact identity independently of catalog presentation", async () => {
+  globalThis.window = { __CAYU_DASHBOARD_CONFIG__: { apiBaseUrl: "/nested/api" } }
+  const api = await import("../src/next/api/eval-views.ts")
+  const originalFetch = globalThis.fetch
+  const identity = {
+    source: "corpus",
+    target_key: "writer",
+    revision: "sha256:abc",
+    suite_id: "one",
+  }
+  const calls = []
+  globalThis.fetch = async (url) => {
+    calls.push(url)
+    return new Response(
+      JSON.stringify(url.includes("resolve-corpus") ? identity : { items: [], has_more: false }),
+    )
+  }
+  try {
+    assert.equal(
+      await api.resolveLegacyEvalSuite(identity.revision, "one", undefined),
+      model.suiteSelector(identity),
+    )
+    assert.match(calls[0], /resolve-corpus\?corpus=sha256%3Aabc&suite=one/)
+    assert.equal(calls.length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("queued-message setup documents the required authentication dependency", async () => {
+  const { readFile } = await import("node:fs/promises")
+  const text = await readFile(
+    new URL("../src/next/routes/session/session-page.tsx", import.meta.url),
+    "utf8",
+  )
+  assert.match(text, /cayu serve --auth module:auth_dependency/)
+  assert.match(text, /session_message_access_policy/)
+})

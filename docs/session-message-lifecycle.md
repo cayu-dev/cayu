@@ -61,6 +61,16 @@ body `requested_by` even if it matches the authenticated actor. Terminal-action
 bodies have no actor or context field. Protected responses, including errors,
 are private/no-store and use bounded, non-disclosing errors.
 
+## Messages in the local dashboard
+
+`cayu serve --dev` runs without sign-in, so sending messages while a session runs
+is unavailable. To enable it, use `cayu serve --auth module:auth_dependency` instead of `--dev` and
+configure `CayuApp(session_message_access_policy=policy)`. Replace
+`module:auth_dependency` with the import path of your authentication dependency. The policy must permit
+`inspect` and `enqueue` for the signed-in person and the specific session; grant
+`withdraw` separately if they should be able to remove a queued message.
+Authentication alone does not grant access, and the policy cannot replace sign-in.
+
 ## Python API
 
 ```python

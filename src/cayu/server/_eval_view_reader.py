@@ -91,6 +91,24 @@ class EvalViewReader:
             raise HTTPException(status_code=404, detail="Eval target not found.")
         return target
 
+    async def resolve_corpus_suite(
+        self, revision: str, suite_id: str, target_key: str | None
+    ) -> EvalSuiteViewIdentity:
+        document = await self.store.load_corpus(revision)
+        if document is None:
+            raise HTTPException(status_code=404, detail="Eval suite not found.")
+        document = await asyncio.to_thread(_exact_model, document, EvalCorpusDocument, "corpus")
+        if document.revision != revision:
+            raise HTTPException(status_code=409, detail="Eval suite identity mismatch.")
+        self.target(document.target_key)
+        if target_key is not None and target_key != document.target_key:
+            raise HTTPException(status_code=404, detail="Eval suite not found.")
+        if not any(suite.id == suite_id for suite in document.suites):
+            raise HTTPException(status_code=404, detail="Eval suite not found.")
+        return EvalSuiteViewIdentity(
+            source="corpus", target_key=document.target_key, revision=revision, suite_id=suite_id
+        )
+
     async def suite_document(self, identity):
         if not isinstance(identity, EvalSuiteViewIdentity):
             raise HTTPException(

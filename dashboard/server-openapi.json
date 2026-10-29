@@ -25458,7 +25458,7 @@
                 "type": "null"
               }
             ],
-            "description": "Why an approval or recovery item shows no arguments. no_review_policy: the app configured no human review policy, so it shows no arguments for approvals; configure one such as ToolArgumentReview. quarantined: the inbox never lists them, and the app's review policy decides what protected human review shows.",
+            "description": "Why an approval or recovery item shows no arguments. no_review_policy: the agent configured no human review policy, so it shows no arguments for approvals; configure one such as ToolArgumentReview. quarantined: the inbox never lists them, and the agent's review policy decides what protected human review shows.",
             "title": "Arguments Unavailable Reason"
           },
           "attention_id": {
@@ -38729,7 +38729,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "71",
+            "default": "72",
             "title": "Contract Version",
             "type": "string"
           },
@@ -46450,7 +46450,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "71",
+            "default": "72",
             "title": "Contract Version",
             "type": "string"
           }
@@ -50917,6 +50917,80 @@
           }
         },
         "summary": "List Suite Views"
+      }
+    },
+    "/api/evals/suite-views/resolve-corpus": {
+      "get": {
+        "operationId": "resolve_corpus_suite_view_api_evals_suite_views_resolve_corpus_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "corpus",
+            "required": true,
+            "schema": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "title": "Corpus",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "suite",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Suite",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalSuiteViewIdentity"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Resolve Corpus Suite View"
       }
     },
     "/api/evals/suite-views/{suite_key}": {

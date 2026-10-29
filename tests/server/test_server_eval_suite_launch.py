@@ -525,3 +525,72 @@ def test_suite_launch_preview_bounds_scenario_preparation_and_cleans_up_cancella
             assert provider.requests == []
 
     asyncio.run(exercise())
+
+
+def test_launched_authored_suite_has_one_catalog_row_from_fresh_adapter(sqlite_resources):
+    async def exercise():
+        async with sqlite_resources as resources:
+            target, store, suite, _provider = await _saved_suite(resources)
+            server = _server(target, store)
+            root = f"/api/evals/suites/{suite.revision}/runs"
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=server), base_url="http://test"
+            ) as client:
+                body = await _reviewed_body(client, root)
+                response = await client.post(
+                    root, headers={**_AUTH_HEADERS, "Idempotency-Key": "catalog-dedup"}, json=body
+                )
+                assert response.status_code == 202, response.text
+                run_ids = {item["run"]["spec"]["run_id"] for item in response.json()["runs"]}
+            # A fresh adapter must reconstruct the persisted relation. The fixture
+            # retains ownership of both adapters and closes them exactly once.
+            reopened = resources.own(SQLiteEvalStore(store.path))
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=_server(target, reopened)), base_url="http://test"
+            ) as client:
+                response = await client.get(
+                    "/api/evals/suite-views", params={"limit": 1}, headers=_AUTH_HEADERS
+                )
+                assert response.status_code == 200, response.text
+                page = response.json()
+                assert len(page["items"]) == 1
+                assert page["items"][0]["source"] == "authored"
+                assert page["has_more"] is False
+                assert page["next_cursor"] is None
+                detail = await client.get(
+                    f"/api/evals/suite-views/{page['items'][0]['id']}", headers=_AUTH_HEADERS
+                )
+                assert detail.status_code == 200, detail.text
+                assert {item["native_run_id"] for item in detail.json()["runs"]["items"]} == run_ids
+                for run_id in run_ids:
+                    admitted = await reopened.load_run(run_id)
+                    spec = admitted.spec
+                    params = {"corpus": spec.corpus_revision, "suite": spec.suite_id}
+                    resolved = await client.get(
+                        "/api/evals/suite-views/resolve-corpus",
+                        params=params,
+                        headers=_AUTH_HEADERS,
+                    )
+                    assert resolved.status_code == 200, resolved.text
+                    from cayu.evals.read_views import EvalSuiteViewIdentity
+
+                    identity = EvalSuiteViewIdentity.model_validate(resolved.json())
+                    assert identity.target_key == target.key
+                    history = await client.get(
+                        f"/api/evals/suite-views/{identity.id}", headers=_AUTH_HEADERS
+                    )
+                    assert history.status_code == 200, history.text
+                    assert run_id in {r["native_run_id"] for r in history.json()["runs"]["items"]}
+                    for invalid in (
+                        {"suite": "unknown"},
+                        {"corpus": "sha256:" + "f" * 64},
+                        {"target": "unknown"},
+                    ):
+                        rejected = await client.get(
+                            "/api/evals/suite-views/resolve-corpus",
+                            params={**params, **invalid},
+                            headers=_AUTH_HEADERS,
+                        )
+                        assert rejected.status_code == 404, rejected.text
+
+    asyncio.run(exercise())

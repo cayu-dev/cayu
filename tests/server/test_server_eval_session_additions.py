@@ -1541,3 +1541,215 @@ def test_exact_replay_distinguishes_boolean_and_numeric_assertion_values(
             client.portal.call(
                 partial(store.publish_session_addition, prepared, changed_record, **kwargs)
             )
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_authored_derived_corpus_remains_visible_after_independent_score(
+    addition_environment, backend, request, monkeypatch
+):
+    from cayu.evals.read_views import EvalViewQuery
+
+    dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+    from cayu.storage.evals_sqlite import SQLiteEvalStore
+
+    captured = []
+    original = SQLiteEvalStore.publish_session_addition
+
+    async def observe(self, prepared, record, **kwargs):
+        captured.append((prepared, record))
+        return await original(self, prepared, record, **kwargs)
+
+    monkeypatch.setattr(SQLiteEvalStore, "publish_session_addition", observe)
+    server, app, store = addition_environment(
+        "sqlite" if backend == "memory" else backend, postgres_dsn=dsn
+    )
+    with TestClient(server) as client:
+        authored_selector, authored = _destination(client, "authored")
+        root = f"/api/evals/suites/{authored['suite']['identity']['revision']}/runs"
+        preview = client.post(f"{root}/preview", headers=_AUTH_HEADERS, json={})
+        assert preview.status_code == 200, preview.text
+        data = preview.json()
+        assert data["ready"], data
+        launched = client.post(
+            root,
+            headers={**_AUTH_HEADERS, "Idempotency-Key": "authored-source"},
+            json={
+                "expected_exposure_revision": data["exposure"]["revision"],
+                "expected_execution_profiles": [
+                    {
+                        "case_ids": item["case_ids"],
+                        "execution_profile_revision": item["execution_profile_revision"],
+                    }
+                    for item in data["launches"]
+                ],
+            },
+        )
+        assert launched.status_code == 202, launched.text
+        spec = launched.json()["runs"][0]["run"]["spec"]
+        destination = EvalSuiteViewIdentity(
+            source="corpus",
+            target_key=spec["target_key"],
+            revision=spec["corpus_revision"],
+            suite_id=spec["suite_id"],
+        )
+        before = client.get("/api/evals/suite-views", headers=_AUTH_HEADERS).json()
+        assert all(item["id"] != destination.id for item in before["items"])
+        body, plan = _review(client, destination.id, mode="score")
+        saved = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/additions",
+            headers={**_AUTH_HEADERS, "Idempotency-Key": "independent-score"},
+            json=body,
+        )
+        assert saved.status_code == 201, saved.text
+        if backend == "memory":
+            from tests.evals.test_eval_store import _request
+
+            from cayu.evals.store import EvalRunInvocation, InMemoryEvalStore
+
+            async def exercise_memory():
+                memory = InMemoryEvalStore()
+                try:
+                    corpus = await store.load_corpus(destination.revision)
+                    document = await store.load_authored_suite(
+                        authored["suite"]["identity"]["revision"]
+                    )
+                    await memory.save_corpus(corpus, redact_json=app.redact_json)
+                    await memory.save_authored_suite(document, redact_json=app.redact_json)
+                    run = _request(corpus).model_copy(
+                        update={
+                            "invocation": EvalRunInvocation(
+                                authored_suite_revision=document.revision,
+                                authored_suite_selection_revision="sha256:" + "a" * 64,
+                            )
+                        }
+                    )
+                    await memory.admit_run(run, redact_json=app.redact_json)
+                    prepared, record = captured[0]
+                    await memory.publish_session_addition(
+                        prepared, record, redact_json=app.redact_json
+                    )
+                    page = await memory.list_view_index(EvalViewQuery())
+                    assert any(
+                        item.source == "corpus" and item.revision == destination.revision
+                        for item in page.items
+                    )
+
+                    async def hidden():
+                        page = await memory.list_view_index(EvalViewQuery())
+                        assert not any(
+                            item.source == "corpus" and item.revision == destination.revision
+                            for item in page.items
+                        )
+
+                    # A result without the placement, a dangling placement, and a
+                    # different-target result do not establish independent usage.
+                    saved_record = memory._session_additions.pop(record.receipt.operation_id)
+                    await hidden()
+                    memory._session_additions[record.receipt.operation_id] = saved_record
+                    result = memory._results.pop(prepared.captured.revision)
+                    await hidden()
+                    memory._results[prepared.captured.revision] = result
+                    original_record = result.record
+                    result.record = original_record.model_copy(
+                        update={
+                            "target": original_record.target.model_copy(
+                                update={"target_key": "other-target"}
+                            )
+                        }
+                    )
+                    await hidden()
+                    result.record = original_record
+                finally:
+                    await memory.close()
+
+            client.portal.call(exercise_memory)
+        items, cursor = [], None
+        while True:
+            page = client.get(
+                "/api/evals/suite-views",
+                headers=_AUTH_HEADERS,
+                params={"limit": 1, **({"cursor": cursor} if cursor else {})},
+            ).json()
+            items.extend(page["items"])
+            if not page["has_more"]:
+                break
+            cursor = page["next_cursor"]
+        placed = next((item for item in items if item["id"] == destination.id), None)
+        assert placed is not None, items
+        assert placed["last_run"]["placement"]["destination"] == plan["destination"]
+        detail = client.get(
+            f"/api/evals/suite-views/{destination.id}", headers=_AUTH_HEADERS
+        ).json()
+        attachment = next(
+            item
+            for item in detail["runs"]["items"]
+            if item["result_revision"] == plan["captured_result_revision"]
+        )
+        assert attachment["suite"] != plan["destination"]
+        execution = EvalSuiteViewIdentity.model_validate(attachment["suite"])
+        assert any(item["id"] == execution.id for item in items)
+        authored_history = client.get(
+            f"/api/evals/suite-views/{authored_selector}", headers=_AUTH_HEADERS
+        ).json()
+        assert all(
+            item["result_revision"] != plan["captured_result_revision"]
+            for item in authored_history["runs"]["items"]
+        )
+        if backend == "sqlite":
+            from cayu.storage.evals_sqlite import SQLiteEvalStore
+
+            async def reopen():
+                fresh = SQLiteEvalStore(store.path)
+                try:
+                    page = await fresh.list_view_index(EvalViewQuery())
+                    assert any(
+                        item.source == "corpus" and item.revision == destination.revision
+                        for item in page.items
+                    )
+                finally:
+                    await fresh.close()
+
+            client.portal.call(reopen)
+            # Corrupt only the association under test, then restore it. Normal
+            # writer guards are tested elsewhere; reads require positive evidence.
+            import sqlite3
+
+            with sqlite3.connect(store.path) as db:
+                operation = saved.json()["operation_id"]
+                raw = db.execute(
+                    "SELECT record_json, result_revision FROM cayu_eval_session_additions WHERE operation_id = ?",
+                    (operation,),
+                ).fetchone()
+                db.execute(
+                    "UPDATE cayu_eval_session_additions SET result_revision = ? WHERE operation_id = ?",
+                    ("sha256:" + "f" * 64, operation),
+                )
+                db.commit()
+
+                async def hidden():
+                    page = await store.list_view_index(EvalViewQuery())
+                    assert not any(
+                        item.source == "corpus" and item.revision == destination.revision
+                        for item in page.items
+                    )
+
+                client.portal.call(hidden)
+                db.execute(
+                    "UPDATE cayu_eval_session_additions SET result_revision = ? WHERE operation_id = ?",
+                    (raw[1], operation),
+                )
+                db.execute(
+                    "UPDATE cayu_eval_result_records SET target_key = 'other-target' WHERE revision = ?",
+                    (raw[1],),
+                )
+                db.commit()
+                client.portal.call(hidden)
+                db.execute(
+                    "UPDATE cayu_eval_result_records SET target_key = ? WHERE revision = ?",
+                    (destination.target_key, raw[1]),
+                )
+                db.execute(
+                    "DELETE FROM cayu_eval_session_additions WHERE operation_id = ?", (operation,)
+                )
+                db.commit()
+                client.portal.call(hidden)

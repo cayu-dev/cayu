@@ -222,7 +222,7 @@ export interface InboxItem {
   arguments: null
   /**
    * Why an approval or recovery item shows no arguments: "no_review_policy" when the
-   * app configured no human review policy (such as ToolArgumentReview), "quarantined"
+   * agent configured no human review policy (such as ToolArgumentReview), "quarantined"
    * when one decides what protected human review shows.
    */
   arguments_unavailable_reason: "quarantined" | "no_review_policy" | null

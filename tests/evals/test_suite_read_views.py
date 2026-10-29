@@ -144,18 +144,18 @@ def test_postgres_read_plans_preserve_binary_order_under_a_linguistic_default(vi
         db.create_collation("linguistic", linguistic)
         db.create_collation("C", lambda a, b: (a > b) - (a < b))
         db.executescript("""
-            CREATE TABLE cayu_eval_authored_suites (revision TEXT, created_at TEXT, target_key TEXT);
+            CREATE TABLE cayu_eval_authored_suites (revision TEXT, created_at TEXT, target_key TEXT, suite_id TEXT);
             CREATE TABLE cayu_eval_corpora (revision TEXT, created_at TEXT, target_key TEXT);
             CREATE TABLE cayu_eval_suites (corpus_revision TEXT, suite_id TEXT COLLATE linguistic);
             CREATE TABLE cayu_eval_runs (run_id TEXT COLLATE linguistic, created_at TEXT,
-                target_key TEXT, corpus_revision TEXT, suite_id TEXT, result_revision TEXT);
+                target_key TEXT, corpus_revision TEXT, suite_id TEXT, result_revision TEXT, invocation_json TEXT);
             CREATE TABLE cayu_eval_cases (corpus_revision TEXT, suite_id TEXT, case_id TEXT COLLATE linguistic);
             CREATE TABLE cayu_eval_result_records (revision TEXT, created_at TEXT, target_key TEXT,
                 corpus_revision TEXT, suite_id TEXT, origin TEXT, captured_result TEXT);
-            CREATE TABLE cayu_eval_session_additions (destination_selector TEXT, result_revision TEXT);
+            CREATE TABLE cayu_eval_session_additions (destination_selector TEXT, result_revision TEXT, record_json TEXT);
             CREATE TABLE cayu_eval_report_series (selector_json TEXT, created_at TEXT, target_key TEXT);
             CREATE TABLE cayu_eval_reports (report_key TEXT, created_at TEXT, target_key TEXT,
-                series_id TEXT, association_key TEXT);
+                series_id TEXT, association_key TEXT, record_json TEXT);
         """)
         revision = "sha256:" + "a" * 64
         at = datetime(2026, 1, 1, tzinfo=UTC)
@@ -168,7 +168,7 @@ def test_postgres_read_plans_preserve_binary_order_under_a_linguistic_default(vi
         )
         run_ids = ("aa", "a-b", "Zed", "zed")
         db.executemany(
-            "INSERT INTO cayu_eval_runs VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO cayu_eval_runs VALUES (?, ?, ?, ?, ?, ?, '{}')",
             [(value, at.isoformat(), "target", revision, "a-b", revision) for value in run_ids],
         )
         db.executemany(
@@ -276,3 +276,346 @@ def test_postgres_result_run_linkage_uses_recorded_identity(postgres_dsn):
             await store.close()
 
     asyncio.run(exercise())
+
+
+async def _exercise_authored_catalog_dedup(store, independent="native"):
+    from cayu.evals.read_views import EvalSuiteViewIdentity, EvalViewQuery
+    from cayu.evals.store import EvalRunInvocation
+
+    corpus = _corpus(target_key=f"catalog-dedup-{independent}", trials=1)
+    authored_run = f"{corpus.target_key}-authored"
+    document = compile_eval_suite_authoring_draft(
+        _draft().model_copy(update={"target_key": corpus.target_key, "id": corpus.suites[0].id})
+    )
+    await store.save_authored_suite(document, redact_json=_NO_SECRETS.redact_json)
+    await store.save_corpus(corpus, redact_json=_NO_SECRETS.redact_json)
+    # Matching names are not evidence. The persisted admitted invocation is.
+    before = await store.list_view_index(EvalViewQuery(target_key=corpus.target_key))
+    assert {item.source for item in before.items} == {"authored", "corpus"}
+    request = _request(corpus, run_id=authored_run, key=authored_run).model_copy(
+        update={
+            "invocation": EvalRunInvocation(
+                authored_suite_revision=document.revision,
+                authored_suite_selection_revision="sha256:" + "a" * 64,
+            ),
+        }
+    )
+    await store.admit_run(request, redact_json=_NO_SECRETS.redact_json)
+    page = await store.list_view_index(EvalViewQuery(target_key=corpus.target_key, limit=1))
+    assert [item.source for item in page.items] == ["authored"]
+    assert page.has_more is False
+    assert page.next_cursor is None
+    scope = EvalSuiteViewIdentity(
+        source="corpus",
+        target_key=corpus.target_key,
+        revision=corpus.revision,
+        suite_id=corpus.suites[0].id,
+    )
+    history = await store.list_view_index(EvalViewQuery(target_key=corpus.target_key, suite=scope))
+    assert [item.revision for item in history.items] == [authored_run]
+    if independent == "result":
+        # A directly saved result has no native run or placement association.
+        from tests.evals.eval_store_conformance import captured_result_for_corpus
+        from tests.evals.test_corpus_execution import _provider, _target
+
+        from cayu.evals.execution import run_corpus_suite
+
+        result = await run_corpus_suite(
+            _target(_provider(trials=1), key=corpus.target_key), corpus, corpus.suites[0].id
+        )
+        captured = captured_result_for_corpus(corpus, result)
+        await store.save_captured_result(corpus, captured, redact_json=_NO_SECRETS.redact_json)
+    else:
+        await store.admit_run(
+            _request(
+                corpus,
+                run_id=f"{corpus.target_key}-standalone",
+                key=f"{corpus.target_key}-standalone",
+            ),
+            redact_json=_NO_SECRETS.redact_json,
+        )
+    mixed = await store.list_view_index(EvalViewQuery(target_key=corpus.target_key))
+    assert {item.source for item in mixed.items} == {"authored", "corpus"}
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("independent", ["native", "result"])
+def test_authored_catalog_deduplicates_only_linked_corpora_before_pagination(
+    tmp_path, backend, independent
+):
+    async def exercise():
+        store = (
+            InMemoryEvalStore() if backend == "memory" else SQLiteEvalStore(tmp_path / "dedup.db")
+        )
+        try:
+            # PostgreSQL fixtures retain earlier module cases. Exercise the same
+            # populated-store boundary even in isolated local backends.
+            await _exercise_suite_read_store(store)
+            await _exercise_authored_catalog_dedup(store, independent)
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("independent", ["native", "result"])
+def test_postgres_authored_catalog_deduplicates_only_linked_corpora(postgres_dsn, independent):
+    from cayu.storage.evals_postgres import PostgresEvalStore
+    from cayu.storage.migrations import SchemaMode
+
+    async def exercise():
+        store = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await _exercise_authored_catalog_dedup(store, independent)
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("mismatch", ["missing_document", "target", "suite"])
+def test_corpus_catalog_keeps_ambiguous_authored_links(tmp_path, backend, mismatch):
+    from cayu.evals.read_views import EvalViewQuery
+    from cayu.evals.store import EvalRunInvocation
+
+    async def exercise():
+        store = (
+            InMemoryEvalStore()
+            if backend == "memory"
+            else SQLiteEvalStore(tmp_path / "ambiguous.db")
+        )
+        try:
+            corpus = _corpus(trials=1)
+            document = compile_eval_suite_authoring_draft(
+                _draft().model_copy(
+                    update={
+                        "target_key": "other-target" if mismatch == "target" else corpus.target_key,
+                        "id": "other-suite" if mismatch == "suite" else corpus.suites[0].id,
+                    }
+                )
+            )
+            await store.save_authored_suite(document, redact_json=_NO_SECRETS.redact_json)
+            await store.save_corpus(corpus, redact_json=_NO_SECRETS.redact_json)
+            request = _request(corpus).model_copy(
+                update={
+                    "invocation": EvalRunInvocation(
+                        authored_suite_revision="sha256:" + "f" * 64
+                        if mismatch == "missing_document"
+                        else document.revision,
+                        authored_suite_selection_revision="sha256:" + "a" * 64,
+                    )
+                }
+            )
+            await store.admit_run(request, redact_json=_NO_SECRETS.redact_json)
+            page = await store.list_view_index(EvalViewQuery(target_key=corpus.target_key))
+            assert any(
+                item.source == "corpus" and item.revision == corpus.revision for item in page.items
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+async def _exercise_report_catalog_dedup(store):
+    from tests.evals.test_corpus_execution import _provider, _target
+
+    from cayu.evals.execution import run_corpus_suite
+    from cayu.evals.read_views import EvalSuiteViewIdentity, EvalViewQuery
+    from cayu.evals.reported import (
+        EvalCorpusReportEvidence,
+        EvalReport,
+        EvalReportCorpusAssociation,
+    )
+    from cayu.evals.store import EvalRunInvocation
+
+    corpus = _corpus(target_key="catalog-report-association", trials=1)
+    document = compile_eval_suite_authoring_draft(
+        _draft().model_copy(update={"target_key": corpus.target_key, "id": corpus.suites[0].id})
+    )
+    await store.save_corpus(corpus, redact_json=_NO_SECRETS.redact_json)
+    await store.save_authored_suite(document, redact_json=_NO_SECRETS.redact_json)
+    admitted = _request(
+        corpus, run_id="catalog-report-authored", key="catalog-report-authored"
+    ).model_copy(
+        update={
+            "invocation": EvalRunInvocation(
+                authored_suite_revision=document.revision,
+                authored_suite_selection_revision="sha256:" + "a" * 64,
+            )
+        }
+    )
+    await store.admit_run(admitted, redact_json=_NO_SECRETS.redact_json)
+    scope = EvalSuiteViewIdentity(
+        source="corpus",
+        target_key=corpus.target_key,
+        revision=corpus.revision,
+        suite_id=corpus.suites[0].id,
+    )
+    query = EvalViewQuery(target_key=corpus.target_key, limit=1)
+
+    async def catalog():
+        items, cursor = [], None
+        while True:
+            page = await store.list_view_index(query.model_copy(update={"cursor": cursor}))
+            items.extend(page.items)
+            if not page.has_more:
+                return items
+            assert page.next_cursor != cursor
+            cursor = page.next_cursor
+
+    async def hidden():
+        assert not any(
+            item.source == "corpus" and item.revision == corpus.revision for item in await catalog()
+        )
+
+    await hidden()
+    result = await run_corpus_suite(
+        _target(_provider(trials=1), key=corpus.target_key), corpus, corpus.suites[0].id
+    )
+    report = EvalReport(
+        report_id="unassociated",
+        target_key=corpus.target_key,
+        program_key="catalog-ci",
+        evidence=EvalCorpusReportEvidence(result=result),
+    )
+    await store.publish_report(report, "catalog-publisher", redact_json=_NO_SECRETS.redact_json)
+    await hidden()  # Matching evidence alone is not an explicit association.
+    association = EvalReportCorpusAssociation(
+        corpus_revision=corpus.revision, suite_id=corpus.suites[0].id
+    )
+    linked = report.model_copy(update={"report_id": "associated", "association": association})
+    for changed in (
+        linked.model_copy(update={"target_key": "different-target"}),
+        linked.model_copy(
+            update={
+                "association": association.model_copy(
+                    update={"corpus_revision": "sha256:" + "f" * 64}
+                )
+            }
+        ),
+        linked.model_copy(
+            update={"association": association.model_copy(update={"suite_id": "other-suite"})}
+        ),
+    ):
+        with pytest.raises(ValueError, match="association"):
+            await store.publish_report(
+                changed, "catalog-publisher", redact_json=_NO_SECRETS.redact_json
+            )
+        await hidden()
+    # Another revision of the same target/suite must not revive this corpus.
+    other = _corpus(target_key=corpus.target_key, trials=2)
+    await store.save_corpus(other, redact_json=_NO_SECRETS.redact_json)
+    other_result = await run_corpus_suite(
+        _target(_provider(trials=2), key=corpus.target_key), other, other.suites[0].id
+    )
+    await store.publish_report(
+        EvalReport(
+            report_id="other-revision",
+            target_key=corpus.target_key,
+            program_key="catalog-ci",
+            evidence=EvalCorpusReportEvidence(result=other_result),
+            association=EvalReportCorpusAssociation(
+                corpus_revision=other.revision, suite_id=other.suites[0].id
+            ),
+        ),
+        "catalog-publisher",
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    await hidden()
+    accepted = await store.publish_report(
+        linked, "catalog-publisher", redact_json=_NO_SECRETS.redact_json
+    )
+    assert (
+        await store.publish_report(linked, "catalog-publisher", redact_json=_NO_SECRETS.redact_json)
+        == accepted
+    )
+    assert await store.load_result_record(result.revision) is None
+    items = await catalog()
+    assert len({item.key for item in items}) == len(items)
+    assert any(item.source == "corpus" and item.revision == corpus.revision for item in items)
+    assert {item.source for item in items} == {"authored", "corpus", "reported_suite"}
+    history = await store.list_view_index(EvalViewQuery(target_key=corpus.target_key, suite=scope))
+    assert {(item.source, item.revision) for item in history.items} == {
+        ("run", admitted.run_id),
+        ("report", accepted.receipt.id),
+    }
+    authored = EvalSuiteViewIdentity(
+        source="authored", target_key=corpus.target_key, revision=document.revision
+    )
+    history = await store.list_view_index(
+        EvalViewQuery(target_key=corpus.target_key, suite=authored)
+    )
+    assert [(item.source, item.revision) for item in history.items] == [("run", admitted.run_id)]
+    with pytest.raises(ValueError, match="outside the permitted query scope"):
+        EvalViewQuery(target_key=corpus.target_key, target_keys=("different-target",))
+    excluded = await store.list_view_index(EvalViewQuery(target_keys=("different-target",)))
+    assert excluded.items == ()
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_explicit_reports_keep_authored_corpus_catalog_history(tmp_path, backend, request):
+    if backend == "postgres":
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        dsn = request.getfixturevalue("postgres_dsn")
+
+    async def exercise():
+        store = (
+            InMemoryEvalStore()
+            if backend == "memory"
+            else SQLiteEvalStore(tmp_path / "report-catalog.db")
+            if backend == "sqlite"
+            else PostgresEvalStore(dsn, schema_mode=SchemaMode.CREATE)
+        )
+        try:
+            await _exercise_report_catalog_dedup(store)
+            if isinstance(store, SQLiteEvalStore):
+                from cayu.evals.read_views import EvalViewQuery
+
+                fresh = SQLiteEvalStore(store.path)
+                try:
+                    page = await fresh.list_view_index(
+                        EvalViewQuery(target_key="catalog-report-association")
+                    )
+                    assert sum(item.source == "corpus" for item in page.items) == 2
+                finally:
+                    await fresh.close()
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_sqlite_catalog_uses_json_extract_for_all_nested_identity_fields(tmp_path, monkeypatch):
+    """Older supported SQLite builds have JSON1 but cannot parse JSON arrows."""
+    import cayu.storage.evals_sqlite as sqlite_store
+
+    original = sqlite_store.view_index_sql
+    observed_queries = []
+
+    def compatible_query(query, *, postgres):
+        sql, params = original(query, postgres=postgres)
+        assert not postgres
+        assert "->" not in sql, "SQLite catalog must not require SQLite 3.38 JSON operators"
+        observed_queries.append(sql)
+        return sql, params
+
+    monkeypatch.setattr(sqlite_store, "view_index_sql", compatible_query)
+
+    async def exercise():
+        from cayu.evals.read_views import EvalViewQuery
+
+        store = SQLiteEvalStore(tmp_path / "json1-catalog.db")
+        try:
+            assert (await store.list_view_index(EvalViewQuery())).items == ()
+            await _exercise_authored_catalog_dedup(store, "native")
+            await _exercise_authored_catalog_dedup(store, "result")
+            await _exercise_report_catalog_dedup(store)
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+    assert observed_queries
