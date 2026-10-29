@@ -40,6 +40,7 @@ import {
   resolveDashboardCapability,
 } from "../lib/dashboard-capabilities"
 import { fetchDashboardIdentitySnapshot } from "../lib/dashboard-identity-query"
+import { readSidebarHidden, writeSidebarHidden } from "../lib/sidebar-preference"
 import { useTheme } from "../lib/theme"
 import { cn } from "../lib/utils"
 import { realApi } from "../next/api/real"
@@ -225,7 +226,8 @@ function DashboardShell() {
   const pageLayout = useRouterState({
     select: (s) => s.matches.at(-1)?.staticData.dashboardLayout === "page",
   })
-  const [sidebarHidden, setSidebarHidden] = useState(false)
+  const [sidebarHidden, setSidebarHidden] = useState(readSidebarHidden)
+  useEffect(() => writeSidebarHidden(sidebarHidden), [sidebarHidden])
   const [mobileOpen, setMobileOpen] = useState(false)
   const [query, setQuery] = useState("")
   const searchRef = useRef<HTMLInputElement>(null)

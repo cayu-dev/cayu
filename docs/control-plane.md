@@ -103,6 +103,12 @@ content security policy, including when the dashboard is mounted below a path.
 
 To check the member experience, sign in through the configured identity proxy
 with a role in `ControlPlaneRoles.read_and_decide`, then open the dashboard.
+Locally, start `cayu serve` with `CAYU_PROXY_IDENTITY_ISSUER`,
+`CAYU_PROXY_IDENTITY_AUDIENCE` and `CAYU_PROXY_IDENTITY_JWKS_URL` set (see
+[Trust a sign-in proxy](project-server.md#trust-a-sign-in-proxy)), serve a JWKS
+for a key you control, and send a token signed with that key whose `role` claim is
+`member` in the identity header. `tests/server/test_proxy_identity.py` shows how
+to build the key, the JWKS and the token.
 The authenticated `/api/app` response drives the shell's access presentation.
 Members can browse sessions and pending work, approve or deny a pending tool
 approval, answer a pending question, and approve or reject knowledge proposals
@@ -352,8 +358,8 @@ can duplicate provider work and cost.
 
 The `/cayu/` UI is the **Developer dashboard**, both locally and on Cloud.
 The app registers **specialists**: the Specialists page lists them, and sessions,
-tasks and New Run identify the specialist they use. A **subagent** remains a child
-session started with `SubagentTool`.
+tasks and "Start a session" identify the specialist they use.
+A **subagent** remains a child session started with `SubagentTool`.
 
 Python names (`CayuApp`, `register_agent`, `AgentSpec`), API fields, the `/api/agents`
 read and existing authentication configuration remain unchanged. The old dashboard

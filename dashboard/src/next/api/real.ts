@@ -34,9 +34,13 @@ import { overviewForDisplay } from "./overview"
 import { createDeclaredTask, fetchTaskDependents, fetchTaskIndex, taskQueryString } from "./tasks"
 import type { Api, InboxPage, SessionOverview, TaskScheduleEvent } from "./types"
 
-/** Proposed (backend item 14): the suite-centred eval calls have no endpoint yet. */
+/**
+ * These calls back only the prototype's own Evals pages, which run on the fake API. The
+ * shipped Evals pages (`next/routes/evals`) read `/api/evals/suite-views` and
+ * `/api/evals/run-views` directly, so nothing calls these against a real server.
+ */
 async function needsEvalReads(): Promise<never> {
-  throw new Error("Needs backend item 14 (suite-centred eval reads).")
+  throw new Error("The prototype's Evals calls only run on the fake API.")
 }
 
 const query = (params: Record<string, string | number | null | undefined>) => {

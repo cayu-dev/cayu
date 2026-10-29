@@ -3,7 +3,8 @@
  * generated types, so the fake API (mock/api.ts) answers in exactly the shapes the
  * runtime returns, and switching to the real server means passing real.ts instead.
  *
- * Calls marked "Proposed" need a runtime change first (see PAGE-MAP.md, backend items).
+ * Notes like "backend item 7" name the runtime change a call came with (PAGE-MAP.md);
+ * every one of them has landed.
  */
 import type {
   AgentsPage,
@@ -128,7 +129,7 @@ export type ToolUsage = {
 }
 
 /**
- * Proposed (backend item 7): a kind of task the app's own worker handles. Creating one
+ * Backend item 7: a kind of task the app's own worker handles. Creating one
  * runs the app the real way, through its orchestration, not one specialist directly.
  */
 export type TaskType = {
@@ -139,7 +140,7 @@ export type TaskType = {
   agent_name: string | null
 }
 
-/** Proposed (backend item 12): knowledge the agent has kept and uses. */
+/** Backend item 12: knowledge the agent has kept and uses. */
 export type KnowledgeEntry = {
   id: string
   text: string
@@ -156,7 +157,7 @@ export type KnowledgeEntry = {
 export type SummaryTone = "neutral" | "attention"
 
 /**
- * Proposed (backend items 1 and 2): `GET /api/sessions?include=overview`.
+ * Backend items 1 and 2: `GET /api/sessions?include=overview`.
  * `title`, `summary` and `summary_tone` are set by the agent; everything else the runtime
  * derives.
  */
@@ -208,7 +209,7 @@ export type RecoveryRequest = {
   answer?: string | null
 }
 
-/** What the shell shows about the running app. Proposed: a small `/api/app` read. */
+/** What the shell shows about the running app, from `GET /api/app` (backend item 8). */
 export type AppInfo = { name: string; runtime_version: string }
 
 export type Api = {
@@ -306,7 +307,7 @@ export type Api = {
   ): Promise<KeptKnowledgeListResponse>
   /** Retire the exact observed active revision. */
   removeKnowledge(id: string, expectedRevision: number): Promise<void>
-  /** Proposed (backend item 14): every suite with its last run and baseline. */
+  /** Backend item 14: every suite with its last run and baseline (prototype pages only). */
   evalSuites(): Promise<EvalSuiteSummary[]>
   evalSuite(id: string): Promise<EvalSuiteDetail>
   /** A run, compared with the suite's baseline unless `compareWith` names another run. */

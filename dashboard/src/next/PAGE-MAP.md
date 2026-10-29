@@ -79,7 +79,7 @@ reported series expose their supported read-only evidence and downloads.
 | Eval editor: shared full-page suite settings and case rail; Input/Checks tabs, all portable checks and typed judges; exact parent-aware Save, then separate reviewed Run; private in-memory drafts and explicit leave confirmation | Suite authoring sheet | `/evals/suites/new?target=…`, `/evals/suites/:id/edit?case=…` |
 | Eval run: verdict (Improvement, Regression, Tradeoff, No change) and counts, passing / flaky / judge score / cost against the compared run, filter chips (Regressed, Improved, Failing, Flaky), compare with the baseline or any other run, Approve as baseline; a case opens a drawer with each trial's checks and judge reasons, both outputs side by side and the trial's trace | Results and Runs tabs, their inspectors and Compare | `/evals/runs/:id` |
 | Eval settings: what trials run with per specialist, the judge, limits, what this deployment supports, and the advanced tools (corpus import and export, judge calibration, memory reports, production scenarios) | Readiness and execution profile cards, header actions | `/evals/settings` |
-| Usage, Environments, Artifacts, System | unchanged, in the sidebar; the prototype shows today's pages as they are, marked "Today's page, unchanged" | same URLs |
+| Usage, Environments, Artifacts, System | unchanged, inside the new shell (the prototype harness marks them "Today's page, unchanged") | same URLs |
 
 ## Current runtime contracts
 

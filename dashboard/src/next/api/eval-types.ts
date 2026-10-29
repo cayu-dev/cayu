@@ -1,8 +1,7 @@
 /**
- * Proposed (backend item 14): suite-centred reads for the Evals pages. Today the server
- * has the parts (targets, corpora, authored suites, runs, results, baselines, comparisons;
- * see `src/lib/api.ts`) but no read that answers "how is each suite doing against its
- * baseline" in one call, and CLI runs never reach the eval store.
+ * The prototype's view model for its own Evals pages, from backend item 14. The shipped
+ * Evals pages (`next/routes/evals`) read the server's suite and run views
+ * (`/api/evals/suite-views`, `/api/evals/run-views`) through `app/eval-view-model.ts`.
  */
 
 /** A run's outcome against the suite's approved baseline, case by case. */
