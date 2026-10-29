@@ -22,8 +22,10 @@ from cayu.cli.store_targets import SessionStoreTarget, resolve_session_store_tar
 
 @dataclass(frozen=True)
 class ReadTarget:
-    """Exactly one of ``store`` and ``application`` is set."""
+    """Exactly one of ``store``, ``application`` and ``server_url`` is set."""
 
+    server_url: str | None = None
+    authorization_env: str = "CAYU_API_AUTHORIZATION"
     store: SessionStoreTarget | None = None
     application: str | None = None
     context: Path | None = None
@@ -34,6 +36,12 @@ def add_read_target_options(parser: argparse.ArgumentParser) -> None:
     """Add ``--sqlite``/``--postgres``/``--application`` and the Cloud options."""
 
     target = parser.add_mutually_exclusive_group()
+    target.add_argument("--server-url", help="Read the running Cayu server at this mount URL.")
+    parser.add_argument(
+        "--authorization-env",
+        default="CAYU_API_AUTHORIZATION",
+        help="Authorization header environment variable for --server-url.",
+    )
     target.add_argument("--sqlite", metavar="PATH", help="Read this SQLite database.")
     target.add_argument("--postgres", metavar="DSN", help="Read this Postgres database.")
     target.add_argument(
@@ -55,13 +63,24 @@ def add_read_target_options(parser: argparse.ArgumentParser) -> None:
         type=_positive_seconds,
         default=30.0,
         metavar="SECONDS",
-        help="With --application: how long each request may take (default: 30).",
+        help="With --application or --server-url: how long each request may take (default: 30).",
     )
 
 
 def resolve_read_target(args: argparse.Namespace) -> ReadTarget:
     """Resolve the parsed options; raises ``ValueError`` for an invalid combination."""
 
+    if args.server_url is not None:
+        if args.context is not None:
+            raise ValueError("--context applies only with --application.")
+        from cayu.cli.diagnostics import request_cost_endpoint
+
+        request_cost_endpoint(args.server_url)
+        return ReadTarget(
+            server_url=args.server_url,
+            authorization_env=args.authorization_env,
+            timeout_seconds=args.timeout_seconds,
+        )
     if args.application is None:
         if args.context is not None:
             raise ValueError("--context applies only with --application.")

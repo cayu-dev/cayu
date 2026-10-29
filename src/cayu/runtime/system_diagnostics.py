@@ -220,6 +220,7 @@ class EvalsReadiness(_DiagnosticsModel):
 class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     task_index: OptionalSurfaceCapability | None = None
     task_creation: OptionalSurfaceCapability | None = None
+    task_graph_creation: OptionalSurfaceCapability | None = None
     tool_inventory: OptionalSurfaceCapability | None = None
     tool_display: OptionalSurfaceCapability | None = None
     tool_usage: OptionalSurfaceCapability | None = None

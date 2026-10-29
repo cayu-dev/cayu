@@ -33,7 +33,7 @@ def add_knowledge_parser(subparsers: Any) -> None:
 
     knowledge = subparsers.add_parser(
         "knowledge",
-        help="Inspect kept and pending knowledge entries.",
+        help="Inspect knowledge and keep or drop proposals.",
         description=(
             "Read knowledge entries from a local store (--sqlite, --postgres, or the "
             "project's store) or from a Cayu Cloud Agent (--application NAME). Start with "
@@ -41,6 +41,26 @@ def add_knowledge_parser(subparsers: Any) -> None:
         ),
     )
     commands = knowledge.add_subparsers(dest="knowledge_command", required=True)
+
+    from cayu.cli._control_plane_actions import add_action_target_options
+
+    for name in ("keep", "drop"):
+        action = commands.add_parser(
+            name,
+            help=f"{name.capitalize()} a pending knowledge proposal.",
+            description=(
+                f"{name.capitalize()} a pending knowledge proposal. Inspect it first with "
+                "`cayu knowledge show ENTRY_ID`. Mutations use the running agent's review permissions."
+            ),
+        )
+        action.add_argument("entry_id")
+        if name == "keep":
+            action.add_argument(
+                "--operation-id",
+                required=True,
+                help="Retain this ID to retry the same keep operation.",
+            )
+        add_action_target_options(action)
 
     list_parser = commands.add_parser(
         "list",
@@ -94,6 +114,10 @@ def add_knowledge_parser(subparsers: Any) -> None:
 
 
 def run_knowledge(args: argparse.Namespace) -> int:
+    if args.knowledge_command in {"keep", "drop"}:
+        from cayu.cli._control_plane_actions import run_action
+
+        return run_action(args)
     return run_read_command(
         args,
         _run_knowledge_command,
@@ -115,6 +139,16 @@ async def _run_knowledge_command(args: argparse.Namespace, target: ReadTarget) -
 def open_knowledge_reader(target: ReadTarget) -> KnowledgeReader:
     """The knowledge reader for a resolved ``--sqlite``/``--postgres``/``--application``."""
 
+    if target.server_url is not None:
+        from cayu.cli._cloud_agent_api import CayuApi
+        from cayu.cli.diagnostics import read_authorization
+
+        api = CayuApi(
+            target.server_url,
+            authorization=read_authorization(target.authorization_env),
+            timeout_seconds=target.timeout_seconds,
+        )
+        return ApiKnowledgeReader(api, source={"kind": "server", "url": target.server_url})
     if target.store is not None:
         return open_store_knowledge_reader(target.store)
     assert target.application is not None

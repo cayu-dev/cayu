@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from typing import Any, cast
 
 from cayu.cli._cloud_agent_api import open_cloud_agent_api
@@ -36,7 +37,7 @@ def add_task_parser(subparsers: Any) -> None:
 
     task = subparsers.add_parser(
         "task",
-        help="Inspect durable tasks: status, result, cancellation and retries.",
+        help="Inspect and control durable tasks.",
         description=(
             "Read durable tasks from a local store (--sqlite, --postgres, or the project's "
             "store) or from a Cayu Cloud Agent (--application NAME). Start with "
@@ -44,6 +45,53 @@ def add_task_parser(subparsers: Any) -> None:
         ),
     )
     commands = task.add_subparsers(dest="task_command", required=True)
+
+    from cayu.cli._control_plane_actions import add_action_target_options
+
+    create = commands.add_parser(
+        "create",
+        help="Queue a declared task on a running agent.",
+        description=(
+            "Queue a declared task on a running agent. Inspect its result with "
+            "`cayu task show TASK_ID`. Retain the operation ID and input for exact retry."
+        ),
+    )
+    create.add_argument("type", help="Declared task type (see the dashboard task catalog).")
+    create.add_argument("--input-file", type=Path, help="JSON object containing task input.")
+    create.add_argument(
+        "--operation-id", required=True, help="Retain this ID and input for exact retry."
+    )
+    add_action_target_options(create)
+    graph = commands.add_parser(
+        "graph-create",
+        help="Atomically queue a declared task graph.",
+        description=(
+            "Atomically queue a declared task graph from a JSON file. Inspect an emitted "
+            "task ID with `cayu task show TASK_ID`. Retain the operation ID and graph for exact retry."
+        ),
+    )
+    graph.add_argument(
+        "file", type=Path, help="JSON object with nodes {key,type,input,prerequisite_keys}."
+    )
+    graph.add_argument(
+        "--operation-id", required=True, help="Retain this ID and graph for exact retry."
+    )
+    add_action_target_options(graph)
+    for name, help_text in (("block", "Block a task."), ("hold", "Pause a task until resumed.")):
+        action = commands.add_parser(
+            name,
+            help=help_text,
+            description=(
+                f"{help_text} Inspect the current result with `cayu task show TASK_ID` "
+                "before retrying an uncertain request."
+            ),
+        )
+        action.add_argument("task_id")
+        action.add_argument("--reason")
+        action.add_argument(
+            "--payload-file", type=Path, help="Optional JSON object with hold details."
+        )
+        add_action_target_options(action)
 
     list_parser = commands.add_parser(
         "list",
@@ -88,6 +136,10 @@ def add_task_parser(subparsers: Any) -> None:
 
 
 def run_task(args: argparse.Namespace) -> int:
+    if args.task_command in {"create", "graph-create", "block", "hold"}:
+        from cayu.cli._control_plane_actions import run_action
+
+        return run_action(args)
     return run_read_command(
         args,
         _run_task_command,
@@ -109,6 +161,16 @@ async def _run_task_command(args: argparse.Namespace, target: ReadTarget) -> int
 def open_task_reader(target: ReadTarget) -> TaskReader:
     """The task reader for a resolved ``--sqlite``/``--postgres``/``--application``."""
 
+    if target.server_url is not None:
+        from cayu.cli._cloud_agent_api import CayuApi
+        from cayu.cli.diagnostics import read_authorization
+
+        api = CayuApi(
+            target.server_url,
+            authorization=read_authorization(target.authorization_env),
+            timeout_seconds=target.timeout_seconds,
+        )
+        return ApiTaskReader(api, source={"kind": "server", "url": target.server_url})
     if target.store is not None:
         return open_store_task_reader(target.store)
     assert target.application is not None

@@ -28,7 +28,7 @@ events = await app.list_task_graph_events(receipt.graph_id, after_sequence=0, li
 Every member needs an explicit task ID. Submission order is irrelevant: forward
 references are accepted. All prerequisites must name members of this submission.
 Cycles, self-dependencies, duplicate identities and occupied task IDs reject the
-whole admission. Bounds are 128 tasks, 1,024 prerequisite edges and 1 MiB of
+whole admission. Bounds are 1,024 tasks, 4,096 prerequisite edges and 4 MiB of
 canonical admission authority, including the task requests. Graph/member IDs are
 bounded to 256 UTF-8 bytes. Task payloads retain their existing independent bounds.
 Contract-bound members also reserve snapshot capacity for dependency-skip
@@ -95,5 +95,10 @@ group success; an early group decision does not stop remaining graph work.
 The Python SDK and all three built-in task stores support graph operations.
 Custom task stores must implement the graph contract and explicitly expose
 `supports_task_graphs`; the base implementation refuses graph operations.
-There are no dedicated graph HTTP routes. This API does not introduce task groups,
+Full-access callers can submit declared task types with `POST /api/task-graphs`
+or `cayu task graph-create`, using the same atomic graph owner. The HTTP entrance
+derives task IDs and specialists from node keys and registered type declarations;
+it does not accept raw SDK task requests. See the [CLI graph example](control-plane.md#task-cli)
+for its JSON shape, credentials and exact-retry rules. CLI input files additionally
+have a 1 MiB bound. This API does not introduce task groups,
 quorum, compensation, session orchestration or a general workflow language.

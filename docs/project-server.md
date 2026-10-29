@@ -304,6 +304,31 @@ own intentional process exit keeps its status. The opt-in reload mode below
 reports worker startup errors while its supervisor continues watching for fixes.
 Multi-process serving without reload remains outside this command's scope.
 
+## Configure dashboard prices
+
+Pass a PriceBook JSON file to `cayu serve --dev --price-book prices.json`, or
+set a project default:
+
+```toml
+[tool.cayu.serve]
+price_book = "prices.json"
+```
+
+The project setting is relative to the project root. A CLI path is relative
+to the directory where you invoked the command and overrides the project
+setting. Use the same PriceBook JSON format as `cayu session usage --price-book`
+(or `cayu.budgets.pricing.dump_price_book`). The file must be at most 1 MiB and
+pass the dashboard's existing PriceBook validation before the agent factory
+is built. Malformed or unreadable files stop startup; they never silently
+turn pricing off. The book reaches `DashboardConfig.runtime_config["priceBook"]`
+for dashboard cost estimates; it does not change a runtime spending policy.
+Without either option, dashboard pricing is unchanged.
+
+The selection is preserved by `--reload`; each new worker reads the selected
+file. For projects using `service_factory`, the service owns its dashboard
+configuration: set its `DashboardConfig.runtime_config["priceBook"]` there.
+The serve option and project key are rejected for those projects.
+
 ## Reload Python code during development
 
 Reload is off by default. To restart automatically when Python source under the

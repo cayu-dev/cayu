@@ -248,6 +248,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
+        "task_graph_creation": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
         "task_creation": {
             "configured": False,
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
@@ -460,6 +465,13 @@ def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tm
     assert capabilities["actor"] == {"subject": "operator-a", "tenant": "tenant-a"}
     assert "must-not-appear" not in response.text
     for name, surface in capabilities["surfaces"].items():
+        if name == "task_graph_creation":
+            assert surface == {
+                "configured": True,
+                "read": {"enabled": False, "unavailable_reason": "unsupported"},
+                "mutate": {"enabled": True, "unavailable_reason": None},
+            }
+            continue
         if name in {"browser_recordings", "eval_suite_views", "eval_reported_views"}:
             assert surface == {
                 "configured": False,

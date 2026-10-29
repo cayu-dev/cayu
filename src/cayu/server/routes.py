@@ -4651,6 +4651,7 @@ def create_router(
         and type(session_store).read_store_identity is not SessionStore.read_store_identity,
         task_index_supported=task_store is not None
         and inspect.unwrap(type(task_store).query_task_index) is not TaskStore.query_task_index,
+        task_graph_creation_supported=task_store is not None and task_store.supports_task_graphs,
         task_creation_supported=task_store is not None
         and task_store.supports_task_creation_operations,
         browser_recordings_configured=browser_recordings_configured,

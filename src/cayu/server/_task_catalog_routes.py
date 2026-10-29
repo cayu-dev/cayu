@@ -7,7 +7,7 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import (
     canonical_durable_json_bytes,
@@ -22,6 +22,12 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
+from cayu.tasks.graphs import (
+    TASK_GRAPH_MAX_NODES,
+    TaskGraphConflict,
+    TaskGraphCreate,
+    TaskGraphNode,
+)
 from cayu.tasks.operations import (
     TaskCreationConflict,
     TaskCreationOperation,
@@ -61,6 +67,54 @@ class DeclaredTaskCreateBody(_TaskOperationBody):
     @classmethod
     def copy_input(cls, value: Any) -> dict[str, Any]:
         return copy_durable_json_object(value, "task input")
+
+
+class DeclaredTaskGraphNode(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    key: str = Field(min_length=1, max_length=256)
+    type: str = Field(min_length=1, max_length=256)
+    input: dict[str, Any]
+    prerequisite_keys: tuple[str, ...] = Field(default=(), max_length=TASK_GRAPH_MAX_NODES)
+
+    @field_validator("key", "type")
+    @classmethod
+    def clean_identity(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "graph node identity")
+
+    @field_validator("input", mode="before")
+    @classmethod
+    def copy_input(cls, value: Any) -> dict[str, Any]:
+        return copy_durable_json_object(value, "task input")
+
+
+class DeclaredTaskGraphCreateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    operation_id: str = Field(min_length=1, max_length=256)
+    nodes: tuple[DeclaredTaskGraphNode, ...] = Field(min_length=1, max_length=TASK_GRAPH_MAX_NODES)
+
+    @field_validator("operation_id")
+    @classmethod
+    def clean_identity(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "graph operation identity")
+
+    @model_validator(mode="after")
+    def validate_keys(self) -> DeclaredTaskGraphCreateBody:
+        keys = {node.key for node in self.nodes}
+        if len(keys) != len(self.nodes):
+            raise ValueError("Graph node keys must be unique.")
+        for node in self.nodes:
+            if len(set(node.prerequisite_keys)) != len(node.prerequisite_keys) or any(
+                key not in keys or key == node.key for key in node.prerequisite_keys
+            ):
+                raise ValueError("Graph prerequisites must name distinct other nodes.")
+        return self
+
+
+class TaskGraphCreationResponse(BaseModel):
+    graph_id: str
+    task_ids: dict[str, str]
 
 
 class TaskReplayBody(_TaskOperationBody):
@@ -264,6 +318,90 @@ def register_task_catalog_routes(
         if result.id != task_id:
             raise HTTPException(503, detail={"code": "task_creation_result_invalid"})
         return TaskCreationResponse(task_id=result.id)
+
+    @mutation_router.post(
+        "/task-graphs", response_model=TaskGraphCreationResponse, dependencies=protected
+    )
+    async def create_graph(
+        body: DeclaredTaskGraphCreateBody,
+        actor: AuthContext | None = auth_default,
+    ) -> TaskGraphCreationResponse:
+        store = cayu_app.task_store
+        if store is None or not store.supports_task_graphs:
+            raise HTTPException(501, detail={"code": "task_graph_creation_unsupported"})
+        if any(cayu_app.redact_json(node.key) != node.key for node in body.nodes):
+            raise HTTPException(422, detail={"code": "task_graph_identity_invalid"})
+        origin = (
+            None
+            if actor is None
+            else InvocationOrigin(
+                trust=InvocationOriginTrust.SERVER_VERIFIED,
+                subject=actor.subject,
+                tenant=actor.tenant,
+            )
+        )
+        identity = sha256(
+            canonical_durable_json_bytes(
+                {
+                    "operation_id": body.operation_id,
+                    "actor": None if origin is None else origin.model_dump(mode="json"),
+                },
+                "graph operation identity",
+            )
+        ).hexdigest()
+        graph_id = f"task-graph-operation-{identity}"
+        task_ids = {
+            node.key: "graph-task-"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {"graph_id": graph_id, "key": node.key}, "graph node identity"
+                )
+            ).hexdigest()
+            for node in body.nodes
+        }
+        nodes = []
+        for node in sorted(body.nodes, key=lambda item: item.key):
+            spec = declaration(node.type)
+            if isinstance(spec, str):
+                raise HTTPException(422, detail={"code": spec})
+            try:
+                valid = task_input_validator(spec).is_valid(node.input)
+            except Exception:
+                valid = False
+            if not valid:
+                raise HTTPException(422, detail={"code": "task_graph_input_invalid"})
+            # Bind exact replay to the declaration, just as single-task operations do.
+            declaration_sha256 = sha256(
+                canonical_durable_json_bytes(spec.model_dump(mode="json"), "task declaration")
+            ).hexdigest()
+            request = task_create_with_runtime_invocation(
+                TaskCreate(
+                    task_id=task_ids[node.key],
+                    type=spec.name,
+                    assigned_agent_name=spec.agent_name,
+                    input=node.input,
+                    metadata={"task_type_declaration_sha256": declaration_sha256},
+                ),
+                source=TaskExecutionSource.HTTP_TASK,
+                verified_origin=origin,
+            )
+            nodes.append(
+                TaskGraphNode(
+                    task=request,
+                    prerequisite_task_ids=tuple(task_ids[key] for key in node.prerequisite_keys),
+                )
+            )
+        try:
+            result = await cayu_app.create_task_graph(
+                TaskGraphCreate(graph_id=graph_id, nodes=tuple(nodes))
+            )
+        except TaskGraphConflict:
+            raise HTTPException(409, detail={"code": "task_graph_creation_conflict"}) from None
+        except NotImplementedError:
+            raise HTTPException(501, detail={"code": "task_graph_creation_unsupported"}) from None
+        except (TypeError, ValueError):
+            raise HTTPException(422, detail={"code": "task_graph_creation_invalid"}) from None
+        return TaskGraphCreationResponse(graph_id=result.graph_id, task_ids=task_ids)
 
     @mutation_router.post("/tasks", response_model=TaskCreationResponse, dependencies=protected)
     async def create_task(

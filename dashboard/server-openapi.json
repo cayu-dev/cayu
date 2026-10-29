@@ -9838,6 +9838,16 @@
               }
             ]
           },
+          "task_graph_creation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "task_index": {
             "anyOf": [
               {
@@ -11294,6 +11304,70 @@
           "input"
         ],
         "title": "DeclaredTaskCreateBody",
+        "type": "object"
+      },
+      "DeclaredTaskGraphCreateBody": {
+        "additionalProperties": false,
+        "properties": {
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/DeclaredTaskGraphNode"
+            },
+            "maxItems": 1024,
+            "minItems": 1,
+            "title": "Nodes",
+            "type": "array"
+          },
+          "operation_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "nodes"
+        ],
+        "title": "DeclaredTaskGraphCreateBody",
+        "type": "object"
+      },
+      "DeclaredTaskGraphNode": {
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "additionalProperties": true,
+            "title": "Input",
+            "type": "object"
+          },
+          "key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "prerequisite_keys": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1024,
+            "title": "Prerequisite Keys",
+            "type": "array"
+          },
+          "type": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "type",
+          "input"
+        ],
+        "title": "DeclaredTaskGraphNode",
         "type": "object"
       },
       "DelegatedActionReference": {
@@ -38589,7 +38663,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "67",
+            "default": "69",
             "title": "Contract Version",
             "type": "string"
           },
@@ -42266,6 +42340,27 @@
         ],
         "title": "TaskExecutionSource",
         "type": "string"
+      },
+      "TaskGraphCreationResponse": {
+        "properties": {
+          "graph_id": {
+            "title": "Graph Id",
+            "type": "string"
+          },
+          "task_ids": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Task Ids",
+            "type": "object"
+          }
+        },
+        "required": [
+          "graph_id",
+          "task_ids"
+        ],
+        "title": "TaskGraphCreationResponse",
+        "type": "object"
       },
       "TaskHoldBody": {
         "properties": {
@@ -46289,7 +46384,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "67",
+            "default": "69",
             "title": "Contract Version",
             "type": "string"
           }
@@ -57352,6 +57447,44 @@
           "title": "AuthContext",
           "type": "object"
         }
+      }
+    },
+    "/api/task-graphs": {
+      "post": {
+        "operationId": "create_graph_api_task_graphs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeclaredTaskGraphCreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskGraphCreationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Graph"
       }
     },
     "/api/task-types": {

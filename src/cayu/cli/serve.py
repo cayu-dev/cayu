@@ -40,6 +40,7 @@ class ServeError(ValueError):
 @dataclass(frozen=True)
 class _ServeSettings:
     auth_target: str | None = None
+    price_book: Path | None = None
     startup_recovery_statuses: frozenset[SessionStatus] | None = None
     recovery_inactive_after_seconds: int = 300
     # The project's own routes: `module:function` targets, each called with the app and
@@ -105,6 +106,12 @@ def add_serve_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Restart on Python source changes for development; in-memory state is lost.",
     )
+    parser.add_argument(
+        "--price-book",
+        type=Path,
+        metavar="PATH",
+        help="Dashboard PriceBook JSON file; overrides [tool.cayu.serve].price_book.",
+    )
     access = parser.add_mutually_exclusive_group()
     access.add_argument(
         "--dev",
@@ -126,6 +133,16 @@ def _resolve_serve_project(
     project = resolve_project(command="cayu serve", suggest_explicit_target=False, start=start)
     settings = _serve_settings(project.root)
     auth_target = serve_auth_target(args, settings.auth_target)
+    if args.price_book is not None:
+        # Resolve before project_context changes the working directory or reload spawns.
+        args.price_book = args.price_book.resolve()
+    if project.service_target is not None and (
+        args.price_book is not None or settings.price_book is not None
+    ):
+        raise ServeError(
+            "A maintained public service owns its dashboard configuration; "
+            "configure its DashboardConfig.runtime_config priceBook in the service factory."
+        )
     if project.service_target is not None and settings.routers:
         raise ServeError(
             "[tool.cayu.serve].routers is for projects served by their factory; a "
@@ -187,6 +204,20 @@ def _build_serve_app(
         )
     else:
         auth = None if args.dev else _load_auth(auth_target)
+        price_book = args.price_book or settings.price_book
+        runtime_config = {}
+        if price_book is not None:
+            from cayu.cli._json_inputs import json_object_file
+
+            try:
+                runtime_config["priceBook"] = json_object_file(price_book)
+                dashboard = server_module.DashboardConfig(runtime_config=runtime_config)
+            except (ValueError, TypeError):
+                raise ServeError(
+                    "Dashboard price book must be a valid PriceBook JSON file of at most 1 MiB."
+                ) from None
+        else:
+            dashboard = server_module.DashboardConfig()
         app = build_project_app(project.target, command="Serve")
         lifecycle = server_module.ServerLifecycleConfig(
             startup_recovery_statuses=settings.startup_recovery_statuses,
@@ -199,12 +230,14 @@ def _build_serve_app(
             server_module.ServerConfig.local_development(
                 lifecycle=lifecycle,
                 request_timing=request_timing,
+                dashboard=dashboard,
             )
             if args.dev
             else server_module.ServerConfig.protected(
                 auth,
                 lifecycle=lifecycle,
                 request_timing=request_timing,
+                dashboard=dashboard,
             )
         )
         server = server_module.create_server(
@@ -341,6 +374,7 @@ def _serve_settings(root: Path) -> _ServeSettings:
     configured = cast("dict[str, Any]", value)
     unexpected = set(configured) - {
         "auth",
+        "price_book",
         "startup_recovery_statuses",
         "recovery_inactive_after_seconds",
         "routers",
@@ -350,6 +384,9 @@ def _serve_settings(root: Path) -> _ServeSettings:
             f"{discovered.pyproject}: [tool.cayu.serve] has unsupported keys: "
             f"{', '.join(sorted(unexpected))}."
         )
+    price_book = configured.get("price_book")
+    if price_book is not None and (not isinstance(price_book, str) or not price_book.strip()):
+        raise ServeError("[tool.cayu.serve].price_book must be a non-empty file path.")
     auth = configured.get("auth")
     if auth is not None and (not isinstance(auth, str) or not auth.strip()):
         raise ServeError(
@@ -408,6 +445,7 @@ def _serve_settings(root: Path) -> _ServeSettings:
         )
     return _ServeSettings(
         auth_target=None if auth is None else auth.strip(),
+        price_book=None if price_book is None else (root / price_book).resolve(),
         startup_recovery_statuses=statuses,
         recovery_inactive_after_seconds=inactivity,
         routers=tuple(target.strip() for target in routers or ()),

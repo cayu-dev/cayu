@@ -603,6 +603,68 @@ before counting and pagination, preserve resource bounds, and fail without a
 successful result on incomplete traversal. It is a trusted operator surface,
 not a new model-tool access grant. The default implementation is unsupported.
 
+#### Task CLI
+
+The CLI can create and control tasks on a running server:
+
+```bash
+cayu task create report --input-file report.json --operation-id report-2026-10-29 --json
+cayu task hold TASK_ID --reason "Waiting for review"
+cayu task block TASK_ID --reason "Missing source data"
+cayu task list --server-url http://127.0.0.1:8000 --json
+```
+
+`hold` uses the task pause transition; it does not interrupt work already owned
+by a worker. The server applies the same lifecycle and full-access checks as
+the dashboard. `--payload-file` accepts a JSON object of hold details. The
+input defaults to `{}` when `--input-file` is omitted.
+
+`cayu task graph-create graph.json --operation-id daily-report --json` admits
+a whole dependency graph atomically. For example, `graph.json` can contain:
+
+```json
+{
+  "nodes": [
+    {"key": "collect", "type": "report", "input": {"topic": "source data"}},
+    {
+      "key": "summarize",
+      "type": "report",
+      "input": {"topic": "summary"},
+      "prerequisite_keys": ["collect"]
+    }
+  ]
+}
+```
+
+Every type must be declared by the agent. This is `POST /api/task-graphs` with
+`operation_id` and `nodes`; the response contains `graph_id` and a `task_ids`
+map keyed by the submitted node keys. The `task_graph_creation` capability
+reports availability. Nodes are bounded by the existing task-graph limits;
+cycles, duplicate keys, missing prerequisites and invalid inputs reject the
+whole request. Specialists and verified invocation origins come from server
+configuration and authentication, never from the JSON file. Workers still
+own execution. Graph admission uses the existing atomic task-store operation;
+no task is published if a later node is invalid.
+
+Keep the operation ID and the original input file. Retrying an identical
+creation returns the same result, including after a restart. Changing a node,
+its prerequisites or its declaration under the same operation ID is rejected.
+Ordering nodes or prerequisite lists differently does not change the graph.
+A different authenticated actor has a separate operation namespace.
+
+Task and knowledge mutations accept `--server-url` (default
+`http://127.0.0.1:8000`, including a mount prefix when present) or
+`--application NAME` for a Cayu Cloud Agent using the existing Cloud login.
+For a protected server, set the complete Authorization header in
+`CAYU_API_AUTHORIZATION`, or name another variable with `--authorization-env`.
+Do not pass credentials in the URL. HTTPS is required outside loopback.
+The CLI discovers the API with a read before sending a mutation once. It does
+not automatically retry mutations on timeouts, lost responses or server
+errors: inspect the state, and explicitly retry an idempotent creation or Keep
+with the original operation ID and unchanged input. Block, Hold and Drop have
+no operation receipt; inspect their current state before deciding what to do
+following an uncertain response.
+
 `GET /api/task-types` returns `{task_types: [...]}`. An empty list means the host
 has declared no dashboard-createable types. The `task_creation` capability reports
 whether the configured task store supports exact creation and source selection.
@@ -708,6 +770,21 @@ cayu knowledge list --kind denial --label agent=reviewer
 cayu knowledge list --status pending --namespace reviews --json
 cayu knowledge show ENTRY_ID
 ```
+
+To review proposals against a running server:
+
+```bash
+cayu knowledge list --status pending --server-url http://127.0.0.1:8000 --json
+cayu knowledge keep ENTRY_ID --operation-id review-2026-10-29 --json
+cayu knowledge drop ENTRY_ID --json
+```
+
+Keep calls the existing approval workflow with an explicit idempotency key;
+repeating that key returns the approved-entry projection using the durable
+activation receipt. Keep records authenticated reviewer attribution. Drop archives
+a pending proposal through the existing rejection workflow; it does not record
+reviewer attribution. Both preserve the server's review scope and permissions. Local store options
+remain read-only; mutations always go through the running server.
 
 `--status` is `active` (kept, the default) or `pending`, and `archived` from a
 local store. `--kind` repeats for any of several kinds and `--label KEY=VALUE`

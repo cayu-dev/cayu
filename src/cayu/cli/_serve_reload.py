@@ -39,6 +39,8 @@ def run_reload(uvicorn: Any, args: argparse.Namespace, root: Path) -> None:
         arguments.append("--dev")
     elif args.auth is not None:
         arguments.extend(("--auth", args.auth))
+    if args.price_book is not None:
+        arguments.extend(("--price-book", str(args.price_book)))
     previous = os.environ.get(_RELOAD_ENV)
     os.environ[_RELOAD_ENV] = json.dumps({"root": str(root), "arguments": arguments})
     try:

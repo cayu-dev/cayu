@@ -4741,6 +4741,7 @@ export type ControlPlaneSurfaceCapabilities = {
     structured_output_transcript?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
     task_creation?: OptionalSurfaceCapability | null;
+    task_graph_creation?: OptionalSurfaceCapability | null;
     task_index?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     tool_display?: OptionalSurfaceCapability | null;
@@ -5446,6 +5447,44 @@ export type DeclaredTaskCreateBody = {
      * Operation Id
      */
     operation_id: string;
+    /**
+     * Type
+     */
+    type: string;
+};
+
+/**
+ * DeclaredTaskGraphCreateBody
+ */
+export type DeclaredTaskGraphCreateBody = {
+    /**
+     * Nodes
+     */
+    nodes: Array<DeclaredTaskGraphNode>;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+};
+
+/**
+ * DeclaredTaskGraphNode
+ */
+export type DeclaredTaskGraphNode = {
+    /**
+     * Input
+     */
+    input: {
+        [key: string]: unknown;
+    };
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Prerequisite Keys
+     */
+    prerequisite_keys?: Array<string>;
     /**
      * Type
      */
@@ -21088,6 +21127,22 @@ export type TaskCreationResponse = {
 export type TaskExecutionSource = 'http_run' | 'http_task' | 'product_operation' | 'scheduled' | 'sdk_task' | 'task_dispatch' | 'webhook';
 
 /**
+ * TaskGraphCreationResponse
+ */
+export type TaskGraphCreationResponse = {
+    /**
+     * Graph Id
+     */
+    graph_id: string;
+    /**
+     * Task Ids
+     */
+    task_ids: {
+        [key: string]: string;
+    };
+};
+
+/**
  * TaskHoldBody
  */
 export type TaskHoldBody = {
@@ -29387,6 +29442,31 @@ export type GetSystemDiagnosticsApiSystemDiagnosticsGetResponses = {
 };
 
 export type GetSystemDiagnosticsApiSystemDiagnosticsGetResponse = GetSystemDiagnosticsApiSystemDiagnosticsGetResponses[keyof GetSystemDiagnosticsApiSystemDiagnosticsGetResponses];
+
+export type CreateGraphApiTaskGraphsPostData = {
+    body: DeclaredTaskGraphCreateBody;
+    path?: never;
+    query?: never;
+    url: '/api/task-graphs';
+};
+
+export type CreateGraphApiTaskGraphsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CreateGraphApiTaskGraphsPostError = CreateGraphApiTaskGraphsPostErrors[keyof CreateGraphApiTaskGraphsPostErrors];
+
+export type CreateGraphApiTaskGraphsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: TaskGraphCreationResponse;
+};
+
+export type CreateGraphApiTaskGraphsPostResponse = CreateGraphApiTaskGraphsPostResponses[keyof CreateGraphApiTaskGraphsPostResponses];
 
 export type TaskTypesApiTaskTypesGetData = {
     body?: never;

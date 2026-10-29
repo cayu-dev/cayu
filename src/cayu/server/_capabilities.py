@@ -42,6 +42,7 @@ class ControlPlaneCapabilitySnapshot:
     eval_captured_results_supported: bool
     browser_recordings_configured: bool = False
     task_index_supported: bool = False
+    task_graph_creation_supported: bool = False
     task_creation_supported: bool = False
     tool_usage_supported: bool = False
     session_overview_supported: bool = False
@@ -91,6 +92,11 @@ class ControlPlaneCapabilitySnapshot:
                     self.tasks_configured,
                     read_supported=self.task_index_supported,
                     mutation_supported=False,
+                ),
+                task_graph_creation=_optional_surface(
+                    self.tasks_configured,
+                    read_supported=False,
+                    mutation_supported=self.task_graph_creation_supported,
                 ),
                 task_creation=_optional_surface(
                     self.tasks_configured,
@@ -217,6 +223,7 @@ def inspect_control_plane_capabilities(
     eval_captured_results_supported: bool = False,
     browser_recordings_configured: bool = False,
     task_index_supported: bool = False,
+    task_graph_creation_supported: bool = False,
     task_creation_supported: bool = False,
     tool_usage_supported: bool = False,
     session_overview_supported: bool = False,
@@ -249,6 +256,7 @@ def inspect_control_plane_capabilities(
         ("session_usage_aggregates_supported", session_usage_aggregates_supported),
         ("task_index_supported", task_index_supported),
         ("task_creation_supported", task_creation_supported),
+        ("task_graph_creation_supported", task_graph_creation_supported),
         ("tool_usage_supported", tool_usage_supported),
         ("session_overview_supported", session_overview_supported),
         ("session_topology_supported", session_topology_supported),
@@ -277,6 +285,7 @@ def inspect_control_plane_capabilities(
         browser_recordings_configured=browser_recordings_configured,
         task_index_supported=task_index_supported,
         task_creation_supported=task_creation_supported,
+        task_graph_creation_supported=task_graph_creation_supported,
         tool_usage_supported=tool_usage_supported,
         session_overview_supported=session_overview_supported,
         cayu_version=_cayu_distribution_version(),

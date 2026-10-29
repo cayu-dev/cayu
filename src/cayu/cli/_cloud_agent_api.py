@@ -56,7 +56,7 @@ class CayuApiNotFound(CayuApiError):
 
 
 class CayuApi:
-    """Read-only JSON client for one Cayu server's API.
+    """JSON client for one Cayu server's reads and explicit one-shot mutations.
 
     ``url`` is where the server mounts Cayu: an application that embeds it with
     ``mount_cayu(..., path="/cayu")`` serves the API at ``/cayu/api/``, and ``cayu serve``
@@ -89,6 +89,7 @@ class CayuApi:
         self._headers = {"Accept": "application/json"}
         if authorization is not None:
             self._headers["Authorization"] = authorization
+        self._credential_parts = _authorization_secrets(authorization)
         self.description = description
         self._http = http
         self._owns_http = http is None
@@ -128,6 +129,57 @@ class CayuApi:
         """
 
         return self._request("POST", path, query, body, resource)
+
+    def mutate(
+        self,
+        path: str,
+        body: Mapping[str, Any],
+        *,
+        resource: str,
+        operation_id: str | None = None,
+    ) -> Any:
+        """Dispatch once to a discovered API; never retry a possibly committed write.
+
+        Discovery is a read. A timeout, lost response or proxy error after POST is
+        ambiguous; callers retain their original operation identity for explicit retry.
+        """
+        if self._base is None:
+            self.get("/app", resource="agent")
+        assert self._base is not None
+        headers = dict(self._headers)
+        if operation_id is not None:
+            headers["Idempotency-Key"] = operation_id
+        try:
+            response = self._bounded_request(
+                "POST",
+                self._origin + self._base + path,
+                None,
+                body,
+                resource,
+                headers=headers,
+            )
+        except (httpx.HTTPError, CayuApiError) as exc:
+            raise CayuApiError(
+                "outcome_unknown",
+                "The server did not confirm the mutation. It may have completed; inspect "
+                "the result before retrying, using the same operation ID and request.",
+            ) from exc
+        if response.status_code >= 500:
+            raise CayuApiError(
+                "outcome_unknown",
+                "The server did not confirm the mutation. It may have completed; inspect "
+                "the result before retrying, using the same operation ID and request.",
+                status_code=response.status_code,
+            )
+        try:
+            return self._body(response, resource)
+        except CayuApiError as exc:
+            if response.status_code == 200:
+                raise CayuApiError(
+                    "outcome_unknown",
+                    "The mutation returned no readable receipt; inspect its result before retrying.",
+                ) from exc
+            raise
 
     def _request(
         self,
@@ -215,6 +267,8 @@ class CayuApi:
         query: Mapping[str, str | Sequence[str]] | None,
         body: Mapping[str, Any] | None,
         resource: str,
+        *,
+        headers: Mapping[str, str] | None = None,
     ) -> httpx.Response:
         """Send one request, reading at most ``MAX_RESPONSE_BYTES`` of its (decoded) answer."""
 
@@ -223,7 +277,7 @@ class CayuApi:
             url,
             params=None if query is None else dict(query),
             json=None if body is None else dict(body),
-            headers=self._headers,
+            headers=self._headers if headers is None else headers,
         ) as response:
             received = bytearray()
             for chunk in response.iter_bytes():
@@ -247,10 +301,38 @@ class CayuApi:
             content=bytes(received),
         )
 
+    def ensure_safe_output(self, value: Any) -> None:
+        """Refuse publication of the active credential, including JSON object keys."""
+        if not self._credential_parts:
+            return
+        pending = [value]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, str):
+                if any(secret in item for secret in self._credential_parts):
+                    raise CayuApiError(
+                        "unsafe_response", "The server returned credential-bearing content."
+                    )
+            elif isinstance(item, dict):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
+
     def _body(self, response: httpx.Response, resource: str) -> Any:
         established = self._base is not None
         status = response.status_code
-        detail = _detail(response)
+        # Inspect decoded JSON before error details or successful bodies reach consumers.
+        # Field-name heuristics cannot recognize opaque tokens or Basic credentials.
+        try:
+            body = response.json()
+        except ValueError:
+            body, valid_json = None, False
+            self.ensure_safe_output(response.text)
+        else:
+            valid_json = True
+            self.ensure_safe_output(body)
+        detail = _detail(body)
         if status in {401, 403}:
             raise CayuApiError(
                 "credentials_rejected",
@@ -293,14 +375,11 @@ class CayuApi:
                 f"{self.description} answered HTTP {status} for {resource}.",
                 status_code=status,
             )
-        try:
-            return response.json()
-        except ValueError:
+        if not valid_json:
             if not established:
-                raise _RouteMissing from None
-            raise CayuApiError(
-                "not_cayu", f"{self.description} did not answer {resource} as Cayu."
-            ) from None
+                raise _RouteMissing
+            raise CayuApiError("not_cayu", f"{self.description} did not answer {resource} as Cayu.")
+        return body
 
 
 class _RouteMissing(Exception):
@@ -309,6 +388,27 @@ class _RouteMissing(Exception):
     def __init__(self, status_code: int = 404) -> None:
         super().__init__(status_code)
         self.status_code = status_code
+
+
+def _authorization_secrets(authorization: str | None) -> tuple[str, ...]:
+    if not authorization:
+        return ()
+    secrets = {authorization}
+    parts = authorization.split(maxsplit=1)
+    if len(parts) == 2:
+        scheme, payload = parts[0], parts[1].strip()
+        secrets.add(payload)
+        if scheme.lower() == "basic":
+            try:
+                decoded = base64.b64decode(payload, validate=True).decode("utf-8")
+            except (ValueError, UnicodeError):
+                pass
+            else:
+                secrets.add(decoded)
+                _, separator, password = decoded.partition(":")
+                if separator and password:
+                    secrets.add(password)
+    return tuple(secret for secret in secrets if secret)
 
 
 def basic_authorization(username: str, password: str) -> str:
@@ -395,13 +495,9 @@ def cloud_agent_api(
     )
 
 
-def _detail(response: httpx.Response) -> str | None:
+def _detail(body: Any) -> str | None:
     """The server's own bounded ``detail``, never a request value it echoes."""
 
-    try:
-        body = response.json()
-    except ValueError:
-        return None
     detail = body.get("detail") if isinstance(body, dict) else None
     if isinstance(detail, list):
         # FastAPI request validation: name each rejected parameter and its rule.
