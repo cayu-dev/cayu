@@ -87,6 +87,38 @@ Provider names are part of both model and price identity. Model aliases never al
 provider name. Account discounts, regional premiums, negotiated rates, taxes, invoice
 rounding, and reconciliation remain application/provider concerns.
 
+## October 29 refresh evidence and remaining gaps
+
+The Gemini API subset includes `gemini-4-argon`, with implicit cache reads and
+Standard/Batch schedules on either side of December 1, 2026, from the official
+[pricing table](https://ai.google.dev/gemini-api/docs/pricing). Its initial schedule
+starts on the verification date, October 29; earlier usage remains unpriced. The
+[model record](https://ai.google.dev/gemini-api/docs/models/gemini-4-argon) uses the
+65,536-token default synchronous output limit. The optional million-token long-decode
+mode and explicit cache writes are not represented by this record.
+
+Azure verification uses exact-model filters on the
+[Retail Prices API](https://prices.azure.com/api/retail/prices), for example
+`serviceName eq 'Foundry Models' and contains(meterName, '5.6 sol')`. Inspect all
+returned pages and distinguish Global Standard meters from Batch, Priority, and
+regional meters. Current rates for nano, 5.5, luna, and sol were reconfirmed; existing
+historical boundaries and context bands are preserved. The 5.5 Batch meters have
+separate short/long-context rates, which the single Batch tier does not fully express,
+so that field remains unknown.
+
+Bedrock Global Opus 5 prices were matched against the
+[public price list](https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrockFoundationModels/current/index.json)
+using the exact model name and `global_standard` / `global_batch` usage types. All
+33 bundled source regions agree on Standard, Batch, cache-read, and both cache-write
+rates. This verifies the documented subset, not provider-wide recommendation coverage.
+
+Vertex model cards reconfirm the five previously flagged model records, independently
+of pricing. Their price verification dates remain October 12: the linked pricing page
+redirected to a table without Claude rates during this audit. Direct Anthropic API
+prices are not evidence for Vertex billing. New Azure GPT-6-family and Vertex
+Fable 5.1 / Opus 5.5 recommendations remain outside the bundled subset until exact
+provider pricing can be verified.
+
 ## Matching
 
 Bundled records use exact canonical IDs, exact aliases, and explicit narrow

@@ -573,3 +573,48 @@ def test_gpt6_hosted_search_prices_tokens_and_search_calls(model, expected):
     assert summary.unpriced_model_steps == 0
     assert summary.line_items[0].web_search_cost == Decimal("0.01")
     assert summary.total_cost == Decimal(expected)
+
+
+@pytest.mark.parametrize(
+    "when, expected",
+    [("2026-11-30", "0.191"), ("2026-12-01", "0.382")],
+)
+def test_argon_introductory_price_boundary_includes_cached_input(when, expected):
+    event = _completed(
+        provider_name="google",
+        model="gemini-4-argon",
+        input_tokens=100_000,
+        cache_read_input_tokens=10_000,
+        output_tokens=1_000,
+    ).model_copy(update={"timestamp": datetime.fromisoformat(when).replace(tzinfo=UTC)})
+    summary = estimate_session_cost(
+        session_id="session-1", events=[event], pricing=default_price_book()
+    )
+    assert summary.priced_model_steps == 1
+    assert summary.total_cost == Decimal(expected)
+
+
+def test_argon_catalog_and_batch_schedule_scope():
+    catalog = default_model_catalog()
+    model = catalog.resolve(provider_name="google", model="gemini-4-argon")
+    assert model is not None
+    assert model.context_window == 1_048_576
+    assert model.max_output_tokens == 65_536  # Default synchronous limit, not long decode.
+    assert model.prompt_caching and model.tool_calling and model.structured_output
+    assert catalog.resolve(provider_name="google", model="gemini-4-argon-cyber") is None
+    price = next(p for p in default_price_book().prices if p.model == "gemini-4-argon")
+    assert price.schedule_on(date(2026, 10, 28)) is None
+    for when, rates in [
+        (date(2026, 11, 30), ("1", "5", "0.05")),
+        (date(2026, 12, 1), ("2", "10", "0.1")),
+    ]:
+        schedule = price.schedule_on(when)
+        assert schedule is not None and schedule.pricing.batch is not None
+        batch = schedule.pricing.batch
+        assert (
+            batch.input_per_million,
+            batch.output_per_million,
+            batch.cache_read_input_per_million,
+        ) == tuple(map(Decimal, rates))
+        assert schedule.pricing.cache_write_5m_per_million is None
+        assert schedule.pricing.cache_write_1h_per_million is None
