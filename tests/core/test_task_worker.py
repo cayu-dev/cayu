@@ -8555,3 +8555,40 @@ def test_abandoned_task_cancellation_names_the_retry_reconciliation_boundary() -
         assert (await store.load_task(task.id)) == fenced
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", [None, "unsupported"])
+def test_unfinished_continuation_is_failed(outcome):
+    async def scenario():
+        store = InMemoryTaskStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await _seed_receipt_backed_continuation(
+            app, store, task_id="unfinished", session_id="interrupted"
+        )
+
+        async def fresh(*args):
+            raise AssertionError("There is no fresh task")
+
+        async def continuation(app, task, worker_id):
+            assert task.interrupted_handoff_id is not None
+            return outcome
+
+        try:
+            handled = await run_task_worker(
+                app,
+                store,
+                fresh,
+                worker_id="continuation-worker",
+                recovered_interrupted_task_handler=continuation,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                max_tasks=1,
+            )
+            assert handled == 1
+            task = await store.load_task("unfinished")
+            assert task is not None
+            assert task.status is TaskStatus.FAILED, (task.status, task.worker_id)
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())

@@ -5053,6 +5053,7 @@ async def _safe_fail(
         payload,
         lease_expires_at=lease_expires_at,
         lease_authority=lease_authority,
+        handoff_id=lease_authority.handoff_id if lease_authority is not None else None,
     )
 
 
