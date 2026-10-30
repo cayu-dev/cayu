@@ -1674,9 +1674,7 @@ def test_authored_derived_corpus_remains_visible_after_independent_score(
             if not page["has_more"]:
                 break
             cursor = page["next_cursor"]
-        placed = next((item for item in items if item["id"] == destination.id), None)
-        assert placed is not None, items
-        assert placed["last_run"]["placement"]["destination"] == plan["destination"]
+        assert any(item["id"] == destination.id for item in items), items
         detail = client.get(
             f"/api/evals/suite-views/{destination.id}", headers=_AUTH_HEADERS
         ).json()
@@ -1685,14 +1683,21 @@ def test_authored_derived_corpus_remains_visible_after_independent_score(
             for item in detail["runs"]["items"]
             if item["result_revision"] == plan["captured_result_revision"]
         )
+        assert attachment["placement"]["destination"] == plan["destination"]
         assert attachment["suite"] != plan["destination"]
         execution = EvalSuiteViewIdentity.model_validate(attachment["suite"])
         assert any(item["id"] == execution.id for item in items)
         authored_history = client.get(
             f"/api/evals/suite-views/{authored_selector}", headers=_AUTH_HEADERS
         ).json()
+        # Other operations may already have attached this immutable result to
+        # the authored suite. This operation must only place it in the corpus.
         assert all(
             item["result_revision"] != plan["captured_result_revision"]
+            or (
+                item["placement"] is not None
+                and item["placement"]["operation_id"] != saved.json()["operation_id"]
+            )
             for item in authored_history["runs"]["items"]
         )
         if backend == "sqlite":

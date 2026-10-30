@@ -427,6 +427,13 @@ class RecoveryHarness:
         finally:
             await store.close()
 
+    async def wait_for_task_lease_expiry(self, task_id: str) -> None:
+        store = self.task_store()
+        try:
+            await _wait_for_task_lease_expiry(store, task_id)
+        finally:
+            await store.close()
+
     def session_store(self):
         return _session_store(self.backend)
 
@@ -1528,7 +1535,7 @@ async def _run_terminal_race(config: dict[str, Any]) -> dict[str, Any]:
             worker_id="terminal-race-owner",
             query=TaskQuery(type=task_type),
             max_tasks=1,
-            lease_seconds=(1 if config.get("race_mode") == "failure_decision_loss" else 300),
+            lease_seconds=(30 if config.get("race_mode") == "failure_decision_loss" else 300),
             reclaim=False,
         )
         return {

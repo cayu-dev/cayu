@@ -270,7 +270,7 @@ def test_process_loss_after_failure_decision_recovers_exact_terminal_outcome(
         )
         await asyncio.to_thread(worker.wait_for_phase, "failure_decision_committed")
         worker.sigkill()
-        await asyncio.sleep(1.1)
+        await harness.wait_for_task_lease_expiry(task_id)
 
         session_store = harness.session_store()
         task_store = harness.task_store()
