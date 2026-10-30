@@ -21955,7 +21955,9 @@
                 "enum": [
                   "provider_failure",
                   "environment_failure",
-                  "execution_failure"
+                  "execution_failure",
+                  "setup_failure",
+                  "limit_reached"
                 ],
                 "type": "string"
               },
@@ -21964,6 +21966,27 @@
               }
             ],
             "title": "Execution Failure Category"
+          },
+          "execution_limit": {
+            "anyOf": [
+              {
+                "enum": [
+                  "input_tokens",
+                  "output_tokens",
+                  "total_tokens",
+                  "tool_calls",
+                  "model_steps",
+                  "elapsed_seconds",
+                  "estimated_cost",
+                  "execution_deadline"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Limit"
           },
           "execution_status": {
             "anyOf": [
@@ -34654,7 +34677,9 @@
                 "enum": [
                   "provider_failure",
                   "environment_failure",
-                  "execution_failure"
+                  "execution_failure",
+                  "setup_failure",
+                  "limit_reached"
                 ],
                 "type": "string"
               },
@@ -34663,6 +34688,27 @@
               }
             ],
             "title": "Execution Failure Category"
+          },
+          "execution_limit": {
+            "anyOf": [
+              {
+                "enum": [
+                  "input_tokens",
+                  "output_tokens",
+                  "total_tokens",
+                  "tool_calls",
+                  "model_steps",
+                  "elapsed_seconds",
+                  "estimated_cost",
+                  "execution_deadline"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Limit"
           },
           "execution_status": {
             "anyOf": [
@@ -38960,7 +39006,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "77",
+            "default": "78",
             "title": "Contract Version",
             "type": "string"
           },
@@ -47094,7 +47140,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "77",
+            "default": "78",
             "title": "Contract Version",
             "type": "string"
           }

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast, get_args
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
@@ -82,6 +82,8 @@ from cayu.evals.models import (
     EvalAssertionResult,
     EvalCaseResult,
     EvalContext,
+    EvalExecutionFailureCategory,
+    EvalExecutionLimit,
     EvalOutcome,
     EvalRun,
     EvalStatus,
@@ -154,6 +156,7 @@ from cayu.messages import Message
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions._run_identity import eval_trial_scope
+from cayu.sessions._terminal_evidence import TERMINAL_EVENT_TYPES
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, RunnerObservedEventIdentity, Session, SessionStatus
 from cayu.sessions.requests import RunRequest, copy_run_request
@@ -180,6 +183,28 @@ TrialCompletionCallback = Callable[
     [str, EvalTrialResult, _EvalTrialPublicData],
     Awaitable[None],
 ]
+
+# A trial keeps a run's traceback once, on its error, bounded to this many characters.
+_TRIAL_TRACEBACK_MAX_CHARS = 4096
+_TRACEBACK_TRUNCATION_MARKER = "[earlier traceback lines omitted]\n"
+
+# Why the assertions of a trial whose candidate run failed were not evaluated.
+_CANDIDATE_DID_NOT_RUN = "candidate_did_not_run"
+_CANDIDATE_RUN_FAILED = "candidate_run_failed"
+_NOT_EVALUATED_MESSAGES = {
+    _CANDIDATE_DID_NOT_RUN: (
+        f"Not evaluated ({_CANDIDATE_DID_NOT_RUN}): the candidate's run failed before it started."
+    ),
+    _CANDIDATE_RUN_FAILED: f"Not evaluated ({_CANDIDATE_RUN_FAILED}): the candidate's run failed.",
+}
+_ENVIRONMENT_FAILURE_EVENT_TYPES = frozenset(
+    {
+        EventType.ENVIRONMENT_BINDING_FAILED,
+        EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+    }
+)
+_EXECUTION_LIMITS = frozenset(get_args(EvalExecutionLimit))
 
 if TYPE_CHECKING:
     from cayu.evals.corpus import EvalCorpusDocument
@@ -632,7 +657,12 @@ def _format_exception(exc: BaseException) -> str:
         formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
     except Exception:
         return _format_exception_summary(exc)
-    return formatted or _format_exception_summary(exc)
+    if not formatted:
+        return _format_exception_summary(exc)
+    if len(formatted) > _TRIAL_TRACEBACK_MAX_CHARS:
+        # The innermost frames and the exception line come last.
+        return _TRACEBACK_TRUNCATION_MARKER + formatted[-_TRIAL_TRACEBACK_MAX_CHARS:]
+    return formatted
 
 
 class EvalCase(BaseModel):
@@ -2879,10 +2909,13 @@ async def _run_case_once_with_public_projection(
         observe_eval_session(app.session_store, trial_request.session_id)
     emitted_root_events: list[RunnerObservedEventIdentity] = []
     emitted_root_events_truncated = False
+    root_failure_event: Event | None = None
     observed_session_id: str | None = None
     run_drained = False
     session_id: str | None = None
     run_error: str | None = None
+    # Set when the candidate's own run raised or failed while it was being set up.
+    not_evaluated_reason: str | None = None
     unavailable_reason: str | None = None
     evidence_complete = False
     session: Session | None = None
@@ -2945,6 +2978,8 @@ async def _run_case_once_with_public_projection(
                     # child-session events, they must not replace the root trial identity.
                     observed_session_id = observed_session_id or event.session_id
                     if event.session_id == observed_session_id:
+                        if event.type == EventType.SESSION_FAILED:
+                            root_failure_event = event
                         if len(emitted_root_events) < TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS:
                             emitted_root_events.append(
                                 RunnerObservedEventIdentity(
@@ -2962,6 +2997,9 @@ async def _run_case_once_with_public_projection(
                 # deadline. Deadline expiry arrives as cancellation and is handled below.
                 run_error = _format_exception(exc)
                 diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
+                not_evaluated_reason = (
+                    _CANDIDATE_DID_NOT_RUN if observed_session_id is None else _CANDIDATE_RUN_FAILED
+                )
             except Exception as exc:
                 if exception_tree_contains(
                     exc,
@@ -2970,6 +3008,9 @@ async def _run_case_once_with_public_projection(
                     raise
                 run_error = _format_exception(exc)
                 diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
+                not_evaluated_reason = (
+                    _CANDIDATE_DID_NOT_RUN if observed_session_id is None else _CANDIDATE_RUN_FAILED
+                )
 
             candidate_session_id = observed_session_id or trial_request.session_id
             if candidate_session_id is not None:
@@ -3004,7 +3045,7 @@ async def _run_case_once_with_public_projection(
                             terminal_evidence = await _load_fresh_interrupted_evidence(
                                 app,
                                 candidate_session_id,
-                                tuple(emitted_root_events),
+                                _through_terminal_event(emitted_root_events),
                                 emitted_events_truncated=emitted_root_events_truncated,
                                 limits=root_terminal_limits,
                                 before_store_read=require_evidence_read_allowed,
@@ -3028,6 +3069,21 @@ async def _run_case_once_with_public_projection(
                                 f"{_format_exception(interrupted_exc)}"
                             )
                             diagnostic_code = EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_FAILED
+                    elif (
+                        run_error is None
+                        and run_drained
+                        and observed_session_id == candidate_session_id
+                        and exc.code
+                        == TerminalSessionEvidenceErrorCode.INITIAL_TRANSCRIPT_INCOMPLETE
+                        and root_failure_event is not None
+                    ):
+                        # The session failed while it was being set up, before its initial
+                        # transcript was published, so it has no terminal snapshot. The
+                        # drained stream names the cause.
+                        session_id = candidate_session_id
+                        run_error = _session_failure_reason((root_failure_event,))
+                        diagnostic_code = EvalTrialDiagnosticCode.SESSION_FAILED
+                        not_evaluated_reason = _CANDIDATE_DID_NOT_RUN
                     elif run_error is None:
                         unavailable_reason = (
                             f"Terminal evidence unavailable ({exc.code.value}): {exc}"
@@ -3128,7 +3184,9 @@ async def _run_case_once_with_public_projection(
                                     app,
                                     capture_state,
                                     root_session_id=session_id,
-                                    root_interrupted_observed_events=tuple(emitted_root_events),
+                                    root_interrupted_observed_events=_through_terminal_event(
+                                        emitted_root_events
+                                    ),
                                     lifecycle=memory_attribution_read_lifecycle,
                                 )
                             except SessionTrajectoryError as exc:
@@ -3263,11 +3321,20 @@ async def _run_case_once_with_public_projection(
                     )
 
             if run_error is not None:
+                # A run that failed without a terminal snapshot leaves its assertions
+                # unevaluated; the error itself stays on the trial. Any other error,
+                # including evidence preparation failing after the snapshot loaded,
+                # blocks them as errors.
+                if not_evaluated_reason is not None and session is None:
+                    blocked_outcome = EvalOutcome.UNAVAILABLE
+                    blocked_message = _NOT_EVALUATED_MESSAGES[not_evaluated_reason]
+                else:
+                    blocked_outcome, blocked_message = EvalOutcome.ERROR, run_error
                 assertion_results = list(
                     _blocked_assertion_results(
                         case.assertions,
-                        EvalOutcome.ERROR,
-                        run_error,
+                        blocked_outcome,
+                        blocked_message,
                         memory_attribution_evidence=memory_attribution,
                     )
                 )
@@ -3328,6 +3395,7 @@ async def _run_case_once_with_public_projection(
             run_error = _format_exception(exc)
             diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
         unavailable_reason = None
+        not_evaluated_reason = None
         # A timeout may happen after the exact terminal snapshot, probes, and
         # child tree were fully captured while an assertion was evaluating.
         # Preserve that completed evidence; the ERROR outcome already records
@@ -3370,30 +3438,24 @@ async def _run_case_once_with_public_projection(
             )
         )
 
-    execution_status = (
-        None
-        if session is None
-        else (
-            "failed"
-            if session.status == SessionStatus.FAILED
-            else "completed"
-            if session.status == SessionStatus.COMPLETED
-            else None
+    failure_category: EvalExecutionFailureCategory | None = None
+    execution_limit: EvalExecutionLimit | None = None
+    if session is not None and session.status == SessionStatus.FAILED:
+        failure_category = _execution_failure_category(
+            (event.type for event in events),
+            started=True,
         )
-    )
-    failure_category = None
-    if execution_status == "failed":
-        event_types = {event.type for event in events}
-        if event_types & {
-            EventType.ENVIRONMENT_BINDING_FAILED,
-            EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
-            EventType.ENVIRONMENT_FACTORY_FAILED,
-        }:
-            failure_category = "environment_failure"
-        elif EventType.MODEL_ERROR in event_types:
-            failure_category = "provider_failure"
-        else:
-            failure_category = "execution_failure"
+    elif not_evaluated_reason is not None and session is None:
+        failure_category = _execution_failure_category(
+            (identity.event_type for identity in emitted_root_events),
+            started=not_evaluated_reason == _CANDIDATE_RUN_FAILED,
+        )
+    elif session is not None and session.status == SessionStatus.INTERRUPTED:
+        execution_limit = _execution_limit(events)
+        if execution_limit is not None:
+            failure_category = "limit_reached"
+    # Without a terminal snapshot, the drained runtime stream is the run's only record.
+    execution_failed = not_evaluated_reason is not None and session is None
     from cayu.budgets.usage import count_model_steps_with_usage
 
     observed_model_calls = sum(event.type == EventType.MODEL_STARTED for event in events)
@@ -3430,7 +3492,9 @@ async def _run_case_once_with_public_projection(
     )
     return (
         EvalTrialResult(
+            execution_status="failed" if execution_failed else None,
             execution_failure_category=failure_category,
+            execution_limit=execution_limit,
             usage_evidence_state=usage_state,
             trial_number=trial_number,
             status=status,
@@ -3441,7 +3505,7 @@ async def _run_case_once_with_public_projection(
             error=run_error,
             unavailable_reason=unavailable_reason,
             evidence_complete=evidence_complete,
-            events_count=len(events),
+            events_count=len(emitted_root_events) if execution_failed else len(events),
             usage_summary=session_usage_summary_payload(usage_summary)
             if usage_summary is not None
             else None,
@@ -3496,11 +3560,12 @@ async def _load_fresh_interrupted_evidence(
         )
         evidence = _validated_terminal_session_evidence(evidence)
     except (NotImplementedError, TerminalSessionEvidenceError) as exc:
-        detail = (
-            exc.code.value
-            if isinstance(exc, TerminalSessionEvidenceError)
-            else str(exc).strip() or type(exc).__name__
-        )
+        if not isinstance(exc, TerminalSessionEvidenceError):
+            detail = str(exc).strip() or type(exc).__name__
+        elif exc.detail is None:
+            detail = exc.code.value
+        else:
+            detail = f"{exc.code.value}: {exc.detail}"
         raise _FreshInterruptedEvidenceUnavailable(detail) from exc
     return evidence
 
@@ -4208,6 +4273,45 @@ def _validate_timeout_seconds(value: float | None, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a finite positive number.")
     if value <= 0:
         raise ValueError(f"{field_name} must be a positive number.")
+
+
+def _through_terminal_event(
+    identities: Sequence[RunnerObservedEventIdentity],
+) -> tuple[RunnerObservedEventIdentity, ...]:
+    """Cut drained root events after the run's terminal event, as its evidence is cut.
+
+    Terminal hooks emit records after the terminal event; they are outside the run.
+    """
+
+    for index in range(len(identities) - 1, -1, -1):
+        if identities[index].event_type in TERMINAL_EVENT_TYPES:
+            return tuple(identities[: index + 1])
+    return tuple(identities)
+
+
+def _execution_failure_category(
+    event_types: Iterable[EventType | str],
+    *,
+    started: bool,
+) -> EvalExecutionFailureCategory:
+    observed = set(event_types)
+    if observed & _ENVIRONMENT_FAILURE_EVENT_TYPES:
+        return "environment_failure"
+    if EventType.MODEL_ERROR in observed:
+        return "provider_failure"
+    return "execution_failure" if started else "setup_failure"
+
+
+def _execution_limit(events: Sequence[Event]) -> EvalExecutionLimit | None:
+    """Name the run limit that stopped an interrupted session, from its terminal event."""
+
+    if not events or events[-1].type != EventType.SESSION_INTERRUPTED:
+        return None
+    payload = events[-1].payload
+    limit = payload.get("limit")
+    if payload.get("interruption_type") != "limit_reached" or limit not in _EXECUTION_LIMITS:
+        return None
+    return cast("EvalExecutionLimit", limit)
 
 
 def _session_failure_reason(events: Iterable[Event]) -> str:

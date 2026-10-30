@@ -178,8 +178,13 @@ def benchmark_failure_category(trial: PublishedEvalTrialResult) -> str:
         return "recovery_blocked"
     if code == "case_timeout":
         return "timeout"
-    if trial.execution_failure_category is not None or trial.execution_status == "failed":
-        return trial.execution_failure_category or "execution_failure"
+    category = trial.execution_failure_category
+    # A run that failed before it started is an execution failure for retries. A run
+    # stopped by a run limit was scored, so its assertion outcome names it below.
+    if category == "setup_failure" or (category is None and trial.execution_status == "failed"):
+        return "execution_failure"
+    if category is not None and category != "limit_reached":
+        return category
     if code == "passed":
         return "passed"
     if code == "assertion_failed":

@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals.benchmark_campaign import (
     BenchmarkCampaignSettingsV1,
     admit_benchmark_campaign,
@@ -143,6 +144,61 @@ def test_comparison_and_static_rescore_never_dispatch(tmp_path):
             await plan.corpus_target.app.session_store.close()
 
     asyncio.run(scenario())
+
+
+def test_trial_stopped_by_a_run_limit_keeps_its_retry_category_and_output(tmp_path):
+    async def scenario():
+        loaded = load_benchmark_package(write_synthetic_benchmark_package(tmp_path / "package"))
+        plan = build_synthetic_benchmark_plan(tmp_path / "target")
+        directory = tmp_path / "campaign"
+        # Each synthetic answer reports 10 tokens, so the limit stops the run after it.
+        prepared = await prepare_benchmark_campaign(
+            loaded,
+            plan,
+            case_ids=["wrong-answer"],
+            settings=BenchmarkCampaignSettingsV1(
+                limits=RunLimits(max_total_tokens=5),
+                max_retry_attempts=1,
+                retry_categories=("answer_mismatch",),
+            ),
+        )
+        campaign = await admit_benchmark_campaign(prepared, directory)
+        try:
+            await resume_benchmark_campaign(directory, plan)
+            store = SQLiteEvalStore(
+                directory / "evals.sqlite3", read_only=True, schema_mode=SchemaMode.VALIDATE
+            )
+            try:
+                result = await store.load_result(campaign.runs[0].spec.id)
+            finally:
+                await store.close()
+            (trial,) = result.run.cases[0].trials
+            inspection = await inspect_benchmark_campaign(directory)
+            scorer_path = write_synthetic_benchmark_package(tmp_path / "scorer", scorer_version="2")
+            rescored = await rescore_benchmark_campaign(directory, scorer_path)
+            successor = await retry_benchmark_trial(
+                directory, plan, case_id="wrong-answer", trial_number=1
+            )
+            return trial, inspection, rescored, load_benchmark_campaign(successor)
+        finally:
+            await plan.corpus_target.app.session_store.close()
+
+    trial, inspection, rescored, successor = asyncio.run(scenario())
+
+    assert (trial.execution_failure_category, trial.execution_limit) == (
+        "limit_reached",
+        "total_tokens",
+    )
+    assert trial.output.text == "WRONG"
+    assert [row.failure_category for row in inspection.trials] == ["answer_mismatch"]
+    assert successor.retry_of is not None
+    assert successor.retry_of.failure_category == "answer_mismatch"
+    # The retained answer is rescored, not dropped as unavailable.
+    (row,) = rescored["trials"]
+    assert {item["id"]: item["outcome"] for item in row["assertions"]} == {
+        "completed": "failed",
+        "answer": "failed",
+    }
 
 
 def test_typed_failures_selective_retry_and_retained_native_links(tmp_path):

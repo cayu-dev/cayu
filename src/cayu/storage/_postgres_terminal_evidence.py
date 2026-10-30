@@ -250,77 +250,6 @@ async def _load_evidence(
                         observed=session_transport_size,
                     )
 
-                if observed is not None:
-                    await cur.execute(
-                        """
-                            WITH bounded_identities AS (
-                                SELECT octet_length(event_type)
-                                           + octet_length(sequence::text) AS transport_bytes
-                                FROM cayu_events
-                                WHERE session_id = %s
-                                ORDER BY sequence ASC
-                                LIMIT %s
-                            )
-                            SELECT COUNT(*),
-                                   COALESCE(MAX(transport_bytes), 0),
-                                   COALESCE(SUM(transport_bytes), 0)
-                            FROM bounded_identities
-                            """,
-                        (session_id, selected_limits.max_events + 1),
-                    )
-                    identity_preflight = await cur.fetchone()
-                    if identity_preflight is None:
-                        raise TerminalSessionEvidenceError(
-                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
-                        )
-                    identity_count = int(identity_preflight[0])
-                    if identity_count > selected_limits.max_events:
-                        raise TerminalSessionEvidenceError(
-                            TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
-                            limit=selected_limits.max_events,
-                            observed=identity_count,
-                        )
-                    if identity_count != len(observed):
-                        raise TerminalSessionEvidenceError(
-                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
-                        )
-                    identity_largest_bytes = int(identity_preflight[1])
-                    if identity_largest_bytes > max_record_transport_bytes:
-                        raise TerminalSessionEvidenceError(
-                            TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
-                            limit=max_record_transport_bytes,
-                            observed=identity_largest_bytes,
-                        )
-                    identity_total_bytes = int(identity_preflight[2])
-                    if identity_total_bytes > max_total_transport_bytes:
-                        raise TerminalSessionEvidenceError(
-                            TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
-                            limit=max_total_transport_bytes,
-                            observed=identity_total_bytes,
-                        )
-                    await cur.execute(
-                        """
-                            SELECT sequence, event_type
-                            FROM cayu_events
-                            WHERE session_id = %s
-                            ORDER BY sequence ASC
-                            LIMIT %s
-                            """,
-                        (session_id, identity_count),
-                    )
-                    identity_rows = await cur.fetchall()
-                    _validate_runner_observed_event_identity_snapshot(
-                        observed,
-                        tuple(
-                            RunnerObservedEventIdentity(
-                                session_id=session_id,
-                                sequence=row[0],
-                                event_type=row[1],
-                            )
-                            for row in identity_rows
-                        ),
-                    )
-
                 await cur.execute(
                     """
                         SELECT
@@ -579,6 +508,30 @@ async def _load_evidence(
                         TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
                         limit=max_total_transport_bytes,
                         observed=total_transport_bytes,
+                    )
+                if observed is not None:
+                    await cur.execute(
+                        """
+                            SELECT sequence, event_type
+                            FROM cayu_events
+                            WHERE session_id = %s AND sequence <= %s
+                            ORDER BY sequence ASC
+                            LIMIT %s
+                            """,
+                        (session_id, terminal_record.sequence, event_count),
+                    )
+                    identity_rows = await cur.fetchall()
+                    _validate_runner_observed_event_identity_snapshot(
+                        observed,
+                        tuple(
+                            RunnerObservedEventIdentity(
+                                session_id=session_id,
+                                sequence=row[0],
+                                event_type=row[1],
+                            )
+                            for row in identity_rows
+                        ),
+                        terminal_sequence=terminal_record.sequence,
                     )
 
                 session = await load_session(cur, session_id)

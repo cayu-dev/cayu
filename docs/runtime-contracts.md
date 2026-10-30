@@ -19215,7 +19215,9 @@ EvalStore. This changes no database schema or checkpoint size bound.
 
 Optional trial `execution_failure_category` and `usage_evidence_state` distinguish
 typed execution failure and incomplete accounting independently of assertion
-outcomes. Missing usage remains unavailable. Campaign comparison binds package,
+outcomes. The categories are `provider_failure`, `environment_failure`,
+`execution_failure`, `setup_failure` (the run failed before its session started)
+and `limit_reached`, which comes with `execution_limit` naming the run limit. Missing usage remains unavailable. Campaign comparison binds package,
 cohort, scorer, execution profile, budget, and retry identities; static rescoring
 uses retained facts and never dispatches candidate or judge work. See
 [benchmark campaigns](benchmark-campaigns.md) for supported modes and acceptance.

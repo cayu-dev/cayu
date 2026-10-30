@@ -27,7 +27,14 @@ from cayu._validation import MAX_SESSION_ID_BYTES
 from cayu.build_provenance import RuntimeBuildProvenance
 from cayu.evals._admission import LaunchScheduling, TrialAdmission
 from cayu.evals._inspection_documents import ProcessDocuments, decode_document, read_regular_file
-from cayu.evals.models import EvalRun, EvalStatus, aggregate_eval_score, aggregate_eval_status
+from cayu.evals.models import (
+    EvalExecutionFailureCategory,
+    EvalExecutionLimit,
+    EvalRun,
+    EvalStatus,
+    aggregate_eval_score,
+    aggregate_eval_status,
+)
 from cayu.evals.session_inspection import EvalSessionInspectionV1, inspect_eval_sessions
 
 
@@ -61,6 +68,10 @@ class EvalProcessCaseInspectionV1(_Model):
     score: float | None = None
     error: str | None = None
     unavailable_reason: str | None = None
+    # The candidate's run, apart from how its assertions scored it.
+    execution_status: Literal["completed", "failed"] | None = None
+    execution_failure_category: EvalExecutionFailureCategory | None = None
+    execution_limit: EvalExecutionLimit | None = None
     assertion_failures: tuple[dict[str, Any], ...] = ()
     session: EvalSessionReferenceV1 | None = None
     session_inspection: EvalSessionInspectionV1 | None = None
@@ -427,6 +438,11 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
                 unavailable_reason=None
                 if case is None or case.unavailable_reason is None
                 else case.unavailable_reason[:4096],
+                execution_status=None if case is None else case.trials[0].execution_status,
+                execution_failure_category=None
+                if case is None
+                else case.trials[0].execution_failure_category,
+                execution_limit=None if case is None else case.trials[0].execution_limit,
                 assertion_failures=()
                 if case is None
                 else tuple(

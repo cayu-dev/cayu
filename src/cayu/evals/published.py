@@ -115,6 +115,8 @@ from cayu.evals.memory_attribution import (
 )
 from cayu.evals.models import (
     EvalAssertionResult,
+    EvalExecutionFailureCategory,
+    EvalExecutionLimit,
     EvalRun,
     EvalTrialResult,
     _model_instance_python_input,
@@ -1366,9 +1368,12 @@ class PublishedEvalTrialResult(_PortableModel):
     execution_status: Literal["completed", "failed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    execution_failure_category: (
-        Literal["provider_failure", "environment_failure", "execution_failure"] | None
-    ) = Field(default=None, exclude_if=lambda value: value is None)
+    execution_failure_category: EvalExecutionFailureCategory | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    execution_limit: EvalExecutionLimit | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     failure_evidence: FailureEvidence | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -1446,9 +1451,13 @@ class PublishedEvalTrialResult(_PortableModel):
             raise ValueError(
                 "Failed-workflow observations cannot imply completed execution or scoring."
             )
+        if (self.execution_limit is not None) != (
+            self.execution_failure_category == "limit_reached"
+        ):
+            raise ValueError("A run limit is recorded exactly when a run limit stopped the run.")
         expected_status = (
             "error"
-            if self.failure_capture is not None
+            if self.execution_status == "failed"
             else _published_status_from_outcomes(assertion.outcome for assertion in self.assertions)
         )
         expected_score = _published_score(assertion.score for assertion in self.assertions)
@@ -3020,6 +3029,7 @@ def _published_case(
                 operation_outcomes=trial.operation_outcomes,
                 execution_status=trial.execution_status,
                 execution_failure_category=trial.execution_failure_category,
+                execution_limit=trial.execution_limit,
                 usage_evidence_state=trial.usage_evidence_state
                 or (
                     "partial"

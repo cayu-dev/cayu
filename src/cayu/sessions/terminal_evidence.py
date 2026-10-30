@@ -171,6 +171,7 @@ class TerminalSessionEvidenceError(RuntimeError):
         *,
         limit: int | None = None,
         observed: int | None = None,
+        detail: str | None = None,
     ) -> None:
         if not isinstance(code, TerminalSessionEvidenceErrorCode):
             raise TypeError("code must be a TerminalSessionEvidenceErrorCode.")
@@ -178,13 +179,19 @@ class TerminalSessionEvidenceError(RuntimeError):
             raise ValueError("limit must be a non-negative integer or None.")
         if observed is not None and (type(observed) is not int or observed < 0):
             raise ValueError("observed must be a non-negative integer or None.")
+        if detail is not None and type(detail) is not str:
+            raise TypeError("detail must be a string or None.")
         self.code = code
         self.limit = limit
         self.observed = observed
-        detail = _TERMINAL_SESSION_EVIDENCE_ERROR_MESSAGES[code]
+        # Names only counts, sequences and event types, never record content.
+        self.detail = detail
+        message = _TERMINAL_SESSION_EVIDENCE_ERROR_MESSAGES[code]
         if limit is not None:
-            detail = f"{detail} Limit: {limit}."
-        super().__init__(detail)
+            message = f"{message} Limit: {limit}."
+        if detail is not None:
+            message = f"{message} {detail}"
+        super().__init__(message)
 
 
 class TerminalPublicationMarker(BaseModel):
@@ -557,9 +564,51 @@ def _copy_runner_owned_interruption_proof(
 def _validate_runner_observed_event_identity_snapshot(
     expected: tuple[RunnerObservedEventIdentity, ...],
     actual: Sequence[RunnerObservedEventIdentity],
+    *,
+    terminal_sequence: int,
 ) -> None:
-    if tuple(actual) != expected:
-        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    """Match the drained root events with the durable prefix, both through the terminal event.
+
+    Records after the terminal event, such as terminal hooks the run emitted or an
+    environment's later cleanup, are outside the run. A newer run moves the terminal
+    event past every drained event, so its records still differ.
+    """
+
+    emitted = tuple(
+        identity
+        for identity in expected
+        if identity.sequence is not None and identity.sequence <= terminal_sequence
+    )
+    durable = tuple(actual)
+    if durable == emitted:
+        return
+    position = next(
+        (
+            index
+            for index, (observed, stored) in enumerate(zip(emitted, durable, strict=False))
+            if observed != stored
+        ),
+        min(len(emitted), len(durable)),
+    )
+    raise TerminalSessionEvidenceError(
+        TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT,
+        detail=(
+            f"Through the terminal event, the run emitted {len(emitted)} root events and "
+            f"the durable log holds {len(durable)}; they first differ at event "
+            f"{position + 1}: emitted {_observed_identity_text(emitted, position)}, "
+            f"durable {_observed_identity_text(durable, position)}."
+        ),
+    )
+
+
+def _observed_identity_text(
+    identities: Sequence[RunnerObservedEventIdentity],
+    position: int,
+) -> str:
+    if position >= len(identities):
+        return "nothing"
+    identity = identities[position]
+    return f"{identity.event_type} at sequence {identity.sequence}"
 
 
 def _terminal_session_evidence_expected_event_type(

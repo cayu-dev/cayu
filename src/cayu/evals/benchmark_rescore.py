@@ -17,11 +17,13 @@ from cayu.storage.migrations import SchemaMode
 
 def _saved_evidence(trial):
     output = trial.output
+    # A run stopped by a run limit was scored on its retained output. Any other recorded
+    # execution failure, including a run that never started, has no scoreable output.
     complete = (
         output.evidence_state == "complete"
         and not output.preview_truncated
         and trial.execution_status != "failed"
-        and trial.execution_failure_category is None
+        and trial.execution_failure_category in (None, "limit_reached")
         and trial.failure_capture is None
     )
     statuses = {

@@ -237,6 +237,28 @@ class EvalStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+# Why a candidate's run did not complete. ``setup_failure`` means the run failed
+# before its session started; ``limit_reached`` means a run limit stopped it.
+EvalExecutionFailureCategory = Literal[
+    "provider_failure",
+    "environment_failure",
+    "execution_failure",
+    "setup_failure",
+    "limit_reached",
+]
+# The run limit named by ``session.limit_reached`` (cayu.runtime.stop_policy.StopLimit).
+EvalExecutionLimit = Literal[
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "tool_calls",
+    "model_steps",
+    "elapsed_seconds",
+    "estimated_cost",
+    "execution_deadline",
+]
+
+
 class EvalOutcome(StrEnum):
     """One evaluated assertion outcome.
 
@@ -357,9 +379,12 @@ class EvalTrialResult(BaseModel):
     execution_status: Literal["completed", "failed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    execution_failure_category: (
-        Literal["provider_failure", "environment_failure", "execution_failure"] | None
-    ) = Field(default=None, exclude_if=lambda value: value is None)
+    execution_failure_category: EvalExecutionFailureCategory | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    execution_limit: EvalExecutionLimit | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     failure_evidence: FailureEvidence | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -462,6 +487,10 @@ class EvalTrialResult(BaseModel):
             )
         ):
             raise ValueError("Failed execution cannot carry successful output or scoring.")
+        if (self.execution_limit is not None) != (
+            self.execution_failure_category == "limit_reached"
+        ):
+            raise ValueError("A run limit is recorded exactly when a run limit stopped the run.")
         if self.failure_capture is not None and (
             self.execution_status != "failed"
             or self.failure_capture.session_id != self.session_id
@@ -514,11 +543,12 @@ class EvalTrialResult(BaseModel):
         if self.status == EvalStatus.ERROR:
             if self.error is None:
                 raise ValueError("error trials require an error diagnostic.")
+            # A recorded execution failure explains an error whose assertions never ran.
             if (
                 self.assertions
                 and not any(assertion.outcome == EvalOutcome.ERROR for assertion in self.assertions)
                 and not (
-                    self.failure_capture is not None
+                    self.execution_status == "failed"
                     and all(
                         assertion.outcome == EvalOutcome.UNAVAILABLE
                         for assertion in self.assertions
@@ -694,7 +724,7 @@ class EvalTrialResult(BaseModel):
                 raise ValueError("Omitted trajectory memory sources must retain their limit.")
         expected_status = (
             EvalStatus.ERROR
-            if self.failure_capture is not None
+            if self.execution_status == "failed"
             else _status_from_assertions(self.assertions)
         )
         # Execution/evidence can fail before assertions exist. Once assertion

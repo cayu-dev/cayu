@@ -25,6 +25,8 @@ from cayu.evals import (
     EvalTrialDiagnosticCode,
     ScriptedModelProvider,
 )
+from cayu.evals.benchmark_inspection import benchmark_failure_category
+from cayu.evals.benchmark_rescore import _saved_evidence
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
@@ -608,9 +610,14 @@ def test_profile_pinned_corpus_execution_retains_interrupted_event_identity():
     assert trial.evidence_complete is True
     assert trial.status == "failed"
     assert trial.code is EvalTrialDiagnosticCode.ASSERTION_FAILED
+    assert trial.execution_failure_category == "limit_reached"
+    assert trial.execution_limit == "estimated_cost"
     detail = trial.assertions[0].detail
     assert type(detail) is PublishedRootStatusDetail
     assert detail.actual == "interrupted"
+    # The run limit failed the run; the assertions still scored what it did.
+    dimensions = present_eval_result(result).cases[0].trials[0].dimensions
+    assert (dimensions.runtime, dimensions.candidate) == ("failed", "failed")
 
 
 def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
@@ -820,6 +827,43 @@ def test_run_corpus_suite_scores_completed_tools_when_ask_mode_interrupts_on_sql
     assert assertions["completed"].detail.actual == "interrupted"
     assert assertions["customer-loaded"].outcome == "passed"
     assert assertions["recommendation-created"].outcome == "passed"
+
+
+def test_corpus_trial_whose_candidate_did_not_start_is_a_runtime_failure():
+    judge, judge_provider = _model_judge_target()
+    candidate_provider = _provider(trials=1)
+    target = _target(candidate_provider, model_judges=(judge,))
+    target = target.model_copy(
+        update={
+            "request_base": target.request_base.model_copy(
+                update={"environment_name": "no_environment"}
+            )
+        }
+    )
+    corpus = _model_judge_corpus(judge)
+
+    result = asyncio.run(run_corpus_suite(target, corpus, "refund-regressions"))
+
+    trial = result.run.cases[0].trials[0]
+    assert trial.status == "error"
+    assert trial.code is EvalTrialDiagnosticCode.EXECUTION_FAILED
+    assert trial.execution_status == "failed"
+    assert trial.execution_failure_category == "setup_failure"
+    (assertion,) = trial.assertions
+    assert assertion.outcome == "unavailable"
+    assert assertion.detail.diagnostic == "evidence_unavailable"
+    reliability = result.run.cases[0].reliability
+    assert (reliability.runtime_error_trials, reliability.evaluator_error_trials) == (1, 0)
+    dimensions = present_eval_result(result).cases[0].trials[0].dimensions
+    assert dimensions.runtime == "failed"
+    assert dimensions.candidate == "not_scored"
+    assert dimensions.evaluator_health == "unavailable"
+    assert "Candidate run: failed (setup_failure)." in render_corpus_execution_html(result)
+    assert benchmark_failure_category(trial) == "execution_failure"
+    saved = _saved_evidence(trial)
+    assert (saved.final_output_state, saved.root_evidence_available) == ("unavailable", False)
+    assert candidate_provider.requests == []
+    assert judge_provider.requests == []
 
 
 def test_run_corpus_suite_resolves_trusted_model_judge_and_publishes_its_contract():

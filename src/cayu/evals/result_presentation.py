@@ -39,6 +39,7 @@ from cayu.evals.corpus import (
 )
 from cayu.evals.evidence import _canonical_decimal
 from cayu.evals.execution import CorpusExecutionResult
+from cayu.evals.models import EvalExecutionFailureCategory, EvalExecutionLimit
 from cayu.evals.published import (
     PublishedArtifactDetail,
     PublishedAssertionResult,
@@ -362,9 +363,12 @@ class EvalAssertionPresentationV1(_PortableModel):
 
 
 class EvalTrialPresentationV1(_PortableModel):
-    execution_failure_category: (
-        Literal["provider_failure", "environment_failure", "execution_failure"] | None
-    ) = Field(default=None, exclude_if=lambda value: value is None)
+    execution_failure_category: EvalExecutionFailureCategory | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    execution_limit: EvalExecutionLimit | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     execution_status: Literal["completed", "failed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -392,6 +396,10 @@ class EvalTrialPresentationV1(_PortableModel):
             assertion.outcome not in {"error", "unavailable"} for assertion in self.assertions
         ):
             raise ValueError("Failed execution cannot carry scored assertions.")
+        if (self.execution_limit is not None) != (
+            self.execution_failure_category == "limit_reached"
+        ):
+            raise ValueError("A run limit is recorded exactly when a run limit stopped the run.")
         expected_status = (
             "error"
             if self.execution_status == "failed"
@@ -417,6 +425,7 @@ class EvalTrialPresentationV1(_PortableModel):
             self.assertions,
             runtime=self.dimensions.runtime,
             evidence=self.dimensions.evidence,
+            limit_reached=self.execution_failure_category == "limit_reached",
         )
         if self.dimensions != expected_dimensions:
             raise ValueError("Presented trial outcome dimensions contradict its assertions.")
@@ -888,8 +897,10 @@ def _candidate_outcome(
     runtime: EvalRuntimeOutcome,
     deterministic: EvalAssertionDimension,
     semantic: EvalAssertionDimension,
+    limit_reached: bool,
 ) -> EvalCandidateOutcome:
-    if runtime in {"failed", "unavailable"}:
+    # A run stopped by a run limit failed, yet its assertions still scored what it did.
+    if runtime == "unavailable" or (runtime == "failed" and not limit_reached):
         return "not_scored"
     used = tuple(value for value in (deterministic, semantic) if value != "not_used")
     if any(value in {"error", "unavailable"} for value in used):
@@ -906,6 +917,7 @@ def _dimensions(
     *,
     runtime: EvalRuntimeOutcome,
     evidence: EvalEvidenceState,
+    limit_reached: bool = False,
 ) -> EvalResultOutcomeDimensionsV1:
     deterministic = _aggregate_assertion_dimension(
         assertion.outcome
@@ -922,6 +934,7 @@ def _dimensions(
             runtime=runtime,
             deterministic=deterministic,
             semantic=semantic,
+            limit_reached=limit_reached,
         ),
         deterministic_assertions=deterministic,
         semantic_quality=semantic,
@@ -936,6 +949,7 @@ def _presented_dimensions(
     *,
     runtime: EvalRuntimeOutcome,
     evidence: EvalEvidenceState,
+    limit_reached: bool,
 ) -> EvalResultOutcomeDimensionsV1:
     deterministic = _aggregate_assertion_dimension(
         assertion.outcome for assertion in assertions if assertion.category == "deterministic"
@@ -959,6 +973,7 @@ def _presented_dimensions(
             runtime=runtime,
             deterministic=deterministic,
             semantic=semantic,
+            limit_reached=limit_reached,
         ),
         deterministic_assertions=deterministic,
         semantic_quality=semantic,
@@ -1078,6 +1093,7 @@ def _present_fresh_trial(trial: PublishedEvalTrialResult) -> EvalTrialPresentati
     )
     return EvalTrialPresentationV1(
         execution_failure_category=validated.execution_failure_category,
+        execution_limit=validated.execution_limit,
         execution_status=validated.execution_status,
         trial_number=validated.trial_number,
         status=validated.status,
@@ -1087,6 +1103,7 @@ def _present_fresh_trial(trial: PublishedEvalTrialResult) -> EvalTrialPresentati
             validated.assertions,
             runtime=runtime,
             evidence=evidence,
+            limit_reached=validated.execution_failure_category == "limit_reached",
         ),
         assertions=assertions,
     )

@@ -547,22 +547,6 @@ async def _load_terminal_session_evidence(
             checkpoint
         )
         session_records = state.session_event_records.get(session_id, [])
-        if observed is not None:
-            if len(session_records) != len(observed):
-                raise TerminalSessionEvidenceError(
-                    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
-                )
-            terminal_session_evidence._validate_runner_observed_event_identity_snapshot(
-                observed,
-                tuple(
-                    RunnerObservedEventIdentity(
-                        session_id=record.event.session_id,
-                        sequence=record.sequence,
-                        event_type=record.event.type,
-                    )
-                    for record in session_records
-                ),
-            )
         newest_evidence_records = tuple(
             islice(
                 (
@@ -599,6 +583,19 @@ async def _load_terminal_session_evidence(
                 observed=event_stop,
             )
         events = session_records[:event_stop]
+        if observed is not None:
+            terminal_session_evidence._validate_runner_observed_event_identity_snapshot(
+                observed,
+                tuple(
+                    RunnerObservedEventIdentity(
+                        session_id=record.event.session_id,
+                        sequence=record.sequence,
+                        event_type=record.event.type,
+                    )
+                    for record in events
+                ),
+                terminal_sequence=terminal_record.sequence,
+            )
 
         messages = state.transcripts.get(session_id, [])
         interaction_ids = state.transcript_interaction_ids.get(session_id, [])

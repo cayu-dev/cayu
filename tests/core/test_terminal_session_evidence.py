@@ -551,10 +551,44 @@ async def _exercise_runner_owned_interrupted_evidence(
     assert evidence.events[-1].event.type is EventType.SESSION_INTERRUPTED
     _assert_exact_snapshot_bytes(evidence)
 
+    # Records after the terminal event are outside the interrupted run, whether
+    # the runner never drained them (environment cleanup) or it did (terminal hooks).
+    await store.append_event(
+        root_id,
+        Event(
+            id=f"{root_id}-cleanup-progress",
+            type=EventType.ENVIRONMENT_LIFECYCLE_PROGRESS,
+            session_id=root_id,
+        ),
+    )
+    await store.append_event(
+        root_id,
+        Event(id=f"{root_id}-hook-started", type=EventType.HOOK_STARTED, session_id=root_id),
+    )
+    hook_started = (await store.query_events(EventQuery(session_id=root_id)))[-1]
+    for drained in (
+        observed,
+        (
+            *observed,
+            RunnerObservedEventIdentity(
+                session_id=root_id,
+                sequence=hook_started.sequence,
+                event_type=EventType.HOOK_STARTED,
+            ),
+        ),
+    ):
+        after_terminal = await store.load_runner_owned_interrupted_evidence(
+            root_id,
+            observed_events=drained,
+        )
+        assert after_terminal.events == evidence.events
+        assert after_terminal.transcript == evidence.transcript
+
+    terminal = observed[-1]
     forged = list(observed)
     forged[-1] = RunnerObservedEventIdentity(
         session_id=root_id,
-        sequence=forged[-1].sequence,
+        sequence=terminal.sequence,
         event_type=EventType.SESSION_FAILED,
     )
     with pytest.raises(TerminalSessionEvidenceError) as mismatched:
@@ -563,6 +597,25 @@ async def _exercise_runner_owned_interrupted_evidence(
             observed_events=tuple(forged),
         )
     assert mismatched.value.code is TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+    assert mismatched.value.detail == (
+        f"Through the terminal event, the run emitted {len(observed)} root events and "
+        f"the durable log holds {len(observed)}; they first differ at event "
+        f"{len(observed)}: emitted session.failed at sequence {terminal.sequence}, "
+        f"durable session.interrupted at sequence {terminal.sequence}."
+    )
+    with pytest.raises(TerminalSessionEvidenceError) as short:
+        await store.load_runner_owned_interrupted_evidence(
+            root_id,
+            observed_events=observed[:-1],
+        )
+    assert short.value.code is TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+    assert short.value.detail == (
+        f"Through the terminal event, the run emitted {len(observed) - 1} root events and "
+        f"the durable log holds {len(observed)}; they first differ at event "
+        f"{len(observed)}: emitted nothing, "
+        f"durable session.interrupted at sequence {terminal.sequence}."
+    )
+    assert str(short.value).endswith(short.value.detail)
 
     with pytest.raises(TerminalSessionEvidenceError) as missing_proof:
         await store.load_runner_owned_interrupted_evidence(root_id)
@@ -574,6 +627,27 @@ async def _exercise_runner_owned_interrupted_evidence(
             expected_parent_session_id="another-parent",
         )
     assert ambiguous_proof.value.code is TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+
+    # A newer run's terminal event lies past everything the runner drained.
+    await store.append_events(
+        root_id,
+        [
+            Event(id=f"{root_id}-resumed", type=EventType.SESSION_RESUMED, session_id=root_id),
+            Event(
+                id=f"{root_id}-interrupted-again",
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=root_id,
+            ),
+        ],
+    )
+    with pytest.raises(TerminalSessionEvidenceError) as newer_run:
+        await store.load_runner_owned_interrupted_evidence(root_id, observed_events=observed)
+    assert newer_run.value.code is TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+    assert newer_run.value.detail is not None
+    assert newer_run.value.detail.startswith(
+        f"Through the terminal event, the run emitted {len(observed)} root events and "
+        f"the durable log holds {len(observed) + 4};"
+    )
 
     child_id = f"{prefix}-runner-interrupted-child"
     await _create_interrupted_session(

@@ -10550,7 +10550,11 @@ export type EvalTrialPresentationV1 = {
     /**
      * Execution Failure Category
      */
-    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | null;
+    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | 'setup_failure' | 'limit_reached' | null;
+    /**
+     * Execution Limit
+     */
+    execution_limit?: 'input_tokens' | 'output_tokens' | 'total_tokens' | 'tool_calls' | 'model_steps' | 'elapsed_seconds' | 'estimated_cost' | 'execution_deadline' | null;
     /**
      * Execution Status
      */
@@ -17017,7 +17021,11 @@ export type PublishedEvalTrialResult = {
     /**
      * Execution Failure Category
      */
-    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | null;
+    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | 'setup_failure' | 'limit_reached' | null;
+    /**
+     * Execution Limit
+     */
+    execution_limit?: 'input_tokens' | 'output_tokens' | 'total_tokens' | 'tool_calls' | 'model_steps' | 'elapsed_seconds' | 'estimated_cost' | 'execution_deadline' | null;
     /**
      * Execution Status
      */

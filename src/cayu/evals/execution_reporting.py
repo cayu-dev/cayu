@@ -917,6 +917,15 @@ def _trial_section(trial: Any, presentation: EvalTrialPresentationV1) -> str:
         if failure_capture is not None
         else ""
     )
+    failure_category = presentation.execution_failure_category
+    run_failure_html = ""
+    if failure_category is not None:
+        cause = (
+            failure_category
+            if presentation.execution_limit is None
+            else f"{failure_category}: {presentation.execution_limit}"
+        )
+        run_failure_html = f"<p>Candidate run: failed ({_escape(cause)}).</p>"
     capture_diagnostic = getattr(trial, "capture_diagnostic", None)
     capture_html = (
         "<h5>Capture failure</h5><pre>"
@@ -930,7 +939,8 @@ def _trial_section(trial: Any, presentation: EvalTrialPresentationV1) -> str:
         f"<p>Score {_score(trial.score)} · {trial.duration_ms} ms · "
         f"evidence {'complete' if trial.evidence_complete else 'incomplete'} · "
         f"usage {_escape(usage)} · reason <code>{_escape(trial.code)}</code></p>"
-        f"<p>{_escape(trial.message)}</p>{capture_html}{failure_evidence_html}{failure_html}"
+        f"<p>{_escape(trial.message)}</p>{run_failure_html}{capture_html}"
+        f"{failure_evidence_html}{failure_html}"
         f"<p>{_escape(operations)}</p>"
         f"<p>Memory attribution: {_escape(memory_summary)} · revision "
         f"<code>{_escape(memory.revision)}</code></p>"

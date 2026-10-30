@@ -631,7 +631,17 @@ def _trial_section(trial: Any) -> str:
         else ""
     )
     execution = getattr(trial, "execution_status", None)
-    execution_html = f"<p>Workflow execution: {_escape(execution)}.</p>" if execution else ""
+    failure_category = getattr(trial, "execution_failure_category", None)
+    execution_limit = getattr(trial, "execution_limit", None)
+    if failure_category is not None:
+        cause = (
+            failure_category
+            if execution_limit is None
+            else f"{failure_category}: {execution_limit}"
+        )
+        execution_html = f"<p>Candidate run: failed ({_escape(cause)}).</p>"
+    else:
+        execution_html = f"<p>Workflow execution: {_escape(execution)}.</p>" if execution else ""
     failure_capture = getattr(trial, "failure_capture", None)
     failure_evidence = getattr(trial, "failure_evidence", None)
     failure_evidence_html = (

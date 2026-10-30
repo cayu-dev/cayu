@@ -506,7 +506,8 @@ def test_blocked_compiled_assertions_retain_their_definition_revision():
     result = asyncio.run(run_eval_case(app, case, suite_id="suite"))
 
     assertion = result.trials[0].assertions[0]
-    assert assertion.outcome is EvalOutcome.ERROR
+    assert assertion.outcome is EvalOutcome.UNAVAILABLE
+    assert "candidate_did_not_run" in assertion.message
     assert assertion.assertion_revision == assertion_spec_revision(spec)
 
 

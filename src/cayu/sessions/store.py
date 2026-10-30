@@ -4884,8 +4884,12 @@ class SessionStore(ABC):
     ) -> TerminalSessionEvidence:
         """Read one exact interrupted snapshot from a runner-owned execution tree.
 
-        A root read must compare the complete durable event-log identity with
-        ``observed_events``. A descendant read instead proves its direct parent
+        A root read must compare the durable event-log identity with
+        ``observed_events``, both through the current terminal event; records
+        after that event, such as terminal hooks or environment cleanup, are
+        outside the observed run.
+        A mismatch reports which counts, sequences or event types differ. A
+        descendant read instead proves its direct parent
         through ``expected_parent_session_id``; the caller must have established
         that parent as part of the same freshly executed tree. Exactly one proof
         is required. Implementations must apply record/count/byte limits before

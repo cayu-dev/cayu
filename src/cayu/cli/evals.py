@@ -441,6 +441,11 @@ async def _inspect_process(args: argparse.Namespace) -> int:
                 lines.append(
                     f"  Observed exception (provisional): {_inspection_text(case.observed_exception_type)}"
                 )
+            if case.execution_failure_category is not None:
+                cause = case.execution_failure_category
+                if case.execution_limit is not None:
+                    cause = f"{cause}: {case.execution_limit}"
+                lines.append(f"  Candidate run: failed ({cause})")
             if case.error:
                 lines.append(f"  Error: {_inspection_text(case.error)}")
             if case.unavailable_reason:

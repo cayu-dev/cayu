@@ -13,7 +13,9 @@ import pytest
 from cayu import Event, EventType, Message, RunRequest, SessionStatus
 from cayu.cli import main
 from cayu.evals import (
+    EvalAssertionResult,
     EvalCaseResult,
+    EvalOutcome,
     EvalRun,
     EvalStatus,
     EvalSuiteTrialPolicyV1,
@@ -30,7 +32,13 @@ def _write(path: Path, value) -> None:
     path.write_text(json.dumps(value))
 
 
-def _receipts(root: Path, *, results: int = 0, terminal: str | None = None) -> Path:
+def _receipts(
+    root: Path,
+    *,
+    results: int = 0,
+    terminal: str | None = None,
+    trial: EvalTrialResult | None = None,
+) -> Path:
     directory = root / "workers"
     directory.mkdir()
     _write(
@@ -61,8 +69,8 @@ def _receipts(root: Path, *, results: int = 0, terminal: str | None = None) -> P
         directory / "start.json",
         {"launch_id": "launch-1", "fingerprint": "a" * 64, "assignments": [["case-a"], ["case-b"]]},
     )
-    now = datetime.now(UTC)
-    for index in range(results):
+    now = datetime.now(UTC) if trial is None else trial.completed_at
+    if trial is None:
         trial = EvalTrialResult(
             trial_number=1,
             status=EvalStatus.ERROR,
@@ -70,6 +78,7 @@ def _receipts(root: Path, *, results: int = 0, terminal: str | None = None) -> P
             started_at=now,
             completed_at=now,
         )
+    for index in range(results):
         case = EvalCaseResult.from_trials(
             case_id=identity["case_ids"][index],
             trials=[trial],
@@ -339,6 +348,40 @@ def test_failure_cli_filters_cases_and_refuses_receipt_overwrite(tmp_path, capsy
         == 2
     )
     assert (directory / "launch.json").read_bytes() == original
+
+
+def test_failures_report_the_candidate_run_apart_from_its_assertions(tmp_path, capsys):
+    now = datetime.now(UTC)
+    not_evaluated = (
+        "Not evaluated (candidate_did_not_run): the candidate's run failed before it started."
+    )
+    trial = EvalTrialResult(
+        trial_number=1,
+        status=EvalStatus.ERROR,
+        error="KeyError: 'Environment not registered: no_environment'",
+        execution_status="failed",
+        execution_failure_category="setup_failure",
+        assertions=(
+            EvalAssertionResult(
+                name="FinalOutputContains",
+                outcome=EvalOutcome.UNAVAILABLE,
+                message=not_evaluated,
+            ),
+        ),
+        started_at=now,
+        completed_at=now,
+    )
+    directory = _receipts(tmp_path, results=2, terminal="completed", trial=trial)
+
+    assert main(["eval", "failures", str(directory), "--no-sessions", "--case", "case-a"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "  Candidate run: failed (setup_failure)" in lines
+    assert f"  FinalOutputContains: unavailable; {not_evaluated}" in lines
+    assert main(["eval", "failures", str(directory), "--no-sessions", "--json"]) == 0
+    case = json.loads(capsys.readouterr().out)["cases"][0]
+    assert case["execution_status"] == "failed"
+    assert case["execution_failure_category"] == "setup_failure"
+    assert case["execution_limit"] is None
 
 
 def test_finished_progress_cannot_promote_a_run_without_worker_results(tmp_path):

@@ -1826,7 +1826,10 @@ Interrupted sessions remain outside the production terminal-evidence contract
 used by promotion. A direct Python eval can nevertheless score an interruption
 that it created itself: the runner must drain that fresh execution, and an
 opted-in store must atomically match every emitted root event's durable
-sequence and type. Before payload hydration, built-in SQL stores apply bounded
+sequence and type, through the session's terminal event. Records after that
+event, such as terminal hooks or an environment's cleanup, are outside the run. A mismatch
+reports what differed: the event counts and the first differing sequence and
+event type. Before payload hydration, built-in SQL stores apply bounded
 counts and backend-specific working-set guards; evidence that passes those
 guards is then checked against the same exact canonical record and total byte
 limits used by every store.
@@ -1970,6 +1973,36 @@ unavailable or incomplete evidence are likewise explicit. CI callers can keep
 using the stable `0` / `1` / `2` exit contract: candidate failures and genuine
 regressions return `1`; evaluator/runtime failure, incomplete evidence, and
 incompatible or identity-unmatched comparisons return `2`.
+
+A trial records its candidate runtime outcome in `execution_status`,
+`execution_failure_category` and `execution_limit`:
+
+- A run that fails before its session starts, for example because the
+  request names an unregistered environment, has `execution_status="failed"`
+  and the category `setup_failure`. A session that fails while it is being set
+  up, for example because its environment factory was refused, has the same
+  status and the category of the cause, such as `environment_failure`; its
+  `error` keeps the refusal message and code, and `events_count` counts the
+  events the run emitted. A run that raises after its session started, with no
+  terminal snapshot, also has `execution_status="failed"`, with the category
+  of the cause or `execution_failure`.
+- The assertions of a run with `execution_status="failed"` are not evaluated.
+  Each is `unavailable`, and its message names the reason:
+  `candidate_did_not_run` or `candidate_run_failed`. The run's error, with a
+  traceback bounded to its last 4,096 characters, is kept once, on the trial.
+  The trial is a runtime error, never an evaluator error. An assertion that
+  raises while it evaluates a run that did execute is still an evaluator
+  `error`.
+- A session that fails after it started keeps its exact snapshot and the
+  category of the cause: `environment_failure`, `provider_failure` or
+  `execution_failure`.
+- A run stopped by a run limit has the category `limit_reached` and
+  `execution_limit` naming the limit, such as `elapsed_seconds`. It keeps its
+  events, usage and output, and its assertions still score what the candidate
+  did before the limit, so its candidate outcome comes from them.
+
+The HTML reports and `cayu eval failures` show this as `Candidate run: failed
+(<category>)`, or `(limit_reached: <limit>)` for a run limit.
 
 For every AI judgment, the presentation retains the safe judge-profile and
 evaluator-implementation identity, independent/same-model label, diagnostic,
