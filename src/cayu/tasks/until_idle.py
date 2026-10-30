@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -25,8 +25,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from cayu.applications import CayuApp
+    from cayu.tasks.abandoned import FencedTaskMonitor
     from cayu.tasks.store import TaskStore
-    from cayu.tasks.worker import TaskHandler
+    from cayu.tasks.worker import TaskHandler, _InterruptedHandoffRecoveryPage
 
 _UNTIL_IDLE_REQUESTED: ContextVar[bool] = ContextVar("cayu_worker_until_idle", default=False)
 
@@ -42,16 +43,31 @@ class TaskWorkerIdleResult(BaseModel):
     The times are the store's observation, for the worker's ``query``, made
     just before the claim that found nothing (see
     :class:`cayu.tasks.TaskScheduleWakeup`). ``next_available_at`` is the
-    earliest time a pending scheduled task becomes claimable and
-    ``next_expiry_at`` the earliest time one stops being admissible, so a sweep
-    can record that it expired. They are empty when nothing is scheduled or
-    the run was not idle.
+    earliest time a pending scheduled task becomes claimable.
+    ``next_expiry_at`` is the earliest time a scheduled task stops being
+    admissible, so a sweep can record that it expired, or, with
+    ``reconcile_abandoned_after_s``, a task fenced after worker loss becomes
+    due to be settled. Claims held by other workers, live or dead, are not
+    reported: after a run that crashed, wait for its claims to expire
+    (``lease_seconds``) before starting the worker again. The times are empty
+    when nothing is scheduled or the run was not idle.
 
     Start the worker again at once when ``maintenance_required`` is true
     (expired or skipped tasks were still waiting to be recorded after the
-    worker claimed again) or ``continuations_pending`` is true (a handled task
-    may have handed off a session that this run, which scans for
-    continuations once, didn't continue).
+    worker claimed again, recovering a session failed on a task for the first
+    time, or looking for fenced tasks failed) or ``continuations_pending`` is
+    true (a handled task may have handed off a session that this run, which
+    scans for continuations once, didn't continue). If a run reports the same
+    signals as the run before it, back off before starting it again.
+
+    ``attention_required`` is true when a task in the worker's scope can't
+    progress until someone acts: a task fenced after worker loss that this
+    worker won't settle, a session whose recovery needs ``cayu recovery``
+    (for example ``ModelCompletionManualRecoveryRequired``), or one whose
+    recovery failed again when the run retried it at once. The worker logs a
+    warning naming each one. It is also true when the run found more than
+    100,000 fenced tasks, more than it reads in one run. Starting the worker
+    again doesn't help; start it once that is done.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -62,6 +78,7 @@ class TaskWorkerIdleResult(BaseModel):
     next_expiry_at: datetime | None = None
     maintenance_required: StrictBool = False
     continuations_pending: StrictBool = False
+    attention_required: StrictBool = False
 
 
 @dataclass
@@ -82,9 +99,40 @@ class _TaskWorkerIdleExit:
     claimed_again: bool = False
     observation: TaskScheduleWakeup | None = None
     idle: bool = False
+    # Tasks the latest whole pass of interrupted-handoff recovery failed on, and
+    # those of them the pass before failed on too.
+    recovery_failed: frozenset[str] = frozenset()
+    recovery_repeated: frozenset[str] = frozenset()
+    manual_recovery_required: bool = False
+    # A pass that failed is retried once at once, before the run returns.
+    recovery_retried: bool = False
+    recovery_retry_pending: bool = False
+    fenced: FencedTaskMonitor | None = None
+    fenced_scan_failed: bool = False
+    _pass_failed: set[str] = field(default_factory=set)
+    _pass_manual: bool = False
 
     def may_return(self) -> bool:
         return self.maintenance_settled and self.continuations_scanned and self.steps_running == 1
+
+    def record_recovery_page(
+        self, page: _InterruptedHandoffRecoveryPage, *, first_page: bool
+    ) -> None:
+        if first_page:
+            self._pass_failed = set()
+            self._pass_manual = False
+            self.recovery_retry_pending = False
+        self._pass_failed |= page.failed
+        self._pass_manual |= page.manual_recovery_required
+        if not page.exhausted:
+            return
+        failed = frozenset(self._pass_failed)
+        self.recovery_repeated = failed & self.recovery_failed
+        self.recovery_failed = failed
+        self.manual_recovery_required = self._pass_manual
+        if failed and not self.recovery_retried:
+            self.recovery_retried = True
+            self.recovery_retry_pending = True
 
     def claim_again(self, observation: TaskScheduleWakeup | None, observed_after: int) -> bool:
         """Record an empty claim; return True to observe and claim once more first.
@@ -109,13 +157,21 @@ class _TaskWorkerIdleExit:
         observation = self.observation
         if not self.idle or observation is None:
             return TaskWorkerIdleResult(handled=handled, idle=self.idle)
+        fenced = self.fenced
+        expiries = [observation.next_expiry_at, None if fenced is None else fenced.next_settle_at]
         return TaskWorkerIdleResult(
             handled=handled,
             idle=True,
             next_available_at=observation.next_available_at,
-            next_expiry_at=observation.next_expiry_at,
-            maintenance_required=observation.maintenance_required,
+            next_expiry_at=min((time for time in expiries if time is not None), default=None),
+            maintenance_required=observation.maintenance_required
+            or bool(self.recovery_failed - self.recovery_repeated)
+            or self.fenced_scan_failed,
             continuations_pending=self.continuations_pending,
+            # A failure the run's immediate retry hit again won't clear by itself.
+            attention_required=self.manual_recovery_required
+            or bool(self.recovery_repeated)
+            or (fenced is not None and (fenced.attention_required or fenced.pass_unfinished)),
         )
 
 

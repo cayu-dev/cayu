@@ -27,6 +27,14 @@ cayu worker dispatch
 cayu worker fresh --shutdown-grace-seconds 45
 ```
 
+A worker whose stores are PostgreSQL needs the `postgres` extra, and serving the
+same application with `cayu serve` (its webhooks, the dashboard, Cayu Cloud's
+schedule route) needs the `server` extra too: `pip install "cayu[postgres,server]"`,
+or `uv sync --extra postgres --extra server` in a Cayu checkout. The in-memory and
+SQLite stores need neither. `cayu serve` also starts only with `--dev` (an
+unauthenticated server on a loopback address, for local development) or an auth
+target (`--auth MODULE:ATTRIBUTE`, or `[tool.cayu.serve].auth`).
+
 Every target has one contract: an `async def` callable with two required
 positional parameters, `(app, stop)`. `app` is the freshly constructed
 `CayuApp`; `stop` is an `asyncio.Event` set by SIGINT or SIGTERM. Invalid
@@ -168,9 +176,12 @@ itself:
 cayu worker dispatch --reconcile-abandoned-after-seconds 120
 ```
 
-A task fenced under another worker id is then settled as cancelled once the
-worker has seen it fenced for 120 seconds, with the declaration recorded as the
-validator; create a new task if the work should run again. The flag sets
+A task fenced under another worker id is then settled as cancelled once it has
+been fenced for 120 seconds, counted from its stored lease expiry by the store's
+clock (so a worker started again, such as with `--until-idle`, keeps counting;
+with a custom store that doesn't report that clock, `supports_lease_clock`, from
+when this process first saw it fenced),
+with the declaration recorded as the validator; create a new task if the work should run again. The flag sets
 `CAYU_WORKER_RECONCILE_ABANDONED_AFTER_S`, which `run_task_worker` reads when the
 entrypoint doesn't pass `reconcile_abandoned_after_s` itself. It is off by
 default and refused with `--processes`, because with several workers an expired
@@ -246,6 +257,10 @@ async def run_fresh_tasks(app: CayuApp, stop):
     )
 ```
 
+This worker runs only `domain_job` tasks. A worker that should also continue
+`sleep_until` wakes or app-hosted external-event waits must not filter out their
+task types; pass `query=None` for one worker that runs everything.
+
 The store must report scheduled task times (`supports_task_scheduling`; every
 built-in store does); otherwise the call fails before claiming anything.
 
@@ -259,18 +274,52 @@ run. The command closes the app, then prints one JSON line and exits `0`; read
 the last line of stdout:
 
 ```json
-{"handled":2,"idle":true,"next_available_at":"2027-01-15T12:00:00Z","next_expiry_at":null,"maintenance_required":false,"continuations_pending":false}
+{"handled":2,"idle":true,"next_available_at":"2027-01-15T12:00:00Z","next_expiry_at":null,"maintenance_required":false,"continuations_pending":false,"attention_required":false}
 ```
 
-Start the worker again at `next_available_at` (a scheduled task becomes
-claimable) or `next_expiry_at` (a scheduled task stops being admissible and a
-worker records it as expired), whichever is earlier. Start it again at once when
-`idle` is false (`max_tasks` or a stop ended the run, so work may still be due),
-`maintenance_required` is true, or `continuations_pending` is true. Both times
-are `null` when nothing is scheduled. They come from the store just before the
-claim that found nothing, so a task that becomes due while the worker exits is
-never missed. They cover only that worker's `query`: with several worker names,
-start each at its own time, or one host timer at the earliest.
+Start the worker again at `next_available_at` or `next_expiry_at`, whichever is
+earlier:
+
+- `next_available_at`: a scheduled task becomes claimable.
+- `next_expiry_at`: a scheduled task stops being admissible, and the worker
+  records it as expired; or, with `--reconcile-abandoned-after-seconds`, a
+  fenced task becomes due to be settled. It covers nothing else: claims that
+  other workers hold, live or dead, are not reported.
+
+After a run that crashed or was killed (a non-zero exit, or no result line),
+wait until its task claims expire, `lease_seconds` after it ended (300 by
+default), before starting the worker again, as Cayu Cloud does. A run started
+earlier finds those tasks still claimed and can't take them over.
+
+Start it again at once when `idle` is false (`max_tasks` or a stop ended the
+run, so work may still be due), `maintenance_required` is true (also when
+recovering a session failed on a task for the first time, or looking for
+fenced tasks failed), or `continuations_pending` is true. When a run reports
+the same signals as the run before it (handled nothing, the same flags, the same times), back off
+before starting it again, for example by doubling the delay from a minute up
+to an hour: a flag no run can clear would otherwise restart the worker
+forever. Both times are `null` when nothing is scheduled. They come from the
+store just before the claim that found nothing, so a task that becomes due
+while the worker exits is never missed. They cover only that worker's `query`: with several worker
+names, start each at its own time, or one host timer at the earliest.
+
+`attention_required` means a person must act: a task can't progress until
+someone does, and the worker logged a warning naming it:
+
+- a task fenced after worker loss that this worker won't settle (see
+  [when a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task));
+  each run reads every fenced task in its scope, so later ones are never
+  left behind tasks that can't be settled yet;
+- more than 100,000 fenced tasks, more than one run reads: an unusual number,
+  which someone should look into;
+- a session whose recovery needs an operator decision, such as
+  `ModelCompletionManualRecoveryRequired` after a worker died during a model
+  call (`cayu recovery plan`, then `cayu recovery execute`);
+- a session whose recovery failed, and failed again when the run retried it at
+  once.
+
+Starting the worker again doesn't help, so don't schedule a run for it; start
+the worker once that is done.
 
 The continuation scan runs once per start, in one slot, so a handed-off session
 that waits on a person doesn't keep the worker running or get continued after
@@ -282,11 +331,11 @@ itself:
 
 - tasks created after the run, for example by the web process;
 - a session handed off later, for example when a person answers in the web
-  process, and attached handoffs whose owner's lease is still live;
-- claims of a run that was killed or failed, which expire after
-  `lease_seconds` (300 by default); start the worker again after a non-zero exit;
-- tasks fenced after worker loss, which `reconcile_abandoned_after_s` settles
-  only after a worker has seen them fenced for that long;
+  process or after `cayu recovery execute`, which a worker with a
+  `recovered_interrupted_task_handler` continues;
+- claims of a run that was killed or failed, and of any other worker that
+  stopped: wait `lease_seconds` (300 by default) after a run that crashed, as
+  above;
 - tasks blocked by a concurrency key or a dependency held by work in another
   process;
 - event retry deadlines of pending and paused tasks, enforced only while a

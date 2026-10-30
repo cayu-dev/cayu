@@ -381,8 +381,8 @@ await run_task_worker(
 ```
 
 At its reclaim cadence, whether or not its handler is busy, it settles every
-fenced task in its `query`'s scope that another worker id holds, once it has
-seen the task fenced for at least 120 seconds, through
+fenced task in its `query`'s scope that another worker id holds, once the task
+has been fenced for at least 120 seconds since its lease expired, through
 `reconcile_abandoned_task_cancellation` with validator
 `cayu.task-worker.single-worker`, and logs a warning for each. It leaves tasks
 under its own worker id, session-attached tasks and retry series alone. `cayu
@@ -390,8 +390,13 @@ worker --reconcile-abandoned-after-seconds 120` sets the same option for a
 project worker. Don't set it when several workers or processes claim the same
 tasks: a worker whose heartbeat is slow can still be running a task whose lease
 expired. The store decides that a lease expired by its own clock, and the
-worker counts the 120 seconds on its own monotonic clock, so skew between the
-two can't shorten the wait. `reconcile_abandoned_tasks(task_store,
+120 seconds count from the stored lease expiry on that same clock, so a worker
+whose clock runs ahead of the store's can't shorten the wait, and a worker
+started again (for example each `--until-idle` run) keeps counting where the
+last one was. A store clock that steps forward does shorten it, as it shortens
+the lease itself. A custom store that doesn't report its lease clock
+(`supports_lease_clock`) counts from when this worker process first saw
+the task fenced. `reconcile_abandoned_tasks(task_store,
 live_worker_ids=..., validator_id=..., validator_version=...)` settles every
 fenced task held by a worker not in `live_worker_ids` at once, for an
 application that knows which workers are live some other way, for example from

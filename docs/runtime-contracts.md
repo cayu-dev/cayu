@@ -7993,9 +7993,12 @@ the handler runs is logged and retried at the next interval. With
 `reconcile_abandoned_after_s` (or `CAYU_WORKER_RECONCILE_ABANDONED_AFTER_S`,
 which `cayu worker --reconcile-abandoned-after-seconds` sets) it declares itself
 the only worker for that scope and settles each ordinary, unattached fenced
-task held by another worker id once it has listed the task as fenced for at
-least that long, counted on its monotonic clock from the first scan that saw
-it (lease expiry itself is the store's decision), through
+task held by another worker id once the task's stored `lease_expires_at` is
+at least that long before the store's lease clock (`TaskStore.lease_clock()`,
+`supports_lease_clock`),
+so the wait survives worker restarts and a worker clock that runs ahead (a
+store clock that steps forward shortens it; a store without that clock counts
+from this process's first sight, on its monotonic clock), through
 `reconcile_abandoned_task_cancellation` with validator
 `cayu.task-worker.single-worker` version `1`, evidence
 `lease-expired-at:<lease expiry>`, and the declaring worker as the `SYSTEM`
@@ -20479,7 +20482,7 @@ carries its source's status, no `ended_at`, and only its own counts and cost.
 | `release_id` | The [Release](#release-identity) the session's latest event that begins work recorded, or `null`. |
 | `model_steps`, `tool_calls` | The session's own counts, as usage accounting reports them. |
 | `cost` | `{"amount", "currency", "complete"}`: the session's own estimated cost with Cayu's bundled price book, as `get_session_cost` computes it. `amount` is a decimal string. `complete` is false when a model step or auxiliary attempt could not be priced, so the amount is low. |
-| `waiting_for` | The session's pending actions: `{"kind", "attention_id", "tool_name", "requested_at", "child_session_id", "child_run_id", "external_wait"}`, `kind` being `tool_approval`, `user_input`, `manual_recovery`, `delegated_action` or `external_event`. `attention_id` is the identity pending-action reads, `get_human_attention_state` and touches use. A delegated action has none and names in `child_session_id` the child whose own item a person settles. `child_run_id` is set only when the retained wait proves that exact child incarnation; a missing or replacement child is not followed. An `external_event` item is a session parked on an [external-event wait](external-event-waits.md); see below. `external_wait` is `null` for every other kind. |
+| `waiting_for` | The session's pending actions: `{"kind", "attention_id", "tool_name", "requested_at", "child_session_id", "child_run_id", "external_wait", "wake_at"}`, `kind` being `tool_approval`, `user_input`, `manual_recovery`, `delegated_action`, `external_event` or `wake`. `attention_id` is the identity pending-action reads, `get_human_attention_state` and touches use. A delegated action has none and names in `child_session_id` the child whose own item a person settles. `child_run_id` is set only when the retained wait proves that exact child incarnation; a missing or replacement child is not followed. An `external_event` item is a session parked on an [external-event wait](external-event-waits.md); see below. `external_wait` is `null` for every other kind. A `wake` item is a session asleep in [`sleep_until`](task-scheduling.md#let-an-agent-sleep-and-continue-later): no person settles it, it has no `attention_id`, and `wake_at` is when it continues on its own, in UTC. `wake_at` is `null` for every other kind. A parent waiting on a sleeping subagent has a `delegated_action` item naming the subagent; the `wake` item is on the subagent's own row. |
 
 A session parked on an external-event wait (`SessionExternalWaitAdapter.run_to_wait`
 or `resume_to_wait`) is `interrupted`, with an `external_event` item in

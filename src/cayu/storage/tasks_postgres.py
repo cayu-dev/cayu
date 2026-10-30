@@ -398,6 +398,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         return await list_events(self, group_id, after_sequence=after_sequence, limit=limit)
 
     supports_task_scheduling: ClassVar[bool] = True
+    supports_lease_clock: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
@@ -1617,6 +1618,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 next_expiry_at=expiry,
                 maintenance_required=maintenance,
             )
+
+    async def lease_clock(self) -> datetime:
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            # Leases expire by the database clock, whatever clock the store was given.
+            return await self._database_now(cur)
 
     async def load_task(self, task_id: str, *, _access_bounds=None) -> Task | None:
         if _access_bounds is None:

@@ -235,7 +235,7 @@ def test_reconcile_abandoned_tasks_settles_fences_of_gone_workers_only(
     asyncio.run(scenario())
 
 
-def test_the_declared_wait_counts_from_the_first_scan_whatever_the_store_clock(
+def test_the_declared_wait_counts_from_the_lease_expiry_by_the_store_clock(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     import cayu.tasks.abandoned as abandoned
@@ -244,11 +244,111 @@ def test_the_declared_wait_counts_from_the_first_scan_whatever_the_store_clock(
 
     async def scenario() -> None:
         clock = _Clock()
-        # The store's clock runs five minutes ahead of the worker's.
+        # The store's clock runs five minutes ahead of the worker's; only the store's counts.
         clock.value += timedelta(minutes=5)
         store = InMemoryTaskStore(ownership_clock=clock)
         dead = await _started_claim(store, "dead", "worker-old")
         await _fence_after_worker_loss(store, clock, [dead])
+        assert dead.lease_expires_at is not None
+        settle_at = dead.lease_expires_at + timedelta(seconds=120)
+
+        first = abandoned.FencedTaskMonitor(
+            store,
+            worker_id="worker-new",
+            query=TaskQuery(type="scan"),
+            reconcile_abandoned_after_s=120,
+        )
+        # Fenced one second ago by the store's clock: 119 seconds to go.
+        assert await first.scan() == []
+        assert first.next_settle_at == settle_at
+        assert not first.attention_required
+        clock.value = settle_at - timedelta(seconds=1)
+        assert await first.scan() == []
+        clock.value = settle_at
+        [settled] = await first.scan()
+        assert settled.id == "dead" and settled.status is TaskStatus.CANCELLED
+        assert first.next_settle_at is None and not first.attention_required
+
+    asyncio.run(scenario())
+    [message] = _warnings(caplog, "is fenced")
+    assert "once 120 seconds have passed since its lease expired" in message
+
+
+def test_a_due_task_whose_settlement_loses_a_race_keeps_no_settle_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.tasks.abandoned as abandoned
+
+    async def lost_race(*_args: object, **_kwargs: object) -> list[Task]:
+        # As when _settle_abandoned skips a task on TaskClaimLost or a terminal conflict.
+        return []
+
+    async def scenario() -> None:
+        clock = _Clock()
+        store = InMemoryTaskStore(ownership_clock=clock)
+        dead = await _started_claim(store, "dead", "worker-old")
+        await _fence_after_worker_loss(store, clock, [dead])
+        assert dead.lease_expires_at is not None
+        monitor = abandoned.FencedTaskMonitor(
+            store,
+            worker_id="worker-new",
+            query=TaskQuery(type="scan"),
+            reconcile_abandoned_after_s=120,
+        )
+        assert await monitor.scan() == []
+        assert monitor.next_settle_at == dead.lease_expires_at + timedelta(seconds=120)
+        monkeypatch.setattr(abandoned, "_settle_abandoned", lost_race)
+        clock.value = dead.lease_expires_at + timedelta(seconds=120)
+        assert await monitor.scan() == []
+        assert monitor.next_settle_at is None
+
+    asyncio.run(scenario())
+
+
+def test_fences_this_worker_wont_settle_need_attention() -> None:
+    import cayu.tasks.abandoned as abandoned
+
+    async def scenario() -> None:
+        clock = _Clock()
+        store = InMemoryTaskStore(ownership_clock=clock)
+        dead = await _started_claim(store, "dead", "worker-old")
+        own = await _started_claim(store, "own", "worker-new")
+        await _fence_after_worker_loss(store, clock, [dead, own])
+        undeclared = abandoned.FencedTaskMonitor(
+            store,
+            worker_id="worker-new",
+            query=TaskQuery(type="scan"),
+            reconcile_abandoned_after_s=None,
+        )
+        assert await undeclared.scan() == []
+        assert undeclared.attention_required and undeclared.next_settle_at is None
+        declared = abandoned.FencedTaskMonitor(
+            store,
+            worker_id="worker-new",
+            query=TaskQuery(type="scan"),
+            reconcile_abandoned_after_s=0,
+        )
+        [settled] = await declared.scan()
+        assert settled.id == "dead"
+        # The fence under its own id still waits for someone.
+        assert declared.attention_required
+
+    asyncio.run(scenario())
+
+
+def test_a_store_without_a_lease_clock_counts_the_wait_from_first_sight() -> None:
+    import cayu.tasks.abandoned as abandoned
+
+    class LeaselessStore(InMemoryTaskStore):
+        supports_lease_clock = False
+
+    async def scenario() -> None:
+        clock = _Clock()
+        store = LeaselessStore(ownership_clock=clock)
+        dead = await _started_claim(store, "dead", "worker-old")
+        await _fence_after_worker_loss(store, clock, [dead])
+        # Long past the lease: only this process's own wait counts on this store.
+        clock.value += timedelta(hours=1)
         elapsed = [0.0]
         monitor = abandoned.FencedTaskMonitor(
             store,
@@ -257,8 +357,8 @@ def test_the_declared_wait_counts_from_the_first_scan_whatever_the_store_clock(
             reconcile_abandoned_after_s=120,
             clock=lambda: elapsed[0],
         )
-        # Fenced one second ago by the store's clock: the wait starts now.
         assert await monitor.scan() == []
+        assert monitor.next_settle_at is None
         elapsed[0] = 119.0
         assert await monitor.scan() == []
         elapsed[0] = 120.0
@@ -266,8 +366,6 @@ def test_the_declared_wait_counts_from_the_first_scan_whatever_the_store_clock(
         assert settled.id == "dead" and settled.status is TaskStatus.CANCELLED
 
     asyncio.run(scenario())
-    [message] = _warnings(caplog, "is fenced")
-    assert "once it has stayed fenced for 120 seconds" in message
 
 
 def test_counts_and_listings_keep_the_store_expiry_decision(tmp_path: Path) -> None:
@@ -769,22 +867,24 @@ def test_the_declared_wait_survives_scans_that_each_read_part_of_the_backlog(
             await _started_claim(store, f"dead-{index}", "worker-old") for index in range(10)
         ]
         await _fence_after_worker_loss(store, clock, started)
-        elapsed = [0.0]
         monitor = abandoned.FencedTaskMonitor(
             store,
             worker_id="worker-new",
             query=TaskQuery(type="scan"),
             reconcile_abandoned_after_s=100,
-            clock=lambda: elapsed[0],
         )
         # Three scans see the whole backlog of ten, four at a time.
         for _ in range(3):
             assert await monitor.scan() == []
-        elapsed[0] = 100.0
+        last_lease = max(task.lease_expires_at for task in started)  # type: ignore[type-var]
+        first_lease = min(task.lease_expires_at for task in started)  # type: ignore[type-var]
+        assert monitor.next_settle_at == first_lease + timedelta(seconds=100)
+        clock.value = last_lease + timedelta(seconds=100)
         settled: list[Task] = []
         for _ in range(4):
             settled.extend(await monitor.scan())
         assert sorted(task.id for task in settled) == [f"dead-{index}" for index in range(10)]
         assert await store.list_tasks(TaskQuery(fenced_after_worker_loss=True)) == []
+        assert monitor.next_settle_at is None
 
     asyncio.run(scenario())

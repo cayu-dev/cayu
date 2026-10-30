@@ -137,6 +137,7 @@ def test_timer_worker_runs_due_timers_until_idle(tmp_path: Path) -> None:
         "next_expiry_at": None,
         "maintenance_required": False,
         "continuations_pending": False,
+        "attention_required": False,
     }
 
 

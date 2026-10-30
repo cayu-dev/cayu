@@ -359,8 +359,7 @@ def test_the_monitor_says_what_it_will_do_with_each_fenced_task(
             store,
             worker_id="worker-new",
             query=TaskQuery(type="scan"),
-            reconcile_abandoned_after_s=60,
-            clock=lambda: 0.0,
+            reconcile_abandoned_after_s=600,
             settlement=AbandonedTaskSettlement.RESTART,
         )
         assert await monitor.scan() == []
@@ -373,7 +372,9 @@ def test_the_monitor_says_what_it_will_do_with_each_fenced_task(
     }
     assert "can't be restarted" in messages["plain"]
     assert "already restarted 0 time(s) after worker loss, its limit" in messages["capped"]
-    assert "will restart it once it has stayed fenced for 60 seconds" in messages["restartable"]
+    assert ("will restart it once 600 seconds have passed since its lease expired") in messages[
+        "restartable"
+    ]
     assert "(restart 1 of 2 after worker loss)" in messages["restartable"]
 
 

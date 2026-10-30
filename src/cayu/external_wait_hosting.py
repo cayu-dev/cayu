@@ -130,6 +130,17 @@ class ExternalEventSource(ABC):
         """
 
 
+def external_wait_hosting(app: CayuApp) -> ExternalWaitHosting | None:
+    """The external-event waits ``host_external_waits`` set up, or ``None`` before it ran.
+
+    ``app.external_wait_hosting`` reads it. A task handler uses it to register a
+    wait and park its session on it. The type is
+    :class:`cayu.sessions.ExternalWaitHosting`.
+    """
+
+    return app._external_wait_hosting
+
+
 def host_external_waits(
     app: CayuApp,
     *,

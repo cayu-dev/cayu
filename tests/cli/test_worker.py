@@ -917,6 +917,7 @@ def test_worker_until_idle_runs_due_tasks_and_prints_the_next_wake(
             "next_expiry_at": None,
             "maintenance_required": False,
             "continuations_pending": False,
+            "attention_required": False,
         }
     ]
     assert (project / "handled.txt").read_text(encoding="utf-8").split() == ["due-1", "due-2"]

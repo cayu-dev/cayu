@@ -43,16 +43,31 @@ Application-wide policies remain configured on `CayuApp` as usual.
 `app.host_external_waits(...)` builds the parts below once from the application's
 own session and task stores, in the factory that both commands load. After that the
 task worker services the waits and `cayu serve` takes their webhooks, so the
-application writes no servicing loop, deadline handler or delivery route:
+application writes no servicing loop, deadline handler or delivery route.
+`cayu serve` needs `cayu[server]`, and PostgreSQL stores need `cayu[postgres]`
+(`pip install "cayu[postgres,server]"`; see [named workers](project-workers.md#run-a-named-worker)):
 
 ```python
 import json
 
 from cayu.external_wait_hosting import ExternalEventSource, ReceivedExternalEvent
-from cayu.external_waits import ExternalWaitContext
+from cayu.external_waits import ExternalWaitAccessPolicy, ExternalWaitContext
 from cayu.sessions.external_waits import ExternalWaitScope
 
 SCOPE = ExternalWaitScope(application_scope="video-service", generation=1)
+WORKER = ExternalWaitContext(principal="cayu-worker")
+# The hosting context services waits and schedules their deadlines (read, service),
+# starts waits from task handlers (reserve, register) and stops a task's wait (cancel).
+WORKER_ACTIONS = frozenset({"read", "service", "reserve", "register", "cancel"})
+
+
+class RendererPolicy(ExternalWaitAccessPolicy):
+    def authorize(self, context, *, scope, source, action):
+        if scope.application_scope != SCOPE.application_scope or source != "renderer":
+            return False
+        if context.principal == "renderer-webhook":
+            return action == "deliver"
+        return context.principal == WORKER.principal and action in WORKER_ACTIONS
 
 
 class RendererWebhook(ExternalEventSource):
@@ -77,8 +92,8 @@ class RendererWebhook(ExternalEventSource):
 def build_app():
     app = CayuApp(session_store=..., task_store=...)
     app.host_external_waits(
-        access_policy=JobPolicy(),  # As in the next section.
-        context=ExternalWaitContext(principal="cayu-worker"),
+        access_policy=RendererPolicy(),
+        context=WORKER,
         scopes={SCOPE: ("renderer",)},
         sources=(RendererWebhook(),),
         delivery_path="/webhooks/waits",
@@ -185,14 +200,88 @@ due needs nothing specific to external waits.
 
 The documented way to run an agent in the background is a task handler under
 `cayu worker` that links the session to its task. Such a handler can wait on an
-external event too: it runs its session to the wait under its worker's claim and
-returns `TaskHandlerOutcome.SESSION_INTERRUPTED`.
+external event too: it reserves a correlation, registers the wait, runs its
+session to the wait under its worker's claim, and returns
+`TaskHandlerOutcome.SESSION_INTERRUPTED`.
+
+The factory hosts the waits as above, and every process that loads it gets the same
+hosting back from `app.external_wait_hosting` (`None` until `host_external_waits`
+ran; annotate it with `cayu.sessions.ExternalWaitHosting`). The handler acts as the
+hosting's own principal, `hosting.context`, which `RendererPolicy` grants `reserve`,
+`register`, `service` and `cancel` besides `read`, while the webhook's principal gets
+only `deliver`; use a separate context if your policy keeps those apart. A webhook source authenticates its sender
+from the raw body: `await request.body()` returns it already bounded to
+`max_request_bytes`.
 
 ```python
+import hashlib
+import hmac
+import json
+import os
+from datetime import datetime
+
+from cayu import Message, RunRequest
+from cayu.external_wait_hosting import ExternalEventSource, ReceivedExternalEvent
+from cayu.external_waits import ExternalWaitContext
+from cayu.sessions.external_waits import (
+    ExternalCorrelationRequest,
+    ExternalWaitRegistration,
+    ExternalWaitScope,
+)
 from cayu.tasks import TaskHandlerOutcome
+
+SCOPE = ExternalWaitScope(application_scope="video-service", generation=1)
+
+
+class SignedRenderer(ExternalEventSource):
+    """The renderer signs the raw body with HMAC-SHA256, hex, in X-Signature."""
+
+    source = "renderer"
+
+    async def receive(self, request):
+        body = await request.body()  # Already bounded by max_request_bytes.
+        secret = os.environ["RENDERER_WEBHOOK_SECRET"].encode()
+        expected = hmac.new(secret, body, hashlib.sha256).hexdigest().encode()
+        # Compare bytes: a header that isn't ASCII is a mismatch (401), not an error.
+        signature = request.headers.get("x-signature", "").encode()
+        if not hmac.compare_digest(expected, signature):
+            return None  # The route answers 401.
+        data = json.loads(body)
+        return ReceivedExternalEvent(
+            context=ExternalWaitContext(principal="renderer-webhook"),
+            scope=ExternalWaitScope(
+                application_scope=SCOPE.application_scope, generation=data["generation"]
+            ),
+            correlation_key=data["job_id"],
+            delivery_id=data["delivery_id"],
+            payload_json=json.dumps(data["result"]),
+        )
 
 
 async def handle(app, task, worker_id):
+    hosting = app.external_wait_hosting
+    context = hosting.context
+    # The deadline comes from the task's input, so a retried handler reserves the
+    # same correlation, with the same deadline, and replays it.
+    deadline = task.input.get("deadline")
+    correlation = await hosting.waits.reserve_correlation(
+        ExternalCorrelationRequest(
+            scope=SCOPE,
+            source="renderer",
+            correlation_key=task.input["job_id"],
+            deadline=None if deadline is None else datetime.fromisoformat(deadline),
+        ),
+        context=context,
+    )
+    registration = ExternalWaitRegistration(
+        correlation=correlation,
+        operation_key="wait-" + task.input["job_id"],
+        projector_id="json",
+        projector_version=1,
+    )
+    # Registers the wait and schedules its deadline task; `hosting.waits.register`
+    # alone would leave the deadline unobserved.
+    await hosting.register(registration, context=context)
     await hosting.run_to_wait(
         RunRequest(
             agent_name="renderer",
@@ -207,6 +296,13 @@ async def handle(app, task, worker_id):
     )
     return TaskHandlerOutcome.SESSION_INTERRUPTED
 ```
+
+Create the task with the job and its deadline in its input, for example
+`TaskCreate(type="render", input={"job_id": "video-42", "deadline": "2027-01-15T12:00:00+00:00"})`,
+and pass `sources=(SignedRenderer(),)` and a `delivery_path` to
+`host_external_waits`. Never compute the deadline in the handler from the current
+time: a retry would ask for a different one, and reserving the same key with a
+different deadline conflicts.
 
 - **Parking.** The worker hands the task off *parked* on the wait: it stays
   `running` with no worker and no lease, and its handoff names the wait

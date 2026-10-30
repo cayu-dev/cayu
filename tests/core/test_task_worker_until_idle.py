@@ -144,6 +144,7 @@ def test_until_idle_returns_at_once_when_nothing_is_due():
             "next_expiry_at": None,
             "maintenance_required": False,
             "continuations_pending": False,
+            "attention_required": False,
         }
 
     asyncio.run(run())

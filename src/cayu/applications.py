@@ -317,6 +317,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
 from cayu.external_agents._session_control import require_native_session
+from cayu.external_wait_hosting import external_wait_hosting as _external_wait_hosting
 from cayu.external_wait_hosting import host_external_waits as _host_external_waits
 from cayu.fork_controllers import (
     ForkController,
@@ -5911,6 +5912,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         return self._agent_registry._agents
 
     host_external_waits = _host_external_waits
+    external_wait_hosting = property(_external_wait_hosting)
 
     def register_task_type(self, spec: TaskTypeSpec) -> TaskTypeSpec:
         """Declare a public task type without starting or scheduling work."""

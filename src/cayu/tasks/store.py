@@ -269,6 +269,8 @@ class TaskStore(ABC):
         raise NotImplementedError("This TaskStore does not support task graphs.")
 
     supports_task_scheduling: ClassVar[bool] = False
+    # True when lease_clock reads the clock this store decides lease expiry by.
+    supports_lease_clock: ClassVar[bool] = False
     supports_task_topology: ClassVar[bool] = False
     supports_idempotent_terminalization: ClassVar[bool] = False
     supports_attached_task_recovery_terminalization: ClassVar[bool] = False
@@ -866,6 +868,13 @@ class TaskStore(ABC):
     async def next_task_schedule_wakeup(self, query: TaskQuery | None = None) -> TaskScheduleWakeup:
         """Observe the next matching deadline; the result grants no claim authority."""
         raise NotImplementedError("This TaskStore does not support task scheduling.")
+
+    async def lease_clock(self) -> datetime:
+        """The current time on the clock this store decides lease expiry by.
+
+        Stores that implement it set ``supports_lease_clock``.
+        """
+        raise NotImplementedError("This TaskStore does not report its lease clock.")
 
     @abstractmethod
     async def create_running_task(

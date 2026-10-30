@@ -22,6 +22,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "ContextViewExtensionRegistration",
     ),
     "ContextViewLimits": ("cayu.sessions.context_views", "ContextViewLimits"),
+    "ExternalWaitHosting": ("cayu.external_wait_hosting", "ExternalWaitHosting"),
     "ContextViewLifecycleEvent": (
         "cayu.sessions.context_views",
         "ContextViewLifecycleEvent",
@@ -765,6 +766,7 @@ PUBLIC_NAMES = [
     "ContextViewProjectionSource",
     "ContextViewExtensionProjection",
     "ContextViewLimits",
+    "ExternalWaitHosting",
     "ContextViewLifecycleEvent",
     "ContextViewManifest",
     "ContextViewOwnershipRequest",

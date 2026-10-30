@@ -510,6 +510,7 @@ class SQLiteTaskStore(TaskStore):
         return await list_events(self, graph_id, after_sequence=after_sequence, limit=limit)
 
     supports_task_scheduling: ClassVar[bool] = True
+    supports_lease_clock: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
@@ -4076,6 +4077,9 @@ class SQLiteTaskStore(TaskStore):
                     next_expiry_at=sqlite_records.parse_optional_datetime(expiry),
                     maintenance_required=bool(maintenance),
                 )
+
+    async def lease_clock(self) -> datetime:
+        return self._ownership_clock()
 
     @runtime_task_creation
     async def create_running_task(

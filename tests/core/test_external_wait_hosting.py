@@ -19,6 +19,7 @@ from cayu.external_wait_hosting import (
 from cayu.external_wait_scheduler import EXTERNAL_WAIT_TASK_TYPE
 from cayu.external_waits import ExternalWaitAccessPolicy, ExternalWaitContext
 from cayu.providers.base import ModelStreamEvent
+from cayu.sessions import ExternalWaitHosting
 from cayu.sessions.external_waits import (
     ExternalCorrelationRequest,
     ExternalEventDelivery,
@@ -409,9 +410,13 @@ def test_hosting_refuses_what_it_could_not_run(tmp_path):
                 sources=(Stranger(),),
                 delivery_path="/w",
             )
-        app.host_external_waits(
+        # Refused attempts leave nothing behind; the one that succeeds is the app's.
+        assert app.external_wait_hosting is None
+        hosting = app.host_external_waits(
             access_policy=Policy(), context=WORKER, scopes={scope: ("renderer",)}
         )
+        assert app.external_wait_hosting is hosting
+        assert isinstance(hosting, ExternalWaitHosting)
         with pytest.raises(ValueError, match="already hosts"):
             app.host_external_waits(
                 access_policy=Policy(), context=WORKER, scopes={scope: ("renderer",)}

@@ -457,6 +457,10 @@ class _InterruptedHandoffRecoveryPage:
     recovered: int
     next_after: tuple[datetime, str] | None
     exhausted: bool
+    # Tasks whose session's recovery failed; a later pass may succeed.
+    failed: frozenset[str] = frozenset()
+    # A session's recovery needs a person (``cayu recovery``) before any pass can.
+    manual_recovery_required: bool = False
 
 
 class _TaskRetryHandlerUnsettled(RuntimeError):
@@ -550,9 +554,12 @@ async def run_task_worker(
       lost; a failure then is logged and retried at the next interval.
     - ``reconcile_abandoned_after_s`` declares that this is the only worker
       claiming tasks in its ``query``'s scope. A task the store reports fenced
-      after worker loss, held by another worker id, is then settled once this
-      worker has seen it fenced for this many seconds (counted on its own
-      monotonic clock, so clock skew can't shorten the wait), as cancelled
+      after worker loss, held by another worker id, is then settled once its
+      lease expired this many seconds ago (by the store's lease clock, so a
+      worker clock that runs ahead can't shorten the wait, and a worker started
+      again, such as with ``--until-idle``, keeps counting from the lease; a
+      store without ``supports_lease_clock`` counts from this process's
+      first sight), as cancelled
       through ``reconcile_abandoned_task_cancellation``, with the
       declaration (``cayu.task-worker.single-worker``) recorded as the
       validator. ``None`` (the default) settles nothing, unless ``cayu worker
@@ -759,10 +766,14 @@ async def run_task_worker(
             reconcile_abandoned_after_s=reconcile_abandoned_after_s,
             settlement=abandoned_settlement,
             max_restarts=max_abandoned_restarts,
+            # A run that exits once idle scans once, so it reads every fenced task.
+            whole_pass=until_idle is not None,
         )
         if reclaim or reconcile_abandoned_after_s is not None
         else None
     )
+    if until_idle is not None:
+        until_idle.fenced = fenced_monitor
     infrastructure_stop = asyncio.Event()
     slot_stop = infrastructure_stop if concurrency > 1 else stop
 
@@ -801,11 +812,16 @@ async def run_task_worker(
         async def scan_fenced_tasks() -> bool:
             assert fenced_monitor is not None
             try:
-                return bool(await fenced_monitor.scan())
+                settled = await fenced_monitor.scan()
+                if until_idle is not None:
+                    until_idle.fenced_scan_failed = False
+                return bool(settled)
             except Exception:
                 logger.exception(
                     "Looking for fenced tasks failed; retrying in %g seconds.", reclaim_every_s
                 )
+                if until_idle is not None:
+                    until_idle.fenced_scan_failed = True
                 return False
 
         # An until-idle run names the bound so it can tell when one call left more.
@@ -944,6 +960,10 @@ async def run_task_worker(
                     limit=_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE,
                     stop=slot_stop,
                 )
+                if until_idle is not None:
+                    until_idle.record_recovery_page(
+                        recovery_page, first_page=expired_handoff_after is None
+                    )
                 if recovery_page.recovered:
                     meaningful_activity = True
                     # Recovery follows lease expiry and the scan creation time, so
@@ -952,7 +972,9 @@ async def run_task_worker(
                 if recovery_page.exhausted:
                     expired_handoff_after = None
                     next_interrupted_handoff_recovery_at = (
-                        loop.time() + interrupted_handoff_recovery_every_s
+                        0.0
+                        if until_idle is not None and until_idle.recovery_retry_pending
+                        else loop.time() + interrupted_handoff_recovery_every_s
                     )
                 else:
                     expired_handoff_after = recovery_page.next_after
@@ -1037,6 +1059,7 @@ async def run_task_worker(
                 and owns_maintenance
                 and expired_handoff_after is None
                 and not reclaim_backlog
+                and not until_idle.recovery_retry_pending
             ):
                 until_idle.maintenance_settled = True
             observation: TaskScheduleWakeup | None = None
@@ -4135,6 +4158,8 @@ async def _recover_expired_interrupted_task_handoffs(
         limit=limit,
     )
     recovered = 0
+    failed: set[str] = set()
+    manual_recovery_required = False
     next_after = after
     for task in candidates:
         if _is_stopped(stop):
@@ -4142,6 +4167,8 @@ async def _recover_expired_interrupted_task_handoffs(
                 recovered=recovered,
                 next_after=next_after,
                 exhausted=False,
+                failed=frozenset(failed),
+                manual_recovery_required=manual_recovery_required,
             )
         if type(task) is not Task or task.session_id is None or task.lease_expires_at is None:
             raise TypeError("Interrupted-task handoff recovery returned an invalid task.")
@@ -4190,6 +4217,10 @@ async def _recover_expired_interrupted_task_handoffs(
                     type(exc).__name__,
                     diagnostic.message,
                 )
+                if isinstance(exc, _manual_recovery_errors()):
+                    manual_recovery_required = True
+                else:
+                    failed.add(task.id)
                 continue
             session = await app.session_store.load(task.session_id)
             if session is None or session.instance_id != task.session_instance_id:
@@ -4209,6 +4240,7 @@ async def _recover_expired_interrupted_task_handoffs(
                 app.redact_json(session.id),
                 type(exc).__name__,
             )
+            failed.add(task.id)
             continue
         request = interrupted_task_handoff_request(
             task,
@@ -4245,6 +4277,24 @@ async def _recover_expired_interrupted_task_handoffs(
         recovered=recovered,
         next_after=next_after,
         exhausted=len(candidates) < limit,
+        failed=frozenset(failed),
+        manual_recovery_required=manual_recovery_required,
+    )
+
+
+def _manual_recovery_errors() -> tuple[type[Exception], ...]:
+    """Recovery failures that no later pass fixes until a person acts."""
+
+    from cayu.runtime._approval_support import (
+        RoundToolManualRecoveryRequired,
+        ToolApprovalManualRecoveryRequired,
+    )
+    from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
+
+    return (
+        ModelCompletionManualRecoveryRequired,
+        RoundToolManualRecoveryRequired,
+        ToolApprovalManualRecoveryRequired,
     )
 
 

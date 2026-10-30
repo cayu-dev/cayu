@@ -123,8 +123,10 @@ atomically when a worker claims. Stores that do not support scheduling raise
 
 A host that doesn't keep a worker running calls `run_task_worker_until_idle`
 (or `cayu worker NAME --until-idle`) instead. It handles what is claimable,
-returns once nothing is, and reports the store's `next_available_at` and
-`next_expiry_at` for its query so the host knows when to start it again; see
+returns once nothing is, and reports for its query when to start it again:
+`next_available_at`, and in `next_expiry_at` the earliest schedule expiry or
+fenced-task settle time. It also says when a person must act
+(`attention_required`); see
 [run due tasks and exit](project-workers.md#run-due-tasks-and-exit).
 
 `app.list_task_schedule_events(task_id, after_sequence=0, limit=100)` returns
@@ -191,8 +193,11 @@ Three kinds of waiting look alike but differ in what survives a crash:
 | Durable one-shot self-wake | the `sleep_until` tool | nothing | the same session continues on time |
 | Recurring schedule | the application creates each next one-shot task, or a host schedule such as Cloud `[[schedules]]` | nothing | the application's own publication retry |
 
-`SleepUntilTool` is opt-in. Register it on the agents that may schedule their own
-continuation; registration refuses it unless the application has a task store that
+`SleepUntilTool` is opt-in; its wakes run in the application's task worker
+(`cayu worker`, which with PostgreSQL stores needs `cayu[postgres]`, plus
+`cayu[server]` to also run `cayu serve`; see
+[named workers](project-workers.md#run-a-named-worker)). Register it on the agents
+that may schedule their own continuation; registration refuses it unless the application has a task store that
 supports scheduling and declares bound and parked interrupted-task handoffs
 (`supports_bound_interrupted_task_handoffs` and
 `supports_parked_interrupted_task_handoffs` on the store's own class). The built-in
@@ -401,7 +406,9 @@ receipts and wake task, named by the subagent's own session.
   `session.delegated_action.updated`. A parent waiting on a sleeping subagent, at
   any depth, waits on no person: the server's pending-action API leaves it out (its
   `total_count` is `null` while any delegated action is pending), and Cloud reports
-  the parent `running` with the subagent's `waiting_for.kind = "wake"`. Stopping the parent closes its call; the subagent
+  the parent `running` with a `waiting_for` item of kind `delegated_action` naming
+  the subagent, whose own row has the `wake` item with `wake_at`. Stopping the
+  parent closes its call; the subagent
   still wakes and ends, and the parent is not revived. Stopping the sleeping
   subagent cancels its wake, and the parent's call receives the subagent's
   interrupted result.

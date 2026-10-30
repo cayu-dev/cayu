@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable, Collection, Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from math import isfinite
@@ -43,6 +43,7 @@ from time import monotonic
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import require_clean_nonblank
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.tasks._lease_clock import reports_lease_clock
 from cayu.tasks.cancellation import (
     _TASK_CANCELLATION_REQUESTED_REASON,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
@@ -77,6 +78,9 @@ _HELD_STATUSES = frozenset({TaskStatus.CLAIMED, TaskStatus.RUNNING})
 # A worker reads fenced tasks this many at a time, and at most _SCAN_MAX per scan.
 _SCAN_PAGE = 100
 _SCAN_MAX = 1_000
+# A run that scans once (``--until-idle``) reads every fenced task in one scan, up
+# to this many; more than that is unusual enough for someone to look.
+_WHOLE_PASS_SCAN_MAX = 100_000
 
 logger = logging.getLogger(__name__)
 
@@ -455,14 +459,22 @@ class FencedTaskMonitor:
 
     With ``reconcile_abandoned_after_s`` set, the worker declares it is the only
     one claiming tasks in ``query``'s scope, so a task fenced under another
-    worker id has no live owner once it has stayed fenced that long. The store
-    decides that the lease expired, by its own clock; the wait is counted on
-    this process's monotonic ``clock`` from the first scan that saw the task
-    fenced, so clock skew between the worker and the store can't shorten it.
+    worker id has no live owner once it has stayed fenced that long. The wait
+    counts from the task's stored ``lease_expires_at`` on the store's own lease
+    clock (``TaskStore.lease_clock``), so a worker whose clock runs ahead of the
+    store's can't shorten it, and a worker that starts again, such as one run
+    with ``--until-idle``, keeps counting where the last one was. A store that
+    doesn't report its lease clock (``supports_lease_clock``) counts the
+    wait on this process's monotonic ``clock`` from the first scan that saw the
+    task fenced, so it restarts with every process.
     One scan reads at most ``_SCAN_MAX`` fenced tasks; when there are more, the
     next scan continues where it stopped, so every fenced task is reached in
-    turn. What it remembers per task is dropped once a full pass over the scope
-    no longer finds the task.
+    turn. With ``whole_pass``, for a worker that scans once and exits
+    (``--until-idle``), one scan reads every fenced task from the start, up to
+    100,000; :attr:`pass_unfinished` says when that cap left more unread. What it
+    remembers per task is dropped once a full pass over the scope no longer
+    finds the task: :attr:`next_settle_at` and :attr:`attention_required` cover
+    the tasks of the latest full pass.
     """
 
     def __init__(
@@ -475,17 +487,30 @@ class FencedTaskMonitor:
         clock: Callable[[], float] = monotonic,
         settlement: AbandonedTaskSettlement = AbandonedTaskSettlement.CANCEL,
         max_restarts: int = DEFAULT_MAX_ABANDONED_RESTARTS,
+        whole_pass: bool = False,
     ) -> None:
         self._task_store = task_store
+        self._whole_pass = whole_pass
         self._worker_id = worker_id
         self._query = fenced_task_scan_query(query)
         self._after_s = reconcile_abandoned_after_s
         self._clock = clock
+        self._lease_clock = reconcile_abandoned_after_s is not None and reports_lease_clock(
+            task_store,
+            fallback="reconcile_abandoned_after_s counts from this process's first sight",
+        )
+        # Without the store's lease clock: when this process first saw each task fenced.
+        self._first_seen: dict[tuple[str, datetime | None], float] = {}
         self._settlement = abandoned_task_settlement_choice(settlement)
         self._max_restarts = validate_max_restarts(max_restarts, "max_restarts")
         self._next_offset = 0
         self._reported: set[tuple[str, datetime | None]] = set()
-        self._first_seen: dict[tuple[str, datetime | None], float] = {}
+        # When each fenced task this worker will settle becomes due, by the store's clock.
+        self._settle_at: dict[tuple[str, datetime | None], datetime] = {}
+        # Fenced tasks this worker won't settle: someone must act.
+        self._unsettleable: set[tuple[str, datetime | None]] = set()
+        # The latest scan stopped at its limit with more fenced tasks to read.
+        self._pass_unfinished = False
         # Tasks seen since the scan that started at offset zero.
         self._traversal_seen: set[tuple[str, datetime | None]] = set()
 
@@ -496,25 +521,32 @@ class FencedTaskMonitor:
         tasks, next_offset = await _list_fenced(
             self._task_store,
             self._query.model_copy(update={"offset": start}),
-            max_tasks=_SCAN_MAX,
+            max_tasks=_WHOLE_PASS_SCAN_MAX if self._whole_pass else _SCAN_MAX,
         )
         self._next_offset = next_offset or 0
+        self._pass_unfinished = next_offset is not None
         if start == 0:
             self._traversal_seen = set()
         fenced = [task for task in tasks if has_cancellation_fence(task)]
-        observed_at = self._clock()
         seen = {(task.id, task.lease_expires_at) for task in fenced}
-        for key in seen:
-            self._first_seen.setdefault(key, observed_at)
         settled: list[Task] = []
-        if self._after_s is not None:
-            due = [
+        waiting = (
+            []
+            if self._after_s is None
+            else [
                 task
                 for task in fenced
                 if _settleable(task, live_worker_ids=frozenset({self._worker_id}))
-                and observed_at - self._first_seen[(task.id, task.lease_expires_at)]
-                >= self._after_s
             ]
+        )
+        waiting_keys = {(task.id, task.lease_expires_at) for task in waiting}
+        self._unsettleable |= seen - waiting_keys
+        if self._after_s is not None and waiting:
+            due = (
+                await self._due_by_lease_clock(waiting, self._after_s)
+                if self._lease_clock
+                else self._due_since_first_sight(waiting, self._after_s)
+            )
             settled = await _settle_abandoned(
                 self._task_store,
                 due,
@@ -553,17 +585,75 @@ class FencedTaskMonitor:
                     self._after_s,
                 )
         settled_ids = {task.id for task in settled}
+        settled_keys = {
+            (task.id, task.lease_expires_at) for task in fenced if task.id in settled_ids
+        }
         self._warn([task for task in fenced if task.id not in settled_ids])
-        self._traversal_seen |= seen
+        self._traversal_seen |= seen - settled_keys
         if next_offset is None:
-            # A full pass over the scope ended: forget only tasks it no longer
-            # found, so memory follows the fenced tasks that exist and a task's
-            # wait keeps counting across passes.
+            # A full pass over the scope ended: forget tasks it no longer found
+            # or settled, so memory follows the fenced tasks that exist.
             self._reported &= self._traversal_seen
+            self._unsettleable &= self._traversal_seen
+            self._settle_at = {
+                key: value for key, value in self._settle_at.items() if key in self._traversal_seen
+            }
             self._first_seen = {
                 key: value for key, value in self._first_seen.items() if key in self._traversal_seen
             }
         return settled
+
+    async def _due_by_lease_clock(self, waiting: list[Task], after_s: float) -> list[Task]:
+        # Read after the listing: the store's clock only moves on.
+        as_of = await self._task_store.lease_clock()
+        due = []
+        for task in waiting:
+            assert task.lease_expires_at is not None
+            key = (task.id, task.lease_expires_at)
+            remaining_s = after_s - (as_of - task.lease_expires_at).total_seconds()
+            if remaining_s <= 0:
+                # Due now: a settlement that loses a race leaves no stale time behind.
+                self._settle_at.pop(key, None)
+                due.append(task)
+                continue
+            try:
+                settle_at = as_of + timedelta(seconds=remaining_s)
+            except OverflowError:
+                # Further away than any datetime: there is no time to report.
+                continue
+            self._settle_at[key] = settle_at
+        return due
+
+    def _due_since_first_sight(self, waiting: list[Task], after_s: float) -> list[Task]:
+        observed_at = self._clock()
+        due = []
+        for task in waiting:
+            first_seen = self._first_seen.setdefault((task.id, task.lease_expires_at), observed_at)
+            if observed_at - first_seen >= after_s:
+                due.append(task)
+        return due
+
+    @property
+    def next_settle_at(self) -> datetime | None:
+        """When the next fenced task this worker will settle becomes due, by the store's clock."""
+
+        return min(self._settle_at.values(), default=None)
+
+    @property
+    def pass_unfinished(self) -> bool:
+        """Whether the latest scan stopped at its limit with more fenced tasks to read.
+
+        With ``whole_pass`` that takes an unusual number of fenced tasks, so
+        someone should look; another run starts over and reads the same ones.
+        """
+
+        return self._pass_unfinished
+
+    @property
+    def attention_required(self) -> bool:
+        """Whether a fenced task in scope waits for someone, because this worker won't settle it."""
+
+        return bool(self._unsettleable)
 
     def _warn(self, fenced: list[Task]) -> None:
         for task in fenced:
@@ -593,7 +683,7 @@ class FencedTaskMonitor:
                 "It is held under this worker's own id, so this worker will not settle it; "
                 "settle it with reconcile_abandoned_task_cancellation once its handler stopped"
             )
-        wait = f"once it has stayed fenced for {self._after_s:g} seconds"
+        wait = f"once {self._after_s:g} seconds have passed since its lease expired"
         if self._settlement is AbandonedTaskSettlement.RESTART:
             if not task.restartable:
                 return (
