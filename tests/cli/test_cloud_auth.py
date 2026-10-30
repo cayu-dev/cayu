@@ -817,6 +817,49 @@ def test_workos_transient_refresh_retries_and_persists_rotated_credentials(
     assert persisted.refresh_token == "refresh-token-refreshed"
 
 
+def test_workos_refresh_works_inside_an_async_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = time.time()
+    refreshed_access_token = _jwt(expires_at=now + 7200, marker="refreshed")
+    server, thread, forms, _ = _start_refresh_and_deployment_server(
+        [
+            (
+                200,
+                {
+                    "access_token": refreshed_access_token,
+                    "organization_id": "org_test",
+                    "refresh_token": "refresh-token-refreshed",
+                    "user": {"id": "user_test"},
+                },
+            ),
+        ]
+    )
+    store, _ = _configure_saved_workos_login(
+        monkeypatch,
+        tmp_path,
+        api_url=f"http://127.0.0.1:{server.server_port}",
+        expires_at=now + 3600,
+    )
+    monkeypatch.setattr(cloud_auth.time, "time", lambda: now + 3570)
+
+    async def command() -> CloudApiClient:
+        # As `cayu inbox --application` does: the client is built in the command's loop.
+        return cloud_cli.cloud_client(context=None, timeout_seconds=1.0)
+
+    try:
+        asyncio.run(command())
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert len(forms) == 1
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.access_token == refreshed_access_token
+
+
 @pytest.mark.parametrize(
     "failed_reservation_call",
     [1, 2],

@@ -12,7 +12,8 @@ import math
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Coroutine, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -498,7 +499,7 @@ class WorkOSDeviceAuthClient:
     ) -> httpx.Response:
         try:
             if total_timeout_seconds is not None:
-                return asyncio.run(
+                return _run_request(
                     self._request_with_total_timeout(
                         method,
                         url,
@@ -535,6 +536,22 @@ class WorkOSDeviceAuthClient:
                 timeout=phase_timeout_seconds,
             ) as client:
                 return await client.request(method, url, data=form)
+
+
+def _run_request(request: Coroutine[Any, Any, httpx.Response]) -> httpx.Response:
+    """Run ``request`` on an event loop of its own and return its response.
+
+    Async commands such as `cayu inbox` build their Cloud client inside their own event
+    loop, where `asyncio.run` can't start another, so there the request runs on a helper
+    thread's loop. The caller waits for it either way.
+    """
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(request)
+    with ThreadPoolExecutor(max_workers=1) as helper:
+        return helper.submit(lambda: asyncio.run(request)).result()
 
 
 def fresh_cloud_credentials(
