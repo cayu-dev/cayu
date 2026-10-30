@@ -56,6 +56,7 @@ from cayu.approvals.review import (
 )
 from cayu.approvals.tools import (
     PendingToolApproval,
+    ToolApprovalDecision,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
     copy_public_tool_approval_request,
@@ -281,6 +282,7 @@ from cayu.context.footprints import (
 )
 from cayu.deadlines import (
     ExecutionDeadline,
+    ExecutionDeadlineExceeded,
     admit_handler_run,
     current_execution_deadline,
     deadline_stream,
@@ -9416,13 +9418,25 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
                 session, participant_context=participant_context
             ):
                 yield event
-        deadline_plan = (
-            None
-            if session is None
-            else await plan_continuation_deadline(
-                self, session, request, participant_context=participant_context
+        try:
+            deadline_plan = (
+                None
+                if session is None
+                else await plan_continuation_deadline(
+                    self, session, request, participant_context=participant_context
+                )
             )
-        )
+        except ExecutionDeadlineExceeded as refusal:
+            if task_id is not None or request.decision is not ToolApprovalDecision.DENY:
+                raise
+            for event in await self._incomplete_recovery.deny_stranded_approval(
+                request,
+                refusal=refusal,
+                require_review=self._recovery_coordinator.require_tool_approval_review,
+            ):
+                yield event
+            await self._event_writer.recover_persisted_side_effects()
+            return
         session_id = request.session_id
         task_worker_id = request.task_worker_id
         task_handoff_id = request.task_handoff_id

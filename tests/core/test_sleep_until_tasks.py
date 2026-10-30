@@ -6,7 +6,12 @@ import asyncio
 from datetime import UTC, datetime
 
 import pytest
-from tests.core.test_sleep_until import _sleep_results, _sleep_then_answer, _StableScriptedProvider
+from tests.core.test_sleep_until import (
+    _Clock,
+    _sleep_results,
+    _sleep_then_answer,
+    _StableScriptedProvider,
+)
 
 from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.events import EventType
@@ -37,11 +42,13 @@ _SLEEP_SECONDS = 1
 _JOB = "job"
 
 
-def _stores(backend: str, tmp_path, request):
+def _stores(backend: str, tmp_path, request, *, clock=None):
     if backend == "memory":
-        return InMemorySessionStore(), InMemoryTaskStore()
+        return InMemorySessionStore(), InMemoryTaskStore(clock=clock)
     if backend == "sqlite":
-        return SQLiteSessionStore(tmp_path / "sessions.db"), SQLiteTaskStore(tmp_path / "tasks.db")
+        return SQLiteSessionStore(tmp_path / "sessions.db"), SQLiteTaskStore(
+            tmp_path / "tasks.db", clock=clock
+        )
     from cayu.storage import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
     from cayu.storage.tasks_postgres import PostgresTaskStore
@@ -49,12 +56,12 @@ def _stores(backend: str, tmp_path, request):
     dsn = request.getfixturevalue("postgres_dsn")
     return (
         PostgresSessionStore(dsn, schema_mode=SchemaMode.CREATE),
-        PostgresTaskStore(dsn, schema_mode=SchemaMode.CREATE),
+        PostgresTaskStore(dsn, schema_mode=SchemaMode.CREATE, clock=clock),
     )
 
 
-def _app(sessions, tasks, calls: list[ModelRequest]) -> CayuApp:
-    app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+def _app(sessions, tasks, calls: list[ModelRequest], *, clock=None) -> CayuApp:
+    app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False, clock=clock)
     app.register_provider(
         _StableScriptedProvider(
             response_factory=_sleep_then_answer({"duration_seconds": _SLEEP_SECONDS}, calls=calls)
@@ -117,12 +124,15 @@ async def _parked_job(app: CayuApp, task_id: str):
     return job, wake_id
 
 
-async def _wake_due(app: CayuApp, wake_id: str) -> None:
+async def _wake_due(app: CayuApp, wake_id: str, *, clock: _Clock | None = None) -> None:
     [wake] = [
         task
         for task in await app.task_store.list_tasks()
         if task.type == SESSION_WAKE_TASK_TYPE and task.input["wake_id"] == wake_id
     ]
+    if clock is not None:
+        clock.now = max(clock.now, wake.available_at)
+        return
     delay = (wake.available_at - datetime.now(UTC)).total_seconds()
     await asyncio.sleep(max(delay, 0) + 0.05)
 
@@ -137,8 +147,9 @@ def test_a_task_owned_session_parks_its_task_and_the_wake_continues_it(
 ) -> None:
     async def scenario() -> None:
         calls: list[ModelRequest] = []
-        sessions, tasks = _stores(backend, tmp_path, request)
-        app = _app(sessions, tasks, calls)
+        clock = _Clock(datetime.now(UTC))
+        sessions, tasks = _stores(backend, tmp_path, request, clock=clock)
+        app = _app(sessions, tasks, calls, clock=clock)
         try:
             job, wake_id = await _parked_job(app, f"job-park-{backend}")
             # The worker is released and the task parked on its wake, still running.
@@ -170,7 +181,7 @@ def test_a_task_owned_session_parks_its_task_and_the_wake_continues_it(
             assert idle.next_available_at is not None
             assert len(calls) == 1
 
-            await _wake_due(app, wake_id)
+            await _wake_due(app, wake_id, clock=clock)
             idle = await run_task_worker_until_idle(
                 app,
                 tasks,
@@ -199,17 +210,24 @@ def test_a_parked_task_is_continued_by_a_worker_in_a_new_process_after_a_restart
 ) -> None:
     async def scenario() -> None:
         calls: list[ModelRequest] = []
+        clock = _Clock(datetime.now(UTC))
         first = _app(
-            SQLiteSessionStore(tmp_path / "s.db"), SQLiteTaskStore(tmp_path / "t.db"), calls
+            SQLiteSessionStore(tmp_path / "s.db"),
+            SQLiteTaskStore(tmp_path / "t.db", clock=clock),
+            calls,
+            clock=clock,
         )
         try:
-            job, _ = await _parked_job(first, "job-restart")
+            job, wake_id = await _parked_job(first, "job-restart")
+            await _wake_due(first, wake_id, clock=clock)
         finally:
             await _close(first)
-        await asyncio.sleep(_SLEEP_SECONDS + 0.1)
 
-        sessions, tasks = SQLiteSessionStore(tmp_path / "s.db"), SQLiteTaskStore(tmp_path / "t.db")
-        second = _app(sessions, tasks, calls)
+        sessions, tasks = (
+            SQLiteSessionStore(tmp_path / "s.db"),
+            SQLiteTaskStore(tmp_path / "t.db", clock=clock),
+        )
+        second = _app(sessions, tasks, calls, clock=clock)
         try:
             idle = await run_task_worker_until_idle(
                 second,
@@ -232,21 +250,24 @@ def test_a_parked_task_is_continued_by_a_worker_in_a_new_process_after_a_restart
 def test_a_worker_lost_before_the_handoff_is_recovered_parked() -> None:
     async def scenario() -> None:
         calls: list[ModelRequest] = []
-        sessions, tasks = InMemorySessionStore(), InMemoryTaskStore()
-        app = _app(sessions, tasks, calls)
+        clock = _Clock(datetime.now(UTC))
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore(clock=clock, ownership_clock=clock)
+        app = _app(sessions, tasks, calls, clock=clock)
         await tasks.create_task(TaskCreate(task_id="job-lost", type=_JOB))
 
         async def run_then_die(app, task, worker_id):
             await _run_job(app, task, worker_id)
             raise asyncio.CancelledError
 
-        claimed = await tasks.claim_task("doomed", lease_seconds=1)
+        claimed = await tasks.claim_task("doomed", lease_seconds=60)
         with pytest.raises(asyncio.CancelledError):
             await run_then_die(app, claimed, "doomed")
         checkpoint = await sessions.load_checkpoint(_session_id("job-lost"))
         wake_id = checkpoint["pending_wake"]["continuation"]["input_id"]
         # The worker never handed the task off; its lease expires with the session asleep.
-        await asyncio.sleep(1.1)
+        clock.now = max(clock.now, claimed.lease_expires_at)
+        clock.advance(1)
         await run_task_worker_until_idle(
             app,
             tasks,
@@ -417,8 +438,9 @@ def test_the_wake_waits_for_a_worker_that_has_not_handed_the_task_off_yet() -> N
 def test_an_until_idle_run_that_parks_a_task_does_not_ask_to_run_again_at_once() -> None:
     async def scenario() -> None:
         calls: list[ModelRequest] = []
-        sessions, tasks = InMemorySessionStore(), InMemoryTaskStore()
-        app = _app(sessions, tasks, calls)
+        clock = _Clock(datetime.now(UTC))
+        sessions, tasks = InMemorySessionStore(), InMemoryTaskStore(clock=clock)
+        app = _app(sessions, tasks, calls, clock=clock)
         await tasks.create_task(TaskCreate(task_id="job-idle", type=_JOB))
         idle = await run_task_worker_until_idle(
             app,

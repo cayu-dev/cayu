@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
+import pytest
 from fastapi.testclient import TestClient
-from tests.core.test_continuation_deadlines import _app, _pause_in_handler, _run
+from tests.core.test_continuation_deadlines import _app, _pause_in_handler, _run, _store
 from tests.core.test_continuation_deadlines import skip_ahead as skip_ahead
 from tests.server.test_server_inbox import _as, _authenticate, _items, _settle, _wait_for_status
 
-from cayu.deadlines import ExecutionDeadline
+from cayu import SessionStatus
+from cayu.deadlines import ExecutionDeadline, task_event_deadline_scope
+from cayu.events import EventType
 from cayu.server import ServerConfig, create_server
 from cayu.sessions import InMemorySessionStore
 
@@ -67,3 +72,59 @@ def test_a_settle_after_an_explicit_deadline_says_which_deadline_passed(skip_ahe
         assert "set explicitly with execution_deadline" in detail["message"]
         assert item["execution_deadline"]["expires_at"][:19] in detail["message"]
         assert detail["item"]["status"] == "pending"
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("enclosing", [False, True])
+def test_an_approval_past_its_deadline_can_only_be_denied_and_the_denial_ends_it(
+    skip_ahead,
+    enclosing,
+    backend,
+    tmp_path,
+    request,
+) -> None:
+    session_id = f"filing-{uuid4().hex[:12]}"
+    app = _app(_store(backend, tmp_path, request))
+    with TestClient(create_server(app, config=ServerConfig.protected(_authenticate))) as client:
+
+        async def pause() -> None:
+            if enclosing:
+                async with task_event_deadline_scope(ExecutionDeadline.after(180)):
+                    await _pause_in_handler(app, session_id, "approval")
+            else:
+                await _run(
+                    app, session_id, "approval", execution_deadline=ExecutionDeadline.after(60)
+                )
+
+        _call(client, pause)
+        [item] = _items(client, "priya")
+        assert item["decisions"] == ["approve", "deny"]
+
+        skip_ahead(181)
+        [item] = _items(client, "priya")
+        assert item["decisions"] == ["deny"]
+        refused = _settle(client, item["id"], "priya", decision="approve")
+        assert refused.status_code == 409, refused.text
+        assert "Execution deadline expired" in refused.json()["detail"]["message"]
+
+        denied = _settle(client, item["id"], "priya", decision="deny", reason="Too late.")
+        assert denied.status_code == 200, denied.text
+        settlement = denied.json()["item"]["settlement"]
+        assert (settlement["decision"], settlement["reason"]) == ("deny", "Too late.")
+        assert settlement["decided_by"]["subject"] == "priya"
+        assert _items(client, "priya") == []
+        again = _settle(client, item["id"], "priya", decision="deny", reason="Too late.")
+        assert again.status_code == 200, again.text
+        assert again.json()["replayed"] is True
+
+        async def ended() -> None:
+            session = await app.session_store.load(session_id)
+            assert session.status is SessionStatus.FAILED
+            events = await app.session_store.load_events(session_id)
+            [failed] = [event for event in events if event.type is EventType.SESSION_FAILED]
+            assert failed.payload["reason"] == "tool_approval_denied_after_deadline"
+            assert "execution deadline passed" in failed.payload["error"]
+            assert [event.type for event in events].count(EventType.TOOL_CALL_APPROVAL_DENIED) == 1
+            assert not any(event.type is EventType.TOOL_CALL_STARTED for event in events)
+
+        _call(client, ended)

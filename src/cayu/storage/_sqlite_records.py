@@ -12,6 +12,7 @@ from cayu._validation import copy_durable_json_object, copy_label_map
 from cayu.deadlines import (
     EXECUTION_DEADLINE_METADATA_KEY,
     EXECUTION_DEADLINE_ORIGIN_METADATA_KEY,
+    TASK_EVENT_DEADLINE_METADATA_KEY,
     ExecutionDeadlineReport,
 )
 from cayu.events import Event
@@ -390,6 +391,15 @@ def pending_action_session_from_row(
                     }
                 ),
                 EXECUTION_DEADLINE_ORIGIN_METADATA_KEY: row["execution_deadline_origin"],
+                **(
+                    {}
+                    if row["task_event_deadline_json"] is None
+                    else {
+                        TASK_EVENT_DEADLINE_METADATA_KEY: json.loads(
+                            row["task_event_deadline_json"]
+                        )
+                    }
+                ),
             },
             top_level=row["parent_session_id"] is None,
         ),

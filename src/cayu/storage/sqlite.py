@@ -7106,7 +7106,10 @@ class SQLiteSessionStore(
                 ) AS execution_deadline_json,
                 json_extract(
                     cayu_sessions.metadata_json, '$."cayu:execution_deadline_origin"'
-                ) AS execution_deadline_origin
+                ) AS execution_deadline_origin,
+                json_extract(
+                    cayu_sessions.metadata_json, '$."cayu:task_event_deadline"'
+                ) AS task_event_deadline_json
             FROM cayu_checkpoints
                 INDEXED BY idx_cayu_checkpoints_pending_control_action
             JOIN cayu_sessions ON cayu_sessions.id = cayu_checkpoints.session_id

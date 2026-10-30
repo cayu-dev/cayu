@@ -51,6 +51,10 @@ running while the item waits, and a settle after it passes is refused with 409
 `conflict`, naming the deadline's expiry and origin. To continue such a session,
 settle it from code with a new deadline, for example
 `app.resolve_tool_approval(ToolApprovalRequest(..., execution_deadline=ExecutionDeadline.after(3600)))`.
+Once that deadline has passed, an approval's `decisions` is `["deny"]`: denying
+still settles it, and ends the session instead of continuing it (see
+[Approvals across an upgrade](#approvals-across-an-upgrade); the failure's
+`reason` is `"tool_approval_denied_after_deadline"`).
 `GET /api/pending-actions` returns the same `execution_deadline` on each action.
 
 An `id` names one exact pause or proposal revision. A new question, or a revised
@@ -301,11 +305,13 @@ adopted: approving answers 409 `conflict`. The
 Developer dashboard offers the same decision under the update after a
 `profile_changed` refusal. Use a new `idempotency_key` for each adoption.
 
-A denial always settles. When the change can't be adopted, the paused round can't
+A denial always settles. When the change can't be adopted, or the session's
+execution deadline passed while the approval waited, the paused round can't
 continue, so a denial ends the session instead of continuing it: nothing runs,
 `tool.call.approval_denied` is recorded with the person and reason as usual, and
 the session fails with `error_type: "SessionAbandoned"` and `reason:
-"tool_approval_denied_after_profile_change"`. The settle answers 200 with a `deny`
+"tool_approval_denied_after_profile_change"` (or
+`"tool_approval_denied_after_deadline"`). The settle answers 200 with a `deny`
 settlement; repeating it replays. This applies to a session with no environment
 binding and no task of its own, such as a `propose_tool_call` proposal; any other
 session still answers 409 until the application version that proposed the call

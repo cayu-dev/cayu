@@ -75,6 +75,20 @@ INBOX_DECISIONS: dict[str, tuple[InboxDecision, ...]] = {
 }
 
 
+def inbox_decisions(
+    kind: InboxItemKind, execution_deadline: ExecutionDeadlineReport | None
+) -> list[InboxDecision]:
+    """What an item of ``kind`` accepts now.
+
+    An approval whose session's execution deadline passed for good can't continue,
+    so it can only be denied: the denial ends the session without running anything.
+    """
+
+    if kind == "approval" and execution_deadline is not None and execution_deadline.passed():
+        return ["deny"]
+    return list(INBOX_DECISIONS[kind])
+
+
 class _InboxModel(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 

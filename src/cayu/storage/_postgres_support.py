@@ -8,6 +8,7 @@ from cayu._validation import copy_label_map
 from cayu.deadlines import (
     EXECUTION_DEADLINE_METADATA_KEY,
     EXECUTION_DEADLINE_ORIGIN_METADATA_KEY,
+    TASK_EVENT_DEADLINE_METADATA_KEY,
     ExecutionDeadlineReport,
 )
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
@@ -163,6 +164,7 @@ def pending_action_session_from_row(
                 for key, value in (
                     (EXECUTION_DEADLINE_METADATA_KEY, row[14]),
                     (EXECUTION_DEADLINE_ORIGIN_METADATA_KEY, row[15]),
+                    (TASK_EVENT_DEADLINE_METADATA_KEY, row[16]),
                 )
                 if value is not None
             },

@@ -46,6 +46,21 @@ if TYPE_CHECKING:
 
 
 STRANDED_APPROVAL_DENIAL_REASON = "tool_approval_denied_after_profile_change"
+# The session's execution deadline passed while its approval waited, so the
+# denied round could not continue either.
+EXPIRED_APPROVAL_DENIAL_REASON = "tool_approval_denied_after_deadline"
+_STRANDED_DENIAL_ERRORS = {
+    STRANDED_APPROVAL_DENIAL_REASON: (
+        "The pending approval was denied after the application's execution profile "
+        "changed. The session ended without continuing, because the paused round "
+        "could not continue under the changed profile."
+    ),
+    EXPIRED_APPROVAL_DENIAL_REASON: (
+        "The pending approval was denied after the session's execution deadline "
+        "passed. The session ended without continuing, because the paused round "
+        "could not continue past its deadline."
+    ),
+}
 
 
 def stranded_approval_failure_event(session: Session, record: dict[str, Any]) -> Event:
@@ -92,8 +107,9 @@ def abandoned_session_record(
         "unknown_tool_calls": unknown_tool_calls,
     }
     if denied_approval is not None:
-        # A person denied the round's approval, but the application's execution
-        # profile had changed so the round could not continue under it.
+        # A person denied the round's approval, but the round could not continue:
+        # the application's execution profile had changed, or the session's
+        # execution deadline had passed (``reason`` says which).
         record["denied_approval"] = denied_approval
     return record
 
@@ -160,10 +176,8 @@ def abandoned_session_failure_payload(record: dict[str, Any]) -> dict[str, Any]:
     if "denied_approval" in record:
         denial = record["denied_approval"]
         return {
-            "error": (
-                "The pending approval was denied after the application's execution profile "
-                "changed. The session ended without continuing, because the paused round "
-                "could not continue under the changed profile."
+            "error": _STRANDED_DENIAL_ERRORS.get(
+                record["reason"], _STRANDED_DENIAL_ERRORS[STRANDED_APPROVAL_DENIAL_REASON]
             ),
             "error_type": "SessionAbandoned",
             "abandoned": True,

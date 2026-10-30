@@ -85,6 +85,7 @@ from cayu.server.inbox import (
     InboxSettlement,
     InboxSettleRequest,
     InboxSettleResponse,
+    inbox_decisions,
 )
 from cayu.sessions._pending_approval_reader import approval_resolution_intent_from_checkpoint
 from cayu.sessions._terminal_evidence import _INTERRUPTION_TYPE_USER_INPUT_REQUIRED
@@ -575,7 +576,7 @@ def register_inbox_routes(
             ),
             question=projected["question"],
             options=projected["options"],
-            decisions=list(INBOX_DECISIONS[kind]),
+            decisions=inbox_decisions(kind, action.session.execution_deadline),
             execution_deadline=action.session.execution_deadline,
         )
 

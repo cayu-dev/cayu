@@ -361,6 +361,55 @@ def test_an_explicit_deadline_still_expires_until_a_settle_replaces_it(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("enclosing_deadline", [False, True])
+def test_denying_an_approval_after_its_deadline_ends_the_session(
+    skip_ahead, enclosing_deadline
+) -> None:
+    async def scenario() -> None:
+        app = _app(InMemorySessionStore())
+        try:
+            if enclosing_deadline:
+                from cayu.deadlines import task_event_deadline_scope
+
+                async with task_event_deadline_scope(ExecutionDeadline.after(180)):
+                    await _pause_in_handler(app, "filing", "approval")
+            else:
+                await _run(
+                    app, "filing", "approval", execution_deadline=ExecutionDeadline.after(60)
+                )
+            pending = (await app.session_store.load_checkpoint("filing"))["pending_tool_approval"]
+            skip_ahead(181)
+            with pytest.raises(ExecutionDeadlineExceeded):
+                await _settle(app, "filing", "approval")
+            denial = ToolApprovalRequest(
+                session_id="filing",
+                approval_id=pending["approval_id"],
+                tool_round_id=pending["tool_round_id"],
+                tool_call_id=pending["tool_call_id"],
+                decision=ToolApprovalDecision.DENY,
+                reason="Too late.",
+            )
+            events = [event async for event in app.resolve_tool_approval(denial)]
+            assert [event.type for event in events] == [
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+                EventType.SESSION_FAILED,
+            ]
+            assert events[-1].payload["reason"] == "tool_approval_denied_after_deadline"
+            session = await app.session_store.load("filing")
+            assert session.status is SessionStatus.FAILED
+            pending_actions = await app.session_store.query_pending_actions(
+                PendingActionQuery(session_id="filing")
+            )
+            assert pending_actions.actions == []
+            # The same denial again reports what it settled and writes nothing new.
+            replayed = [event async for event in app.resolve_tool_approval(denial)]
+            assert [event.id for event in replayed] == [event.id for event in events]
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_a_settle_for_another_pause_leaves_the_deadline_alone(skip_ahead) -> None:
     async def scenario() -> None:
         app = _app(InMemorySessionStore())
@@ -936,6 +985,65 @@ def test_human_wait_renewal_cannot_extend_task_event_deadline(
             # the event expires, even when asked for a fresh longer run deadline.
             with pytest.raises(ExecutionDeadlineExceeded):
                 await _settle(app, session_id, gate, ExecutionDeadline.after(3600))
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("run_default", [False, True])
+@pytest.mark.parametrize(
+    "refusal_source", ["replacement", "ambient", "valid_replacement_in_expired_scope"]
+)
+def test_invalid_decision_deadline_does_not_abandon_a_resumable_approval(
+    skip_ahead, run_default, refusal_source
+):
+    from contextlib import nullcontext
+
+    async def scenario():
+        app = _app(InMemorySessionStore())
+        try:
+            if run_default:
+                await _pause_in_handler(app, "filing", "approval")
+            else:
+                await _run(
+                    app,
+                    "filing",
+                    "approval",
+                    execution_deadline=ExecutionDeadline.after(
+                        60 if refusal_source == "valid_replacement_in_expired_scope" else 7200
+                    ),
+                )
+            checkpoint = await app.session_store.load_checkpoint("filing")
+            pending = checkpoint["pending_tool_approval"]
+            before = await app.session_store.load_events("filing")
+            skip_ahead(1200)
+            expired = ExecutionDeadline.after(0)
+            denial = ToolApprovalRequest(
+                session_id="filing",
+                approval_id=pending["approval_id"],
+                tool_round_id=pending["tool_round_id"],
+                tool_call_id=pending["tool_call_id"],
+                decision=ToolApprovalDecision.DENY,
+                execution_deadline=(
+                    expired
+                    if refusal_source == "replacement"
+                    else ExecutionDeadline.after(3600)
+                    if refusal_source == "valid_replacement_in_expired_scope"
+                    else None
+                ),
+            )
+            scope = (
+                execution_deadline_scope(expired)
+                if refusal_source != "replacement"
+                else nullcontext()
+            )
+            with pytest.raises(ExecutionDeadlineExceeded):
+                async with scope:
+                    _ = [event async for event in app.resolve_tool_approval(denial)]
+            assert (await app.session_store.load("filing")).status is SessionStatus.INTERRUPTED
+            assert await app.session_store.load_checkpoint("filing") == checkpoint
+            assert await app.session_store.load_events("filing") == before
         finally:
             await app.aclose()
 

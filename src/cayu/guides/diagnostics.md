@@ -551,7 +551,9 @@ resumable work, and fails the session with `error_type: "SessionAbandoned"` and
 resumed; fork it to continue its conversation. Repeating the same denial replays
 those events. This needs a session with no environment binding and no task of
 its own (a `propose_tool_call` proposal, for example); for any other session the
-mismatch is still raised.
+mismatch is still raised. A denial after the session's execution deadline passed
+ends the session the same way, with `reason: "tool_approval_denied_after_deadline"`,
+instead of raising `ExecutionDeadlineExceeded`.
 
 ```python
 from cayu.approvals import ToolApprovalRequest

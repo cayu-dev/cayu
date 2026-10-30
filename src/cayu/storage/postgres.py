@@ -6355,7 +6355,8 @@ class PostgresSessionStore(
             "AS runtime_build_provenance, cayu_sessions.instance_id, "
             "cayu_sessions.metadata -> 'cayu:execution_deadline' AS execution_deadline, "
             "cayu_sessions.metadata ->> 'cayu:execution_deadline_origin' "
-            "AS execution_deadline_origin"
+            "AS execution_deadline_origin, "
+            "cayu_sessions.metadata -> 'cayu:task_event_deadline' AS task_event_deadline"
         )
         candidate_select_sql = cast(
             "LiteralString",

@@ -1,4 +1,4 @@
-"""Settle a denial that a changed execution profile won't let continue.
+"""Settle a denial that a changed execution profile or a passed deadline won't let continue.
 
 ``IncompleteSessionRecovery.deny_stranded_approval`` ends the session instead of
 continuing the denied round. These wrap approval resolution: one replays a
@@ -17,6 +17,7 @@ from cayu.approvals.tools import (
     ToolApprovalProfileAdoptionRefused,
     ToolApprovalRequest,
 )
+from cayu.deadlines import ExecutionDeadlineExceeded
 from cayu.events import Event, EventType
 from cayu.runtime._session_abandonment import stranded_approval_denial
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
@@ -88,7 +89,11 @@ async def deny_when_stranded(
             async for event in stream:
                 resumed = resumed or event.type is EventType.SESSION_RESUMED
                 yield event
-    except (ExecutionProfileMismatchError, ToolApprovalProfileAdoptionRefused) as refusal:
+    except (
+        ExecutionProfileMismatchError,
+        ToolApprovalProfileAdoptionRefused,
+        ExecutionDeadlineExceeded,
+    ) as refusal:
         if denial is None or resumed:
             raise
         for event in await app._incomplete_recovery.deny_stranded_approval(

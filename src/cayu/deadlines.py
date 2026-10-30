@@ -630,6 +630,14 @@ class ExecutionDeadlineReport(BaseModel):
         """Report a session's stored deadline; ``None`` when it has none or it can't be read."""
         try:
             deadline = deadline_from_metadata(metadata)
+            event = task_event_deadline_from_metadata(metadata)
+            if event.expires_at is not None:
+                # A human pause renews the run default, never its enclosing event.
+                deadline = (
+                    effective_deadline(deadline, event)
+                    if waiting_for_a_person_counts(deadline, top_level=top_level)
+                    else event
+                )
         except ValidationError:
             return None
         if deadline.expires_at is None:
@@ -640,6 +648,14 @@ class ExecutionDeadlineReport(BaseModel):
             origin=deadline.origin,
             waiting_counts=waiting_for_a_person_counts(deadline, top_level=top_level),
         )
+
+    def passed(self) -> bool:
+        """Whether the deadline passed for good: settling the pause doesn't renew it.
+
+        A settle that continues the session is then refused unless it carries a
+        new deadline; a denial, which runs nothing, ends the session instead.
+        """
+        return self.waiting_counts and self.expires_at <= datetime.now(UTC)
 
 
 class ExecutionDeadlineRenewal(BaseModel):

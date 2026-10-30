@@ -48,6 +48,11 @@ from cayu.budgets.base import (
     copy_budget_policy,
 )
 from cayu.collaboration.access import CollaborationAccessContext
+from cayu.deadlines import (
+    ExecutionDeadlineExceeded,
+    task_event_deadline_from_metadata,
+    waiting_for_a_person_counts,
+)
 from cayu.environments.factory import EnvironmentFactoryOperation
 from cayu.events import (
     Event,
@@ -145,6 +150,7 @@ from cayu.runtime._run_limits import (
     SessionUsageTracker,
 )
 from cayu.runtime._session_abandonment import (
+    EXPIRED_APPROVAL_DENIAL_REASON,
     STRANDED_APPROVAL_DENIAL_REASON,
     abandoned_session_from_checkpoint,
     abandoned_session_record,
@@ -4789,11 +4795,14 @@ class IncompleteSessionRecovery:
         the round started with. When the application changed more than Cayu and no
         ``ExecutionProfilePolicy`` adopts the change, the round can't continue, so
         the approval would stay pending until its deadline, which settles it the
-        same way. A denial runs nothing, so instead this ends the session without
-        continuing it: the round leaves resumable work, the session fails as
-        abandoned with the denial recorded, and ``tool.call.approval_denied`` then
-        ``session.failed`` are published. No model, tool or environment is touched,
-        so the current profile is never needed.
+        same way. The same holds when the session's execution deadline passed while
+        the approval waited (``refusal`` is then ``ExecutionDeadlineExceeded``): the
+        continuation is refused at admission. A denial runs nothing, so instead this
+        ends the session without continuing it: the round leaves resumable work, the
+        session fails as abandoned with the denial recorded, and
+        ``tool.call.approval_denied`` then ``session.failed`` are published. No
+        model, tool or environment is touched. Deadline-based abandonment requires
+        an expired durable bound, never merely a rejected replacement or caller scope.
 
         Anything else raises ``refusal``: a claimed or partly settled approval, a
         session with an environment binding or unfinished tasks, or a round with an
@@ -4819,6 +4828,36 @@ class IncompleteSessionRecovery:
             return await self._publish_stranded_approval_denial(session, denial)
         if session.status is not SessionStatus.INTERRUPTED or session.environment_name is not None:
             raise refusal
+        from cayu.runtime._continuation_deadline import human_wait_pause
+
+        pause = await human_wait_pause(self._session_store, session)
+
+        def require_expired_session_deadline(current_session: Session) -> None:
+            if not isinstance(refusal, ExecutionDeadlineExceeded):
+                return
+            # A rejected proposed deadline is not authority to abandon existing work.
+            if request.execution_deadline is not None:
+                request.execution_deadline.require_admission("resume")
+            if task_event_deadline_from_metadata(current_session.metadata).expired:
+                return
+            if request.execution_deadline is not None:
+                # The admitted replacement supersedes the stored deadline.
+                raise refusal
+            stored = current_session.execution_deadline
+            if not stored.expired:
+                raise refusal
+            if (
+                not waiting_for_a_person_counts(
+                    stored, top_level=current_session.parent_session_id is None
+                )
+                and pause is not None
+                and stored.expires_at is not None
+                and stored.expires_at > pause.timestamp
+            ):
+                # A run-default deadline with time left at the pause is renewable.
+                raise refusal
+
+        require_expired_session_deadline(session)
         pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -4909,6 +4948,7 @@ class IncompleteSessionRecovery:
                 is not None
             ):
                 raise RuntimeError("Tool approval was claimed before its denial ended the session.")
+            require_expired_session_deadline(current_session)
             require_review(request, current_session, current)
             copied, durable_round = self._checkpoint_without_pending_approval_round(
                 current_session, current, pending_round, pending_approval
@@ -4916,7 +4956,9 @@ class IncompleteSessionRecovery:
             if ABANDONED_SESSION_CHECKPOINT_KEY in copied:
                 raise RuntimeError("Session already retains abandonment evidence.")
             copied[ABANDONED_SESSION_CHECKPOINT_KEY] = abandoned_session_record(
-                reason=STRANDED_APPROVAL_DENIAL_REASON,
+                reason=EXPIRED_APPROVAL_DENIAL_REASON
+                if isinstance(refusal, ExecutionDeadlineExceeded)
+                else STRANDED_APPROVAL_DENIAL_REASON,
                 metadata={},
                 tool_round=durable_round,
                 unknown_tool_calls=[],
