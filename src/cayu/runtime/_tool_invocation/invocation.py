@@ -1985,14 +1985,6 @@ class ToolInvocation:
             if workspace_window_id is not None:
                 try:
                     await close_workspace_mutation_window()
-                except BaseExceptionGroup as exc:
-                    if _contains_process_signal(exc) or is_current_runner_cancellation_group(exc):
-                        raise
-                    workspace_capture_failure_detail = "receipt_publication_failed"
-                    workspace_capture_payload = {
-                        "workspace_mutation_capture_status": "failed",
-                        "workspace_mutation_capture_detail_code": workspace_capture_failure_detail,
-                    }
                 except asyncio.CancelledError as exc:
                     post_tool_cancellation = await consume_post_tool_cancellation(exc)
                     if post_tool_cancellation is not None:
@@ -2005,7 +1997,11 @@ class ToolInvocation:
                         "workspace_mutation_capture_status": "interrupted",
                         "workspace_mutation_capture_detail_code": "receipt_publication_interrupted",
                     }
-                except Exception as exc:
+                except (Exception, BaseExceptionGroup) as exc:
+                    if isinstance(exc, BaseExceptionGroup) and (
+                        _contains_process_signal(exc) or is_current_runner_cancellation_group(exc)
+                    ):
+                        raise
                     if any(
                         isinstance(candidate, WorkspaceMutationSettlementError)
                         for candidate in iter_exception_tree(exc)
