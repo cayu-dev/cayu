@@ -20,8 +20,9 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from cayu._validation import require_durable_clean_nonblank
 from cayu.budgets.pricing import PriceBook, estimate_model_step_cost
 from cayu.budgets.usage import UsageMetrics, normalize_usage_metrics
 from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
@@ -65,6 +66,9 @@ MODEL_CHECK_SCHEMA_VERSION: Literal["1"] = "1"
 # adapter accepts it, so one cap serves all of them.
 MODEL_CHECK_MAX_OUTPUT_TOKENS = 16
 MODEL_CHECK_TIMEOUT_SECONDS = 30.0
+# Where a Cayu server runs the check on its own app, under its API path.
+MODEL_CHECK_API_PATH = "/diagnostics/model-check"
+MODEL_CHECK_NAME_MAX_CHARS = 256
 _MODEL_CHECK_PROMPT = "Reply with the single word: ready"
 _PREFLIGHT_DETAIL_MAX_BYTES = 512
 # Provider model IDs also use '/' (OpenRouter) and '@' (Vertex) separators.
@@ -148,6 +152,21 @@ class _ModelCheckRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class ModelCheckRequest(_ModelCheckRecord):
+    """The check a Cayu server runs on its own app: a model and, optionally, a provider.
+
+    The server supplies the prompt, output cap and deadline; a request can't change them.
+    """
+
+    model: str = Field(min_length=1, max_length=MODEL_CHECK_NAME_MAX_CHARS)
+    provider: str | None = Field(default=None, min_length=1, max_length=MODEL_CHECK_NAME_MAX_CHARS)
+
+    @field_validator("model", "provider")
+    @classmethod
+    def _require_clean_name(cls, value: str | None, info) -> str | None:
+        return None if value is None else require_durable_clean_nonblank(value, info.field_name)
+
+
 class ModelCheckRoute(_ModelCheckRecord):
     provider: str
     model: str
@@ -218,6 +237,13 @@ class ModelCheckResult(_ModelCheckRecord):
     usage: ModelCheckUsage | None
     pricing: ModelCheckPricing
     error: ModelCheckFailure | None
+
+    @model_validator(mode="after")
+    def _require_one_outcome(self) -> ModelCheckResult:
+        # check_model always says one thing; a report read from a server must too.
+        if self.ok is not (self.answer is not None) or self.ok is not (self.error is None):
+            raise ValueError("A model check reports an answer when ok, and an error when not.")
+        return self
 
 
 def resolve_model_check_route(

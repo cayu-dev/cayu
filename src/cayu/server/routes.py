@@ -207,6 +207,7 @@ from cayu.server._inbox_routes import register_inbox_routes
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
 from cayu.server._kept_knowledge import register_kept_knowledge
 from cayu.server._memory_report_routes import register_memory_report_routes
+from cayu.server._model_check_routes import register_model_check_route
 from cayu.server._request_timing import RequestTimingRecorder
 from cayu.server._request_validation import invalid_parameters_detail
 from cayu.server._scenario_routes import (
@@ -4485,7 +4486,8 @@ def create_router(
         evaluation_promotion_pricing: Optional already-validated dashboard price
             book reused for captured cost evidence.
         generated_evals_pricing: Optional server-owned dashboard price book used
-            by generated execution targets for cost assertions and run ceilings.
+            by generated execution targets for cost assertions and run ceilings,
+            and to price the model check.
         evals: Complete authenticated durable execution wiring for one explicit
             V1 corpus target. It takes indivisible precedence over generated
             project targets. When both it and project authority are absent, no
@@ -5376,6 +5378,14 @@ def create_router(
                 vcpu=vcpu,
             )
         return _request_timing.summary(since_seconds=since_seconds, vcpu=vcpu)
+
+    # A provider call, so its body is bounded like the other control-plane actions.
+    register_model_check_route(
+        bounded_control_plane_router,
+        cayu_app=cayu_app,
+        protected=protected,
+        price_book=generated_evals_pricing,
+    )
 
     @router.post(
         "/operations/snapshot",

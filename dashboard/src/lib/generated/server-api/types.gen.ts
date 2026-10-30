@@ -14960,6 +14960,228 @@ export type Message = {
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 
 /**
+ * ModelCheckAnswer
+ */
+export type ModelCheckAnswer = {
+    /**
+     * Finish Reason
+     */
+    finish_reason: string;
+    /**
+     * Text Received
+     */
+    text_received: boolean;
+};
+
+/**
+ * ModelCheckFailure
+ */
+export type ModelCheckFailure = {
+    category: ModelCheckFailureCategory;
+    /**
+     * Detail
+     */
+    detail?: string | null;
+    /**
+     * Message
+     */
+    message: string;
+    /**
+     * Provider Error Code
+     */
+    provider_error_code?: string | null;
+    /**
+     * Provider Error Type
+     */
+    provider_error_type?: string | null;
+    rejection?: ModelCheckRejection | null;
+    /**
+     * Retryable
+     */
+    retryable?: boolean | null;
+    /**
+     * Status Code
+     */
+    status_code?: number | null;
+};
+
+/**
+ * ModelCheckFailureCategory
+ */
+export type ModelCheckFailureCategory = 'preflight_rejected' | 'unsupported' | 'billing_identity_failed' | 'authentication_failed' | 'permission_denied' | 'not_found' | 'rate_limited' | 'request_rejected' | 'server_error' | 'provider_error' | 'timeout' | 'stream_failed' | 'event_after_completion' | 'generation_failed';
+
+/**
+ * ModelCheckLimits
+ */
+export type ModelCheckLimits = {
+    /**
+     * Max Output Tokens
+     */
+    max_output_tokens: number;
+    /**
+     * Timeout Seconds
+     */
+    timeout_seconds: number;
+};
+
+/**
+ * ModelCheckPriceBook
+ */
+export type ModelCheckPriceBook = {
+    /**
+     * Generated At
+     */
+    generated_at: string;
+    /**
+     * Source
+     */
+    source: 'bundled' | 'project';
+    /**
+     * Version
+     */
+    version: string;
+};
+
+/**
+ * ModelCheckPricing
+ */
+export type ModelCheckPricing = {
+    /**
+     * Currency
+     */
+    currency?: string | null;
+    /**
+     * Estimated Cost
+     */
+    estimated_cost?: string | null;
+    price_book: ModelCheckPriceBook;
+    /**
+     * Priced
+     */
+    priced: boolean;
+    /**
+     * Unpriced Reason
+     */
+    unpriced_reason?: string | null;
+};
+
+/**
+ * ModelCheckRejection
+ */
+export type ModelCheckRejection = {
+    /**
+     * Explanation
+     */
+    explanation: string;
+    /**
+     * Parameter
+     */
+    parameter: string;
+    /**
+     * Reason
+     */
+    reason: string;
+};
+
+/**
+ * ModelCheckRequest
+ *
+ * The check a Cayu server runs on its own app: a model and, optionally, a provider.
+ *
+ * The server supplies the prompt, output cap and deadline; a request can't change them.
+ */
+export type ModelCheckRequest = {
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Provider
+     */
+    provider?: string | null;
+};
+
+/**
+ * ModelCheckResult
+ */
+export type ModelCheckResult = {
+    answer: ModelCheckAnswer | null;
+    error: ModelCheckFailure | null;
+    /**
+     * Latency Ms
+     */
+    latency_ms: number | null;
+    limits: ModelCheckLimits;
+    /**
+     * Ok
+     */
+    ok: boolean;
+    pricing: ModelCheckPricing;
+    route: ModelCheckRoute;
+    /**
+     * Schema Version
+     */
+    schema_version?: '1';
+    usage: ModelCheckUsage | null;
+};
+
+/**
+ * ModelCheckRoute
+ */
+export type ModelCheckRoute = {
+    /**
+     * Billing Provider
+     */
+    billing_provider?: string | null;
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Provider
+     */
+    provider: string;
+    /**
+     * Provider Model
+     */
+    provider_model?: string | null;
+    /**
+     * Resolution
+     */
+    resolution: 'explicit' | 'model_pattern' | 'default';
+};
+
+/**
+ * ModelCheckUsage
+ */
+export type ModelCheckUsage = {
+    /**
+     * Cache Read Tokens
+     */
+    cache_read_tokens: number;
+    /**
+     * Cache Write Tokens
+     */
+    cache_write_tokens: number;
+    /**
+     * Input Tokens
+     */
+    input_tokens: number;
+    /**
+     * Output Tokens
+     */
+    output_tokens: number;
+    /**
+     * Reasoning Tokens
+     */
+    reasoning_tokens: number;
+    /**
+     * Total Tokens
+     */
+    total_tokens: number;
+};
+
+/**
  * ModelFailoverCandidate
  */
 export type ModelFailoverCandidate = {
@@ -24487,6 +24709,35 @@ export type GetContractApiContractGetResponses = {
 };
 
 export type GetContractApiContractGetResponse = GetContractApiContractGetResponses[keyof GetContractApiContractGetResponses];
+
+export type RunModelCheckApiDiagnosticsModelCheckPostData = {
+    body: ModelCheckRequest;
+    path?: never;
+    query?: never;
+    url: '/api/diagnostics/model-check';
+};
+
+export type RunModelCheckApiDiagnosticsModelCheckPostErrors = {
+    /**
+     * The request is invalid, or names no single registered provider for the model. No provider request was sent.
+     */
+    422: ApiErrorResponse;
+    /**
+     * Another check is running in this process, or one finished less than 5 seconds ago. Retry after the `Retry-After` header.
+     */
+    429: ApiErrorResponse;
+};
+
+export type RunModelCheckApiDiagnosticsModelCheckPostError = RunModelCheckApiDiagnosticsModelCheckPostErrors[keyof RunModelCheckApiDiagnosticsModelCheckPostErrors];
+
+export type RunModelCheckApiDiagnosticsModelCheckPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ModelCheckResult;
+};
+
+export type RunModelCheckApiDiagnosticsModelCheckPostResponse = RunModelCheckApiDiagnosticsModelCheckPostResponses[keyof RunModelCheckApiDiagnosticsModelCheckPostResponses];
 
 export type GetRequestCostDiagnosticsApiDiagnosticsRequestsGetData = {
     body?: never;

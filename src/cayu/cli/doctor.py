@@ -13,6 +13,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
+from pathlib import Path
 from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
@@ -33,7 +34,12 @@ from cayu.cli.project_control_plane import (
     build_project_control_plane_context,
     close_project_control_plane_context,
 )
-from cayu.cli.providers import model_argument, run_model_check
+from cayu.cli.providers import (
+    application_argument,
+    model_argument,
+    provider_argument,
+    run_model_check,
+)
 from cayu.cli.scaffold_check import check_declared_scaffold_source
 from cayu.project_control_plane import resolve_project_control_plane_context
 from cayu.runtime.checks import DiagnosticSeverity, ProjectControlPlaneCheckEvidence
@@ -107,7 +113,23 @@ def add_doctor_parser(subparsers: Any) -> None:
     parser.add_argument(
         "--provider",
         metavar="NAME",
+        type=provider_argument,
         help="With --model, the registered provider to check, as for `cayu providers check`.",
+    )
+    parser.add_argument(
+        "--application",
+        metavar="NAME",
+        type=application_argument,
+        help=(
+            "With --model, run the check on this Cayu Cloud Agent instead, as for "
+            "`cayu providers check --application`."
+        ),
+    )
+    parser.add_argument(
+        "--context",
+        type=Path,
+        metavar="PATH",
+        help="With --application: the private Cayu Cloud context JSON (`cayu cloud --context`).",
     )
     parser.add_argument(
         "--session",
@@ -161,8 +183,11 @@ def _request_cost_endpoint_argument(value: str) -> str:
 def run_doctor(args: argparse.Namespace) -> int:
     if args.model is not None:
         return _run_doctor_model_check(args)
-    if args.provider is not None:
-        print("error: --provider applies only with --model.", file=sys.stderr)
+    if args.provider is not None or args.application is not None or args.context is not None:
+        print(
+            "error: --provider, --application and --context apply only with --model.",
+            file=sys.stderr,
+        )
         return 2
     with _sigterm_cleanup_boundary():
         return _run_doctor_before_deadline(args)
@@ -176,8 +201,13 @@ def _run_doctor_model_check(args: argparse.Namespace) -> int:
             "error: --model writes no bundle; drop --session and --requests-from.", file=sys.stderr
         )
         return 2
+    if args.target is not None and args.application is not None:
+        print("error: --application checks the Agent's own app; drop the target.", file=sys.stderr)
+        return 2
     return run_model_check(
         target=args.target,
+        application=args.application,
+        context=args.context,
         model=args.model,
         provider_name=args.provider,
         output_format="json",

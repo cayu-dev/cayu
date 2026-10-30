@@ -99,6 +99,28 @@ The command exits 0 when the model answered and 1 when it didn't. An unknown
 that fails to load exits 2 with a `MODEL_CHECK_NOT_RUN` error before any
 request.
 
+### On a Cayu Cloud Agent
+
+```bash
+cayu providers check gpt-6.1-sol --application bug-hunter
+cayu doctor --model gpt-6.1-sol --application bug-hunter
+```
+
+`--application NAME` runs the same check inside the Agent's running release, with
+its providers, secrets and price book, and prints the same report. The CLI signs
+in to Cayu Cloud as `cayu cloud` does (`cayu cloud login`, `--context` or
+`CAYU_CLOUD_API_KEY`) and sends only the model and `--provider` to the Agent's
+own `POST /api/diagnostics/model-check`, with its Developer dashboard login; the
+Agent's server supplies the prompt, cap and deadline. Pricing comes from the
+Agent's `[tool.cayu.serve].price_book` when it sets one.
+
+The Agent needs a release built with a Cayu that serves the check; an older one
+exits 2 with `error.category: unsupported`.
+Each Agent process runs one check at a time and waits five seconds after one
+before the next; a check asked for sooner exits 2 with `error.category: busy`.
+Other refusals, such as an unknown `--provider`, rejected credentials or an
+Agent that isn't running, also exit 2, with the Agent API's `error.category`.
+
 ## Prompt caching
 
 Prompt caching is on by default where the provider needs explicit markers.

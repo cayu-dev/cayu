@@ -10590,6 +10590,26 @@ configured API authentication dependency and `Cache-Control: private,
 no-store`. Persisted event side-effect health is tracked separately and is not
 claimed by this snapshot.
 
+Server contract version 82 adds the protected `POST /api/diagnostics/model-check`
+route, which `cayu providers check MODEL --application NAME` calls on a Cayu
+Cloud Agent. Its `ModelCheckRequest` body carries only `model` and an optional
+`provider`, each a clean string of at most 256 characters; the server fixes the
+prompt, the 16-token output cap, no tools and the 30-second deadline. It runs the
+local command's check on the served app, with its providers, credentials and
+secret redactor, priced by the server's configured dashboard price book
+(`source: project`) or else Cayu's bundled book (`source: bundled`). The answer
+is a `ModelCheckResult`, the local command's JSON report, with `ok: false` for a
+provider failure; it never carries the prompt, answer text, provider error text
+or credentials, and the check writes nothing to a store. A body that names no
+single registered provider for the model is refused with 422 before any provider
+request. Each process runs one check at a time and admits the next only five
+seconds after the last finished; otherwise it answers 429 with `Retry-After`.
+The route takes the API's authentication dependency and, under
+`ControlPlaneRoles`, full-access roles only. Responses are `Cache-Control:
+private, no-store`. An Agent needs a release built with this contract before the
+CLI can check models on it; older servers answer 404 or 405, which the CLI
+reports as `unsupported`.
+
 The local `cayu doctor --bundle OUTPUT` command is a separate support boundary,
 not a server diagnostics route or health probe. It discovers the production
 project/service target, constructs its `CayuApp` once inside a hard-deadline

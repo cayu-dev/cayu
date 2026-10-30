@@ -30711,6 +30711,447 @@
         "title": "MessageRole",
         "type": "string"
       },
+      "ModelCheckAnswer": {
+        "additionalProperties": false,
+        "properties": {
+          "finish_reason": {
+            "title": "Finish Reason",
+            "type": "string"
+          },
+          "text_received": {
+            "title": "Text Received",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "finish_reason",
+          "text_received"
+        ],
+        "title": "ModelCheckAnswer",
+        "type": "object"
+      },
+      "ModelCheckFailure": {
+        "additionalProperties": false,
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/ModelCheckFailureCategory"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "provider_error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Error Code"
+          },
+          "provider_error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Error Type"
+          },
+          "rejection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelCheckRejection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retryable": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retryable"
+          },
+          "status_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Code"
+          }
+        },
+        "required": [
+          "category",
+          "message"
+        ],
+        "title": "ModelCheckFailure",
+        "type": "object"
+      },
+      "ModelCheckFailureCategory": {
+        "enum": [
+          "preflight_rejected",
+          "unsupported",
+          "billing_identity_failed",
+          "authentication_failed",
+          "permission_denied",
+          "not_found",
+          "rate_limited",
+          "request_rejected",
+          "server_error",
+          "provider_error",
+          "timeout",
+          "stream_failed",
+          "event_after_completion",
+          "generation_failed"
+        ],
+        "title": "ModelCheckFailureCategory",
+        "type": "string"
+      },
+      "ModelCheckLimits": {
+        "additionalProperties": false,
+        "properties": {
+          "max_output_tokens": {
+            "title": "Max Output Tokens",
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "title": "Timeout Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "max_output_tokens",
+          "timeout_seconds"
+        ],
+        "title": "ModelCheckLimits",
+        "type": "object"
+      },
+      "ModelCheckPriceBook": {
+        "additionalProperties": false,
+        "properties": {
+          "generated_at": {
+            "title": "Generated At",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "bundled",
+              "project"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "version",
+          "generated_at"
+        ],
+        "title": "ModelCheckPriceBook",
+        "type": "object"
+      },
+      "ModelCheckPricing": {
+        "additionalProperties": false,
+        "properties": {
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "estimated_cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Cost"
+          },
+          "price_book": {
+            "$ref": "#/components/schemas/ModelCheckPriceBook"
+          },
+          "priced": {
+            "title": "Priced",
+            "type": "boolean"
+          },
+          "unpriced_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unpriced Reason"
+          }
+        },
+        "required": [
+          "priced",
+          "price_book"
+        ],
+        "title": "ModelCheckPricing",
+        "type": "object"
+      },
+      "ModelCheckRejection": {
+        "additionalProperties": false,
+        "properties": {
+          "explanation": {
+            "title": "Explanation",
+            "type": "string"
+          },
+          "parameter": {
+            "title": "Parameter",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "parameter",
+          "explanation"
+        ],
+        "title": "ModelCheckRejection",
+        "type": "object"
+      },
+      "ModelCheckRequest": {
+        "additionalProperties": false,
+        "description": "The check a Cayu server runs on its own app: a model and, optionally, a provider.\n\nThe server supplies the prompt, output cap and deadline; a request can't change them.",
+        "properties": {
+          "model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Model",
+            "type": "string"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "title": "ModelCheckRequest",
+        "type": "object"
+      },
+      "ModelCheckResult": {
+        "additionalProperties": false,
+        "properties": {
+          "answer": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelCheckAnswer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelCheckFailure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latency_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latency Ms"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/ModelCheckLimits"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "pricing": {
+            "$ref": "#/components/schemas/ModelCheckPricing"
+          },
+          "route": {
+            "$ref": "#/components/schemas/ModelCheckRoute"
+          },
+          "schema_version": {
+            "const": "1",
+            "default": "1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelCheckUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "route",
+          "limits",
+          "latency_ms",
+          "answer",
+          "usage",
+          "pricing",
+          "error"
+        ],
+        "title": "ModelCheckResult",
+        "type": "object"
+      },
+      "ModelCheckRoute": {
+        "additionalProperties": false,
+        "properties": {
+          "billing_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Billing Provider"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "provider_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Model"
+          },
+          "resolution": {
+            "enum": [
+              "explicit",
+              "model_pattern",
+              "default"
+            ],
+            "title": "Resolution",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "resolution"
+        ],
+        "title": "ModelCheckRoute",
+        "type": "object"
+      },
+      "ModelCheckUsage": {
+        "additionalProperties": false,
+        "properties": {
+          "cache_read_tokens": {
+            "title": "Cache Read Tokens",
+            "type": "integer"
+          },
+          "cache_write_tokens": {
+            "title": "Cache Write Tokens",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "reasoning_tokens": {
+            "title": "Reasoning Tokens",
+            "type": "integer"
+          },
+          "total_tokens": {
+            "title": "Total Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "total_tokens",
+          "reasoning_tokens",
+          "cache_read_tokens",
+          "cache_write_tokens"
+        ],
+        "title": "ModelCheckUsage",
+        "type": "object"
+      },
       "ModelFailoverCandidate": {
         "additionalProperties": false,
         "properties": {
@@ -39155,7 +39596,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "81",
+            "default": "82",
             "title": "Contract Version",
             "type": "string"
           },
@@ -47344,7 +47785,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "81",
+            "default": "82",
             "title": "Contract Version",
             "type": "string"
           }
@@ -48870,6 +49311,55 @@
           "title": "AuthContext",
           "type": "object"
         }
+      }
+    },
+    "/api/diagnostics/model-check": {
+      "post": {
+        "description": "Send one bounded request for `model` through the provider an agent using it resolves to (or `provider`), with this server's credentials, and report the outcome, latency, route, usage and pricing, as `cayu providers check` does. The server fixes the prompt, a 16-token output cap, no tools and a 30-second deadline. The report never carries the prompt, the answer text, the provider's error text or credentials, and nothing is stored. A provider failure is a report with `ok: false`, not an HTTP error. One check runs at a time per process.",
+        "operationId": "run_model_check_api_diagnostics_model_check_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelCheckResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request is invalid, or names no single registered provider for the model. No provider request was sent."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Another check is running in this process, or one finished less than 5 seconds ago. Retry after the `Retry-After` header."
+          }
+        },
+        "summary": "Run Model Check"
       }
     },
     "/api/diagnostics/requests": {

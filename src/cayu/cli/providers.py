@@ -4,12 +4,17 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
 from typing import Any
+
+from pydantic import ValidationError
 
 from cayu._validation import require_durable_clean_nonblank
 from cayu.budgets.pricing import PriceBook, default_price_book
+from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, open_cloud_agent_api
 from cayu.cli._json_inputs import json_object_file
 from cayu.cli._output import add_output_options, output_destination, terminal_safe
+from cayu.cli._read_targets import cloud_login_output_conflict
 from cayu.cli.project import (
     CayuProjectConfiguration,
     ProjectError,
@@ -21,8 +26,11 @@ from cayu.cli.project import (
     resolve_project,
 )
 from cayu.runtime._model_check import (
+    MODEL_CHECK_API_PATH,
+    MODEL_CHECK_NAME_MAX_CHARS,
     MODEL_CHECK_SCHEMA_VERSION,
     MODEL_CHECK_TIMEOUT_SECONDS,
+    ModelCheckRequest,
     ModelCheckResult,
     ModelCheckRouteError,
     PriceBookSource,
@@ -31,6 +39,8 @@ from cayu.runtime._model_check import (
 )
 
 _NOT_RUN_CODE = "MODEL_CHECK_NOT_RUN"
+# A Cloud Agent's check can take its whole deadline before it answers.
+_APPLICATION_TIMEOUT_SECONDS = MODEL_CHECK_TIMEOUT_SECONDS + 15.0
 
 
 def add_providers_parser(subparsers: Any) -> None:
@@ -47,40 +57,77 @@ def add_providers_parser(subparsers: Any) -> None:
         "check",
         help="Check that a model answers through the project's provider and is priced.",
         description=(
-            "Build the project's application and send one bounded request for MODEL "
-            "through its registered provider and credentials: a fixed short prompt, the "
-            "smallest output cap, no tools and a short timeout. Report the outcome, "
-            "latency, route, usage and pricing, never the prompt or the answer. Exits 1 "
-            "when the model does not answer."
+            "Build the project's application, or use a Cayu Cloud Agent's with "
+            "--application, and send one bounded request for MODEL through its registered "
+            "provider and credentials: a fixed short prompt, the smallest output cap, no "
+            "tools and a short timeout. Report the outcome, latency, route, usage and "
+            "pricing, never the prompt or the answer. Exits 1 when the model does not "
+            "answer."
         ),
     )
     check.add_argument("model", metavar="MODEL", type=model_argument, help="Model to check.")
     check.add_argument(
         "--provider",
         metavar="NAME",
+        type=provider_argument,
         help=(
             "Registered provider to send the request through (default: the provider an "
             "agent using MODEL resolves to: a matching model pattern, else the default "
             "provider)."
         ),
     )
-    check.add_argument(
+    where = check.add_mutually_exclusive_group()
+    where.add_argument(
         "--target",
         help="Override project discovery with a module:factory target.",
+    )
+    where.add_argument(
+        "--application",
+        metavar="NAME",
+        type=application_argument,
+        help=(
+            "Run the check on the Cayu Cloud Agent with this slug or name instead: in its "
+            "running release, with its providers, secrets and price book, signed in as "
+            "`cayu cloud` is. Its release needs a Cayu that serves the check."
+        ),
+    )
+    check.add_argument(
+        "--context",
+        type=Path,
+        metavar="PATH",
+        help="With --application: the private Cayu Cloud context JSON (`cayu cloud --context`).",
     )
     add_output_options(check)
 
 
 def model_argument(value: str) -> str:
+    # Model and provider names are bounded as a Cayu server's check bounds them.
+    return _clean_argument(value, "model", max_chars=MODEL_CHECK_NAME_MAX_CHARS)
+
+
+def provider_argument(value: str) -> str:
+    return _clean_argument(value, "provider", max_chars=MODEL_CHECK_NAME_MAX_CHARS)
+
+
+def application_argument(value: str) -> str:
+    return _clean_argument(value, "application")
+
+
+def _clean_argument(value: str, field_name: str, *, max_chars: int | None = None) -> str:
     try:
-        return require_durable_clean_nonblank(value, "model")
+        value = require_durable_clean_nonblank(value, field_name)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
+    if max_chars is not None and len(value) > max_chars:
+        raise argparse.ArgumentTypeError(f"`{field_name}` must be at most {max_chars} characters.")
+    return value
 
 
 def run_providers(args: argparse.Namespace) -> int:
     return run_model_check(
         target=args.target,
+        application=args.application,
+        context=args.context,
         model=args.model,
         provider_name=args.provider,
         output_format=args.output_format,
@@ -91,18 +138,41 @@ def run_providers(args: argparse.Namespace) -> int:
 def run_model_check(
     *,
     target: str | None,
+    application: str | None,
+    context: Path | None,
     model: str,
     provider_name: str | None,
     output_format: str,
     output: str | None,
 ) -> int:
-    """Run the check and render it; exit 0 when the model answered, 1 when not."""
+    """Run the check here or on ``application`` and render it.
 
-    try:
-        result = asyncio.run(_check(target, model=model, provider_name=provider_name))
-    except (ProjectError, ModelCheckRouteError) as exc:
-        _render_not_run(str(exc), as_json=output_format == "json")
-        return 2
+    Exits 0 when the model answered, 1 when it didn't, and 2 when the check didn't run.
+    """
+
+    as_json = output_format == "json"
+    if application is None:
+        if context is not None:
+            _render_not_run("--context applies only with --application.", as_json=as_json)
+            return 2
+        try:
+            result = asyncio.run(_check(target, model=model, provider_name=provider_name))
+        except (ProjectError, ModelCheckRouteError) as exc:
+            _render_not_run(str(exc), as_json=as_json)
+            return 2
+    else:
+        # Before any output is opened: the Cloud sign-in reads these files.
+        conflict = None if output is None else cloud_login_output_conflict(output, context)
+        if conflict is not None:
+            _render_not_run(conflict, as_json=as_json)
+            return 2
+        try:
+            result = _check_on_application(
+                application, context=context, model=model, provider_name=provider_name
+            )
+        except CayuApiError as exc:
+            _render_not_run(str(exc), as_json=as_json, category=exc.category)
+            return 2
     try:
         with output_destination(output):
             if output_format == "json":
@@ -158,6 +228,57 @@ async def _check(target: str | None, *, model: str, provider_name: str | None) -
             await close_project_app(app)
 
 
+def _check_on_application(
+    application: str, *, context: Path | None, model: str, provider_name: str | None
+) -> ModelCheckResult:
+    """Have the Cloud Agent ``application`` run the check through its own Cayu API."""
+
+    request = ModelCheckRequest(model=model, provider=provider_name)
+    api = open_cloud_agent_api(
+        application, context=context, timeout_seconds=_APPLICATION_TIMEOUT_SECONDS
+    )
+    try:
+        # A route every Cayu serves finds the Agent's API first, so an Agent whose
+        # Cayu predates the check is told apart from one that serves no Cayu API.
+        api.get("/contract", resource="server contract")
+        try:
+            answer = api.post(
+                MODEL_CHECK_API_PATH,
+                request.model_dump(exclude_none=True),
+                resource="model check",
+            )
+        except CayuApiError as exc:
+            raise _agent_refusal(api, exc) from None
+    finally:
+        api.close()
+    try:
+        return ModelCheckResult.model_validate(answer)
+    except ValidationError:
+        raise CayuApiError(
+            "invalid_response",
+            f"{api.description} answered the model check with a report this CLI can't read; "
+            "a newer Cayu CLI may read it.",
+        ) from None
+
+
+def _agent_refusal(api: CayuApi, error: CayuApiError) -> CayuApiError:
+    if error.category == "unsupported":
+        return CayuApiError(
+            "unsupported",
+            f"{api.description} runs a Cayu that can't check models. Deploy a release "
+            "built with this CLI's Cayu version or newer, then run the check again.",
+            status_code=error.status_code,
+        )
+    if error.status_code == 429:
+        return CayuApiError(
+            "busy",
+            f"{api.description} is running another model check or has just finished one; "
+            "try again in a few seconds.",
+            status_code=429,
+        )
+    return error
+
+
 def _price_book(
     configured: CayuProjectConfiguration | None,
 ) -> tuple[PriceBook, PriceBookSource]:
@@ -179,19 +300,20 @@ def _price_book(
         raise ProjectError(message) from None
 
 
-def _render_not_run(message: str, *, as_json: bool) -> None:
+def _render_not_run(message: str, *, as_json: bool, category: str | None = None) -> None:
+    """Report a check that didn't run; ``category`` is the Agent API's, with --application."""
+
     if as_json:
+        error = {"code": _NOT_RUN_CODE, "message": message}
+        if category is not None:
+            error["category"] = category
         print(
             json.dumps(
-                {
-                    "schema_version": MODEL_CHECK_SCHEMA_VERSION,
-                    "error": {"code": _NOT_RUN_CODE, "message": message},
-                },
-                sort_keys=True,
+                {"schema_version": MODEL_CHECK_SCHEMA_VERSION, "error": error}, sort_keys=True
             )
         )
     else:
-        print(f"error: {message}", file=sys.stderr)
+        print(f"error: {terminal_safe(message)}", file=sys.stderr)
 
 
 def _render_human(result: ModelCheckResult) -> str:
