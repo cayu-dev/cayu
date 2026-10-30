@@ -218,12 +218,18 @@ async def test_stale_runner_cannot_execute_after_a_successor_attaches(tmp_path: 
     model = ClientTokenLambdaModel()
     sidecar = SupervisorTransport(tmp_path)
     stale = await _runner(model, sidecar)
+    assert stale.owner_superseded is False
+    assert stale.owner_fence_generation is not None
     assert (await stale.exec(ExecCommand.process("python3", "-c", "print(1)"))).exit_code == 0
 
     successor = await _runner(model, sidecar, stale.microvm_id)
+    assert stale.owner_superseded is False  # No operation has observed the takeover yet.
 
     with pytest.raises(LambdaMicroVMOwnershipSuperseded):
         await stale.exec(ExecCommand.process("python3", "-c", "print(2)"))
+    assert stale.owner_superseded is True
+    assert stale.owner_fence_generation is None
+    assert successor.owner_superseded is False
     with pytest.raises(RuntimeError, match="poisoned|closed"):
         await stale.exec(ExecCommand.process("python3", "-c", "print(3)"))
     result = await successor.exec(ExecCommand.process("python3", "-c", "print('successor')"))
@@ -809,3 +815,19 @@ def test_lifecycle_lease_rejects_unknown_actions(sidecar, action: Any) -> None:
     with pytest.raises(HTTPException) as raised:
         asyncio.run(sidecar.acquire_lifecycle({"claim_id": _CLAIM_A, "action": action}))
     assert raised.value.status_code == 400
+
+
+@pytest.mark.anyio
+async def test_unclaimed_runner_reports_read_only_unsuperseded_state(tmp_path: Path) -> None:
+    runner = LambdaMicroVMRunner(
+        ClientTokenLambdaModel(),
+        microvm_id="unclaimed",
+        endpoint="https://microvm.example",
+        endpoint_transport=SupervisorTransport(tmp_path),
+    )
+    assert runner.owner_fence_generation is None
+    assert runner.owner_superseded is False
+    with pytest.raises(AttributeError):
+        runner.owner_superseded = True
+    await runner.close()
+    assert runner.owner_superseded is False

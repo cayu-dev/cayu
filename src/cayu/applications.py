@@ -730,6 +730,7 @@ from cayu.tasks.dispatch import (
     InlineDispatcher,
     _QueuedDispatchEnvelope,
     _QueuedDispatchSettlement,
+    _validate_dispatch_handle_for_request,
     copy_dispatch_handle,
     copy_dispatch_request,
     redact_dispatch_request,
@@ -9983,22 +9984,3 @@ def _artifact_store(registered_environment: runtime_records.RegisteredEnvironmen
     if registered_environment is None:
         return None
     return registered_environment.environment.artifact_store
-
-
-def _validate_dispatch_handle_for_request(
-    *,
-    handle: DispatchHandle,
-    request: DispatchRequest,
-) -> None:
-    if type(handle) is not DispatchHandle:
-        raise TypeError("Dispatcher must return a DispatchHandle.")
-    mismatches = []
-    if handle.dispatch_id != request.dispatch_id:
-        mismatches.append("dispatch_id")
-    if handle.session_id != request.session_id:
-        mismatches.append("session_id")
-    if handle.task_id != request.task_id:
-        mismatches.append("task_id")
-    if mismatches:
-        fields = ", ".join(mismatches)
-        raise ValueError(f"Dispatcher returned a handle for the wrong request fields: {fields}.")

@@ -4004,3 +4004,22 @@ def _dispatch_status_after_event(
     if event.type == EventType.SESSION_INTERRUPTED:
         return DispatchStatus.INTERRUPTED
     return fallback
+
+
+def _validate_dispatch_handle_for_request(
+    *,
+    handle: DispatchHandle,
+    request: DispatchRequest,
+) -> None:
+    if type(handle) is not DispatchHandle:
+        raise TypeError("Dispatcher must return a DispatchHandle.")
+    mismatches = []
+    if handle.dispatch_id != request.dispatch_id:
+        mismatches.append("dispatch_id")
+    if handle.session_id != request.session_id:
+        mismatches.append("session_id")
+    if handle.task_id != request.task_id:
+        mismatches.append("task_id")
+    if mismatches:
+        fields = ", ".join(mismatches)
+        raise ValueError(f"Dispatcher returned a handle for the wrong request fields: {fields}.")

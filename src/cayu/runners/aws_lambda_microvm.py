@@ -2541,6 +2541,19 @@ class LambdaMicroVMRunner(Runner):
             return None
         return f"{self.microvm_id}:{self._owner_generation}"
 
+    @property
+    def owner_superseded(self) -> bool:
+        """Whether a guest operation has reported that a successor owns this MicroVM.
+
+        False before the first claim and while ownership has not been reported
+        lost. Once true, it stays true for this runner; do not retry or reattach
+        it. This is observed state, not a live ownership check. Unlike
+        :attr:`owner_fence_generation`, it distinguishes an unclaimed runner
+        from one that has learned its claim was superseded.
+        """
+
+        return self._owner_superseded
+
     def _mark_superseded(self) -> None:
         self._owner_superseded = True
         self._poison_exec("Lambda MicroVM ownership was superseded")

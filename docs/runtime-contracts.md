@@ -15099,7 +15099,12 @@ every command start carries that claim. A newer claim cancels earlier owners' co
 the agent proxy relay, and makes the sidecar reject older owners' starts, which surface as
 `LambdaMicroVMOwnershipSuperseded` and permanently poison that runner. An older owner's command
 that was still running is reported with `cancel_reason="owner_superseded"` and raises the same
-error instead of returning an ordinary cancelled result. Concurrent recovery workers that adopt
+error instead of returning an ordinary cancelled result. The read-only
+`LambdaMicroVMRunner.owner_superseded` property becomes true when any guest operation
+reports this loss and stays true for that runner. It is false before a claim and does
+not poll the guest: false is not proof of current ownership. In contrast,
+`owner_fence_generation` is `None` both before a claim and after supersession.
+Concurrent recovery workers that adopt
 the same MicroVM therefore converge on one executing owner. Readiness after resume
 only confirms an existing claim, so a stale runner cannot take a MicroVM back. Every
 control-plane suspend or terminate, whether from `suspend()`, `terminate()`, `close()`, or
