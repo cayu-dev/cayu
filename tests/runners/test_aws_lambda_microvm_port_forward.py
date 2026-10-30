@@ -1,4 +1,4 @@
-"""LambdaMicroVMRunner port forwards over sidecar protocol 7 (fake AWS, real sidecar)."""
+"""LambdaMicroVMRunner port forwards over the sidecar protocol (fake AWS, real sidecar)."""
 
 from __future__ import annotations
 

@@ -15056,7 +15056,7 @@ extra. `create(...)` calls the distinct `lambda-microvms` control API, waits for
 sidecar health interface, and terminates a newly created MicroVM if setup fails or is cancelled.
 `from_existing(...)` restores identity from `get_microvm` and generates a fresh endpoint token;
 JWE tokens are memory-only and never belong in reconnect metadata. Both process and shell forms
-cross sidecar protocol version `7` without host-environment inheritance; readiness rejects an
+cross sidecar protocol version `8` without host-environment inheritance; readiness rejects an
 image that reports another version. Protocol 7 adds port forwards through
 `port_forward_capability()`: the guest listens on its agent network's gateway address and the
 runner relays each connection to a host `host:port` over the owner-fenced endpoint, moving bytes
@@ -15086,6 +15086,16 @@ A failed open that cannot confirm closure retains its cleanup handle on the orig
 (including cancellation). Recover it with `RunnerPortForwardCapability.failed_open_forward(error)`
 and retry `close()` before treating the listener as closed. Idle guest receive timeouts keep
 waiting, and transient accept-poll failures retry until closure or owner supersession.
+Protocol 8 adds optional `owner_epoch` to runner creation, attachment and direct
+construction. The sidecar's `/health` advertises `capabilities: ["owner_epoch"]`;
+the runner requires that capability and protocol 8 before sending a numbered claim.
+The sidecar remembers the highest accepted nonnegative integer epoch under its owner
+lock. A lower epoch returns HTTP 409 (`LambdaMicroVMStaleOwnerEpoch`, a subclass of
+`LambdaMicroVMOwnershipSuperseded`) without changing the owner or touching its work.
+Equal epochs retain ordinary claim behavior. Claims without an epoch keep their
+existing behavior and do not lower the remembered maximum. This caller epoch is
+separate from the sidecar's internal generation. Like the owner fence, its high-water
+mark survives suspend/resume but not a sidecar restart.
 Protocol 6 adds interactive processes through
 `interactive_process_capability()`: stdio streams by byte offset, and each process runs in its
 own guest PID namespace, so `close()` confirms that the whole process tree exited. Protocol 4 carries up to 24 MiB of stdin (larger stdin is

@@ -655,7 +655,7 @@ def test_sidecar_routes_fence_forwards_to_the_current_owner(
     monkeypatch.setattr(app, "FORWARDS", _registry())
     claim, successor = "c" * 40, "d" * 40
     try:
-        assert asyncio.run(app.health())["protocol_version"] == "7"
+        assert asyncio.run(app.health())["protocol_version"] == "8"
         asyncio.run(app.claim_owner({"claim_id": claim}))
         opened = asyncio.run(app.open_forward({"forward_id": "fwd", "owner_claim": claim}))
         client = _connect(opened)

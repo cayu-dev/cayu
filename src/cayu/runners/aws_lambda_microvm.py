@@ -102,7 +102,7 @@ DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_LAMBDA_MICROVM_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS = 0.01
-LAMBDA_MICROVM_PROTOCOL_VERSION = "7"
+LAMBDA_MICROVM_PROTOCOL_VERSION = "8"
 # Sized for the built-in browser worker: a default session response envelope
 # plus a browser-profile checkpoint, and a default upload batch on stdin. Both
 # match the first-party sidecar's own ceilings.
@@ -137,6 +137,7 @@ _LAMBDA_FORWARD_METHODS = (
     "close_forward",
 )
 _LAMBDA_OWNER_SUPERSEDED_HTTP_STATUS = 412
+_LAMBDA_STALE_OWNER_EPOCH_HTTP_STATUS = 409
 _LAMBDA_OWNER_LIFECYCLE_LEASED_HTTP_STATUS = 423
 _LAMBDA_OWNER_SUPERSEDED_CANCEL_REASON = "owner_superseded"
 # A lifecycle lease authorizes exactly one provider request, and only if it is
@@ -359,6 +360,14 @@ class LambdaMicroVMOwnershipSuperseded(LambdaMicroVMError):
     """
 
 
+class LambdaMicroVMStaleOwnerEpoch(LambdaMicroVMOwnershipSuperseded):
+    """The requested owner epoch is older than one the sidecar already accepted.
+
+    The current owner and its work are unchanged. Retrying the same stale epoch
+    cannot acquire ownership; the rejected runner must not act on the MicroVM.
+    """
+
+
 class LambdaMicroVMOwnershipUnverified(LambdaMicroVMError):
     """The sidecar could not confirm this runner still owns the MicroVM.
 
@@ -453,6 +462,7 @@ class LambdaMicroVMEndpointTransport(Protocol):
         token: str,
         claim_id: str,
         timeout_s: float,
+        owner_epoch: int | None = None,
     ) -> Mapping[str, Any]: ...
 
     async def check_owner(
@@ -765,13 +775,17 @@ class HttpxLambdaMicroVMEndpointTransport:
         token: str,
         claim_id: str,
         timeout_s: float,
+        owner_epoch: int | None = None,
     ) -> Mapping[str, Any]:
         return await self._request(
             "POST",
             endpoint=endpoint,
             token=token,
             path="/v1/owner",
-            payload={"claim_id": claim_id},
+            payload={
+                "claim_id": claim_id,
+                **({"owner_epoch": owner_epoch} if owner_epoch is not None else {}),
+            },
             timeout_s=timeout_s,
         )
 
@@ -873,6 +887,13 @@ class HttpxLambdaMicroVMEndpointTransport:
                         raise LambdaMicroVMEndpointUnauthorized(
                             "Lambda MicroVM endpoint token was rejected."
                         )
+                    if (
+                        path == "/v1/owner"
+                        and response.status_code == _LAMBDA_STALE_OWNER_EPOCH_HTTP_STATUS
+                    ):
+                        raise LambdaMicroVMStaleOwnerEpoch(
+                            "Lambda MicroVM sidecar rejected an older owner epoch."
+                        )
                     if response.status_code == _LAMBDA_OWNER_SUPERSEDED_HTTP_STATUS:
                         raise LambdaMicroVMOwnershipSuperseded(
                             "Lambda MicroVM sidecar reports a newer owner."
@@ -963,9 +984,12 @@ class LambdaMicroVMRunner(Runner):
         env_overlay: Mapping[str, str] | None = None,
         ready_timeout_s: float = DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS,
         lifecycle_timeout_s: float = DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS,
+        owner_epoch: int | None = None,
     ) -> None:
         if client is None:
             raise TypeError("LambdaMicroVMRunner client cannot be None.")
+        self._owner_epoch = _validate_owner_epoch(owner_epoch)
+        self._owner_epoch_verified = False
         self._client = client
         self._owns_client = owns_client
         self.microvm_id = require_clean_nonblank(microvm_id, "microvm_id")
@@ -1302,8 +1326,12 @@ class LambdaMicroVMRunner(Runner):
         client_token: str | None = None,
         client_token_not_after: float | None = None,
         lifecycle_timeout_s: float = DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS,
+        owner_epoch: int | None = None,
     ) -> LambdaMicroVMRunner:
         """Allocate a MicroVM and wait until its sidecar is ready.
+
+        ``owner_epoch`` optionally fences claims against older caller epochs.
+        It requires protocol 8 and the advertised ``owner_epoch`` capability.
 
         With ``client_token``, submission is idempotent: transient control-plane
         failures replay the same token and parameters, and a replay adopts the
@@ -1315,6 +1343,7 @@ class LambdaMicroVMRunner(Runner):
         replacement. ``client_token_not_after`` bounds when any submission for
         the token may be sent (see ``run_microvm_with_client_token``).
         """
+        owner_epoch = _validate_owner_epoch(owner_epoch)
         image = require_clean_nonblank(image_identifier, "image_identifier")
         token = None if client_token is None else _validate_client_token(client_token)
         if client_token_not_after is not None and token is None:
@@ -1398,6 +1427,7 @@ class LambdaMicroVMRunner(Runner):
                     env_overlay=environment_overlay,
                     ready_timeout_s=ready_timeout_s,
                     lifecycle_timeout_s=lifecycle_timeout_s,
+                    owner_epoch=owner_epoch,
                 )
                 reclamation.runner = runner
                 if not reclamation.abandoned:
@@ -1523,7 +1553,15 @@ class LambdaMicroVMRunner(Runner):
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         env_overlay: Mapping[str, str] | None = None,
         lifecycle_timeout_s: float = DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS,
+        owner_epoch: int | None = None,
     ) -> LambdaMicroVMRunner:
+        """Attach and claim an existing MicroVM, optionally with ``owner_epoch``.
+
+        An epoch lower than any previously accepted epoch is refused without
+        disturbing the current owner. Equal epochs retain normal claim behavior.
+        Omitting it keeps legacy claims; those never reset the retained maximum.
+        """
+        owner_epoch = _validate_owner_epoch(owner_epoch)
         identifier = require_clean_nonblank(microvm_id, "microvm_id")
         guest_root = _validate_guest_root(default_cwd)
         environment_overlay = _preflight_runner_creation(
@@ -1589,6 +1627,7 @@ class LambdaMicroVMRunner(Runner):
                     env_overlay=environment_overlay,
                     ready_timeout_s=ready_timeout_s,
                     lifecycle_timeout_s=lifecycle_timeout_s,
+                    owner_epoch=owner_epoch,
                 )
                 reclamation.runner = runner
 
@@ -2462,6 +2501,16 @@ class LambdaMicroVMRunner(Runner):
                 f"expected {LAMBDA_MICROVM_PROTOCOL_VERSION}, got {reported_version}."
             )
 
+        capabilities = response.get("capabilities")
+        if self._owner_epoch is not None and (
+            not isinstance(capabilities, list) or "owner_epoch" not in capabilities
+        ):
+            raise _LambdaMicroVMProtocolVersionMismatch(
+                "Lambda MicroVM sidecar does not advertise owner_epoch support."
+            )
+
+        self._owner_epoch_verified = True
+
     async def _claim_owner(self) -> None:
         """Become the MicroVM's only command owner; later claims fence this runner.
 
@@ -2478,7 +2527,16 @@ class LambdaMicroVMRunner(Runner):
                 self._mark_superseded()
                 raise LambdaMicroVMOwnershipSuperseded("Lambda MicroVM has a newer owner.")
             return
-        response = await self._endpoint_call("claim_owner", claim_id=self._owner_claim)
+        if self._owner_epoch is not None and not self._owner_epoch_verified:
+            await self._endpoint_health()
+        options = {} if self._owner_epoch is None else {"owner_epoch": self._owner_epoch}
+        try:
+            response = await self._endpoint_call(
+                "claim_owner", claim_id=self._owner_claim, **options
+            )
+        except LambdaMicroVMStaleOwnerEpoch:
+            self._mark_superseded()
+            raise
         generation = response.get("generation")
         if type(generation) is not int or generation <= 0:
             raise LambdaMicroVMProtocolError("Lambda MicroVM owner claim returned no generation.")
@@ -4263,3 +4321,9 @@ def _nonnegative_float(value: float, field_name: str) -> float:
     if not isfinite(value) or value < 0:
         raise ValueError(f"{field_name} must be finite and non-negative.")
     return float(value)
+
+
+def _validate_owner_epoch(value: int | None) -> int | None:
+    if value is not None and (type(value) is not int or value < 0):
+        raise ValueError("owner_epoch must be a nonnegative integer or None.")
+    return value

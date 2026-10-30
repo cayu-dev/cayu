@@ -60,7 +60,7 @@ docker build --platform linux/arm64 \
   -t cayu-lambda-microvm-sidecar-proof "$proof_root/wheel"
 docker run --rm --platform linux/arm64 --entrypoint python3.11 \
   cayu-lambda-microvm-sidecar-proof -c \
-  'import asyncio, json; from pathlib import Path; from lambda_microvm_sidecar.app import health; manifest = json.loads(Path("/opt/cayu/lambda_microvm_sidecar/cayu-lambda-microvm-sidecar-manifest.json").read_text()); result = asyncio.run(health()); assert result == {"status": "ok", "protocol_version": manifest["protocol_version"]}'
+  'import asyncio, json; from pathlib import Path; from lambda_microvm_sidecar.app import health; manifest = json.loads(Path("/opt/cayu/lambda_microvm_sidecar/cayu-lambda-microvm-sidecar-manifest.json").read_text()); result = asyncio.run(health()); assert result == {"status": "ok", "protocol_version": manifest["protocol_version"], "capabilities": ["owner_epoch"]}'
 
 "$repository_root/.release-sdist-venv/bin/python" - <<'PY'
 from importlib.resources import files

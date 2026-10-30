@@ -43,6 +43,9 @@ from cayu.runners.aws_lambda_microvm import (
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMProtocolError as LambdaMicroVMProtocolError
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMRunner as LambdaMicroVMRunner
 from cayu.runners.aws_lambda_microvm import (
+    LambdaMicroVMStaleOwnerEpoch as LambdaMicroVMStaleOwnerEpoch,
+)
+from cayu.runners.aws_lambda_microvm import (
     LambdaMicroVMSubmissionClosed as LambdaMicroVMSubmissionClosed,
 )
 from cayu.runners.base import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES as DEFAULT_EXEC_OUTPUT_LIMIT_BYTES

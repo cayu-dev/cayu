@@ -108,8 +108,8 @@ uv run python scripts/generate_sidecar_manifest.py --check
 
 ## Protocol
 
-The sidecar implements Cayu Lambda MicroVM command protocol version `7`. `GET /health` returns
-`{"status":"ok","protocol_version":"7"}` so the host can reject an incompatible image before
+The sidecar implements Cayu Lambda MicroVM command protocol version `8`. `GET /health` returns
+`{"status":"ok","protocol_version":"8","capabilities":["owner_epoch"]}` so the host can reject an incompatible image before
 sending a command. The host requires the exact version, so an image built from an earlier
 release must be rebuilt. Version 2 added the boolean `omit_truncated_output` command field: redacted
 executions use it to suppress a channel whose unavailable suffix could complete a workload
@@ -123,6 +123,20 @@ command of earlier owners, reporting them with `"cancel_reason": "owner_supersed
 the agent proxy relay so the new owner's proxy can be installed. Re-presenting the current claim is idempotent. `POST /v1/owner/check` reports whether
 a claim is still current. The fence lives in sidecar memory, so it survives suspend and resume;
 a restarted sidecar forgets it and every earlier host becomes stale until a new claim.
+
+Version 8 accepts an optional nonnegative integer `owner_epoch` in `POST /v1/owner`.
+The sidecar retains the highest accepted epoch under the owner lock. A lower epoch
+returns HTTP 409 before touching ownership, relays, lifecycle leases, or commands;
+the host raises `LambdaMicroVMStaleOwnerEpoch` (a `LambdaMicroVMOwnershipSuperseded`
+subclass). Equal epochs retain the normal claim rules. Omitted or null epochs keep
+legacy last-claim-wins behavior without lowering the retained maximum. The epoch
+survives suspend/resume with the in-memory fence, but not a sidecar restart.
+
+Pass `owner_epoch=` to `LambdaMicroVMRunner.create`, `from_existing`, or its direct
+constructor. Before relying on this feature, check protocol 8 and the `owner_epoch`
+health capability; the runner checks both before sending a numbered claim. This
+caller-supplied epoch is separate from the sidecar-generated `generation` returned
+by a successful claim.
 
 Takeover is atomic with command admission. The owner check, request validation (which may
 install the agent proxy relay), and registration of a start all run while the fence is held,
@@ -247,7 +261,8 @@ If this interrupts an
 owner takeover, both owners have no authority until the original cleanup callback succeeds.
 Retrying the same claim settles that takeover without another generation; a third claim must
 settle it before advancing ownership. Omitting or replacing the retry's callback cannot bypass
-the retained cleanup. Rebuild the sidecar image to apply these fixes; the protocol stays 7.
+the retained cleanup. Rebuild the sidecar image to apply these fixes and the protocol 8
+owner-epoch fence.
 
 - `GET /health`
 - `POST /v1/owner`

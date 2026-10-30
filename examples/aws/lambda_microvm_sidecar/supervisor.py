@@ -98,6 +98,10 @@ class OwnerSupersededError(RuntimeError):
     """A command was submitted by an owner that a later claim has fenced."""
 
 
+class StaleOwnerEpochError(RuntimeError):
+    """A claim carries an epoch below the highest accepted owner epoch."""
+
+
 class OwnerLifecycleLeasedError(RuntimeError):
     """The current owner holds a lifecycle lease; no claim or command is admitted."""
 
@@ -132,6 +136,7 @@ class OwnerFence:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._generation = 0
+        self._highest_owner_epoch: int | None = None
         self._digest: bytes | None = None
         self._lease: _LifecycleLease | None = None
         self._pending_supersede: Callable[[], None] | None = None
@@ -141,6 +146,7 @@ class OwnerFence:
         claim_id: object,
         *,
         on_supersede: Callable[[], None] | None = None,
+        owner_epoch: object = None,
     ) -> tuple[int, bool]:
         """Return the current generation and whether this claim superseded another.
 
@@ -150,9 +156,19 @@ class OwnerFence:
         settles it before completing that claim or advancing another claim.
         """
 
+        if owner_epoch is not None and (type(owner_epoch) is not int or owner_epoch < 0):
+            raise CommandRequestError("owner_epoch must be a nonnegative integer or null")
         digest = _claim_digest(claim_id)
         with self._lock:
+            if (
+                owner_epoch is not None
+                and self._highest_owner_epoch is not None
+                and owner_epoch < self._highest_owner_epoch
+            ):
+                raise StaleOwnerEpochError("owner epoch is older than an accepted claim")
             same_claim = self._digest is not None and hmac.compare_digest(self._digest, digest)
+            if same_claim and owner_epoch is not None:
+                self._highest_owner_epoch = owner_epoch
             if self._pending_supersede is not None:
                 self._pending_supersede()
                 self._pending_supersede = None
@@ -166,6 +182,8 @@ class OwnerFence:
                     "the current MicroVM owner is suspending or terminating it"
                 )
             superseded = self._digest is not None
+            if owner_epoch is not None:
+                self._highest_owner_epoch = owner_epoch
             self._generation += 1
             self._digest = digest
             if superseded and on_supersede is not None:

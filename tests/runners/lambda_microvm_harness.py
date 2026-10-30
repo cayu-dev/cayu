@@ -14,9 +14,10 @@ from examples.aws.lambda_microvm_sidecar.supervisor import (
     OwnerFence,
     OwnerLifecycleLeasedError,
     OwnerSupersededError,
+    StaleOwnerEpochError,
 )
 
-from cayu.runners import LambdaMicroVMOwnershipSuperseded
+from cayu.runners import LambdaMicroVMOwnershipSuperseded, LambdaMicroVMStaleOwnerEpoch
 from cayu.runners.aws_lambda_microvm import (
     LAMBDA_MICROVM_PROTOCOL_VERSION,
     LambdaMicroVMLifecycleInProgress,
@@ -54,11 +55,15 @@ class OwnerFencedTransport:
     def on_supersede(self) -> None:
         """Run under the fence before a new owner is admitted, as the sidecar's relay teardown."""
 
-    async def claim_owner(self, *, claim_id: str, **_kwargs: Any) -> dict[str, Any]:
+    async def claim_owner(
+        self, *, claim_id: str, owner_epoch: int | None = None, **_kwargs: Any
+    ) -> dict[str, Any]:
         try:
             generation, superseded = self.owner_fence.claim(
-                claim_id, on_supersede=self.on_supersede
+                claim_id, on_supersede=self.on_supersede, owner_epoch=owner_epoch
             )
+        except StaleOwnerEpochError as exc:
+            raise LambdaMicroVMStaleOwnerEpoch(str(exc)) from exc
         except OwnerLifecycleLeasedError as exc:
             raise LambdaMicroVMLifecycleInProgress(str(exc)) from exc
         if superseded:
@@ -176,8 +181,12 @@ class SupervisorTransport(OwnerFencedTransport):
         self.released: list[str] = []
         self._scripted_results: dict[str, dict[str, Any]] = {}
 
-    async def health(self, **_kwargs: Any) -> dict[str, str]:
-        return {"status": "ok", "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION}
+    async def health(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION,
+            "capabilities": ["owner_epoch"],
+        }
 
     async def start_command(
         self,

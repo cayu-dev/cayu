@@ -20,10 +20,11 @@ from .supervisor import (
     OwnerFence,
     OwnerLifecycleLeasedError,
     OwnerSupersededError,
+    StaleOwnerEpochError,
 )
 
 ROOT = os.environ.get("CAYU_MICROVM_WORKSPACE_ROOT", "/workspace")
-PROTOCOL_VERSION = "7"
+PROTOCOL_VERSION = "8"
 AGENT_UID = int(os.environ.get("CAYU_MICROVM_AGENT_UID", "1000"))
 AGENT_GID = int(os.environ.get("CAYU_MICROVM_AGENT_GID", "1000"))
 AGENT_NETNS = os.environ.get("CAYU_MICROVM_AGENT_NETNS", "cayu-agent")
@@ -35,9 +36,10 @@ EXECUTION_BOUNDARY = CommandExecutionBoundary(
 SUPERVISOR = CommandSupervisor(root=ROOT, execution_boundary=EXECUTION_BOUNDARY)
 OWNER = OwnerFence()
 FORWARDS = PortForwardRegistry()
-# 412 is reserved for a superseded owner and 423 for a lifecycle lease held by
-# the current owner, so the host never parses error bodies.
+# 409 on claims rejects stale epochs, 412 rejects superseded owners, and 423
+# reports a lifecycle lease held by the current owner; hosts need not parse bodies.
 OWNER_SUPERSEDED_STATUS = 412
+STALE_OWNER_EPOCH_STATUS = 409
 OWNER_LIFECYCLE_LEASED_STATUS = 423
 OWNER_SUPERSEDED_REASON = "owner_superseded"
 # Interactive stdio blocks on pipes and long polls. Its own pool keeps that
@@ -65,8 +67,8 @@ def _close_guest_relays() -> None:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "protocol_version": PROTOCOL_VERSION}
+async def health() -> dict[str, Any]:
+    return {"status": "ok", "protocol_version": PROTOCOL_VERSION, "capabilities": ["owner_epoch"]}
 
 
 @app.post("/aws/lambda-microvms/runtime/v1/ready")
@@ -90,7 +92,10 @@ async def claim_owner(payload: dict[str, Any]) -> dict[str, Any]:
             OWNER.claim,
             payload.get("claim_id"),
             on_supersede=_close_guest_relays,
+            owner_epoch=payload.get("owner_epoch"),
         )
+    except StaleOwnerEpochError as exc:
+        raise HTTPException(status_code=STALE_OWNER_EPOCH_STATUS, detail=str(exc)) from exc
     except CommandRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OwnerLifecycleLeasedError as exc:

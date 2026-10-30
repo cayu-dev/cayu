@@ -94,6 +94,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.runners.aws_lambda_microvm",
         "LambdaMicroVMOwnershipSuperseded",
     ),
+    "LambdaMicroVMStaleOwnerEpoch": (
+        "cayu.runners.aws_lambda_microvm",
+        "LambdaMicroVMStaleOwnerEpoch",
+    ),
     "LambdaMicroVMOwnershipUnverified": (
         "cayu.runners.aws_lambda_microvm",
         "LambdaMicroVMOwnershipUnverified",
@@ -201,6 +205,7 @@ PUBLIC_NAMES = [
     "LambdaMicroVMOwnershipUnverified",
     "LambdaMicroVMProtocolError",
     "LambdaMicroVMRunner",
+    "LambdaMicroVMStaleOwnerEpoch",
     "LambdaMicroVMSubmissionClosed",
     "LaunchedRunner",
     "LocalRunner",
