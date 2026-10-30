@@ -9822,6 +9822,16 @@
           "dashboard": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
+          "deployment_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "environment_details": {
             "anyOf": [
               {
@@ -39596,7 +39606,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "82",
+            "default": "83",
             "title": "Contract Version",
             "type": "string"
           },
@@ -43234,6 +43244,15 @@
             ],
             "title": "Docs Enabled"
           },
+          "kind": {
+            "enum": [
+              "local",
+              "cloud",
+              "embedded"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
           "name": {
             "anyOf": [
               {
@@ -43257,6 +43276,7 @@
           }
         },
         "required": [
+          "kind",
           "name_status",
           "api_access",
           "dashboard_access",
@@ -47785,7 +47805,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "82",
+            "default": "83",
             "title": "Contract Version",
             "type": "string"
           }

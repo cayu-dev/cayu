@@ -60,6 +60,7 @@ from cayu.runtime.service_manifest import (
     ServiceIdentityStoreKind,
     ServiceMode,
 )
+from cayu.runtime.system_diagnostics import DeploymentKind, resolve_deployment_kind
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot
 from cayu.server.config import (
     AuthenticatedAccess,
@@ -925,6 +926,13 @@ class CayuService:
     def execution_timeout_s(self) -> float | None:
         """Configured finish-by duration for each new product operation."""
         return self._execution_timeout_s
+
+    @property
+    def deployment_kind(self) -> DeploymentKind:
+        """Resolved startup declaration captured by the mounted diagnostics owner."""
+        if self._system_diagnostics_snapshot is None:
+            raise RuntimeError("System diagnostics are not attached to this service.")
+        return self._system_diagnostics_snapshot.deployment_kind
 
     @property
     def project_control_plane_context_attached(self) -> bool:
@@ -2618,6 +2626,7 @@ def create_agent_service(
     evaluation_promotion: EvaluationPromotionConfig | None = None,
     evals: EvalsConfig | None = None,
     project_context: ProjectControlPlaneContext | None = None,
+    deployment_kind: DeploymentKind | None = None,
 ) -> CayuService:
     """Assemble the maintained product API and separately protected control plane.
 
@@ -2631,6 +2640,11 @@ def create_agent_service(
     ExecutionDeadline.after(execution_timeout_s, source="product_service")
     if project_context is not None and type(project_context) is not ProjectControlPlaneContext:
         raise TypeError("project_context must be a framework-owned ProjectControlPlaneContext.")
+    deployment_kind = resolve_deployment_kind(
+        deployment_kind,
+        None if project_context is None else project_context.deployment_kind,
+        default="embedded",
+    )
     agent_name = require_durable_clean_nonblank(agent_name, "agent_name")
     if agent_name not in app.list_agents():
         raise ValueError(f"agent_name must identify a registered specialist: {agent_name}")
@@ -2864,6 +2878,7 @@ def create_agent_service(
         server,
         app,
         path=control_plane_path,
+        deployment_kind=deployment_kind,
         access=operator_mount_access,
         evaluation_promotion=evaluation_promotion,
         evals=evals,

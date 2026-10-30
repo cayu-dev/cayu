@@ -481,9 +481,9 @@ recovery_inactive_after_seconds = 900
         "startup_recovery_statuses": ["pending"],
         "recovery_inactive_after_seconds": 900,
     }
-    assert manifest.entrypoint == "cayu serve --host 0.0.0.0 --port 8000"
+    assert manifest.entrypoint == "cayu serve --deployment-kind cloud --host 0.0.0.0 --port 8000"
     assert manifest.web == cloud_project.CloudWebProcess(
-        command="cayu serve --host 0.0.0.0 --port 8000",
+        command="cayu serve --deployment-kind cloud --host 0.0.0.0 --port 8000",
         port=8000,
     )
     assert manifest.worker is None
@@ -548,9 +548,9 @@ scout = "operations.scout_runs:run_scout_worker"
         "Added [worker] with `cayu worker scout` next to [web], so the Agent runs its "
         "declared worker."
     ]
-    assert manifest.entrypoint == "cayu serve --host 0.0.0.0 --port 8000"
+    assert manifest.entrypoint == "cayu serve --deployment-kind cloud --host 0.0.0.0 --port 8000"
     assert manifest.web is not None
-    assert manifest.web.command == "cayu serve --host 0.0.0.0 --port 8000"
+    assert manifest.web.command == "cayu serve --deployment-kind cloud --host 0.0.0.0 --port 8000"
     assert manifest.worker == cloud_project.CloudWorkerProcess(command="cayu worker scout")
 
 

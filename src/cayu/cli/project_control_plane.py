@@ -26,6 +26,7 @@ from cayu.project_control_plane import (
     ProjectEvalTarget,
     _create_project_control_plane_context,
 )
+from cayu.runtime.system_diagnostics import DeploymentKind, validate_deployment_kind
 from cayu.storage.targets import configured_database_pool_max
 
 _DISTRIBUTION_NAME_RE = re.compile(
@@ -60,6 +61,7 @@ def build_project_control_plane_context(
     mode: str,
     environ: Mapping[str, str] | None = None,
     eval_targets: tuple[ProjectEvalTarget, ...] = (),
+    deployment_kind: DeploymentKind | None = None,
 ) -> ProjectControlPlaneContext:
     """Resolve one framework-owned context without importing project code.
 
@@ -67,6 +69,8 @@ def build_project_control_plane_context(
     project (see ``cayu.cli._project_evals``); this function imports none of them.
     """
 
+    if deployment_kind is not None:
+        deployment_kind = validate_deployment_kind(deployment_kind)
     root = root.resolve()
     if mode == "development":
         access = ProjectControlPlaneAccess.TRUSTED_LOCAL_DEVELOPMENT
@@ -97,6 +101,7 @@ def build_project_control_plane_context(
         ) from exc
     return _create_project_control_plane_context(
         project_root=root,
+        deployment_kind=deployment_kind,
         project_id=project_id,
         eval_judge_configuration=eval_judge_configuration,
         eval_price_book=eval_price_book,

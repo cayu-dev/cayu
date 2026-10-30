@@ -842,6 +842,7 @@ def test_mount_cayu_accepts_explicit_open_or_authenticated_access() -> None:
     assert open_contract["capabilities"]["surfaces"]["pricing"]["configured"] is True
     open_diagnostics = open_client.get("/control/api/system/diagnostics").json()
     assert open_diagnostics["deployment"] == {
+        "kind": "embedded",
         "name": None,
         "name_status": "not_provided",
         "api_access": "open",

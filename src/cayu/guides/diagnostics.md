@@ -2,11 +2,11 @@
 
 `cayu check` renders these stable findings from the public application manifest.
 Run the correction, then rerun `cayu inspect --json` and `cayu check --json`.
-Two sections cover runtime behavior instead of check findings:
+Three sections cover runtime behavior instead of check findings:
 [execution-profile-mismatch](#execution-profile-mismatch) explains the error a
 resumed session raises after the agent's code changed, and
 [request-cost](#request-cost) covers what a running server spends on each HTTP
-route and how to check it.
+route and how to check it. [system](#system) shows the running agent's declared deployment kind and setup.
 
 ## scaffold-import-removed
 
@@ -642,3 +642,18 @@ Verify with `cayu check --json`. The warning does not block the default check;
 `--fail-on warning` treats it as a failure. Source import-safety checks still run
 before the agent is loaded. Names come from booted registration evidence;
 loading a serialized manifest alone cannot establish this diagnostic.
+
+
+## system
+
+Use `cayu diagnostics system --server-url http://127.0.0.1:8000` to inspect
+deployment kind, name, access and versions. Add `--json` for the full protected
+System snapshot, or select a Cloud agent with `--application AGENT` instead of
+`--server-url`. The command requires full access; it cannot infer setup from an
+offline database. A nested Developer dashboard uses its mount URL.
+
+Deployment kind is explicit startup metadata: local, Cloud or embedded. For a
+Cloud web process use `cayu serve --deployment-kind cloud`; generated Cloud
+manifests include it. Custom service factories forward the existing project
+context or declare the matching kind through `create_agent_service()`. Names and
+credentials do not determine kind, and changing kind does not change access.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
 import sys
 from collections.abc import Sequence
@@ -22,6 +23,7 @@ from cayu.cli.project import (
     CayuProject,
     build_project_app,
     build_project_service,
+    close_project_app,
     discover_cayu_project_configuration,
     project_context,
     resolve_project,
@@ -91,6 +93,11 @@ def serve_auth_target(args: argparse.Namespace, configured: str | None) -> str |
 def add_serve_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the `cayu serve` options to `parser`."""
 
+    parser.add_argument(
+        "--deployment-kind",
+        choices=("local", "cloud", "embedded"),
+        help="Explicit hosting declaration for System diagnostics; no effect on access policy.",
+    )
     parser.add_argument(
         "--host",
         default="127.0.0.1",
@@ -181,6 +188,7 @@ def serve_project_control_plane(
         project.root,
         mode="development" if args.dev else "production",
         eval_targets=load_project_eval_targets(project.root, on_error=report),
+        deployment_kind=args.deployment_kind,
     )
 
 
@@ -207,6 +215,20 @@ def _build_serve_app(
             command="Serve",
             project_context=project_control_plane,
         )
+        if args.deployment_kind is not None and service.deployment_kind != args.deployment_kind:
+            mismatch = ServeError(
+                "The service deployment kind does not match --deployment-kind. "
+                "Forward project_context to create_agent_service(), or configure its "
+                "deployment_kind explicitly to match."
+            )
+            try:
+                asyncio.run(close_project_app(service.cayu_app))
+            except BaseException as cleanup:
+                raise BaseExceptionGroup(
+                    "Deployment declaration rejected and runtime cleanup failed",
+                    [mismatch, cleanup],
+                ) from None
+            raise mismatch
         if not args.dev:
             from cayu.runtime.checks import check_public_service_deployment
 
@@ -265,6 +287,7 @@ def _build_serve_app(
         config = (
             server_module.ServerConfig.local_development(
                 lifecycle=lifecycle,
+                deployment_kind=project_control_plane.deployment_kind or "local",
                 request_timing=request_timing,
                 dashboard=dashboard,
             )
@@ -272,6 +295,7 @@ def _build_serve_app(
             else server_module.ServerConfig.protected(
                 auth,
                 lifecycle=lifecycle,
+                deployment_kind=project_control_plane.deployment_kind or "local",
                 request_timing=request_timing,
                 dashboard=dashboard,
             )

@@ -884,7 +884,7 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
     worker_command: str | None = None
     notes: list[str] = []
     if "serve" in cayu or isinstance(cayu.get("factory"), str):
-        web_command = "cayu serve --host 0.0.0.0 --port 8000"
+        web_command = "cayu serve --deployment-kind cloud --host 0.0.0.0 --port 8000"
         serve_setup = _plan_init_serve_setup(pyproject_path)
         writes_auth_module = _auth_module_needs_writing(root, serve_setup)
     if worker_names:

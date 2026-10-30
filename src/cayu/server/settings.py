@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from pydantic.config import ExtraValues
 
 from cayu._validation import require_clean_nonblank
+from cayu.runtime.system_diagnostics import DeploymentKind
 from cayu.server.auth import BasicAuth
 from cayu.server.config import (
     DEFAULT_DASHBOARD_PATH,
@@ -625,6 +626,7 @@ class ServerSettings(BaseSettings):
             # settings_customise_sources() can install Cayu's redacting wrapper.
             _raise_redacted_settings_parse_error("the dotenv file")
 
+    deployment_kind: DeploymentKind = "local"
     deployment_name: str = DEFAULT_SERVER_DEPLOYMENT_NAME
     title: str = DEFAULT_SERVER_TITLE
     access: ServerAccessSettings | None = None
@@ -719,6 +721,7 @@ class ServerSettings(BaseSettings):
         )
         return ServerConfig(
             deployment_name=self.deployment_name,
+            deployment_kind=self.deployment_kind,
             title=self.title,
             access=resolved_access,
             api=ServerApiConfig(

@@ -40,6 +40,7 @@ from cayu.evals.corpus import EvaluationEvidencePolicySpec
 from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.store import EVAL_STORE_MAX_LEASE_SECONDS, EvalStore
+from cayu.runtime.system_diagnostics import DeploymentKind
 from cayu.server._browser_control_config import BrowserControlServerConfig
 from cayu.server.auth import TrustedLocalAuth
 from cayu.server.contracts import (
@@ -617,6 +618,7 @@ class ServerConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
+    deployment_kind: DeploymentKind = "local"
     deployment_name: str = DEFAULT_SERVER_DEPLOYMENT_NAME
     title: str = DEFAULT_SERVER_TITLE
     access: ServerAccessConfig
@@ -708,6 +710,7 @@ class ServerConfig(BaseModel):
         cls,
         *,
         deployment_name: str = DEFAULT_SERVER_DEPLOYMENT_NAME,
+        deployment_kind: DeploymentKind = "local",
         api: ServerApiConfig | None = None,
         dashboard: DashboardConfig | None = None,
         lifecycle: ServerLifecycleConfig | None = None,
@@ -721,6 +724,7 @@ class ServerConfig(BaseModel):
 
         return cls(
             deployment_name=deployment_name,
+            deployment_kind=deployment_kind,
             access=OpenAccess(),
             api=api or ServerApiConfig(),
             dashboard=dashboard or DashboardConfig(),
@@ -736,6 +740,7 @@ class ServerConfig(BaseModel):
         dependency: Any,
         *,
         deployment_name: str = DEFAULT_SERVER_DEPLOYMENT_NAME,
+        deployment_kind: DeploymentKind = "local",
         api: ServerApiConfig | None = None,
         dashboard: DashboardConfig | None = None,
         docs: DocsConfig | None = None,
@@ -751,6 +756,7 @@ class ServerConfig(BaseModel):
         return cls(
             request_timing=request_timing,
             deployment_name=deployment_name,
+            deployment_kind=deployment_kind,
             access=AuthenticatedAccess(dependency=dependency),
             api=api or ServerApiConfig(),
             dashboard=dashboard or DashboardConfig(),
@@ -768,6 +774,7 @@ class ServerConfig(BaseModel):
         dashboard_access = self.dashboard.access or self.access
         return {
             "deployment_name": self.deployment_name,
+            "deployment_kind": self.deployment_kind,
             "title": self.title,
             "access": self.access.kind,
             "api": {"enabled": self.api.enabled, "path": self.api.path},

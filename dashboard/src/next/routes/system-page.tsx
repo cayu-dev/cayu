@@ -3,27 +3,55 @@
  * whether pricing is on, then the features this deployment has turned off. Capability
  * matrices, store fingerprints and the raw diagnostics sit in Debug. Full access only.
  */
-import { useQuery } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { CircleCheck, CircleMinus, CircleSlash, RefreshCw } from "lucide-react"
 import type { ReactNode } from "react"
 import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
-import { fetchSystemDiagnostics, type SystemDiagnostics } from "@/lib/api"
+import { ApiClientError, fetchSystemDiagnostics, type SystemDiagnostics } from "@/lib/api"
 import type { CapabilityOperation } from "@/lib/generated/server-api"
 import { cn } from "@/lib/utils"
 import { useApp } from "../app/queries"
 import { useNow, useServices } from "../app/services"
 import { relativeTime } from "../app/session-model"
 import { EmptyState, ErrorState, PageBody, TopBar } from "./common"
-import { EVAL_OPERATIONS, evalReason, readable, STORE, turnedOff } from "./system/system-labels"
+import {
+  deploymentKindLabel,
+  EVAL_OPERATIONS,
+  evalReason,
+  readable,
+  STORE,
+  turnedOff,
+} from "./system/system-labels"
 
 export function SystemPage() {
   const { prototype } = useServices()
   const viewer = useViewer()
   const allowed = !!prototype || viewer?.full_access === true
+  const client = useQueryClient()
   const diagnostics = useQuery({
     queryKey: ["system-diagnostics"],
-    queryFn: ({ signal }) => fetchSystemDiagnostics(signal),
+    queryFn: async ({ signal }) => {
+      try {
+        const data = await fetchSystemDiagnostics(signal)
+        signal.throwIfAborted()
+        return data
+      } catch (error) {
+        signal.throwIfAborted()
+        if (error instanceof ApiClientError && [401, 403].includes(error.status)) {
+          client
+            .getQueryCache()
+            .find({ queryKey: ["system-diagnostics"], exact: true })
+            ?.setState({
+              data: undefined,
+              dataUpdatedAt: 0,
+              error,
+              status: "error",
+            })
+        }
+        throw error
+      }
+    },
     enabled: allowed,
     staleTime: 60_000,
     retry: false,
@@ -143,6 +171,7 @@ function About({ data }: { data: SystemDiagnostics }) {
       <dl className="rounded-xl border border-border bg-card px-4 py-2">
         {app.data?.name && <Row k="Name">{app.data.name}</Row>}
         <Row k="Cayu version">{data.versions.cayu ?? "Not reported"}</Row>
+        <Row k="Deployment kind">{deploymentKindLabel(deployment.kind)}</Row>
         <Row k="Deployment">
           {deployment.name ??
             (deployment.name_status === "omitted" ? "Name hidden" : "No name set")}
@@ -305,8 +334,9 @@ function SystemDebug({ data }: { data: SystemDiagnostics }) {
           {data.versions.cayu ?? "null"} (capabilities: {data.capabilities.cayu_version ?? "null"})
         </Row>
         <Row k="Deployment" mono>
-          name_status={data.deployment.name_status} · api_access={data.deployment.api_access} ·
-          dashboard_access={data.deployment.dashboard_access ?? "null"} · dashboard_enabled=
+          kind={data.deployment.kind} · name_status={data.deployment.name_status} · api_access=
+          {data.deployment.api_access} · dashboard_access=
+          {data.deployment.dashboard_access ?? "null"} · dashboard_enabled=
           {String(data.deployment.dashboard_enabled)} · docs_enabled=
           {String(data.deployment.docs_enabled)}
         </Row>

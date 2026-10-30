@@ -438,7 +438,7 @@ def test_init_writes_cloud_sign_in_and_no_home_for_cayu_serve(tmp_path: Path) ->
 
     content = (tmp_path / "cayu-cloud.toml").read_text()
     assert content.endswith(
-        '\n[web]\ncommand = "cayu serve --host 0.0.0.0 --port 8000"\nport = 8000\n'
+        '\n[web]\ncommand = "cayu serve --deployment-kind cloud --host 0.0.0.0 --port 8000"\nport = 8000\n'
         '\n[sign_in]\nmode = "cloud"\n'
     )
     assert "home" not in tomllib.loads(content)

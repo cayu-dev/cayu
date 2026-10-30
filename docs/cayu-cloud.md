@@ -115,7 +115,7 @@ still require `--application`.
 ## Initialize an Agent project
 
 `cayu cloud init` writes `cayu-cloud.toml`. For a project with a `[tool.cayu]`
-factory it writes a web process that runs `cayu serve --host 0.0.0.0 --port 8000`.
+factory it writes a web process that runs `cayu serve --deployment-kind cloud --host 0.0.0.0 --port 8000`.
 For a project that declares `[tool.cayu.workers]` it also writes a `[worker]` that runs
 `cayu worker NAME`, next to `[web]` when there is one; without it, runs the web process
 queues for the worker would never execute. Cayu Cloud runs one worker process per Agent,

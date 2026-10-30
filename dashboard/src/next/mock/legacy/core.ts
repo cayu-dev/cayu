@@ -1275,6 +1275,7 @@ function systemDiagnostics(_: LegacyRequest, context: LegacyContext): SystemDiag
   return {
     observed_at: iso(context.now()),
     deployment: {
+      kind: "local",
       name: "development",
       name_status: "available",
       api_access: "open",

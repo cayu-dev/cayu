@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -18,6 +18,30 @@ from pydantic import (
 MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS = 64
 MAX_SYSTEM_DEPLOYMENT_NAME_CHARS = 128
 MAX_SYSTEM_PRICING_METADATA_CHARS = 256
+
+DeploymentKind = Literal["local", "cloud", "embedded"]
+
+
+def validate_deployment_kind(value: object) -> DeploymentKind:
+    """Validate explicit startup metadata without echoing rejected values."""
+    if type(value) is not str or value not in ("local", "cloud", "embedded"):
+        raise ValueError("deployment_kind must be local, cloud, or embedded.")
+    return cast("DeploymentKind", value)
+
+
+def resolve_deployment_kind(
+    explicit: DeploymentKind | None,
+    hosting: DeploymentKind | None,
+    *,
+    default: DeploymentKind,
+) -> DeploymentKind:
+    """Join startup declarations; neither authentication nor names are evidence."""
+    explicit = None if explicit is None else validate_deployment_kind(explicit)
+    hosting = None if hosting is None else validate_deployment_kind(hosting)
+    if explicit is not None and hosting is not None and explicit != hosting:
+        raise ValueError("deployment_kind conflicts with the project startup declaration.")
+    return explicit or hosting or validate_deployment_kind(default)
+
 
 SystemAccessKind = Literal["open", "authenticated"]
 SystemDiagnosticTextStatus = Literal["available", "not_provided", "omitted"]
@@ -60,6 +84,7 @@ class _DiagnosticsModel(BaseModel):
 class SystemDeploymentDiagnostics(_DiagnosticsModel):
     """Bounded resolved server identity and effective access posture."""
 
+    kind: DeploymentKind
     name: str | None = Field(default=None, max_length=MAX_SYSTEM_DEPLOYMENT_NAME_CHARS)
     name_status: SystemDiagnosticTextStatus
     api_access: SystemAccessKind
@@ -218,6 +243,7 @@ class EvalsReadiness(_DiagnosticsModel):
 
 
 class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
+    deployment_kind: OptionalSurfaceCapability | None = None
     environment_details: OptionalSurfaceCapability | None = None
     task_index: OptionalSurfaceCapability | None = None
     task_creation: OptionalSurfaceCapability | None = None

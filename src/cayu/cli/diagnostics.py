@@ -8,7 +8,7 @@ import json
 import os
 import re
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 from cayu.cli._output import add_output_options, output_destination
@@ -17,6 +17,9 @@ from cayu.runtime.request_costs import (
     MAX_REQUEST_COST_WINDOW_SECONDS,
     RequestCostSummary,
 )
+
+if TYPE_CHECKING:
+    from cayu.cli._read_targets import ReadTarget
 
 CLI_SCHEMA_VERSION = "1"
 DEFAULT_SERVER_URL = "http://127.0.0.1:8000"
@@ -40,6 +43,15 @@ def add_diagnostics_parser(subparsers: Any) -> None:
         description="Read live diagnostics from a running Cayu server.",
     )
     commands = parser.add_subparsers(dest="diagnostics_command", required=True)
+    from cayu.cli._read_targets import add_read_target_options
+
+    system_parser = commands.add_parser(
+        "system",
+        help="Inspect deployment kind, setup and available features.",
+        description="Read the protected System diagnostics from a running agent. Requires full access; use --json for the complete snapshot.",
+    )
+    add_read_target_options(system_parser, allow_store=False)
+    add_output_options(system_parser, formats=("json", "table"), default="table")
     requests_parser = commands.add_parser(
         "requests",
         help="Summarize recent request rate, latency, and CPU by route.",
@@ -96,6 +108,15 @@ def add_diagnostics_parser(subparsers: Any) -> None:
 
 
 def run_diagnostics(args: argparse.Namespace) -> int:
+    if args.diagnostics_command == "system":
+        from cayu.cli._read_targets import run_read_command
+
+        return run_read_command(
+            args,
+            _run_system,
+            error_code="SYSTEM_DIAGNOSTICS_FAILED",
+            schema_version=CLI_SCHEMA_VERSION,
+        )
     try:
         with output_destination(args.output):
             return _run_requests(args)
@@ -342,3 +363,50 @@ def _positive_int(value: str) -> int:
     if number < 1:
         raise argparse.ArgumentTypeError("must be at least 1.")
     return number
+
+
+async def _run_system(args: argparse.Namespace, target: ReadTarget) -> int:
+    from pydantic import ValidationError
+
+    from cayu.cli._cloud_agent_api import CayuApi, open_cloud_agent_api
+    from cayu.cli._output import print_table
+    from cayu.runtime.system_diagnostics import SystemDiagnosticsResponse
+
+    if target.server_url is not None:
+        api = CayuApi(
+            target.server_url,
+            authorization=read_authorization(target.authorization_env),
+            timeout_seconds=target.timeout_seconds,
+        )
+    elif target.application is not None:
+        api = open_cloud_agent_api(
+            target.application, context=target.context, timeout_seconds=target.timeout_seconds
+        )
+    else:
+        raise ValueError("System diagnostics requires a server URL or Cloud application.")
+    try:
+        raw = api.get("/system/diagnostics", resource="system diagnostics")
+        try:
+            diagnostics = SystemDiagnosticsResponse.model_validate(raw)
+        except ValidationError:
+            raise ValueError("The server returned invalid system diagnostics.") from None
+        if args.output_format == "json":
+            print(diagnostics.model_dump_json(indent=2))
+        else:
+            deployment = diagnostics.deployment
+            print_table(
+                ["Setting", "Value"],
+                [
+                    {"Setting": label, "Value": value}
+                    for label, value in (
+                        ("Deployment kind", deployment.kind),
+                        ("Deployment name", deployment.name or "Not reported"),
+                        ("API access", deployment.api_access),
+                        ("Cayu version", diagnostics.versions.cayu or "Not reported"),
+                        ("Server contract", diagnostics.versions.server_contract),
+                    )
+                ],
+            )
+        return 0
+    finally:
+        api.close()

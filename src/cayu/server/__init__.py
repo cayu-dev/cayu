@@ -75,6 +75,7 @@ try:
         ServiceIdentityStoreKind,
         ServiceMode,
     )
+    from cayu.runtime.system_diagnostics import DeploymentKind, resolve_deployment_kind
     from cayu.server._browser_client import browser_client_base_path, browser_client_router
     from cayu.server._diagnostics import SystemDiagnosticsSnapshot, dashboard_pricing_metadata
     from cayu.server._request_timing import RequestTimingMiddleware, RequestTimingRecorder
@@ -287,6 +288,11 @@ def create_server(
         raise TypeError("config must be a resolved ServerConfig instance.")
     resolved_config = config
     resolved_project_context = resolve_project_control_plane_context(project_context, app)
+    resolved_deployment_kind = resolve_deployment_kind(
+        resolved_config.deployment_kind,
+        None if resolved_project_context is None else resolved_project_context.deployment_kind,
+        default="local",
+    )
     api_auth = auth_dependency_for(resolved_config.access)
     from cayu.server._browser_control_server import BrowserControlServer
 
@@ -533,6 +539,7 @@ def create_server(
             browser_recordings_configured=browser_recordings is not None,
             dashboard_pricing_configured=pricing_metadata is not None,
             deployment_name=resolved_config.deployment_name,
+            deployment_kind=resolved_deployment_kind,
             dashboard_access_authenticated=(
                 None if not resolved_config.dashboard.enabled else dashboard_auth is not None
             ),
@@ -635,6 +642,7 @@ def mount_cayu(
     app: CayuApp,
     *,
     path: str = "/cayu",
+    deployment_kind: DeploymentKind | None = None,
     dashboard: bool = True,
     dashboard_dir: str | Path | None = None,
     access: ServerAccessConfig,
@@ -724,6 +732,11 @@ def mount_cayu(
     in unless timing is explicitly off.
     """
     resolved_project_context = resolve_project_control_plane_context(_project_context, app)
+    deployment_kind = resolve_deployment_kind(
+        deployment_kind,
+        None if resolved_project_context is None else resolved_project_context.deployment_kind,
+        default="embedded",
+    )
     auth = auth_dependency_for(access)
     mount_path = normalize_dashboard_path(path, field_name="path")
     api_path = _join_public_paths(mount_path, "api")
@@ -801,6 +814,7 @@ def mount_cayu(
             prepared_dashboard is not None and prepared_dashboard[1].dashboard_pricing_configured
         ),
         deployment_name=None,
+        deployment_kind=deployment_kind,
         dashboard_access_authenticated=(auth is not None if dashboard else None),
         docs_enabled=None,
         dashboard_pricing_metadata=(

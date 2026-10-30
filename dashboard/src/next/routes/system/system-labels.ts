@@ -20,6 +20,7 @@ const SURFACE: Partial<Record<keyof ControlPlaneSurfaceCapabilities, string>> = 
   artifacts: "Artifacts",
   browser_recordings: "Browser recordings",
   dashboard: "Dashboard",
+  deployment_kind: "Deployment kind",
   eval_reported_views: "Eval reports",
   eval_suite_views: "Eval suite pages",
   evals: "Evals",
@@ -152,4 +153,17 @@ export const STORE: Record<string, string> = {
   task: "Tasks",
   knowledge: "Knowledge",
   artifact: "Artifacts",
+}
+
+export function deploymentKindLabel(kind: unknown): string {
+  switch (kind) {
+    case "local":
+      return "Local"
+    case "cloud":
+      return "Cloud"
+    case "embedded":
+      return "Embedded"
+    default:
+      return "Not reported"
+  }
 }

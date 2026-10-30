@@ -14,6 +14,7 @@ from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
 from cayu.applications import CayuApp
 from cayu.budgets.pricing import PriceBook, copy_price_book
 from cayu.evals.store import EvalStore
+from cayu.runtime.system_diagnostics import DeploymentKind, validate_deployment_kind
 
 if TYPE_CHECKING:
     from cayu.evals.execution import CorpusTarget
@@ -160,6 +161,7 @@ class ProjectControlPlaneContext:
         "_assembly_token",
         "_close_lock",
         "_closed",
+        "_deployment_kind",
         "_eval_judge_configuration",
         "_eval_price_book",
         "_eval_store",
@@ -184,6 +186,7 @@ class ProjectControlPlaneContext:
         access: ProjectControlPlaneAccess,
         eval_targets: tuple[ProjectEvalTarget, ...] = (),
         eval_worker: str | None = None,
+        deployment_kind: DeploymentKind | None = None,
         _assembly_token: object | None = None,
     ) -> None:
         if _assembly_token is not _PROJECT_CONTEXT_ASSEMBLY_TOKEN:
@@ -220,6 +223,9 @@ class ProjectControlPlaneContext:
             eval_worker = require_clean_nonblank(eval_worker, "eval_worker")
             require_unicode_scalar_text(eval_worker, "eval_worker")
 
+        self._deployment_kind = (
+            None if deployment_kind is None else validate_deployment_kind(deployment_kind)
+        )
         self._project_root = project_root
         self._project_id = project_id
         self._eval_judge_configuration = eval_judge_configuration
@@ -246,6 +252,11 @@ class ProjectControlPlaneContext:
             f"eval_target_count={len(self._eval_targets)!r}, "
             f"access={self._access.value!r})"
         )
+
+    @property
+    def deployment_kind(self) -> DeploymentKind | None:
+        """Optional explicit hosting declaration from project bootstrap."""
+        return self._deployment_kind
 
     @property
     def project_identity_configured(self) -> bool:
@@ -340,6 +351,7 @@ class ProjectControlPlaneContext:
             raise ValueError("Project Control Plane identity contains a workload secret.")
         return ResolvedProjectControlPlaneContext(
             project_id=self._project_id,
+            deployment_kind=self._deployment_kind,
             application_release_id=release_id,
             app_manifest_fingerprint=manifest.fingerprint,
             app_manifest_project_root=self._project_root,
@@ -363,6 +375,7 @@ class ResolvedProjectControlPlaneContext:
     """Application-bound project context retained only inside server assembly."""
 
     project_id: str | None
+    deployment_kind: DeploymentKind | None
     application_release_id: str
     app_manifest_fingerprint: str
     app_manifest_project_root: Path
@@ -420,9 +433,11 @@ def _create_project_control_plane_context(
     eval_price_book: PriceBook | None = None,
     eval_targets: tuple[ProjectEvalTarget, ...] = (),
     eval_worker: str | None = None,
+    deployment_kind: DeploymentKind | None = None,
 ) -> ProjectControlPlaneContext:
     return ProjectControlPlaneContext(
         project_root=project_root,
+        deployment_kind=deployment_kind,
         project_id=project_id,
         eval_judge_configuration=eval_judge_configuration,
         eval_price_book=eval_price_book,

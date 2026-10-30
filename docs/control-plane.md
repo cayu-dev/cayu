@@ -168,8 +168,13 @@ missing or untitled producers display “Untitled session” without an overview
 
 System is for full-access viewers. It shows agent setup, disabled-feature reasons
 and Evals readiness; capability matrices and raw diagnostics stay in Debug.
-It reports deployment name and sign-in requirements without guessing deployment
-kind. Member reads on the other pages still require server authorization.
+It reports the explicit local, Cloud or embedded deployment kind alongside the
+name and sign-in requirements. The `deployment_kind` capability advertises the
+field; kind comes from startup configuration, never names or credentials.
+`cayu diagnostics system --server-url URL --json` and
+`cayu diagnostics system --application AGENT --json` expose the same snapshot.
+See [deployment declarations](server-configuration.md#deployment-kind).
+Member reads on the other pages still require server authorization.
 
 ## Project-owned Evals assembly
 

@@ -1488,6 +1488,7 @@ def build_service(*, mode, project_context=None):
     assert control_plane["disposition"] == "collected"
     diagnostics = control_plane["evidence"]["report"]
     assert diagnostics["deployment"] == {
+        "kind": "embedded",
         "name": None,
         "name_status": "not_provided",
         "api_access": "authenticated",

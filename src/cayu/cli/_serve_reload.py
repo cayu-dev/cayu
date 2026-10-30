@@ -39,6 +39,8 @@ _RELOAD_WARNING = (
 def run_reload(uvicorn: Any, args: argparse.Namespace, root: Path) -> None:
     """Pass only CLI options and the project root to fresh spawned workers."""
     arguments = ["--host", args.host, "--port", str(args.port)]
+    if args.deployment_kind is not None:
+        arguments.extend(("--deployment-kind", args.deployment_kind))
     if args.dev:
         arguments.append("--dev")
     elif args.auth is not None:

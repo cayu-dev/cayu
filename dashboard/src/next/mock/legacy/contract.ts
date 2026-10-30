@@ -111,6 +111,11 @@ export const CONTRACT: ServerContract = {
     configured_store_roles: ["session", "task", "knowledge", "artifact"],
     actor: null,
     surfaces: {
+      deployment_kind: {
+        configured: true,
+        read: { enabled: true, unavailable_reason: null },
+        mutate: { enabled: false, unavailable_reason: "unsupported" },
+      },
       dashboard: {
         configured: true,
         read: {

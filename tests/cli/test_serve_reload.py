@@ -59,9 +59,12 @@ def _wait(process, log_path, predicate, *, timeout=35):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX subprocess signal/reaping acceptance")
 @pytest.mark.parametrize(
-    ("persistent", "bootstrap_async"), [(False, False), (True, False), (False, True)]
+    ("persistent", "bootstrap_async", "deployment_kind"),
+    [(False, False, "cloud"), (True, False, "cloud"), (False, True, "cloud"), (False, False, None)],
 )
-def test_reload_restarts_on_file_edits_and_warns_about_state(tmp_path, persistent, bootstrap_async):
+def test_reload_restarts_on_file_edits_and_warns_about_state(
+    tmp_path, persistent, bootstrap_async, deployment_kind
+):
     (tmp_path / "pyproject.toml").write_text('[tool.cayu]\nfactory = "reload_app:build_app"\n')
     source = tmp_path / "reload_app.py"
     source.write_text(_source("before", persistent, bootstrap_async))
@@ -72,7 +75,17 @@ def test_reload_restarts_on_file_edits_and_warns_about_state(tmp_path, persisten
     log_path = tmp_path / "server.log"
     with log_path.open("w") as log:
         process = subprocess.Popen(
-            [sys.executable, "-m", "cayu.cli", "serve", "--dev", "--reload", "--port", str(port)],
+            [
+                sys.executable,
+                "-m",
+                "cayu.cli",
+                "serve",
+                "--dev",
+                *(["--deployment-kind", deployment_kind] if deployment_kind is not None else []),
+                "--reload",
+                "--port",
+                str(port),
+            ],
             cwd=tmp_path,
             env=env,
             stdout=log,
@@ -89,6 +102,9 @@ def test_reload_restarts_on_file_edits_and_warns_about_state(tmp_path, persisten
                     )
 
                 _wait(process, log_path, lambda: has_agent("before"))
+                assert client.get("/api/system/diagnostics").json()["deployment"]["kind"] == (
+                    deployment_kind or "local"
+                )
                 response = client.post(
                     "/api/run",
                     json={"session_id": "retained", "agent": "before", "prompt": "go"},
@@ -122,6 +138,9 @@ def test_reload_restarts_on_file_edits_and_warns_about_state(tmp_path, persisten
                 time.sleep(1.1)
                 source.write_text(_source("after_repair", persistent, bootstrap_async))
                 _wait(process, log_path, lambda: has_agent("after_repair"))
+                assert client.get("/api/system/diagnostics").json()["deployment"]["kind"] == (
+                    deployment_kind or "local"
+                )
                 assert log_path.read_text().count("WARNING: cayu serve --reload") == 5
                 assert client.get("/api/sessions/retained").status_code == (
                     200 if persistent else 404

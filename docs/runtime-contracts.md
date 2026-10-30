@@ -10559,8 +10559,8 @@ process only; see [server configuration](server-configuration.md#request-timing)
 
 The protected `GET /api/system/diagnostics` response is a separate, manually
 requested operator snapshot. It repeats the capability projection so the
-response is independently useful, and adds the resolved Cayu deployment name
-when the server owns one, API/dashboard access posture, dashboard and generated
+response is independently useful, and adds the resolved `deployment.kind`
+(`local`, `cloud`, or `embedded`) and Cayu deployment name when the server owns one, API/dashboard access posture, dashboard and generated
 documentation state, Cayu and server-contract versions, bounded artifact-store
 registrations, and default pricing-catalog provenance. Embedded `mount_cayu(...)`
 installations report the host-owned deployment name and documentation state as

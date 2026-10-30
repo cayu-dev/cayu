@@ -239,6 +239,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert body["capabilities"]["configured_store_roles"] == ["session"]
     assert body["capabilities"]["actor"] is None
     assert body["capabilities"]["surfaces"] == {
+        "deployment_kind": {
+            "configured": True,
+            "read": {"enabled": True, "unavailable_reason": None},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
         "artifact_search": {
             "configured": False,
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
@@ -591,6 +596,7 @@ def test_system_diagnostics_reports_bounded_protected_runtime_state(tmp_path) ->
     assert auth_calls == 1
     body = response.json()
     assert body["deployment"] == {
+        "kind": "local",
         "name": "production-eu",
         "name_status": "available",
         "api_access": "authenticated",

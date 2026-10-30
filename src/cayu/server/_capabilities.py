@@ -94,6 +94,7 @@ class ControlPlaneCapabilitySnapshot:
                 else ServerContractActor(subject=actor.subject, tenant=actor.tenant)
             ),
             surfaces=ControlPlaneSurfaceCapabilities(
+                deployment_kind=_optional_surface(True, mutation_supported=False),
                 environment_details=_optional_surface(
                     True,
                     read_supported=self.environment_activity_supported,

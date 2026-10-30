@@ -165,6 +165,7 @@ from cayu.runtime.request_costs import (
     RequestCostSummary,
     disabled_request_cost_summary,
 )
+from cayu.runtime.system_diagnostics import DeploymentKind, resolve_deployment_kind
 from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.server._app_info_routes import register_app_info_routes
 from cayu.server._artifact_query import (
@@ -4421,6 +4422,7 @@ def create_router(
     browser_recordings_configured: bool = False,
     dashboard_pricing_configured: bool = False,
     deployment_name: str | None = None,
+    deployment_kind: DeploymentKind | None = None,
     dashboard_access_authenticated: bool | None = None,
     docs_enabled: bool | None = None,
     dashboard_pricing_metadata: tuple[str, str] | None = None,
@@ -4521,6 +4523,11 @@ def create_router(
         and type(_project_context) is not ResolvedProjectControlPlaneContext
     ):
         raise TypeError("_project_context must be framework-owned project context or None.")
+    deployment_kind = resolve_deployment_kind(
+        deployment_kind,
+        None if _project_context is None else _project_context.deployment_kind,
+        default="embedded",
+    )
     trusted_local_evals_access = (
         _project_context is not None and _project_context.trusted_local_development
     )
@@ -4813,6 +4820,7 @@ def create_router(
     diagnostics_snapshot = inspect_system_diagnostics(
         capabilities=capability_snapshot,
         deployment_name=deployment_name,
+        deployment_kind=deployment_kind,
         api_authenticated=auth is not None,
         dashboard_authenticated=dashboard_access_authenticated,
         dashboard_enabled=dashboard_configured,

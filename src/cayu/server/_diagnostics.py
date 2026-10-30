@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Literal, cast
 
 from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
+from cayu.runtime.system_diagnostics import DeploymentKind
 from cayu.server._capabilities import ControlPlaneCapabilitySnapshot
 from cayu.server.auth import AuthContext
 from cayu.server.contracts import (
@@ -29,6 +30,7 @@ class SystemDiagnosticsSnapshot:
     """Fixed server wiring captured without retaining secret-bearing configuration."""
 
     capabilities: ControlPlaneCapabilitySnapshot
+    deployment_kind: DeploymentKind
     deployment_name: str | None
     deployment_name_status: Literal["available", "not_provided", "omitted"]
     api_access: Literal["open", "authenticated"]
@@ -60,6 +62,7 @@ class SystemDiagnosticsSnapshot:
         return SystemDiagnosticsResponse(
             observed_at=datetime.now(UTC),
             deployment=SystemDeploymentDiagnostics(
+                kind=self.deployment_kind,
                 name=self.deployment_name,
                 name_status=self.deployment_name_status,
                 api_access=self.api_access,
@@ -94,6 +97,7 @@ def inspect_system_diagnostics(
     *,
     capabilities: ControlPlaneCapabilitySnapshot,
     deployment_name: str | None,
+    deployment_kind: DeploymentKind,
     api_authenticated: bool,
     dashboard_authenticated: bool | None,
     dashboard_enabled: bool,
@@ -136,6 +140,7 @@ def inspect_system_diagnostics(
 
     return SystemDiagnosticsSnapshot(
         capabilities=capabilities,
+        deployment_kind=deployment_kind,
         deployment_name=bounded_deployment_name,
         deployment_name_status=deployment_name_status,
         api_access="authenticated" if api_authenticated else "open",

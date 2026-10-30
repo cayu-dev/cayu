@@ -4783,6 +4783,7 @@ export type ControlPlaneSurfaceCapabilities = {
     artifacts: OptionalSurfaceCapability;
     browser_recordings?: OptionalSurfaceCapability | null;
     dashboard: OptionalSurfaceCapability;
+    deployment_kind?: OptionalSurfaceCapability | null;
     environment_details?: OptionalSurfaceCapability | null;
     eval_reported_views?: OptionalSurfaceCapability | null;
     eval_suite_views?: OptionalSurfaceCapability | null;
@@ -21551,6 +21552,10 @@ export type SystemDeploymentDiagnostics = {
      * Docs Enabled
      */
     docs_enabled: boolean | null;
+    /**
+     * Kind
+     */
+    kind: 'local' | 'cloud' | 'embedded';
     /**
      * Name
      */

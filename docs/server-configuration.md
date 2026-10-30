@@ -246,6 +246,48 @@ runtime-owned deployment configuration and registrations; it is not a
 readiness endpoint or infrastructure monitor. Keep load balancer liveness
 checks on `/api/health`.
 
+## Deployment kind
+
+System diagnostics report an explicit `deployment.kind`: `local`, `cloud`, or
+`embedded`. This is startup metadata, not an access policy or infrastructure
+probe. A deployment name, sign-in setting, Cloud credentials, or environment
+name does not establish its kind.
+
+`ServerConfig` (including `local_development()` and `protected()`) defaults to
+`local`. Pass `deployment_kind="cloud"` when constructing a Cloud server;
+`ServerSettings` also accepts `CAYU_SERVER_DEPLOYMENT_KIND=cloud`. Direct
+`mount_cayu()` and `create_agent_service()` calls default to `embedded` when
+there is no explicit kind or project startup declaration. Their optional
+`deployment_kind` argument supplies that declaration for custom hosts.
+
+`cayu serve` puts an explicit `--deployment-kind` value in its framework-owned
+`ProjectControlPlaneContext`; omitting the flag leaves that declaration absent.
+The standalone server defaults to `local`. A maintained service uses its explicit
+kind, or `embedded` when neither the factory nor the CLI supplies one; use
+`--deployment-kind local` to label a locally hosted service. Generated service
+factories already forward `project_context` to `create_agent_service()`, so they
+need no additional factory argument. A custom factory may forward that context
+or configure its kind directly. For an explicit CLI request, Cayu checks the
+returned service's resolved kind; a factory that already reports the requested kind is accepted
+even without a context parameter. A mismatch refuses startup with guidance.
+Conflicting explicit configuration and context declarations are rejected before
+the diagnostic snapshot is captured. None of these settings grants access or
+changes development/production safety checks.
+
+`cayu cloud init` writes `--deployment-kind cloud` into the web command. For an
+existing Cloud manifest, add that option to its `cayu serve` command; custom
+server entrypoints must declare Cloud in their configuration. Reload workers
+retain the selected CLI declaration. Cayu never rewrites captured diagnostics
+after a service has been assembled.
+
+Inspect the same protected snapshot with
+`cayu diagnostics system --server-url http://127.0.0.1:8000 --json` or
+`cayu diagnostics system --application AGENT --json`. A nested server uses its
+mount URL, such as `http://127.0.0.1:8000/cayu`. Local HTTP credentials come from
+`CAYU_API_AUTHORIZATION`; Cloud uses the selected Cloud context. Table output
+summarizes deployment kind, name, access and versions. Both formats require the
+same full access as System; this is not an offline database inspection command.
+
 ## Request timing
 
 `RequestTimingConfig` turns on a pure ASGI middleware that records one entry per

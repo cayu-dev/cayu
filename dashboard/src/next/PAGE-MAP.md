@@ -83,7 +83,7 @@ reported series expose their supported read-only evidence and downloads.
 | Environments: one row per environment with where it runs, workspace and branches, whether files are kept, knowledge store, declared MCP servers, retained-session counts and last activity | Environments (wiring tables) | `/environments` |
 | Environment: Runs on, Workspace, Files, Knowledge, MCP servers, recent sessions by title, recent files; Debug with IDs, branch capabilities and lifecycle | – (new) | `/environments/:name` |
 | Artifacts: files with kind, size, the session that made them (by title) and specialist; global public-text search and newest/oldest/name/size sort before paging; filters and paging in the URL; a preview drawer with Download and Open raw (its `preview_store_id` is separate from the list’s `artifact_store_id`); Debug with store, scope and metadata | Artifacts (ID-first table, side preview) | `/artifacts?artifact=…` |
-| System (full access only): About this agent (version, deployment, who you're signed in as, stores, pricing); what's turned off and why; Evals readiness; Debug with the feature tables, store fingerprints and raw diagnostics | System (diagnostics matrices) | `/system` |
+| System (full access only): About this agent (version, explicit local/Cloud/embedded deployment kind and name, who you're signed in as, stores, pricing); what's turned off and why; Evals readiness; Debug with the feature tables, store fingerprints and raw diagnostics | System (diagnostics matrices) | `/system` |
 
 ## Current runtime contracts
 
@@ -104,6 +104,10 @@ current behavior rather than outstanding proposals.
 | 12 | Kept-knowledge reads and revision-fenced retirement. Reviews share Inbox decisions and source evidence. Members may read and Keep/Drop; Remove requires full access. See [Knowledge](https://github.com/cayu-tech/cayu/blob/main/docs/control-plane.md). |
 | 14 | Suite-centred native reads and reported CI series. Reported evidence does not grant native execution, comparison or baseline authority. See [Evals](https://github.com/cayu-tech/cayu/blob/main/docs/evals.md) and [CI reporting](https://github.com/cayu-tech/cayu/blob/main/docs/recipes/ci-eval-reporting.md). |
 
+Deployment kind is declared at startup and exposed by System and
+`cayu diagnostics system`; neither infers hosting from names or sign-in. See
+[deployment declarations](https://github.com/cayu-tech/cayu/blob/main/docs/server-configuration.md#deployment-kind).
+
 ## Current page limitations
 
 The production and prototype pages retain the following explicit limitations.
@@ -121,7 +125,6 @@ or claim an exact result from a partial read.
 | Page | Remaining work | Current behavior |
 | --- | --- | --- |
 | Usage | Start counts for labels, parent sessions and causal budgets | Headline keeps these filters; chart explicitly unavailable because the histogram API cannot apply them |
-| System | Deployment kind (local, Cloud, embedded) | Shows the deployment name and whether sign-in is required |
 
 ## Production ownership and navigation
 
