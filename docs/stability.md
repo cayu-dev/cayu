@@ -170,6 +170,18 @@ workers and servers must stop before migration; rollback requires a pre-upgrade
 backup. Clients, custom dashboards, corpus exports, and result readers must be
 updated together. Subsequent releases retain the normal versioning rules.
 
+### v0.16.3 exception
+
+The v0.16.3 release preparation explicitly includes server contract 79, portable
+eval corpus schema 6, published eval result schema 12, assertion evidence schema
+6, and the readable-text default for Cloud service logs despite its patch version.
+This is a scoped exception to the minor-release rule, not a claim of patch
+compatibility. Storage revision and compatibility floor remain 137.
+
+The release notes describe coordinated client upgrades, corpus re-exports, result
+reader updates, and the explicit JSON flag for log consumers. Subsequent releases
+retain the normal versioning rules.
+
 ## Release-notes format
 
 Edit [release-notes.md](release-notes.md) only during release preparation; ordinary

@@ -1,5 +1,47 @@
 # Release notes
 
+## v0.16.3
+
+Upgrade: Storage revision and compatibility floor remain 137; no database migration
+is required from v0.16.2. Server contract advances from 77 to 79; upgrade servers,
+generated HTTP clients, and custom dashboards together. Re-export portable eval
+corpora for schema 6 and update published-result readers for schema 12 and assertion
+evidence schema 6. Manifest schema remains 17. Scripts reading Cloud service logs
+as JSON must now pass `--json`.
+
+### Breaking changes
+
+This release uses the scoped [v0.16.3 exception](stability.md#v0163-exception).
+
+- Server contract 79 requires matching clients and dashboards.
+- Portable eval corpora require schema 6; published eval results require schema 12,
+  and assertion evidence requires schema 6. Older schema versions are not accepted.
+- Application-evaluator and structured-output assertion details share a 12 MiB
+  per-suite publication budget, replacing the 16 MiB application-evaluator budget.
+- `cayu cloud service logs` prints readable text by default. Use `--json` to retain
+  machine-readable envelopes.
+
+### Changes
+
+- Portable eval corpora can assert on structured-output fields using JSON pointers,
+  exact comparisons, membership, numeric comparisons, existence, and bounded patterns.
+  Assertions bind to the configured structured-output contract.
+- Evaluations distinguish candidate startup failures and run-limit interruptions
+  from evaluator errors, retaining terminal evidence, usage, and the reached limit.
+- Cloud service logs include time, process, and release, with filters, pagination,
+  and follow mode. Unsupported options are refused on older Cloud servers.
+
+### Fixes
+
+- Expired approvals retain the elected worker's handoff identity, and unfinished
+  continuations fail with the correct ownership fence.
+- Workspace checkpoint failures close attribution windows and prevent retained
+  checkpoint work from publishing after writer isolation ends. Grouped settlement
+  failures continue to block subsequent tools until settlement is proven.
+- Proxy telemetry is quarantined when captured tool output is unsafe to publish.
+- Release verification handles shared PostgreSQL eval history and waits for actual
+  worker-lease expiry before testing recovery after process loss.
+
 ## v0.16.2
 
 Upgrade: Stop older workers and servers, back up the database, and run
