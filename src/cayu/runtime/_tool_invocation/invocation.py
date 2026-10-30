@@ -1956,7 +1956,10 @@ class ToolInvocation:
                     idempotency_key=idempotency_key,
                     redactor=invocation_secret_scope.redactor,
                     output_redactor=invocation_secret_scope.redactor,
-                    quarantine_output=publish_arguments_as_unavailable,
+                    quarantine_output=(
+                        publish_arguments_as_unavailable
+                        or invocation_secret_scope.seal_for_publication().unsafe_output
+                    ),
                 ):
                     yield event, None
             raise
@@ -2217,7 +2220,9 @@ class ToolInvocation:
                         idempotency_key=idempotency_key,
                         redactor=redactor,
                         output_redactor=output_redactor,
-                        quarantine_output=publish_arguments_as_unavailable,
+                        quarantine_output=(
+                            publish_arguments_as_unavailable or publication_snapshot.unsafe_output
+                        ),
                     ),
                     cancellation=post_tool_cancellation,
                     restore_cancellation_requests=post_tool_cancellation_requests_consumed,
