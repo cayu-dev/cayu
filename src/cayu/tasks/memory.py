@@ -317,6 +317,7 @@ from cayu.tasks.retry_budgets import (
     raise_task_retry_key_closed,
     task_event_retry_refusal,
     task_retry_key_request,
+    warn_implicit_event_budget,
 )
 from cayu.tasks.retry_budgets import unscoped_task_retry_key as _unscoped_task_retry_key
 from cayu.tasks.scheduling import (
@@ -2327,6 +2328,7 @@ class InMemoryTaskStore(TaskStore):
                     retry_key=keyed[0],
                     budget=keyed[1],
                     budget_is_explicit=request.retry_budget is not None,
+                    implicit_budget=request.retry_budget is None and request.retry_policy is None,
                     task_id=task.id,
                     now=self._clock(),  # Read right before the decision.
                 )
@@ -2341,6 +2343,7 @@ class InMemoryTaskStore(TaskStore):
                 assert digest is not None
                 self._creation_operation_receipts[task_id] = digest
             created = task.model_copy(deep=True)
+        warn_implicit_event_budget(request, key_state)
         self._publish_task_admission_wakeup(task, now=admission_now)
         return created
 

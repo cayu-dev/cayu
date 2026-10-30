@@ -782,6 +782,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     ),
     136: POSTGRES_TASK_STEP_DDL,
     138: POSTGRES_EVAL_RUN_TRIAL_SLOT_DDL,
+    139: (),  # Retry-key JSON provenance; compatibility fence only.
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

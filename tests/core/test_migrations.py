@@ -776,3 +776,15 @@ def test_revision_twenty_three_rejects_pre_execution_identity_workers() -> None:
         app_latest=23,
         app_min_supported=23,
     )
+
+
+def test_retry_budget_provenance_fences_old_readers():
+    current = m.SchemaState(revision=139, compatible_from=139)
+    with pytest.raises(m.SchemaTooNew):
+        m.validate(current, app_latest=138, app_min_supported=137)
+    with pytest.raises(m.SchemaTooOld):
+        m.validate(m.SchemaState(revision=138, compatible_from=137))
+    assert (
+        m.validate_migration_input(m.SchemaState(revision=138, compatible_from=137))[0].revision
+        == 139
+    )

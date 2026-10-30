@@ -845,6 +845,13 @@ class TaskStore(ABC):
     async def create_task(self, request: TaskCreate) -> Task:
         """Create a task and its immutable invocation provenance atomically.
 
+        Resubmitting an event can raise ``TaskRetryBudgetExhausted`` when its
+        shared budget runs out or ``TaskEventAlreadyCompleted`` after success.
+        Handle both in reconciliation loops. Root tasks infer event identity from
+        a nonblank ``input["event_id"]`` unless ``event_id`` or ``retry_key`` is set.
+        Choose ``retry_budget`` on the first submission; use
+        ``TaskRetryBudget.unlimited()`` for intentionally unlimited attempts.
+
         Implementations must mint the final task ID, load any requested parent,
         and call ``task_invocation_for_create`` inside the same create boundary.
         """

@@ -335,6 +335,7 @@ from cayu.tasks.retry_budgets import (
     task_event_retry_refusal,
     task_retry_key_request,
     unscoped_task_retry_key,
+    warn_implicit_event_budget,
 )
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
@@ -384,7 +385,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 137
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 139
 
 
 @model_store_surface("tasks")
@@ -3723,7 +3724,8 @@ class SQLiteTaskStore(TaskStore):
                     supports_verified_work_contracts=True,
                     event_budget=True,
                 )
-                refused = self._admit_task_retry_key_unlocked(request, task)
+                key_state, admitted = self._admit_task_retry_key_unlocked(request, task)
+                refused = None if admitted else key_state
                 if refused is None:
                     self._insert_task_unlocked(task)
                     self._record_task_transition_unlocked(None, task)
@@ -3737,16 +3739,17 @@ class SQLiteTaskStore(TaskStore):
         if refused is not None:
             # Raised after commit so the given-up state is durable.
             raise_task_retry_key_closed(refused)
+        warn_implicit_event_budget(request, key_state)
         self._publish_task_admission_wakeup(task, now=admission_now)
         return created
 
     def _admit_task_retry_key_unlocked(
         self, request: TaskCreate, task: Task
-    ) -> TaskRetryKeyState | None:
-        """Count a keyed task inside its insert transaction; return the state if refused."""
+    ) -> tuple[TaskRetryKeyState | None, bool]:
+        """Count a keyed task inside its insert transaction; return state and admission."""
         keyed = task_retry_key_request(request, task)
         if keyed is None:
-            return None
+            return None, True
         if self._task_exists_unlocked(task.id):
             raise ValueError(f"Task already exists: {task.id}")
         prior = self._load_task_retry_key_unlocked(keyed[0])
@@ -3758,6 +3761,7 @@ class SQLiteTaskStore(TaskStore):
             task_id=task.id,
             now=self._clock(),
             budget_is_explicit=request.retry_budget is not None,
+            implicit_budget=request.retry_budget is None and request.retry_policy is None,
         )
         if state is not prior:
             self._connection.execute(
@@ -3765,7 +3769,7 @@ class SQLiteTaskStore(TaskStore):
                 "ON CONFLICT (retry_key) DO UPDATE SET state_json = excluded.state_json",
                 (state.retry_key, state.model_dump_json()),
             )
-        return None if admitted else state
+        return state, admitted
 
     def _load_task_retry_key_unlocked(self, retry_key: str) -> TaskRetryKeyState | None:
         row = self._connection.execute(

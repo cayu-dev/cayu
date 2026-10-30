@@ -8444,6 +8444,14 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
 
     @_tracked_entrance
     async def create_task(self, request: TaskCreate) -> Task:
+        """Create a task under its durable event budget.
+
+        Resubmission raises ``TaskRetryBudgetExhausted`` after the shared budget
+        runs out, or ``TaskEventAlreadyCompleted`` after the event succeeds.
+        Reconciliation loops must handle both. Root tasks infer identity from
+        nonblank ``input["event_id"]``; choose ``retry_budget`` on the first
+        submission, or ``TaskRetryBudget.unlimited()`` for unlimited attempts.
+        """
         operation = task_creation.create_task(
             request,
             task_store=self.task_store,

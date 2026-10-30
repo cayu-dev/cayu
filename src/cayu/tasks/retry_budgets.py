@@ -99,6 +99,7 @@ class TaskRetryKeyState(BaseModel):
     legacy_attempts: StrictInt = Field(default=0, ge=0)
     succeeded_at: datetime | None = None
     budget: TaskRetryBudget
+    implicit_budget: bool = Field(default=False, exclude_if=lambda value: not value)
     first_attempt_at: datetime
     latest_attempt_at: datetime
     latest_task_id: str
@@ -387,6 +388,7 @@ def admit_task_retry_key(
     task_id: str,
     now: datetime,
     budget_is_explicit: bool = True,
+    implicit_budget: bool = False,
 ) -> tuple[TaskRetryKeyState, bool]:
     """Decide one new task for ``retry_key`` from store-authoritative ``now``.
 
@@ -402,6 +404,7 @@ def admit_task_retry_key(
             retry_key=retry_key,
             attempts=1,
             budget=budget,
+            implicit_budget=implicit_budget,
             first_attempt_at=now,
             latest_attempt_at=now,
             latest_task_id=task_id,
@@ -534,3 +537,33 @@ async def reconcile_task_event_deadlines(task_store: Any) -> None:
         task = await task_store.load_task(task_id)
         if task is not None:
             await enforce_task_event_deadline(task_store, task)
+
+
+def warn_implicit_event_budget(request: Any, state: TaskRetryKeyState | None) -> None:
+    """Warn after the second admission commits, never on replay or declared policy."""
+    if (
+        state is None
+        or state.attempts != 2
+        or not state.implicit_budget
+        or request.retry_budget is not None
+        or request.retry_policy is not None
+    ):
+        return
+    source = (
+        "retry_key"
+        if request.retry_key is not None
+        else "event_id"
+        if request.event_id is not None
+        else 'input["event_id"]'
+    )
+    logging.getLogger(__name__).warning(
+        "Implicit event retry budget: identity from %s; attempt 2 of %s admitted "
+        "After %s attempts, the next submission raises "
+        "TaskRetryBudgetExhausted. Handle exhaustion when resubmitting. For new events, "
+        "choose retry_budget=TaskRetryBudget(max_attempts=...) or "
+        "retry_budget=TaskRetryBudget.unlimited() on the first submission; "
+        "an existing event keeps its original budget.",
+        source,
+        state.budget.max_attempts,
+        state.budget.max_attempts,
+    )

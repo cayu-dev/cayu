@@ -406,3 +406,68 @@ def test_boundary_withholds_a_refusal_whose_state_holds_a_secret(secret):
     )
     assert type(withheld) is not TaskRetryBudgetExhausted
     assert secret not in str(withheld)
+
+
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("identity", ["input", "event_id", "retry_key"])
+@pytest.mark.parametrize("policy", ["implicit", "default", "same_value", "unlimited"])
+def test_second_implicit_admission_warns_before_exhaustion(
+    backend, identity, policy, tmp_path, request, caplog
+):
+    import logging
+    from uuid import uuid4
+
+    async def scenario():
+        store = _store(backend, tmp_path, request)
+        event = uuid4().hex
+        budget = {
+            "implicit": None,
+            "default": TaskRetryBudget(),
+            "same_value": DEFAULT_TASK_RETRY_BUDGET,
+            "unlimited": TaskRetryBudget.unlimited(),
+        }[policy]
+        fields = {"input": {"event_id": event}} if identity == "input" else {identity: event}
+        try:
+            for attempt in (1, 2, 3):
+                await store.create_task(
+                    TaskCreate(type="warning-test", retry_budget=budget, **fields)
+                )
+                warnings = [
+                    r for r in caplog.records if "Implicit event retry budget:" in r.message
+                ]
+                assert len(warnings) == int(policy == "implicit" and attempt >= 2)
+            if policy != "unlimited":
+                with pytest.raises(TaskRetryBudgetExhausted):
+                    await store.create_task(
+                        TaskCreate(type="warning-test", retry_budget=budget, **fields)
+                    )
+            if policy == "implicit":
+                [warning] = [
+                    r.message for r in caplog.records if "Implicit event retry budget:" in r.message
+                ]
+                assert ('input["event_id"]' if identity == "input" else identity) in warning
+                assert "attempt 2 of 3" in warning
+                assert "TaskRetryBudgetExhausted" in warning
+                assert "TaskRetryBudget.unlimited()" in warning
+                assert event not in warning
+        finally:
+            await _close(store)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+
+
+def test_custom_store_admission_without_provenance_uses_plain_boolean_default():
+    from cayu.tasks.retry_budgets import admit_task_retry_key
+
+    state, admitted = admit_task_retry_key(
+        None,
+        retry_key="custom-store-event",
+        budget=DEFAULT_TASK_RETRY_BUDGET,
+        task_id="custom-store-task",
+        now=datetime.now(UTC),
+    )
+    assert admitted
+    assert state.implicit_budget is False
+    assert "implicit_budget" not in state.model_dump()

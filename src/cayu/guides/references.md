@@ -288,6 +288,14 @@ Models get the same split through the `list_knowledge`, `search_knowledge` and
 
 ## background-work
 
+Resubmitters calling `create_task` must handle `TaskRetryBudgetExhausted` and
+`TaskEventAlreadyCompleted`. Root tasks also infer event identity from a nonblank
+`input["event_id"]`; this inference stays enabled to bound repeated submissions
+of the same webhook event. Without a declared policy, the shared default allows
+three attempts. The second admission warns before exhaustion. Choose `retry_budget=`
+on the first submission, including `TaskRetryBudget.unlimited()` when attempts
+must remain unlimited; an existing event retains its original budget.
+
 `TaskStore` owns durable work; a dispatcher claims it and a worker executes it.
 Event watchers react to persisted events with delivery identity and retries.
 Keep enqueue, claim, execution, result recording, and recovery distinct so a
@@ -467,3 +475,7 @@ capabilities separately from a structural manifest.
 
 Use `cayu guide human-attention` for the canonical EventSink, pending-action,
 durable destination, and restart-reconciliation integration.
+
+The implicit-budget warning requires storage schema revision 139. Migrate the
+database before upgrading existing applications; older binaries refuse the
+new revision rather than misreading retry-key provenance.

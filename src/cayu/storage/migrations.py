@@ -579,6 +579,9 @@ REVISIONS: tuple[Revision, ...] = (
     # and opening them again under a later owner fences the earlier claims.
     # Eval stores require it.
     Revision(revision=138, kind=RevisionKind.ADDITIVE, compatible_from=137),
+    # Retry-key JSON records whether the original budget was implicit. Older
+    # readers forbid unknown fields and must refuse before touching task state.
+    Revision(revision=139, kind=RevisionKind.BREAKING, compatible_from=139),
 )
 
 #: The revision an empty database is initialized to.
