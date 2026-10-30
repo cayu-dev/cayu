@@ -12781,6 +12781,16 @@
             "pattern": "^sha256:[0-9a-f]{64}$",
             "title": "Source Revision",
             "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalAdditionWorkspace"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -13019,6 +13029,67 @@
           "state"
         ],
         "title": "EvalAdditionSourceLink",
+        "type": "object"
+      },
+      "EvalAdditionWorkspace": {
+        "additionalProperties": false,
+        "description": "The workspace fixture a runnable case gets from its session, or why it gets none.\n\n``captured``: the case starts from ``repository`` at ``revision``, the commit\nthe session's source workspace was at when it bound; ``clean`` says whether\nGit confirmed the checkout had no uncommitted change, which the environment\ndoesn't record. ``unregistered``: the session ran on that commit of a source\nthe eval target's application hasn't registered. ``unsupported``: the eval\ntarget runs a workflow, whose trials can't start from a fixture.\n``unrecorded``: the session's environment recorded no revision. ``message``\nsays which, plainly.",
+        "properties": {
+          "clean": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Clean"
+          },
+          "message": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "repository": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repository"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          },
+          "state": {
+            "enum": [
+              "captured",
+              "unregistered",
+              "unsupported",
+              "unrecorded"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "message"
+        ],
+        "title": "EvalAdditionWorkspace",
         "type": "object"
       },
       "EvalAssertionPresentationV1": {
@@ -14056,6 +14127,16 @@
               }
             ],
             "title": "Stimulus"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceFixtureSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -14217,6 +14298,16 @@
               }
             ],
             "title": "Stimulus"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceFixtureSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -14370,6 +14461,16 @@
               }
             ],
             "title": "Stimulus"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceFixtureSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -14526,6 +14627,16 @@
               }
             ],
             "title": "Stimulus"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceFixtureSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -39915,7 +40026,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "85",
+            "default": "86",
             "title": "Contract Version",
             "type": "string"
           },
@@ -48114,7 +48225,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "85",
+            "default": "86",
             "title": "Contract Version",
             "type": "string"
           }

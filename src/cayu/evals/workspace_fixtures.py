@@ -193,6 +193,19 @@ class WorkspaceFixtureSpec(BaseModel):
         )
 
 
+def _workspace_fixture_input(value: object) -> object:
+    """A case's ``workspace`` field input, an exact ``WorkspaceFixtureSpec`` copied as JSON.
+
+    Other models are refused; JSON objects and ``None`` pass to validation.
+    """
+
+    if type(value) is WorkspaceFixtureSpec:
+        return value.model_dump(mode="json")
+    if isinstance(value, BaseModel):
+        raise TypeError("workspace must be an exact WorkspaceFixtureSpec or JSON object.")
+    return value
+
+
 __all__ = [
     "EVAL_WORKSPACE_FIXTURE_MAX_BYTES",
     "EVAL_WORKSPACE_FIXTURE_MAX_FILES",

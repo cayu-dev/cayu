@@ -985,6 +985,16 @@ and a subclass that doesn't override it, returns `None`. The eval runner uses it
 to give each trial of a case with a
 [workspace fixture](evals.md#workspace-fixtures) its own checkout.
 
+`workspace_repository="name"` on `DockerCodingEnvironmentFactory` or
+`BrokeredSandboxCodingEnvironmentFactory` says that `source_workspace` is a Git
+checkout of the workspace source registered as `name`
+(`CayuApp.register_workspace_source`). Each session then records the commit at
+the checkout's HEAD when it binds, and whether the checkout had uncommitted
+changes, so `cayu eval add-session` can start a case from that commit
+([a session's workspace as a fixture](evals.md#a-sessions-workspace-as-a-fixture)).
+It is evidence, not configuration: it stays out of the execution profile, and a
+factory re-sourced with `with_source_workspace` doesn't carry it.
+
 A tool call gets its knowledge store and access scope from the environment it
 runs in, not from the app. A coding workspace has no knowledge unless you give
 it some, because the app's scope often spans every tenant and a workspace

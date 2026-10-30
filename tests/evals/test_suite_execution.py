@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from cayu import AgentSpec, CayuApp, RunRequest
 from cayu.evals import CorpusTarget, ScriptedModelProvider
@@ -9,12 +10,16 @@ from cayu.evals.execution import compile_corpus_suite, evaluation_target_identit
 from cayu.evals.store import EvalRunInvocation, EvalScenarioRunInvocation
 from cayu.evals.suite_authoring import (
     EvalCaseDraftV1,
+    EvalCaseDraftV2,
+    EvalScenarioStimulusV1,
     EvalSimpleInputStimulusV1,
     EvalSuiteDraftV1,
     compile_eval_suite_draft,
+    duplicate_eval_case,
     eval_suite_selection,
 )
 from cayu.evals.suite_execution import corpus_for_authored_simple_selection
+from cayu.evals.workspace_fixtures import WorkspaceFixtureSpec
 
 _REVISION_A = "sha256:" + "a" * 64
 _REVISION_B = "sha256:" + "b" * 64
@@ -83,6 +88,57 @@ def test_authored_corpus_identity_is_stable_across_application_releases() -> Non
     assert first.cases[0].source.evidence_revision == document.cases[0].revision
     assert compile_corpus_suite(first, first_target, document.suite.id).corpus == first
     assert compile_corpus_suite(second, second_target, document.suite.id).corpus == second
+
+
+def test_an_authored_case_fixture_reaches_its_corpus_case_and_an_absent_one_is_omitted() -> None:
+    def draft(**fields) -> EvalCaseDraftV1:
+        return EvalCaseDraftV1(
+            id="case-one",
+            name="Case one",
+            stimulus=EvalSimpleInputStimulusV1(
+                input=RunInputSpec(messages=(CorpusUserMessageSpec(text="Check the claim."),))
+            ),
+            assertions=(RootStatusAssertionSpec(id="completed", expected="completed"),),
+            **fields,
+        )
+
+    def suite(case: EvalCaseDraftV1):
+        return compile_eval_suite_draft(
+            EvalSuiteDraftV1(
+                id="claims", target_key="assistant.default", name="Claims", cases=(case,)
+            )
+        )
+
+    fixture = WorkspaceFixtureSpec(repository="payments", revision="a" * 40)
+    plain = suite(draft())
+    fixed = suite(draft(workspace=fixture))
+    # A case without a fixture serializes, and so revises, as it did before fixtures.
+    assert "workspace" not in plain.cases[0].model_dump(mode="json")
+    assert fixed.cases[0].revision != plain.cases[0].revision
+    assert EvalCaseDraftV2.from_case(fixed.cases[0]).workspace == fixture
+    target = _target(release="release-one", system_prompt="First release.")
+    corpus = corpus_for_authored_simple_selection(fixed, eval_suite_selection(fixed), target)
+    assert corpus.cases[0].workspace == fixture
+    plain_corpus = corpus_for_authored_simple_selection(plain, eval_suite_selection(plain), target)
+    assert plain_corpus.cases[0].workspace is None
+    # A duplicated case starts from the same fixture.
+    duplicated = duplicate_eval_case(fixed, "case-one", new_case_id="case-two")
+    assert [case.workspace for case in duplicated.cases] == [fixture, fixture]
+
+
+def test_a_scenario_case_takes_no_workspace_fixture() -> None:
+    # A resumed scenario trial would get a fresh checkout without its earlier changes.
+    scenario = EvalScenarioStimulusV1(scenario_id="refund", scenario_revision=_REVISION_A)
+    fixture = WorkspaceFixtureSpec(repository="payments", revision="a" * 40)
+    for draft_type in (EvalCaseDraftV1, EvalCaseDraftV2):
+        with pytest.raises(ValidationError, match="scenario case can't have a workspace"):
+            draft_type(
+                id="case-one",
+                name="Case one",
+                stimulus=scenario,
+                assertions=(RootStatusAssertionSpec(id="completed", expected="completed"),),
+                workspace=fixture,
+            )
 
 
 def test_authored_invocation_provenance_is_paired_and_legacy_shape_stays_stable() -> None:

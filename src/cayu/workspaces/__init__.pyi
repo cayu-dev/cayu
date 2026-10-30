@@ -173,7 +173,16 @@ from cayu.workspaces.runner import (
 )
 from cayu.workspaces.runner import RunnerWorkspace as RunnerWorkspace
 from cayu.workspaces.sources import (
+    DEFAULT_GIT_REMOTE_FETCH_TIMEOUT_SECONDS as DEFAULT_GIT_REMOTE_FETCH_TIMEOUT_SECONDS,
+)
+from cayu.workspaces.sources import (
+    DEFAULT_GIT_REMOTE_MAX_FETCH_BYTES as DEFAULT_GIT_REMOTE_MAX_FETCH_BYTES,
+)
+from cayu.workspaces.sources import (
     DEFAULT_GIT_WORKSPACE_SOURCE_TIMEOUT_SECONDS as DEFAULT_GIT_WORKSPACE_SOURCE_TIMEOUT_SECONDS,
 )
+from cayu.workspaces.sources import MAX_GIT_REMOTE_FETCH_FILES as MAX_GIT_REMOTE_FETCH_FILES
+from cayu.workspaces.sources import GitRemoteCredentials as GitRemoteCredentials
+from cayu.workspaces.sources import GitRemoteWorkspaceSource as GitRemoteWorkspaceSource
 from cayu.workspaces.sources import GitWorkspaceSource as GitWorkspaceSource
 from cayu.workspaces.sources import WorkspaceSource as WorkspaceSource

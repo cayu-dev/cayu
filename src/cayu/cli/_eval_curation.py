@@ -732,9 +732,15 @@ def render_addition(answer: Mapping[str, Any]) -> str:
         change = f"a new revision with {count} case" + ("" if count == 1 else "s")
     else:
         change = "this exact case is already there, its cases unchanged"
+    workspace = plan.get("workspace")
+    # What the case's workspace starts from, or why it has no fixture.
+    detail = f"\nWorkspace: {_text(workspace['message'])}" if isinstance(workspace, dict) else ""
     if result["receipt"] is None:
         return (
-            f"Preview of case {_text(plan['case_id'])}: {change}.\n"
+            f"Preview of case {_text(plan['case_id'])}: {change}.{detail}\n"
             f"Publish it: {_text(result['commands']['publish'])}"
         )
-    return f"Added case {_text(plan['case_id'])}: {change}.\nSuite: {_text(result['destination'])}"
+    return (
+        f"Added case {_text(plan['case_id'])}: {change}.{detail}\n"
+        f"Suite: {_text(result['destination'])}"
+    )

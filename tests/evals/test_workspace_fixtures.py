@@ -358,19 +358,24 @@ def test_re_sourcing_ignores_later_changes_to_what_the_caller_passed(tmp_path: P
 
 
 def test_re_sourcing_carries_every_constructor_argument_but_the_source(tmp_path: Path) -> None:
-    brokered = _brokered(FakeBroker(tmp_path / "cloud"), tmp_path)
+    brokered = _brokered(FakeBroker(tmp_path / "cloud"), tmp_path, workspace_repository="target")
     docker = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
         toolchain_profile=docker_toolchain_profile(
             image_identity=DockerImageIdentity(reference="python:3.12-slim@sha256:" + "a" * 64)
         ),
+        workspace_repository="target",
     )
     for factory in (brokered, docker):
         parameters = set(inspect.signature(type(factory).__init__).parameters)
+        # The repository the source is a checkout of describes the source, not the configuration.
         assert set(factory._source_independent_arguments) == parameters - {
             "self",
             "source_workspace",
+            "workspace_repository",
         }
+        resourced = factory.with_source_workspace(factory.source_workspace)
+        assert resourced is not None and resourced.workspace_repository is None
 
 
 def test_a_docker_factory_whose_configuration_changed_takes_no_other_source(
@@ -477,6 +482,16 @@ def _template(tmp_path: Path) -> Path:
 
 def _request() -> RunRequest:
     return RunRequest(agent_name="verifier", messages=[Message.text("user", "Check.")])
+
+
+@pytest.fixture(autouse=True)
+def _private_temporary_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Trial checkouts go to this test's own directory, so what a test counts there can't
+    include another test's, running at the same time in another process."""
+
+    private = tmp_path / "tmp"
+    private.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(private))
 
 
 def _trial_directories() -> set[Path]:

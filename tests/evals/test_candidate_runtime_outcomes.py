@@ -30,6 +30,7 @@ from cayu.evals.runner import _TRACEBACK_TRUNCATION_MARKER, _TRIAL_TRACEBACK_MAX
 from cayu.events import Event, EventType
 from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers import ModelProvider, ModelStreamEvent
+from cayu.runtime._run_limits import RunLimitController
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.stop_policy import StopLimit
 from cayu.sandbox_broker import BrokeredSandboxCodingEnvironmentFactory
@@ -38,17 +39,6 @@ from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.workspaces import LocalWorkspace
-
-# Longer than the one-second run limit, so the second model step crosses it.
-_SLOW_STEP_SECONDS = 1.2
-
-
-class _SlowSecondStepProvider(ScriptedModelProvider):
-    async def stream(self, request):
-        if self.requests:
-            await asyncio.sleep(_SLOW_STEP_SECONDS)
-        async for event in super().stream(request):
-            yield event
 
 
 class _NoteTool(Tool):
@@ -132,7 +122,7 @@ def _sandboxed_app(store, broker: FakeBroker, tmp_path) -> CayuApp:
     (source / "README.md").write_text("project\n")
     app = CayuApp(enable_logging=False, session_store=store)
     app.register_provider(
-        _SlowSecondStepProvider([_note_step("call-1"), _note_step("call-2")]),
+        ScriptedModelProvider([_note_step("call-1"), _note_step("call-2")]),
         default=True,
     )
     app.register_environment_factory(
@@ -344,10 +334,24 @@ def test_execution_limits_name_every_run_limit():
 
 
 @pytest.mark.store_semantics
-def test_trial_stopped_by_a_run_limit_keeps_its_evidence(store_case):
+def test_trial_stopped_by_a_run_limit_keeps_its_evidence(store_case, monkeypatch):
     _, tmp_path, _ = store_case
     broker = FakeBroker(tmp_path / "broker")
-    suite = _case(_request(limits=RunLimits(max_elapsed_seconds=1)), FinalOutputContains("done"))
+    # This test checks retained evidence, not wall-clock cancellation. Advance only
+    # the run's budget clock after a known tool result, so database load cannot
+    # decide whether a model or tool operation was interrupted halfway through.
+    elapsed = 0.0
+    original_run = _NoteTool.run
+
+    async def run_note(self, ctx, args):
+        nonlocal elapsed
+        result = await original_run(self, ctx, args)
+        elapsed = 60.0
+        return result
+
+    monkeypatch.setattr(_NoteTool, "run", run_note)
+    monkeypatch.setattr(RunLimitController, "elapsed_seconds", lambda self, **kwargs: elapsed)
+    suite = _case(_request(limits=RunLimits(max_elapsed_seconds=60)), FinalOutputContains("done"))
 
     async def scenario():
         store = await _open_store(store_case)
@@ -377,9 +381,10 @@ def test_trial_stopped_by_a_run_limit_keeps_its_evidence(store_case):
     assert events[-1].payload["reason"] == "limit_reached"
     assert events[-1].payload["limit"] == "elapsed_seconds"
     assert len(stored_events) > len(events)
-    # Sandbox setup counts toward the limit and may consume it before any model step.
+    # The clock advances only after one completed model step and its note tool.
     assert trial.usage_summary is not None
     model_steps = trial.usage_summary["model_steps"]
+    assert model_steps == 1
     assert model_steps == sum(event.type is EventType.MODEL_COMPLETED for event in events)
     assert trial.usage_summary["usage"]["total_tokens"] == 5 * model_steps
     assert "Candidate run: failed (limit_reached: elapsed_seconds)." in render_html_report(result)

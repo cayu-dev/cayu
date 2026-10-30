@@ -168,6 +168,7 @@ def _corpus_for_authored_cases(
                 source=source,
                 input=case_input,
                 assertions=case.assertions,
+                workspace=case.workspace,
             )
         )
     return EvalCorpusDocument.create(

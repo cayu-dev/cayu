@@ -6205,6 +6205,7 @@ export type EvalAdditionPlan = {
      * Source Revision
      */
     source_revision: string;
+    workspace?: EvalAdditionWorkspace | null;
 };
 
 /**
@@ -6268,6 +6269,43 @@ export type EvalAdditionSourceLink = {
      * State
      */
     state: 'available' | 'unavailable';
+};
+
+/**
+ * EvalAdditionWorkspace
+ *
+ * The workspace fixture a runnable case gets from its session, or why it gets none.
+ *
+ * ``captured``: the case starts from ``repository`` at ``revision``, the commit
+ * the session's source workspace was at when it bound; ``clean`` says whether
+ * Git confirmed the checkout had no uncommitted change, which the environment
+ * doesn't record. ``unregistered``: the session ran on that commit of a source
+ * the eval target's application hasn't registered. ``unsupported``: the eval
+ * target runs a workflow, whose trials can't start from a fixture.
+ * ``unrecorded``: the session's environment recorded no revision. ``message``
+ * says which, plainly.
+ */
+export type EvalAdditionWorkspace = {
+    /**
+     * Clean
+     */
+    clean?: boolean | null;
+    /**
+     * Message
+     */
+    message: string;
+    /**
+     * Repository
+     */
+    repository?: string | null;
+    /**
+     * Revision
+     */
+    revision?: string | null;
+    /**
+     * State
+     */
+    state: 'captured' | 'unregistered' | 'unsupported' | 'unrecorded';
 };
 
 /**
@@ -6746,6 +6784,7 @@ export type EvalCaseDefinitionV1 = {
     } & EvalSimpleInputStimulusV1) | ({
         kind: 'scenario';
     } & EvalScenarioStimulusV1);
+    workspace?: WorkspaceFixtureSpec | null;
 };
 
 /**
@@ -6783,6 +6822,7 @@ export type EvalCaseDefinitionV2 = {
     } & EvalSimpleInputStimulusV1) | ({
         kind: 'scenario';
     } & EvalScenarioStimulusV1);
+    workspace?: WorkspaceFixtureSpec | null;
 };
 
 /**
@@ -6816,6 +6856,7 @@ export type EvalCaseDraftV1 = {
     } & EvalSimpleInputStimulusV1) | ({
         kind: 'scenario';
     } & EvalScenarioStimulusV1);
+    workspace?: WorkspaceFixtureSpec | null;
 };
 
 /**
@@ -6849,6 +6890,7 @@ export type EvalCaseDraftV2 = {
     } & EvalSimpleInputStimulusV1) | ({
         kind: 'scenario';
     } & EvalScenarioStimulusV1);
+    workspace?: WorkspaceFixtureSpec | null;
 };
 
 /**

@@ -112,6 +112,7 @@ from cayu.runtime._binding_cleanup import (
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools.base import ToolContext
+from cayu.workspaces._workspace_origin import metadata_with_workspace_origin
 from cayu.workspaces.base import Workspace, WorkspaceManifestLimits, matches_list_pattern
 from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.revisions import (
@@ -123,6 +124,7 @@ from cayu.workspaces.revisions import (
     observe_deterministic_workspace,
 )
 from cayu.workspaces.runner import RunnerWorkspace
+from cayu.workspaces.sources import _source_name
 
 if TYPE_CHECKING:
     from cayu.knowledge.base import KnowledgeStore
@@ -420,6 +422,7 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         path: str = "/workspace",
         git_baseline: bool = True,
         staging_capacity: SyncBindingStagingCapacity | None = None,
+        workspace_repository: str | None = None,
     ) -> None:
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
@@ -451,6 +454,9 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             )
         self._docker_target = target_workspace
         self._git_baseline = git_baseline
+        self._workspace_repository = (
+            None if workspace_repository is None else _source_name(workspace_repository)
+        )
         self._source_copy_authority = source_copy_authority
         self._immutable_input_store = immutable_input_store
         self._immutable_input_attachments = attachments
@@ -524,7 +530,9 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             session_id=session_id,
             agent_name=agent_name,
             environment_name=environment_name,
-            metadata=metadata,
+            metadata=await metadata_with_workspace_origin(
+                self._workspace_repository, protected_source, metadata
+            ),
         )
         try:
             copied_workspace = bound.workspace
@@ -1001,6 +1009,13 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     be slow, such as heavily loaded machines. It is operational and stays out
     of the factory's configuration fingerprint, so raising it does not strand
     sessions that are waiting to retry their cleanup.
+
+    ``workspace_repository`` names the workspace source (registered with
+    ``CayuApp.register_workspace_source``) that ``source_workspace`` is a Git
+    checkout of. Each session then records the commit the checkout was at when
+    it copied in, and whether it had uncommitted changes, so
+    ``cayu eval add-session`` can start the case at that commit. A factory
+    re-sourced with ``with_source_workspace`` doesn't carry it.
     """
 
     source_workspace: LocalWorkspace
@@ -1036,6 +1051,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         command_cleanup: Literal["command_or_sandbox", "sandbox"] = "sandbox",
         cancel_timeout_s: float | None = None,
         staging_capacity: SyncBindingStagingCapacity | None = None,
+        workspace_repository: str | None = None,
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
@@ -1105,6 +1121,11 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         ):
             raise TypeError("transfer_limits must be DockerWorkspaceTransferLimits or None.")
         self.source_workspace = source_workspace
+        #: The registered workspace source ``source_workspace`` is a Git checkout of, if any.
+        #: Evidence only, so it stays out of the configuration fingerprint.
+        self.workspace_repository = (
+            None if workspace_repository is None else _source_name(workspace_repository)
+        )
         #: The Docker profile this factory verifies, built here from a neutral profile.
         self.toolchain_profile = docker_profile
         #: The profile tools must hold to admit this factory's runners.
@@ -1386,6 +1407,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             immutable_input_attachments=immutable_input_attachments,
             git_baseline=self.git_baseline,
             staging_capacity=self.staging_capacity,
+            workspace_repository=self.workspace_repository,
         )
 
     def allocation_scope(

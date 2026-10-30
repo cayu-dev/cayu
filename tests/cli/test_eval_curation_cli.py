@@ -131,6 +131,8 @@ def test_add_session_previews_then_publishes_the_reviewed_plan_once(
         }
         assert previewed["receipt"] is None
         assert previewed["plan"]["membership_changed"] is True
+        # The session ran without a coding environment, so the case has no workspace fixture.
+        assert previewed["plan"]["workspace"]["state"] == "unrecorded"
         assert previewed["plan"]["destination_case_count"] == parent["cases"]["total"] + 1
         # A preview publishes nothing.
         assert _ok(capsys, "suites", "show", selector, *_LOCAL)["cases"] == parent["cases"]
@@ -166,6 +168,7 @@ def test_add_session_previews_then_publishes_the_reviewed_plan_once(
         assert main(["eval", "suites", "show", destination, *_LOCAL, "--table"]) == 0
         text = capsys.readouterr().out
         assert f"Preview of case {capture['id']}: a new revision with" in text
+        assert "Workspace: The session's environment recorded no workspace revision" in text
         assert f"Publish it: cayu eval add-session {_SESSION_ID}" in text
         assert f"Suite {shown['suite']['name']} (authored," in text
         assert "Baseline: one for each run's execution group" in text

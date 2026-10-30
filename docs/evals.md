@@ -2128,10 +2128,56 @@ Git repository (a working checkout or a bare mirror) that already holds the
 commits cases name: it reads the revision's tree into a private index and writes
 it out with the repository's own attributes and filters, leaving the
 repository's HEAD, index and working tree untouched, and the checkout gets no
-`.git`. Each Git command may run for `timeout_s` seconds (300 by default). An
-application whose repository lives behind a remote with its own credentials
-subclasses `WorkspaceSource` and fetches before it checks out. Sources are local
-preparation authority, so the app manifest doesn't list them.
+`.git`. Each Git command may run for `timeout_s` seconds (300 by default).
+Sources are local preparation authority, so the app manifest doesn't list them.
+
+`GitRemoteWorkspaceSource(name, url, mirror)` keeps a bare mirror of a Git
+remote in the directory `mirror` and fetches what a case needs:
+
+```python
+from cayu.vaults import SecretRef
+from cayu.workspaces import GitRemoteCredentials, GitRemoteWorkspaceSource
+
+app.register_workspace_source(
+    GitRemoteWorkspaceSource(
+        "payments",
+        "https://github.com/acme/payments.git",
+        "/srv/cayu/mirrors/payments",
+        credentials=GitRemoteCredentials(
+            username=SecretRef(name="payments-git-username"),  # "x-access-token" for a GitHub token
+            password=SecretRef(name="payments-git-token"),
+            resolver=vault,
+        ),
+    )
+)
+```
+
+On first use the source clones the remote into `mirror`, which must be absent,
+empty or a bare repository. A checkout of a commit the mirror lacks fetches
+every branch and tag, then the commit by its id if it is on none of them (most
+hosts allow that; the commit is then kept under `refs/cayu/revisions/`).
+`await source.refresh()` fetches branches and tags ahead of a run. The remote is
+an `https://` URL (`http://` only on a loopback host), or a `file://` URL or
+absolute path on this machine; it can't carry credentials, a query or a
+fragment, and other transports are refused. `credentials` are vault references
+(a `Vault` or `CredentialProxy` resolves them) sent only to an `https://`
+remote. Each fetch resolves them and hands them to Git through its own
+environment, read by an askpass helper, so they never reach a URL, an argument,
+the mirror's configuration, a log or an error, and resolved values are scrubbed
+from Git's output. Every clone or fetch writes into a new repository beside the
+mirror that borrows the mirror's objects, so Git fetches only what the mirror
+lacks. It runs for at most `fetch_timeout_s` seconds (600 by default) and may
+write at most `max_fetch_bytes` (4 GiB by default) in at most
+`MAX_GIT_REMOTE_FETCH_FILES` (100,000) files, whichever protocol the remote
+speaks: Git's dumb HTTP protocol, which writes an object per file, is measured
+as it runs. A fetch past a limit is stopped and removed, and only a fetch that
+finished within them moves into the mirror: its objects as packs, each visible
+only once whole (loose objects are packed first), then its refs. Fetches into
+one mirror wait for each other, across processes too. Hooks, the host's Git
+configuration, `~/.netrc` and credential helpers, redirects and automatic
+garbage collection are off for every fetch. Checkouts then work as
+`GitWorkspaceSource`'s do, from the mirror. Any other source subclasses
+`WorkspaceSource` and implements `checkout(revision, destination)`.
 
 For every trial, the runner checks the revision out into a new directory under
 the system temporary directory, writes the fixture's files into it, and runs the
@@ -2177,6 +2223,57 @@ makes the old and new results incomparable. `compare_eval_runs` names a direct
 case whose trials ran on a different fixture in `incomparable_cases` and
 `inconclusive_reasons`, compares neither it nor the run totals, and
 `cayu eval compare` exits `2`.
+
+An authored suite's case (`EvalCaseDraftV2`, `EvalCaseDefinitionV2` and their V1
+forms) takes the same optional `workspace`, which its corpus case carries when
+the suite runs. Like a corpus case's, it is omitted when absent, so a case
+without one keeps its revision. A scenario case can't have one yet: a scenario
+trial that waits, for an approval say, resumes after a restart from its
+checkpoint, and its fixture would be checked out afresh, without the changes the
+trial had made.
+
+#### A session's workspace as a fixture
+
+[`cayu eval add-session`](#curating-evals-from-the-cli) and the server's
+session additions give a runnable case the workspace its session started from,
+when the session's environment recorded it. A coding environment records it
+when its factory names the source its `source_workspace` is a checkout of:
+
+```python
+app.register_workspace_source(GitWorkspaceSource("payments", checkout_path))
+factory = BrokeredSandboxCodingEnvironmentFactory(
+    broker=SandboxBrokerClient.from_env(),
+    source_workspace=LocalWorkspace(checkout_path, workspace_id="project"),
+    egress="public_web",
+    workspace_repository="payments",
+)
+```
+
+`DockerCodingEnvironmentFactory` takes `workspace_repository` too. As each
+session binds, the environment asks Git for the commit at the checkout's HEAD
+and whether the checkout has uncommitted changes outside the paths it excludes,
+and records them in the `environment.binding.completed` event's
+`bound_metadata` as `workspace_origin`: `{"repository", "revision", "clean"}`.
+Nothing is recorded when the source workspace isn't the top of a Git checkout or
+its HEAD has no commit. Reading the revision only reads the checkout, and a
+failure to read it never fails the session.
+
+The addition reads the session's first binding (a later turn binds a checkout
+the session may already have written back into) and its plan says what it
+found in `workspace`, with a plain `message`:
+
+| `state` | The case |
+| --- | --- |
+| `captured` | gets `workspace: {repository, revision}`. `clean` is `false` when the checkout had uncommitted changes (or Git couldn't confirm it had none): the environment doesn't record them, so the case starts from the commit alone, and the message says so. |
+| `unregistered` | names the source and commit, which the eval target's application (the one that runs the case) hasn't registered; the case is added without a fixture. Register the source and preview again to add one. |
+| `unsupported` | names the source and commit, but the eval target runs a workflow, which builds its own runtime for each trial and takes no fixture; the case is added without one. |
+| `unrecorded` | the session's environment recorded no revision; the case is added without a fixture. |
+
+A scored capture doesn't run, so its plan has no `workspace`. The fixture is part
+of the case's definition, so the reviewed plan's revision covers it. With
+`--table`, `cayu eval add-session` prints the message on a `Workspace:` line; the
+JSON output carries the whole plan. The same holds with `--application`, which
+reaches a Cloud Agent's own server.
 
 ## Eval modes
 
@@ -4031,7 +4128,10 @@ the approval sets that group's baseline. When its answer is lost, the error's
 N`, and a baseline that has moved past generation `N` since fails with
 `eval_baseline_conflict` instead of being overridden.
 
-`add-session` is [Add a session to a suite](#add-a-session-to-a-suite) from a terminal.
+`add-session` is [Add a session to a suite](#add-a-session-to-a-suite) from a terminal. A
+runnable case starts from the commit its session's coding checkout was at, when the
+environment recorded it; the plan's `workspace` says whether it did and why not
+([A session's workspace as a fixture](#a-sessions-workspace-as-a-fixture)).
 
 `calibrate` is the [calibration workbench](#developer-dashboard-calibrate-an-ai-judge). It
 picks one structured AI judge check (`structured_model_judge`) of one case of a saved suite,

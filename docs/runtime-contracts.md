@@ -2776,6 +2776,24 @@ the application's registrations, manifest and execution profile are unchanged.
 sources are not part of the app manifest. Server contract 84 publishes
 `EvalCaseSpec.workspace` and `PublishedEvalTrialResult.workspace` in the
 OpenAPI schema.
+Authored suite cases (`EvalCaseDraftV1`, `EvalCaseDefinitionV1`, `EvalCaseDraftV2`,
+`EvalCaseDefinitionV2`) take the same optional `workspace`, omitted when absent
+and part of the authored case revision when present; their compiled corpus case
+carries it. A `DockerCodingEnvironmentFactory` or
+`BrokeredSandboxCodingEnvironmentFactory` given `workspace_repository` records
+`workspace_origin` (`repository`, the full commit id at the source checkout's
+HEAD as `revision`, and `clean`) in its bindings' `bound_metadata`, which is in
+the `environment.binding.*` events; the key is reserved for that binding.
+`workspace_repository` is outside the configuration fingerprint and isn't carried
+by `with_source_workspace`. A runnable session addition's `EvalAdditionPlan`
+carries `workspace`, an `EvalAdditionWorkspace` (`state` `captured`,
+`unregistered`, `unsupported` or `unrecorded`, `repository`, `revision`, `clean`
+and `message`) read from the session's first binding and checked against the
+eval target's application and kind; a `captured` state's
+`{repository, revision}` fixture is the case definition's `workspace`. It is
+absent from scored additions and from plans stored before it existed, so their
+plan revisions are unchanged. Server contract 86 publishes it and the authored
+case `workspace` in the OpenAPI schema.
 `EvalCaseComparison` and `EvalRunComparison` scores are optional finite values in
 the inclusive range from 0 through 1, matching their source eval results.
 `EvalRun.cost` is the sum of its trials' `EvalTrialCost` records. It is derived

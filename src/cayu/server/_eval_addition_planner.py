@@ -25,6 +25,7 @@ from cayu.evals.session_additions import (
     PreparedEvalAddition,
     addition_revision,
     addition_source_binding,
+    session_addition_workspace,
 )
 from cayu.evals.store import EvalStore
 from cayu.evals.suite_authoring import (
@@ -106,6 +107,7 @@ class EvalAdditionPlanner:
         captured = None
         authored = None
         corpus = None
+        workspace = None
         if request.mode == "score":
             # A captured result keeps an independent one-case execution contract.
             capture_suite = (
@@ -165,6 +167,8 @@ class EvalAdditionPlanner:
                 raise HTTPException(
                     status_code=409, detail="The captured session has no runnable input."
                 )
+            # The target's application runs the case, so its sources are the ones that count.
+            workspace = session_addition_workspace(trajectory, target=target)
             if isinstance(parent_document, EvalCorpusDocument):
                 case = EvalCaseSpec.create(
                     id=request.case_id,
@@ -173,6 +177,7 @@ class EvalAdditionPlanner:
                     source=runnable.source.case_source(),
                     input=runnable.case.input,
                     assertions=assertions,
+                    workspace=workspace.fixture(),
                 )
                 corpus = EvalCorpusDocument.create(
                     target_key=parent_document.target_key,
@@ -204,6 +209,7 @@ class EvalAdditionPlanner:
                     source=runnable.source.case_source(),
                     stimulus=EvalSimpleInputStimulusV1(input=runnable.case.input),
                     assertions=draft_assertions,
+                    workspace=workspace.fixture(),
                 )
                 if parent_document is None:
                     authored = compile_eval_suite_authoring_draft(
@@ -270,6 +276,8 @@ class EvalAdditionPlanner:
             execution_case_count=1 if captured is not None else None,
             captured_result_revision=None if captured is None else captured.revision,
         )
+        if workspace is not None:
+            material["workspace"] = workspace.model_dump(mode="json")
         plan = EvalAdditionPlan.model_validate(
             {"revision": addition_revision(material), **material}
         )

@@ -59,7 +59,7 @@ from cayu.evals.models import (
     EvalRunContractV2,
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
-from cayu.evals.workspace_fixtures import WorkspaceFixtureSpec
+from cayu.evals.workspace_fixtures import WorkspaceFixtureSpec, _workspace_fixture_input
 from cayu.memory.attribution import (
     MEMORY_ATTRIBUTION_DEFAULT_MAX_EXPOSURES,
     MEMORY_ATTRIBUTION_DEFAULT_MAX_ITEMS,
@@ -1975,11 +1975,7 @@ class EvalCaseSpec(_PortableModel):
     @field_validator("workspace", mode="before")
     @classmethod
     def copy_workspace(cls, value: object) -> object:
-        if type(value) is WorkspaceFixtureSpec:
-            return value.model_dump(mode="json")
-        if isinstance(value, BaseModel):
-            raise TypeError("workspace must be an exact WorkspaceFixtureSpec or JSON object.")
-        return value
+        return _workspace_fixture_input(value)
 
     @field_validator("id", "suite_id")
     @classmethod

@@ -103,6 +103,8 @@ from cayu.sandbox_broker.runner import (
     validate_staged_copies_mode,
 )
 from cayu.workspaces import LocalWorkspace, RunnerWorkspace, Workspace
+from cayu.workspaces._workspace_origin import metadata_with_workspace_origin
+from cayu.workspaces.sources import _source_name
 
 if TYPE_CHECKING:
     from cayu.knowledge.base import KnowledgeStore
@@ -175,6 +177,7 @@ class BrokeredSandboxCodingBinding(SyncBinding):
         git_baseline: bool = True,
         workspace_setup_commands: Sequence[str] = (),
         setup_command_timeout_s: int = DEFAULT_BROKERED_SETUP_COMMAND_TIMEOUT_SECONDS,
+        workspace_repository: str | None = None,
         **options: Any,
     ) -> None:
         if type(git_baseline) is not bool:
@@ -182,6 +185,9 @@ class BrokeredSandboxCodingBinding(SyncBinding):
         self._setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
         super().__init__(**options)
         self._git_baseline = git_baseline
+        self._workspace_repository = (
+            None if workspace_repository is None else _source_name(workspace_repository)
+        )
         self._workspace_setup_commands = _validated_commands(
             workspace_setup_commands, field_name="workspace_setup_commands"
         )
@@ -209,7 +215,9 @@ class BrokeredSandboxCodingBinding(SyncBinding):
             session_id=session_id,
             agent_name=agent_name,
             environment_name=environment_name,
-            metadata=metadata,
+            metadata=await metadata_with_workspace_origin(
+                self._workspace_repository, workspace, metadata
+            ),
         )
         if not self._git_baseline and not self._workspace_setup_commands:
             return bound
@@ -434,6 +442,13 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     them; the scope defaults to the one bound to the store. Without a store the
     sessions have no knowledge. Neither enters the sandbox: the tools run in
     the Agent process.
+
+    ``workspace_repository`` names the workspace source (registered with
+    ``CayuApp.register_workspace_source``) that ``source_workspace`` is a Git
+    checkout of. Each session then records the commit the checkout was at when
+    it copied in, and whether it had uncommitted changes, so
+    ``cayu eval add-session`` can start the case at that commit. A factory
+    re-sourced with ``with_source_workspace`` doesn't carry it.
     """
 
     source_workspace: LocalWorkspace
@@ -468,6 +483,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         staged_copies: StagedCopiesMode = "auto",
         knowledge_store: KnowledgeStore | None = None,
         knowledge_access_scope: KnowledgeAccessScope | None = None,
+        workspace_repository: str | None = None,
     ) -> None:
         if not isinstance(broker, SandboxBrokerClient):
             raise TypeError("broker must be a SandboxBrokerClient.")
@@ -524,6 +540,11 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         )
         self.broker = broker
         self.source_workspace = source_workspace
+        #: The registered workspace source ``source_workspace`` is a Git checkout of, if any.
+        #: Evidence only, so it stays out of the configuration fingerprint.
+        self.workspace_repository = (
+            None if workspace_repository is None else _source_name(workspace_repository)
+        )
         self.egress: SandboxEgressMode = egress
         #: The canonical hosts of an ``allowlist`` egress; ``None`` for the other modes.
         self.egress_hosts: tuple[str, ...] | None = owned_hosts
@@ -1012,6 +1033,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             git_baseline=self.git_baseline,
             workspace_setup_commands=self.workspace_setup_commands,
             setup_command_timeout_s=self.setup_command_timeout_s,
+            workspace_repository=self.workspace_repository,
         )
 
 

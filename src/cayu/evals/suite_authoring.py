@@ -73,6 +73,7 @@ from cayu.evals.corpus import (
     _validated_assertion_spec,
 )
 from cayu.evals.trial_policy import EVAL_SUITE_MAX_CONCURRENCY, EvalSuiteTrialPolicyV1
+from cayu.evals.workspace_fixtures import WorkspaceFixtureSpec, _workspace_fixture_input
 
 EVAL_SUITE_AUTHORING_SCHEMA_VERSION = 1
 EVAL_SUITE_AUTHORING_V2_SCHEMA_VERSION = 2
@@ -426,6 +427,29 @@ class _EvalCaseAuthoringBase(_PortableModel):
     description: StrictStr | None = None
     source: EvaluationSourceIdentityV1 | None = None
     stimulus: EvalCaseStimulusV1
+    # Each trial's workspace is prepared from it, as a corpus case's is. Omitted when
+    # absent, so a case without one keeps its revision.
+    workspace: WorkspaceFixtureSpec | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+    @field_validator("workspace", mode="before")
+    @classmethod
+    def copy_workspace(cls, value: object) -> object:
+        return _workspace_fixture_input(value)
+
+    @model_validator(mode="after")
+    def validate_workspace_stimulus(self) -> _EvalCaseAuthoringBase:
+        # A scenario trial that waits, for an approval say, resumes after a restart
+        # from its checkpoint, but its fixture would be checked out afresh, without the
+        # changes the trial had made.
+        if self.workspace is not None and type(self.stimulus) is EvalScenarioStimulusV1:
+            raise ValueError(
+                "A scenario case can't have a workspace fixture: a scenario that resumes "
+                "after a restart would get a fresh checkout without its earlier changes."
+            )
+        return self
 
     @field_validator("id")
     @classmethod
@@ -1397,6 +1421,7 @@ def duplicate_eval_case(
         source=source.source,
         stimulus=source.stimulus,
         assertions=source.assertions,
+        workspace=source.workspace,
     )
     return add_eval_case(validated, duplicate)
 
