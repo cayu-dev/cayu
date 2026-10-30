@@ -158,6 +158,18 @@ These changes are listed under `Breaking changes` in the v0.16.1 release notes,
 with instructions for applications that need fixed time limits. This exception
 does not change the patch-release rules for subsequent releases.
 
+### v0.16.2 exception
+
+The v0.16.2 release preparation explicitly includes the already-landed storage
+revisions 134 through 137, server contract 77, portable eval corpus schema 5,
+and published eval result schema 11 despite its patch version. This is a scoped
+exception to the minor-release rule, not a claim of patch compatibility.
+
+The release notes list the breaking boundaries and upgrade procedure. Older
+workers and servers must stop before migration; rollback requires a pre-upgrade
+backup. Clients, custom dashboards, corpus exports, and result readers must be
+updated together. Subsequent releases retain the normal versioning rules.
+
 ## Release-notes format
 
 Edit [release-notes.md](release-notes.md) only during release preparation; ordinary

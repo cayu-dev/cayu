@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
+from uuid import UUID, uuid5
 
 from cayu._validation import copy_durable_metadata
 from cayu.approvals.user_input import pending_user_input_from_checkpoint
-from cayu.events import EventType
+from cayu.events import (
+    Event,
+    EventType,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.sessions._abandonment_checkpoint import ABANDONED_SESSION_CHECKPOINT_KEY
 from cayu.sessions._completion_finalization import (
@@ -38,6 +46,34 @@ if TYPE_CHECKING:
 
 
 STRANDED_APPROVAL_DENIAL_REASON = "tool_approval_denied_after_profile_change"
+
+
+def stranded_approval_failure_event(session: Session, record: dict[str, Any]) -> Event:
+    """Use one terminal event for direct denial publication and crash recovery."""
+    denial = record["denied_approval"]
+    return event_with_runtime_payload_authority(
+        event_with_runtime_envelope_authority(
+            event_with_runtime_generated_id(
+                Event(
+                    id=str(
+                        uuid5(
+                            UUID("951440b9-3a08-4b67-b436-b5310cc4c832"),
+                            f"{session.id}\0failed\0{denial['approval_id']}",
+                        )
+                    ),
+                    type=EventType.SESSION_FAILED,
+                    session_id=session.id,
+                    timestamp=datetime.fromisoformat(denial["denied_at"]),
+                    agent_name=session.agent_name,
+                    payload=abandoned_session_failure_payload(record),
+                )
+            ),
+            "session_id",
+        ),
+        "approval_id",
+        "tool_call_id",
+        "tool_round_id",
+    )
 
 
 def abandoned_session_record(

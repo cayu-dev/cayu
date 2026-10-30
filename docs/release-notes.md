@@ -1,5 +1,61 @@
 # Release notes
 
+## v0.16.2
+
+Upgrade: Stop older workers and servers, back up the database, and run
+`cayu storage migrate --acknowledge-breaking 134 --acknowledge-breaking 135
+--acknowledge-breaking 137` before restarting. Storage revision and compatibility
+floor advance from 133 to 137; server contract advances from 67 to 77; manifest
+schema remains 17. Upgrade servers, generated HTTP clients, and custom dashboards
+together. Re-export portable eval corpora with this version and update result readers.
+
+### Breaking changes
+
+This release uses the scoped [v0.16.2 exception](stability.md#v0162-exception).
+
+- Storage revisions 134, 135, and 137 are breaking writer boundaries for referenced
+  tool results, task restart history, and parked task handoffs. Older binaries must
+  not open the upgraded store; rollback requires restoring the pre-upgrade backup.
+  Revision 136 adds saved task step results. PostgreSQL migrations also require
+  backup evidence or an explicit backup waiver; see the storage migration guide.
+- Server contract 77 requires matching clients and dashboards. The bundled dashboard
+  is rebuilt with this release.
+- Portable eval corpus schema 5 rejects schema-4 imports. Published eval result
+  schema 11 requires updated readers; schema-10 readers reject the new result detail.
+
+### Changes
+
+- Tasks can restart after confirmed worker loss, retain named session and step
+  results across reruns, and park while a session or subagent sleeps until a durable
+  deadline. Server and worker loops service external-event waits.
+- CLI commands inspect tasks, sessions, Knowledge entries, approval inboxes,
+  environments, and pricing. Model connectivity checks report bounded diagnostics.
+- Evaluation commands manage suites, runs, session additions, and baseline approvals
+  locally or through Cloud. Portable corpora can call application evaluators, and
+  comparisons explain inconclusive results and baseline incompatibility.
+- Usage views expose filtered time series, provider/model costs, and ranked sessions.
+  Reworked Environments, Artifacts, and System pages expose native details and activity.
+- Cloud commands expose worker drains, task handoffs, release inspection, service
+  transition waiting, and publication refusal details.
+- Bundled model data adds Gemini 4 Argon and its scheduled December pricing change,
+  with refreshed verified provider records and documented coverage limits.
+
+### Fixes
+
+- Pending tool approvals can adopt compatible runtime upgrades while retaining
+  argument bindings and policy checks. Hook-modified arguments preserve type changes.
+- Eligible tool approvals stranded by incompatible application changes can be
+  denied without continuing the paused round. The denial ends the session,
+  preserves human-review bindings, and repairs missing settlement events on retry.
+- Completed external tool results survive telemetry cancellation, and deferred
+  execution rejects evidence that expires during asynchronous publication.
+- Recovery preserves finalization evidence when progress publication fails and
+  avoids duplicate work after interrupted task execution.
+- Cloud authentication refresh works inside async commands. Dashboard drafts,
+  reading positions, and sidebar preferences survive navigation.
+- Large tool results are stored once, overview queries avoid unnecessary work,
+  and SQLite migrations check available disk space before starting.
+
 ## v0.16.1
 
 Upgrade: No storage migration is required from 0.16.0. Storage revision and

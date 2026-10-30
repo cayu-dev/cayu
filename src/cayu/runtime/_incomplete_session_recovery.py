@@ -53,7 +53,6 @@ from cayu.events import (
     Event,
     EventType,
     copy_event,
-    event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
@@ -147,10 +146,10 @@ from cayu.runtime._run_limits import (
 )
 from cayu.runtime._session_abandonment import (
     STRANDED_APPROVAL_DENIAL_REASON,
-    abandoned_session_failure_payload,
     abandoned_session_from_checkpoint,
     abandoned_session_record,
     stranded_approval_denial,
+    stranded_approval_failure_event,
 )
 from cayu.runtime._session_control import (
     SessionControl,
@@ -4981,29 +4980,7 @@ class IncompleteSessionRecovery:
         )
         if record is None:
             raise RuntimeError("Denied approval lost its abandonment evidence.")
-        failed = event_with_runtime_payload_authority(
-            event_with_runtime_envelope_authority(
-                event_with_runtime_generated_id(
-                    Event(
-                        id=str(
-                            uuid5(
-                                _STRANDED_APPROVAL_DENIAL_NAMESPACE,
-                                f"{session.id}\0failed\0{denial['approval_id']}",
-                            )
-                        ),
-                        type=EventType.SESSION_FAILED,
-                        session_id=session.id,
-                        timestamp=denied_at,
-                        agent_name=session.agent_name,
-                        payload=abandoned_session_failure_payload(record),
-                    )
-                ),
-                "session_id",
-            ),
-            "approval_id",
-            "tool_call_id",
-            "tool_round_id",
-        )
+        failed = stranded_approval_failure_event(session, record)
         published = []
         for event in (denied, failed):
             prepared = self._event_writer.prepare(event)

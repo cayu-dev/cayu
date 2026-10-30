@@ -253,3 +253,54 @@ def test_the_denial_needs_a_review_of_the_paused_approval(current_review) -> Non
         assert tool.calls == []
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("recover_first", [True, False])
+def test_denial_retry_and_terminal_recovery_share_failure_event(monkeypatch, recover_first):
+    from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+
+    store, requested, app = _upgraded(monkeypatch, _FileBug(behavior_version="2"))
+
+    async def crash_before_publication(*args, **kwargs):
+        raise RuntimeError("publication interrupted")
+
+    async def scenario():
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                type(app._incomplete_recovery),
+                "_publish_stranded_approval_denial",
+                crash_before_publication,
+            )
+            with pytest.raises(RuntimeError, match="publication interrupted"):
+                await _collect(app.resolve_tool_approval(_deny(requested)))
+        assert (await store.load("bug-report")).status is SessionStatus.FAILED
+        original = _app(store)
+
+        async def repair():
+            _use_cayu(monkeypatch, "0.15.0")
+            return await original._session_recovery.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id="bug-report")
+            )
+
+        async def retry():
+            _use_cayu(monkeypatch, "0.16.0")
+            return await _collect(app.resolve_tool_approval(_deny(requested)))
+
+        if recover_first:
+            recovered = await repair()
+            assert any(event.type is EventType.SESSION_FAILED for event in recovered.events)
+            replayed = await retry()
+        else:
+            replayed = await retry()
+            await repair()
+        failures = await store.query_events(
+            EventQuery(session_id="bug-report", event_type=EventType.SESSION_FAILED)
+        )
+        assert len(failures) == 1
+        assert replayed[-1].type is EventType.SESSION_FAILED
+        assert replayed[-1].payload["reason"] == failures[0].event.payload["reason"]
+        assert failures[0].event.payload["reason"] == "tool_approval_denied_after_profile_change"
+        await app.aclose()
+        await original.aclose()
+
+    asyncio.run(scenario())

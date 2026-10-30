@@ -68,6 +68,7 @@ from cayu.runtime._run_limits import (
 from cayu.runtime._session_abandonment import (
     abandoned_session_failure_payload,
     abandoned_session_from_checkpoint,
+    stranded_approval_failure_event,
 )
 from cayu.runtime._session_control import (
     SessionControl,
@@ -864,6 +865,12 @@ class TerminalEvidenceFinalization:
         interruption_reason: str | None = None,
         abandoned: dict[str, Any] | None = None,
     ) -> Event:
+        if (
+            session.status is SessionStatus.FAILED
+            and abandoned is not None
+            and abandoned.get("denied_approval") is not None
+        ):
+            return stranded_approval_failure_event(session, abandoned)
         event_type = _TERMINAL_EVENT_TYPE_BY_STATUS[session.status]
         pending_interrupt_request_id = (
             None
