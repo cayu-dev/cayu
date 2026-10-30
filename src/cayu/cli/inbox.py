@@ -3,7 +3,7 @@
 The commands work the same against the project's own application in this process and
 against a Cloud Agent (``--application``), through ``cayu.cli._inbox_client``. Arguments
 show only through the application's human-review policy (``docs/human-review.md``), and
-approving or denying settles the item through the inbox's settle route.
+approving, denying or dismissing settles the item through the inbox's settle route.
 """
 
 from __future__ import annotations
@@ -53,7 +53,8 @@ def add_inbox_parser(subparsers: Any) -> None:
         description=(
             "List an agent's inbox (tool approvals, questions, recovery items and knowledge "
             "proposals), show one item with the arguments the application's human-review "
-            "policy lets you see, and approve or deny tool approvals. Without --application "
+            "policy lets you see, approve or deny tool approvals, and dismiss recovery items "
+            "whose session won't continue. Without --application "
             "it opens the project's application and its store in this process; with "
             "--application NAME it reads that Cayu Cloud Agent with your `cayu cloud login`."
         ),
@@ -129,6 +130,26 @@ def add_inbox_parser(subparsers: Any) -> None:
         )
         _add_review_options(command)
         _add_target_options(command)
+
+    dismiss = commands.add_parser(
+        "dismiss",
+        help="Dismiss a recovery item by abandoning its session.",
+        description=(
+            "Dismiss a recovery item (a tool call that started with no recorded outcome) when "
+            "its session will never continue, such as one from a run that ended long ago. The "
+            "session is abandoned: the call's outcome stays unknown and it never runs again, "
+            "and the session fails and can't be resumed. A session that is still active, "
+            "whose tasks are running, or that waits on something else is refused; recover "
+            "such an item in the Developer dashboard."
+        ),
+    )
+    dismiss.add_argument("item_id", metavar="ITEM_ID")
+    dismiss.add_argument(
+        "--reason",
+        required=True,
+        help=f"Why, recorded with the abandonment (at most {_REASON_MAX_CHARS} characters).",
+    )
+    _add_target_options(dismiss)
 
 
 def _add_review_options(parser: argparse.ArgumentParser) -> None:
@@ -362,7 +383,12 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
             f"This item is {state.get('status')}, so there is nothing to {decision}.",
             item=state,
         )
-    if item.get("kind") != "approval":
+    if decision == "dismiss" and item.get("kind") != "recovery":
+        raise InboxClientError(
+            "not_a_recovery_item",
+            f"`cayu inbox dismiss` dismisses recovery items; this item is a {item.get('kind')}.",
+        )
+    if decision != "dismiss" and item.get("kind") != "approval":
         raise InboxClientError(
             "not_an_approval",
             f"`cayu inbox {decision}` settles tool approvals; this item is a {item.get('kind')}.",
@@ -370,20 +396,22 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
     body: dict[str, Any] = {"decision": decision}
     if args.reason is not None:
         body["reason"] = args.reason
-    if args.claim_task:
+    if getattr(args, "claim_task", False):
         body["task_continuation"] = "claim"
-    if _has_review(item):
+    if decision != "dismiss" and _has_review(item):
         reference = await _decision_reference(args, inbox, item, decision)
         if reference is not None:
             body["review_reference"] = reference
     answer = await inbox.settle(args.item_id, body)
     settled: dict[str, Any] = answer["item"] if isinstance(answer.get("item"), dict) else {}
-    if inbox.where == "local" and args.output_format != "json":
+    if inbox.where == "local" and decision != "dismiss" and args.output_format != "json":
         print(
             f"Recorded. Session {_plain(item.get('session_id'))} continues in this process...",
             file=sys.stderr,
         )
-    session_status = await inbox.after_settle(item.get("session_id"))
+    session_status = (
+        None if decision == "dismiss" else await inbox.after_settle(item.get("session_id"))
+    )
     if args.output_format == "json":
         _print_json(
             {
@@ -397,7 +425,7 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
         return 0
     settlement = settled.get("settlement") or {}
     who = (settlement.get("decided_by") or {}).get("subject")
-    done = "Approved" if decision == "approve" else "Denied"
+    done = {"approve": "Approved", "deny": "Denied", "dismiss": "Dismissed"}[decision]
     again = " (already recorded)" if answer.get("replayed") is True else ""
     print(f"{done} {args.item_id}{again}" + (f" as {_plain(who)}." if who else "."))
     if session_status is not None:

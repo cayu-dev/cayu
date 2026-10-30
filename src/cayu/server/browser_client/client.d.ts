@@ -194,13 +194,14 @@ export interface WatchSessionsOptions {
 }
 
 export type InboxItemKind = "approval" | "question" | "recovery" | "knowledge"
-export type InboxDecision = "approve" | "deny" | "answer" | "keep" | "drop"
+export type InboxDecision = "approve" | "deny" | "answer" | "dismiss" | "keep" | "drop"
 export type InboxSettledDecision =
   | "approve"
   | "deny"
   | "expire"
   | "answer"
   | "recover"
+  | "dismiss"
   | "keep"
   | "drop"
 

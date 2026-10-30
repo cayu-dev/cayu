@@ -965,3 +965,17 @@ def test_operator_only_auth_without_proxy_variables_is_the_operator_login(monkey
     module = _import_environment_auth(monkeypatch, _environment())
 
     assert type(module.OPERATOR_ONLY_AUTH) is BasicAuth
+
+
+@pytest.mark.parametrize("role", ["member", "admin", "developer"])
+def test_only_full_access_can_dismiss_recovery_items(jwks, signing_key, role):
+    from cayu.server._inbox_routes import _session_item_id, _SessionLocator
+
+    client = _server(_auth(jwks))
+    item_id = _session_item_id(_SessionLocator("recovery", "missing", 1, "attention"))
+    response = client.post(
+        f"/api/inbox/{item_id}/settle",
+        json={"decision": "dismiss", "reason": "Run ended."},
+        headers=_as(_token(signing_key, role=role)),
+    )
+    assert response.status_code == (403 if role == "member" else 404), response.text

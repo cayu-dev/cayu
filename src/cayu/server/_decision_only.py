@@ -36,6 +36,8 @@ async def has_decision_overrides(request: HTTPConnection) -> bool:
         return False  # The route's body validation reports malformed JSON.
     if not isinstance(body, dict):
         return False
+    if template.endswith("/inbox/{item_id}/settle") and body.get("decision") == "dismiss":
+        return True
     if any(body.get(field) is not None for field in _EXECUTION_OVERRIDES):
         return True
     metadata = body.get("metadata")

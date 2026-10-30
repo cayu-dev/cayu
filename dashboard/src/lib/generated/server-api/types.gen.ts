@@ -12379,7 +12379,7 @@ export type InboxItem = {
      *
      * What this item accepts; empty when it is settled elsewhere.
      */
-    decisions: Array<'approve' | 'deny' | 'answer' | 'keep' | 'drop'>;
+    decisions: Array<'approve' | 'deny' | 'answer' | 'dismiss' | 'keep' | 'drop'>;
     /**
      * Detail
      */
@@ -12530,9 +12530,11 @@ export type InboxProfileAdoption = {
  * durable ``reason``.
  * ``approve`` can carry the changed ``arguments`` the tool runs with, or an
  * ``approval_revision`` naming an edit the application stored itself.
- * ``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge
- * proposal. An approval can carry ``profile_adoption`` to settle after an
- * upgrade changed the application's execution profile. ``review_reference`` is
+ * ``answer`` settles a question. ``dismiss`` settles a recovery item by
+ * abandoning its session, and requires a ``reason``. ``keep`` and ``drop``
+ * settle a knowledge proposal. An approval can carry ``profile_adoption`` to
+ * settle after an upgrade changed the application's execution profile.
+ * ``review_reference`` is
  * required when the application configures a human-review policy; read it from
  * ``GET /api/sessions/{id}/human-review``.
  * Task-linked approvals and questions require ordinary worker/handoff authority,
@@ -12554,7 +12556,7 @@ export type InboxSettleRequest = {
     /**
      * Decision
      */
-    decision: 'approve' | 'deny' | 'answer' | 'keep' | 'drop';
+    decision: 'approve' | 'deny' | 'answer' | 'dismiss' | 'keep' | 'drop';
     profile_adoption?: InboxProfileAdoption | null;
     /**
      * Reason
@@ -12606,7 +12608,7 @@ export type InboxSettlement = {
     /**
      * Decision
      */
-    decision: 'approve' | 'deny' | 'expire' | 'answer' | 'recover' | 'keep' | 'drop';
+    decision: 'approve' | 'deny' | 'expire' | 'answer' | 'recover' | 'dismiss' | 'keep' | 'drop';
     /**
      * Reason
      */

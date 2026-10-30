@@ -4,7 +4,9 @@ An item id is a locator, never authority: it names the session (by its public
 alias), the source event of the pause and its human-attention identity, or a
 knowledge entry and revision. Every read re-derives the exact pending action
 or proposal from durable state, and every settle goes through the Runtime's
-exact-action APIs with the verified caller as the decider.
+exact-action APIs with the verified caller as the decider. Dismissing a
+recovery item abandons its session (``CayuApp.abandon_session``), recording
+the person and reason with the abandonment.
 """
 
 from __future__ import annotations
@@ -21,7 +23,11 @@ from fastapi import APIRouter, HTTPException, Path, Query, Response
 from pydantic import ValidationError
 
 from cayu._event_schema import private_event_linkage_value
-from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+from cayu.approvals.actors import (
+    ResolutionActor,
+    ResolutionActorSource,
+    resolution_actor_payload,
+)
 from cayu.approvals.review import HumanReviewDenied
 from cayu.approvals.revisions import approval_revision_metadata
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
@@ -42,7 +48,11 @@ from cayu.knowledge.records import KnowledgeRevisionConflict, KnowledgeStatus
 from cayu.knowledge.search import decode_knowledge_list_cursor, encode_knowledge_list_cursor
 from cayu.runtime._approval_support import approval_resolution_request_digest
 from cayu.runtime._inbox_continuation import controlled_inbox_continuation
-from cayu.runtime._session_abandonment import stranded_approval_denial
+from cayu.runtime._session_abandonment import (
+    abandoned_session_failure_payload,
+    abandoned_session_from_checkpoint,
+    stranded_approval_denial,
+)
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.human_attention import (
     AttentionKind,
@@ -79,15 +89,16 @@ from cayu.server.inbox import (
 from cayu.sessions._pending_approval_reader import approval_resolution_intent_from_checkpoint
 from cayu.sessions._terminal_evidence import _INTERRUPTION_TYPE_USER_INPUT_REQUIRED
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
-from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import (
     PendingActionQuery,
     PendingActionRecord,
     PendingActionResultTooLarge,
+    human_attention_id,
 )
 from cayu.sessions.pending_actions import manual_recovery_action_id, manual_recovery_identity
 from cayu.sessions.queries import decode_session_cursor
-from cayu.sessions.records import EventRecord, Session
+from cayu.sessions.records import EventRecord, PendingActionKind, Session, SessionStatusConflict
 
 if TYPE_CHECKING:
     from fastapi.params import Depends
@@ -116,6 +127,9 @@ _ATTENTION_KINDS: dict[InboxItemKind, AttentionKind] = {
     "recovery": "manual_recovery",
 }
 _ACTION_LINKAGE = {"approval": "approval_id", "question": "input_id"}
+# The abandonment reason a dismissed recovery item's session fails with; the
+# person and their reason are its metadata.
+_DISMISSAL_REASON = "inbox_dismissed"
 _RESOLVED_DECISIONS: dict[str, InboxSettledDecision] = {
     "approval": "approve",
     "question": "answer",
@@ -310,6 +324,22 @@ def _decider(value: object) -> InboxDecider | None:
     except ValidationError:
         return None
     return InboxDecider(subject=actor.subject, tenant=actor.tenant, source=actor.source)
+
+
+def _abandons_call(payload: dict[str, Any], reference: HumanAttentionReference) -> bool:
+    """Whether a ``session.failed`` payload abandoned the session with this call unknown."""
+
+    unknown = payload.get("tool_effect_outcome_unknown")
+    return (
+        payload.get("error_type") == "SessionAbandoned"
+        and isinstance(unknown, list)
+        and any(
+            isinstance(call, dict)
+            and call.get("tool_round_id") == reference.round_id
+            and call.get("tool_call_id") == reference.tool_call_id
+            for call in unknown
+        )
+    )
 
 
 def _knowledge_decider(annotations: dict[str, Any], identity: str) -> InboxDecider:
@@ -580,9 +610,62 @@ def register_inbox_routes(
         if not records or records[0].sequence != locator.sequence:
             return None
         reference = _event_reference(locator.kind, session, records[0], locator.attention_id)
+        if reference is None and locator.kind == "recovery":
+            reference = await round_call_reference(session, records[0], locator.attention_id)
         if reference is None:
             return None
         return _SessionItem(locator.kind, session, reference, None)
+
+    async def round_call_reference(
+        session: Session, record: EventRecord, attention_id: str
+    ) -> HumanAttentionReference | None:
+        """A recovery item whose source event names its round but not the call.
+
+        A session interrupted by recovery after its worker died names only the round;
+        the pending-action read took the call from the round itself. Once the item is
+        settled the round is gone, so the call is the one of the round's started calls
+        whose attention identity the locator names.
+        """
+
+        assert session.instance_id is not None
+        round_id = record.event.payload.get("tool_round_id")
+        if not isinstance(round_id, str):
+            return None
+        started = await session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_types=(EventType.TOOL_CALL_STARTED,),
+                before_sequence=record.sequence,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=_PENDING_SCAN_LIMIT,
+            )
+        )
+        for candidate in started:
+            payload = candidate.event.payload
+            tool_call_id = payload.get("tool_call_id")
+            if (
+                payload.get("tool_round_id") == round_id
+                and isinstance(tool_call_id, str)
+                and human_attention_id(
+                    session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    kind=PendingActionKind.MANUAL_RECOVERY,
+                    discriminator=round_id,
+                    tool_call_id=tool_call_id,
+                )
+                == attention_id
+            ):
+                return HumanAttentionReference(
+                    attention_id=attention_id,
+                    session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    kind="manual_recovery",
+                    action_id=round_id,
+                    round_id=round_id,
+                    tool_call_id=tool_call_id,
+                    source_sequence=record.sequence,
+                )
+        return None
 
     async def claimed_settlement(item: _SessionItem) -> InboxSettlement | None:
         """The durable decision event and its attribution, including recovered sibling calls."""
@@ -590,7 +673,13 @@ def register_inbox_routes(
         reference = item.reference
         after = reference.source_sequence
         event_types = (
-            (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_BLOCKED)
+            # An abandoned session's failure dismisses the calls it left unknown.
+            (
+                EventType.TOOL_CALL_COMPLETED,
+                EventType.TOOL_CALL_FAILED,
+                EventType.TOOL_CALL_BLOCKED,
+                EventType.SESSION_FAILED,
+            )
             if item.kind == "recovery"
             # A denial that ended its session after a profile change has no
             # resumption; its denial event is the decision.
@@ -609,8 +698,14 @@ def register_inbox_routes(
             )
             for record in records:
                 payload = record.event.payload
+                attribution = payload
                 decision: InboxSettledDecision | None = None
-                if item.kind == "approval" and payload.get("approval_id") == reference.action_id:
+                if record.event.type is EventType.SESSION_FAILED:
+                    if _abandons_call(payload, reference):
+                        decision = "dismiss"
+                        metadata = payload.get("metadata")
+                        attribution = metadata if isinstance(metadata, dict) else {}
+                elif item.kind == "approval" and payload.get("approval_id") == reference.action_id:
                     if payload.get("expired") is True:
                         decision = "expire"
                     else:
@@ -629,10 +724,10 @@ def register_inbox_routes(
                 if decision is not None:
                     return InboxSettlement(
                         decision=decision,
-                        decided_by=_decider(cayu_app.redact_json(payload.get("resolved_by"))),
+                        decided_by=_decider(cayu_app.redact_json(attribution.get("resolved_by"))),
                         decided_at=record.event.timestamp,
-                        reason=cayu_app.redact_json(payload.get("reason"))
-                        if type(payload.get("reason")) is str
+                        reason=cayu_app.redact_json(attribution.get("reason"))
+                        if type(attribution.get("reason")) is str
                         else None,
                     )
             if len(records) < _CLAIM_SCAN_PAGE:
@@ -804,18 +899,13 @@ def register_inbox_routes(
         body: InboxSettleRequest,
         auth_context: AuthContext | None,
     ) -> InboxSettleResponse:
-        if item.kind == "recovery":
-            raise _conflict(
-                "not_settleable",
-                "Recovery items are settled in the Developer dashboard, with the evidence "
-                "of what happened.",
-                await session_item_state(item),
-            )
         if body.decision not in INBOX_DECISIONS[item.kind]:
             raise HTTPException(
                 status_code=422,
                 detail=f"A {item.kind} accepts {' or '.join(INBOX_DECISIONS[item.kind])}.",
             )
+        if item.kind == "recovery":
+            return await dismiss_recovery_item(item, body, auth_context)
         if item.kind == "approval" and (
             item.reference.round_id is None or item.reference.tool_call_id is None
         ):
@@ -896,6 +986,69 @@ def register_inbox_routes(
             # The Runtime stopped before recording the decision, or recorded expiry instead.
             raise _state_conflict(settled)
         return InboxSettleResponse(replayed=False, item=settled)
+
+    async def dismiss_recovery_item(
+        item: _SessionItem, body: InboxSettleRequest, auth_context: AuthContext | None
+    ) -> InboxSettleResponse:
+        """Dismiss a recovery item by abandoning its session.
+
+        The call's unknown outcome stays recorded as unknown and is never run again;
+        the session fails as abandoned, with the person and reason as the
+        abandonment's metadata. A session abandonment doesn't end (a live owner, a
+        task still running, a pause that isn't an unknown tool outcome) is refused,
+        and the item stays pending for the Developer dashboard.
+        """
+
+        assert body.reason is not None
+        resolved_by = resolution_actor_payload(_inbox_actor(auth_context))
+        refusal: str | None = None
+        accepted = abandoned_session_from_checkpoint(
+            await cayu_app.session_store.load_checkpoint(item.session.id)
+        )
+        retry = (
+            accepted is not None
+            and accepted["reason"] == _DISMISSAL_REASON
+            and accepted["metadata"]
+            == cayu_app.redact_json({"reason": body.reason, "resolved_by": resolved_by})
+            and _abandons_call(abandoned_session_failure_payload(accepted), item.reference)
+        )
+        if item.pending is not None or retry:
+            try:
+                result = await cayu_app.abandon_session(
+                    cayu_app.project_session_id_for_exposure(item.session.id),
+                    reason=_DISMISSAL_REASON,
+                    metadata={"reason": body.reason, "resolved_by": resolved_by},
+                )
+            except KeyError:
+                raise HTTPException(status_code=404, detail=_NOT_FOUND) from None
+            except (RuntimeError, SessionStatusConflict) as exc:
+                raise _conflict("not_settleable", str(exc), await session_item_state(item)) from exc
+            refusal = None if result.message is None else cayu_app.redact_json(result.message)
+        state = await session_item_state(replace(item, pending=None))
+        settled = state.settlement
+        if settled is None or settled.decision != "dismiss":
+            if item.pending is None:
+                raise _state_conflict(state)
+            current = await resolve_session_item(
+                _SessionLocator(
+                    item.kind,
+                    cayu_app.project_session_id_for_exposure(item.session.id),
+                    item.reference.source_sequence,
+                    item.reference.attention_id,
+                )
+            )
+            raise _conflict(
+                "not_settleable",
+                "This recovery item's session can't be abandoned now"
+                + (f": {refusal}" if refusal else ".")
+                + " Recover it in the Developer dashboard with the evidence of what happened.",
+                state if current is None else await session_item_state(current),
+            )
+        # Repeating the same person's dismissal with the same reason replays it.
+        decider = _decider(resolved_by)
+        if settled.decided_by == decider and settled.reason == cayu_app.redact_json(body.reason):
+            return InboxSettleResponse(replayed=item.pending is None, item=state)
+        raise _state_conflict(state)
 
     # ── Knowledge proposals ──────────────────────────────────────────────────
 

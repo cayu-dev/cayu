@@ -15773,6 +15773,7 @@
               "approve",
               "deny",
               "answer",
+              "dismiss",
               "keep",
               "drop"
             ],
@@ -16065,7 +16066,7 @@
     },
     "InboxSettleRequest": {
       "additionalProperties": false,
-      "description": "A person's decision on one inbox item.\n\n``approve`` and ``deny`` settle an approval. Every decision accepts an optional\ndurable ``reason``.\n``approve`` can carry the changed ``arguments`` the tool runs with, or an\n``approval_revision`` naming an edit the application stored itself.\n``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge\nproposal. An approval can carry ``profile_adoption`` to settle after an\nupgrade changed the application's execution profile. ``review_reference`` is\nrequired when the application configures a human-review policy; read it from\n``GET /api/sessions/{id}/human-review``.\nTask-linked approvals and questions require ordinary worker/handoff authority,\nor explicit ``task_continuation=\"claim\"`` to acquire a new workerless handoff.\nControlled claims never borrow an active worker's authority.",
+      "description": "A person's decision on one inbox item.\n\n``approve`` and ``deny`` settle an approval. Every decision accepts an optional\ndurable ``reason``.\n``approve`` can carry the changed ``arguments`` the tool runs with, or an\n``approval_revision`` naming an edit the application stored itself.\n``answer`` settles a question. ``dismiss`` settles a recovery item by\nabandoning its session, and requires a ``reason``. ``keep`` and ``drop``\nsettle a knowledge proposal. An approval can carry ``profile_adoption`` to\nsettle after an upgrade changed the application's execution profile.\n``review_reference`` is\nrequired when the application configures a human-review policy; read it from\n``GET /api/sessions/{id}/human-review``.\nTask-linked approvals and questions require ordinary worker/handoff authority,\nor explicit ``task_continuation=\"claim\"`` to acquire a new workerless handoff.\nControlled claims never borrow an active worker's authority.",
       "properties": {
         "answer": {
           "anyOf": [
@@ -16106,6 +16107,7 @@
             "approve",
             "deny",
             "answer",
+            "dismiss",
             "keep",
             "drop"
           ],
@@ -16237,6 +16239,7 @@
             "expire",
             "answer",
             "recover",
+            "dismiss",
             "keep",
             "drop"
           ],
@@ -23688,7 +23691,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "79",
+          "default": "80",
           "title": "Contract Version",
           "type": "string"
         },
@@ -31224,7 +31227,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "79",
+          "default": "80",
           "title": "Contract Version",
           "type": "string"
         }

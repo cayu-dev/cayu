@@ -406,6 +406,58 @@ def test_the_cli_decides_on_a_cloud_agent_through_the_same_commands(monkeypatch,
     }
 
 
+def test_the_cli_dismisses_only_a_recovery_item(monkeypatch, capsys) -> None:
+    recovery = {
+        "id": "inbox_r",
+        "kind": "recovery",
+        "status": "pending",
+        "session_id": "s2",
+        "item": {
+            **_PENDING,
+            "id": "inbox_r",
+            "kind": "recovery",
+            "title": "Manual recovery required",
+            "decisions": ["dismiss"],
+        },
+    }
+    dismissed = {
+        "replayed": False,
+        "settled": True,
+        "item": {
+            "id": "inbox_r",
+            "kind": "recovery",
+            "status": "settled",
+            "settlement": {"decision": "dismiss", "decided_by": {"subject": "user_1"}},
+        },
+    }
+    cloud = _Cloud(
+        {
+            ("GET", "/inbox_a"): _STATE,
+            ("GET", "/inbox_r"): recovery,
+            ("POST", "/inbox_r/settle"): dismissed,
+        }
+    )
+    import cayu.cli.cloud as cloud_cli
+
+    monkeypatch.setattr(cloud_cli, "cloud_client", lambda **_kwargs: cloud)
+    monkeypatch.setattr(cloud_cli, "resolve_application_id", lambda _client, name: f"id-{name}")
+
+    with pytest.raises(SystemExit):
+        main(["inbox", "dismiss", "inbox_r", "--application", "bugs"])
+    assert "--reason" in capsys.readouterr().err
+    assert main(["inbox", "dismiss", "inbox_a", "--application", "bugs", "--reason", "x"]) == 1
+    assert "dismisses recovery items; this item is a approval" in capsys.readouterr().err
+    assert main(["inbox", "deny", "inbox_r", "--application", "bugs"]) == 1
+    assert "settles tool approvals; this item is a recovery" in capsys.readouterr().err
+    assert (
+        main(["inbox", "dismiss", "inbox_r", "--application", "bugs", "--reason", "Old run"]) == 0
+    )
+    assert capsys.readouterr().out.strip() == "Dismissed inbox_r as user_1."
+    method, path, options = cloud.calls[-1]
+    assert (method, path) == ("POST", "/v1/applications/id-bugs/inbox/inbox_r/settle")
+    assert options["payload"] == {"decision": "dismiss", "reason": "Old run"}
+
+
 def test_an_older_cloud_settles_without_a_reference_when_it_cant_say_about_a_policy(
     monkeypatch, capsys
 ) -> None:

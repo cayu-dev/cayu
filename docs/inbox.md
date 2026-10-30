@@ -13,7 +13,7 @@ The optional server serves it next to the rest of the control plane:
 | --- | --- |
 | `GET /api/inbox` | Lists what is waiting: approvals, questions and recovery items, then knowledge proposals |
 | `GET /api/inbox/{item_id}` | Reads one item's current state, wherever it was settled |
-| `POST /api/inbox/{item_id}/settle` | Approves, denies, answers, keeps or drops one item as the caller |
+| `POST /api/inbox/{item_id}/settle` | Approves, denies, answers, dismisses, keeps or drops one item as the caller |
 
 `GET /api/contract` advertises the routes under `capabilities.surfaces.inbox`. A
 browser app uses them through the served `client.js`; see
@@ -29,7 +29,7 @@ An item has an `id`, a `kind` (`approval`, `question`, `recovery` or `knowledge`
 | --- | --- | --- |
 | `approval` | A tool call a `ToolPolicy` sent for approval. `detail` is the policy's `reason`; `tool_name` names the tool. | `approve`, `deny` |
 | `question` | An `ask_user` call. `question` and `options` hold what the agent asked. | `answer` |
-| `recovery` | A tool call whose outcome is unknown after an interruption. | none: settle it in the Developer dashboard, with the evidence of what happened |
+| `recovery` | A tool call whose outcome is unknown after an interruption. | `dismiss`, when the session will never continue (see [Dismissing a recovery item](#dismissing-a-recovery-item)); otherwise recover it in the Developer dashboard, with the evidence of what happened |
 | `knowledge` | A knowledge entry waiting for review. `knowledge` names its `entry_id`, `revision` and `kind`. | `keep`, `drop` |
 
 Approvals, questions and recovery items also carry `session_id` (the public session
@@ -278,7 +278,7 @@ caller can show who decided instead:
 | `superseded` | It was replaced before it was settled |
 | `expired` | The approval expired before anyone decided it |
 | `unavailable` | Its state can't be read right now; try again |
-| `not_settleable` | A recovery item; settle it in the Developer dashboard |
+| `not_settleable` | A recovery item whose session can't be abandoned now (still active, a task still running, or waiting on something else); recover it in the Developer dashboard |
 | `conflict` | The Runtime refused this decision and the item is still pending, for example an edit its schema rejects |
 | `profile_changed` | The application changed while the approval waited and the decision didn't adopt the change; settle again with `profile_adoption` |
 
@@ -310,6 +310,25 @@ settlement; repeating it replays. This applies to a session with no environment
 binding and no task of its own, such as a `propose_tool_call` proposal; any other
 session still answers 409 until the application version that proposed the call
 settles it.
+
+### Dismissing a recovery item
+
+A recovery item stays until someone says what became of the call. When its session
+will never continue, for example one from a run that ended long ago, settle it with
+`{"decision": "dismiss", "reason": "..."}`; the reason is required. Dismissing
+abandons the session the way `CayuApp.abandon_session` does: the call's outcome
+stays recorded as unknown and is never run again, and the session fails with
+`error_type: "SessionAbandoned"`, `reason: "inbox_dismissed"`, and the person and
+reason in its `metadata`. The session can't be resumed; fork it to continue its
+conversation. The settlement reads `decision: "dismiss"` with the person and reason,
+and repeating the same person's dismissal with the same reason replays, including
+finishing terminal publication after an interrupted abandonment. With
+`ProxyIdentityAuth`, dismissal requires a `full_access` role (`admin` or
+`developer` by default); `read_and_decide` members cannot abandon sessions.
+
+A session that abandonment doesn't end is refused with 409 `not_settleable` and the
+item stays pending: one with a live execution owner, a task that isn't finished, or a
+pause other than an unknown tool outcome (such as a question it is still waiting on).
 
 ### Repeating a settle
 
@@ -423,6 +442,7 @@ $ cayu inbox list
 $ cayu inbox show inbox_...
 $ cayu inbox approve inbox_... --reason "Checked against the vendor master."
 $ cayu inbox deny inbox_... --reason "Wrong vendor."
+$ cayu inbox dismiss inbox_... --reason "The run ended on Oct 25."
 ```
 
 Without `--application`, the commands open the project's application (`[tool.cayu]
@@ -450,6 +470,8 @@ Cloud Agent). When the application has a policy, `approve` and `deny` ask for a
 fresh review and send its `review_reference` with the decision; a review that
 withholds the call's content can only be denied. For a session whose task worker let
 it go while it waits, `--claim-task` sends `task_continuation: "claim"`.
+`dismiss` dismisses a recovery item, with the required `--reason`, by abandoning its
+session (see [Dismissing a recovery item](#dismissing-a-recovery-item)).
 
 The output is a table by default and JSON with `--json`, with a `schema_version`.
 An item someone else settled first is reported with who decided and when.

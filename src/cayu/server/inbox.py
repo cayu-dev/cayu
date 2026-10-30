@@ -3,9 +3,10 @@
 Approvals, questions and recovery items are the agent's own pending actions;
 knowledge proposals are its pending knowledge entries. The inbox lists them as
 one kind of record and settles approvals, questions and knowledge proposals
-through the Runtime's exact-action APIs, so a decision made from Cayu Cloud,
-the agent's own app or the Developer dashboard shows as settled in the other
-two. The person who decides is always the verified caller.
+through the Runtime's exact-action APIs, and dismisses a recovery item by
+abandoning its session, so a decision made from Cayu Cloud, the agent's own app
+or the Developer dashboard shows as settled in the other two. The person who
+decides is always the verified caller.
 
 ``InboxAccess`` is the deployment's rule for who may see and settle an item. It
 is one decision point: the server applies it on every route that lists or
@@ -35,8 +36,10 @@ from cayu.execution_profiles import (
 from cayu.server.auth import AuthContext
 
 InboxItemKind = Literal["approval", "question", "recovery", "knowledge"]
-InboxDecision = Literal["approve", "deny", "answer", "keep", "drop"]
-InboxSettledDecision = Literal["approve", "deny", "expire", "answer", "recover", "keep", "drop"]
+InboxDecision = Literal["approve", "deny", "answer", "dismiss", "keep", "drop"]
+InboxSettledDecision = Literal[
+    "approve", "deny", "expire", "answer", "recover", "dismiss", "keep", "drop"
+]
 InboxItemStatus = Literal["pending", "settled", "superseded", "unavailable"]
 # ``profile_changed``: the application changed while the approval was pending and
 # the decision did not adopt the current execution profile; settle it again with
@@ -61,13 +64,13 @@ InboxIssueCode = Literal[
 INBOX_REASON_MAX_CHARS = 4096
 INBOX_ANSWER_MAX_CHARS = 16_384
 
-#: The decisions each kind of item accepts. Recovery items are listed so the inbox
-#: is complete, but a person settles them in the Developer dashboard, where the
-#: recovery evidence can be supplied.
+#: The decisions each kind of item accepts. A recovery item is recovered in the
+#: Developer dashboard, where the evidence of what happened can be supplied; the
+#: inbox can only dismiss it, which abandons its session (``CayuApp.abandon_session``).
 INBOX_DECISIONS: dict[str, tuple[InboxDecision, ...]] = {
     "approval": ("approve", "deny"),
     "question": ("answer",),
-    "recovery": (),
+    "recovery": ("dismiss",),
     "knowledge": ("keep", "drop"),
 }
 
@@ -250,9 +253,11 @@ class InboxSettleRequest(_InboxModel):
     durable ``reason``.
     ``approve`` can carry the changed ``arguments`` the tool runs with, or an
     ``approval_revision`` naming an edit the application stored itself.
-    ``answer`` settles a question. ``keep`` and ``drop`` settle a knowledge
-    proposal. An approval can carry ``profile_adoption`` to settle after an
-    upgrade changed the application's execution profile. ``review_reference`` is
+    ``answer`` settles a question. ``dismiss`` settles a recovery item by
+    abandoning its session, and requires a ``reason``. ``keep`` and ``drop``
+    settle a knowledge proposal. An approval can carry ``profile_adoption`` to
+    settle after an upgrade changed the application's execution profile.
+    ``review_reference`` is
     required when the application configures a human-review policy; read it from
     ``GET /api/sessions/{id}/human-review``.
     Task-linked approvals and questions require ordinary worker/handoff authority,
@@ -291,12 +296,12 @@ class InboxSettleRequest(_InboxModel):
         if self.task_continuation is not None and (
             self.task_worker_id is not None
             or self.task_handoff_id is not None
-            or self.decision in {"keep", "drop"}
+            or self.decision in {"dismiss", "keep", "drop"}
         ):
             raise ValueError("Controlled continuation is only for decisions without worker IDs.")
         if self.task_handoff_id is not None and self.task_worker_id is None:
             raise ValueError("task_handoff_id requires task_worker_id.")
-        if self.task_worker_id is not None and self.decision in {"keep", "drop"}:
+        if self.task_worker_id is not None and self.decision in {"dismiss", "keep", "drop"}:
             raise ValueError("Task continuation authority applies to approvals and questions.")
         if (self.arguments is not None or self.approval_revision is not None) and (
             self.decision != "approve"
@@ -306,7 +311,9 @@ class InboxSettleRequest(_InboxModel):
             raise ValueError("profile_adoption applies to approvals.")
         if (self.answer is not None) != (self.decision == "answer"):
             raise ValueError("answer is required for decision=answer and allowed only there.")
-        if self.review_reference is not None and self.decision in {"keep", "drop"}:
+        if self.decision == "dismiss" and self.reason is None:
+            raise ValueError("reason is required for decision=dismiss.")
+        if self.review_reference is not None and self.decision in {"dismiss", "keep", "drop"}:
             raise ValueError("review_reference applies to approvals and questions.")
         if self.review_reference is not None and self.arguments is not None:
             # The review binds the proposal it showed; changed arguments would run
