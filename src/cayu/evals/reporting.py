@@ -7,7 +7,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, field_validator
 
 from cayu._validation import (
     copy_durable_json_object,
@@ -22,6 +22,7 @@ from cayu.evals.memory_attribution import eval_memory_attribution_summary
 from cayu.evals.models import (
     EVAL_SCHEMA_VERSION,
     TRAJECTORY_SCHEMA_VERSION,
+    EvalCaseResult,
     EvalOutcome,
     EvalRun,
     EvalStatus,
@@ -41,6 +42,11 @@ _STATUS_SEVERITY = {
     EvalStatus.UNAVAILABLE: 3,
     EvalStatus.ERROR: 4,
 }
+# A comparison decides only between results that passed or failed.
+_VERDICT_STATUSES = frozenset({EvalStatus.PASSED, EvalStatus.FAILED})
+# How much of a case's own reason a comparison repeats; an error can carry a whole traceback,
+# whose end names the exception.
+_COMPARISON_REASON_MAX_CHARS = 1000
 
 
 class _TrajectoryDocument(BaseModel):
@@ -62,18 +68,28 @@ class EvalCaseComparison(BaseModel):
     current_status: EvalStatus | None = None
     baseline_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     current_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    # Why a side neither passed nor failed, from its case result.
+    baseline_reason: str | None = None
+    current_reason: str | None = None
     regressions: tuple[str, ...] = Field(default_factory=tuple)
+    improvements: tuple[str, ...] = Field(default_factory=tuple)
 
     @field_validator("case_id")
     @classmethod
     def validate_case_id(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
 
-    @field_validator("regressions")
+    @field_validator("baseline_reason", "current_reason")
     @classmethod
-    def validate_regressions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def validate_reason(cls, value: str | None, info) -> str | None:
+        return None if value is None else require_durable_text(value, info.field_name)
+
+    @field_validator("regressions", "improvements")
+    @classmethod
+    def validate_regressions(cls, value: tuple[str, ...], info) -> tuple[str, ...]:
         return tuple(
-            require_durable_text(item, f"regressions[{index}]") for index, item in enumerate(value)
+            require_durable_text(item, f"{info.field_name}[{index}]")
+            for index, item in enumerate(value)
         )
 
 
@@ -90,6 +106,11 @@ class EvalRunComparison(BaseModel):
     current_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     memory_attribution_support: Literal["unsupported"] = "unsupported"
     regressions: tuple[str, ...] = Field(default_factory=tuple)
+    improvements: tuple[str, ...] = Field(default_factory=tuple)
+    # Cases that passed or failed in both runs, so their comparison is decided.
+    comparable_cases: StrictInt = Field(default=0, ge=0)
+    # Why the comparison can't decide: each case, or run, that neither passed nor failed.
+    inconclusive_reasons: tuple[str, ...] = Field(default_factory=tuple)
     cases: tuple[EvalCaseComparison, ...] = Field(default_factory=tuple)
 
     @field_validator("baseline_run_id", "current_run_id", "baseline_suite_id", "current_suite_id")
@@ -97,11 +118,12 @@ class EvalRunComparison(BaseModel):
     def validate_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
 
-    @field_validator("regressions")
+    @field_validator("regressions", "improvements", "inconclusive_reasons")
     @classmethod
-    def validate_regressions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def validate_regressions(cls, value: tuple[str, ...], info) -> tuple[str, ...]:
         return tuple(
-            require_durable_text(item, f"regressions[{index}]") for index, item in enumerate(value)
+            require_durable_text(item, f"{info.field_name}[{index}]")
+            for index, item in enumerate(value)
         )
 
     @field_validator("cases", mode="before")
@@ -372,10 +394,21 @@ def compare_eval_runs(
     case_ids = sorted(set(baseline_by_case) | set(current_by_case))
     comparisons: list[EvalCaseComparison] = []
     regressions: list[str] = []
+    improvements: list[str] = []
+    inconclusive: dict[str, list[str]] = {"baseline": [], "current": []}
+    comparable_cases = 0
 
     for case_id in case_ids:
         base = baseline_by_case.get(case_id)
         cur = current_by_case.get(case_id)
+        reasons = {"baseline": _no_verdict_reason(base), "current": _no_verdict_reason(cur)}
+        for side, case in (("baseline", base), ("current", cur)):
+            if case is not None and case.status not in _VERDICT_STATUSES:
+                reason = reasons[side]
+                inconclusive[side].append(
+                    f"{case_id}: {side} {case.status.value}"
+                    + ("" if reason is None else f": {reason}")
+                )
         if base is None:
             # A newly-added case is not a regression; note it for the report only,
             # and do not let it fail the comparison's exit code.
@@ -384,26 +417,39 @@ def compare_eval_runs(
                     case_id=case_id,
                     current_status=cur.status if cur is not None else None,
                     current_score=cur.score if cur is not None else None,
+                    current_reason=reasons["current"],
                     regressions=("case added in current run",),
                 )
             )
             continue
         case_regressions: list[str] = []
+        case_improvements: list[str] = []
         if cur is None:
             case_regressions.append("case missing from current run")
         else:
+            if base.status in _VERDICT_STATUSES and cur.status in _VERDICT_STATUSES:
+                comparable_cases += 1
             if _STATUS_SEVERITY[cur.status] > _STATUS_SEVERITY[base.status]:
                 case_regressions.append(
                     f"status regressed from {base.status.value} to {cur.status.value}"
                 )
-            if (
-                cur.score is not None
-                and base.score is not None
-                and cur.score < base.score - score_tolerance
-            ):
-                case_regressions.append(f"score regressed from {base.score:.2f} to {cur.score:.2f}")
+            elif _STATUS_SEVERITY[cur.status] < _STATUS_SEVERITY[base.status]:
+                case_improvements.append(
+                    f"status improved from {base.status.value} to {cur.status.value}"
+                )
+            if cur.score is not None and base.score is not None:
+                if cur.score < base.score - score_tolerance:
+                    case_regressions.append(
+                        f"score regressed from {base.score:.2f} to {cur.score:.2f}"
+                    )
+                elif cur.score > base.score + score_tolerance:
+                    case_improvements.append(
+                        f"score improved from {base.score:.2f} to {cur.score:.2f}"
+                    )
         for item in case_regressions:
             regressions.append(f"{case_id}: {item}")
+        for item in case_improvements:
+            improvements.append(f"{case_id}: {item}")
         comparisons.append(
             EvalCaseComparison(
                 case_id=case_id,
@@ -411,9 +457,15 @@ def compare_eval_runs(
                 current_status=cur.status if cur is not None else None,
                 baseline_score=base.score,
                 current_score=cur.score if cur is not None else None,
+                baseline_reason=reasons["baseline"],
+                current_reason=reasons["current"],
                 regressions=tuple(case_regressions),
+                improvements=tuple(case_improvements),
             )
         )
+    for side, run in (("baseline", baseline), ("current", current)):
+        if run.status not in _VERDICT_STATUSES and not inconclusive[side]:
+            inconclusive[side].append(f"{side} run {run.status.value}")
 
     if _STATUS_SEVERITY[current.status] > _STATUS_SEVERITY[baseline.status]:
         regressions.insert(
@@ -439,8 +491,22 @@ def compare_eval_runs(
         baseline_score=baseline.score,
         current_score=current.score,
         regressions=tuple(regressions),
+        improvements=tuple(improvements),
+        comparable_cases=comparable_cases,
+        inconclusive_reasons=(*inconclusive["baseline"], *inconclusive["current"]),
         cases=tuple(comparisons),
     )
+
+
+def _no_verdict_reason(case: EvalCaseResult | None) -> str | None:
+    """Why ``case`` neither passed nor failed, from its own result, or None."""
+
+    if case is None or case.status in _VERDICT_STATUSES:
+        return None
+    reason = case.unavailable_reason or case.error
+    if reason is None or len(reason) <= _COMPARISON_REASON_MAX_CHARS:
+        return reason
+    return "…" + reason[-(_COMPARISON_REASON_MAX_CHARS - 1) :]
 
 
 def render_comparison_html(comparison: EvalRunComparison) -> str:
@@ -483,8 +549,13 @@ def render_comparison_html(comparison: EvalRunComparison) -> str:
     <p>Baseline <code>{_escape(comparison.baseline_run_id)}</code> vs current <code>{_escape(comparison.current_run_id)}</code></p>
     <p>Score: {_format_score(comparison.baseline_score)} -&gt; {_format_score(comparison.current_score)}</p>
     <p>Memory-attribution comparison: <code>{_escape(comparison.memory_attribution_support)}</code> in this compact report.</p>
+    <p>Comparable cases: {comparison.comparable_cases} of {len(comparison.cases)}</p>
+    <h2>Inconclusive</h2>
+    <div class="regressions">{_escape("; ".join(comparison.inconclusive_reasons) or "Every case passed or failed in both runs.")}</div>
     <h2>Regressions</h2>
     <div class="regressions">{_escape("; ".join(comparison.regressions) or "No regressions detected.")}</div>
+    <h2>Improvements</h2>
+    <p>{_escape("; ".join(comparison.improvements) or "No improvements detected.")}</p>
     <h2>Cases</h2>
     <table>
       <thead><tr><th>Case</th><th>Baseline</th><th>Current</th><th>Baseline Score</th><th>Current Score</th><th>Regressions</th></tr></thead>

@@ -367,7 +367,12 @@ passed, or a compatible comparison found no regression; `1` means execution
 completed and produced a failed result or a compatible regression; `2` means
 the command could not make a conclusive pass/fail decision. Exit `2` covers
 invalid corpus or result input, unavailable/error/skipped evidence, incomparable
-contracts, target/configuration errors, and execution errors. Direct-suite runs
+contracts, target/configuration errors, and execution errors. When `eval compare`
+exits `2` it says why on standard error, one reason per case or run that neither passed
+nor failed, with that result's own reason. A direct-suite comparison also keeps them as
+`inconclusive_reasons` and still reports what it could compare: `comparable_cases`
+(cases that passed or failed in both runs), `regressions` and `improvements` (each also
+on its case), and each case's `baseline_reason` and `current_reason`. Direct-suite runs
 use the same `0`/`1`/`2` status mapping. `eval report` and `eval compare`
 auto-detect direct `EvalRun`, captured `CapturedEvaluationResultV1`, and fresh
 `CorpusExecutionResult` documents. Captured and fresh published results can be

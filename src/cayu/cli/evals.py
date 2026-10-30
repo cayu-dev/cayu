@@ -5,12 +5,14 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
 from cayu.applications import CayuApp
-from cayu.cli._output import add_output_options
+from cayu.cli._output import add_output_options, terminal_safe
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals._admission import LaunchAdmission, admission_scope
@@ -772,30 +774,37 @@ def _compare(args: argparse.Namespace) -> int:
         )
         _write_or_print(output, args.output)
         if not comparison.compatibility.comparable:
-            return 2
-        if comparison.structured_judge_comparison_state in {
-            "observation_identity_mismatch",
-            "source_detail_unavailable",
-        }:
-            return 2
-        if comparison.tool_json_comparison_state in {
-            "observation_identity_mismatch",
-            "source_detail_unavailable",
-        }:
-            return 2
-        if _status_exit_code(comparison.baseline.status) == 2:
-            return 2
-        current_exit = _status_exit_code(comparison.current.status)
-        if current_exit == 2:
-            return 2
-        for published_result in (baseline_result, current_result):
+            return _inconclusive(
+                [
+                    "the results aren't comparable: "
+                    + ", ".join(reason.value for reason in comparison.compatibility.reasons)
+                ]
+            )
+        inconclusive: list[str] = []
+        for kind, state in (
+            ("structured judge", comparison.structured_judge_comparison_state),
+            ("tool JSON", comparison.tool_json_comparison_state),
+        ):
+            if state in {"observation_identity_mismatch", "source_detail_unavailable"}:
+                inconclusive.append(f"{kind} comparison is {state}")
+        for side, status in (
+            ("baseline", comparison.baseline.status),
+            ("current", comparison.current.status),
+        ):
+            if _status_exit_code(status) == 2:
+                inconclusive.append(f"{side} run {status}")
+        for side, published_result in (("baseline", baseline_result), ("current", current_result)):
             dimensions = present_eval_result(published_result).dimensions
-            if (
-                dimensions.evaluator_health in {"error", "unavailable"}
-                or dimensions.runtime in {"failed", "unavailable"}
-                or dimensions.evidence in {"incomplete", "unavailable"}
+            for name, value, undecided in (
+                ("evaluator health", dimensions.evaluator_health, {"error", "unavailable"}),
+                ("runtime", dimensions.runtime, {"failed", "unavailable"}),
+                ("evidence", dimensions.evidence, {"incomplete", "unavailable"}),
             ):
-                return 2
+                if value in undecided:
+                    inconclusive.append(f"{side} {name} {value}")
+        if inconclusive:
+            return _inconclusive(inconclusive)
+        current_exit = _status_exit_code(comparison.current.status)
         if (
             current_exit == 1
             or comparison.regressions
@@ -823,14 +832,37 @@ def _compare(args: argparse.Namespace) -> int:
         else render_comparison_html(comparison)
     )
     _write_or_print(output, args.output)
-    if _status_exit_code(baseline.status) == 2:
-        return 2
-    current_exit = _status_exit_code(current.status)
-    if current_exit == 2:
-        return 2
-    if current_exit == 1 or comparison.regressions:
+    if _status_exit_code(baseline.status) == 2 or _status_exit_code(current.status) == 2:
+        decided = {EvalStatus.PASSED, EvalStatus.FAILED}
+        comparable = [
+            case
+            for case in comparison.cases
+            if case.baseline_status in decided and case.current_status in decided
+        ]
+        regressed = sum(bool(case.regressions) for case in comparable)
+        improved = sum(bool(case.improvements) for case in comparable)
+        return _inconclusive(
+            comparison.inconclusive_reasons,
+            summary=(
+                f"compared {comparison.comparable_cases} of {len(comparison.cases)} cases: "
+                f"{regressed} regressed, {improved} improved."
+            ),
+        )
+    if _status_exit_code(current.status) == 1 or comparison.regressions:
         return 1
     return 0
+
+
+def _inconclusive(reasons: Sequence[str], *, summary: str | None = None) -> int:
+    """Say on standard error why a comparison decided nothing, and return its exit code.
+
+    The reasons repeat text from the compared files, so control characters are escaped.
+    """
+
+    print(f"cayu eval compare: inconclusive: {terminal_safe('; '.join(reasons))}", file=sys.stderr)
+    if summary is not None:
+        print(f"cayu eval compare: {summary}", file=sys.stderr)
+    return 2
 
 
 def _status_exit_code(status: EvalStatus | str) -> int:
@@ -1055,9 +1087,19 @@ def _validate_workflow_plan(
     )
 
 
+# Control characters a terminal would act on; line breaks and tabs stay.
+_TERMINAL_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
 def _write_or_print(content: str, path: str | None) -> None:
     if path is None:
-        print(content, end="")
+        # Reports repeat text from results (errors, reasons, outputs). A control character
+        # reaches the terminal as a \uXXXX escape, which stays valid JSON (serialized with
+        # ensure_ascii=False, JSON keeps C1 controls literal) and is inert in HTML and text.
+        print(
+            _TERMINAL_CONTROLS.sub(lambda match: f"\\u{ord(match.group()):04x}", content),
+            end="",
+        )
         return
     Path(path).write_text(content, encoding="utf-8")
 

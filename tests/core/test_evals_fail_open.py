@@ -25,6 +25,7 @@ from cayu.evals import (
     run_eval_case,
     run_eval_suite,
 )
+from cayu.evals.models import aggregate_eval_score
 from cayu.providers import ModelStreamEvent
 from cayu.sessions import InMemorySessionStore, SessionIdentity
 
@@ -532,3 +533,80 @@ def test_trials_rejects_invalid_values():
         asyncio.run(run_eval_case(_app(), case, suite_id="s", trials=0))
     with pytest.raises(TypeError, match="trials"):
         asyncio.run(run_eval_case(_app(), case, suite_id="s", trials=True))
+
+
+def _unavailable_case(case_id: str, reason: str) -> EvalCaseResult:
+    now = datetime.now(UTC)
+    trial = EvalTrialResult(
+        trial_number=1,
+        status=EvalStatus.UNAVAILABLE,
+        session_id="session-1",
+        unavailable_reason=reason,
+        started_at=now,
+        completed_at=now,
+    )
+    return EvalCaseResult.from_trials(case_id=case_id, trials=(trial,))
+
+
+def _scored_run(status: EvalStatus, cases: list[EvalCaseResult]) -> EvalRun:
+    return _run(status, aggregate_eval_score(case.score for case in cases), cases)
+
+
+def test_an_inconclusive_comparison_says_why_and_reports_what_it_compared():
+    lost = "Fresh interrupted evidence unavailable: evidence_inconsistent"
+    base = _scored_run(
+        EvalStatus.UNAVAILABLE,
+        [
+            _case_result("a", EvalStatus.PASSED, 1.0),
+            _case_result("b", EvalStatus.FAILED, 0.0),
+            _unavailable_case("c", lost),
+        ],
+    )
+    cur = _scored_run(
+        EvalStatus.PASSED,
+        [
+            _case_result("a", EvalStatus.PASSED, 1.0),
+            _case_result("b", EvalStatus.PASSED, 1.0),
+            _case_result("c", EvalStatus.PASSED, 1.0),
+        ],
+    )
+
+    comparison = compare_eval_runs(base, cur)
+
+    assert comparison.inconclusive_reasons == (f"c: baseline unavailable: {lost}",)
+    assert comparison.comparable_cases == 2
+    assert comparison.improvements == (
+        "b: status improved from failed to passed",
+        "b: score improved from 0.00 to 1.00",
+        "c: status improved from unavailable to passed",
+    )
+    assert comparison.regressions == ()
+    (_, _, case_c) = comparison.cases
+    assert case_c.baseline_reason == lost
+    assert case_c.current_reason is None
+    assert comparison.cases[1].improvements == (
+        "status improved from failed to passed",
+        "score improved from 0.00 to 1.00",
+    )
+
+
+def test_an_inconclusive_comparison_keeps_the_end_of_a_long_error():
+    error = "Traceback (most recent call last):\n" + "  frame\n" * 500 + "KeyError: 'missing'"
+    now = datetime.now(UTC)
+    trial = EvalTrialResult(
+        trial_number=1,
+        status=EvalStatus.ERROR,
+        session_id="session-1",
+        error=error,
+        started_at=now,
+        completed_at=now,
+    )
+    errored = EvalCaseResult.from_trials(case_id="a", trials=(trial,))
+    base = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
+
+    comparison = compare_eval_runs(base, _scored_run(EvalStatus.ERROR, [errored]))
+
+    (reason,) = comparison.inconclusive_reasons
+    assert reason.startswith("a: current error: …")
+    assert reason.endswith("KeyError: 'missing'")
+    assert len(comparison.cases[0].current_reason or "") == 1000

@@ -7,14 +7,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.core.test_evals_fail_open import _case_result, _scored_run, _unavailable_case
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.cli import main
-from cayu.cli.evals import add_eval_parser
+from cayu.cli.evals import _write_or_print, add_eval_parser
 from cayu.evals.assertions import FinalOutputContains
 from cayu.evals.models import EvalStatus
-from cayu.evals.reporting import load_eval_run
+from cayu.evals.reporting import load_eval_run, write_eval_run_json
 from cayu.evals.runner import EvalCase, EvalPlan, EvalSuite
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelStreamEvent
@@ -572,3 +573,90 @@ def test_stagger_queue_does_not_consume_real_case_timeout(tmp_path):
     assert scheduling["stagger_seconds"] == 4
     first, second = scheduling["admissions"]
     assert second["monotonic_seconds"] - first["monotonic_seconds"] >= 4
+
+
+def test_eval_compare_says_why_it_is_inconclusive(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    lost = "Fresh interrupted evidence unavailable: evidence_inconsistent"
+    baseline = tmp_path / "baseline.json"
+    current = tmp_path / "current.json"
+    write_eval_run_json(
+        _scored_run(
+            EvalStatus.UNAVAILABLE,
+            [
+                _case_result("a", EvalStatus.PASSED, 1.0),
+                _unavailable_case("b", lost),
+                _case_result("c", EvalStatus.FAILED, 0.0),
+            ],
+        ),
+        baseline,
+    )
+    write_eval_run_json(
+        _scored_run(
+            EvalStatus.PASSED,
+            [
+                _case_result("a", EvalStatus.PASSED, 1.0),
+                _case_result("b", EvalStatus.PASSED, 1.0),
+                _case_result("c", EvalStatus.PASSED, 1.0),
+            ],
+        ),
+        current,
+    )
+
+    assert main(["eval", "compare", str(baseline), str(current), "--format", "json"]) == 2
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["inconclusive_reasons"] == [f"b: baseline unavailable: {lost}"]
+    assert captured.err.splitlines() == [
+        f"cayu eval compare: inconclusive: b: baseline unavailable: {lost}",
+        # Only a and c are comparable; c improved both its status and its score, and counts
+        # once. b's recovery is in the reasons above.
+        "cayu eval compare: compared 2 of 3 cases: 0 regressed, 1 improved.",
+    ]
+
+
+def test_eval_compare_escapes_control_characters_in_its_reasons(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clipboard = "lost \x1b]52;c;YXR0YWNrZXI=\x07"
+    baseline = tmp_path / "baseline.json"
+    write_eval_run_json(
+        _scored_run(EvalStatus.UNAVAILABLE, [_unavailable_case("a", clipboard)]), baseline
+    )
+
+    assert main(["eval", "compare", str(baseline), str(baseline), "--format", "json"]) == 2
+
+    err = capsys.readouterr().err
+    assert "\x1b" not in err and "\x07" not in err
+    assert "lost \\x1b]52;c;YXR0YWNrZXI=\\x07" in err
+
+
+def test_an_html_comparison_on_stdout_escapes_control_characters(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clipboard = "lost \x1b]52;c;YXR0YWNrZXI=\x07"
+    baseline = tmp_path / "baseline.json"
+    write_eval_run_json(
+        _scored_run(EvalStatus.UNAVAILABLE, [_unavailable_case("a", clipboard)]), baseline
+    )
+
+    assert main(["eval", "compare", str(baseline), str(baseline), "--format", "html"]) == 2
+
+    out = capsys.readouterr().out
+    assert "<html" in out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "lost \\u001b]52;c;YXR0YWNrZXI=\\u0007" in out
+
+
+def test_json_printed_to_stdout_stays_valid_json_with_c1_controls(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Published-result reports serialize with ensure_ascii=False, which keeps C1 controls.
+    document = {"error": "provider returned \x85 then \x9b31m"}
+
+    _write_or_print(json.dumps(document, ensure_ascii=False), None)
+
+    out = capsys.readouterr().out
+    assert "\x85" not in out and "\x9b" not in out
+    assert json.loads(out) == document
