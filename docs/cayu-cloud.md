@@ -1224,9 +1224,10 @@ or, when the baseline has moved past generation `N` since, refuses with
 `eval_baseline_conflict` instead of overriding the later approval. Each command prints text, or
 the JSON envelope with `--json`.
 
-`cayu eval suites`, `cayu eval add-session` and the same `runs` and `baseline approve` commands
-take `--application NAME` too, to list and open the Agent's suites and add its sessions to
-them; see [Curating evals from the CLI](evals.md#curating-evals-from-the-cli).
+`cayu eval suites`, `cayu eval add-session`, `cayu eval calibrate`, `cayu eval scenario` and the
+same `runs` and `baseline approve` commands take `--application NAME` too, to list and open the
+Agent's suites, add its sessions to them, calibrate its AI judges and check and run its
+production scenarios; see [Curating evals from the CLI](evals.md#curating-evals-from-the-cli).
 
 ## Signing in to an Agent
 

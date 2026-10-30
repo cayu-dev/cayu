@@ -1234,8 +1234,8 @@ def _agent_api(
 def eval_api(api: CayuApi) -> Iterator[CayuApi]:
     """``api`` for eval commands, closed afterwards; its failures become eval command errors.
 
-    Shared by `cayu cloud eval` and `cayu eval suites|runs|add-session|baseline`
-    (`cayu.cli._eval_curation`), which reach a running server or a Cloud Agent.
+    Shared by `cayu cloud eval` and `cayu eval suites|runs|add-session|baseline|calibrate|
+    scenario` (`cayu.cli._eval_curation`), which reach a running server or a Cloud Agent.
     """
 
     try:

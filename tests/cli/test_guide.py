@@ -139,6 +139,10 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "saved suite revision" in quality["content"]
     assert "AI judge with weighted criteria" in quality["content"]
     assert "Configured evaluator with a rubric" in quality["content"]
+    assert (
+        "cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID"
+        in quality["content"]
+    )
 
     assert main(["guide", "evals-production"]) == 0
     production = capsys.readouterr().out
@@ -153,6 +157,8 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "Semantic use" in production
     assert "Causal contribution" in production
     assert "Settings → Production scenarios" in production
+    assert "cayu eval scenario check --session SESSION_ID" in production
+    assert "cayu eval scenario run --scenario REVISION" in production
     assert "Settings → Memory reports" in production
 
 

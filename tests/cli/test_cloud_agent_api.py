@@ -58,6 +58,22 @@ def test_client_never_repeats_a_detail_that_carries_a_credential() -> None:
     assert "sk-live" not in str(raised.value)
 
 
+def test_client_reads_the_message_of_a_structured_refusal() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/app"):
+            return httpx.Response(200, json={})
+        refusal = {"code": "session_not_found", "message": "Session missing was not found."}
+        return httpx.Response(404, json={"detail": refusal})
+
+    api = _api(handler)
+    api.get("/app", resource="agent")
+    # A route's own refusal, not a route the server doesn't serve.
+    with pytest.raises(CayuApiError) as raised:
+        api.post("/evals/sessions/missing/evaluation/preview", {}, resource="evaluation")
+    assert raised.value.category == "not_found"
+    assert raised.value.detail == "Session missing was not found."
+
+
 def test_reader_sends_only_set_query_parameters_as_strings() -> None:
     seen: list[httpx.QueryParams] = []
 

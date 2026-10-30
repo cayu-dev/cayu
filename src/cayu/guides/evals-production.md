@@ -111,6 +111,25 @@ It does not cancel or erase accepted server work; a new run can duplicate that
 work. Abandonment is unavailable while a request is in flight. Closing the
 browser does not cancel server work.
 
+From a terminal or a coding agent, `cayu eval scenario` checks, saves and runs a scenario
+through the same server API; add `--application NAME` for a Cayu Cloud Agent:
+
+```console
+cayu eval scenario check --session SESSION_ID
+cayu eval scenario run --scenario REVISION
+```
+
+`--session` takes the scenario a finished session's capture proposes, `--file FILE` a
+scenario JSON file, and `--scenario REVISION` a saved revision from `cayu eval scenario
+list` (`cayu eval scenario show REVISION` prints it). The launch settings are options such as
+`--environment`, `--trials` and `--max-cost`. `check` runs nothing; `--save` saves the
+checked revision. A ready check prints `commands.run`, which runs that revision under an
+operation ID and the binding it reviewed. `run` saves the revision and admits the run, and
+its `commands.continue` repeats that admission after a lost response. Repeating either
+command answers with the run it admitted, even after a deploy, without starting a second
+one. Fixture
+preparation and checkpoint approvals stay in the Developer dashboard.
+
 During execution, the run page shows queued, running, awaiting-input,
 awaiting-approval, cancelling, and terminal trial phases. Approve or deny only
 the displayed fresh request. Cancellation is a durable server request, not a

@@ -755,6 +755,9 @@ evidence**:
 4. run calibration and inspect every typed criterion judgment, aggregate
    disagreement, pass/fail agreement, evaluator error, usage, and cost record.
 
+`cayu eval calibrate` does the same from a terminal, through the same routes, with the fixed
+evidence and labels in files; see [Curating evals from the CLI](#curating-evals-from-the-cli).
+
 Calibration invokes only the isolated judge path. It never starts the candidate
 agent, calls candidate tools, prepares fixtures, or creates environment effects.
 Repeated trials therefore measure judge agreement and stability over one exact,
@@ -3133,6 +3136,9 @@ The protected API exposes the same bounded workflow at:
 - `POST /api/evals/runs/{run_id}/scenario-approval` to submit a fresh,
   actor-attributed approve or deny decision for one current trial checkpoint.
 
+`cayu eval scenario list|show|check|run` calls the catalog, preview, save and launch routes
+from a terminal; see [Curating evals from the CLI](#curating-evals-from-the-cli).
+
 **Run scenario** executes the reviewed document through the target's ordinary
 `CayuApp` runtime. Initial, queued, resumed, file, and structured inputs retain
 their typed message shape; scenario approval decisions are never copied from a
@@ -3966,8 +3972,8 @@ summaries—never fabricated regressions.
 ### Curating evals from the CLI
 
 These commands call the server API the Evals area calls, so a terminal or a coding agent
-can list and open suites and runs, add a finished session to a suite and approve a baseline
-without the browser:
+can list and open suites and runs, add a finished session to a suite, approve a baseline,
+calibrate an AI judge and check and run production scenarios without the browser:
 
 ```console
 cayu eval suites list
@@ -3976,6 +3982,10 @@ cayu eval runs list
 cayu eval runs show RUN_ID
 cayu eval add-session SESSION_ID --suite SUITE --mode case --preview
 cayu eval baseline approve RUN_ID
+cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID \
+  --evidence evidence.json --labels labels.json --preview
+cayu eval scenario check --session SESSION_ID
+cayu eval scenario run --scenario REVISION
 ```
 
 | Developer dashboard | CLI | Server API |
@@ -3986,6 +3996,10 @@ cayu eval baseline approve RUN_ID
 | A run's status and progress | `cayu eval runs show RUN_ID` | `GET /api/evals/runs/{run_id}` and `GET /api/evals/run-views/{run_key}` |
 | **Add to evals** on a session | `cayu eval add-session SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/additions/preview`, then `POST /api/evals/sessions/{session_id}/additions` |
 | **Approve as baseline** on a run | `cayu eval baseline approve RUN_ID` | `GET /api/evals/runs/{run_id}/result`, then `POST /api/evals/results/{result_revision}/baseline` |
+| **Judges and calibration**: **Check calibration**, **Run calibration** | `cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID ...` | `GET /api/evals/suite-views/{suite_key}` and the suite's `GET /api/evals/suites/{suite_revision}` or `GET /api/evals/corpora/{corpus_revision}`, then `POST /api/evals/judge-calibrations/preview` and `POST /api/evals/judge-calibrations` |
+| **Production scenarios** library | `cayu eval scenario list`, `cayu eval scenario show REVISION` | `GET /api/evals/scenarios`, `GET /api/evals/scenarios/{scenario_revision}` |
+| **Check readiness** and **Save** | `cayu eval scenario check ... [--save]` | `POST /api/evals/scenarios/preview`, and `POST /api/evals/scenarios` |
+| **Run scenario** | `cayu eval scenario run ...` | `POST /api/evals/scenarios/preview` and `POST /api/evals/scenarios`, then `POST /api/evals/scenarios/{scenario_revision}/runs` |
 
 They reach the project's running server, `cayu serve`'s `http://127.0.0.1:8000`, or
 `--server-url URL`, including a mount prefix. For a protected server, set the complete
@@ -4018,6 +4032,67 @@ N`, and a baseline that has moved past generation `N` since fails with
 `eval_baseline_conflict` instead of being overridden.
 
 `add-session` is [Add a session to a suite](#add-a-session-to-a-suite) from a terminal.
+
+`calibrate` is the [calibration workbench](#developer-dashboard-calibrate-an-ai-judge). It
+picks one structured AI judge check (`structured_model_judge`) of one case of a saved suite,
+authored or corpus, by the suite's `id`, the case's id and the check's id. `--evidence FILE`
+holds the fixed evidence as one JSON object: `final_output`, the candidate answer to judge;
+`task`, the request it answered (default: the case's name); `transcript`, only when the
+check judges the transcript; and `source_id`, an operator-declared source (default:
+`ASSERTION_ID-known-evidence`). `--labels FILE` holds a human score from `0` to `1` for each
+criterion of the check's rubric, by criterion id, such as `{"correctness": 1, "usefulness":
+0.5}`. `--trials N` repeats the judge call (default `3`, at most `10`), and
+`--calibration-id` names the calibration (default `ASSERTION_ID-calibration`): the defaults
+are the workbench's.
+
+The command previews the calibration, which states the judge work and its token and cost
+ceilings and calls no judge, then runs it under a run ID. `--preview` stops after the
+preview and prints `commands.run`, the command that runs that reviewed definition with
+`--run-id ID --expected-definition-revision REV`. The run's answer, `report`, is the stored
+report, which keeps every trial's judgment, its absolute error against the human aggregate
+and its pass agreement. Running `commands.run` again returns that stored report without
+another judge call, also after a server restart; evidence or labels files changed since the
+preview are refused with `calibration_changed`, and a run ID that already ran other input
+with `run_id_conflict`. A check the server can't run now, such as one whose judge profile
+changed, fails with `calibration_not_ready` and the server's `diagnostics`; a `--run-id` that
+already has a stored report still returns it. A lost or late answer fails with
+`outcome_unknown` and the same `commands.run`: the server returns the report if it stored one, and runs the judge again if
+the earlier run stopped before storing its report. A calibration answers once its judge calls
+finish, so its `--timeout-seconds` defaults to `600`. Calibration never runs the candidate
+agent, its tools or its sessions. The two files are the calibration's draft, which the
+workbench keeps only in its open tab.
+
+`scenario` is the [production scenario editor](#portable-multi-stage-scenarios). `check` and
+`run` take the scenario from `--file FILE` (a revision `scenario show` printed, as
+`result.scenario`, or a draft without `revision`), from `--session SESSION_ID` (the scenario
+the finished session's capture proposes) or from `--scenario REVISION` (a saved revision
+from `scenario list`), and the launch settings the dashboard offers: `--environment NAME`,
+`--trials N`, `--max-concurrency N`, `--trial-timeout-seconds N` (default `300`), `--max-steps
+N`, the per-run limits `--max-total-tokens`, `--max-tool-calls` and `--max-elapsed-seconds`,
+`--max-cost AMOUNT [--currency CODE]` and, for each file requirement, `--artifact
+REQUIREMENT=ARTIFACT_ID`. `check` is **Check readiness**: it returns the scenario's revision
+and its `preflight` (`ready`, the reviewed `binding` or the `diagnostics` with their
+remediation) and runs nothing; `--save` also saves the revision to the library. A ready check
+prints `commands.run`, which runs that revision under a fresh `--operation-id`, pinned with
+`--expected-scenario-revision` (unless the source is `--scenario`),
+`--expected-binding-revision` and `--expected-execution-profile-revision`.
+
+`run` checks the scenario, saves its revision and admits one run of the binding the check
+reviewed, with the operation ID as its `Idempotency-Key`, and returns the admitted `run`;
+`cayu eval runs show RUN_ID` (`commands.show`) follows it. Its `commands.continue` repeats
+that admission with `--scenario REVISION --operation-id ID --expected-binding-revision REV
+--expected-execution-profile-revision REV`; until the scenario is known to be saved, it names
+the scenario's source and `--expected-scenario-revision` instead of `--scenario`, so that it
+can still save it. A run with a reviewed binding, the check's
+`commands.run` or a run's `commands.continue`, sends that admission first, as given: it
+answers with the run the key already admitted, also after a deploy changed the current
+binding, and a key that admitted nothing admits a run only under that same binding and
+execution profile, or fails with `scenario_changed`. Only when the server doesn't hold the
+scenario yet does it check the source, save it and send the admission again; a file or
+session that no longer holds the checked revision then fails with `scenario_changed`. A lost
+answer fails with `outcome_unknown` and `commands.continue`. A scenario the server can't run
+now fails with `scenario_not_ready` and its diagnostics, and an operation ID that already
+admitted another run with `operation_id_conflict`.
 
 ### Browser acceptance profiles
 

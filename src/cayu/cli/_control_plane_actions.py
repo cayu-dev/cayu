@@ -127,7 +127,7 @@ def _output_aliases_input(args: argparse.Namespace) -> bool:
     if args.output is None:
         return False
     output = Path(args.output)
-    for name in ("file", "input_file", "payload_file", "context"):
+    for name in ("file", "input_file", "payload_file", "context", "evidence", "labels"):
         source = getattr(args, name, None)
         if source is None:
             continue

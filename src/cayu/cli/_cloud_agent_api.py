@@ -517,6 +517,9 @@ def _detail(body: Any) -> str | None:
     """The server's own bounded ``detail``, never a request value it echoes."""
 
     detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        # A structured refusal, such as `{"code": "session_not_found", "message": ...}`.
+        detail = detail.get("message")
     if isinstance(detail, list):
         # FastAPI request validation: name each rejected parameter and its rule.
         parts = []

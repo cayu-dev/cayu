@@ -115,6 +115,22 @@ again before intentionally starting a new run. Abandoning does not cancel or
 erase server work and can allow duplicate paid calls; it is unavailable while a
 request is in flight.
 
+From a terminal or a coding agent, `cayu eval calibrate` runs the same calibration of a saved
+suite's check through the same server API; add `--application NAME` for a Cayu Cloud Agent:
+
+```console
+cayu eval suites list
+cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID \
+  --evidence evidence.json --labels labels.json --preview
+```
+
+`evidence.json` holds the fixed `final_output`, and optionally its `task`, a `transcript`
+for a check that judges one, and a `source_id`. `labels.json` scores each criterion by id,
+such as `{"correctness": 1, "usefulness": 0.5}`. The preview states the judge work and prints
+`commands.run`, which runs it under a run ID. Running that command again returns the stored
+report without another judge call, and it refuses evidence or labels changed since the
+preview. The two files are the calibration's draft, so closing the terminal loses nothing.
+
 Use clearly good, clearly bad, and difficult boundary examples. If repeated
 judge scores move materially on identical evidence, refine the rubric or use a
 different judge before treating its threshold as a release gate.

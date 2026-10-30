@@ -1,11 +1,14 @@
-"""`cayu eval suites|runs|add-session|baseline`: curate evals from the terminal.
+"""`cayu eval suites|runs|add-session|baseline|calibrate|scenario`: curate evals from the
+terminal.
 
 These commands do what the Developer dashboard's Evals area does, through the same server
-API: list suites and runs and open one, add a finished session to a suite, and approve a run
-as its suite's baseline. They reach the project's running server (`--server-url`, `cayu
-serve`'s address by default) or, with `--application NAME`, a Cayu Cloud Agent, signed in
-as `cayu cloud` is. `runs` and `baseline approve` are `cayu cloud eval runs` and `cayu cloud
-eval baseline` (`cayu.cli._cloud_evals`), so with `--application` they answer the same.
+API: list suites and runs and open one, add a finished session to a suite, approve a run as
+its suite's baseline, calibrate an AI judge (`cayu.cli._eval_calibration`) and check and run
+production scenarios (`cayu.cli._eval_scenarios`). They reach the project's running server
+(`--server-url`, `cayu serve`'s address by default) or, with `--application NAME`, a Cayu
+Cloud Agent, signed in as `cayu cloud` is. `runs` and `baseline approve` are `cayu cloud eval
+runs` and `cayu cloud eval baseline` (`cayu.cli._cloud_evals`), so with `--application` they
+answer the same.
 
 `add-session` previews the addition (`POST /evals/sessions/{id}/additions/preview`) and
 publishes the plan it previewed under an idempotency key (`POST .../additions`); `--preview`
@@ -51,7 +54,7 @@ from cayu.cli._cloud_evals import (
 from cayu.cli._cloud_settings import _cell, _table
 from cayu.cli._output import output_destination
 
-COMMANDS = frozenset({"suites", "runs", "add-session", "baseline"})
+COMMANDS = frozenset({"suites", "runs", "add-session", "baseline", "calibrate", "scenario"})
 # The `source` of a suite view whose runs are external eval reports (`EvalReportedSuiteView`).
 _REPORTED = "reported"
 # The server's own refusals of a publication (`cayu.server._eval_addition_routes`): the
@@ -62,7 +65,8 @@ _ADDITION_KEY_CONFLICT = "The operation key is already bound to another addition
 
 
 def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    """Add `suites`, `runs`, `add-session` and `baseline` to `cayu eval`."""
+    """Add `suites`, `runs`, `add-session`, `baseline`, `calibrate` and `scenario` to
+    `cayu eval`."""
 
     suites = commands.add_parser(
         "suites",
@@ -261,6 +265,19 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
     )
     _add_target_options(approve, render_baseline)
 
+    from cayu.cli._eval_calibration import (
+        CALIBRATION_TIMEOUT_SECONDS,
+        add_calibration_parser,
+        render_calibration,
+    )
+    from cayu.cli._eval_scenarios import add_scenario_parser
+
+    calibrate = add_calibration_parser(commands)
+    _add_target_options(calibrate, render_calibration)
+    calibrate.set_defaults(timeout_seconds=CALIBRATION_TIMEOUT_SECONDS)
+    for parser, render in add_scenario_parser(commands):
+        _add_target_options(parser, render)
+
 
 def run_curation_command(args: argparse.Namespace) -> int:
     """Run one of the commands and print its JSON envelope, or its text with ``--table``."""
@@ -298,9 +315,17 @@ def run_curation_command(args: argparse.Namespace) -> int:
 
 
 def _execute(args: argparse.Namespace) -> dict[str, Any]:
+    from cayu.cli import _eval_calibration as calibration
+    from cayu.cli import _eval_scenarios as scenarios
+
     action = args.eval_command
+    # Options and input files are checked before any request.
     if action == "add-session":
         _check_addition_options(args)
+    elif action == "calibrate":
+        calibration_inputs = calibration.read_calibration_inputs(args)
+    elif action == "scenario":
+        scenario_draft = scenarios.check_scenario_options(args)
     with _target_api(args) as (api, source, target):
         if action == "suites":
             if args.eval_suites_command == "list":
@@ -317,6 +342,12 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         elif action == "add-session":
             result = _add_session(api, args, target=target)
             operation = "eval.add-session"
+        elif action == "calibrate":
+            result = calibration.calibrate(api, args, calibration_inputs, target=target)
+            operation = "eval.calibrate"
+        elif action == "scenario":
+            result = scenarios.run_scenario_command(api, args, scenario_draft, target=target)
+            operation = f"eval.scenario.{args.eval_scenario_command}"
         else:
             result = _approve_baseline(
                 api, args, command=["cayu", "eval", "baseline", "approve", args.run_id, *target]
@@ -571,6 +602,18 @@ def _suite_id(plan: Any) -> str:
         raise CloudEvalError(
             "api_response_invalid", "The server's eval session addition plan is invalid."
         ) from None
+
+
+def _diagnosed_refusal(category: str, lead: str, diagnostics: Any) -> CloudEvalError:
+    """``lead``, then the messages of the server's ``diagnostics``, which the error keeps."""
+
+    diagnostics = diagnostics or []
+    reasons = " ".join(str(item.get("message")) for item in diagnostics if isinstance(item, dict))
+    return CloudEvalError(
+        category,
+        lead + (f": {reasons}" if reasons else "."),
+        details={"diagnostics": diagnostics},
+    )
 
 
 def _page(page: Any, what: str) -> dict[str, Any]:

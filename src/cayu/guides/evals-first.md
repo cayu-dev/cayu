@@ -38,6 +38,10 @@ cayu eval suites list
 cayu eval suites show SUITE
 ```
 
+`cayu eval calibrate` and `cayu eval scenario` do what **Judges and calibration** and
+**Production scenarios** do; `cayu guide evals-ai-quality` and `cayu guide evals-production`
+show them.
+
 ## Create one deterministic suite
 
 1. Open **Evals → New suite** and select the specialist.
