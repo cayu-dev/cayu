@@ -1910,6 +1910,15 @@ The same suite/assertion surface supports several modes:
 
 - **Deterministic** — drive the run with a `ScriptedModelProvider` (and fake tools). Hermetic,
   fast, and provider-free — ideal for CI. This is what the Minimal Example and most tests use.
+  A scripted route has no price, so a production request with a cost budget
+  (`budget_limits=[BudgetLimit.usd(5)]`) is refused before its first model call. Name the
+  real route's provider and its usage dialect instead of patching the budget out:
+  `ScriptedModelProvider(script, billing_provider_name="openai",
+  usage_dialect=UsageDialect.OPENAI)` with the agent's model `gpt-5.6-luna` reads the
+  script's usage as OpenAI's and estimates it at that model's price-book rates, so the
+  budget is checked and recorded as in production. The session keeps the provider name
+  `scripted`, and each estimate's billing evidence records
+  `pricing_basis="scripted_test_estimate"`. A real route without a price still fails closed.
 - **Integration** — run against real providers, tools, runners, and environments to check whether
   the agent actually solves the task and to capture real cost/latency/tool usage. Slower and
   optionally gated behind credentials.

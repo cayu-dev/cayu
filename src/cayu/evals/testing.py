@@ -7,7 +7,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
-from cayu._validation import copy_json_value
+from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu.budgets.billing import BillingIdentity
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.context.thinking import ThinkingConfig
 from cayu.messages import (
@@ -24,8 +25,10 @@ from cayu.providers.base import (
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    UsageDialect,
     _preflight_provider_portable_messages,
     copy_model_stream_event,
+    copy_usage_dialect,
 )
 from cayu.providers.operations import (
     ProviderOperationAdapter,
@@ -257,6 +260,13 @@ class ScriptedModelProvider(ModelProvider):
     Shared concurrent evals require request-aware selection; per-trial workflow
     factories may instead construct independent positional providers. Native
     structured-output support is explicitly opt-in.
+
+    A scripted route has no price, so a request with a cost budget is refused before
+    its first model call. Pass the route's real provider as `billing_provider_name`
+    (for example ``"openai"`` with model ``"gpt-5.6-luna"``), and its usage dialect as
+    `usage_dialect`, to estimate the scripted usage at that provider's rates, as the
+    budget does in production. The session keeps this provider's own name, and its
+    billing evidence records ``pricing_basis="scripted_test_estimate"``.
     """
 
     name = "scripted"
@@ -305,6 +315,8 @@ class ScriptedModelProvider(ModelProvider):
         background: bool = False,
         response_factory: Callable[[ModelRequest], Iterable[ModelStreamEvent]] | None = None,
         supports_native_structured_output: bool = False,
+        billing_provider_name: str | None = None,
+        usage_dialect: UsageDialect | None = None,
     ) -> None:
         if events is not None and response_factory is not None:
             raise ValueError("ScriptedModelProvider accepts events or response_factory, not both.")
@@ -314,6 +326,21 @@ class ScriptedModelProvider(ModelProvider):
             raise TypeError("response_factory must be callable.")
         if type(supports_native_structured_output) is not bool:
             raise TypeError("supports_native_structured_output must be a bool.")
+        # An omitted option keeps what a subclass declares.
+        if usage_dialect is not None:
+            self.usage_dialect = copy_usage_dialect(usage_dialect)
+        if billing_provider_name is not None:
+            if type(billing_provider_name) is not str:
+                raise TypeError("billing_provider_name must be a string or None.")
+            require_clean_nonblank(billing_provider_name, "billing_provider_name")
+            if self.usage_dialect is UsageDialect.AUTO:
+                # Usage is read by the registered name, so a scripted cache-read count would
+                # be billed as ordinary input unless the script's dialect is declared.
+                raise ValueError(
+                    "billing_provider_name needs the usage_dialect of the provider the "
+                    "scripted route stands in for, for example UsageDialect.OPENAI."
+                )
+            self.billing_provider_name = billing_provider_name
         self.name = name
         self.supports_native_structured_output = supports_native_structured_output
         self._batches = _normalize_batches(events) if events is not None else None
@@ -374,6 +401,15 @@ class ScriptedModelProvider(ModelProvider):
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         for event in self._consume_batch(request):
             yield event
+
+    async def billing_identity_for_request(self, request: ModelRequest) -> BillingIdentity | None:
+        if self.billing_provider_name is None:
+            return None
+        return BillingIdentity(
+            provider_name=self.billing_provider_name,
+            resource_id=request.model,
+            request_evidence={"access_mode": "scripted", "pricing_basis": "scripted_test_estimate"},
+        )
 
 
 @dataclass
@@ -552,7 +588,15 @@ def _execution_profile_material(provider: ScriptedModelProvider) -> dict[str, An
     if provider._response_factory is not None:
         # An arbitrary application callback is not transparent built-in behavior.
         return None
-    return {
+    material: dict[str, Any] = {
         "background": provider.provider_operations is not None,
         "supports_native_structured_output": provider.supports_native_structured_output,
     }
+    # Accounting settings change how usage is read and priced, so a change must not pass an
+    # exact-profile check. They're added only when set, so other scripted profiles keep
+    # their identity.
+    if provider.billing_provider_name is not None:
+        material["billing_provider_name"] = provider.billing_provider_name
+    if provider.usage_dialect is not UsageDialect.AUTO:
+        material["usage_dialect"] = provider.usage_dialect.value
+    return material

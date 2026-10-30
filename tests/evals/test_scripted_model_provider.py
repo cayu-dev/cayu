@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets import BudgetLimit, default_price_book
 from cayu.context.structured_output import StructuredOutputSpec
 from cayu.evals.assertions import ChildSessionCompleted, FinalOutputContains, SessionCompleted
 from cayu.evals.judges import LLMJudge
@@ -17,10 +19,10 @@ from cayu.evals.runner import (
     run_eval_plan,
     run_eval_suite,
 )
-from cayu.evals.testing import ScriptedModelProvider
+from cayu.evals.testing import ScriptedModelProvider, _execution_profile_material
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.providers.base import ModelRequest, ModelStreamEvent
+from cayu.providers.base import ModelRequest, ModelStreamEvent, UsageDialect
 from cayu.providers.operations import ProviderOperationStartRequest
 from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.requests import RunRequest
@@ -181,6 +183,148 @@ def test_nested_drain_restores_live_ancestor_reservation(background, cancel_chil
             await asyncio.gather(*children, return_exceptions=True)
 
     asyncio.run(exercise())
+
+
+def _budgeted_case() -> EvalCase:
+    return EvalCase(
+        id="budgeted",
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "hi")],
+            budget_limits=[BudgetLimit.usd(5)],
+        ),
+        assertions=[FinalOutputContains("done")],
+    )
+
+
+def _scripted_luna_app(provider: ScriptedModelProvider) -> CayuApp:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="agent", model="gpt-5.6-luna"))
+    return app
+
+
+def _usage_completion(text: str) -> tuple[ModelStreamEvent, ...]:
+    return (
+        ModelStreamEvent.text_delta(text),
+        ModelStreamEvent.completed(
+            {"usage": {"input_tokens": 1000, "output_tokens": 100, "total_tokens": 1100}}
+        ),
+    )
+
+
+def test_a_budgeted_request_runs_on_a_scripted_route_priced_as_the_real_one() -> None:
+    provider = ScriptedModelProvider(
+        _usage_completion("done"),
+        billing_provider_name="openai",
+        usage_dialect=UsageDialect.OPENAI,
+    )
+    app = _scripted_luna_app(provider)
+
+    run = asyncio.run(run_eval_suite(app, EvalSuite(id="budgets", cases=[_budgeted_case()])))
+
+    (case,) = run.cases
+    assert case.status.value == "passed"
+    session_id = case.trials[0].session_id
+    assert session_id is not None
+    cost = asyncio.run(app.get_session_cost(session_id, default_price_book()))
+    (item,) = cost.line_items
+    assert item.priced is True
+    assert cost.total_cost > 0
+    assert item.provider_name == "scripted"
+    assert item.pricing_provider_name == "openai"
+    assert item.billing_identity is not None
+    assert item.billing_identity.request_evidence == {
+        "access_mode": "scripted",
+        "pricing_basis": "scripted_test_estimate",
+    }
+
+
+def test_a_scripted_route_reads_cached_usage_the_real_providers_way() -> None:
+    cached = (
+        ModelStreamEvent.text_delta("done"),
+        ModelStreamEvent.completed(
+            {
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 100,
+                    "total_tokens": 1100,
+                    "input_tokens_details": {"cached_tokens": 900},
+                }
+            }
+        ),
+    )
+    app = _scripted_luna_app(
+        ScriptedModelProvider(
+            cached, billing_provider_name="openai", usage_dialect=UsageDialect.OPENAI
+        )
+    )
+
+    run = asyncio.run(run_eval_suite(app, EvalSuite(id="budgets", cases=[_budgeted_case()])))
+
+    session_id = run.cases[0].trials[0].session_id
+    assert session_id is not None
+    cost = asyncio.run(app.get_session_cost(session_id, default_price_book()))
+    (item,) = cost.line_items
+    assert item.cache_read_input_tokens == 900
+    assert item.uncached_input_tokens == 100
+
+
+def test_a_scripted_route_without_a_billing_provider_still_fails_closed_on_a_budget() -> None:
+    app = _scripted_luna_app(ScriptedModelProvider(_usage_completion("done")))
+
+    run = asyncio.run(run_eval_suite(app, EvalSuite(id="budgets", cases=[_budgeted_case()])))
+
+    (case,) = run.cases
+    assert case.status.value != "passed"
+    events = asyncio.run(app.session_store.load_events(case.trials[0].session_id))
+    assert any(
+        "scripted/gpt-5.6-luna has no matching pricing" in json.dumps(event.payload)
+        for event in events
+    )
+
+
+def test_omitted_billing_options_keep_a_subclass_declaration() -> None:
+    class OpenAIShapedScript(ScriptedModelProvider):
+        billing_provider_name = "openai"
+        usage_dialect = UsageDialect.OPENAI
+
+    provider = OpenAIShapedScript(completed("x"))
+
+    assert provider.billing_provider_name == "openai"
+    assert provider.usage_dialect is UsageDialect.OPENAI
+    assert ScriptedModelProvider(completed("x")).usage_dialect is UsageDialect.AUTO
+    assert ScriptedModelProvider(completed("x")).billing_provider_name is None
+
+
+def test_billing_options_are_part_of_the_scripted_execution_profile() -> None:
+    plain = _execution_profile_material(ScriptedModelProvider(completed("x")))
+    openai = _execution_profile_material(
+        ScriptedModelProvider(
+            completed("x"), billing_provider_name="openai", usage_dialect=UsageDialect.OPENAI
+        )
+    )
+    generic = _execution_profile_material(
+        ScriptedModelProvider(
+            completed("x"), billing_provider_name="openai", usage_dialect=UsageDialect.GENERIC
+        )
+    )
+
+    assert plain == {"background": False, "supports_native_structured_output": False}
+    assert openai is not None and generic is not None
+    assert openai["billing_provider_name"] == "openai"
+    assert openai != generic
+
+
+def test_billing_provider_name_must_be_a_clean_name_with_a_usage_dialect() -> None:
+    with pytest.raises(TypeError, match="billing_provider_name"):
+        ScriptedModelProvider(completed("x"), billing_provider_name=3)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="billing_provider_name"):
+        ScriptedModelProvider(
+            completed("x"), billing_provider_name=" ", usage_dialect=UsageDialect.OPENAI
+        )
+    with pytest.raises(ValueError, match="usage_dialect"):
+        ScriptedModelProvider(completed("x"), billing_provider_name="openai")
 
 
 def test_events_and_factory_are_mutually_exclusive() -> None:
