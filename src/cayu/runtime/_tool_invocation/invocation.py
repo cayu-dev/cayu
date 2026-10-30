@@ -286,7 +286,9 @@ class ToolInvocation:
         rejoin_targeted_invocation: bool = False,
         tool_invocation_observer: Callable[[str], None] | None = None,
         approved_arguments: dict[str, Any] | None = None,
+        run_time_left: Callable[[], float | None] | None = None,
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
+        """Run one tool call; ``run_time_left`` caps it by the run's remaining time."""
         if approved_arguments is not None and (
             check_policy or approval_id is None or _targeted_tool_invocation_payload(tool_call)
         ):
@@ -1843,6 +1845,7 @@ class ToolInvocation:
             auxiliary_inference=self._auxiliary_inference,
             auxiliary_policy=auxiliary_invocation_policy,
             tool_timeout_seconds=self._tool_timeout_seconds,
+            run_time_left=run_time_left,
             strict_common_budget_admission=self._strict_common_budget_admission,
             on_invoke=(
                 None

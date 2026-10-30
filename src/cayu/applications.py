@@ -1583,6 +1583,9 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             clock=self._clock,
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
             apply_limit_evaluation=self._session_finalization.apply_tool_round_limit,
+            close_round_at_finish_cutoff=(
+                self._session_finalization.close_tool_round_at_finish_cutoff
+            ),
             close_interrupted_round=self._pending_tool_round_recovery.close_interrupted_tool_round,
             publish_session_wake=(
                 (lambda pending: _session_wakes._publish_session_wake(self, pending))

@@ -154,6 +154,7 @@ from cayu.budgets.billing import (
 from cayu.budgets.run_limits import RunLimits, copy_run_limits, has_run_limits
 from cayu.budgets.usage import (
     SessionUsageSummary,
+    is_conversational_model_completion_payload,
 )
 from cayu.collaboration.access import CollaborationAccessContext
 from cayu.collaboration.peer_content import PeerContentAppendRequest, PeerContentReceipt
@@ -280,6 +281,7 @@ from cayu.runtime._durable_subagents import (
     durable_subagent_worker_incompatible,
     is_durable_subagent_submission_unsettled,
 )
+from cayu.runtime._elapsed_limit import ElapsedLimitExpired, elapsed_limit_stream
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
     exception_failure_payload,
@@ -848,6 +850,19 @@ def _knowledge_access_scope(
 
 def _user_tool_call_count(tool_calls: list[runtime_records.ToolCallRequest]) -> int:
     return sum(1 for tool_call in tool_calls if tool_call.name != STRUCTURED_OUTPUT_TOOL_NAME)
+
+
+def _model_step_completion_published(
+    item: tuple[Event | None, ModelStepFlowOutcome | None],
+) -> bool:
+    # Automatic context compaction publishes its own model.completed earlier in
+    # the step; only the conversational completion ends the bounded model call.
+    event, _ = item
+    return (
+        event is not None
+        and event.type is EventType.MODEL_COMPLETED
+        and is_conversational_model_completion_payload(event.payload)
+    )
 
 
 def _failure_carries_interaction_publication_rejection(
@@ -6809,6 +6824,49 @@ class SessionEngine:
                 ):
                     yield event
 
+            async def elapsed_limit_interruption() -> AsyncGenerator[Event, None]:
+                # A completion published just before the cut leaves its tool round
+                # pending. None of its calls ran: close them as skipped by the limit.
+                (
+                    _checkpoint,
+                    pending_tool_round,
+                ) = await pending_round_reader.load_pending_tool_round(
+                    self.session_store,
+                    outcome_state.session.id,
+                )
+                usage = await self._run_limit_controller.session_usage_summary(
+                    outcome_state.session.id
+                )
+                async for event in self._session_finalization.stop_session_for_limit_reached(
+                    session=outcome_state.session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    decision=limit_gate.elapsed_limit_decision(),
+                    usage_summary=usage,
+                    cost_summary=None,
+                    messages=messages,
+                    tool_calls=(
+                        []
+                        if pending_tool_round is None
+                        else tool_round_recovery.pending_round_tool_calls(pending_tool_round)
+                    ),
+                    completed_tool_outcomes=[],
+                    tool_round_identity=(
+                        None
+                        if pending_tool_round is None
+                        else pending_rounds.pending_tool_round_identity(pending_tool_round)
+                    ),
+                    run_started_at=run_started_at,
+                    turn_usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    reconcile_transition_cancellation=False,
+                    finish_up=finish_decision is not None,
+                ):
+                    yield event
+
             if model_boundary.state == "promoted" and model_boundary.completion_event is not None:
                 yield copy_event(model_boundary.completion_event)
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
@@ -7390,6 +7448,7 @@ class SessionEngine:
                 execution_profile_fingerprint=(
                     None if execution_profile is None else execution_profile.fingerprint
                 ),
+                reserve_finish_time=structured_output is not None and limits.on_limit == "finish",
             )
             tool_round_runner = self._tool_round_executor.create_run(
                 session=outcome_state.session,
@@ -7867,14 +7926,21 @@ class SessionEngine:
                         if structured_output_retries
                         else RequestVariant.INITIAL
                     )
-                    model_step_events = model_step_run.execute(
-                        step=step,
-                        messages=messages,
-                        source_transcript_cursor=source_transcript_cursor,
-                        model_step_identity=model_step_identity,
-                        request_variant=request_variant,
-                        finish_up=finish_decision is not None,
+                    # max_elapsed_seconds bounds the model call in flight, the
+                    # finishing step included; the call sees an ordinary cancellation.
+                    model_step_events = elapsed_limit_stream(
+                        model_step_run.execute(
+                            step=step,
+                            messages=messages,
+                            source_transcript_cursor=source_transcript_cursor,
+                            model_step_identity=model_step_identity,
+                            request_variant=request_variant,
+                            finish_up=finish_decision is not None,
+                        ),
+                        limit_gate.elapsed_seconds_left,
+                        settled=_model_step_completion_published,
                     )
+                    elapsed_limit_expired = False
                     try:
                         async for event, flow_outcome in model_step_events:
                             if event is not None:
@@ -7894,8 +7960,14 @@ class SessionEngine:
                                         "Model step produced more than one terminal flow outcome."
                                     )
                                 model_step_flow_outcome = flow_outcome
+                    except ElapsedLimitExpired:
+                        elapsed_limit_expired = True
                     finally:
                         await _close_async_iterator(model_step_events)
+                    if elapsed_limit_expired:
+                        async for event in elapsed_limit_interruption():
+                            yield event
+                        return
                 if model_step_flow_outcome is None:
                     await self._session_control.raise_if_interrupted(outcome_state.session.id)
                     raise RuntimeError("Model step finished without a terminal flow outcome.")

@@ -53,6 +53,7 @@ class ToolInvocationDispatch:
         runner_events: list[Event],
         settle_workspace: Callable[[], Awaitable[tuple[Event, ...]]] | None,
         on_invoke: Callable[[], None] | None = None,
+        run_time_left: Callable[[], float | None] | None = None,
     ) -> None:
         self._call = call
         self._on_invoke = on_invoke
@@ -62,6 +63,7 @@ class ToolInvocationDispatch:
         self._auxiliary_inference = auxiliary_inference
         self._auxiliary_policy = auxiliary_policy
         self._tool_timeout_seconds = tool_timeout_seconds
+        self._run_time_left = run_time_left
         self._strict_common_budget_admission = strict_common_budget_admission
         self._runner_events = runner_events
         self._settle_workspace = settle_workspace
@@ -247,6 +249,10 @@ class ToolInvocationDispatch:
                 registered_execution_contract=registered_tool.execution_contract,
                 finalize_publication=self._secret_scope.seal_for_publication,
                 timeout_seconds=self._tool_timeout_seconds,
+                # Read only now: admission and effect preparation also take time.
+                run_time_left_seconds=(
+                    None if self._run_time_left is None else self._run_time_left()
+                ),
                 before_dispatch=require_resource_dispatch,
                 reconcile_result=reconcile_child_result,
                 inference_scope=inference_scope,

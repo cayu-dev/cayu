@@ -92,11 +92,19 @@ class _ToolTimeoutOwner:
         "_handle",
         "_latest_external_message",
         "_marker",
+        "_owned_request_consumed",
         "_request_dispatched",
+        "_same_task",
         "_task",
     )
 
-    def __init__(self, timeout_seconds: float) -> None:
+    def __init__(self, timeout_seconds: float, *, same_task: bool = False) -> None:
+        """``same_task`` means the tool runs in this owner's task, not a child task.
+
+        A shield in that task can then consume caller requests along with this
+        owner's; ``callers_consumed`` separates them from its reported count.
+        """
+
         task = asyncio.current_task()
         if task is None:
             raise RuntimeError("Tool timeout requires an active asyncio task.")
@@ -107,6 +115,8 @@ class _ToolTimeoutOwner:
         self._external_request_count = 0
         self._latest_external_message: object | None = None
         self._request_dispatched = False
+        self._same_task = same_task
+        self._owned_request_consumed = False
         self._handle: asyncio.TimerHandle | None = asyncio.get_running_loop().call_later(
             timeout_seconds,
             self._expire,
@@ -137,6 +147,7 @@ class _ToolTimeoutOwner:
             0,
         )
         owned_request_is_pending = self._request_dispatched and pending_requests > 0
+        self._owned_request_consumed = self._request_dispatched and not owned_request_is_pending
         self._external_request_count = max(
             pending_requests - int(owned_request_is_pending),
             0,
@@ -145,6 +156,20 @@ class _ToolTimeoutOwner:
             self._latest_external_message = getattr(self._task, "_cancel_message", None)
         if owned_request_is_pending:
             self._task.uncancel()
+
+    def callers_consumed(self, consumed_requests: int) -> int:
+        """How many requests a shield consumed beyond this owner's own.
+
+        In a child task the settlement consumed only that child's requests:
+        evidence, not caller requests to replay here. In this owner's task,
+        every consumed request but this owner's own was a caller's. If a
+        caller's pending request was taken for this owner's and removed above,
+        this owner's own request was consumed instead, so it is counted here.
+        """
+
+        if not self._same_task:
+            return 0
+        return max(consumed_requests - int(self._owned_request_consumed), 0)
 
     def cancellation_request_count(self) -> int:
         return int(self._request_dispatched)
@@ -533,14 +558,35 @@ def _isolated_failure_outcome(
     )
 
 
+def _tool_timer(
+    timeout_seconds: float | None, run_time_left_seconds: float | None
+) -> tuple[float | None, bool]:
+    """Pick the earlier of the tool timeout and the run's remaining time.
+
+    Returns the timer's seconds and whether the run's time limit set it.
+    """
+
+    if run_time_left_seconds is None:
+        return timeout_seconds, False
+    run_time_left_seconds = max(run_time_left_seconds, 0.0)
+    if timeout_seconds is not None and timeout_seconds <= run_time_left_seconds:
+        return timeout_seconds, False
+    return run_time_left_seconds, True
+
+
 def _tool_timeout_outcome(
     *,
     tool: Tool,
     effect: ToolEffect,
     timeout_seconds: float | None,
     redactor: SecretRedactor,
+    run_time_limited: bool = False,
 ) -> ToolExecutionOutcome:
-    message = f"Tool call timed out after {timeout_seconds} seconds."
+    message = (
+        f"Tool call stopped after {timeout_seconds:g} seconds: the run reached its time limit."
+        if run_time_limited and timeout_seconds is not None
+        else f"Tool call timed out after {timeout_seconds} seconds."
+    )
     if type(tool) is ProcessIsolatedTool:
         return _isolated_failure_outcome(
             terminal_outcome="tool_execution_timeout",
@@ -584,6 +630,7 @@ async def run_tool(
     registered_execution_contract: dict[str, Any] | None = None,
     finalize_publication: Callable[[], InvocationPublicationSnapshot] | None = None,
     timeout_seconds: float | None = None,
+    run_time_left_seconds: float | None = None,
     before_dispatch: Callable[[], Awaitable[None]] | None = None,
     reconcile_result: Callable[[], Awaitable[ToolResult | None]] | None = None,
     inference_scope: AuxiliaryInferenceScope | None = None,
@@ -592,7 +639,9 @@ async def run_tool(
     """Execute one tool and seal its evolving secret scope before publication.
 
     ``on_invoke`` is called immediately before the tool body runs, after every
-    dispatch and pre-dispatch check has passed.
+    dispatch and pre-dispatch check has passed. ``run_time_left_seconds`` caps
+    the call like ``timeout_seconds`` does, with a result naming the run's time
+    limit; the registered execution contract still uses ``timeout_seconds``.
     """
 
     if finalize_publication is not None and not callable(finalize_publication):
@@ -613,6 +662,7 @@ async def run_tool(
             registered_schema=registered_schema,
             registered_execution_contract=registered_execution_contract,
             timeout_seconds=timeout_seconds,
+            run_time_left_seconds=run_time_left_seconds,
             before_dispatch=before_dispatch,
             inference_scope=inference_scope,
             on_invoke=on_invoke,
@@ -663,7 +713,9 @@ async def _run_tool(
     before_dispatch: Callable[[], Awaitable[None]] | None,
     inference_scope: AuxiliaryInferenceScope | None,
     on_invoke: Callable[[], None] | None = None,
+    run_time_left_seconds: float | None = None,
 ) -> ToolExecutionOutcome:
+    timer_seconds, run_time_limited = _tool_timer(timeout_seconds, run_time_left_seconds)
     timer: _ToolTimeoutOwner | None = None
     grouped_failure: BaseExceptionGroup | None = None
     current_task = asyncio.current_task()
@@ -720,8 +772,21 @@ async def _run_tool(
                         redactor=_active_redactor(redactor),
                     )
 
-        if timeout_seconds is None:
+        if timer_seconds is None:
             raw_result = await invoke_registered_tool()
+        elif timeout_seconds is None:
+            # Only the run's time bounds this call. Without a tool timeout the
+            # tool runs in the run's own task, so keep it there and cancel that
+            # task at the cut instead of moving the tool into a child task.
+            # Requests a durable shield consumes come back as a reported count
+            # (callers_consumed). A tool that calls uncancel() on its own task
+            # can still hide a caller's request, as it can without a timer.
+            timer = _ToolTimeoutOwner(timer_seconds, same_task=True)
+            try:
+                raw_result = await invoke_registered_tool()
+            finally:
+                timer.close()
+                timer.consume_request()
         else:
 
             async def invoke_tool() -> ToolResult:
@@ -731,7 +796,7 @@ async def _run_tool(
                 invoke_tool(),
                 name="cayu-tool-execution",
             )
-            timer = _ToolTimeoutOwner(timeout_seconds)
+            timer = _ToolTimeoutOwner(timer_seconds)
             try:
                 # Keep the opaque tool/runner task separate from the deadline
                 # owner. Extension code may normalize its own cancellation,
@@ -782,7 +847,8 @@ async def _run_tool(
             tool=tool,
             effect=effect,
             redactor=_active_redactor(redactor),
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=timer_seconds,
+            run_time_limited=run_time_limited,
         )
     except IsolatedToolPreDispatchFailure as exc:
         ctx._discard_policy_denials_for(tool)
@@ -872,7 +938,8 @@ async def _run_tool(
                 tool=tool,
                 effect=effect,
                 redactor=_active_redactor(redactor),
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=timer_seconds,
+                run_time_limited=run_time_limited,
             )
         active_redactor = _active_redactor(redactor)
         diagnostic = tool_results.exception_diagnostic(
@@ -904,7 +971,8 @@ async def _run_tool(
                     tool=tool,
                     effect=effect,
                     redactor=_active_redactor(redactor),
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=timer_seconds,
+                    run_time_limited=run_time_limited,
                 )
         elif isinstance(exc, Exception):
             active_redactor = _active_redactor(redactor)
@@ -957,12 +1025,14 @@ async def _run_tool(
                 cancellation_requests_consumed,
             ) = committed_cancellation
             if timer is not None:
-                # The durable settlement ran in the isolated tool task, so its
-                # consumed count belongs to that child. Caller authority remains
-                # pending on this wrapper task and must not be restored twice,
-                # whether settlement finishes before or after the deadline.
-                external_cancellation_requests = timer.external_request_count()
-                if external_cancellation_requests > 0:
+                # In a child task the durable settlement consumed only that
+                # child's requests. Caller authority remains pending on this
+                # wrapper task and must not be restored twice, whether
+                # settlement finishes before or after the deadline. In the
+                # timer's own task, the caller's consumed requests are restored.
+                callers_consumed = timer.callers_consumed(cancellation_requests_consumed)
+                if timer.external_request_count() > 0 or callers_consumed > 0:
+                    restore_task_cancellation_requests(callers_consumed, cancellation=cancellation)
                     caller_cancellation = _caller_cancellation_after_tool_timeout(
                         cancellation,
                         subsequent_cancellation,
@@ -994,9 +1064,11 @@ async def _run_tool(
                 # Preserve caller requests already pending on the wrapper;
                 # child settlement counts are evidence for signal selection,
                 # not requests that should be replayed into this task, whether
-                # settlement finishes before or after the deadline.
-                external_cancellation_requests = timer.external_request_count()
-                if external_cancellation_requests > 0:
+                # settlement finishes before or after the deadline. In the
+                # timer's own task, the caller's consumed requests are restored.
+                callers_consumed = timer.callers_consumed(cancellation_requests_consumed)
+                if timer.external_request_count() > 0 or callers_consumed > 0:
+                    restore_task_cancellation_requests(callers_consumed, cancellation=cancellation)
                     caller_cancellation = _caller_cancellation_after_tool_timeout(
                         cancellation,
                         subsequent_cancellation,

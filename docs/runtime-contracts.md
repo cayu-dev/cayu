@@ -10825,7 +10825,7 @@ estimated-cost bound. Add count limits only when the application needs them.
 | `max_steps` | 1,000 for interactive SDK runs; no cap for task-backed SDK runs unless explicitly configured. HTTP runs and product services use the application cap (1,000 by default). `None` disables it. |
 | `limits.max_tool_calls` | `None`, meaning no call-count cap. |
 | `limits.max_input_tokens`, `max_output_tokens`, `max_total_tokens` | `None`; evaluated from observed model usage. |
-| `limits.max_elapsed_seconds` | `None`; a cooperative check between operations. Run scope counts active invocation time and excludes recorded human waits; session scope counts wall time since creation. Use a deadline to interrupt a stalled operation. |
+| `limits.max_elapsed_seconds` | `None`; checked between operations and also bounds a model call or tool call in flight (see [elapsed time in flight](#run-elapsed-time-in-flight)). Run scope counts active invocation time and excludes recorded human waits; session scope counts wall time since creation. |
 
 A limit stop emits `session.interrupted` with `reason="limit_reached"`, `limit`
 naming the bound, and `structured_output_pending` saying whether a requested
@@ -10855,12 +10855,46 @@ mechanism. A valid answer is published before the limit interruption, with
 `structured_output_pending=false` and `finish_up=true`. An invalid answer ends
 with `structured_output_pending=true`; it gets no repair or research step.
 
-Finishing is best effort within the original authority. A long in-flight call
-can consume all remaining time or budget before the next model boundary. Cayu
-never extends a deadline or budget, dispatches after a hard gate denies admission,
-or guarantees a valid answer. Token and estimated-cost use can cross a limit in
-one admitted model call; a valid answer already returned by that final call is
-retained. Configure enough time reserve for the expected answer latency.
+Finishing is best effort within the original authority. Cayu never extends a
+deadline or budget, dispatches after a hard gate denies admission, or guarantees
+a valid answer. Token and estimated-cost use can cross a limit in one admitted
+model call; a valid answer already returned by that final call is retained.
+Configure enough time reserve for the expected answer latency.
+
+<a id="run-elapsed-time-in-flight"></a>
+`max_elapsed_seconds` also bounds work in flight, so a run ends at its limit
+rather than when a long call returns:
+
+- **Model calls.** A model step still in flight when the limit passes, the
+  finishing step included, is cancelled the way an interruption cancels it: the
+  provider call is cancelled, its budget reservations settle, and the step leaves
+  no answer. The run then stops with `session.limit_reached` and
+  `session.interrupted`, `limit="elapsed_seconds"`. Once the step's own
+  `model.completed` is published (a context-compaction completion earlier in the
+  step doesn't count), the rest of the step is local bookkeeping and is not cut.
+- **Tool calls.** Each ordinary tool call runs for at most the time left, or
+  `tool_timeout_seconds` if that is shorter. A call stopped by the run's time ends
+  with the timed-out result `tool_timeout_seconds` produces
+  (`terminal_outcome="tool_execution_timeout"`), with the content "Tool call
+  stopped after N seconds: the run reached its time limit." so the model and the
+  application see why. The effect rules are the same as for a timeout: an effect
+  that may have happened has `outcome_unknown=true`, and an `EXTERNAL` effect
+  needs manual reconciliation. The call already passed its policy or approval
+  and is not asked again. Calls of the round that hadn't started, including
+  parallel calls still waiting for a concurrency slot, are skipped without dispatch (`tool.call.failed`, `reason="limit_reached"`,
+  `skipped=true`). After the round, the run stops at the next boundary as before.
+- **Finishing.** With `on_limit="finish"` and a structured answer requested,
+  ordinary tool calls stop `finish_reserve_seconds` before the limit (or before
+  `execution_deadline`, whichever comes first), so the finishing step keeps the
+  reserve: the next model step is the finishing step, and it produces the
+  structured answer. Model steps are not stopped early: an ordinary step still runs
+  until the limit, because a step cut short leaves nothing to finish from. A step
+  that is still running at the limit ends the run with
+  `structured_output_pending=true`.
+- **Not cut.** Tool calls that run when a person settles an approval or answers a
+  question keep only their own `tool_timeout_seconds`; the limit applies at the
+  next boundary. `execution_deadline` keeps cancelling all in-flight work at its
+  expiry.
 
 `RunLimits` provides hard token/tool/time stop controls for runtime calls.
 `BudgetLimit` provides estimated-cost stop controls backed by an explicitly selected

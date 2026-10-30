@@ -97,6 +97,7 @@ from cayu.budgets.usage import (
     combine_session_usage_summaries,
     session_usage_summary,
 )
+from cayu.deadlines import current_execution_deadline
 from cayu.events import (
     Event,
     EventType,
@@ -2141,6 +2142,21 @@ class RunLimitController:
             (snapshot.summary, session_usage_summary(snapshot.summary.session_id, pending)),
         )
 
+    def elapsed_seconds(self, *, session: Session, limits: RunLimits, started_at: float) -> float:
+        """Time counted against ``max_elapsed_seconds`` on the clock ``limits.scope`` selects.
+
+        Session scope is wall time since the session was created, on the injected
+        clock. Run scope is monotonic time since ``started_at``, which continuations
+        have already shifted past recorded human waits.
+        """
+
+        if limits.scope == "session":
+            created_at = session.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            return max(0.0, (self._clock() - created_at.astimezone(UTC)).total_seconds())
+        return max(0.0, time.monotonic() - started_at)
+
     async def evaluate_operation_run_limit(
         self,
         *,
@@ -2159,20 +2175,16 @@ class RunLimitController:
                 await self._session_store.read_usage_accounting(EventQuery(session_id=session.id)),
                 usage_events,
             )
-            created_at = session.created_at
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=UTC)
-            elapsed_seconds = max(
-                0,
-                int((self._clock() - created_at.astimezone(UTC)).total_seconds()),
-            )
         else:
             usage = session_usage_summary(session.id, usage_events)
-            elapsed_seconds = max(0, int(time.monotonic() - operation_started_at))
         return first_reached_limit(
             limits=limits,
             usage=usage,
-            elapsed_seconds=elapsed_seconds,
+            elapsed_seconds=int(
+                self.elapsed_seconds(
+                    session=session, limits=limits, started_at=operation_started_at
+                )
+            ),
         )
 
     async def _cost_for_budget(
@@ -2392,16 +2404,9 @@ class RunLimitController:
                     total_tokens=max(0, current.total_tokens - baseline.total_tokens),
                 ),
             )
-        if limits.scope == "session":
-            created_at = session.created_at
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=UTC)
-            elapsed_seconds = max(
-                0,
-                int((self._clock() - created_at.astimezone(UTC)).total_seconds()),
-            )
-        else:
-            elapsed_seconds = max(0, int(time.monotonic() - run_started_at))
+        elapsed_seconds = int(
+            self.elapsed_seconds(session=session, limits=limits, started_at=run_started_at)
+        )
         decision = first_reached_limit(
             limits=limits,
             usage=usage_for_limits,
@@ -5633,6 +5638,7 @@ class RunLimitGate:
         run_budget_authorities: Mapping[str, RunBudgetAccountingAuthority] | None = None,
         pricing_provider_name: str | None = None,
         execution_profile_fingerprint: str | None = None,
+        reserve_finish_time: bool = False,
     ) -> None:
         self._controller = controller
         self._session = session
@@ -5648,6 +5654,99 @@ class RunLimitGate:
         self._pricing_provider_name = pricing_provider_name
         self._execution_profile_fingerprint = execution_profile_fingerprint
         self._usage_tracker = controller.usage_tracker(session.id)
+        # A run that finishes with a structured answer stops ordinary tool calls
+        # finish_reserve_seconds before max_elapsed_seconds, so the finishing
+        # model step keeps that time.
+        self._tool_reserve_seconds = (
+            limits.finish_reserve_seconds
+            if reserve_finish_time and limits.on_limit == "finish"
+            else 0
+        )
+
+    def _elapsed_seconds(self) -> float:
+        return self._controller.elapsed_seconds(
+            session=self._session, limits=self._limits, started_at=self._run_started_at
+        )
+
+    def elapsed_seconds_left(self) -> float | None:
+        """Seconds left before ``max_elapsed_seconds``, or ``None`` without that limit."""
+
+        maximum = self._limits.max_elapsed_seconds
+        if maximum is None:
+            return None
+        return maximum - self._elapsed_seconds()
+
+    def _deadline_seconds_left(self) -> float | None:
+        # The execution deadline cancels the whole run at its expiry. Only a
+        # finishing reserve needs ordinary tool calls to stop before it.
+        if not self._tool_reserve_seconds:
+            return None
+        return current_execution_deadline().remaining_seconds()
+
+    def tool_seconds_left(self) -> float | None:
+        """Seconds an ordinary tool call may still run before the run's time limit stops it.
+
+        That is the time left before ``max_elapsed_seconds`` or, with a finishing
+        reserve, before the earlier of that limit and the execution deadline,
+        less the reserve.
+        """
+
+        bounds = [
+            bound
+            for bound in (self.elapsed_seconds_left(), self._deadline_seconds_left())
+            if bound is not None
+        ]
+        return min(bounds) - self._tool_reserve_seconds if bounds else None
+
+    def elapsed_limit_decision(self) -> StopDecision:
+        """The stop for work cut off in flight when ``max_elapsed_seconds`` passed."""
+
+        maximum = self._limits.max_elapsed_seconds
+        if maximum is None:
+            raise RuntimeError("An elapsed-time stop requires max_elapsed_seconds.")
+        # The cut fires at the limit; whole-second rounding must not report less.
+        actual = max(int(self._elapsed_seconds()), maximum)
+        return StopDecision(
+            limit=StopLimit.ELAPSED_SECONDS,
+            maximum=maximum,
+            actual=actual,
+            message=f"Run limit reached: elapsed_seconds {actual} >= {maximum}.",
+        )
+
+    def tool_cutoff_decision(self) -> StopDecision | None:
+        """The finishing stop for tool dispatch once only the finishing reserve is left.
+
+        ``None`` unless the run reserves time for a finishing step and no time
+        before that reserve is left. Without a reserve, the hard elapsed-time
+        check stops tool dispatch instead.
+        """
+
+        reserve = self._tool_reserve_seconds
+        if not reserve:
+            return None
+        maximum = self._limits.max_elapsed_seconds
+        elapsed_left = self.elapsed_seconds_left()
+        deadline_left = self._deadline_seconds_left()
+        if (
+            maximum is not None
+            and elapsed_left is not None
+            and elapsed_left <= reserve
+            and (deadline_left is None or elapsed_left <= deadline_left)
+        ):
+            return StopDecision(
+                limit=StopLimit.ELAPSED_SECONDS,
+                maximum=maximum,
+                actual=int(self._elapsed_seconds()),
+                message="Finishing before the elapsed-time limit.",
+            )
+        if deadline_left is not None and deadline_left <= reserve:
+            return StopDecision(
+                limit=StopLimit.EXECUTION_DEADLINE,
+                maximum=reserve,
+                actual=Decimal(str(deadline_left)),
+                message="Finishing within the remaining execution deadline.",
+            )
+        return None
 
     async def evaluate_limits(
         self,

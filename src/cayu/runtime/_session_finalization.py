@@ -206,6 +206,7 @@ from cayu.runtime._terminal_evidence_reader import (
 )
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
 from cayu.runtime._tool_round_executor import (
+    ToolRoundFinishCutoffRequest,
     ToolRoundLimitRequest,
     ordered_tool_result_messages,
 )
@@ -3463,6 +3464,27 @@ class SessionFinalization:
             active_run=request.active_run,
             execution_profile=request.execution_profile,
             invocation_context=request.invocation_context,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+
+    async def close_tool_round_at_finish_cutoff(
+        self,
+        request: ToolRoundFinishCutoffRequest,
+    ) -> AsyncGenerator[Event, None]:
+        """Skip a round's undispatched calls and keep the session running to finish."""
+
+        stream = self._close_limited_tool_round(
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            messages=request.messages,
+            tool_calls=request.tool_calls,
+            completed_tool_outcomes=request.completed_tool_outcomes,
+            decision=request.decision,
+            tool_round_identity=request.tool_round_identity,
+            execution_profile=request.execution_profile,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:

@@ -169,6 +169,7 @@ from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicyError,
     mcp_manifest_policy_payload,
 )
+from cayu.runtime.stop_policy import StopDecision
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -240,6 +241,24 @@ class ToolRoundLimitRequest:
 
 
 LimitEventStream = Callable[[ToolRoundLimitRequest], AsyncIterator[Event]]
+
+
+@dataclass(frozen=True)
+class ToolRoundFinishCutoffRequest:
+    """Skip a round's undispatched calls so the run keeps its finishing reserve."""
+
+    decision: StopDecision
+    session: Session
+    registered_agent: runtime_records.RegisteredAgentState
+    registered_environment: runtime_records.RegisteredEnvironment | None
+    messages: list[Message]
+    tool_calls: list[runtime_records.ToolCallRequest]
+    completed_tool_outcomes: list[runtime_records.ToolCallOutcome]
+    tool_round_identity: ToolRoundIdentity
+    execution_profile: ExecutionProfileIdentity | None
+
+
+FinishCutoffEventStream = Callable[[ToolRoundFinishCutoffRequest], AsyncIterator[Event]]
 InterruptedRoundEventStream = Callable[[InterruptedToolRoundRequest], AsyncGenerator[Event, None]]
 
 
@@ -280,6 +299,7 @@ class ToolRoundExecutor:
         clock: Callable[[], datetime],
         checkpoint_transform: CheckpointTransformFactory,
         apply_limit_evaluation: LimitEventStream,
+        close_round_at_finish_cutoff: FinishCutoffEventStream,
         close_interrupted_round: InterruptedRoundEventStream,
         publish_session_wake: Callable[[PendingUserInput], Awaitable[None]] | None = None,
         subagent_may_sleep: Callable[[Session], Awaitable[bool]] | None = None,
@@ -294,6 +314,7 @@ class ToolRoundExecutor:
         self._clock = clock
         self._checkpoint_transform = checkpoint_transform
         self._apply_limit_evaluation = apply_limit_evaluation
+        self._close_round_at_finish_cutoff = close_round_at_finish_cutoff
         self._close_interrupted_round = close_interrupted_round
         self._publish_session_wake = publish_session_wake
         self._subagent_may_sleep = subagent_may_sleep
@@ -1337,6 +1358,7 @@ class ToolRoundRun:
             raise ValueError("Tool-round execution lost frozen invocation authority.")
         self._invocation_context = invocation_context
         self.stopped_for_limit = False
+        self.closed_for_finish = False
         self.user_input_pause_superseded = False
 
     def _wake_allowed(self) -> bool:
@@ -1397,11 +1419,8 @@ class ToolRoundRun:
         model_step: int | None = None,
     ) -> AsyncGenerator[Event, None]:
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
-        model_attempt_identity = ModelAttemptIdentity(
-            model_step_id=tool_round_identity.model_step_id,
-            model_attempt_id=tool_round_identity.model_attempt_id,
-        )
         self.stopped_for_limit = False
+        self.closed_for_finish = False
         self.user_input_pause_superseded = False
         executor = self._executor
         session = self._session
@@ -1503,19 +1522,15 @@ class ToolRoundRun:
                         yield event
                 raise
 
-        limit_evaluation = await self._limit_gate.evaluate_limits(
+        async for event in self._check_dispatch_limits(
             pending_tool_calls=len(tool_calls),
-            execution_identity=model_attempt_identity,
-        )
-        async for event in self._apply_limit_evaluation(
-            limit_evaluation,
             messages=messages,
             tool_calls=tool_calls,
+            completed_tool_outcomes=tool_outcomes,
             tool_round_identity=tool_round_identity,
         ):
             yield event
-        if limit_evaluation.decision is not None:
-            self.stopped_for_limit = True
+        if self.stopped_for_limit or self.closed_for_finish:
             return
 
         if policy_plan.pending_approval is not None:
@@ -1705,10 +1720,14 @@ class ToolRoundRun:
         round_cancellation_baseline = 0 if round_task is None else round_task.cancelling()
         try:
             await round_owner.admit()
-            for run_parallel, segment_calls in segments:
+            for segment_index, (run_parallel, segment_calls) in enumerate(segments):
                 if run_parallel:
                     call_stream = self._run_tool_calls_parallel(
+                        messages=messages,
                         tool_calls=segment_calls,
+                        round_tool_calls=tool_calls,
+                        # The round's own check admitted the first segment.
+                        check_dispatch_limits=segment_index > 0,
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
                         policy_evidence_by_id=policy_evidence_by_id,
@@ -1732,6 +1751,11 @@ class ToolRoundRun:
                             round_owner.record_redactor if round_owner.defers_terminals else None
                         ),
                         publication_snapshot_observer=round_owner.record_publication_snapshot,
+                        publish_staged_terminals=(
+                            round_owner.publish_before_limit
+                            if round_owner.defers_terminals
+                            else None
+                        ),
                     )
                 else:
                     call_stream = self._run_tool_calls_sequential(
@@ -1773,9 +1797,9 @@ class ToolRoundRun:
                     async for event, outcome in owned_stream:
                         yield event
                         round_owner.observe_execution(event, outcome)
-                if self.stopped_for_limit:
+                if self.stopped_for_limit or self.closed_for_finish:
                     break
-            if self.stopped_for_limit:
+            if self.stopped_for_limit or self.closed_for_finish:
                 round_owner.finish_dispatch()
                 return
         except WorkspaceMutationSettlementError as settlement_failure:
@@ -1984,6 +2008,63 @@ class ToolRoundRun:
         async for event in self._executor._apply_limit_evaluation(request):
             yield event
 
+    async def _check_dispatch_limits(
+        self,
+        *,
+        pending_tool_calls: int,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
+        tool_round_identity: ToolRoundIdentity,
+        publish_staged_terminals: Callable[[], AsyncIterator[Event]] | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        """Stop at a hard limit, or close the round when only the finishing reserve is left.
+
+        Sets ``stopped_for_limit`` or ``closed_for_finish``; either means no
+        further call of this round may be dispatched.
+        """
+
+        limit_evaluation = await self._limit_gate.evaluate_limits(
+            pending_tool_calls=pending_tool_calls,
+            execution_identity=ModelAttemptIdentity(
+                model_step_id=tool_round_identity.model_step_id,
+                model_attempt_id=tool_round_identity.model_attempt_id,
+            ),
+        )
+        async for event in self._apply_limit_evaluation(
+            limit_evaluation,
+            messages=messages,
+            tool_calls=tool_calls,
+            completed_tool_outcomes=completed_tool_outcomes,
+            tool_round_identity=tool_round_identity,
+            publish_staged_terminals=publish_staged_terminals,
+        ):
+            yield event
+        if limit_evaluation.decision is not None:
+            self.stopped_for_limit = True
+            return
+        cutoff = self._limit_gate.tool_cutoff_decision()
+        if cutoff is None:
+            return
+        if publish_staged_terminals is not None:
+            async for event in publish_staged_terminals():
+                yield event
+        async for event in self._executor._close_round_at_finish_cutoff(
+            ToolRoundFinishCutoffRequest(
+                decision=cutoff,
+                session=self._session,
+                registered_agent=self._registered_agent,
+                registered_environment=self._registered_environment,
+                messages=messages,
+                tool_calls=tool_calls,
+                completed_tool_outcomes=completed_tool_outcomes,
+                tool_round_identity=copy_tool_round_identity(tool_round_identity),
+                execution_profile=self._execution_profile,
+            )
+        ):
+            yield event
+        self.closed_for_finish = True
+
     async def close_after_interrupt(
         self,
         exc: BaseException,
@@ -2117,18 +2198,10 @@ class ToolRoundRun:
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
         if round_tool_calls is None:
             round_tool_calls = tool_calls
-        model_attempt_identity = ModelAttemptIdentity(
-            model_step_id=tool_round_identity.model_step_id,
-            model_attempt_id=tool_round_identity.model_attempt_id,
-        )
         for tool_call in tool_calls:
             await self._executor._session_control.raise_if_interrupted(self._session.id)
-            limit_evaluation = await self._limit_gate.evaluate_limits(
+            async for event in self._check_dispatch_limits(
                 pending_tool_calls=1,
-                execution_identity=model_attempt_identity,
-            )
-            async for event in self._apply_limit_evaluation(
-                limit_evaluation,
                 messages=messages,
                 tool_calls=round_tool_calls,
                 completed_tool_outcomes=tool_outcomes,
@@ -2136,8 +2209,7 @@ class ToolRoundRun:
                 publish_staged_terminals=publish_staged_terminals,
             ):
                 yield event, None
-            if limit_evaluation.decision is not None:
-                self.stopped_for_limit = True
+            if self.stopped_for_limit or self.closed_for_finish:
                 return
             stream = self._executor.invocation.execute(
                 session=self._session,
@@ -2165,6 +2237,7 @@ class ToolRoundRun:
                 deferred_terminal_capture_recorder=deferred_terminal_capture_recorder,
                 resolved_redactor_observer=resolved_redactor_observer,
                 publication_snapshot_observer=publication_snapshot_observer,
+                run_time_left=self._limit_gate.tool_seconds_left,
             )
             async with aclosing(stream) as owned_stream:
                 async for event, outcome in owned_stream:
@@ -2174,7 +2247,10 @@ class ToolRoundRun:
     async def _run_tool_calls_parallel(
         self,
         *,
+        messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
+        round_tool_calls: list[runtime_records.ToolCallRequest],
+        check_dispatch_limits: bool,
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         policy_results_by_id: dict[str, ToolPolicyResult | None],
         policy_evidence_by_id: dict[str, ToolPolicyEvidence],
@@ -2196,16 +2272,35 @@ class ToolRoundRun:
             ]
             | None
         ) = None,
+        publish_staged_terminals: Callable[[], AsyncIterator[Event]] | None = None,
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
+        if check_dispatch_limits:
+            async for event in self._check_dispatch_limits(
+                pending_tool_calls=len(tool_calls),
+                messages=messages,
+                tool_calls=round_tool_calls,
+                completed_tool_outcomes=tool_outcomes,
+                tool_round_identity=tool_round_identity,
+                publish_staged_terminals=publish_staged_terminals,
+            ):
+                yield event, None
+            if self.stopped_for_limit or self.closed_for_finish:
+                return
         semaphore = asyncio.Semaphore(self._executor._max_parallel_tool_calls)
         buffers: list[list[tuple[Event, runtime_records.ToolCallOutcome | None]]] = [
             [] for _ in tool_calls
         ]
         child_cancellations: list[asyncio.CancelledError | None] = [None] * len(tool_calls)
+        # Calls whose concurrency slot came only after the run's time ran out.
+        out_of_time: set[int] = set()
 
         async def execute_call(index: int, tool_call: runtime_records.ToolCallRequest) -> None:
             async with semaphore:
                 await self._executor._session_control.raise_if_interrupted(self._session.id)
+                time_left = self._limit_gate.tool_seconds_left()
+                if time_left is not None and time_left <= 0:
+                    out_of_time.add(index)
+                    return
                 try:
                     stream = self._executor.invocation.execute(
                         session=self._session,
@@ -2235,6 +2330,7 @@ class ToolRoundRun:
                         deferred_terminal_capture_recorder=deferred_terminal_capture_recorder,
                         resolved_redactor_observer=resolved_redactor_observer,
                         publication_snapshot_observer=publication_snapshot_observer,
+                        run_time_left=self._limit_gate.tool_seconds_left,
                     )
                     async with aclosing(stream) as owned_stream:
                         async for item in owned_stream:
@@ -2367,8 +2463,10 @@ class ToolRoundRun:
         if current_cancellation_failure is not None:
             raise current_cancellation_failure
         for index, tool_call in enumerate(tool_calls):
-            if deferred_terminal_stager is None and all(
-                outcome is None for _, outcome in buffers[index]
+            if (
+                index not in out_of_time
+                and deferred_terminal_stager is None
+                and all(outcome is None for _, outcome in buffers[index])
             ):
                 buffers[index].append(
                     await self._abnormal_tool_termination_item(
@@ -2379,6 +2477,20 @@ class ToolRoundRun:
         for buffer in buffers:
             for item in buffer:
                 yield item
+        if not out_of_time:
+            return
+        # Never dispatched: the limit stop or finishing closure skips them.
+        async for event in self._check_dispatch_limits(
+            pending_tool_calls=len(out_of_time),
+            messages=messages,
+            tool_calls=round_tool_calls,
+            completed_tool_outcomes=tool_outcomes,
+            tool_round_identity=tool_round_identity,
+            publish_staged_terminals=publish_staged_terminals,
+        ):
+            yield event, None
+        if not (self.stopped_for_limit or self.closed_for_finish):
+            raise RuntimeError("Parallel tool calls ran out of time without a limit decision.")
 
     async def _abnormal_tool_termination_item(
         self,
