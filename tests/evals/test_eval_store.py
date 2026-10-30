@@ -9,6 +9,7 @@ from tests.evals.eval_store_conformance import (
     _scenario,
     assert_eval_store_conformance,
     assert_scenario_progress_conformance,
+    assert_trial_distribution_conformance,
 )
 from tests.evals.test_corpus_execution import (
     _corpus,
@@ -90,6 +91,7 @@ def test_memory_eval_store_shared_conformance() -> None:
             InMemoryEvalStore(),
             corpus=corpus,
         )
+        await assert_trial_distribution_conformance(InMemoryEvalStore(), corpus=corpus)
 
     asyncio.run(exercise())
 

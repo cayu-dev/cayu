@@ -29,6 +29,7 @@ from cayu.storage._completion_evaluation_schema import POSTGRES_COMPLETION_EVALU
 from cayu.storage._completion_verifier_dispatch_schema import (
     POSTGRES_COMPLETION_VERIFIER_DISPATCH_DDL,
 )
+from cayu.storage._eval_trial_slot_schema import POSTGRES_EVAL_RUN_TRIAL_SLOT_DDL
 from cayu.storage._external_wait_schema import POSTGRES_EXTERNAL_WAIT_DDL
 from cayu.storage._model_policy_schema import POSTGRES_MODEL_POLICY_DDL
 from cayu.storage._participant_bindings_schema import POSTGRES_PARTICIPANT_BINDINGS_DDL
@@ -780,6 +781,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "NOT NULL DEFAULT '[]'::jsonb",
     ),
     136: POSTGRES_TASK_STEP_DDL,
+    138: POSTGRES_EVAL_RUN_TRIAL_SLOT_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

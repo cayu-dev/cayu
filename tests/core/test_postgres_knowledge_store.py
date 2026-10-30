@@ -1048,6 +1048,7 @@ _TABLES = (
     "cayu_agent_snapshot_gc_plans",
     "cayu_agent_snapshot_gc_receipts",
     "cayu_task_steps",
+    "cayu_eval_run_trial_slots",
     "cayu_schema_migrations",
 )
 

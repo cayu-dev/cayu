@@ -83,7 +83,15 @@ from cayu.evals.result_contract import (
     PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
     _EvalTrialPublicData,
 )
-from cayu.evals.runner import EvalCase, EvalSuite, _run_eval_suite_with_public_projection
+from cayu.evals.runner import (
+    EvalCase,
+    EvalSuite,
+    TrialExecution,
+    _ClaimedTrial,
+    _run_claimed_suite_trials_with_public_projection,
+    _run_eval_suite_with_public_projection,
+    _TrialClaims,
+)
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.evals.workflow_target import (
     WORKFLOW_EVAL_DEFAULT_CLOSE_TIMEOUT_SECONDS,
@@ -1535,24 +1543,30 @@ async def run_corpus_suite(
     )
 
 
-async def _run_compiled_corpus_suite(
+@dataclass(frozen=True)
+class _CorpusExecutionPlan:
+    """What every process that runs trials of one compiled suite must agree on."""
+
+    target: CorpusTarget
+    target_before: EvaluationTargetIdentity
+    run_id: str
+    output_preview_bytes: int
+    run_stream: Callable[[RunRequest], Any] | None
+    trial_request_transform: Callable[[str, str, int, RunRequest], RunRequest] | None
+    external_trials: tuple[ExternalTrialIdentityV1, ...]
+    workflow_execution_profile_fingerprint: str | None
+
+
+async def _plan_compiled_corpus_execution(
     target: CorpusTarget,
     compiled: CompiledCorpusSuite,
     *,
     max_concurrency: int,
-    manifest_project_root: Path | None = None,
-    expected_app_manifest_fingerprint: str | None = None,
-    expected_execution_profile: ExecutionProfileIdentity | None = None,
-    native_run_id: str | None = None,
-    execution_capacity: EvalExecutionCapacity | None = None,
-    accepted_exposure: EvalSuiteRunExposureV1 | None = None,
-    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]
-    | None = None,
-    trial_completed: Callable[[str, EvalTrialResult, _EvalTrialPublicData], Awaitable[None]]
-    | None = None,
-) -> CorpusExecutionResult:
-    """Execute one internally compiled suite without repeating corpus compilation."""
-
+    manifest_project_root: Path | None,
+    expected_app_manifest_fingerprint: str | None,
+    expected_execution_profile: ExecutionProfileIdentity | None,
+    native_run_id: str | None,
+) -> _CorpusExecutionPlan:
     validated_target = _copy_corpus_target(target)
     if type(compiled) is not CompiledCorpusSuite:
         raise TypeError("compiled must be an exact CompiledCorpusSuite.")
@@ -1567,8 +1581,6 @@ async def _run_compiled_corpus_suite(
         raise TypeError(
             "expected_execution_profile must be an exact ExecutionProfileIdentity or None."
         )
-    if accepted_exposure is not None and type(accepted_exposure) is not EvalSuiteRunExposureV1:
-        raise TypeError("accepted_exposure must be an exact EvalSuiteRunExposureV1 or None.")
     _validate_corpus_concurrency(validated_target, max_concurrency)
     if max_concurrency > compiled.run_contract.trial_policy.max_concurrency:
         raise ValueError("max_concurrency cannot exceed the immutable suite trial policy.")
@@ -1674,13 +1686,10 @@ async def _run_compiled_corpus_suite(
 
         trial_request_transform = external_trial_request
 
-    internal_run, trial_public_data_by_case = await _run_eval_suite_with_public_projection(
-        validated_target.app,
-        compiled.suite,
-        max_concurrency=max_concurrency,
-        case_timeout_seconds=compiled.timeout_seconds,
-        trials=compiled.trials,
-        trial_policy=compiled.run_contract.trial_policy,
+    return _CorpusExecutionPlan(
+        target=validated_target,
+        target_before=target_before,
+        run_id=selected_run_id,
         output_preview_bytes=output_preview_bytes,
         run_stream=(
             run_stream
@@ -1691,17 +1700,62 @@ async def _run_compiled_corpus_suite(
             )
             else None
         ),
-        run_id=selected_run_id,
         trial_request_transform=trial_request_transform,
+        external_trials=external_trials,
+        workflow_execution_profile_fingerprint=workflow_execution_profile_fingerprint,
+    )
+
+
+async def _run_compiled_corpus_suite(
+    target: CorpusTarget,
+    compiled: CompiledCorpusSuite,
+    *,
+    max_concurrency: int,
+    manifest_project_root: Path | None = None,
+    expected_app_manifest_fingerprint: str | None = None,
+    expected_execution_profile: ExecutionProfileIdentity | None = None,
+    native_run_id: str | None = None,
+    execution_capacity: EvalExecutionCapacity | None = None,
+    accepted_exposure: EvalSuiteRunExposureV1 | None = None,
+    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]
+    | None = None,
+    trial_completed: Callable[[str, EvalTrialResult, _EvalTrialPublicData], Awaitable[None]]
+    | None = None,
+) -> CorpusExecutionResult:
+    """Execute one internally compiled suite without repeating corpus compilation."""
+
+    if accepted_exposure is not None and type(accepted_exposure) is not EvalSuiteRunExposureV1:
+        raise TypeError("accepted_exposure must be an exact EvalSuiteRunExposureV1 or None.")
+    plan = await _plan_compiled_corpus_execution(
+        target,
+        compiled,
+        max_concurrency=max_concurrency,
+        manifest_project_root=manifest_project_root,
+        expected_app_manifest_fingerprint=expected_app_manifest_fingerprint,
+        expected_execution_profile=expected_execution_profile,
+        native_run_id=native_run_id,
+    )
+    validated_target = plan.target
+    internal_run, trial_public_data_by_case = await _run_eval_suite_with_public_projection(
+        validated_target.app,
+        compiled.suite,
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=compiled.timeout_seconds,
+        trials=compiled.trials,
+        trial_policy=compiled.run_contract.trial_policy,
+        output_preview_bytes=plan.output_preview_bytes,
+        run_stream=plan.run_stream,
+        run_id=plan.run_id,
+        trial_request_transform=plan.trial_request_transform,
         execution_capacity=execution_capacity,
         completed_trials=completed_trials,
         trial_completed=trial_completed,
         workflow_target=(
             validated_target if type(validated_target) is WorkflowEvalTarget else None
         ),
-        workflow_execution_profile_fingerprint=workflow_execution_profile_fingerprint,
+        workflow_execution_profile_fingerprint=plan.workflow_execution_profile_fingerprint,
     )
-    if workflow_execution_profile_fingerprint is not None:
+    if plan.workflow_execution_profile_fingerprint is not None:
         try:
             final_workflow_execution_profile_fingerprint = (
                 await validated_target.app.inspect_run_execution_profile(
@@ -1713,7 +1767,10 @@ async def _run_compiled_corpus_suite(
                 "Workflow target execution profile could not be revalidated "
                 f"({type(exc).__name__})."
             ) from None
-        if final_workflow_execution_profile_fingerprint != workflow_execution_profile_fingerprint:
+        if (
+            final_workflow_execution_profile_fingerprint
+            != plan.workflow_execution_profile_fingerprint
+        ):
             raise EvalExecutionProfileChangedError(
                 "Workflow target execution profile changed during eval execution."
             )
@@ -1721,26 +1778,75 @@ async def _run_compiled_corpus_suite(
         _finalize_compiled_corpus_result,
         validated_target,
         compiled,
-        target_before,
+        plan.target_before,
         internal_run,
         trial_public_data_by_case,
         manifest_project_root,
-        external_trials,
+        plan.external_trials,
         accepted_exposure,
     )
 
 
-def _finalize_compiled_corpus_result(
+async def _run_compiled_corpus_trials(
     target: CorpusTarget,
     compiled: CompiledCorpusSuite,
+    *,
+    trial_claims: _TrialClaims,
+    max_concurrency: int,
+    manifest_project_root: Path | None = None,
+    expected_app_manifest_fingerprint: str | None = None,
+    expected_execution_profile: ExecutionProfileIdentity | None = None,
+    native_run_id: str | None = None,
+    execution_capacity: EvalExecutionCapacity | None = None,
+) -> None:
+    """Run the trials of a compiled suite that ``trial_claims`` hands this process.
+
+    Each trial runs exactly as ``_run_compiled_corpus_suite`` would run it for
+    the same ``native_run_id``; the run's owner aggregates the retained trials.
+    """
+
+    if type(target) is WorkflowEvalTarget:
+        raise ValueError("A workflow eval target runs all of a run's trials in one process.")
+    plan = await _plan_compiled_corpus_execution(
+        target,
+        compiled,
+        max_concurrency=max_concurrency,
+        manifest_project_root=manifest_project_root,
+        expected_app_manifest_fingerprint=expected_app_manifest_fingerprint,
+        expected_execution_profile=expected_execution_profile,
+        native_run_id=native_run_id,
+    )
+
+    async def unchanged_target() -> None:
+        await asyncio.to_thread(
+            _require_unchanged_target,
+            plan.target,
+            plan.target_before,
+            manifest_project_root,
+        )
+
+    await _run_claimed_suite_trials_with_public_projection(
+        plan.target.app,
+        compiled.suite,
+        trial_claims=_TargetCheckedClaims(trial_claims, unchanged_target),
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=compiled.timeout_seconds,
+        trials=compiled.trials,
+        trial_policy=compiled.run_contract.trial_policy,
+        output_preview_bytes=plan.output_preview_bytes,
+        run_stream=plan.run_stream,
+        run_id=plan.run_id,
+        trial_request_transform=plan.trial_request_transform,
+        execution_capacity=execution_capacity,
+    )
+
+
+def _require_unchanged_target(
+    target: CorpusTarget,
     target_before: EvaluationTargetIdentity,
-    internal_run: EvalRun,
-    trial_public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]],
     manifest_project_root: Path | None,
-    external_trials: tuple[ExternalTrialIdentityV1, ...] = (),
-    accepted_exposure: EvalSuiteRunExposureV1 | None = None,
-) -> CorpusExecutionResult:
-    """Construct and validate the complete published result off the event loop."""
+) -> None:
+    """Refuse results of a target whose identity changed while they were produced."""
 
     target_after = _evaluation_target_identity_from_validated_target(
         target,
@@ -1757,6 +1863,60 @@ def _finalize_compiled_corpus_result(
             "CorpusTarget application manifest changed or execution target identity changed "
             "during eval execution."
         )
+
+
+class _TargetCheckedClaims:
+    """Claims whose trials retain a result only while their target is unchanged."""
+
+    def __init__(self, claims: _TrialClaims, check: Callable[[], Awaitable[None]]) -> None:
+        self._claims = claims
+        self._check = check
+
+    async def claim(self) -> _TargetCheckedTrial | None:
+        claimed = await self._claims.claim()
+        return None if claimed is None else _TargetCheckedTrial(claimed, self._check)
+
+    async def wait(self) -> bool:
+        return await self._claims.wait()
+
+
+class _TargetCheckedTrial:
+    def __init__(self, claimed: _ClaimedTrial, check: Callable[[], Awaitable[None]]) -> None:
+        self._claimed = claimed
+        self._check = check
+
+    @property
+    def case_id(self) -> str:
+        return self._claimed.case_id
+
+    @property
+    def trial_number(self) -> int:
+        return self._claimed.trial_number
+
+    async def settle(self, execute: Callable[[], Awaitable[TrialExecution]]) -> None:
+        async def checked() -> TrialExecution:
+            execution = await execute()
+            # As a single process checks its target after its last trial, every
+            # worker checks it after each trial, before the result is retained.
+            await self._check()
+            return execution
+
+        await self._claimed.settle(checked)
+
+
+def _finalize_compiled_corpus_result(
+    target: CorpusTarget,
+    compiled: CompiledCorpusSuite,
+    target_before: EvaluationTargetIdentity,
+    internal_run: EvalRun,
+    trial_public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]],
+    manifest_project_root: Path | None,
+    external_trials: tuple[ExternalTrialIdentityV1, ...] = (),
+    accepted_exposure: EvalSuiteRunExposureV1 | None = None,
+) -> CorpusExecutionResult:
+    """Construct and validate the complete published result off the event loop."""
+
+    _require_unchanged_target(target, target_before, manifest_project_root)
     run_document: dict[str, Any] = _model_instance_python_input(internal_run)
     run_document["run_contract"] = compiled.run_contract
     bound_run = EvalRun.model_validate(run_document)

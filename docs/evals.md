@@ -95,8 +95,11 @@ To run more trials at once, run them in more processes:
 - For durable runs that `cayu serve` admits, an eval worker (`[tool.cayu.evals]
   worker`, see [server-attached durable
   execution](#server-attached-durable-execution)) started with `cayu worker
-  NAME --processes N` runs several runs at once, one per process. The trials of
-  one run still execute in the process that claimed it.
+  NAME --processes N` spreads a run's trials across its processes, and across
+  any other worker with the run's target registered, up to the run's
+  `max_concurrency` in total; see [spread a run's trials across worker
+  processes](#spread-a-runs-trials-across-worker-processes) for the runs that
+  stay in one process.
 
 Every process must use the same durable store. SQLite allows one writer at a
 time, so sustained writes from several processes want PostgreSQL.
@@ -633,8 +636,9 @@ provenance. Saving an unchanged document with its own revision as parent is a
 read-only no-op: the document must already exist and no associations are added.
 New saves without a parent retain ordinary immutable authored-suite behavior.
 Atomic parent binding and source preservation were introduced in storage revision
-131; current SQLite and PostgreSQL EvalStore implementations require revision 132,
-which also supports reported evaluation evidence. Custom EvalStore
+131; current SQLite and PostgreSQL EvalStore implementations require revision 138,
+which also supports reported evaluation evidence (132) and trials that several
+workers claim (138). Custom EvalStore
 adapters remain readable but cannot admit fresh eval work unless they implement
 the fenced terminal-checkpoint contract and declare `trial_checkpointing = True`.
 These authoring contracts
@@ -3135,6 +3139,23 @@ shutdown. Those execution-loop policies are deliberately outside the store;
 the server-attached coordinator described below provides the built-in durable
 implementation.
 
+A run's owner can also open its trials to every worker with the run's target
+registered. `open_run_trials(claim, slots)` lists exactly the trials of the run's
+suite, in the order they are handed out. `claim_run_trial(target_keys)` then
+claims the next open trial of the oldest running run: one with no checkpoint and
+no live claim, while the run has fewer live trial claims than its
+`max_concurrency`. A trial claim is fenced like a run claim, by a private token,
+its own epoch and a lease. `heartbeat_run_trial` renews it and reports the run's
+lifecycle, `save_claimed_trial_checkpoint` retains the trial's terminal result as
+the run's ordinary checkpoint and ends the claim, and `release_run_trial` gives
+the trial back. A worker that is lost keeps nothing: its claim expires and the
+trial is claimed again under the next epoch, and the lost claim can no longer
+retain a result. A later owner opens the trials again under its own ownership
+epoch, which ends every trial claim taken under an earlier owner, while retained
+checkpoints stay. `unfinished_run_trials(claim)` counts the open trials still
+without a checkpoint. Stores declare this with `trial_distribution = True`; the
+built-in stores need storage revision 138 for it.
+
 Catalog and run lists use opaque keyset cursors plus caller-controlled item and
 byte ceilings. Full corpus and result reads check their exact stored UTF-8 size
 before hydrating the document. The durable result is the bounded,
@@ -3332,6 +3353,45 @@ durable store (`CAYU_DATABASE_URL` or `[tool.cayu.session_store]`); without
 either it says so and runs no eval runs. Its runs use the execution profile the
 web process admitted them under, so a target with process-local components,
 whose profile differs between processes, can't move to a worker.
+
+#### Spread a run's trials across worker processes
+
+A run whose trials may run concurrently (its `max_concurrency` is above one)
+doesn't have to run them all in the process that claimed it. That process, the
+run's owner, opens the trials, and every process with the run's target
+registered claims them one at a time from the durable store: the owner's own
+trials and those of any worker that has no run of its own to claim. Each
+process runs at most its share of the run's concurrent trials, and the store
+never lets more than the run's `max_concurrency` run at once across all of them.
+
+```bash
+cayu worker evals --processes 4
+```
+
+The processes of one `cayu worker NAME --processes N` share each run: with
+`max_concurrency` 8, each runs at most two of its trials at once
+(`ceil(8 / 4)`), so the run uses four cores instead of queuing eight sessions on
+one (see [project workers](project-workers.md#one-process-is-one-cpu-core)). A
+process started on its own counts as one and may take a run's whole
+concurrency; `execution_capacity` still bounds every process. All the
+processes must use the same durable store (SQLite allows one writer at a time,
+so sustained use wants PostgreSQL) and run the same release: a process whose
+target's execution profile differs from the one the run was admitted under
+leaves its trials to the others.
+
+The owner waits until every trial has a checkpoint, its own or another
+worker's, and then aggregates them in trial order exactly as a run resumed from
+its checkpoints does, so the published run has the same case and trial order,
+aggregates and identities as one process running every trial. A worker lost
+mid-trial keeps nothing: its trial's lease expires and the owner, or another
+worker, claims the trial again under a new epoch. If the owner is lost, the next
+owner takes the run over as before, opens its trials again, and keeps the
+checkpoints already retained; trials other workers were still running then are
+run again. Runs that stay in one process: scenario runs, runs with a
+`recovery_policy` (it counts whole run attempts), workflow targets, and runs at
+concurrency one. Direct runs of `cayu eval run` spread over processes with
+`--processes` instead (see [multiple CPU cores from the
+CLI](#multiple-cpu-cores-from-the-cli)).
 
 A project may also declare one bounded default model judge without writing
 Evals-specific Python:

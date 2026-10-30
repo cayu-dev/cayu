@@ -100,6 +100,9 @@ from cayu.evals.store import (
     EvalRunStateConflict,
     EvalRunStatus,
     EvalRunTrialCheckpoint,
+    EvalRunTrialClaim,
+    EvalRunTrialLease,
+    EvalRunTrialSlot,
     EvalScenarioApprovalDecisionRecord,
     EvalScenarioApprovalSubmission,
     EvalScenarioCatalogEntry,
@@ -136,12 +139,14 @@ from cayu.evals.store import (
     _prepare_run_request_for_store,
     _prepare_scenario_catalog_for_store,
     _prepare_trial_checkpoint_for_store,
+    _PreparedEvalRunTrialCheckpoint,
     _read_limit,
     _scenario_progress_for_claim,
     _store_identifier,
     _validate_baseline_result,
     _validate_trial_checkpoints_for_result,
     _validated_trial_checkpoints,
+    _validated_trial_slots,
     authored_suite_catalog_entry,
     authored_suite_scenario_cases,
     decode_authored_suite_cursor,
@@ -164,11 +169,15 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDocument,
     eval_suite_document_from_json,
 )
+from cayu.storage._eval_trial_slot_schema import (
+    EVAL_RUN_TRIAL_SLOTS_REVISION,
+    EVAL_RUN_TRIAL_SLOTS_TABLE,
+)
 from cayu.storage._eval_view_queries import latest_case_results_sql, view_index_sql
 from cayu.storage._postgres_base import _configure_store_connection, _PostgresStoreBase
 from cayu.storage._postgres_verified_work import PostgresMutationMixin
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 132
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = EVAL_RUN_TRIAL_SLOTS_REVISION
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +268,12 @@ def _request_from_row(row: Any) -> EvalRunRequest:
         max_concurrency=row[6],
         invocation=invocation,
     )
+
+
+def _run_record_observation(row: Any) -> EvalRunObservation:
+    """The lifecycle projection of a row read with ``_RUN_COLUMNS``."""
+
+    return _run_observation_from_row((row[0], row[8], row[10], row[15], row[16]))
 
 
 def _run_observation_from_row(row: Any) -> EvalRunObservation:
@@ -495,6 +510,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
     trial_checkpointing: ClassVar[bool] = True
+    trial_distribution: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
     judge_calibrations: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_EVAL_MIN_REQUIRED_REVISION
@@ -1976,86 +1992,460 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                     row = await self._require_run_row(cur, claim.run_id, for_update=True)
                     now = await _database_now(cur)
                     self._require_live_claim(row, claim, now)
+                    await self._retain_trial_checkpoint(cur, row, prepared, now)
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    @staticmethod
+    async def _retain_trial_checkpoint(
+        cur: Any,
+        row: Any,
+        prepared: _PreparedEvalRunTrialCheckpoint,
+        now: datetime,
+    ) -> None:
+        """Insert one terminal trial of the run in ``row``; the same result again is a no-op."""
+
+        request = _request_from_row(row)
+        await cur.execute(
+            """
+            SELECT suites.trials
+            FROM cayu_eval_suites AS suites
+            JOIN cayu_eval_cases AS cases
+              ON cases.corpus_revision = suites.corpus_revision
+             AND cases.suite_id = suites.suite_id
+            WHERE suites.corpus_revision = %s AND suites.suite_id = %s
+              AND cases.case_id = %s
+            """,
+            (
+                request.corpus_revision,
+                request.suite_id,
+                prepared.checkpoint.case_id,
+            ),
+        )
+        suite_row = await cur.fetchone()
+        if suite_row is None:
+            raise EvalRunStateConflict("Eval trial checkpoint case does not belong to its run.")
+        validated = prepared.checkpoint
+        if validated.trial_number > suite_row[0]:
+            raise EvalRunStateConflict("Eval trial checkpoint number exceeds its immutable policy.")
+        key = (validated.case_id, validated.trial_number)
+        await cur.execute(
+            """
+            SELECT checkpoint_json, document_bytes
+            FROM cayu_eval_run_trial_checkpoints
+            WHERE run_id = %s AND case_id = %s AND trial_number = %s
+            """,
+            (request.run_id, *key),
+        )
+        existing = await cur.fetchone()
+        if existing is not None:
+            if existing[1] != len(existing[0].encode("utf-8")):
+                raise RuntimeError("Stored eval trial checkpoint byte accounting is inconsistent.")
+            current = eval_run_trial_checkpoint_from_json(existing[0])
+            if current == validated:
+                return
+            raise EvalRunStateConflict("Eval trial slot already has another terminal result.")
+        if row[23] >= EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS:
+            raise ValueError("Eval run trial checkpoints exceed their item limit.")
+        if row[24] + prepared.document_bytes > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES:
+            raise ValueError("Eval run trial checkpoints exceed their byte limit.")
+        await cur.execute(
+            """
+            INSERT INTO cayu_eval_run_trial_checkpoints (
+                run_id, case_id, trial_number, checkpoint_json, document_bytes
+            ) VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                request.run_id,
+                *key,
+                prepared.document,
+                prepared.document_bytes,
+            ),
+        )
+        await cur.execute(
+            """
+            UPDATE cayu_eval_runs
+            SET trial_checkpoint_count = trial_checkpoint_count + 1,
+                trial_checkpoint_bytes = trial_checkpoint_bytes + %s,
+                updated_at = %s
+            WHERE run_id = %s
+            """,
+            (prepared.document_bytes, now, request.run_id),
+        )
+
+    async def open_run_trials(
+        self,
+        claim: EvalRunClaim,
+        slots: tuple[EvalRunTrialSlot, ...],
+    ) -> None:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        slots = _validated_trial_slots(slots)
+        keys = [(slot.case_id, slot.trial_number) for slot in slots]
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    row = await self._require_run_row(cur, claim.run_id, for_update=True)
+                    now = await _database_now(cur)
+                    self._require_live_claim(row, claim, now)
+                    if EvalRunStatus(row[8]) is not EvalRunStatus.RUNNING:
+                        raise EvalRunStateConflict("Only a running eval run opens its trials.")
+                    await cur.execute(
+                        f"""
+                        SELECT case_id, trial_number, run_epoch, claim_epoch
+                        FROM {EVAL_RUN_TRIAL_SLOTS_TABLE}
+                        WHERE run_id = %s
+                        ORDER BY position ASC
+                        """,
+                        (claim.run_id,),
+                    )
+                    existing = await cur.fetchall()
+                    if existing and existing[0][2] == claim.epoch:
+                        if [(item[0], item[1]) for item in existing] != keys:
+                            raise EvalRunStateConflict(
+                                "Eval run trials are already open in another order."
+                            )
+                        await conn.commit()
+                        return
                     request = _request_from_row(row)
                     await cur.execute(
-                        """
-                        SELECT suites.trials
-                        FROM cayu_eval_suites AS suites
-                        JOIN cayu_eval_cases AS cases
-                          ON cases.corpus_revision = suites.corpus_revision
-                         AND cases.suite_id = suites.suite_id
-                        WHERE suites.corpus_revision = %s AND suites.suite_id = %s
-                          AND cases.case_id = %s
-                        """,
-                        (
-                            request.corpus_revision,
-                            request.suite_id,
-                            prepared.checkpoint.case_id,
-                        ),
+                        "SELECT trials FROM cayu_eval_suites "
+                        "WHERE corpus_revision = %s AND suite_id = %s",
+                        (request.corpus_revision, request.suite_id),
                     )
-                    suite_row = await cur.fetchone()
-                    if suite_row is None:
-                        raise EvalRunStateConflict(
-                            "Eval trial checkpoint case does not belong to its run."
-                        )
-                    validated = prepared.checkpoint
-                    if validated.trial_number > suite_row[0]:
-                        raise EvalRunStateConflict(
-                            "Eval trial checkpoint number exceeds its immutable policy."
-                        )
-                    key = (validated.case_id, validated.trial_number)
+                    suite = await cur.fetchone()
                     await cur.execute(
-                        """
-                        SELECT checkpoint_json, document_bytes
-                        FROM cayu_eval_run_trial_checkpoints
-                        WHERE run_id = %s AND case_id = %s AND trial_number = %s
-                        """,
-                        (claim.run_id, *key),
+                        "SELECT case_id FROM cayu_eval_cases "
+                        "WHERE corpus_revision = %s AND suite_id = %s",
+                        (request.corpus_revision, request.suite_id),
                     )
-                    existing = await cur.fetchone()
-                    if existing is not None:
-                        if existing[1] != len(existing[0].encode("utf-8")):
-                            raise RuntimeError(
-                                "Stored eval trial checkpoint byte accounting is inconsistent."
+                    case_ids = [item[0] for item in await cur.fetchall()]
+                    if suite is None or set(keys) != {
+                        (case_id, trial_number)
+                        for case_id in case_ids
+                        for trial_number in range(1, suite[0] + 1)
+                    }:
+                        raise EvalRunStateConflict(
+                            "Eval trial slots must be exactly the trials of the run."
+                        )
+                    claim_epochs = {(item[0], item[1]): item[3] for item in existing}
+                    await cur.execute(
+                        f"DELETE FROM {EVAL_RUN_TRIAL_SLOTS_TABLE} WHERE run_id = %s",
+                        (claim.run_id,),
+                    )
+                    await cur.executemany(
+                        f"""
+                        INSERT INTO {EVAL_RUN_TRIAL_SLOTS_TABLE} (
+                            run_id, position, case_id, trial_number, run_epoch, claim_epoch
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        [
+                            (
+                                claim.run_id,
+                                position,
+                                case_id,
+                                trial_number,
+                                claim.epoch,
+                                claim_epochs.get((case_id, trial_number), 0),
                             )
-                        current = eval_run_trial_checkpoint_from_json(existing[0])
-                        if current == validated:
-                            await conn.commit()
-                            return
-                        raise EvalRunStateConflict(
-                            "Eval trial slot already has another terminal result."
-                        )
-                    if row[23] >= EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS:
-                        raise ValueError("Eval run trial checkpoints exceed their item limit.")
-                    if row[24] + prepared.document_bytes > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES:
-                        raise ValueError("Eval run trial checkpoints exceed their byte limit.")
-                    await cur.execute(
-                        """
-                        INSERT INTO cayu_eval_run_trial_checkpoints (
-                            run_id, case_id, trial_number, checkpoint_json, document_bytes
-                        ) VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (
-                            claim.run_id,
-                            *key,
-                            prepared.document,
-                            prepared.document_bytes,
-                        ),
-                    )
-                    await cur.execute(
-                        """
-                        UPDATE cayu_eval_runs
-                        SET trial_checkpoint_count = trial_checkpoint_count + 1,
-                            trial_checkpoint_bytes = trial_checkpoint_bytes + %s,
-                            updated_at = %s
-                        WHERE run_id = %s
-                        """,
-                        (prepared.document_bytes, now, claim.run_id),
+                            for position, (case_id, trial_number) in enumerate(keys)
+                        ],
                     )
                 await conn.commit()
             except BaseException:
                 await conn.rollback()
                 raise
+
+    async def claim_run_trial(
+        self,
+        target_keys: tuple[str, ...],
+        *,
+        run_id: str | None = None,
+        lease_seconds: int = 300,
+    ) -> EvalRunTrialLease | None:
+        target_keys = _claim_target_keys(target_keys)
+        if run_id is not None:
+            run_id = _store_identifier(run_id, "run_id")
+        lease_seconds = _lease_seconds(lease_seconds)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    now = await _database_now(cur)
+                    run_clause = "" if run_id is None else "AND runs.run_id = %s"
+                    # Locking the run serializes its trial claims, so two workers
+                    # never both take its last free place under max_concurrency.
+                    await cur.execute(
+                        f"""
+                        SELECT runs.run_id
+                        FROM cayu_eval_runs AS runs
+                        WHERE runs.status = %s
+                          AND runs.target_key = ANY(%s)
+                          {run_clause}
+                          AND EXISTS (
+                              SELECT 1
+                              FROM {EVAL_RUN_TRIAL_SLOTS_TABLE} AS slots
+                              WHERE slots.run_id = runs.run_id
+                                AND slots.run_epoch = runs.ownership_epoch
+                                AND (slots.lease_expires_at IS NULL
+                                     OR slots.lease_expires_at <= %s)
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM cayu_eval_run_trial_checkpoints AS done
+                                    WHERE done.run_id = slots.run_id
+                                      AND done.case_id = slots.case_id
+                                      AND done.trial_number = slots.trial_number
+                                )
+                          )
+                          AND (
+                              SELECT COUNT(*)
+                              FROM {EVAL_RUN_TRIAL_SLOTS_TABLE} AS held
+                              WHERE held.run_id = runs.run_id
+                                AND held.run_epoch = runs.ownership_epoch
+                                AND held.lease_expires_at > %s
+                          ) < runs.max_concurrency
+                        ORDER BY runs.created_at ASC, runs.run_id ASC
+                        FOR UPDATE OF runs SKIP LOCKED
+                        LIMIT 1
+                        """,
+                        (
+                            str(EvalRunStatus.RUNNING),
+                            list(target_keys),
+                            *(() if run_id is None else (run_id,)),
+                            now,
+                            now,
+                        ),
+                    )
+                    candidate = await cur.fetchone()
+                    if candidate is None:
+                        await conn.commit()
+                        return None
+                    row = await self._require_run_row(cur, candidate[0])
+                    if EvalRunStatus(row[8]) is not EvalRunStatus.RUNNING:
+                        await conn.commit()
+                        return None
+                    # Counted again under the run's lock: the candidate query
+                    # read the run's claims before it held the lock.
+                    await cur.execute(
+                        f"""
+                        UPDATE {EVAL_RUN_TRIAL_SLOTS_TABLE} AS slots
+                        SET claim_id = %s, claim_epoch = slots.claim_epoch + 1,
+                            lease_expires_at = %s
+                        WHERE (slots.run_id, slots.position) = (
+                            SELECT candidate_slot.run_id, candidate_slot.position
+                            FROM {EVAL_RUN_TRIAL_SLOTS_TABLE} AS candidate_slot
+                            WHERE candidate_slot.run_id = %s
+                              AND candidate_slot.run_epoch = %s
+                              AND (
+                                  candidate_slot.lease_expires_at IS NULL
+                                  OR candidate_slot.lease_expires_at <= %s
+                              )
+                              AND candidate_slot.claim_epoch < 9223372036854775807
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM cayu_eval_run_trial_checkpoints AS done
+                                  WHERE done.run_id = candidate_slot.run_id
+                                    AND done.case_id = candidate_slot.case_id
+                                    AND done.trial_number = candidate_slot.trial_number
+                              )
+                              AND (
+                                  SELECT COUNT(*)
+                                  FROM {EVAL_RUN_TRIAL_SLOTS_TABLE} AS held
+                                  WHERE held.run_id = candidate_slot.run_id
+                                    AND held.run_epoch = candidate_slot.run_epoch
+                                    AND held.lease_expires_at > %s
+                              ) < %s
+                            ORDER BY candidate_slot.position ASC
+                            LIMIT 1
+                        )
+                        RETURNING case_id, trial_number, run_epoch, claim_id, claim_epoch
+                        """,
+                        (
+                            str(uuid4()),
+                            now + timedelta(seconds=lease_seconds),
+                            row[0],
+                            row[15],
+                            now,
+                            now,
+                            row[6],
+                        ),
+                    )
+                    slot = await cur.fetchone()
+                await conn.commit()
+                if slot is None:
+                    return None
+                return EvalRunTrialLease(
+                    run=_run_record_from_row(row),
+                    claim=EvalRunTrialClaim(
+                        run_id=row[0],
+                        run_epoch=slot[2],
+                        case_id=slot[0],
+                        trial_number=slot[1],
+                        claim_id=slot[3],
+                        epoch=slot[4],
+                    ),
+                )
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def unfinished_run_trials(self, claim: EvalRunClaim) -> int:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            row = await self._require_run_row(cur, claim.run_id)
+            self._require_live_claim(row, claim, await _database_now(cur))
+            await cur.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {EVAL_RUN_TRIAL_SLOTS_TABLE} AS slots
+                WHERE slots.run_id = %s AND slots.run_epoch = %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM cayu_eval_run_trial_checkpoints AS done
+                      WHERE done.run_id = slots.run_id
+                        AND done.case_id = slots.case_id
+                        AND done.trial_number = slots.trial_number
+                  )
+                """,
+                (claim.run_id, claim.epoch),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            return row[0]
+
+    async def heartbeat_run_trial(
+        self,
+        claim: EvalRunTrialClaim,
+        *,
+        extend_seconds: int = 300,
+    ) -> EvalRunObservation:
+        claim = _exact_model(claim, EvalRunTrialClaim, "claim")
+        extend_seconds = _lease_seconds(extend_seconds)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    row = await self._require_run_row(cur, claim.run_id, for_update=True)
+                    now = await _database_now(cur)
+                    await self._require_live_trial_claim(cur, row, claim, now)
+                    await cur.execute(
+                        f"""
+                        UPDATE {EVAL_RUN_TRIAL_SLOTS_TABLE}
+                        SET lease_expires_at = %s
+                        WHERE run_id = %s AND case_id = %s AND trial_number = %s
+                        """,
+                        (
+                            now + timedelta(seconds=extend_seconds),
+                            claim.run_id,
+                            claim.case_id,
+                            claim.trial_number,
+                        ),
+                    )
+                await conn.commit()
+                return _run_record_observation(row)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def save_claimed_trial_checkpoint(
+        self,
+        claim: EvalRunTrialClaim,
+        checkpoint: EvalRunTrialCheckpoint,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> None:
+        claim = _exact_model(claim, EvalRunTrialClaim, "claim")
+        prepared = await asyncio.to_thread(
+            _prepare_trial_checkpoint_for_store,
+            checkpoint,
+            redact_json=redact_json,
+        )
+        if (prepared.checkpoint.case_id, prepared.checkpoint.trial_number) != (
+            claim.case_id,
+            claim.trial_number,
+        ):
+            raise EvalRunStateConflict("Eval trial checkpoint is not for the claimed trial.")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    row = await self._require_run_row(cur, claim.run_id, for_update=True)
+                    now = await _database_now(cur)
+                    await self._require_live_trial_claim(cur, row, claim, now)
+                    await self._retain_trial_checkpoint(cur, row, prepared, now)
+                    await cur.execute(
+                        f"""
+                        UPDATE {EVAL_RUN_TRIAL_SLOTS_TABLE}
+                        SET claim_id = NULL, lease_expires_at = NULL
+                        WHERE run_id = %s AND case_id = %s AND trial_number = %s
+                        """,
+                        (claim.run_id, claim.case_id, claim.trial_number),
+                    )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def release_run_trial(self, claim: EvalRunTrialClaim) -> None:
+        claim = _exact_model(claim, EvalRunTrialClaim, "claim")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await self._load_run_row(cur, claim.run_id, for_update=True)
+                    await cur.execute(
+                        f"""
+                        UPDATE {EVAL_RUN_TRIAL_SLOTS_TABLE}
+                        SET claim_id = NULL, lease_expires_at = NULL
+                        WHERE run_id = %s AND case_id = %s AND trial_number = %s
+                          AND run_epoch = %s AND claim_id = %s AND claim_epoch = %s
+                        """,
+                        (
+                            claim.run_id,
+                            claim.case_id,
+                            claim.trial_number,
+                            claim.run_epoch,
+                            claim.claim_id,
+                            claim.epoch,
+                        ),
+                    )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    @staticmethod
+    async def _require_live_trial_claim(
+        cur: Any,
+        row: Any,
+        claim: EvalRunTrialClaim,
+        now: datetime,
+    ) -> None:
+        if EvalRunStatus(row[8]) not in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}:
+            raise EvalRunClaimLost("Eval run is no longer active.")
+        if row[15] != claim.run_epoch:
+            raise EvalRunClaimLost("Eval run has another owner since the trial was claimed.")
+        await cur.execute(
+            f"""
+            SELECT run_epoch, claim_id, claim_epoch, lease_expires_at
+            FROM {EVAL_RUN_TRIAL_SLOTS_TABLE}
+            WHERE run_id = %s AND case_id = %s AND trial_number = %s
+            """,
+            (claim.run_id, claim.case_id, claim.trial_number),
+        )
+        slot = await cur.fetchone()
+        if (
+            slot is None
+            or slot[0] != claim.run_epoch
+            or slot[1] != claim.claim_id
+            or slot[2] != claim.epoch
+            or slot[3] is None
+            or slot[3] <= now
+        ):
+            raise EvalRunClaimLost("Eval trial claim is no longer live.")
 
     async def submit_scenario_approval(
         self,

@@ -1839,7 +1839,7 @@ def test_authored_lane_accepts_its_suite_wide_frozen_judge_profiles() -> None:
         ),
         cost_budget=None,
     )
-    lease = SimpleNamespace(run=SimpleNamespace(spec=SimpleNamespace(invocation=invocation)))
+    run = SimpleNamespace(spec=SimpleNamespace(invocation=invocation))
     compiled = SimpleNamespace(
         run_contract=SimpleNamespace(
             suite_id="suite-one",
@@ -1876,7 +1876,7 @@ def test_authored_lane_accepts_its_suite_wide_frozen_judge_profiles() -> None:
     registration = SimpleNamespace(catalog_entry=SimpleNamespace(judge_profiles=current_profiles))
 
     assert evals_worker_module._accepted_authored_work_matches_runtime(
-        lease,
+        run,
         compiled,
         registration,
     )
@@ -1890,7 +1890,7 @@ def test_authored_lane_accepts_its_suite_wide_frozen_judge_profiles() -> None:
         ),
     )
     assert not evals_worker_module._accepted_authored_work_matches_runtime(
-        lease,
+        run,
         compiled,
         registration,
     )
@@ -3002,17 +3002,17 @@ def test_worker_classifies_manifest_drift_after_preflight_as_target_unavailable(
     target = _target(provider)
     corpus = _corpus(trials=1)
     store = SQLiteEvalStore(tmp_path / "manifest-drift-after-preflight.db")
-    original_preflight = evals_worker_module.EvalRunCoordinator._preflight_lease
+    original_preflight = evals_worker_module.EvalRunCoordinator._preflight_run
 
-    async def drift_after_preflight(coordinator, lease, registration):
-        prepared = await original_preflight(coordinator, lease, registration)
+    async def drift_after_preflight(coordinator, run, registration):
+        prepared = await original_preflight(coordinator, run, registration)
         if isinstance(prepared, evals_worker_module._PreparedEvalRun):
             target.app.register_agent(AgentSpec(name="late-agent", model="fixture-model"))
         return prepared
 
     monkeypatch.setattr(
         evals_worker_module.EvalRunCoordinator,
-        "_preflight_lease",
+        "_preflight_run",
         drift_after_preflight,
     )
 

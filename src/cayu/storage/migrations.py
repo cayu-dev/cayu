@@ -574,6 +574,11 @@ REVISIONS: tuple[Revision, ...] = (
     # A parked interrupted-task handoff is continued only by its own bound
     # trigger; every continuation claimant must leave it out of its scan.
     Revision(revision=137, kind=RevisionKind.BREAKING, compatible_from=137),
+    # Eval run trials that several workers claim are a new table that older
+    # binaries never read or write: an older owner never opens a run's trials,
+    # and opening them again under a later owner fences the earlier claims.
+    # Eval stores require it.
+    Revision(revision=138, kind=RevisionKind.ADDITIVE, compatible_from=137),
 )
 
 #: The revision an empty database is initialized to.

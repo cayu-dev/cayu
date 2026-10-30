@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
 from threading import Lock
-from typing import TYPE_CHECKING, Any, cast, get_args
+from typing import TYPE_CHECKING, Any, Protocol, cast, get_args
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
@@ -187,6 +187,48 @@ TrialCompletionCallback = Callable[
     [str, EvalTrialResult, _EvalTrialPublicData],
     Awaitable[None],
 ]
+TrialExecution = tuple[EvalTrialResult, _EvalTrialPublicData | None]
+
+
+class _ClaimedTrial(Protocol):
+    """One trial this process claimed from a run that several workers share."""
+
+    @property
+    def case_id(self) -> str: ...
+
+    @property
+    def trial_number(self) -> int: ...
+
+    async def settle(self, execute: Callable[[], Awaitable[TrialExecution]]) -> None:
+        """Run the trial while the claim holds and retain its terminal result.
+
+        A trial whose claim is lost is stopped and left to whichever worker
+        claims it next; its partial result is never retained.
+        """
+        ...
+
+
+class _TrialClaims(Protocol):
+    """Where a process that shares a run with other workers gets its next trial."""
+
+    async def claim(self) -> _ClaimedTrial | None:
+        """The next trial for this process, or None when none is open now."""
+        ...
+
+    async def wait(self) -> bool:
+        """After ``claim`` found nothing, wait for more; False once there is nothing left."""
+        ...
+
+
+@dataclass(frozen=True)
+class _SuiteExecution:
+    # The detached suite the trials ran, not the caller's mutable one.
+    suite: EvalSuite
+    run_id: str
+    started_at: datetime
+    results: list[EvalCaseResult]
+    public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]] | None
+
 
 # A trial keeps a run's traceback once, on its error, bounded to this many characters.
 _TRIAL_TRACEBACK_MAX_CHARS = 4096
@@ -1031,6 +1073,45 @@ async def _run_eval_suite_with_public_projection(
     return run, public_data
 
 
+async def _run_claimed_suite_trials_with_public_projection(
+    app: CayuApp,
+    suite: EvalSuite,
+    *,
+    trial_claims: _TrialClaims,
+    max_concurrency: int,
+    case_timeout_seconds: float | None,
+    trials: int,
+    trial_policy: EvalSuiteTrialPolicyV1,
+    output_preview_bytes: int,
+    run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
+    run_id: str | None = None,
+    trial_request_transform: TrialRequestTransform | None = None,
+    execution_capacity: EvalExecutionCapacity | None = None,
+) -> None:
+    """Run the trials of a corpus suite that ``trial_claims`` hands this process.
+
+    Every trial runs exactly as in ``_run_eval_suite_with_public_projection``;
+    the claims retain each result, and the run's owner aggregates them later.
+    """
+
+    await _execute_eval_suite(
+        app,
+        suite,
+        retain_trajectory=False,
+        retain_final_output=False,
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=case_timeout_seconds,
+        trials=trials,
+        trial_policy=trial_policy,
+        public_output_preview_bytes=output_preview_bytes,
+        run_stream=run_stream,
+        run_id=run_id,
+        trial_request_transform=trial_request_transform,
+        execution_capacity=execution_capacity,
+        trial_claims=trial_claims,
+    )
+
+
 async def _run_eval_suite(
     app: CayuApp,
     suite: EvalSuite,
@@ -1054,6 +1135,74 @@ async def _run_eval_suite(
     workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
     price_book: PriceBook | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
+    execution = await _execute_eval_suite(
+        app,
+        suite,
+        retain_trajectory=retain_trajectory,
+        retain_final_output=retain_final_output,
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=case_timeout_seconds,
+        trials=trials,
+        trial_policy=trial_policy,
+        public_output_preview_bytes=public_output_preview_bytes,
+        run_stream=run_stream,
+        run_id=run_id,
+        trial_request_transform=trial_request_transform,
+        execution_capacity=execution_capacity,
+        completed_trials=completed_trials,
+        trial_completed=trial_completed,
+        workflow_target=workflow_target,
+        workflow_execution_profile_fingerprint=workflow_execution_profile_fingerprint,
+        workflow_instance_tracker=workflow_instance_tracker,
+        price_book=price_book,
+    )
+    started_at = execution.started_at
+    results = execution.results
+    observed_started_at = min(result.started_at for result in results)
+    observed_completed_at = max(result.completed_at for result in results)
+    status = aggregate_eval_status(result.status for result in results)
+    score = aggregate_eval_score(result.score for result in results)
+    return (
+        EvalRun(
+            run_id=execution.run_id,
+            suite_id=execution.suite.id,
+            status=status,
+            score=score,
+            cases=tuple(results),
+            started_at=min(started_at, observed_started_at),
+            completed_at=observed_completed_at,
+            duration_ms=_duration_ms(min(started_at, observed_started_at), observed_completed_at),
+            metadata=execution.suite.metadata,
+            run_contract=None,
+        ),
+        execution.public_data_by_case,
+    )
+
+
+async def _execute_eval_suite(
+    app: CayuApp,
+    suite: EvalSuite,
+    *,
+    retain_trajectory: bool,
+    retain_final_output: bool,
+    max_concurrency: int | None,
+    case_timeout_seconds: float | None,
+    trials: int,
+    trial_policy: EvalSuiteTrialPolicyV1 | None,
+    public_output_preview_bytes: int | None,
+    run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
+    run_id: str | None = None,
+    trial_request_transform: TrialRequestTransform | None = None,
+    execution_capacity: EvalExecutionCapacity | None = None,
+    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]
+    | None = None,
+    trial_completed: TrialCompletionCallback | None = None,
+    workflow_target: WorkflowEvalTarget | None = None,
+    workflow_execution_profile_fingerprint: str | None = None,
+    workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
+    trial_claims: _TrialClaims | None = None,
+    price_book: PriceBook | None = None,
+) -> _SuiteExecution:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
     if price_book is not None and type(price_book) is not PriceBook:
@@ -1188,25 +1337,14 @@ async def _run_eval_suite(
             workflow_target=workflow_target,
             workflow_instance_tracker=workflow_instance_tracker,
             workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
+            trial_claims=trial_claims,
         )
-    observed_started_at = min(result.started_at for result in results)
-    observed_completed_at = max(result.completed_at for result in results)
-    status = aggregate_eval_status(result.status for result in results)
-    score = aggregate_eval_score(result.score for result in results)
-    return (
-        EvalRun(
-            run_id=run_id,
-            suite_id=suite.id,
-            status=status,
-            score=score,
-            cases=tuple(results),
-            started_at=min(started_at, observed_started_at),
-            completed_at=observed_completed_at,
-            duration_ms=_duration_ms(min(started_at, observed_started_at), observed_completed_at),
-            metadata=suite.metadata,
-            run_contract=None,
-        ),
-        public_data_by_case,
+    return _SuiteExecution(
+        suite=suite,
+        run_id=run_id,
+        started_at=started_at,
+        results=results,
+        public_data_by_case=public_data_by_case,
     )
 
 
@@ -1309,6 +1447,7 @@ async def _run_suite_cases(
     workflow_target: WorkflowEvalTarget | None,
     workflow_instance_tracker: _WorkflowInstanceTracker | None,
     workflow_execution_profile_fingerprint: str | None,
+    trial_claims: _TrialClaims | None = None,
 ) -> tuple[
     list[EvalCaseResult],
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
@@ -1357,6 +1496,7 @@ async def _run_suite_cases(
         completed_trials=completed_trials,
         trial_completed=trial_completed,
         execute_trial=execute_trial,
+        trial_claims=trial_claims,
     )
 
 
@@ -1528,8 +1668,14 @@ async def _schedule_suite_trials(
     group_serial_trials: bool = False,
     scripted_providers_by_case: Mapping[str, tuple[ScriptedModelProvider, ...]] | None = None,
     require_owned_scripted_providers: bool = False,
+    trial_claims: _TrialClaims | None = None,
 ) -> tuple[list[EvalCaseResult], dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
-    """Own capacity through reconciliation/publication and preserve ordered recovered slots."""
+    """Own capacity through reconciliation/publication and preserve ordered recovered slots.
+
+    With ``trial_claims``, up to ``max_concurrency`` trials run at once, each one
+    claimed first, and nothing is aggregated here: the run's owner aggregates
+    every worker's retained trials in trial order.
+    """
     # Schedule concrete trials, not whole cases, so one repeated case can consume
     # the configured concurrency. Positional slots preserve authored case order
     # and numeric trial order regardless of completion order.
@@ -1556,8 +1702,27 @@ async def _schedule_suite_trials(
     def count_running_trials() -> int:
         return running_trials
 
-    async def _run_slot(index: int, case: EvalCase, trial_number: int) -> None:
+    async def _execute(case: EvalCase, trial_number: int) -> TrialExecution:
         nonlocal running_trials
+        running_trials += 1
+        try:
+            # Nested evaluations are not additional cases of this CLI launch.
+            with (
+                admission_scope(None),
+                observe_eval_trial(case.id, trial_number),
+                _scripted_eval_trial(
+                    concurrent=max_concurrency > 1,
+                    providers=scripted_providers_by_case.get(case.id, ()),
+                    require_owned=require_owned_scripted_providers,
+                ),
+            ):
+                execution = await execute_trial(case, trial_number)
+                observe_eval_trial_result(execution[0])
+        finally:
+            running_trials -= 1
+        return execution
+
+    async def _run_slot(index: int, case: EvalCase, trial_number: int) -> None:
         async with semaphore:
             capacity_slot = (
                 nullcontext() if execution_capacity is None else execution_capacity.slot()
@@ -1565,28 +1730,50 @@ async def _schedule_suite_trials(
             async with capacity_slot:
                 if admission is not None:
                     await admission.admit(case.id, trial_number)
-                running_trials += 1
-                try:
-                    # Nested evaluations are not additional cases of this CLI launch.
-                    with (
-                        admission_scope(None),
-                        observe_eval_trial(case.id, trial_number),
-                        _scripted_eval_trial(
-                            concurrent=max_concurrency > 1,
-                            providers=(scripted_providers_by_case or {}).get(case.id, ()),
-                            require_owned=require_owned_scripted_providers,
-                        ),
-                    ):
-                        execution = await execute_trial(case, trial_number)
-                        observe_eval_trial_result(execution[0])
-                finally:
-                    running_trials -= 1
+                execution = await _execute(case, trial_number)
                 result, public_data = execution
                 if trial_completed is not None:
                     if public_data is None:
                         raise RuntimeError("Durable trial execution lost its public projection.")
                     await trial_completed(case.id, result, public_data)
                 slots[index][trial_number - 1] = execution
+
+    if trial_claims is not None:
+
+        async def run_claimed_trials() -> None:
+            while True:
+                capacity_slot = (
+                    nullcontext() if execution_capacity is None else execution_capacity.slot()
+                )
+                # Claim only with capacity in hand, so a busy process leaves the
+                # trial to another worker instead of holding it while it waits.
+                async with capacity_slot:
+                    claimed = await trial_claims.claim()
+                    if claimed is not None:
+                        await _run_claimed_trial(claimed)
+                        continue
+                if not await trial_claims.wait():
+                    return
+
+        async def _run_claimed_trial(claimed: _ClaimedTrial) -> None:
+            async def execute() -> TrialExecution:
+                index = case_by_id.get(claimed.case_id)
+                if index is None or not 1 <= claimed.trial_number <= trials:
+                    raise RuntimeError("A claimed eval trial is not a trial of this suite.")
+                case = suite.cases[index]
+                if admission is not None:
+                    await admission.admit(case.id, claimed.trial_number)
+                return await _execute(case, claimed.trial_number)
+
+            await claimed.settle(execute)
+
+        with _scripted_eval_invocation(
+            provider for providers in scripted_providers_by_case.values() for provider in providers
+        ):
+            async with asyncio.TaskGroup() as group:
+                for _ in range(max_concurrency):
+                    group.create_task(run_claimed_trials())
+        return [], None
 
     pending_slots = (
         (index, case, trial_number)

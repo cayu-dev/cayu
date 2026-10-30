@@ -1628,6 +1628,26 @@ def test_provider_timeout_is_not_misclassified_as_case_deadline():
     assert result.trials[0].error == "Session failed: provider stream timed out"
 
 
+def test_a_run_keeps_the_suite_it_ran_when_the_caller_changes_theirs_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from cayu.evals import runner as runner_module
+
+    suite = EvalSuite(id="original-suite", cases=[_case("a")], metadata={"v": "original"})
+    run_cases = runner_module._run_suite_cases
+
+    async def change_the_callers_suite(*args, **kwargs):
+        suite.id = "changed-suite"
+        suite.metadata["v"] = "changed"
+        return await run_cases(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_run_suite_cases", change_the_callers_suite)
+    result = asyncio.run(run_eval_suite(_app_with_provider(_OverlapProbeProvider(1)), suite))
+
+    assert result.suite_id == "original-suite"
+    assert result.metadata == {"v": "original"}
+
+
 def test_max_concurrency_runs_cases_in_parallel_and_keeps_order():
     provider = _OverlapProbeProvider(expected=2)
     suite = EvalSuite(id="parallel", cases=[_case("a"), _case("b")])

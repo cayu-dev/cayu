@@ -20,6 +20,7 @@ from cayu.storage._completion_evaluation_schema import SQLITE_COMPLETION_EVALUAT
 from cayu.storage._completion_verifier_dispatch_schema import (
     SQLITE_COMPLETION_VERIFIER_DISPATCH_DDL,
 )
+from cayu.storage._eval_trial_slot_schema import SQLITE_EVAL_RUN_TRIAL_SLOT_DDL
 from cayu.storage._external_wait_schema import SQLITE_EXTERNAL_WAIT_DDL
 from cayu.storage._model_policy_schema import SQLITE_MODEL_POLICY_DDL
 from cayu.storage._participant_bindings_schema import SQLITE_PARTICIPANT_BINDINGS_DDL
@@ -738,6 +739,7 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     133: """CREATE INDEX IF NOT EXISTS idx_cayu_tasks_event_retry_key
         ON cayu_tasks(json_extract(invocation_json, '$.event_retry_key'), status);""",
     136: SQLITE_TASK_STEP_DDL,
+    138: SQLITE_EVAL_RUN_TRIAL_SLOT_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

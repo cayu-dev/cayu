@@ -352,6 +352,11 @@ more processes, which the store already coordinates:
   worker today.
 - Separate containers or hosts, each running one or more worker processes.
 
+An eval worker (`[tool.cayu.evals] worker`) started with `--processes N` also
+spreads the trials of each eval run across its processes; see [spread a run's
+trials across worker
+processes](evals.md#spread-a-runs-trials-across-worker-processes).
+
 Every process must use the same durable stores. SQLite allows one writer at a
 time, so sustained writes from several processes want PostgreSQL. A web
 process that only creates tasks and serves reads can stay a single process;

@@ -544,8 +544,13 @@ class ResolvedEvalsRuntime:
     # The targets whose runs this process claims, when not all of them: the
     # project's eval worker runs the rest.
     claimed_target_keys: tuple[str, ...] | None = None
+    # How many processes of this worker share eval runs. Each runs at most its
+    # share of a run's concurrent trials and leaves the rest to the others.
+    worker_processes: int = 1
 
     def __post_init__(self) -> None:
+        if type(self.worker_processes) is not int or self.worker_processes < 1:
+            raise ValueError("worker_processes must be a positive integer.")
         if type(self.registry) is not EvalTargetRegistry:
             raise TypeError("registry must be an exact EvalTargetRegistry.")
         if not isinstance(self.store, EvalStore) or not self.store.durable:

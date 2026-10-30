@@ -1360,6 +1360,9 @@ from cayu.evals.store import EvalRunResultSummary as EvalRunResultSummary
 from cayu.evals.store import EvalRunSpec as EvalRunSpec
 from cayu.evals.store import EvalRunStateConflict as EvalRunStateConflict
 from cayu.evals.store import EvalRunStatus as EvalRunStatus
+from cayu.evals.store import EvalRunTrialClaim as EvalRunTrialClaim
+from cayu.evals.store import EvalRunTrialLease as EvalRunTrialLease
+from cayu.evals.store import EvalRunTrialSlot as EvalRunTrialSlot
 from cayu.evals.store import (
     EvalScenarioApprovalDecisionRecord as EvalScenarioApprovalDecisionRecord,
 )

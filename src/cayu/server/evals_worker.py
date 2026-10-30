@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, TypeVar
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
@@ -20,8 +22,11 @@ from cayu.evals.corpus import (
 )
 from cayu.evals.execution import (
     CompiledCorpusSuite,
+    CorpusExecutionResult,
     CorpusTarget,
+    WorkflowEvalTarget,
     _run_compiled_corpus_suite,
+    _run_compiled_corpus_trials,
     compile_corpus_suite,
     evaluation_target_identity,
 )
@@ -43,8 +48,11 @@ from cayu.evals.store import (
     EvalRunFailureReason,
     EvalRunLease,
     EvalRunQuery,
+    EvalRunRecord,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalRunTrialClaim,
+    EvalRunTrialSlot,
     EvalScenarioTrialFailureCode,
     EvalStoreTransientContention,
 )
@@ -57,6 +65,7 @@ from cayu.execution_profiles import (
 from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
+from cayu.server._eval_trial_claims import StoreClaimedTrial, StoreTrialClaims
 from cayu.server.config import EvalsConfig
 from cayu.server.evals_registry import (
     EvalTargetRegistration,
@@ -67,6 +76,12 @@ from cayu.server.evals_registry import (
 
 logger = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
+
+
+# A worker warns once about each of at most this many runs whose trials it can't
+# run, and then leaves them to their owners quietly.
+_MAX_RUNS_LEFT_TO_OWNERS = 128
 
 # Runs a coordinator that runs until idle must not leave behind.
 _OUTSTANDING_RUN_STATUSES = (
@@ -114,8 +129,8 @@ def _is_execution_profile_failure(error: BaseException) -> bool:
     )
 
 
-def _accepted_candidate_pricing_matches_target(lease: EvalRunLease, target: CorpusTarget) -> bool:
-    exposure = lease.run.spec.invocation.authored_suite_exposure
+def _accepted_candidate_pricing_matches_target(run: EvalRunRecord, target: CorpusTarget) -> bool:
+    exposure = run.spec.invocation.authored_suite_exposure
     if exposure is None:
         return True
     current = (
@@ -127,14 +142,14 @@ def _accepted_candidate_pricing_matches_target(lease: EvalRunLease, target: Corp
 
 
 def _accepted_authored_work_matches_runtime(
-    lease: EvalRunLease,
+    run: EvalRunRecord,
     compiled: CompiledCorpusSuite,
     registration: EvalTargetRegistration,
 ) -> bool:
     """Rebind accepted candidate and judge authority to this exact durable run."""
 
-    exposure = lease.run.spec.invocation.authored_suite_exposure
-    snapshot = lease.run.spec.invocation.execution_profile_snapshot
+    exposure = run.spec.invocation.authored_suite_exposure
+    snapshot = run.spec.invocation.execution_profile_snapshot
     if exposure is None or snapshot is None:
         return False
     case_ids = tuple(case.case_id for case in compiled.run_contract.cases)
@@ -149,7 +164,7 @@ def _accepted_authored_work_matches_runtime(
     ):
         return False
     accepted_budget = execution_binding.candidate_cost_budget
-    current_budget = lease.run.spec.invocation.cost_budget
+    current_budget = run.spec.invocation.cost_budget
     if accepted_budget != (
         None
         if current_budget is None
@@ -232,6 +247,7 @@ class EvalRunCoordinator:
         self._launch_revision = launch_revision
         self._stop_requested = asyncio.Event()
         self._drain_requested = asyncio.Event()
+        self._runs_left_to_owners: set[str] = set()
         self._task: asyncio.Task[Any] | None = None
 
     def start(self) -> None:
@@ -322,7 +338,8 @@ class EvalRunCoordinator:
                 await self._wait_for_work()
                 continue
             if lease is None:
-                await self._wait_for_work()
+                if not await self._help_with_trials():
+                    await self._wait_for_work()
                 continue
             await self._run_claimed_lease(lease)
 
@@ -348,7 +365,8 @@ class EvalRunCoordinator:
                     return handled, False
                 if not outstanding:
                     return handled, True
-                await self._wait_for_work()
+                if not await self._help_with_trials():
+                    await self._wait_for_work()
                 continue
             await self._run_claimed_lease(lease)
             handled += 1
@@ -363,6 +381,225 @@ class EvalRunCoordinator:
                 if page.items:
                     return True
         return False
+
+    async def _help_with_trials(self) -> bool:
+        """Run open trials of a run another worker owns; False when none is open."""
+
+        # A launch-scoped worker serves only its own launch's runs.
+        if (
+            self._launch_revision is not None
+            or not self._config.store.trial_distribution
+            or not self._claiming()
+        ):
+            return False
+        try:
+            lease = await self._config.store.claim_run_trial(
+                self._config.target_keys_to_claim,
+                lease_seconds=self._config.lease_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Failed to claim durable eval trials; dispatch will retry.")
+            return False
+        if lease is None:
+            return False
+        if lease.run.id in self._runs_left_to_owners:
+            await self._release_trial(lease.claim)
+            return False
+        # Its lease is kept alive while this worker prepares the run.
+        first = StoreClaimedTrial(
+            self._config.store,
+            lease.claim,
+            lease_seconds=self._config.lease_seconds,
+            poll_interval_seconds=self._config.poll_interval_seconds,
+            stop=self._stop_requested,
+        )
+        claims: StoreTrialClaims | None = None
+        try:
+            registration = self._config.registry.registration(lease.run.spec.target_key)
+            prepared = (
+                None if registration is None else await self._preflight_run(lease.run, registration)
+            )
+            if (
+                registration is None
+                or not isinstance(prepared, _PreparedEvalRun)
+                or not self._distributes_trials(lease.run, prepared)
+            ):
+                # The owner checked the same run and runs the trial itself.
+                self._leave_run_to_owner(lease.run, prepared)
+                return False
+            claims = StoreTrialClaims(
+                store=self._config.store,
+                target_key=lease.run.spec.target_key,
+                run_id=lease.run.id,
+                lease_seconds=self._config.lease_seconds,
+                poll_interval_seconds=self._config.poll_interval_seconds,
+                redact_json=prepared.target.app.redact_json,
+                stop=self._stop_requested,
+                claiming=self._claiming,
+                first=first,
+            )
+            await self._run_trials(lease.run, registration, prepared, claims)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A trial that failed was released for another worker to claim.
+            # Report no help, so the worker waits before it looks again.
+            logger.error(
+                "Running trials of an eval run another worker owns failed.",
+                extra={"eval_run_id": lease.run.id},
+            )
+            return False
+        finally:
+            if claims is None:
+                await first.abandon()
+            else:
+                await claims.close()
+        return True
+
+    async def _release_trial(self, claim: EvalRunTrialClaim) -> None:
+        try:
+            await self._config.store.release_run_trial(claim)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Failed to release an eval trial claim; its lease will expire.")
+
+    def _leave_run_to_owner(
+        self,
+        run: EvalRunRecord,
+        prepared: _PreparedEvalRun | _EvalFailure | None,
+    ) -> None:
+        """Warn once that this worker can't run the trials of ``run``."""
+
+        if run.id in self._runs_left_to_owners:
+            return
+        if len(self._runs_left_to_owners) >= _MAX_RUNS_LEFT_TO_OWNERS:
+            self._runs_left_to_owners.clear()
+        self._runs_left_to_owners.add(run.id)
+        logger.warning(
+            "This worker can't run trials of an eval run another worker owns; "
+            "it leaves them to that worker.",
+            extra={
+                "eval_run_id": run.id,
+                "eval_failure_reason": (
+                    str(prepared.diagnostic.reason) if isinstance(prepared, _EvalFailure) else None
+                ),
+            },
+        )
+
+    def _distributes_trials(self, run: EvalRunRecord, prepared: _PreparedEvalRun) -> bool:
+        """Whether any worker with the target registered may run the run's trials."""
+
+        return (
+            self._config.store.trial_distribution
+            and run.spec.max_concurrency > 1
+            and prepared.scenario is None
+            and type(prepared.target) is not WorkflowEvalTarget
+            # Recovery permission counts whole run attempts, not single trials.
+            and run.spec.invocation.recovery_policy is None
+        )
+
+    def _trial_share(self, run: EvalRunRecord) -> int:
+        """How many of the run's trials this process runs at once at most."""
+
+        return math.ceil(run.spec.max_concurrency / self._config.worker_processes)
+
+    async def _run_trials(
+        self,
+        run: EvalRunRecord,
+        registration: EvalTargetRegistration,
+        prepared: _PreparedEvalRun,
+        claims: StoreTrialClaims,
+    ) -> None:
+        await _run_compiled_corpus_trials(
+            prepared.target,
+            prepared.compiled,
+            trial_claims=claims,
+            max_concurrency=self._trial_share(run),
+            manifest_project_root=registration.manifest_project_root,
+            expected_app_manifest_fingerprint=registration.catalog_entry.app_manifest_fingerprint,
+            expected_execution_profile=prepared.execution_profile,
+            native_run_id=run.id,
+            execution_capacity=self._config.execution_capacity,
+        )
+
+    async def _past_contention(self, operation: Callable[[], Awaitable[_T]]) -> _T:
+        """Retry a store call that transient contention deferred.
+
+        The run's claim monitor still stops the work if the run is lost meanwhile.
+        """
+
+        retry_seconds = min(
+            max(self._config.poll_interval_seconds, EVAL_RUN_MIN_OBSERVATION_INTERVAL_SECONDS),
+            EVAL_RUN_MAX_OBSERVATION_INTERVAL_SECONDS,
+        )
+        while True:
+            try:
+                return await operation()
+            except EvalStoreTransientContention:
+                logger.warning(
+                    "A durable eval store call was deferred by transient store "
+                    "contention; it will be retried."
+                )
+                await asyncio.sleep(retry_seconds)
+
+    async def _run_distributed_lease(
+        self,
+        lease: EvalRunLease,
+        registration: EvalTargetRegistration,
+        prepared: _PreparedEvalRun,
+    ) -> CorpusExecutionResult:
+        """Run this run's trials with every worker that helps, then aggregate them."""
+
+        compiled = prepared.compiled
+        slots = tuple(
+            EvalRunTrialSlot(case_id=case.id, trial_number=trial_number)
+            for case in compiled.suite.cases
+            for trial_number in range(1, compiled.trials + 1)
+        )
+        await self._past_contention(lambda: self._config.store.open_run_trials(lease.claim, slots))
+        await self._run_trials(
+            lease.run,
+            registration,
+            prepared,
+            StoreTrialClaims(
+                store=self._config.store,
+                target_key=lease.run.spec.target_key,
+                run_id=lease.run.id,
+                lease_seconds=self._config.lease_seconds,
+                poll_interval_seconds=self._config.poll_interval_seconds,
+                redact_json=prepared.target.app.redact_json,
+                # The run's claim monitor stops the owner.
+                stop=None,
+                claiming=lambda: True,
+                owner=lease.claim,
+            ),
+        )
+        # Every trial is retained now; aggregate them in trial order as a run
+        # resumed from its checkpoints does.
+        checkpoints = await self._past_contention(
+            lambda: self._config.store.load_trial_checkpoints(lease.claim)
+        )
+        return await _run_compiled_corpus_suite(
+            prepared.target,
+            compiled,
+            max_concurrency=lease.run.spec.max_concurrency,
+            manifest_project_root=registration.manifest_project_root,
+            expected_app_manifest_fingerprint=registration.catalog_entry.app_manifest_fingerprint,
+            expected_execution_profile=prepared.execution_profile,
+            native_run_id=lease.run.id,
+            execution_capacity=self._config.execution_capacity,
+            accepted_exposure=lease.run.spec.invocation.authored_suite_exposure,
+            completed_trials={
+                (checkpoint.case_id, checkpoint.trial_number): (
+                    checkpoint.result,
+                    checkpoint.public_data,
+                )
+                for checkpoint in checkpoints
+            },
+        )
 
     async def _run_claimed_lease(self, lease: EvalRunLease) -> None:
         try:
@@ -428,7 +665,7 @@ class EvalRunCoordinator:
         registration: EvalTargetRegistration,
     ) -> None:
         preflight = asyncio.create_task(
-            self._preflight_lease(lease, registration),
+            self._preflight_run(lease.run, registration),
             name=f"cayu-eval-preflight-{lease.run.id}",
         )
         monitor = asyncio.create_task(
@@ -478,13 +715,13 @@ class EvalRunCoordinator:
             await self._cancel_task(preflight)
             await self._cancel_task(monitor)
 
-    async def _preflight_lease(
+    async def _preflight_run(
         self,
-        lease: EvalRunLease,
+        run: EvalRunRecord,
         registration: EvalTargetRegistration,
     ) -> _PreparedEvalRun | _EvalFailure:
         try:
-            corpus = await self._config.store.load_corpus(lease.run.spec.corpus_revision)
+            corpus = await self._config.store.load_corpus(run.spec.corpus_revision)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -499,10 +736,10 @@ class EvalRunCoordinator:
         try:
             target = target_for_eval_invocation(
                 registration.execution_target(),
-                lease.run.spec.invocation,
+                run.spec.invocation,
             )
-            expected_profile = lease.run.spec.invocation.execution_profile
-            expected_snapshot = lease.run.spec.invocation.execution_profile_snapshot
+            expected_profile = run.spec.invocation.execution_profile
+            expected_snapshot = run.spec.invocation.execution_profile_snapshot
             if expected_profile is None:
                 return _failure(
                     EvalRunFailureCode.TARGET_UNAVAILABLE,
@@ -526,7 +763,7 @@ class EvalRunCoordinator:
                 EvalRunFailureCode.TARGET_UNAVAILABLE, EvalRunFailureReason.TARGET_PREFLIGHT_FAILED
             )
 
-        scenario_invocation = lease.run.spec.invocation.scenario
+        scenario_invocation = run.spec.invocation.scenario
         if scenario_invocation is not None:
             try:
                 scenario = await self._config.store.load_scenario(
@@ -562,10 +799,10 @@ class EvalRunCoordinator:
             try:
                 settings = scenario_launch_settings_from_invocation(
                     scenario_invocation,
-                    max_concurrency=lease.run.spec.max_concurrency,
-                    max_steps=lease.run.spec.invocation.max_steps,
-                    limits=lease.run.spec.invocation.limits,
-                    cost_budget=lease.run.spec.invocation.cost_budget,
+                    max_concurrency=run.spec.max_concurrency,
+                    max_steps=run.spec.invocation.max_steps,
+                    limits=run.spec.invocation.limits,
+                    cost_budget=run.spec.invocation.cost_budget,
                 )
                 preflight = await preflight_eval_scenario(
                     scenario,
@@ -597,7 +834,7 @@ class EvalRunCoordinator:
                 scenario,
                 binding,
                 authored_suite,
-                lease,
+                run,
                 registration,
                 target,
                 prepared_profile.binding.runtime_execution_profile,
@@ -607,7 +844,7 @@ class EvalRunCoordinator:
         return await asyncio.to_thread(
             self._compile_loaded_corpus,
             corpus,
-            lease,
+            run,
             registration,
             target,
             prepared_profile.binding.runtime_execution_profile,
@@ -616,7 +853,7 @@ class EvalRunCoordinator:
     def _compile_loaded_corpus(
         self,
         corpus: EvalCorpusDocument,
-        lease: EvalRunLease,
+        run: EvalRunRecord,
         registration: EvalTargetRegistration,
         target: CorpusTarget,
         execution_profile: ExecutionProfileIdentity,
@@ -638,24 +875,23 @@ class EvalRunCoordinator:
             compiled = compile_corpus_suite(
                 corpus,
                 target,
-                lease.run.spec.suite_id,
+                run.spec.suite_id,
             )
             if (
-                compiled.run_contract.corpus_revision != lease.run.spec.corpus_revision
-                or compiled.run_contract.suite_id != lease.run.spec.suite_id
-                or compiled.run_contract.suite_revision != lease.run.spec.suite_revision
+                compiled.run_contract.corpus_revision != run.spec.corpus_revision
+                or compiled.run_contract.suite_id != run.spec.suite_id
+                or compiled.run_contract.suite_revision != run.spec.suite_revision
             ):
                 raise ValueError("Persisted eval run does not match its compiled suite.")
-            exposure = lease.run.spec.invocation.authored_suite_exposure
-            snapshot = lease.run.spec.invocation.execution_profile_snapshot
-            if lease.run.spec.invocation.authored_suite_revision is not None and (
+            exposure = run.spec.invocation.authored_suite_exposure
+            snapshot = run.spec.invocation.execution_profile_snapshot
+            if run.spec.invocation.authored_suite_revision is not None and (
                 exposure is None
                 or snapshot is None
                 or exposure.trial_policy_revision != compiled.run_contract.trial_policy.revision
-                or not _accepted_authored_work_matches_runtime(lease, compiled, registration)
-                or lease.run.spec.max_concurrency
-                > compiled.run_contract.trial_policy.max_concurrency
-                or not _accepted_candidate_pricing_matches_target(lease, target)
+                or not _accepted_authored_work_matches_runtime(run, compiled, registration)
+                or run.spec.max_concurrency > compiled.run_contract.trial_policy.max_concurrency
+                or not _accepted_candidate_pricing_matches_target(run, target)
             ):
                 raise ValueError("Persisted authored run lost its accepted work exposure.")
         except Exception:
@@ -675,13 +911,13 @@ class EvalRunCoordinator:
         scenario: EvalScenarioDocumentV2,
         binding: ScenarioLaunchBindingV2,
         authored_suite: EvalSuiteDocument | None,
-        lease: EvalRunLease,
+        run: EvalRunRecord,
         registration: EvalTargetRegistration,
         target: CorpusTarget,
         execution_profile: ExecutionProfileIdentity,
     ) -> _PreparedEvalRun | _EvalFailure:
         try:
-            scenario_invocation = lease.run.spec.invocation.scenario
+            scenario_invocation = run.spec.invocation.scenario
             if scenario_invocation is None:
                 return _failure(
                     EvalRunFailureCode.CORPUS_UNAVAILABLE,
@@ -725,25 +961,24 @@ class EvalRunCoordinator:
                     EvalRunFailureCode.CORPUS_UNAVAILABLE,
                     EvalRunFailureReason.CORPUS_COMPILATION_FAILED,
                 )
-            compiled = compile_corpus_suite(corpus, target, lease.run.spec.suite_id)
+            compiled = compile_corpus_suite(corpus, target, run.spec.suite_id)
             if (
-                compiled.run_contract.corpus_revision != lease.run.spec.corpus_revision
-                or compiled.run_contract.suite_revision != lease.run.spec.suite_revision
+                compiled.run_contract.corpus_revision != run.spec.corpus_revision
+                or compiled.run_contract.suite_revision != run.spec.suite_revision
             ):
                 return _failure(
                     EvalRunFailureCode.CORPUS_UNAVAILABLE,
                     EvalRunFailureReason.CORPUS_COMPILATION_FAILED,
                 )
-            exposure = lease.run.spec.invocation.authored_suite_exposure
-            snapshot = lease.run.spec.invocation.execution_profile_snapshot
+            exposure = run.spec.invocation.authored_suite_exposure
+            snapshot = run.spec.invocation.execution_profile_snapshot
             if authored_suite is not None and (
                 exposure is None
                 or snapshot is None
                 or exposure.trial_policy_revision != compiled.run_contract.trial_policy.revision
-                or not _accepted_authored_work_matches_runtime(lease, compiled, registration)
-                or lease.run.spec.max_concurrency
-                > compiled.run_contract.trial_policy.max_concurrency
-                or not _accepted_candidate_pricing_matches_target(lease, target)
+                or not _accepted_authored_work_matches_runtime(run, compiled, registration)
+                or run.spec.max_concurrency > compiled.run_contract.trial_policy.max_concurrency
+                or not _accepted_candidate_pricing_matches_target(run, target)
             ):
                 return _failure(
                     EvalRunFailureCode.CORPUS_UNAVAILABLE,
@@ -787,7 +1022,9 @@ class EvalRunCoordinator:
         block_reexecution = recovery is not None and (
             lease.claim.epoch > recovery.max_execution_attempts
         )
-        if prepared.scenario is None or block_reexecution:
+        if self._distributes_trials(lease.run, prepared):
+            execution_coro = self._run_distributed_lease(lease, registration, prepared)
+        elif prepared.scenario is None or block_reexecution:
             checkpoints = await self._config.store.load_trial_checkpoints(lease.claim)
             completed_trials = {
                 (checkpoint.case_id, checkpoint.trial_number): (

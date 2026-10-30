@@ -16,8 +16,10 @@ from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvalCaseSpec,
     EvalCorpusDocument,
+    EvalSuiteSpec,
     EvaluationSourceIdentityV1,
     RunInputSpec,
+    TrialRequestSpec,
     _content_revision,
 )
 from cayu.evals.execution import (
@@ -66,6 +68,7 @@ from cayu.evals.store import (
     EvalRunStateConflict,
     EvalRunStatus,
     EvalRunTrialCheckpoint,
+    EvalRunTrialSlot,
     EvalScenarioApprovalSubmission,
     EvalScenarioCatalogQuery,
     EvalScenarioRunInvocation,
@@ -85,6 +88,7 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDraftV1,
     compile_eval_suite_draft,
 )
+from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.runtime.manifest import AppManifest, ToolManifest, _app_manifest_fingerprint
 from cayu.sessions.invocation import (
     InvocationOrigin,
@@ -322,6 +326,182 @@ def _terminal_trial_checkpoint(corpus: EvalCorpusDocument) -> EvalRunTrialCheckp
             output=EvalTrialOutputPreviewV1.unavailable(),
         ),
     )
+
+
+def _corpus_with_shared_trials(corpus: EvalCorpusDocument, *, trials: int) -> EvalCorpusDocument:
+    """One case of ``corpus`` with ``trials`` trials, two of them at once, on its own target."""
+
+    original_suite = corpus.suites[0]
+    suite = EvalSuiteSpec.create(
+        id=original_suite.id,
+        name=original_suite.name,
+        trial_request=TrialRequestSpec(
+            trials=trials,
+            timeout_seconds=original_suite.trial_request.timeout_seconds,
+            trial_policy=EvalSuiteTrialPolicyV1.create(trial_count=trials, max_concurrency=2),
+        ),
+    )
+    original = corpus.cases[0]
+    case = EvalCaseSpec.create(
+        id=original.id,
+        suite_id=suite.id,
+        name=original.name,
+        source=original.source,
+        input=original.input,
+        assertions=original.assertions,
+    )
+    return EvalCorpusDocument.create(
+        target_key="distributed-trials-agent",
+        evidence_policy=corpus.evidence_policy,
+        pricing_profile=corpus.pricing_profile,
+        suites=(suite,),
+        cases=(case,),
+    )
+
+
+def _trial_checkpoint(case_id: str, trial_number: int) -> EvalRunTrialCheckpoint:
+    now = datetime.now(UTC)
+    return EvalRunTrialCheckpoint(
+        case_id=case_id,
+        result=EvalTrialResult(
+            trial_number=trial_number,
+            status=EvalStatus.ERROR,
+            error="candidate execution failed",
+            started_at=now,
+            completed_at=now,
+        ),
+        public_data=_EvalTrialPublicData(
+            diagnostic_code=EvalTrialDiagnosticCode.EXECUTION_FAILED,
+            output=EvalTrialOutputPreviewV1.unavailable(),
+        ),
+    )
+
+
+async def assert_trial_distribution_conformance(
+    store: EvalStore,
+    *,
+    corpus: EvalCorpusDocument,
+) -> None:
+    """Trials any worker claims: fenced per trial, per run owner and by max_concurrency."""
+
+    assert store.trial_distribution is True
+    redact = _NO_SECRETS.redact_json
+    shared = _corpus_with_shared_trials(corpus, trials=3)
+    await store.save_corpus(shared, redact_json=redact)
+    suite = shared.suites[0]
+    request = EvalRunRequest(
+        run_id="distributed-trials-run",
+        idempotency_key="sha256:" + hashlib.sha256(b"distributed-trials-run").hexdigest(),
+        corpus_revision=shared.revision,
+        target_key=shared.target_key,
+        suite_id=suite.id,
+        suite_revision=suite.revision,
+        max_concurrency=2,
+    )
+    await store.admit_run(request, redact_json=redact)
+    keys = (shared.target_key,)
+    case_id = shared.cases[0].id
+    slots = tuple(EvalRunTrialSlot(case_id=case_id, trial_number=number) for number in (1, 2, 3))
+
+    # No trial is open before the run's owner opens them.
+    assert await store.claim_run_trial(keys) is None
+    owner = await store.claim_run(target_key=shared.target_key, lease_seconds=60)
+    assert owner is not None
+    assert await store.claim_run_trial(keys) is None
+    with pytest.raises(EvalRunStateConflict, match="exactly the trials"):
+        await store.open_run_trials(owner.claim, slots[:2])
+    await store.open_run_trials(owner.claim, slots)
+    await store.open_run_trials(owner.claim, slots)
+    with pytest.raises(EvalRunStateConflict, match="another order"):
+        await store.open_run_trials(owner.claim, tuple(reversed(slots)))
+    assert await store.unfinished_run_trials(owner.claim) == 3
+
+    # Trials are handed out in order, never more at once than max_concurrency.
+    first = await store.claim_run_trial(keys, lease_seconds=60)
+    second = await store.claim_run_trial(keys, lease_seconds=60)
+    assert first is not None and second is not None
+    assert first.run.id == request.run_id
+    assert (first.claim.trial_number, second.claim.trial_number) == (1, 2)
+    assert (first.claim.run_epoch, first.claim.epoch) == (owner.claim.epoch, 1)
+    assert await store.claim_run_trial(keys, lease_seconds=60) is None
+    assert (await store.heartbeat_run_trial(first.claim)).status is EvalRunStatus.RUNNING
+    with pytest.raises(EvalRunStateConflict, match="claimed trial"):
+        await store.save_claimed_trial_checkpoint(
+            first.claim, _trial_checkpoint(case_id, 2), redact_json=redact
+        )
+    await store.save_claimed_trial_checkpoint(
+        first.claim, _trial_checkpoint(case_id, 1), redact_json=redact
+    )
+    # Retaining the result ends the claim.
+    with pytest.raises(EvalRunClaimLost):
+        await store.heartbeat_run_trial(first.claim)
+    assert await store.unfinished_run_trials(owner.claim) == 2
+    third = await store.claim_run_trial(keys, run_id=request.run_id, lease_seconds=1)
+    assert third is not None and third.claim.trial_number == 3
+
+    # A released trial is open again at once, under a new claim epoch.
+    await store.release_run_trial(second.claim)
+    await store.release_run_trial(second.claim)
+    again = await store.claim_run_trial(keys, lease_seconds=60)
+    assert again is not None
+    assert (again.claim.trial_number, again.claim.epoch) == (2, 2)
+    with pytest.raises(EvalRunClaimLost):
+        await store.save_claimed_trial_checkpoint(
+            second.claim, _trial_checkpoint(case_id, 2), redact_json=redact
+        )
+
+    # A lost worker's claim expires; the trial is claimed again and the old
+    # claim can no longer retain a result.
+    await asyncio.sleep(1.2)
+    with pytest.raises(EvalRunClaimLost):
+        await store.heartbeat_run_trial(third.claim)
+    retaken = await store.claim_run_trial(keys, lease_seconds=60)
+    assert retaken is not None
+    assert (retaken.claim.trial_number, retaken.claim.epoch) == (3, 2)
+    with pytest.raises(EvalRunClaimLost):
+        await store.save_claimed_trial_checkpoint(
+            third.claim, _trial_checkpoint(case_id, 3), redact_json=redact
+        )
+    await store.save_claimed_trial_checkpoint(
+        retaken.claim, _trial_checkpoint(case_id, 3), redact_json=redact
+    )
+
+    # A later owner opens the trials again, which ends every earlier claim;
+    # retained trials stay retained and claim epochs keep counting.
+    await store.release_run(owner.claim)
+    with pytest.raises(EvalRunClaimLost):
+        await store.heartbeat_run_trial(again.claim)
+    successor = await store.claim_run(target_key=shared.target_key, lease_seconds=60)
+    assert successor is not None and successor.claim.epoch == owner.claim.epoch + 1
+    assert await store.claim_run_trial(keys) is None
+    await store.open_run_trials(successor.claim, slots)
+    assert await store.unfinished_run_trials(successor.claim) == 1
+    with pytest.raises(EvalRunClaimLost):
+        await store.save_claimed_trial_checkpoint(
+            again.claim, _trial_checkpoint(case_id, 2), redact_json=redact
+        )
+    last = await store.claim_run_trial(keys, lease_seconds=60)
+    assert last is not None
+    assert (last.claim.run_epoch, last.claim.trial_number, last.claim.epoch) == (
+        successor.claim.epoch,
+        2,
+        3,
+    )
+
+    # A cancelling run tells its trials to stop.
+    await store.request_cancel(request.run_id)
+    assert (await store.heartbeat_run_trial(last.claim)).status is EvalRunStatus.CANCELLING
+    await store.save_claimed_trial_checkpoint(
+        last.claim, _trial_checkpoint(case_id, 2), redact_json=redact
+    )
+    assert await store.unfinished_run_trials(successor.claim) == 0
+    assert [
+        (item.case_id, item.trial_number)
+        for item in await store.load_trial_checkpoints(successor.claim)
+    ] == [(case_id, 1), (case_id, 2), (case_id, 3)]
+    await store.finish_cancel(successor.claim)
+    with pytest.raises(EvalRunClaimLost):
+        await store.heartbeat_run_trial(last.claim)
 
 
 async def assert_scenario_progress_conformance(

@@ -2299,6 +2299,98 @@ class EvalRunLease(_EvalStoreModel):
         return self
 
 
+class EvalRunTrialSlot(_EvalStoreModel):
+    """One trial of a run: a case of its suite and a trial number."""
+
+    case_id: StrictStr
+    trial_number: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+
+    @field_validator("case_id")
+    @classmethod
+    def validate_case_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+
+class EvalRunTrialClaim(_EvalStoreModel):
+    """A worker's fenced claim on one trial of a run whose owner opened its trials.
+
+    ``run_epoch`` is the run ownership epoch that opened the trial and ``epoch``
+    counts the trial's own claims. A later run owner opens the trials again
+    under its own epoch, which ends every claim taken under the earlier one.
+    """
+
+    run_id: StrictStr
+    run_epoch: StrictInt = Field(ge=1, le=_EVAL_STORE_MAX_BIGINT)
+    case_id: StrictStr
+    trial_number: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    claim_id: StrictStr = Field(repr=False)
+    epoch: StrictInt = Field(ge=1, le=_EVAL_STORE_MAX_BIGINT)
+
+    @field_validator("run_id", "claim_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _store_identifier(value, info.field_name)
+
+    @field_validator("case_id")
+    @classmethod
+    def validate_case_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @property
+    def slot(self) -> EvalRunTrialSlot:
+        return EvalRunTrialSlot(case_id=self.case_id, trial_number=self.trial_number)
+
+
+class EvalRunTrialLease(_EvalStoreModel):
+    """A claimed trial together with the run it belongs to."""
+
+    run: EvalRunRecord
+    claim: EvalRunTrialClaim = Field(repr=False)
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> EvalRunTrialLease:
+        if self.run.id != self.claim.run_id:
+            raise ValueError("Eval trial lease claim does not match its run.")
+        ownership = self.run.ownership
+        if ownership is None or ownership.epoch != self.claim.run_epoch:
+            raise ValueError("Eval trial lease claim does not match the run's owner.")
+        return self
+
+
+def _validated_trial_slots(
+    slots: tuple[EvalRunTrialSlot, ...],
+) -> tuple[EvalRunTrialSlot, ...]:
+    if type(slots) is not tuple:
+        raise TypeError("trial slots must be a tuple.")
+    if not 1 <= len(slots) <= EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS:
+        raise ValueError("Eval run trial slots must be nonempty and within their item limit.")
+    copied = tuple(_exact_model(slot, EvalRunTrialSlot, "trial slot") for slot in slots)
+    if len({(slot.case_id, slot.trial_number) for slot in copied}) != len(copied):
+        raise ValueError("Eval run trial slots must be unique.")
+    return copied
+
+
+def _validate_trial_slots_for_run(
+    slots: tuple[EvalRunTrialSlot, ...],
+    request: EvalRunRequest,
+    corpus: EvalCorpusDocument,
+) -> None:
+    """Require exactly the trials of the run's suite, in any order."""
+
+    suite = next((item for item in corpus.suites if item.id == request.suite_id), None)
+    if suite is None:
+        raise EvalRunStateConflict("Eval run suite is unavailable for trial distribution.")
+    trial_count = eval_suite_trial_policy(suite).trial_count
+    expected = {
+        (case.id, trial_number)
+        for case in corpus.cases
+        if case.suite_id == suite.id
+        for trial_number in range(1, trial_count + 1)
+    }
+    if {(slot.case_id, slot.trial_number) for slot in slots} != expected:
+        raise EvalRunStateConflict("Eval trial slots must be exactly the trials of the run.")
+
+
 class EvalRunPage(_EvalStoreModel):
     items: tuple[EvalRunRecord, ...] = Field(max_length=EVAL_STORE_MAX_PAGE_SIZE)
     next_cursor: StrictStr | None = None
@@ -3204,6 +3296,8 @@ class EvalStore(ABC):
     scenarios: ClassVar[bool] = False
     scenario_execution: ClassVar[bool] = False
     trial_checkpointing: ClassVar[bool] = False
+    #: A run's owner can open its trials for any worker to claim.
+    trial_distribution: ClassVar[bool] = False
     suite_authoring: ClassVar[bool] = False
     judge_calibrations: ClassVar[bool] = False
     suite_views: ClassVar[bool] = False
@@ -3612,6 +3706,88 @@ class EvalStore(ABC):
         del claim, checkpoint, redact_json
         raise NotImplementedError("Durable eval trial checkpoints are not supported.")
 
+    async def open_run_trials(
+        self,
+        claim: EvalRunClaim,
+        slots: tuple[EvalRunTrialSlot, ...],
+    ) -> None:
+        """Let any worker claim the run's trials, handed out in ``slots`` order.
+
+        Only the live run owner opens them, and ``slots`` must be exactly the
+        trials of the run's suite. Opening them again under a later owner ends
+        every trial claim taken under an earlier one. Trials that already have
+        a checkpoint are never handed out.
+        """
+
+        del claim, slots
+        raise NotImplementedError("Eval trial distribution is not supported.")
+
+    async def claim_run_trial(
+        self,
+        target_keys: tuple[str, ...],
+        *,
+        run_id: str | None = None,
+        lease_seconds: int = 300,
+    ) -> EvalRunTrialLease | None:
+        """Claim the next open trial of a running run of one of ``target_keys``.
+
+        A trial is open while its run's live owner opened it under the current
+        ownership epoch, it has no checkpoint, and it has no live claim. A run
+        never has more live trial claims than its ``max_concurrency``. Runs are
+        served oldest first, and a run's trials in the order they were opened.
+        ``run_id`` restricts the claim to one run.
+        """
+
+        del target_keys, run_id, lease_seconds
+        raise NotImplementedError("Eval trial distribution is not supported.")
+
+    async def unfinished_run_trials(self, claim: EvalRunClaim) -> int:
+        """How many trials the live run owner opened still have no checkpoint."""
+
+        del claim
+        raise NotImplementedError("Eval trial distribution is not supported.")
+
+    async def heartbeat_run_trial(
+        self,
+        claim: EvalRunTrialClaim,
+        *,
+        extend_seconds: int = 300,
+    ) -> EvalRunObservation:
+        """Extend a live trial claim and return its run's lifecycle.
+
+        Raises ``EvalRunClaimLost`` once the claim is no longer live: it
+        expired and was claimed again, the run has another owner, or the run
+        is no longer active. A ``CANCELLING`` run means: stop the trial.
+        """
+
+        del claim, extend_seconds
+        raise NotImplementedError("Eval trial distribution is not supported.")
+
+    async def save_claimed_trial_checkpoint(
+        self,
+        claim: EvalRunTrialClaim,
+        checkpoint: EvalRunTrialCheckpoint,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> None:
+        """Retain the claimed trial's terminal result and end the claim.
+
+        Fenced like ``save_trial_checkpoint``, by the trial claim instead of the
+        run claim: the claim must be live and the run still running.
+        """
+
+        del claim, checkpoint, redact_json
+        raise NotImplementedError("Eval trial distribution is not supported.")
+
+    async def release_run_trial(self, claim: EvalRunTrialClaim) -> None:
+        """Give up a live trial claim so that another worker can claim the trial.
+
+        Releasing a claim that is no longer live does nothing.
+        """
+
+        del claim
+        raise NotImplementedError("Eval trial distribution is not supported.")
+
     async def submit_scenario_approval(
         self,
         run_id: str,
@@ -3743,6 +3919,20 @@ class _MemoryRunState:
     scenario_progress: EvalScenarioRunProgress | None = None
     trial_checkpoints: dict[tuple[str, int], EvalRunTrialCheckpoint] = field(default_factory=dict)
     trial_checkpoint_bytes: int = 0
+    trial_slots: list[_MemoryTrialSlot] = field(default_factory=list)
+
+
+@dataclass
+class _MemoryTrialSlot:
+    case_id: str
+    trial_number: int
+    run_epoch: int
+    claim_id: str | None = None
+    claim_epoch: int = 0
+    lease_expires_at: datetime | None = None
+
+    def held(self, now: datetime) -> bool:
+        return self.lease_expires_at is not None and self.lease_expires_at > now
 
 
 @dataclass
@@ -3787,6 +3977,7 @@ class InMemoryEvalStore(EvalStore):
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
     trial_checkpointing: ClassVar[bool] = True
+    trial_distribution: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
     judge_calibrations: ClassVar[bool] = True
 
@@ -5061,30 +5252,216 @@ class InMemoryEvalStore(EvalStore):
         )
         async with self._lock:
             state = self._require_live_claim(claim)
+            self._retain_trial_checkpoint(state, prepared)
+
+    def _retain_trial_checkpoint(
+        self,
+        state: _MemoryRunState,
+        prepared: _PreparedEvalRunTrialCheckpoint,
+    ) -> None:
+        corpus = EvalCorpusDocument.model_validate(
+            json.loads(self._corpus_documents[state.request.corpus_revision])
+        )
+        checkpoint = _validate_trial_checkpoint_for_run(
+            prepared.checkpoint,
+            state.request,
+            corpus,
+        )
+        key = (checkpoint.case_id, checkpoint.trial_number)
+        current = state.trial_checkpoints.get(key)
+        if current is not None:
+            if current == checkpoint:
+                return
+            raise EvalRunStateConflict("Eval trial slot already has another terminal result.")
+        if len(state.trial_checkpoints) >= EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS:
+            raise ValueError("Eval run trial checkpoints exceed their item limit.")
+        if (
+            state.trial_checkpoint_bytes + prepared.document_bytes
+            > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES
+        ):
+            raise ValueError("Eval run trial checkpoints exceed their byte limit.")
+        state.trial_checkpoints[key] = checkpoint
+        state.trial_checkpoint_bytes += prepared.document_bytes
+        state.updated_at = self._now()
+
+    async def open_run_trials(
+        self,
+        claim: EvalRunClaim,
+        slots: tuple[EvalRunTrialSlot, ...],
+    ) -> None:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        slots = _validated_trial_slots(slots)
+        async with self._lock:
+            state = self._require_live_claim(claim)
+            if state.status is not EvalRunStatus.RUNNING:
+                raise EvalRunStateConflict("Only a running eval run opens its trials.")
+            keys = [(slot.case_id, slot.trial_number) for slot in slots]
+            if state.trial_slots and state.trial_slots[0].run_epoch == claim.epoch:
+                if [(slot.case_id, slot.trial_number) for slot in state.trial_slots] != keys:
+                    raise EvalRunStateConflict("Eval run trials are already open in another order.")
+                return
             corpus = EvalCorpusDocument.model_validate(
                 json.loads(self._corpus_documents[state.request.corpus_revision])
             )
-            checkpoint = _validate_trial_checkpoint_for_run(
-                prepared.checkpoint,
-                state.request,
-                corpus,
-            )
-            key = (checkpoint.case_id, checkpoint.trial_number)
-            current = state.trial_checkpoints.get(key)
-            if current is not None:
-                if current == checkpoint:
-                    return
-                raise EvalRunStateConflict("Eval trial slot already has another terminal result.")
-            if len(state.trial_checkpoints) >= EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS:
-                raise ValueError("Eval run trial checkpoints exceed their item limit.")
-            if (
-                state.trial_checkpoint_bytes + prepared.document_bytes
-                > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES
-            ):
-                raise ValueError("Eval run trial checkpoints exceed their byte limit.")
-            state.trial_checkpoints[key] = checkpoint
-            state.trial_checkpoint_bytes += prepared.document_bytes
+            _validate_trial_slots_for_run(slots, state.request, corpus)
+            claim_epochs = {
+                (slot.case_id, slot.trial_number): slot.claim_epoch for slot in state.trial_slots
+            }
+            state.trial_slots = [
+                _MemoryTrialSlot(
+                    case_id=case_id,
+                    trial_number=trial_number,
+                    run_epoch=claim.epoch,
+                    claim_epoch=claim_epochs.get((case_id, trial_number), 0),
+                )
+                for case_id, trial_number in keys
+            ]
             state.updated_at = self._now()
+
+    async def claim_run_trial(
+        self,
+        target_keys: tuple[str, ...],
+        *,
+        run_id: str | None = None,
+        lease_seconds: int = 300,
+    ) -> EvalRunTrialLease | None:
+        approved = frozenset(_claim_target_keys(target_keys))
+        if run_id is not None:
+            run_id = _store_identifier(run_id, "run_id")
+        lease_seconds = _lease_seconds(lease_seconds)
+        async with self._lock:
+            now = self._now()
+            candidates = sorted(
+                (
+                    state
+                    for state in self._runs.values()
+                    if state.request.target_key in approved
+                    and (run_id is None or state.request.run_id == run_id)
+                    and state.status is EvalRunStatus.RUNNING
+                    and state.trial_slots
+                    and state.trial_slots[0].run_epoch == state.epoch
+                ),
+                key=lambda item: (item.created_at, item.request.run_id),
+            )
+            for state in candidates:
+                held = sum(1 for slot in state.trial_slots if slot.held(now))
+                if held >= state.request.max_concurrency:
+                    continue
+                slot = next(
+                    (
+                        slot
+                        for slot in state.trial_slots
+                        if not slot.held(now)
+                        and (slot.case_id, slot.trial_number) not in state.trial_checkpoints
+                        and slot.claim_epoch < _EVAL_STORE_MAX_BIGINT
+                    ),
+                    None,
+                )
+                if slot is None:
+                    continue
+                slot.claim_id = _store_identifier(self._claim_id_factory(), "claim_id")
+                slot.claim_epoch += 1
+                slot.lease_expires_at = now + timedelta(seconds=lease_seconds)
+                return EvalRunTrialLease(
+                    run=self._record(state),
+                    claim=EvalRunTrialClaim(
+                        run_id=state.request.run_id,
+                        run_epoch=slot.run_epoch,
+                        case_id=slot.case_id,
+                        trial_number=slot.trial_number,
+                        claim_id=slot.claim_id,
+                        epoch=slot.claim_epoch,
+                    ),
+                )
+            return None
+
+    async def unfinished_run_trials(self, claim: EvalRunClaim) -> int:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        async with self._lock:
+            state = self._require_live_claim(claim)
+            return sum(
+                1
+                for slot in state.trial_slots
+                if slot.run_epoch == claim.epoch
+                and (slot.case_id, slot.trial_number) not in state.trial_checkpoints
+            )
+
+    async def heartbeat_run_trial(
+        self,
+        claim: EvalRunTrialClaim,
+        *,
+        extend_seconds: int = 300,
+    ) -> EvalRunObservation:
+        claim = _exact_model(claim, EvalRunTrialClaim, "claim")
+        extend_seconds = _lease_seconds(extend_seconds)
+        async with self._lock:
+            state, slot = self._require_live_trial_claim(claim)
+            slot.lease_expires_at = self._now() + timedelta(seconds=extend_seconds)
+            return self._observation(state)
+
+    async def save_claimed_trial_checkpoint(
+        self,
+        claim: EvalRunTrialClaim,
+        checkpoint: EvalRunTrialCheckpoint,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> None:
+        claim = _exact_model(claim, EvalRunTrialClaim, "claim")
+        prepared = await asyncio.to_thread(
+            _prepare_trial_checkpoint_for_store,
+            checkpoint,
+            redact_json=redact_json,
+        )
+        if (prepared.checkpoint.case_id, prepared.checkpoint.trial_number) != (
+            claim.case_id,
+            claim.trial_number,
+        ):
+            raise EvalRunStateConflict("Eval trial checkpoint is not for the claimed trial.")
+        async with self._lock:
+            state, slot = self._require_live_trial_claim(claim)
+            self._retain_trial_checkpoint(state, prepared)
+            slot.claim_id = None
+            slot.lease_expires_at = None
+
+    async def release_run_trial(self, claim: EvalRunTrialClaim) -> None:
+        claim = _exact_model(claim, EvalRunTrialClaim, "claim")
+        async with self._lock:
+            state = self._runs.get(claim.run_id)
+            slot = None if state is None else self._trial_slot(state, claim)
+            if slot is not None:
+                slot.claim_id = None
+                slot.lease_expires_at = None
+
+    @staticmethod
+    def _trial_slot(state: _MemoryRunState, claim: EvalRunTrialClaim) -> _MemoryTrialSlot | None:
+        """The claimed slot, when the claim still holds it."""
+
+        return next(
+            (
+                slot
+                for slot in state.trial_slots
+                if slot.case_id == claim.case_id
+                and slot.trial_number == claim.trial_number
+                and slot.run_epoch == claim.run_epoch
+                and slot.claim_id == claim.claim_id
+                and slot.claim_epoch == claim.epoch
+            ),
+            None,
+        )
+
+    def _require_live_trial_claim(
+        self,
+        claim: EvalRunTrialClaim,
+    ) -> tuple[_MemoryRunState, _MemoryTrialSlot]:
+        state = self._require_run(claim.run_id)
+        if state.status not in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}:
+            raise EvalRunClaimLost("Eval run is no longer active.")
+        if state.epoch != claim.run_epoch:
+            raise EvalRunClaimLost("Eval run has another owner since the trial was claimed.")
+        slot = self._trial_slot(state, claim)
+        if slot is None or not slot.held(self._now()):
+            raise EvalRunClaimLost("Eval trial claim is no longer live.")
+        return state, slot
 
     async def update_scenario_trial(
         self,

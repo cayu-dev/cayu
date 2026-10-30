@@ -65,6 +65,19 @@ def positive_process_count(value: str) -> int:
     return count
 
 
+# How many worker processes one supervisor runs, in each of them.
+WORKER_COUNT_ENVIRONMENT = "CAYU_WORKER_COUNT"
+
+
+def process_worker_count() -> int:
+    """How many processes this worker's supervisor runs: 1 without a supervisor."""
+
+    value = os.environ.get(WORKER_COUNT_ENVIRONMENT, "").strip()
+    if not value.isdecimal() or int(value) < 1:
+        return 1
+    return int(value)
+
+
 def process_worker_environment(index: int, count: int) -> dict[str, str]:
     """This process's environment for child ``index`` of ``count``.
 
@@ -78,7 +91,7 @@ def process_worker_environment(index: int, count: int) -> dict[str, str]:
     # Spawn fresh interpreters, including when the caller came from a source tree.
     environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(map(str, sys.path)))
     environment["CAYU_WORKER_INDEX"] = str(index)
-    environment["CAYU_WORKER_COUNT"] = str(count)
+    environment[WORKER_COUNT_ENVIRONMENT] = str(count)
     environment["CAYU_SUPERVISOR_PID"] = str(os.getpid())
     return environment
 

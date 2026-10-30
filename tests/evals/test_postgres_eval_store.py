@@ -13,6 +13,7 @@ from tests.evals.eval_store_conformance import (
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
     assert_judge_calibration_store_conformance,
     assert_scenario_progress_conformance,
+    assert_trial_distribution_conformance,
     captured_result_for_corpus,
 )
 from tests.evals.test_artifact_assertions import structural_corpus, structural_target
@@ -144,6 +145,7 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn, tmp_path) -> None:
                 result=result,
             )
             await assert_scenario_progress_conformance(store, corpus=corpus)
+            await assert_trial_distribution_conformance(store, corpus=corpus)
             await assert_judge_calibration_store_conformance(
                 store,
                 report=await _calibration_report(),
@@ -294,7 +296,7 @@ def test_postgres_eval_store_requires_and_migrates_revision_seventy_four(
 
         validating = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(SchemaTooOld, match="requires >= 132"):
+            with pytest.raises(SchemaTooOld, match="requires >= 138"):
                 await validating.list_corpora()
         finally:
             await validating.close()
@@ -448,6 +450,7 @@ def test_postgres_eval_store_creates_revision_sixty_eight_schema(postgres_dsn) -
                 "cayu_eval_result_records",
                 "cayu_eval_results",
                 "cayu_eval_run_trial_checkpoints",
+                "cayu_eval_run_trial_slots",
                 "cayu_eval_runs",
                 "cayu_eval_scenarios",
                 "cayu_eval_suites",

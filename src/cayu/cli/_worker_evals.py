@@ -10,7 +10,7 @@ it exits, and a worker that runs until idle returns only once no run is left.
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from cayu.applications import CayuApp
@@ -24,6 +24,7 @@ from cayu.project_control_plane import (
     ProjectControlPlaneContext,
     resolve_project_control_plane_context,
 )
+from cayu.runtime._process_workers import process_worker_count
 from cayu.server.evals_registry import (
     EvalTargetRegistry,
     declared_eval_target_registrations,
@@ -94,6 +95,8 @@ def worker_evals(root: Path, name: str, app: CayuApp) -> WorkerEvals | None:
             automatic_store=resolved.eval_store,
         )
         assert runtime is not None
+        # The processes of one supervisor share each run's trials between them.
+        runtime = replace(runtime, worker_processes=process_worker_count())
     except BaseException:
         close_project_control_plane_context(context)
         raise

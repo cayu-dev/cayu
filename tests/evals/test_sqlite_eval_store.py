@@ -17,6 +17,7 @@ from tests.evals.eval_store_conformance import (
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
     assert_judge_calibration_store_conformance,
     assert_scenario_progress_conformance,
+    assert_trial_distribution_conformance,
     captured_result_for_corpus,
 )
 from tests.evals.test_artifact_assertions import structural_corpus, structural_target
@@ -49,6 +50,7 @@ from cayu.evals.store import (
     EvalRunRequest,
     EvalRunStatus,
     EvalRunTrialCheckpoint,
+    EvalRunTrialClaim,
     EvalStoreTransientContention,
 )
 from cayu.storage import _sqlite_connection as sqlite_connection
@@ -611,6 +613,7 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
                 result=result,
             )
             await assert_scenario_progress_conformance(store, corpus=corpus)
+            await assert_trial_distribution_conformance(store, corpus=corpus)
             await assert_judge_calibration_store_conformance(
                 store,
                 report=await _calibration_report(),
@@ -792,6 +795,7 @@ def test_sqlite_eval_store_creates_revision_sixty_eight_schema(tmp_path) -> None
         "cayu_eval_result_records",
         "cayu_eval_results",
         "cayu_eval_run_trial_checkpoints",
+        "cayu_eval_run_trial_slots",
         "cayu_eval_runs",
         "cayu_eval_scenarios",
         "cayu_eval_suites",
@@ -873,7 +877,7 @@ def test_sqlite_eval_store_requires_current_schema(
         schema_migrations.REVISIONS = revisions
         connection.close()
 
-    with pytest.raises(SchemaTooOld, match="requires >= 132"):
+    with pytest.raises(SchemaTooOld, match="requires >= 138"):
         SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
 
@@ -967,7 +971,7 @@ def test_sqlite_eval_store_requires_and_migrates_revision_seventy_four(
         finally:
             connection.close()
 
-        with pytest.raises(SchemaTooOld, match="requires >= 132"):
+        with pytest.raises(SchemaTooOld, match="requires >= 138"):
             SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
         migrated = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
@@ -1770,3 +1774,42 @@ def test_sqlite_eval_store_rolls_back_interrupted_result_publication(tmp_path, c
     assert "sqlite_writer.permanent_storage_failure" in {
         getattr(record, "cayu_eval_store_event", None) for record in caplog.records
     }
+
+
+def test_sqlite_trial_claims_wait_out_writer_contention_within_its_budget(tmp_path) -> None:
+    async def exercise() -> None:
+        path = tmp_path / "trial-claim-contention.db"
+        store = SQLiteEvalStore(path, writer_contention_policy=_fast_contention_policy())
+        exhausted = SQLiteEvalStore(
+            path,
+            writer_contention_policy=_fast_contention_policy(max_wait_seconds=0.1),
+        )
+        claim = EvalRunTrialClaim(
+            run_id="contended-run",
+            run_epoch=1,
+            case_id="refund-approval",
+            trial_number=1,
+            claim_id="contended-claim",
+            epoch=1,
+        )
+        blocker = sqlite3.connect(path)
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            # Another writer holds the database for longer than one lock attempt:
+            # trial claims retry within the writer budget instead of failing.
+            asyncio.get_running_loop().call_later(0.3, blocker.rollback)
+            assert await store.claim_run_trial(("refund-agent",)) is None
+            blocker.execute("BEGIN IMMEDIATE")
+            # Past the budget the error is the store's transient contention, which
+            # the coordinator retries, not a raw SQLite error.
+            with pytest.raises(EvalStoreTransientContention):
+                await exhausted.claim_run_trial(("refund-agent",))
+            with pytest.raises(EvalStoreTransientContention):
+                await exhausted.release_run_trial(claim)
+        finally:
+            blocker.rollback()
+            blocker.close()
+            await exhausted.close()
+            await store.close()
+
+    asyncio.run(exercise())
