@@ -979,8 +979,12 @@ acknowledge sessions nobody has looked at. Check `deployment status` for the rel
 `session_preflight` and decide, or retry with `--acknowledge-session '*'` yourself.
 
 Answering or finishing the sessions and retrying with `--session-policy wait` publishes
-the release once nothing blocks. A refused rollback or promotion returns the Agent's
-selection to the serving release, and the same retry selects it again.
+the release once nothing blocks. A refused rollback returns the Agent's selection to the
+serving release, and the same retry selects it again. A refused promotion doesn't: when
+the promotion selected the release before Cloud checked the sessions (as `deploy`'s
+promote can), it stays `promoted` and selected while the previous release keeps serving,
+and only its `publication_error` says so; when Cloud checked first, the selection never
+changed. Either way, the retry publishes it.
 
 Running `cayu cloud deploy` again with unchanged source and any of the three flags (even
 `--session-policy wait` alone, which keeps the original create request and key) gives the
