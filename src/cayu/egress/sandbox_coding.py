@@ -145,6 +145,8 @@ class SandboxCodingEnvironmentFactory(VirtualEgressEnvironmentFactory):
     ``VirtualEgressEnvironmentFactory``.
     """
 
+    source_workspace: LocalWorkspace
+
     def __init__(
         self,
         *,

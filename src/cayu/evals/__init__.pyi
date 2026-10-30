@@ -1526,6 +1526,17 @@ from cayu.evals.workflow_target import (
     workflow_eval_trial_session_id as workflow_eval_trial_session_id,
 )
 from cayu.evals.workflow_target import workflow_spec_revision as workflow_spec_revision
+from cayu.evals.workspace_fixtures import (
+    EVAL_WORKSPACE_FIXTURE_MAX_BYTES as EVAL_WORKSPACE_FIXTURE_MAX_BYTES,
+)
+from cayu.evals.workspace_fixtures import (
+    EVAL_WORKSPACE_FIXTURE_MAX_FILES as EVAL_WORKSPACE_FIXTURE_MAX_FILES,
+)
+from cayu.evals.workspace_fixtures import (
+    EVAL_WORKSPACE_FIXTURE_MAX_PATH_CHARS as EVAL_WORKSPACE_FIXTURE_MAX_PATH_CHARS,
+)
+from cayu.evals.workspace_fixtures import WorkspaceFixtureIdentityV1 as WorkspaceFixtureIdentityV1
+from cayu.evals.workspace_fixtures import WorkspaceFixtureSpec as WorkspaceFixtureSpec
 from cayu.runtime.evidence_spool import EvidenceSpool as EvidenceSpool
 from cayu.runtime.evidence_spool import IncrementalEvidenceAdmission as IncrementalEvidenceAdmission
 from cayu.runtime.evidence_spool import IncrementalEvidenceError as IncrementalEvidenceError

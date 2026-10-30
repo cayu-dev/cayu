@@ -49,6 +49,7 @@ from cayu.evals.run_cost import (
     eval_cost_difference,
     plain_cost_amount,
 )
+from cayu.evals.workspace_fixtures import WorkspaceFixtureIdentityV1
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -137,6 +138,11 @@ class EvalRunComparison(BaseModel):
     comparable_cases: StrictInt = Field(default=0, ge=0)
     # Why the comparison can't decide: each case, or run, that neither passed nor failed.
     inconclusive_reasons: tuple[str, ...] = Field(default_factory=tuple)
+    # Cases whose trials ran on different workspace fixtures, so neither they nor
+    # the run totals that include them are compared.
+    incomparable_cases: tuple[str, ...] = Field(
+        default_factory=tuple, exclude_if=lambda value: not value
+    )
     cases: tuple[EvalCaseComparison, ...] = Field(default_factory=tuple)
     baseline_cost: EvalRunCost = Field(default_factory=EvalRunCost.not_recorded)
     current_cost: EvalRunCost = Field(default_factory=EvalRunCost.not_recorded)
@@ -448,6 +454,7 @@ def compare_eval_runs(
     regressions: list[str] = []
     improvements: list[str] = []
     inconclusive: dict[str, list[str]] = {"baseline": [], "current": []}
+    incomparable_cases: list[str] = []
     comparable_cases = 0
 
     for case_id in case_ids:
@@ -471,6 +478,24 @@ def compare_eval_runs(
                     current_score=cur.score if cur is not None else None,
                     current_reason=reasons["current"],
                     regressions=("case added in current run",),
+                )
+            )
+            continue
+        if cur is not None and _case_workspaces(base) != _case_workspaces(cur):
+            incomparable_cases.append(case_id)
+            inconclusive["current"].append(
+                f"{case_id}: workspace fixture changed from {_workspaces_label(base)} "
+                f"to {_workspaces_label(cur)}"
+            )
+            comparisons.append(
+                EvalCaseComparison(
+                    case_id=case_id,
+                    baseline_status=base.status,
+                    current_status=cur.status,
+                    baseline_score=base.score,
+                    current_score=cur.score,
+                    baseline_reason=reasons["baseline"],
+                    current_reason=reasons["current"],
                 )
             )
             continue
@@ -519,13 +544,17 @@ def compare_eval_runs(
         if run.status not in _VERDICT_STATUSES and not inconclusive[side]:
             inconclusive[side].append(f"{side} run {run.status.value}")
 
-    if _STATUS_SEVERITY[current.status] > _STATUS_SEVERITY[baseline.status]:
+    if (
+        not incomparable_cases
+        and _STATUS_SEVERITY[current.status] > _STATUS_SEVERITY[baseline.status]
+    ):
         regressions.insert(
             0,
             f"run status regressed from {baseline.status.value} to {current.status.value}",
         )
     if (
-        current.score is not None
+        not incomparable_cases
+        and current.score is not None
         and baseline.score is not None
         and current.score < baseline.score - score_tolerance
     ):
@@ -546,10 +575,27 @@ def compare_eval_runs(
         improvements=tuple(improvements),
         comparable_cases=comparable_cases,
         inconclusive_reasons=(*inconclusive["baseline"], *inconclusive["current"]),
+        incomparable_cases=tuple(incomparable_cases),
         cases=tuple(comparisons),
         baseline_cost=baseline.cost,
         current_cost=current.cost,
     )
+
+
+def _case_workspaces(case: EvalCaseResult) -> frozenset[WorkspaceFixtureIdentityV1 | None]:
+    """The workspace fixtures a case's trials were prepared from."""
+
+    return frozenset(trial.workspace for trial in case.trials)
+
+
+def _workspaces_label(case: EvalCaseResult) -> str:
+    labels = sorted(
+        "no fixture"
+        if workspace is None
+        else f"{workspace.repository}@{workspace.revision} (files {workspace.files_digest})"
+        for workspace in _case_workspaces(case)
+    )
+    return ", ".join(labels)
 
 
 def _no_verdict_reason(case: EvalCaseResult | None) -> str | None:

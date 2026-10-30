@@ -436,6 +436,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     the Agent process.
     """
 
+    source_workspace: LocalWorkspace
+
     @property
     def secret_resolution_scope(self) -> Literal["static"]:
         return "static"
@@ -553,11 +555,12 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         self.git_baseline = git_baseline
         self.setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
         self.staged_copies: StagedCopiesMode = owned_staged_copies
+        owned_sandbox_exclusions = tuple(sandbox_excluded_directory_names)
         names = {
             name.casefold(): name
             for name in (
                 *source_workspace.excluded_directory_names,
-                *sandbox_excluded_directory_names,
+                *owned_sandbox_exclusions,
                 *_PROTECTED_DIRECTORY_NAMES,
             )
         }
@@ -574,12 +577,75 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             behavior_version="1",
             implementation_version=_configuration_fingerprint(self),
         )
+        # Everything but the source, for with_source_workspace: the values this
+        # factory owns, so a caller changing what it passed changes neither.
+        self._source_independent_arguments: dict[str, Any] = {
+            "broker": self.broker,
+            "egress": self.egress,
+            "egress_hosts": self.egress_hosts,
+            "git_repositories": self.git_repositories,
+            "image": self.image,
+            "lease_seconds": self.lease_seconds,
+            "labels": dict(self.labels),
+            "setup_commands": self.setup_commands,
+            # Without explicit limits the largest file follows each sandbox.
+            "transfer_limits": None
+            if self._max_file_bytes_follow_sandbox
+            else self.transfer_limits,
+            "sync_back": self.sync_back,
+            "sandbox_excluded_directory_names": owned_sandbox_exclusions,
+            "staging_capacity": self.staging_capacity,
+            "ready_timeout_s": self.ready_timeout_s,
+            "queue_seconds": self.queue_seconds,
+            "renew_every_s": self.renew_every_s,
+            "git_baseline": self.git_baseline,
+            "workspace_setup_commands": self.workspace_setup_commands,
+            "toolchain_profile": self.toolchain_profile,
+            "setup_command_timeout_s": self.setup_command_timeout_s,
+            "staged_copies": self.staged_copies,
+            "knowledge_store": self._knowledge_store,
+            "knowledge_access_scope": self._knowledge_access_scope,
+        }
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
         """Identity of what every session's sandbox is built from; it never reconnects."""
 
         return self._profile_identity
+
+    def with_source_workspace(
+        self, source_workspace: LocalWorkspace
+    ) -> BrokeredSandboxCodingEnvironmentFactory | None:
+        """Return this factory's configuration over ``source_workspace``.
+
+        The source must exclude what this factory's source excludes, since the
+        exclusions are part of the configuration fingerprint. A subclass gets
+        ``None`` unless it overrides this, since this factory can't rebuild a
+        subclass's own configuration.
+        """
+
+        if not isinstance(source_workspace, LocalWorkspace):
+            raise TypeError("source_workspace must be a LocalWorkspace.")
+        if type(self) is not BrokeredSandboxCodingEnvironmentFactory:
+            return None
+        if (
+            source_workspace.excluded_directory_names
+            != self.source_workspace.excluded_directory_names
+            or source_workspace.excluded_path_patterns
+            != self.source_workspace.excluded_path_patterns
+        ):
+            raise ValueError(
+                "source_workspace must exclude the same paths as the factory's own source."
+            )
+        factory = BrokeredSandboxCodingEnvironmentFactory(
+            source_workspace=source_workspace, **self._source_independent_arguments
+        )
+        if factory.execution_profile_identity != self.execution_profile_identity:
+            raise ValueError(
+                "The factory's configuration changed since it was created, so a factory "
+                "rebuilt over another source would behave differently."
+            )
+        return factory
 
     @property
     def configured_knowledge_store(self) -> KnowledgeStore | None:

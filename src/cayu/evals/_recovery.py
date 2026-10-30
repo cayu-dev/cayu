@@ -38,6 +38,7 @@ def block_uncheckpointed_trials(compiled, completed_trials):
                         memory_attribution_evidence=memory,
                     ),
                     unavailable_reason=message,
+                    workspace=None if case.workspace is None else case.workspace.identity(),
                     started_at=now,
                     completed_at=now,
                 ),

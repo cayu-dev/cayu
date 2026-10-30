@@ -19,15 +19,15 @@ def _validate_portable_structural_workspace_path(path: str) -> str:
 
     normalized = _validate_workspace_relative_path(path)
     if normalized != path:
-        raise ValueError("Workspace assertion paths must use canonical POSIX spelling.")
+        raise ValueError("Workspace paths must use canonical POSIX spelling.")
     if unicodedata.normalize("NFC", path) != path:
-        raise ValueError("Workspace assertion paths must use canonical Unicode spelling.")
+        raise ValueError("Workspace paths must use canonical Unicode spelling.")
     if any(
         ord(character) < 0x20 or character in _WINDOWS_FORBIDDEN_PATH_CHARACTERS
         for character in path
     ):
-        raise ValueError("Workspace assertion paths must use portable POSIX characters.")
+        raise ValueError("Workspace paths must use portable POSIX characters.")
     for component in path.split("/"):
         if component.endswith((" ", ".")) or _WINDOWS_RESERVED_COMPONENT.fullmatch(component):
-            raise ValueError("Workspace assertion paths must not use platform-reserved names.")
+            raise ValueError("Workspace paths must not use platform-reserved names.")
     return path

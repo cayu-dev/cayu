@@ -6819,6 +6819,10 @@ export type EvalCaseResultView = {
  * the retained evidence cannot be represented as one corpus-v2 invocation.
  * Such cases remain portable historical evaluation contracts, but execution
  * rejects them until a runnable input or scenario is authored.
+ *
+ * ``workspace`` is an optional fixture every trial's workspace is prepared
+ * from. It is part of the case revision, so changing its revision or files
+ * makes results of the old and new case incomparable.
  */
 export type EvalCaseSpec = {
     /**
@@ -6847,6 +6851,7 @@ export type EvalCaseSpec = {
      * Suite Id
      */
     suite_id: string;
+    workspace?: WorkspaceFixtureSpec | null;
 };
 
 /**
@@ -16702,6 +16707,7 @@ export type PromotionCaseV1 = {
      * Suite Id
      */
     suite_id: string;
+    workspace?: WorkspaceFixtureSpec | null;
 };
 
 /**
@@ -17297,6 +17303,7 @@ export type PublishedEvalTrialResult = {
      * Usage Evidence State
      */
     usage_evidence_state?: 'complete' | 'partial' | 'unavailable' | null;
+    workspace?: WorkspaceFixtureIdentityV1 | null;
 };
 
 /**
@@ -24255,6 +24262,59 @@ export type WorkspaceFileAssertionSpec = {
      * Sha256
      */
     sha256?: string | null;
+};
+
+/**
+ * WorkspaceFixtureIdentityV1
+ *
+ * What a trial's workspace was prepared from: the revision and a digest of the written files.
+ *
+ * Two fixtures with the same identity prepare the same workspace, since the
+ * revision is a full commit id and ``files_digest`` covers every written path
+ * and its content.
+ */
+export type WorkspaceFixtureIdentityV1 = {
+    /**
+     * Files Digest
+     */
+    files_digest: string;
+    /**
+     * Repository
+     */
+    repository: string;
+    /**
+     * Revision
+     */
+    revision: string;
+};
+
+/**
+ * WorkspaceFixtureSpec
+ *
+ * A repository at one commit, with files written over it, that each trial starts from.
+ *
+ * ``repository`` names a :class:`~cayu.workspaces.WorkspaceSource` the
+ * application registered with ``CayuApp.register_workspace_source``.
+ * ``revision`` is a full commit id. ``files`` maps canonical relative POSIX
+ * paths to UTF-8 text written over the checkout, replacing a file the revision
+ * has at that path. Every trial gets its own copy, so no trial sees another
+ * trial's writes.
+ */
+export type WorkspaceFixtureSpec = {
+    /**
+     * Files
+     */
+    files?: {
+        [key: string]: string;
+    };
+    /**
+     * Repository
+     */
+    repository: string;
+    /**
+     * Revision
+     */
+    revision: string;
 };
 
 /**

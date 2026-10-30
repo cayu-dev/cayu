@@ -61,6 +61,7 @@ from cayu.evals.operation_outcomes import OperationOutcomeSummary, trajectory_op
 from cayu.evals.run_cost import EvalRunCost, EvalTrialCost, eval_run_cost
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.evals.workflow_target import RetainedWorkflowEvalOutput, WorkflowEvalOutputEvidenceV1
+from cayu.evals.workspace_fixtures import WorkspaceFixtureIdentityV1
 from cayu.events import Event, EventType
 from cayu.failure_evidence import FailureEvidence
 from cayu.memory.attribution import MemoryAttribution
@@ -405,6 +406,10 @@ class EvalTrialResult(BaseModel):
         default=None, exclude_if=lambda value: value is None, repr=False
     )
     workflow_output_retention: Literal["retained", "disabled", "limit_exceeded"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # The workspace fixture the trial's workspace was prepared from, when its case has one.
+    workspace: WorkspaceFixtureIdentityV1 | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     evidence_complete: StrictBool = False

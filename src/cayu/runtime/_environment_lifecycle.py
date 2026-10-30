@@ -6300,6 +6300,20 @@ class EnvironmentLifecycle:
         ).difference(self._active_environment_setups)
         return named, unattributed
 
+    def binds_source_workspace(self, workspace_id: str) -> bool:
+        """Whether a session environment this process still owns is bound to ``workspace_id``.
+
+        An owner retained for a finalize retry keeps its binding, and the retry
+        copies back into that source workspace, so the source must outlive it.
+        """
+
+        return any(
+            (bound := owner.registered_environment.bound_workspace) is not None
+            and bound.source_workspace is not None
+            and bound.source_workspace.id == workspace_id
+            for owner in self._active_environment_setups.values()
+        )
+
     async def drain_retained_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Settle retained cleanup owners without cancelling dispatched work."""
 

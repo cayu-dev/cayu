@@ -34,6 +34,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 if TYPE_CHECKING:
     from cayu.egress.authority import EgressAuthorityIdentity
     from cayu.environments.rebuild import EnvironmentRebuildRecord
+    from cayu.workspaces.local import LocalWorkspace
 
 DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS = 15.0
 ENVIRONMENT_ALLOCATION_INTENT_SCHEMA_VERSION = 1
@@ -738,6 +739,24 @@ class EnvironmentFactoryResult:
 
 class EnvironmentFactory(ABC):
     """Creates or attaches a concrete environment for a session."""
+
+    #: The durable workspace every session copies in from and binds for its whole
+    #: run, so two sessions of this factory can't run at once; ``None`` when
+    #: sessions don't share one.
+    source_workspace: LocalWorkspace | None = None
+
+    def with_source_workspace(self, source_workspace: LocalWorkspace) -> EnvironmentFactory | None:
+        """Return a factory configured like this one whose sessions copy in from ``source_workspace``.
+
+        The new factory has this factory's ``execution_profile_identity``, so a
+        session behaves as it would here, on another checkout. The eval runner
+        uses it to give each trial of a case with a workspace fixture its own
+        copy of the fixture's repository. ``None``, the default, means the
+        factory can't take another source.
+        """
+
+        del source_workspace
+        return None
 
     @property
     def secret_resolution_scope(self) -> Literal["static", "dynamic"]:

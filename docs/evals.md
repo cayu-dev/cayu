@@ -871,6 +871,13 @@ materializing result graphs.
 Unknown fields and assertion kinds fail closed; schema version 6 has no
 prior-version compatibility loader.
 
+A case may declare a [workspace fixture](#workspace-fixtures) as `workspace`:
+`{"repository": "<registered source>", "revision": "<full commit id>",
+"files": {"<path>": "<text>"}}`. The field is optional and omitted when absent,
+so cases without one keep their revisions, and it is part of the case revision
+when present. The fixture names a source but carries no path or credential; the
+trusted target's application resolves the name.
+
 ### Safe tool argument and result assertions
 
 `ToolArgumentsContainAssertionSpec` selects one call by exact registered tool
@@ -2069,8 +2076,104 @@ Because of this, `WorkspaceFileAssertionSpec`, `WorkspaceFileExists`, and
 the case finished"*, **not** *"this case created it"*. With a single shared
 environment, a file written by an earlier case can satisfy a later case's
 workspace assertion. To make creation itself meaningful, register an
-environment factory or use a trusted reset/fixture profile. The portable
-assertion does not infer provenance from file presence.
+environment factory or give the case a [workspace fixture](#workspace-fixtures).
+The portable assertion does not infer provenance from file presence.
+
+A coding environment (`DockerCodingEnvironmentFactory`,
+`BrokeredSandboxCodingEnvironmentFactory`, `SandboxCodingEnvironmentFactory`)
+creates a fresh sandbox per session but copies every session in from one
+source workspace, which a session binds for its whole run. Two trials that ran
+at once in such an environment would refuse each other ("SyncBinding source
+workspace ... is already bound by an active session"), so the runner refuses a
+suite before its first trial when more than one trial without a fixture would
+run concurrently in one of them, at the run's concurrency capped by its shared
+`EvalExecutionCapacity`. Give those cases a workspace fixture, or run them with
+`max_concurrency=1`.
+
+### Workspace fixtures
+
+A workspace fixture prepares each trial's workspace from data in the case: a
+repository the application registered, a full commit id, and files written over
+that commit.
+
+```python
+from cayu.evals import EvalCase, EvalSuite, WorkspaceFixtureSpec, run_eval_suite
+from cayu.workspaces import GitWorkspaceSource
+
+app.register_workspace_source(GitWorkspaceSource("payments", "/srv/checkouts/payments"))
+
+suite = EvalSuite(
+    id="verifier",
+    cases=[
+        EvalCase(
+            id="refund-rounding",
+            request=RunRequest(agent_name="verifier", messages=[Message.text("user", claim)]),
+            workspace=WorkspaceFixtureSpec(
+                repository="payments",
+                revision="9f1c2e...",  # all 40 (or 64) hex digits
+                files={"tests/test_claim.py": claim_test},
+            ),
+        ),
+    ],
+)
+run = await run_eval_suite(app, suite, trials=2, max_concurrency=8)
+```
+
+`CayuApp.register_workspace_source(...)` registers a `WorkspaceSource` under
+its name. `GitWorkspaceSource(name, repository)` checks revisions out of a local
+Git repository (a working checkout or a bare mirror) that already holds the
+commits cases name: it reads the revision's tree into a private index and writes
+it out with the repository's own attributes and filters, leaving the
+repository's HEAD, index and working tree untouched, and the checkout gets no
+`.git`. Each Git command may run for `timeout_s` seconds (300 by default). An
+application whose repository lives behind a remote with its own credentials
+subclasses `WorkspaceSource` and fetches before it checks out. Sources are local
+preparation authority, so the app manifest doesn't list them.
+
+For every trial, the runner checks the revision out into a new directory under
+the system temporary directory, writes the fixture's files into it, and runs the
+trial in the case's own environment re-sourced at that directory:
+`factory.with_source_workspace(...)` builds the environment's configuration,
+with the same `execution_profile_identity`, over the checkout, and that factory
+serves the environment's name only inside the trial. The application's
+registration, manifest and execution profile don't change, every trial gets its
+own sandbox copied in from its own checkout, and no trial sees another trial's
+writes, at any concurrency. The environment's source exclusions and toolchain
+checks apply to each checkout as they do to its registered source, and the
+session copies its changes back into the checkout as its `sync_back` policy
+says. Workspace assertions (`WorkspaceFileAssertionSpec`, `WorkspaceFileExists`,
+`WorkspaceFileContains`) read that checkout after the session ended. The
+directory is removed after the trial's assertions have run, unless the session's
+environment cleanup is retained for a finalize retry that copies back into it
+(for example after a failed copy-back): then the checkout stays, with a warning
+naming it, and can be removed once `drain_environment_cleanups()` has settled the
+session. Preparing the checkout is the first step of the trial, so the case
+timeout (`case_timeout_seconds`, or a corpus suite's `timeout_seconds`) covers it.
+
+A fixture's `files` maps canonical relative POSIX paths to UTF-8 text: at most
+256 files and 1 MiB in total, no path inside `.git`, no two paths that differ
+only in case, and no path inside another written file. A file replaces one the
+revision has at that path.
+
+The runner refuses a suite before its first trial when a fixture names a source
+the application didn't register, or the case's environment isn't created by a
+factory that can take another source workspace (`EnvironmentFactory.source_workspace`
+and `with_source_workspace`; see
+[Environment factories](environment-factories.md#choosing-a-coding-backend)). A
+trial whose checkout fails, for example because the repository doesn't have the
+revision, fails before its session starts: `execution_status="failed"` with the
+category `setup_failure`, and its assertions are `unavailable`. Workflow targets
+build their own runtime per trial and reject cases with a fixture.
+
+Every trial of a case with a fixture records it as `workspace`, a
+`WorkspaceFixtureIdentityV1` with the `repository`, the `revision` and
+`files_digest`, the `sha256:` digest of every written path and its content, in
+`EvalTrialResult` and in the published `PublishedEvalTrialResult`. A corpus
+case's fixture is part of its case revision, so changing its revision or files
+makes the old and new results incomparable. `compare_eval_runs` names a direct
+case whose trials ran on a different fixture in `incomparable_cases` and
+`inconclusive_reasons`, compares neither it nor the run totals, and
+`cayu eval compare` exits `2`.
 
 ## Eval modes
 

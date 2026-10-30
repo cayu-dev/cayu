@@ -7,7 +7,7 @@ import math
 import traceback
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import AsyncExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
@@ -54,6 +54,10 @@ from cayu.evals._process_progress import (
 from cayu.evals._workflow_child_lifecycle import (
     _check_workflow_child_lifecycle,
     _WorkflowChildLifecycle,
+)
+from cayu.evals._workspace_fixture_trials import (
+    prepared_workspace_fixture,
+    require_workspace_fixtures_ready,
 )
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY, EvalExecutionCapacity
@@ -147,6 +151,7 @@ from cayu.evals.workflow_target import (
     workflow_eval_output_sha256,
     workflow_eval_trial_session_id,
 )
+from cayu.evals.workspace_fixtures import WorkspaceFixtureSpec
 from cayu.events import Event, EventType, event_durable_sequence
 from cayu.failure_evidence import FailureEvidence
 from cayu.memory.attribution import (
@@ -180,7 +185,7 @@ from cayu.tools._operation_boundary import (
 )
 from cayu.workflows.journal import WORKFLOW_ATTEMPT_EVENT_TYPE, WORKFLOW_JOURNAL_PROVIDER
 from cayu.workflows.workflow import WorkflowSupersededError
-from cayu.workspaces.base import WorkspaceReadResult
+from cayu.workspaces.base import Workspace, WorkspaceReadResult
 
 TrialRequestTransform = Callable[[str, str, int, RunRequest], RunRequest]
 TrialCompletionCallback = Callable[
@@ -720,6 +725,8 @@ class EvalCase(BaseModel):
     request: RunRequest
     assertions: list[EvalAssertion] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Each trial's workspace is prepared from this fixture, in the case's own environment.
+    workspace: WorkspaceFixtureSpec | None = None
 
     @field_validator("id")
     @classmethod
@@ -769,6 +776,7 @@ def _detach_eval_case(case: EvalCase) -> EvalCase:
         request=case.request,
         assertions=case.assertions,
         metadata=case.metadata,
+        workspace=case.workspace,
     )
 
 
@@ -1296,6 +1304,27 @@ async def _execute_eval_suite(
             trials=trials,
             max_concurrency=max_concurrency,
             completed_trials=completed_trials,
+        )
+        require_workspace_fixtures_ready(
+            app,
+            suite.cases,
+            pending_trials={
+                case.id: sum(
+                    (case.id, number) not in completed_trials for number in range(1, trials + 1)
+                )
+                for case in suite.cases
+            },
+            # A shared capacity of one serializes this run's trials as well.
+            max_concurrency=(
+                max_concurrency
+                if execution_capacity is None
+                else min(max_concurrency, execution_capacity.max_active_trials)
+            ),
+        )
+    elif any(case.workspace is not None for case in suite.cases):
+        raise ValueError(
+            "Workspace fixtures prepare the case's session environment; a workflow target "
+            "builds its own runtime for each trial."
         )
     started_at = datetime.now(UTC)
     trial_count = len(suite.cases) * trials
@@ -1920,6 +1949,9 @@ async def _run_eval_case(
     providers = _require_scripted_provider_concurrency(
         app, (case,), trials=trials, max_concurrency=1
     ).get(case.id, ())
+    require_workspace_fixtures_ready(
+        app, (case,), pending_trials={case.id: trials}, max_concurrency=1
+    )
     trial_executions = []
     with _scripted_eval_invocation(providers):
         for trial_number in range(1, trials + 1):
@@ -3156,6 +3188,53 @@ async def _run_case_once_with_public_projection(
             workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
             pricing=pricing,
         )
+    # A trial's workspace checkout lives until its evidence and assertions have read it.
+    async with AsyncExitStack() as workspace_scope:
+        return await _run_session_case_once(
+            app,
+            case,
+            trial_number=trial_number,
+            suite_id=suite_id,
+            retain_trajectory=retain_trajectory,
+            retain_final_output=retain_final_output,
+            timeout_seconds=timeout_seconds,
+            public_output_preview_bytes=public_output_preview_bytes,
+            run_stream=run_stream,
+            trial_request_transform=trial_request_transform,
+            memory_attribution_bounds=memory_attribution_bounds,
+            memory_attribution_source_limit=memory_attribution_source_limit,
+            memory_attribution_max_bytes=memory_attribution_max_bytes,
+            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+            pricing=pricing,
+            workspace_scope=workspace_scope,
+        )
+
+
+async def _run_session_case_once(
+    app: CayuApp,
+    case: EvalCase,
+    *,
+    trial_number: int,
+    suite_id: str,
+    retain_trajectory: bool,
+    retain_final_output: bool,
+    timeout_seconds: float | None,
+    public_output_preview_bytes: int | None,
+    run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None,
+    trial_request_transform: TrialRequestTransform | None,
+    memory_attribution_bounds: MemoryAttributionBounds | None,
+    memory_attribution_source_limit: int | None,
+    memory_attribution_max_bytes: int | None,
+    memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
+    pricing: _ValidatedPricingSnapshot | None,
+    workspace_scope: AsyncExitStack,
+) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
+    """Run one trial as a session of ``app``, capture its evidence and evaluate it.
+
+    A case with a workspace fixture gets its checkout inside the trial's deadline,
+    as the first step of its run, and ``workspace_scope`` removes it afterwards.
+    """
+
     started_at = datetime.now(UTC)
     trial_request = _isolated_trial_request(case.request)
     if trial_request_transform is not None:
@@ -3193,6 +3272,7 @@ async def _run_case_once_with_public_projection(
     assertion_results: list[EvalAssertionResult] = []
     public_output = EvalTrialOutputPreviewV1.unavailable()
     diagnostic_code: EvalTrialDiagnosticCode | None = None
+    fixture_workspace: Workspace | None = None
     selected_memory_bounds = MemoryAttributionBounds.model_validate(
         (memory_attribution_bounds or standard_eval_memory_attribution_bounds()).model_dump(
             mode="python"
@@ -3235,6 +3315,11 @@ async def _run_case_once_with_public_projection(
             ) as deadline,
         ):
             try:
+                if case.workspace is not None:
+                    # A checkout that fails fails the trial before its session starts.
+                    fixture_workspace = await workspace_scope.enter_async_context(
+                        prepared_workspace_fixture(app, case.id, trial_request, case.workspace)
+                    )
                 stream = app.run(trial_request) if run_stream is None else run_stream(trial_request)
                 async for event in stream:
                     # Anchor the trial to the first emitted session. If app.run() ever forwards
@@ -3398,7 +3483,9 @@ async def _run_case_once_with_public_projection(
                             )
                     final_output = final_output_text(transcript)
                     probe_requirements = _collect_probe_requirements(case.assertions)
-                    probes = await _capture_probes(app, session, probe_requirements)
+                    probes = await _capture_probes(
+                        app, session, probe_requirements, fixture_workspace=fixture_workspace
+                    )
                     require_evidence_read_allowed()
                     children_incomplete = _IncompleteFlag()
                     if terminal_evidence is None:
@@ -3780,6 +3867,7 @@ async def _run_case_once_with_public_projection(
             ),
             operation_outcomes=trajectory_operation_outcomes(trajectory),
             memory_attribution=memory_attribution,
+            workspace=None if case.workspace is None else case.workspace.identity(),
             started_at=started_at,
             completed_at=completed_at,
             duration_ms=_duration_ms(started_at, completed_at),
@@ -4204,9 +4292,13 @@ async def _capture_probes(
     app: CayuApp,
     session: Session | None,
     requirements: ProbeRequirements,
+    *,
+    fixture_workspace: Workspace | None = None,
 ) -> TrajectoryProbes:
     # Snapshot exactly what the case's assertions declared, while the environment is still
     # live, so assertions evaluate against the serializable trajectory instead of the app.
+    # A trial prepared from a workspace fixture reads its own workspace, which holds what
+    # the session copied back.
     if session is None or not (
         requirements.workspace_paths
         or requirements.workspace_structure_paths
@@ -4221,16 +4313,18 @@ async def _capture_probes(
         environment = app.get_environment(session.environment_name)
     except Exception:
         environment = None
-    if environment is None:
+    if environment is None and fixture_workspace is None:
         return TrajectoryProbes()
-    env = environment.environment
+    env = None if environment is None else environment.environment
 
     workspace_available = False
     workspace_files: dict[str, bytes | None] = {}
     workspace_file_stats: dict[str, WorkspaceFileProbe] = {}
     workspace_unavailable_paths: list[str] = []
     workspace_structures: dict[str, WorkspaceStructuralProbe] = {}
-    workspace = getattr(env, "workspace", None)
+    workspace = (
+        fixture_workspace if fixture_workspace is not None else getattr(env, "workspace", None)
+    )
     workspace_paths = requirements.workspace_paths | requirements.workspace_structure_paths
     if workspace_paths and workspace is not None:
         workspace_available = True

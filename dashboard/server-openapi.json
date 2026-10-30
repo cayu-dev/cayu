@@ -14561,7 +14561,7 @@
       },
       "EvalCaseSpec": {
         "additionalProperties": false,
-        "description": "One deterministic expectation set with optional fresh-run input.\n\nCaptured-session evaluations intentionally set ``input`` to ``None`` when\nthe retained evidence cannot be represented as one corpus-v2 invocation.\nSuch cases remain portable historical evaluation contracts, but execution\nrejects them until a runnable input or scenario is authored.",
+        "description": "One deterministic expectation set with optional fresh-run input.\n\nCaptured-session evaluations intentionally set ``input`` to ``None`` when\nthe retained evidence cannot be represented as one corpus-v2 invocation.\nSuch cases remain portable historical evaluation contracts, but execution\nrejects them until a runnable input or scenario is authored.\n\n``workspace`` is an optional fixture every trial's workspace is prepared\nfrom. It is part of the case revision, so changing its revision or files\nmakes results of the old and new case incomparable.",
         "properties": {
           "assertions": {
             "items": {
@@ -14705,6 +14705,16 @@
           "suite_id": {
             "title": "Suite Id",
             "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceFixtureSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -34144,6 +34154,16 @@
           "suite_id": {
             "title": "Suite Id",
             "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceFixtureSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -35330,6 +35350,16 @@
               }
             ],
             "title": "Usage Evidence State"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceFixtureIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -39606,7 +39636,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "83",
+            "default": "84",
             "title": "Contract Version",
             "type": "string"
           },
@@ -47805,7 +47835,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "83",
+            "default": "84",
             "title": "Contract Version",
             "type": "string"
           }
@@ -48371,6 +48401,58 @@
           "path"
         ],
         "title": "WorkspaceFileAssertionSpec",
+        "type": "object"
+      },
+      "WorkspaceFixtureIdentityV1": {
+        "additionalProperties": false,
+        "description": "What a trial's workspace was prepared from: the revision and a digest of the written files.\n\nTwo fixtures with the same identity prepare the same workspace, since the\nrevision is a full commit id and ``files_digest`` covers every written path\nand its content.",
+        "properties": {
+          "files_digest": {
+            "title": "Files Digest",
+            "type": "string"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "revision",
+          "files_digest"
+        ],
+        "title": "WorkspaceFixtureIdentityV1",
+        "type": "object"
+      },
+      "WorkspaceFixtureSpec": {
+        "additionalProperties": false,
+        "description": "A repository at one commit, with files written over it, that each trial starts from.\n\n``repository`` names a :class:`~cayu.workspaces.WorkspaceSource` the\napplication registered with ``CayuApp.register_workspace_source``.\n``revision`` is a full commit id. ``files`` maps canonical relative POSIX\npaths to UTF-8 text written over the checkout, replacing a file the revision\nhas at that path. Every trial gets its own copy, so no trial sees another\ntrial's writes.",
+        "properties": {
+          "files": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "object"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "revision"
+        ],
+        "title": "WorkspaceFixtureSpec",
         "type": "object"
       },
       "WorkspaceStructuralEvidenceV1": {

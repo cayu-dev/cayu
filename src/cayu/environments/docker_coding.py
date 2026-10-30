@@ -1003,6 +1003,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     sessions that are waiting to retry their cleanup.
     """
 
+    source_workspace: LocalWorkspace
+
     @property
     def secret_resolution_scope(self) -> Literal["static"]:
         """Every native Docker coding result is credential-free."""
@@ -1194,6 +1196,68 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             if warm_spares
             else None
         )
+        # Everything but the source, for with_source_workspace: the values this
+        # factory owns, so a caller changing what it passed changes neither.
+        self._source_independent_arguments: dict[str, Any] = {
+            "toolchain_profile": owned_profile,
+            "image_identity": image_identity,
+            "platform_architecture": platform_architecture,
+            "restrictions": restrictions,
+            "extra_admission_probes": tuple(extra_admission_probes),
+            "artifact_store": self._artifact_store,
+            "transfer_limits": self.transfer_limits,
+            "runtime": self.runtime,
+            "seccomp_profile": self.seccomp_profile,
+            "docker_path": self.docker_path,
+            "immutable_inputs": self.immutable_inputs,
+            "immutable_input_store": self.immutable_input_store,
+            "immutable_input_runtime_compatibility_fingerprint": (
+                self.immutable_input_runtime_compatibility_fingerprint
+            ),
+            "git_baseline": self.git_baseline,
+            "knowledge_store": self._knowledge_store,
+            "knowledge_access_scope": self._knowledge_access_scope,
+            "deferred": self.deferred,
+            "warm_spares": self.warm_spares,
+            "command_cleanup": self.command_cleanup,
+            "cancel_timeout_s": self.cancel_timeout_s,
+            "staging_capacity": self.staging_capacity,
+        }
+
+    def with_source_workspace(
+        self, source_workspace: LocalWorkspace
+    ) -> DockerCodingEnvironmentFactory | None:
+        """Return this factory's configuration over ``source_workspace``.
+
+        The source must exclude what this factory's source excludes, since the
+        exclusions are part of the configuration fingerprint. The new factory
+        keeps no warm spares: it serves the sessions of one checkout. A
+        subclass gets ``None`` unless it overrides this, since this factory
+        can't rebuild a subclass's own configuration.
+        """
+
+        if not isinstance(source_workspace, LocalWorkspace):
+            raise TypeError("source_workspace must be LocalWorkspace.")
+        if type(self) is not DockerCodingEnvironmentFactory:
+            return None
+        if (
+            source_workspace.excluded_directory_names
+            != self.source_workspace.excluded_directory_names
+            or source_workspace.excluded_path_patterns
+            != self.source_workspace.excluded_path_patterns
+        ):
+            raise ValueError(
+                "source_workspace must exclude the same paths as the factory's own source."
+            )
+        arguments = dict(self._source_independent_arguments)
+        arguments["warm_spares"] = 0
+        factory = DockerCodingEnvironmentFactory(source_workspace=source_workspace, **arguments)
+        if factory.execution_profile_identity != self.execution_profile_identity:
+            raise ValueError(
+                "The factory's configuration changed since it was created, so a factory "
+                "rebuilt over another source would behave differently."
+            )
+        return factory
 
     @property
     def deferred_materialization(self) -> bool:

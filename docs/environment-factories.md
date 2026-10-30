@@ -972,6 +972,19 @@ backend refuses `CAYU_CLOUD_SANDBOX_EGRESS` set to anything else and
 for each clone a parallel worker edits; `RunRequest.environment_name` then
 picks the workspace.
 
+A session binds its source workspace for its whole run, so two sessions of
+one coding environment can't run at once: the second fails with "SyncBinding
+source workspace ... is already bound by an active session".
+`EnvironmentFactory.source_workspace` names that shared source (it is `None`
+for factories whose sessions don't share one), and
+`factory.with_source_workspace(other)` returns a factory with the same
+configuration and `execution_profile_identity` over another `LocalWorkspace`
+that excludes the same paths. `DockerCodingEnvironmentFactory` (without warm
+spares) and `BrokeredSandboxCodingEnvironmentFactory` implement it; the default,
+and a subclass that doesn't override it, returns `None`. The eval runner uses it
+to give each trial of a case with a
+[workspace fixture](evals.md#workspace-fixtures) its own checkout.
+
 A tool call gets its knowledge store and access scope from the environment it
 runs in, not from the app. A coding workspace has no knowledge unless you give
 it some, because the app's scope often spans every tenant and a workspace

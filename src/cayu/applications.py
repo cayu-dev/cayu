@@ -807,6 +807,7 @@ from cayu.verification.completion_verifiers import (
 )
 from cayu.verification.provider_completion_verifiers import ProviderCompletionVerifier
 from cayu.workspaces.observation_recovery import abandoned_workspace_observation_reads
+from cayu.workspaces.sources import WorkspaceSource
 
 logger = logging.getLogger(__name__)
 
@@ -1244,6 +1245,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             session_closure_stores=tuple(owned_store_ids),
             knowledge_store=self.knowledge_store,
         )
+        self._workspace_sources: dict[str, WorkspaceSource] = {}
         self.knowledge_access_scope = (
             None
             if knowledge_access_scope is None
@@ -6070,6 +6072,29 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         )
         self._add_managed_settings(declared)
         return registered
+
+    def register_workspace_source(self, source: WorkspaceSource) -> WorkspaceSource:
+        """Let eval cases name ``source`` as the repository of a workspace fixture.
+
+        Each trial of a case whose ``workspace`` names this source gets a fresh
+        checkout of the fixture's revision with its files written in. Sources are
+        local preparation authority, so the app manifest doesn't list them.
+        """
+
+        if not isinstance(source, WorkspaceSource):
+            raise TypeError("register_workspace_source requires a WorkspaceSource.")
+        if source.name in self._workspace_sources:
+            raise ValueError(f"A workspace source named {source.name!r} is already registered.")
+        self._workspace_sources[source.name] = source
+        return source
+
+    def get_workspace_source(self, name: str) -> WorkspaceSource:
+        """Return the workspace source registered as ``name``; raise ``KeyError`` without one."""
+
+        try:
+            return self._workspace_sources[name]
+        except KeyError:
+            raise KeyError(f"Workspace source not registered: {name}") from None
 
     def register_environment(
         self,

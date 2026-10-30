@@ -3893,8 +3893,8 @@ def test_eval_case_excludes_child_created_after_root_terminal(monkeypatch):
     app.register_agent(AgentSpec(name="parent", model="fake-model"))
     original_capture_probes = eval_runner._capture_probes
 
-    async def capture_probes_after_creating_late_child(app, session, requirements):
-        probes = await original_capture_probes(app, session, requirements)
+    async def capture_probes_after_creating_late_child(app, session, requirements, **options):
+        probes = await original_capture_probes(app, session, requirements, **options)
         assert session is not None
         child = await store.create(
             RunRequest(

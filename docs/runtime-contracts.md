@@ -2750,6 +2750,32 @@ an application evaluator's implementation revision, it joins the published
 assertion comparison contract but not the corpus revision. Server-admitted runs
 also commit the request base, including its structured output, in the eval
 execution profile's target material and runtime profile.
+
+`EvalCaseSpec.workspace` is an optional `WorkspaceFixtureSpec`: a portable
+`repository` name, a full lowercase commit id (40 or 64 hex digits) as
+`revision`, and `files`, at most 256 canonical relative POSIX paths outside
+`.git` mapped to 1 MiB of UTF-8 text in total, sorted, with no two paths equal
+ignoring case and none inside another. It is omitted when absent, so corpus
+schema V6 documents and case revisions without one are unchanged, and it is part
+of the case revision when present; an older Runtime rejects a case that has one
+as an unknown field. `EvalCase.workspace` takes the same model for direct suites.
+`WorkspaceFixtureIdentityV1` (`repository`, `revision`, `files_digest`) is the
+SHA-256 of the canonical JSON object mapping each path to the SHA-256 hex of its
+UTF-8 content. `EvalTrialResult.workspace` and `PublishedEvalTrialResult.workspace`
+carry it for every trial of a case with a fixture, prepared or not, and are
+omitted otherwise; published-run validation requires it to equal the corpus
+case's fixture. `EvalRunComparison.incomparable_cases` names the direct cases
+whose trials ran on different fixtures and is omitted when empty.
+`EnvironmentFactory.source_workspace` (default `None`) names the
+`LocalWorkspace` every session of a factory copies in from, and
+`with_source_workspace(workspace)` (default `None`) returns a factory of the same
+configuration and `execution_profile_identity` over another source; the runner
+serves that factory under the environment's name with a scoped registration, so
+the application's registrations, manifest and execution profile are unchanged.
+`CayuApp.register_workspace_source` registers a `WorkspaceSource` by name;
+sources are not part of the app manifest. Server contract 84 publishes
+`EvalCaseSpec.workspace` and `PublishedEvalTrialResult.workspace` in the
+OpenAPI schema.
 `EvalCaseComparison` and `EvalRunComparison` scores are optional finite values in
 the inclusive range from 0 through 1, matching their source eval results.
 `EvalRun.cost` is the sum of its trials' `EvalTrialCost` records. It is derived

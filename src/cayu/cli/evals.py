@@ -849,6 +849,14 @@ def _compare(args: argparse.Namespace) -> int:
         else render_comparison_html(comparison)
     )
     _write_or_print(output, args.output)
+    if comparison.incomparable_cases:
+        return _inconclusive(
+            comparison.inconclusive_reasons,
+            summary=(
+                f"{len(comparison.incomparable_cases)} of {len(comparison.cases)} cases ran on "
+                "a different workspace fixture, so the runs are not compared."
+            ),
+        )
     if _status_exit_code(baseline.status) == 2 or _status_exit_code(current.status) == 2:
         decided = {EvalStatus.PASSED, EvalStatus.FAILED}
         comparable = [

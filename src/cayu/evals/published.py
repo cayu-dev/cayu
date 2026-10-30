@@ -148,6 +148,7 @@ from cayu.evals.trial_policy import (
     EvalSuiteRunExposureV1,
     EvalSuiteTrialPolicyV1,
 )
+from cayu.evals.workspace_fixtures import WorkspaceFixtureIdentityV1
 from cayu.failure_evidence import FailureEvidence
 
 PUBLISHED_EVAL_SCHEMA_VERSION = 12
@@ -1497,6 +1498,10 @@ class PublishedEvalTrialResult(_PortableModel):
     capture_diagnostic: WorkflowCaptureDiagnostic | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    # The workspace fixture the trial's workspace was prepared from, when its case has one.
+    workspace: WorkspaceFixtureIdentityV1 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     trial_number: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     source_trial_revision: StrictStr = Field(min_length=64, max_length=64)
     status: PublishedStatus
@@ -2456,6 +2461,11 @@ def _validate_published_eval_run_for_corpus(
     for case_spec, published_case in zip(case_specs, run.cases, strict=True):
         if len(published_case.trials) != expected.trials:
             raise ValueError("Published eval run trial counts do not match its corpus suite.")
+        expected_workspace = None if case_spec.workspace is None else case_spec.workspace.identity()
+        if any(trial.workspace != expected_workspace for trial in published_case.trials):
+            raise ValueError(
+                "Published eval run workspaces do not match its immutable corpus cases."
+            )
         if any(
             len(trial.assertions) != len(case_spec.assertions)
             or any(
@@ -3192,9 +3202,12 @@ def _published_case(
     trial_public_data: tuple[_EvalTrialPublicData, ...] | None,
 ) -> PublishedEvalCaseResult:
     trials: list[PublishedEvalTrialResult] = []
+    expected_workspace = None if case.workspace is None else case.workspace.identity()
     for index, trial in enumerate(result.trials):
         if len(trial.assertions) != len(case.assertions):
             raise ValueError("Internal trial assertions do not match the corpus contract.")
+        if trial.workspace != expected_workspace:
+            raise ValueError("Internal trial workspace does not match the corpus case.")
         assertions = tuple(
             _published_assertion(spec, assertion)
             for spec, assertion in zip(case.assertions, trial.assertions, strict=True)
@@ -3225,6 +3238,7 @@ def _published_case(
                 capture_diagnostic=trial.capture_diagnostic,
                 failure_evidence=trial.failure_evidence,
                 failure_capture=trial.failure_capture,
+                workspace=trial.workspace,
                 trial_number=trial.trial_number,
                 source_trial_revision=eval_trial_result_revision(
                     EvalTrialResult.model_validate(

@@ -172,3 +172,8 @@ from cayu.workspaces.runner import (
     DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES as DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES,
 )
 from cayu.workspaces.runner import RunnerWorkspace as RunnerWorkspace
+from cayu.workspaces.sources import (
+    DEFAULT_GIT_WORKSPACE_SOURCE_TIMEOUT_SECONDS as DEFAULT_GIT_WORKSPACE_SOURCE_TIMEOUT_SECONDS,
+)
+from cayu.workspaces.sources import GitWorkspaceSource as GitWorkspaceSource
+from cayu.workspaces.sources import WorkspaceSource as WorkspaceSource

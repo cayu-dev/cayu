@@ -59,6 +59,7 @@ from cayu.evals.models import (
     EvalRunContractV2,
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.evals.workspace_fixtures import WorkspaceFixtureSpec
 from cayu.memory.attribution import (
     MEMORY_ATTRIBUTION_DEFAULT_MAX_EXPOSURES,
     MEMORY_ATTRIBUTION_DEFAULT_MAX_ITEMS,
@@ -1941,6 +1942,10 @@ class EvalCaseSpec(_PortableModel):
     the retained evidence cannot be represented as one corpus-v2 invocation.
     Such cases remain portable historical evaluation contracts, but execution
     rejects them until a runnable input or scenario is authored.
+
+    ``workspace`` is an optional fixture every trial's workspace is prepared
+    from. It is part of the case revision, so changing its revision or files
+    makes results of the old and new case incomparable.
     """
 
     id: StrictStr
@@ -1957,11 +1962,24 @@ class EvalCaseSpec(_PortableModel):
         min_length=1,
         max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     )
+    workspace: WorkspaceFixtureSpec | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("assertions", mode="before")
     @classmethod
     def validate_assertions_are_ordered(cls, value: object, info) -> object:
         return _ordered_sequence_input(value, info.field_name)
+
+    @field_validator("workspace", mode="before")
+    @classmethod
+    def copy_workspace(cls, value: object) -> object:
+        if type(value) is WorkspaceFixtureSpec:
+            return value.model_dump(mode="json")
+        if isinstance(value, BaseModel):
+            raise TypeError("workspace must be an exact WorkspaceFixtureSpec or JSON object.")
+        return value
 
     @field_validator("id", "suite_id")
     @classmethod
@@ -2021,11 +2039,14 @@ class EvalCaseSpec(_PortableModel):
         input: RunInputSpec | None,
         assertions: Sequence[AssertionSpec],
         description: str | None = None,
+        workspace: WorkspaceFixtureSpec | None = None,
     ) -> EvalCaseSpec:
         if type(source) is not EvaluationSourceIdentityV1:
             raise TypeError("source must be an exact EvaluationSourceIdentityV1.")
         if input is not None and type(input) is not RunInputSpec:
             raise TypeError("input must be an exact RunInputSpec or None.")
+        if workspace is not None and type(workspace) is not WorkspaceFixtureSpec:
+            raise TypeError("workspace must be an exact WorkspaceFixtureSpec or None.")
         validated_source = EvaluationSourceIdentityV1.model_validate(_model_python_input(source))
         validated_input = (
             None if input is None else RunInputSpec.model_validate(_model_python_input(input))
@@ -2041,6 +2062,11 @@ class EvalCaseSpec(_PortableModel):
             "input": (None if validated_input is None else validated_input.model_dump(mode="json")),
             "assertions": [assertion.model_dump(mode="json") for assertion in validated_assertions],
         }
+        if workspace is not None:
+            # Omitted when absent, so cases without a fixture keep their revisions.
+            document["workspace"] = WorkspaceFixtureSpec.model_validate(
+                _model_python_input(workspace)
+            ).model_dump(mode="json")
         return cls(revision=_content_revision(document, "eval case spec"), **document)
 
 

@@ -1251,6 +1251,11 @@ def _compile_prepared_corpus_suite(
             and validated_target.external_process is None
         ):
             raise ValueError("Opaque external case references require an external process target.")
+        if case_spec.workspace is not None and type(validated_target) is WorkflowEvalTarget:
+            raise ValueError(
+                f"Eval corpus case {case_spec.id!r} has a workspace fixture, which prepares the "
+                "case's session environment; a workflow target builds its own runtime."
+            )
         corpus_messages = tuple(
             Message.text(MessageRole.USER, message.text) for message in case_input.messages
         )
@@ -1283,6 +1288,7 @@ def _compile_prepared_corpus_suite(
                     "corpus_revision": validated_corpus.revision,
                     "case_revision": case_spec.revision,
                 },
+                workspace=case_spec.workspace,
             )
         )
     suite = EvalSuite(

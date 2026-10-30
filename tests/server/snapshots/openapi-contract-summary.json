@@ -20957,6 +20957,16 @@
             }
           ],
           "title": "Usage Evidence State"
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/WorkspaceFixtureIdentityV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -24163,7 +24173,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "83",
+          "default": "84",
           "title": "Contract Version",
           "type": "string"
         },
@@ -31709,7 +31719,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "83",
+          "default": "84",
           "title": "Contract Version",
           "type": "string"
         }
@@ -32196,6 +32206,31 @@
         "records_sha256"
       ],
       "title": "WorkflowFailureRecordReference",
+      "type": "object"
+    },
+    "WorkspaceFixtureIdentityV1": {
+      "additionalProperties": false,
+      "description": "What a trial's workspace was prepared from: the revision and a digest of the written files.\n\nTwo fixtures with the same identity prepare the same workspace, since the\nrevision is a full commit id and ``files_digest`` covers every written path\nand its content.",
+      "properties": {
+        "files_digest": {
+          "title": "Files Digest",
+          "type": "string"
+        },
+        "repository": {
+          "title": "Repository",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "revision",
+        "files_digest"
+      ],
+      "title": "WorkspaceFixtureIdentityV1",
       "type": "object"
     },
     "_FailureEvidenceFields": {
