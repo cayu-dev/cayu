@@ -98,6 +98,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
 from cayu.messages import Message, MessageRole, TextPart, detach_message
+from cayu.runtime._execution_profile_continuation import _execution_profile_structured_output
 from cayu.runtime.manifest import AppManifest, _app_manifest_fingerprint
 from cayu.sessions.requests import RunRequest, copy_run_request
 from cayu.workflows.base import WorkflowSpec, copy_workflow_spec
@@ -869,8 +870,6 @@ class CorpusTarget(BaseModel):
                 + ", ".join(populated)
                 + "."
             )
-        if self.request_base.structured_output is not None:
-            raise ValueError("CorpusTarget request_base cannot request structured output.")
         if self.request_base._runtime_generated_authority:
             raise ValueError("CorpusTarget request_base cannot carry runtime-generated authority.")
         if self.request_base._input_redactions_applied:
@@ -901,6 +900,9 @@ class CorpusTarget(BaseModel):
             raise ValueError(
                 "External process target evidence policy does not match its CorpusTarget."
             )
+        if self.external_process is not None and self.request_base.structured_output is not None:
+            # The external process provider accepts no tool definitions and no native schema.
+            raise ValueError("External process targets cannot request structured output.")
         return self
 
 
@@ -982,6 +984,11 @@ class WorkflowEvalTarget(CorpusTarget):
     def validate_workflow_contract(self) -> WorkflowEvalTarget:
         if self.external_process is not None:
             raise ValueError("WorkflowEvalTarget cannot also configure an external process.")
+        if self.request_base.structured_output is not None:
+            raise ValueError(
+                "WorkflowEvalTarget projects structured output through its result projector; "
+                "its request_base cannot request structured output."
+            )
         # Constructing the identity here catches changed/malformed revisions before
         # corpus compilation or candidate/provider dispatch.
         self.identity()
@@ -1105,6 +1112,13 @@ def _evaluation_target_identity_from_validated_target(
     )
 
 
+def _requested_structured_output_revision(target: CorpusTarget) -> str | None:
+    """Revision of the structured output the target requests, as its execution profile sees it."""
+
+    component = _execution_profile_structured_output(target.request_base.structured_output)
+    return None if component is None else _content_revision(component, "structured output")
+
+
 def _prepare_corpus_compilation(
     corpus: EvalCorpusDocument,
     target: CorpusTarget,
@@ -1215,6 +1229,7 @@ def _compile_prepared_corpus_suite(
             trusted_pricing_identity=trusted_pricing_identity,
             trusted_model_judges=tuple(trusted_model_judges),
             application_evaluators=validated_target.application_evaluators,
+            structured_output_revision=_requested_structured_output_revision(validated_target),
         )
     )
     compiled_input_chars = 0

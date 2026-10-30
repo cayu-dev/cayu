@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -41,6 +42,14 @@ from cayu._validation import (
 )
 from cayu.budgets.pricing import PriceBook
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
+from cayu.evals._structured_output_fields import (
+    EVAL_STRUCTURED_OUTPUT_FIELD_OBSERVED_MAX_BYTES,
+    EVAL_STRUCTURED_OUTPUT_POINTER_MAX_CHARS,
+    StructuredOutputFieldOperator,
+    copy_structured_output_field_value,
+    json_pointer_tokens,
+    validate_structured_output_field_comparison,
+)
 from cayu.evals.external import OpaqueExternalCaseRefV1
 from cayu.evals.json_output import parse_json_output
 from cayu.evals.json_subset import copy_eval_tool_json_object
@@ -55,7 +64,7 @@ from cayu.memory.attribution import (
     MEMORY_ATTRIBUTION_DEFAULT_MAX_ITEMS,
 )
 
-EVAL_CORPUS_SCHEMA_VERSION = 5
+EVAL_CORPUS_SCHEMA_VERSION = 6
 EVALUATION_EVIDENCE_POLICY_SCHEMA_VERSION = 1
 PRICING_PROFILE_IDENTITY_SCHEMA_VERSION = 1
 PRICING_PROFILE_SEMANTICS_VERSION = 1
@@ -64,10 +73,12 @@ EVALUATION_SOURCE_IDENTITY_SCHEMA_VERSION = 1
 # These execution-only metadata records cross from the trusted compiler to the
 # publisher. They are intentionally absent from portable corpus documents: the
 # target, not the corpus author, resolves the concrete judge or application
-# evaluator implementation and observes its accounting evidence.
+# evaluator implementation, or the structured output a field assertion reads,
+# and observes its accounting evidence.
 _MODEL_JUDGE_RESULT_METADATA_KEY = "cayu.model_judge.result"
 _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY = "cayu.structured_model_judge.result"
 _APPLICATION_EVALUATOR_RESULT_METADATA_KEY = "cayu.application_evaluator.result"
+_STRUCTURED_OUTPUT_FIELD_RESULT_METADATA_KEY = "cayu.structured_output_field.result"
 # Result metadata under this prefix is reserved for Cayu's trusted compilers.
 _RESERVED_RESULT_METADATA_PREFIX = "cayu."
 
@@ -103,8 +114,13 @@ EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_CHARS = 2_048
 # Published sizes are compact UTF-8 JSON bytes, as the published run's own limit counts them.
 EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_BYTES = 4_096
 EVAL_APPLICATION_EVALUATOR_MAX_METADATA_BYTES = 4_096
-# Every trial publishes each application evaluator's parameters and observation again.
-EVAL_CORPUS_MAX_PUBLISHED_APPLICATION_EVALUATOR_BYTES = 16 << 20
+# Every trial publishes each application evaluator's parameters and observation, and
+# each structured-output field's comparison and observation, again; one suite budget
+# covers both. Tool-JSON subsets are not counted: budgeting their 16 KiB retained values
+# at worst case would reject suites that publish today. With the 2 MiB output-preview
+# budget and the bounded judge explanations, a suite's assertion detail stays well
+# inside the 32 MiB published-run limit.
+EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_DETAIL_BYTES = 12 << 20
 EVAL_CORPUS_MAX_TOOL_NAMES = 256
 EVAL_CORPUS_MAX_PROCESS_EVENTS = 256
 EVAL_CORPUS_MAX_WORKSPACE_PATH_CHARS = 1_024
@@ -190,16 +206,16 @@ class _SchemaV3PortableModel(_PortableModel):
         return value
 
 
-class _SchemaV5PortableModel(_PortableModel):
-    """Portable schema root whose v5 discriminator never coerces JSON types."""
+class _SchemaV6PortableModel(_PortableModel):
+    """Portable schema root whose v6 discriminator never coerces JSON types."""
 
-    schema_version: Literal[5] = 5
+    schema_version: Literal[6] = 6
 
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
-            raise ValueError("schema_version must be the integer 5.")
+            raise ValueError("schema_version must be the integer 6.")
         return value
 
 
@@ -539,6 +555,38 @@ class FinalOutputContainsAssertionSpec(_AssertionSpecBase):
             nonblank=True,
             clean=False,
         )
+
+
+class StructuredOutputFieldAssertionSpec(_AssertionSpecBase):
+    """Compare one JSON-pointer field of the run's last validated structured output."""
+
+    kind: Literal["structured_output_field"] = "structured_output_field"
+    pointer: StrictStr
+    operator: StructuredOutputFieldOperator
+    value: JsonValue = Field(default=None, exclude_if=lambda value: value is None)
+
+    @field_validator("pointer")
+    @classmethod
+    def validate_pointer(cls, value: str, info) -> str:
+        pointer = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_STRUCTURED_OUTPUT_POINTER_MAX_CHARS,
+            nonblank=False,
+            clean=False,
+        )
+        json_pointer_tokens(pointer, info.field_name)
+        return pointer
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def copy_value(cls, value: object, info) -> object:
+        return copy_structured_output_field_value(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_comparison(self) -> StructuredOutputFieldAssertionSpec:
+        validate_structured_output_field_comparison(self.operator, self.value)
+        return self
 
 
 class ToolCalledAssertionSpec(_AssertionSpecBase):
@@ -1411,7 +1459,8 @@ AssertionSpec: TypeAlias = Annotated[
     | MaxEstimatedCostAssertionSpec
     | ModelJudgeAssertionSpec
     | StructuredModelJudgeAssertionSpec
-    | ApplicationEvaluatorAssertionSpec,
+    | ApplicationEvaluatorAssertionSpec
+    | StructuredOutputFieldAssertionSpec,
     Field(discriminator="kind"),
 ]
 
@@ -1437,6 +1486,7 @@ _ASSERTION_SPEC_TYPES = (
     ModelJudgeAssertionSpec,
     StructuredModelJudgeAssertionSpec,
     ApplicationEvaluatorAssertionSpec,
+    StructuredOutputFieldAssertionSpec,
 )
 
 
@@ -1448,14 +1498,22 @@ def _validated_assertion_spec(spec: AssertionSpec) -> AssertionSpec:
     return validated
 
 
-def _published_application_evaluator_bytes(spec: ApplicationEvaluatorAssertionSpec) -> int:
-    """What one trial may publish for ``spec``: its parameters and the largest observation."""
+def _published_detail_bytes(spec: AssertionSpec) -> int:
+    """What one trial may publish for ``spec`` in the shared assertion-detail budget."""
 
-    return (
-        compact_json_utf8_size(spec.params)
-        + EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_BYTES
-        + EVAL_APPLICATION_EVALUATOR_MAX_METADATA_BYTES
-    )
+    if type(spec) is ApplicationEvaluatorAssertionSpec:
+        return (
+            compact_json_utf8_size(spec.params)
+            + EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_BYTES
+            + EVAL_APPLICATION_EVALUATOR_MAX_METADATA_BYTES
+        )
+    if type(spec) is StructuredOutputFieldAssertionSpec:
+        return (
+            compact_json_utf8_size(spec.pointer)
+            + compact_json_utf8_size(spec.value)
+            + EVAL_STRUCTURED_OUTPUT_FIELD_OBSERVED_MAX_BYTES
+        )
+    return 0
 
 
 def assertion_spec_revision(spec: AssertionSpec) -> str:
@@ -1986,10 +2044,10 @@ class EvalCaseSpec(_PortableModel):
         return cls(revision=_content_revision(document, "eval case spec"), **document)
 
 
-class EvalCorpusDocument(_SchemaV5PortableModel):
+class EvalCorpusDocument(_SchemaV6PortableModel):
     """One canonical, authority-free corpus for exactly one trusted target key."""
 
-    schema_version: Literal[5] = EVAL_CORPUS_SCHEMA_VERSION
+    schema_version: Literal[6] = EVAL_CORPUS_SCHEMA_VERSION
     revision: StrictStr
     target_key: StrictStr
     evidence_policy: EvaluationEvidencePolicySpec
@@ -2041,13 +2099,11 @@ class EvalCorpusDocument(_SchemaV5PortableModel):
         trials_by_suite = {suite.id: suite.trial_request.trials for suite in self.suites}
         published_results_by_suite: Counter[str] = Counter()
         published_judge_explanation_slots_by_suite: Counter[str] = Counter()
-        published_application_evaluator_bytes_by_suite: Counter[str] = Counter()
+        published_detail_bytes_by_suite: Counter[str] = Counter()
         for case in self.cases:
             published_results_by_suite[case.suite_id] += len(case.assertions)
-            published_application_evaluator_bytes_by_suite[case.suite_id] += sum(
-                _published_application_evaluator_bytes(assertion)
-                for assertion in case.assertions
-                if type(assertion) is ApplicationEvaluatorAssertionSpec
+            published_detail_bytes_by_suite[case.suite_id] += sum(
+                _published_detail_bytes(assertion) for assertion in case.assertions
             )
             published_judge_explanation_slots_by_suite[case.suite_id] += sum(
                 len(assertion.rubric.criteria)
@@ -2074,15 +2130,13 @@ class EvalCorpusDocument(_SchemaV5PortableModel):
                     "explanation characters; the maximum is "
                     f"{EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS}."
                 )
-            evaluator_bytes = (
-                published_application_evaluator_bytes_by_suite[suite_id] * trials_by_suite[suite_id]
-            )
-            if evaluator_bytes > EVAL_CORPUS_MAX_PUBLISHED_APPLICATION_EVALUATOR_BYTES:
+            detail_bytes = published_detail_bytes_by_suite[suite_id] * trials_by_suite[suite_id]
+            if detail_bytes > EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_DETAIL_BYTES:
                 raise ValueError(
-                    f"Eval suite {suite_id!r} permits {evaluator_bytes} published "
-                    "application-evaluator bytes (parameters and the largest observations, "
-                    "for every trial); the maximum is "
-                    f"{EVAL_CORPUS_MAX_PUBLISHED_APPLICATION_EVALUATOR_BYTES}."
+                    f"Eval suite {suite_id!r} permits {detail_bytes} published assertion-detail "
+                    "bytes (application-evaluator parameters, structured-output field "
+                    "comparisons, and the largest observations of each, for every trial); "
+                    f"the maximum is {EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_DETAIL_BYTES}."
                 )
         cost_currencies = {
             assertion.currency
@@ -2252,7 +2306,7 @@ def _eval_run_contract_for_validated_corpus(
 
 
 def eval_corpus_to_json(corpus: EvalCorpusDocument) -> str:
-    """Return deterministic, human-readable corpus v5 JSON."""
+    """Return deterministic, human-readable corpus v6 JSON."""
 
     _, document = _validated_model_document(
         corpus,
@@ -2271,7 +2325,7 @@ def eval_corpus_to_json(corpus: EvalCorpusDocument) -> str:
 
 
 def eval_corpus_from_json(source: str) -> EvalCorpusDocument:
-    """Load one bounded corpus v5 JSON document from text."""
+    """Load one bounded corpus v6 JSON document from text."""
 
     if type(source) is not str:
         raise TypeError("eval_corpus_from_json requires text.")

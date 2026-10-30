@@ -163,7 +163,7 @@ def _corpus(*, include_cost: bool = False) -> EvalCorpusDocument:
     )
 
 
-def test_corpus_v5_round_trips_as_deterministic_json():
+def test_corpus_v6_round_trips_as_deterministic_json():
     corpus = _corpus(include_cost=True)
 
     first = eval_corpus_to_json(corpus)
@@ -174,7 +174,7 @@ def test_corpus_v5_round_trips_as_deterministic_json():
     assert first == second
     assert first.endswith("\n")
     document = json.loads(first)
-    assert EVAL_CORPUS_SCHEMA_VERSION == 5
+    assert EVAL_CORPUS_SCHEMA_VERSION == 6
     assert document["schema_version"] == EVAL_CORPUS_SCHEMA_VERSION
     assert document["target_key"] == "refund-agent"
     assert document["cases"][0]["source"] == {
@@ -1060,7 +1060,7 @@ def test_json_loader_rejects_duplicate_keys_unknown_versions_and_nonportable_num
     with pytest.raises(ValueError, match="unsupported schema_version"):
         eval_corpus_from_json('{"schema_version":1}')
     with pytest.raises(ValueError, match="unsupported schema_version"):
-        eval_corpus_from_json('{"schema_version":6}')
+        eval_corpus_from_json('{"schema_version":7}')
     with pytest.raises(ValueError, match="finite"):
         eval_corpus_from_json('{"schema_version":1,"value":NaN}')
     with pytest.raises(ValueError, match="signed 64-bit"):

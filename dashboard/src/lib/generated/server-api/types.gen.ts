@@ -3428,11 +3428,16 @@ export type AssertionEvidenceView = {
     /**
      * Schema Version
      */
-    schema_version?: 5;
+    schema_version?: 6;
     /**
      * Started Tool Names
      */
     started_tool_names: Array<string>;
+    structured_output?: JsonValue;
+    /**
+     * Structured Output State
+     */
+    structured_output_state?: 'complete' | 'not_validated' | 'unavailable' | 'limit_exceeded';
     /**
      * Tool Call Evidence State
      */
@@ -5929,7 +5934,7 @@ export type EvalAdditionCommitRequest = {
     /**
      * Assertions
      */
-    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec | ApplicationEvaluatorAssertionSpec> | null;
+    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec | ApplicationEvaluatorAssertionSpec | StructuredOutputFieldAssertionSpec> | null;
     /**
      * Case Id
      */
@@ -6044,7 +6049,7 @@ export type EvalAdditionRequest = {
     /**
      * Assertions
      */
-    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec | ApplicationEvaluatorAssertionSpec> | null;
+    assertions?: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec | ApplicationEvaluatorAssertionSpec | StructuredOutputFieldAssertionSpec> | null;
     /**
      * Case Id
      */
@@ -6813,7 +6818,7 @@ export type EvalCaseSpec = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec | ApplicationEvaluatorAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec | ApplicationEvaluatorAssertionSpec | StructuredOutputFieldAssertionSpec>;
     /**
      * Description
      */
@@ -6954,7 +6959,7 @@ export type EvalCorpusDocument = {
     /**
      * Schema Version
      */
-    schema_version?: 5;
+    schema_version?: 6;
     /**
      * Suites
      */
@@ -16871,7 +16876,9 @@ export type PublishedAssertionResult = {
         kind: 'structured_model_judge';
     } & PublishedStructuredModelJudgeDetail) | ({
         kind: 'application_evaluator';
-    } & PublishedApplicationEvaluatorDetail);
+    } & PublishedApplicationEvaluatorDetail) | ({
+        kind: 'structured_output_field';
+    } & PublishedStructuredOutputFieldDetail);
     /**
      * Message
      */
@@ -16975,7 +16982,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 11;
+    schema_version: 12;
     /**
      * Score
      */
@@ -17544,6 +17551,49 @@ export type PublishedStructuredModelJudgeDetail = {
      */
     threshold: string;
     usage?: PublishedStructuredJudgeUsageV1 | null;
+};
+
+/**
+ * PublishedStructuredOutputFieldDetail
+ *
+ * One structured-output field comparison and, when small enough, its observed value.
+ */
+export type PublishedStructuredOutputFieldDetail = {
+    /**
+     * Kind
+     */
+    kind?: 'structured_output_field';
+    /**
+     * Matched
+     */
+    matched?: boolean | null;
+    /**
+     * Observation State
+     */
+    observation_state: 'available' | 'unresolved' | 'not_validated' | 'unavailable' | 'limit_exceeded' | 'redacted';
+    observed?: PublishedStructuredOutputFieldObservationV1 | null;
+    /**
+     * Operator
+     */
+    operator: 'equals' | 'in' | 'exists' | 'matches' | 'gt' | 'gte' | 'lt' | 'lte';
+    /**
+     * Pointer
+     */
+    pointer: string;
+    /**
+     * Structured Output Revision
+     */
+    structured_output_revision?: string | null;
+    value?: JsonValue;
+};
+
+/**
+ * PublishedStructuredOutputFieldObservationV1
+ *
+ * One bounded field value after the trial app's secret redaction.
+ */
+export type PublishedStructuredOutputFieldObservationV1 = {
+    value?: JsonValue;
 };
 
 /**
@@ -21004,6 +21054,35 @@ export type StructuredModelJudgeAssertionSpec = {
      * Threshold
      */
     threshold?: string;
+};
+
+/**
+ * StructuredOutputFieldAssertionSpec
+ *
+ * Compare one JSON-pointer field of the run's last validated structured output.
+ */
+export type StructuredOutputFieldAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'structured_output_field';
+    /**
+     * Operator
+     */
+    operator: 'equals' | 'in' | 'exists' | 'matches' | 'gt' | 'gte' | 'lt' | 'lte';
+    /**
+     * Pointer
+     */
+    pointer: string;
+    value?: JsonValue;
 };
 
 /**

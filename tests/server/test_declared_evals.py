@@ -12,6 +12,14 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
+from tests.evals.test_structured_output_field_assertions import (
+    _agent_target,
+    _spec,
+    _verdict_schema,
+)
+from tests.evals.test_structured_output_field_assertions import (
+    _corpus as _structured_output_corpus,
+)
 from tests.server.test_generated_evals import _wait_for_terminal
 from tests.server.test_server_evals import (
     _AUTH_HEADERS,
@@ -150,5 +158,60 @@ def test_an_explicit_server_eval_target_replaces_the_declared_ones(tmp_path: Pat
         with TestClient(server) as client:
             catalog = client.get("/api/evals/targets", headers=_AUTH_HEADERS).json()
             assert [item["target_key"] for item in catalog["items"]] == ["explicit-agent"]
+    finally:
+        asyncio.run(context.close())
+
+
+def test_a_declared_agent_target_asserts_on_the_structured_output_it_requests(
+    tmp_path: Path,
+) -> None:
+    target = _agent_target(_verdict_schema())
+    declared = ProjectEvalTarget(
+        reference="evals.verifier:build",
+        target=target,
+        execution_profile_policy=_repeatable_execution_policy(target).model_copy(
+            update={"max_trials": 1, "max_concurrency": 1}
+        ),
+    )
+    context = _context(tmp_path, declared, project_id="verifier-project")
+    try:
+        server = create_server(
+            _target(_provider(trials=1)).app,
+            config=ServerConfig.protected(_authenticate),
+            project_context=context,
+        )
+        with TestClient(server) as client:
+            catalog = client.get("/api/evals/targets", headers=_AUTH_HEADERS).json()
+            (item,) = [entry for entry in catalog["items"] if entry["target_key"] == "verifier"]
+            corpus = _structured_output_corpus(
+                _spec(
+                    id="verdict-confirmed", pointer="/verdict", operator="equals", value="confirmed"
+                )
+            )
+            imported = client.post(
+                "/api/evals/corpora", headers=_AUTH_HEADERS, json=corpus.model_dump(mode="json")
+            )
+            assert imported.status_code == 201
+            admitted = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "verifier-run"},
+                json={
+                    "corpus_revision": corpus.revision,
+                    "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": item["execution_profile"]["revision"],
+                },
+            )
+            assert admitted.status_code == 202
+            run = _wait_for_terminal(client, admitted.json()["spec"]["run_id"])
+            assert run["status"] == "completed"
+            result = client.get(
+                f"/api/evals/runs/{run['spec']['run_id']}/result", headers=_AUTH_HEADERS
+            ).json()["result"]
+            (case,) = result["run"]["cases"]
+            (trial,) = case["trials"]
+            (assertion,) = trial["assertions"]
+            assert trial["status"] == "passed"
+            assert assertion["detail"]["observed"] == {"value": "confirmed"}
+            assert assertion["detail"]["structured_output_revision"].startswith("sha256:")
     finally:
         asyncio.run(context.close())

@@ -313,6 +313,9 @@ from cayu.evals.corpus import PublicJudgeReferenceV1 as PublicJudgeReferenceV1
 from cayu.evals.corpus import RootStatusAssertionSpec as RootStatusAssertionSpec
 from cayu.evals.corpus import RunInputSpec as RunInputSpec
 from cayu.evals.corpus import StructuredModelJudgeAssertionSpec as StructuredModelJudgeAssertionSpec
+from cayu.evals.corpus import (
+    StructuredOutputFieldAssertionSpec as StructuredOutputFieldAssertionSpec,
+)
 from cayu.evals.corpus import StructuredRubricCriterionV1 as StructuredRubricCriterionV1
 from cayu.evals.corpus import StructuredRubricV1 as StructuredRubricV1
 from cayu.evals.corpus import ToolArgumentsContainAssertionSpec as ToolArgumentsContainAssertionSpec
@@ -993,6 +996,12 @@ from cayu.evals.published import (
 from cayu.evals.published import PublishedStructuredJudgeUsageV1 as PublishedStructuredJudgeUsageV1
 from cayu.evals.published import (
     PublishedStructuredModelJudgeDetail as PublishedStructuredModelJudgeDetail,
+)
+from cayu.evals.published import (
+    PublishedStructuredOutputFieldDetail as PublishedStructuredOutputFieldDetail,
+)
+from cayu.evals.published import (
+    PublishedStructuredOutputFieldObservationV1 as PublishedStructuredOutputFieldObservationV1,
 )
 from cayu.evals.published import (
     PublishedToolArgumentsContainDetail as PublishedToolArgumentsContainDetail,

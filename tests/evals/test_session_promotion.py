@@ -1424,7 +1424,7 @@ def test_promotion_rejects_multiple_text_parts_instead_of_changing_replay_input(
         promotable_run_input(app, trajectory, source_agent_name="assistant")
     assert captured.value.code is SessionPromotionErrorCode.INPUT_PART_UNSUPPORTED
     assert str(captured.value) == (
-        "Portable corpus v5 requires exactly one text part per caller-supplied message."
+        "Portable corpus v6 requires exactly one text part per caller-supplied message."
     )
 
 

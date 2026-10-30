@@ -16,7 +16,6 @@ from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetLimit
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.configuration import EvalConfig
-from cayu.context import StructuredOutputSpec
 from cayu.context.footprints import RequestFootprintConfig
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.evals import (
@@ -629,7 +628,7 @@ def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
 
     assert result.target == evaluation_target_identity(target)
     assert result.schema_version == 3
-    assert result.run.schema_version == 11
+    assert result.run.schema_version == 12
     assert result.target.application_release_id == "release-2026-08-06"
     assert result.target.app_manifest_fingerprint == target.app.describe().fingerprint
     assert result.run.corpus_revision == corpus.revision
@@ -2181,14 +2180,6 @@ def test_corpus_target_rejects_message_or_runtime_identity_bearing_request_base(
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
-        (
-            lambda request: setattr(
-                request,
-                "structured_output",
-                StructuredOutputSpec(json_schema={"type": "string"}),
-            ),
-            "structured output",
-        ),
         (
             lambda request: setattr(
                 request,

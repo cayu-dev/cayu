@@ -411,7 +411,7 @@ evaluator_only_paths = ["evals/reference", "evals/expected_states"]
 All paths are normalized project-relative POSIX paths, and no list may repeat a
 path, ignoring case and Unicode normalization. `objectives` names the
 objectives file. `eval_targets` use the `module:attribute` form of `eval_target`,
-`corpora` are portable corpus files (schema version 5, suites referenced by
+`corpora` are portable corpus files (schema version 6, suites referenced by
 `suite_id`), and `benchmark_packages` are package directories or manifest files.
 At least one of these three is required. `evaluator_only_paths` hold material a
 candidate must never see, such as reference answers and expected states, in
@@ -778,10 +778,12 @@ set of structural assertion specifications. It cannot contain a `CayuApp`,
 provider/model/environment selection, import path, callback, raw session ID, or
 runtime event payload.
 
-Portable corpus schema version 5 adds application-evaluator assertions to the
-version 4 surface, which added bounded memory-attribution assertions to the
-explicit immutable suite trial policy of version 3. The assertion surface covers
-root and child terminal status, final-output equality/containment, tool
+Portable corpus schema version 6 adds structured-output field assertions to the
+version 5 surface, which added application evaluators to the bounded
+memory-attribution assertions of version 4 and the explicit immutable suite
+trial policy of version 3. The assertion surface covers root and child terminal
+status, final-output equality/containment,
+[structured-output fields](#structured-output-field-assertions), tool
 presence/order/count, bounded tool-argument/result JSON subsets, workspace-file
 structure, artifact structure and explicitly retained public artifact text,
 memory admission/provider-exposure ranges, model-step and token limits, recorded
@@ -816,7 +818,7 @@ and publication shapes but are rejected by fresh-run admission until runnable
 input is authored.
 
 `eval_corpus_to_json(...)`, `eval_corpus_from_json(...)`, and
-`load_eval_corpus(...)` enforce schema version 5 and Cayu's durable-JSON rules,
+`load_eval_corpus(...)` enforce schema version 6 and Cayu's durable-JSON rules,
 including duplicate-key, non-finite-number, integer-range, Unicode, and nesting
 validation. Input is rejected before an unbounded read or decode. The hard
 document limit is 8 MiB, with at most 64 suites, 1,000 cases, 64 assertions per
@@ -827,7 +829,7 @@ cases and trials, matching the boundary of the one-suite execution result. A
 multi-suite corpus may exceed that aggregate because suites execute and publish
 independently; inspection reports the complete corpus-wide count without
 materializing result graphs.
-Unknown fields and assertion kinds fail closed; schema version 5 has no
+Unknown fields and assertion kinds fail closed; schema version 6 has no
 prior-version compatibility loader.
 
 ### Safe tool argument and result assertions
@@ -884,6 +886,118 @@ an expected path are distinct `unavailable` observation states. Redaction on an
 unselected extra field does not prevent a safe comparison. These states and the
 bounded safe actual value are the same in SDK/HTTP results, Developer dashboard
 drill-down, CLI, and JSON/HTML reports.
+
+### Structured-output field assertions
+
+`StructuredOutputFieldAssertionSpec` checks one field of a run's structured
+output, selected by an [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON
+pointer. For an agent session it reads the last structured output the root
+session validated in its current run, the events after its last start or
+resume, so an earlier run of a resumed session never counts; for a
+`WorkflowEvalTarget` it reads the structured output the result projector
+returned. This case checks that a verifier settled on `"confirmed"`:
+
+```json
+{
+  "id": "verdict-confirmed",
+  "kind": "structured_output_field",
+  "pointer": "/verdict",
+  "operator": "equals",
+  "value": "confirmed"
+}
+```
+
+The same spec in Python is
+`StructuredOutputFieldAssertionSpec(id="verdict-confirmed", pointer="/verdict",
+operator="equals", value="confirmed")`.
+
+| `operator` | `value` | Passes when the field |
+| --- | --- | --- |
+| `equals` | any JSON value | equals the value exactly |
+| `in` | non-empty array | equals one of the array's values |
+| `exists` | none | exists |
+| `matches` | pattern string | contains a match for the pattern |
+| `gt`, `gte`, `lt`, `lte` | number | is a number greater than, at least, less than, or at most the value |
+
+Equality compares JSON kind and value: object keys must match exactly, arrays
+are positional, and numbers compare by exact decimal value, so `1` equals `1.0`
+but `true` does not equal `1`. A field of a type the operator cannot compare,
+such as a string for `gt`, fails. The pointer `""` selects the whole output; a
+segment selects an object member or a zero-based array index, with `~0` and
+`~1` escaping `~` and `/`.
+
+`matches` searches the field with Python regular-expression semantics but
+accepts only a subset that runs in linear time, because corpus patterns are
+untrusted: literals, `.`, bracket classes, `\d \w \s` and their negations,
+`\n \r \t \f \v`, escaped punctuation, `^`, `$`, `(...)`, `(?:...)`, `|`, and the
+quantifiers `* + ? {m} {m,} {m,n}` (lazy forms included). Backreferences,
+lookaround, inline flags, `\b`, and possessive quantifiers are rejected. A
+pattern is at most 256 characters and may expand to at most 512 matching
+instructions, and a field longer than 4,096 characters is not searched.
+
+The pointer, operator, and value shape are validated when the spec is built, so
+`cayu eval validate`, server corpus import, and run admission reject a malformed
+pointer, a missing or misshapen value, or an unsupported pattern before any
+candidate runs. The pointer is at most 1,024 characters, and the value at most
+4 KiB, 24 levels, and 256 nodes.
+
+Outcomes keep the reason exact:
+
+- **Passed or failed.** The pointer resolved and the comparison was conclusive.
+  The published `PublishedStructuredOutputFieldDetail` records
+  `observation_state: "available"`, the comparison result, and the observed
+  value when its compact JSON is at most 1 KiB; a larger value is still compared
+  but not published.
+- **Failed, `unresolved`.** The output validated but the pointer selects
+  nothing.
+- **Unavailable.** `not_validated` means the root session's current run
+  validated no structured output, or the workflow projector returned none. `redacted` means
+  the application's secret redaction hid a key on the path or the value being
+  compared. `limit_exceeded` means the output exceeded the 256 KiB evidence limit
+  or a `matches` field exceeded 4,096 characters. `unavailable` means root
+  evidence was missing.
+
+Cayu applies the redaction of the application that ran the trial before
+comparing or publishing anything. Every trial publishes each field's pointer,
+value, and observation again; a field counts its pointer, its value, and 1 KiB
+for the observation against the suite's published assertion-detail budget, which
+it shares with [application evaluators](#application-evaluators). The spec's content revision covers the
+pointer, operator, and value, so changing any of them is an assertion-contract
+change for comparisons. The Developer dashboard does not author this kind yet;
+write it in corpus JSON or Python.
+
+The schema belongs to the application, not the corpus. An agent target asks for
+structured output in its trusted request base, and every case runs with it:
+
+```python
+from cayu import RunRequest
+from cayu.context import StructuredOutputSpec
+from cayu.evals import CorpusTarget
+
+verifier_target = CorpusTarget(
+    key="verifier",
+    app=app,
+    request_base=RunRequest(
+        agent_name="verifier",
+        messages=[],
+        structured_output=StructuredOutputSpec(name="verdict", json_schema=VERDICT_SCHEMA),
+    ),
+    application_release_id="verifier-2026-10-30",
+)
+```
+
+Published details record `structured_output_revision`, the revision of the
+requested `StructuredOutputSpec` (schema, name, strategy, retries, and repair
+prompt) as the run's execution profile identifies it, or `null` when the target
+requests none. It is part of the assertion comparison contract but not the
+corpus revision, so changing the schema makes results incomparable even when the
+corpus is unchanged. A `WorkflowEvalTarget` projects structured output through
+its result projector and rejects a request base that asks for it, and an
+external-process target rejects it because its provider accepts neither tool
+definitions nor a native schema. Python suites can use the assertion through
+`compile_assertion_spec` on cases whose requests ask for structured output, and
+saved trajectories can be scored with `project_assertion_evidence_view` and
+`evaluate_assertion_spec`.
 
 ### Application evaluators
 
@@ -964,9 +1078,13 @@ or failed outcomes, the evaluator's message (at most 2,048 characters and 4 KiB
 of JSON) and metadata (a JSON object of at most 4 KiB) after the redaction of the
 application the trial ran in. Metadata keys starting with `cayu.` are reserved and
 removed. Every trial publishes the parameters and the observation again, so a
-suite whose parameters plus the largest observations, times its trials, would
-exceed 16 MiB of compact UTF-8 JSON is rejected when the corpus is built, before
-anything runs.
+suite's application evaluators and
+[structured-output field assertions](#structured-output-field-assertions) share
+one published assertion-detail budget: evaluator parameters plus the largest
+observations, and field pointers and values plus 1 KiB per observation, times
+the suite's trials, may not exceed 12 MiB of compact UTF-8 JSON, or the corpus is
+rejected when it is built, before anything runs. Tool-argument and tool-result
+subsets are not counted toward it.
 A graded result keeps its score and threshold; without a threshold, only a score
 of 1.0 passes. An exception, an oversized observation, or an invalid result is
 an `error` that still records the evaluator identity. Comparisons treat a
@@ -1216,8 +1334,10 @@ def build_eval() -> EvalPlan:
 `CorpusTarget` is immutable and defensively copies its request, bootstrap,
 evidence-policy, limit, optional pricing, model-judge target, and
 application-evaluator inputs. Its request base must have
-no messages, session/parent/causal/task identity, structured-output request,
-prior redaction state, or runtime authority. Bootstrap messages are bounded
+no messages, session/parent/causal/task identity, prior redaction state, or
+runtime authority. It may request structured output for every case, as
+[structured-output field assertions](#structured-output-field-assertions)
+describe; workflow and external-process targets reject that. Bootstrap messages are bounded
 single-text-part system, user, or assistant messages. Trusted assistant text can
 represent authored conversation history; tool calls, tool results, and provider
 state remain disallowed. Portable corpus input remains user-only. Compilation produces exactly that
@@ -1620,8 +1740,10 @@ profile therefore requires a reviewed corpus revision before another run.
 Portable assertions consume one immutable `AssertionEvidenceView`, produced by
 `project_assertion_evidence_view(...)` from a validated `Trajectory`. The view
 contains only terminal statuses, bounded redacted final output, requested tool
-names and counts, model-step/token counts, and optional currency-local cost
-totals. Schema version 5 also carries one versioned
+names and counts, model-step/token counts, optional currency-local cost totals,
+and the redacted structured output that structured-output field assertions
+compare: the last output the root session validated in its current run, or a
+workflow's projected output, at most 256 KiB. Schema version 6 also carries one versioned
 `EvalMemoryAttributionEvidenceV1` section. That section retains bounded runtime
 receipt/exposure attribution, exact lifecycle states and fingerprints,
 deterministic root/descendant tree paths, optional HMAC session aliases, and
@@ -1720,7 +1842,7 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-11 `PublishedEvalRun` containing
+produces a content-addressed schema-version-12 `PublishedEvalRun` containing
 every case, trial, exact source-trial revision, assertion outcome, safe
 structural detail, duration, and identity-free aggregate usage. Every trial also
 retains the exact bounded memory-attribution section used during evaluation, so
@@ -2447,7 +2569,7 @@ with stable `SessionPromotionErrorCode` values. These rules affect automatic
 portable promotion only: normal Cayu sessions and direct Python evals retain all
 of those capabilities, while runtime tool calls, artifacts, and admitted child
 agents remain eligible. Tool calls and child status remain available as portable
-assertion evidence; corpus v5 does not silently infer replay input or an artifact
+assertion evidence; corpus v6 does not silently infer replay input or an artifact
 assertion from uncaptured state. Caller-driven approval, resume, queued-input, and
 later-interaction phases are checked recursively across every admitted descendant,
 not only on the root.
@@ -2469,7 +2591,7 @@ intentionally absent from serialized trajectories, so a detached or older trajec
 cannot guess which
 transcript messages were caller input; it fails closed as
 `input_evidence_unavailable` instead. Multiple text parts reject because their
-provider-specific boundaries cannot be represented exactly by corpus v5's single
+provider-specific boundaries cannot be represented exactly by corpus v6's single
 text field. The resulting sanitized input and redaction fact carry one exact content
 revision.
 

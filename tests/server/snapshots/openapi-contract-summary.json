@@ -19931,6 +19931,7 @@
               "process_events_in_order": "#/components/schemas/PublishedProcessEventsInOrderDetail",
               "root_status": "#/components/schemas/PublishedRootStatusDetail",
               "structured_model_judge": "#/components/schemas/PublishedStructuredModelJudgeDetail",
+              "structured_output_field": "#/components/schemas/PublishedStructuredOutputFieldDetail",
               "tool_arguments_contain": "#/components/schemas/PublishedToolArgumentsContainDetail",
               "tool_called": "#/components/schemas/PublishedToolCalledDetail",
               "tool_result_contains": "#/components/schemas/PublishedToolResultContainsDetail",
@@ -20003,6 +20004,9 @@
             },
             {
               "$ref": "#/components/schemas/PublishedApplicationEvaluatorDetail"
+            },
+            {
+              "$ref": "#/components/schemas/PublishedStructuredOutputFieldDetail"
             }
           ],
           "title": "Detail"
@@ -20220,7 +20224,7 @@
           "type": "string"
         },
         "schema_version": {
-          "const": 11,
+          "const": 12,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -21509,6 +21513,101 @@
         "diagnostic"
       ],
       "title": "PublishedStructuredModelJudgeDetail",
+      "type": "object"
+    },
+    "PublishedStructuredOutputFieldDetail": {
+      "additionalProperties": false,
+      "description": "One structured-output field comparison and, when small enough, its observed value.",
+      "properties": {
+        "kind": {
+          "const": "structured_output_field",
+          "default": "structured_output_field",
+          "title": "Kind",
+          "type": "string"
+        },
+        "matched": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Matched"
+        },
+        "observation_state": {
+          "enum": [
+            "available",
+            "unresolved",
+            "not_validated",
+            "unavailable",
+            "limit_exceeded",
+            "redacted"
+          ],
+          "title": "Observation State",
+          "type": "string"
+        },
+        "observed": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/PublishedStructuredOutputFieldObservationV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operator": {
+          "enum": [
+            "equals",
+            "in",
+            "exists",
+            "matches",
+            "gt",
+            "gte",
+            "lt",
+            "lte"
+          ],
+          "title": "Operator",
+          "type": "string"
+        },
+        "pointer": {
+          "title": "Pointer",
+          "type": "string"
+        },
+        "structured_output_revision": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Structured Output Revision"
+        },
+        "value": {
+          "$ref": "#/components/schemas/JsonValue"
+        }
+      },
+      "required": [
+        "pointer",
+        "operator",
+        "observation_state"
+      ],
+      "title": "PublishedStructuredOutputFieldDetail",
+      "type": "object"
+    },
+    "PublishedStructuredOutputFieldObservationV1": {
+      "additionalProperties": false,
+      "description": "One bounded field value after the trial app's secret redaction.",
+      "properties": {
+        "value": {
+          "$ref": "#/components/schemas/JsonValue"
+        }
+      },
+      "title": "PublishedStructuredOutputFieldObservationV1",
       "type": "object"
     },
     "PublishedToolArgumentsContainDetail": {
@@ -23589,7 +23688,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "78",
+          "default": "79",
           "title": "Contract Version",
           "type": "string"
         },
@@ -31125,7 +31224,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "78",
+          "default": "79",
           "title": "Contract Version",
           "type": "string"
         }

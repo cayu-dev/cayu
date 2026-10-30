@@ -332,7 +332,7 @@ def test_a_suite_whose_evaluator_payloads_could_not_be_published_is_rejected(par
         ],
     )
 
-    with pytest.raises(ValueError, match="published application-evaluator bytes"):
+    with pytest.raises(ValueError, match="published assertion-detail bytes"):
         EvalCorpusDocument.create(
             target_key="answer-agent",
             evidence_policy=EvaluationEvidencePolicySpec.standard(),
@@ -341,12 +341,12 @@ def test_a_suite_whose_evaluator_payloads_could_not_be_published_is_rejected(par
         )
 
 
-def test_corpus_schema_v5_rejects_earlier_documents():
+def test_corpus_schema_v6_rejects_earlier_documents():
     document = json.loads(eval_corpus_to_json(_corpus()))
-    assert document["schema_version"] == 5
-    document["schema_version"] = 4
+    assert document["schema_version"] == 6
+    document["schema_version"] = 5
 
-    with pytest.raises(ValueError, match="unsupported schema_version 4"):
+    with pytest.raises(ValueError, match="unsupported schema_version 5"):
         eval_corpus_from_json(json.dumps(document))
 
 

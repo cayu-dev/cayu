@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Annotated, Any, Literal, TypeAlias, cast
+from typing import Annotated, Any, Literal, TypeAlias, cast, get_args
 
 from pydantic import (
     BaseModel,
     Field,
+    JsonValue,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -22,6 +24,16 @@ from cayu._validation import (
 )
 from cayu.budgets.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
+from cayu.evals._structured_output_fields import (
+    EVAL_STRUCTURED_OUTPUT_POINTER_MAX_CHARS,
+    StructuredOutputFieldOperator,
+    StructuredOutputFieldOutcome,
+    compare_structured_output_field,
+    copy_observed_field_value,
+    copy_structured_output_field_value,
+    json_pointer_tokens,
+    validate_structured_output_field_comparison,
+)
 from cayu.evals.capture_policy import (
     SessionTrajectoryBounds,
     WorkflowCaptureDiagnostic,
@@ -33,6 +45,7 @@ from cayu.evals.corpus import (
     _MODEL_JUDGE_RESULT_METADATA_KEY,
     _RESERVED_RESULT_METADATA_PREFIX,
     _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
+    _STRUCTURED_OUTPUT_FIELD_RESULT_METADATA_KEY,
     EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_BYTES,
     EVAL_APPLICATION_EVALUATOR_MAX_MESSAGE_CHARS,
     EVAL_APPLICATION_EVALUATOR_MAX_METADATA_BYTES,
@@ -79,6 +92,7 @@ from cayu.evals.corpus import (
     PublicJudgeReferenceV1,
     RootStatusAssertionSpec,
     StructuredModelJudgeAssertionSpec,
+    StructuredOutputFieldAssertionSpec,
     ToolArgumentsContainAssertionSpec,
     ToolCalledAssertionSpec,
     ToolResultContainsAssertionSpec,
@@ -136,7 +150,7 @@ from cayu.evals.trial_policy import (
 )
 from cayu.failure_evidence import FailureEvidence
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 11
+PUBLISHED_EVAL_SCHEMA_VERSION = 12
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -306,6 +320,102 @@ class PublishedFinalOutputEqualsDetail(_PublishedAssertionDetail):
 class PublishedFinalOutputContainsDetail(_PublishedAssertionDetail):
     kind: Literal["final_output_contains"] = "final_output_contains"
     matched: StrictBool | None = None
+
+
+StructuredOutputFieldObservationState: TypeAlias = Literal[
+    "available",
+    "unresolved",
+    "not_validated",
+    "unavailable",
+    "limit_exceeded",
+    "redacted",
+]
+_STRUCTURED_OUTPUT_FIELD_OBSERVATION_STATES = frozenset(
+    get_args(StructuredOutputFieldObservationState)
+)
+
+
+class PublishedStructuredOutputFieldObservationV1(_PortableModel):
+    """One bounded field value after the trial app's secret redaction."""
+
+    value: JsonValue = None
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def copy_value(cls, value: object, info) -> object:
+        return copy_observed_field_value(value, info.field_name)
+
+
+class PublishedStructuredOutputFieldDetail(_PublishedAssertionDetail):
+    """One structured-output field comparison and, when small enough, its observed value."""
+
+    kind: Literal["structured_output_field"] = "structured_output_field"
+    pointer: StrictStr
+    operator: StructuredOutputFieldOperator
+    value: JsonValue = Field(default=None, exclude_if=lambda value: value is None)
+    # The structured output the trusted target requested; null when it requested none.
+    structured_output_revision: StrictStr | None = None
+    observation_state: StructuredOutputFieldObservationState
+    observed: PublishedStructuredOutputFieldObservationV1 | None = None
+    matched: StrictBool | None = None
+
+    @field_validator("pointer")
+    @classmethod
+    def validate_pointer(cls, value: str, info) -> str:
+        pointer = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_STRUCTURED_OUTPUT_POINTER_MAX_CHARS,
+            nonblank=False,
+            clean=False,
+        )
+        json_pointer_tokens(pointer, info.field_name)
+        return pointer
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def copy_value(cls, value: object, info) -> object:
+        return copy_structured_output_field_value(value, info.field_name)
+
+    @field_validator("structured_output_revision")
+    @classmethod
+    def validate_structured_output_revision(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> PublishedStructuredOutputFieldDetail:
+        validate_structured_output_field_comparison(self.operator, self.value)
+        if self.observation_state == "available":
+            if self.matched is None:
+                raise ValueError("Available structured-output fields require a comparison.")
+            if self.observed is not None:
+                comparison = compare_structured_output_field(
+                    self.operator,
+                    self.value,
+                    self.observed.value,
+                )
+                if self.matched is not (comparison is StructuredOutputFieldOutcome.MATCHED) or (
+                    comparison
+                    not in {
+                        StructuredOutputFieldOutcome.MATCHED,
+                        StructuredOutputFieldOutcome.MISMATCHED,
+                    }
+                ):
+                    raise ValueError(
+                        "Structured-output field comparison contradicts its observed value."
+                    )
+        elif self.observed is not None:
+            raise ValueError("Only an available structured-output field carries its value.")
+        elif self.observation_state == "unresolved":
+            if self.matched is not False:
+                raise ValueError(
+                    "An unresolved structured-output pointer is a conclusive mismatch."
+                )
+        elif self.matched is not None:
+            raise ValueError("Incomplete structured-output evidence cannot carry a comparison.")
+        return self
 
 
 class PublishedToolCalledDetail(_PublishedAssertionDetail):
@@ -1222,7 +1332,8 @@ PublishedAssertionDetail: TypeAlias = Annotated[
     | PublishedMaxEstimatedCostDetail
     | PublishedModelJudgeDetail
     | PublishedStructuredModelJudgeDetail
-    | PublishedApplicationEvaluatorDetail,
+    | PublishedApplicationEvaluatorDetail
+    | PublishedStructuredOutputFieldDetail,
     Field(discriminator="kind"),
 ]
 
@@ -1542,7 +1653,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[11]
+    schema_version: Literal[12]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -1835,11 +1946,20 @@ def _detail_has_observation(detail: PublishedAssertionDetail) -> bool:
         return detail.diagnostic == "judgment_recorded"
     if isinstance(detail, PublishedApplicationEvaluatorDetail):
         return detail.observation is not None
+    if isinstance(detail, PublishedStructuredOutputFieldDetail):
+        return detail.observation_state in {"available", "unresolved"}
     return True
 
 
 def _detail_expected_pass(detail: PublishedAssertionDetail) -> bool | None:
-    if isinstance(detail, (PublishedFinalOutputEqualsDetail, PublishedFinalOutputContainsDetail)):
+    if isinstance(
+        detail,
+        (
+            PublishedFinalOutputEqualsDetail,
+            PublishedFinalOutputContainsDetail,
+            PublishedStructuredOutputFieldDetail,
+        ),
+    ):
         return detail.matched
     if isinstance(detail, PublishedRootStatusDetail):
         return None if detail.actual is None else detail.actual == detail.expected
@@ -1971,6 +2091,15 @@ def _detail_evidence_area(detail: PublishedAssertionDetail) -> str:
         return "model-judge"
     if isinstance(detail, PublishedApplicationEvaluatorDetail):
         return "application-evaluator"
+    if isinstance(detail, PublishedStructuredOutputFieldDetail):
+        # Redaction and the pattern-matching limit depend on the exact comparison.
+        comparison = json.dumps(
+            [detail.pointer, detail.operator, detail.value],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return f"structured-output:{comparison}"
     raise AssertionError("Unreachable published assertion detail type.")
 
 
@@ -2104,6 +2233,14 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
             detail.evaluator_implementation_revision,
             detail.params,
         )
+    elif isinstance(detail, PublishedStructuredOutputFieldDetail):
+        static_detail = (
+            detail.kind,
+            detail.pointer,
+            detail.operator,
+            detail.value,
+            detail.structured_output_revision,
+        )
     else:
         raise AssertionError("Unreachable published assertion detail type.")
     return assertion.assertion_id, assertion.assertion_revision, *static_detail
@@ -2203,6 +2340,8 @@ def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
         )
     if type(spec) is ApplicationEvaluatorAssertionSpec:
         return (*base, spec.evaluator_key, spec.params)
+    if type(spec) is StructuredOutputFieldAssertionSpec:
+        return (*base, spec.pointer, spec.operator, spec.value)
     raise AssertionError("Unreachable portable assertion specification type.")
 
 
@@ -2212,18 +2351,32 @@ def _published_assertion_matches_spec(
 ) -> bool:
     """Check that published assertion settings retain the corpus's portable contract.
 
-    A model-judge or application-evaluator implementation revision is resolved from
-    the execution target and deliberately retained in published results for
-    comparison.  It is not part of the portable corpus assertion, so it must not
-    prevent that result from being bound to the corpus that requested the evaluator.
+    A model-judge or application-evaluator implementation revision, or the revision
+    of the structured output a target requested, is resolved from the execution
+    target and deliberately retained in published results for comparison.  It is
+    not part of the portable corpus assertion, so it must not prevent that result
+    from being bound to the corpus that requested the assertion.
     """
 
     if type(spec) not in {
         ModelJudgeAssertionSpec,
         StructuredModelJudgeAssertionSpec,
         ApplicationEvaluatorAssertionSpec,
+        StructuredOutputFieldAssertionSpec,
     }:
         return _assertion_contract(assertion) == _assertion_spec_contract(spec)
+    if type(spec) is StructuredOutputFieldAssertionSpec:
+        detail = assertion.detail
+        if type(detail) is not PublishedStructuredOutputFieldDetail:
+            return False
+        return (
+            assertion.assertion_id,
+            assertion.assertion_revision,
+            detail.kind,
+            detail.pointer,
+            detail.operator,
+            detail.value,
+        ) == _assertion_spec_contract(spec)
     if type(spec) is ApplicationEvaluatorAssertionSpec:
         detail = assertion.detail
         if type(detail) is not PublishedApplicationEvaluatorDetail:
@@ -2521,6 +2674,17 @@ def _safe_metadata_json_object(result: EvalAssertionResult, key: str) -> dict[st
         return None
 
 
+def _safe_metadata_observed_field(
+    result: EvalAssertionResult,
+) -> PublishedStructuredOutputFieldObservationV1 | None:
+    if "observed" not in result.metadata:
+        return None
+    try:
+        return PublishedStructuredOutputFieldObservationV1(value=result.metadata["observed"])
+    except (TypeError, ValueError):
+        return None
+
+
 def _structural_observation_state(
     result: EvalAssertionResult,
     *,
@@ -2615,6 +2779,27 @@ def _published_detail(
                 max_chars=71,
             ),
             actual=_safe_metadata_json_object(result, "actual"),
+            matched=_safe_metadata_bool(result, "matched"),
+        )
+    if type(spec) is StructuredOutputFieldAssertionSpec:
+        raw_state = result.metadata.get("observation_state")
+        field_state: StructuredOutputFieldObservationState = (
+            raw_state
+            if type(raw_state) is str and raw_state in _STRUCTURED_OUTPUT_FIELD_OBSERVATION_STATES
+            else "unavailable"
+        )
+        contract = result.metadata.get(_STRUCTURED_OUTPUT_FIELD_RESULT_METADATA_KEY)
+        return PublishedStructuredOutputFieldDetail(
+            pointer=spec.pointer,
+            operator=spec.operator,
+            value=spec.value,
+            structured_output_revision=(
+                contract.get("structured_output_revision") if type(contract) is dict else None
+            ),
+            observation_state=field_state,
+            observed=(
+                _safe_metadata_observed_field(result) if field_state == "available" else None
+            ),
             matched=_safe_metadata_bool(result, "matched"),
         )
     if type(spec) is ToolsCalledInOrderAssertionSpec:

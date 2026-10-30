@@ -1180,6 +1180,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.evals.published",
         "PublishedStructuredModelJudgeDetail",
     ),
+    "PublishedStructuredOutputFieldDetail": (
+        "cayu.evals.published",
+        "PublishedStructuredOutputFieldDetail",
+    ),
+    "PublishedStructuredOutputFieldObservationV1": (
+        "cayu.evals.published",
+        "PublishedStructuredOutputFieldObservationV1",
+    ),
     "PublishedToolArgumentsContainDetail": (
         "cayu.evals.published",
         "PublishedToolArgumentsContainDetail",
@@ -1372,6 +1380,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "StructuredModelJudgeAssertionDraftV1",
     ),
     "StructuredModelJudgeAssertionSpec": ("cayu.evals.corpus", "StructuredModelJudgeAssertionSpec"),
+    "StructuredOutputFieldAssertionSpec": (
+        "cayu.evals.corpus",
+        "StructuredOutputFieldAssertionSpec",
+    ),
     "StructuredRubricCriterionV1": ("cayu.evals.corpus", "StructuredRubricCriterionV1"),
     "StructuredRubricDraftV1": ("cayu.evals.suite_authoring", "StructuredRubricDraftV1"),
     "StructuredRubricV1": ("cayu.evals.corpus", "StructuredRubricV1"),
@@ -2407,6 +2419,8 @@ PUBLIC_NAMES = [
     "PublishedStructuredJudgeCriterionV1",
     "PublishedStructuredJudgeUsageV1",
     "PublishedStructuredModelJudgeDetail",
+    "PublishedStructuredOutputFieldDetail",
+    "PublishedStructuredOutputFieldObservationV1",
     "PublishedToolArgumentsContainDetail",
     "PublishedToolCalledDetail",
     "PublishedToolResultContainsDetail",
@@ -2497,6 +2511,7 @@ PUBLIC_NAMES = [
     "SessionTrajectoryErrorCode",
     "StructuredModelJudgeAssertionDraftV1",
     "StructuredModelJudgeAssertionSpec",
+    "StructuredOutputFieldAssertionSpec",
     "StructuredRubricCriterionV1",
     "StructuredRubricDraftV1",
     "StructuredRubricV1",

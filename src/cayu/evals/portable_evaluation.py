@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import suppress
 from decimal import Decimal
 from typing import cast
 
+from cayu._validation import DurableValueError
+from cayu.evals._structured_output_fields import (
+    EVAL_STRUCTURED_OUTPUT_FIELD_MATCH_MAX_CHARS,
+    StructuredOutputFieldOutcome,
+    compare_structured_output_field,
+    copy_observed_field_value,
+    json_pointer_tokens,
+    resolve_json_pointer,
+)
 from cayu.evals.corpus import (
     ApplicationEvaluatorAssertionSpec,
     ArtifactAssertionSpec,
@@ -21,6 +31,7 @@ from cayu.evals.corpus import (
     ProcessEventsInOrderAssertionSpec,
     RootStatusAssertionSpec,
     StructuredModelJudgeAssertionSpec,
+    StructuredOutputFieldAssertionSpec,
     ToolArgumentsContainAssertionSpec,
     ToolCalledAssertionSpec,
     ToolResultContainsAssertionSpec,
@@ -173,6 +184,83 @@ def _evaluate_final_output(
             else f"Final output did not {comparison.removesuffix('ed')} the expected text."
         ),
         metadata={"matched": matched},
+    )
+
+
+_STRUCTURED_OUTPUT_FIELD_COMPARISONS = {
+    "equals": ("equaled the expected value", "did not equal the expected value"),
+    "in": ("was one of the expected values", "was not one of the expected values"),
+    "exists": ("exists", "does not exist"),
+    "matches": ("matched the pattern", "did not match the pattern"),
+    "gt": ("was greater than {value}", "was not greater than {value}"),
+    "gte": ("was at least {value}", "was less than {value}"),
+    "lt": ("was less than {value}", "was not less than {value}"),
+    "lte": ("was at most {value}", "was greater than {value}"),
+}
+
+
+def _evaluate_structured_output_field(
+    *,
+    spec: StructuredOutputFieldAssertionSpec,
+    evidence: AssertionEvidenceView,
+) -> EvalAssertionResult:
+    field = f"Structured output field {spec.pointer}" if spec.pointer else "Structured output"
+    metadata: dict[str, object] = {"pointer": spec.pointer, "operator": spec.operator}
+
+    def unavailable(observation_state: str, message: str) -> EvalAssertionResult:
+        return EvalAssertionResult(
+            name=spec.id,
+            outcome=EvalOutcome.UNAVAILABLE,
+            message=message,
+            metadata={
+                **metadata,
+                "evidence_area": "structured output",
+                "observation_state": observation_state,
+            },
+        )
+
+    state = evidence.structured_output_state
+    if state == "not_validated":
+        return unavailable(
+            state,
+            "Structured output evidence is unavailable because no structured output was validated.",
+        )
+    if state != "complete":
+        return unavailable(state, f"Structured output evidence is {state.replace('_', ' ')}.")
+    resolution, observed = resolve_json_pointer(
+        evidence.structured_output,
+        json_pointer_tokens(spec.pointer, "pointer"),
+    )
+    if resolution == "redacted":
+        return unavailable("redacted", f"{field} is hidden by redaction.")
+    if resolution == "unresolved":
+        return _result(
+            spec.id,
+            EvalOutcome.FAILED,
+            f"{field} does not exist.",
+            metadata={**metadata, "observation_state": "unresolved", "matched": False},
+        )
+    comparison = compare_structured_output_field(spec.operator, spec.value, observed)
+    if comparison is StructuredOutputFieldOutcome.REDACTED:
+        return unavailable("redacted", f"{field} is hidden by redaction.")
+    if comparison is StructuredOutputFieldOutcome.LIMIT_EXCEEDED:
+        return unavailable(
+            "limit_exceeded",
+            f"{field} exceeds the {EVAL_STRUCTURED_OUTPUT_FIELD_MATCH_MAX_CHARS}-character "
+            "pattern-matching limit.",
+        )
+    matched = comparison is StructuredOutputFieldOutcome.MATCHED
+    passed_text, failed_text = _STRUCTURED_OUTPUT_FIELD_COMPARISONS[spec.operator]
+    description = (passed_text if matched else failed_text).format(value=spec.value)
+    metadata.update(observation_state="available", matched=matched)
+    # A larger value was still compared; only its publication is withheld.
+    with suppress(DurableValueError):
+        metadata["observed"] = copy_observed_field_value(observed, "observed")
+    return _result(
+        spec.id,
+        EvalOutcome.PASSED if matched else EvalOutcome.FAILED,
+        f"{field} {description}.",
+        metadata=metadata,
     )
 
 
@@ -713,6 +801,8 @@ def _evaluate_validated_assertion_outcome(
             state=evidence.final_output_state,
             contains=True,
         )
+    if type(validated_spec) is StructuredOutputFieldAssertionSpec:
+        return _evaluate_structured_output_field(spec=validated_spec, evidence=evidence)
     if type(validated_spec) is ToolCalledAssertionSpec:
         return _evaluate_tool_called(
             name=validated_spec.id,

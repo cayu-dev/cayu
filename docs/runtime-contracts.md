@@ -2707,6 +2707,49 @@ reusable across evaluator rollouts while comparisons reject results produced by
 different evaluator implementations. Offline rescoring paths
 (`evaluate_assertion_spec`, captured-session scoring, saved workflow captures,
 and benchmark rescoring) have no trusted target and reject the kind.
+
+Corpus schema V6 adds `StructuredOutputFieldAssertionSpec`: an RFC 6901 JSON
+pointer (at most 1,024 characters, `~` escapes limited to `~0` and `~1`) and one
+operator, `equals`, `in`, `exists`, `matches`, `gt`, `gte`, `lt`, or `lte`, with a
+bounded JSON value (4 KiB, 24 levels, 256 nodes) whose shape the operator fixes:
+none for `exists`, a non-empty array for `in`, a pattern string for `matches`,
+and a JSON number for the ordered comparisons. Spec construction validates the
+pointer, the value shape, and the pattern, so corpus loading, CLI validation,
+server import, and run admission reject malformed input. `matches` accepts a
+linear-time subset of Python regular expressions (no backreferences,
+lookaround, flags, word boundaries, or possessive quantifiers; at most 256
+characters and 512 compiled instructions) and searches fields of at most 4,096
+characters; it is simulated as a Thompson NFA, never with backtracking.
+`AssertionEvidenceView.schema_version == 6` adds `structured_output` and
+`structured_output_state` (`complete`, `not_validated`, `unavailable`, or
+`limit_exceeded`): the `output` of the last `structured_output.validated` event in
+the root session's current run (the events after its last `session.started`,
+`session.resumed`, or `session.forked`), or for a workflow trajectory the projected
+`workflow_output.structured_output`, after the trial app's secret redaction and
+within 256 KiB. Equality is exact JSON equality with decimal number comparison; a
+type the operator cannot compare is a conclusive mismatch, an unresolved pointer
+is a conclusive failure, and redaction of a key on the path or of a compared
+string is `unavailable` rather than a mismatch. Published eval schema V12 adds
+`PublishedStructuredOutputFieldDetail` with the pointer, operator, value,
+observation state, comparison result, and the observed value when its compact
+JSON is at most 1 KiB; validation recomputes the comparison from a published
+observed value. Application evaluators and structured-output fields share one
+published assertion-detail budget per suite: evaluator parameters plus 4 KiB of
+message and 4 KiB of metadata, and field pointers and values plus 1 KiB of
+observation, times the suite's trials, may not exceed 12 MiB, or corpus
+construction fails. Tool-JSON subsets are not counted. The assertion
+is deterministic and needs no trusted binding, so `compile_assertion_spec` and
+`evaluate_assertion_spec` accept it. A `CorpusTarget` request base may request
+structured output for every case; `WorkflowEvalTarget` and external-process
+targets reject it. Corpus compilation binds each field assertion to the revision
+of the requested structured output, computed from the same component the
+runtime execution profile records (schema digest, name digest, strategy, retry
+limit, repair-prompt digest), and `PublishedStructuredOutputFieldDetail` records
+it as `structured_output_revision` (`null` when the target requests none). Like
+an application evaluator's implementation revision, it joins the published
+assertion comparison contract but not the corpus revision. Server-admitted runs
+also commit the request base, including its structured output, in the eval
+execution profile's target material and runtime profile.
 `EvalCaseComparison` and `EvalRunComparison` scores are optional finite values in
 the inclusive range from 0 through 1, matching their source eval results.
 `compare_eval_runs` accepts finite nonnegative score tolerances and rejects
@@ -18637,12 +18680,12 @@ inside the fixed 64 KiB public-text ceiling. Binary, truncated, malformed,
 redacted, unsupported, and unavailable content never becomes a mismatch or a
 portable byte field.
 
-`AssertionEvidenceView.schema_version == 5` publishes sorted content-free
+`AssertionEvidenceView.schema_version == 6` publishes sorted content-free
 workspace observations, at most 256 content-minimized artifact observations,
 and per-scope completeness. It omits workspace bytes, artifact/store/session/
 environment identities, timestamps, arbitrary artifact metadata, and binary
 content. `EvalRun.schema_version == 11`, trajectory schema version 5, and
-`PublishedEvalRun.schema_version == 11` bind the new evidence and typed result
+`PublishedEvalRun.schema_version == 12` bind the new evidence and typed result
 details. Result compatibility continues to use exact assertion revisions and
 the admitted evidence-policy revision, so digest/text changes or policy changes
 cannot compare as the same contract. Server/dashboard contract version 40
@@ -18841,8 +18884,8 @@ distinct from a recall-off spec, a no-match receipt, and `truncated`,
 `unavailable`, `redacted`, or `contradictory` attribution.
 
 Runtime-native Evals carry that attribution across both fresh and captured
-publication. `AssertionEvidenceView.schema_version == 5`,
-`EvalRun.schema_version == 11`, `PublishedEvalRun.schema_version == 11`, and
+publication. `AssertionEvidenceView.schema_version == 6`,
+`EvalRun.schema_version == 11`, `PublishedEvalRun.schema_version == 12`, and
 `CorpusExecutionResult.schema_version == 3` each require the same nested
 `EvalMemoryAttributionEvidenceV1`. The nested section is independently
 versioned and content-addressed. It binds a fixed capture-policy revision,

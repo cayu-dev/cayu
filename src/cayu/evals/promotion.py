@@ -826,19 +826,19 @@ _PROMOTION_ERROR_MESSAGES = {
         "Promotion requires a complete completed/failed descendant tree."
     ),
     SessionPromotionErrorCode.APPROVAL_CONTINUATION_UNSUPPORTED: (
-        "Portable corpus v5 does not support approval continuations."
+        "Portable corpus v6 does not support approval continuations."
     ),
     SessionPromotionErrorCode.SESSION_RESUME_UNSUPPORTED: (
-        "Portable corpus v5 does not support resumed sessions."
+        "Portable corpus v6 does not support resumed sessions."
     ),
     SessionPromotionErrorCode.QUEUED_INPUT_UNSUPPORTED: (
-        "Portable corpus v5 does not support queued later input."
+        "Portable corpus v6 does not support queued later input."
     ),
     SessionPromotionErrorCode.LATER_INTERACTION_UNSUPPORTED: (
-        "Portable corpus v5 requires exactly one initial interaction."
+        "Portable corpus v6 requires exactly one initial interaction."
     ),
     SessionPromotionErrorCode.STRUCTURED_OUTPUT_UNSUPPORTED: (
-        "Portable corpus v5 does not support structured-output runs."
+        "Portable corpus v6 does not support structured-output runs."
     ),
     SessionPromotionErrorCode.INPUT_EVIDENCE_UNAVAILABLE: (
         "The session has no runtime-attested fresh-input boundary."
@@ -847,16 +847,16 @@ _PROMOTION_ERROR_MESSAGES = {
         "The runtime promotion attestation does not match the captured trajectory."
     ),
     SessionPromotionErrorCode.INPUT_MESSAGE_COUNT_UNSUPPORTED: (
-        "Portable corpus v5 requires one or more bounded initial user messages."
+        "Portable corpus v6 requires one or more bounded initial user messages."
     ),
     SessionPromotionErrorCode.INPUT_ROLE_UNSUPPORTED: (
-        "Portable corpus v5 accepts only caller-supplied user messages."
+        "Portable corpus v6 accepts only caller-supplied user messages."
     ),
     SessionPromotionErrorCode.INPUT_PART_UNSUPPORTED: (
-        "Portable corpus v5 requires exactly one text part per caller-supplied message."
+        "Portable corpus v6 requires exactly one text part per caller-supplied message."
     ),
     SessionPromotionErrorCode.INPUT_LIMIT_EXCEEDED: (
-        "The initial input exceeds a portable corpus v5 limit."
+        "The initial input exceeds a portable corpus v6 limit."
     ),
     SessionPromotionErrorCode.INPUT_REDACTION_FAILED: (
         "The initial input could not cross the application redaction boundary."

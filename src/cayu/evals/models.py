@@ -2116,6 +2116,16 @@ _TRAJECTORY_LIFECYCLE_EVENT_TYPES = frozenset(
 )
 
 
+def _current_run_events(trajectory: Trajectory) -> tuple[Event, ...]:
+    """Events after the session's last start, resume, or fork: its current run."""
+
+    current_run_start = 0
+    for index, event in enumerate(trajectory.events):
+        if event.type in _TRAJECTORY_LIFECYCLE_EVENT_TYPES:
+            current_run_start = index + 1
+    return trajectory.events[current_run_start:]
+
+
 def _validate_trajectory_terminal_boundary(trajectory: Trajectory) -> None:
     """Require one status-consistent terminal event for the current run."""
 
@@ -2123,13 +2133,9 @@ def _validate_trajectory_terminal_boundary(trajectory: Trajectory) -> None:
         return
     if not trajectory.events:
         raise ValueError("Session-backed trajectories require a terminal event.")
-    current_run_start = 0
-    for index, event in enumerate(trajectory.events):
-        if event.type in _TRAJECTORY_LIFECYCLE_EVENT_TYPES:
-            current_run_start = index + 1
     terminal_events = tuple(
         event
-        for event in trajectory.events[current_run_start:]
+        for event in _current_run_events(trajectory)
         if event.type in _TRAJECTORY_TERMINAL_EVENT_TYPES
     )
     if len(terminal_events) != 1:

@@ -38,7 +38,11 @@ from tests.server.test_server_eval_session_additions import (
     addition_environment as addition_environment,
 )
 from tests.server.test_server_evals import _server
-from tests.server.test_server_evaluation_promotion import _AUTH_HEADERS, _SESSION_ID
+from tests.server.test_server_evaluation_promotion import (
+    _AUTH_HEADERS,
+    _SESSION_ID,
+    _authenticate,
+)
 
 from cayu import Message, RunRequest
 from cayu.cli import _eval_curation as curation
@@ -46,11 +50,18 @@ from cayu.cli import cloud as cloud_cli
 from cayu.cli import main
 from cayu.cli._cloud_agent_api import CayuApi, basic_authorization
 from cayu.server import _eval_addition_routes
-from cayu.server.auth import BasicAuth
+from cayu.server.auth import AuthContext, BasicAuth
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 
 _URL = "http://127.0.0.1"
 _LOCAL = ("--server-url", _URL)
+_CURATION_AUTHORIZATION = "Bearer curation-cli-fixture-7f3a9b82d6e140c5"
+
+
+def _authenticate_curation(request):
+    if request.headers.get("Authorization") == _CURATION_AUTHORIZATION:
+        return AuthContext(subject="eval-operator")
+    return _authenticate(request)
 
 
 @contextmanager
@@ -94,8 +105,8 @@ def _command(text: str) -> tuple[str, ...]:
 def test_add_session_previews_then_publishes_the_reviewed_plan_once(
     addition_environment, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    server, _, _ = addition_environment()
-    monkeypatch.setenv("CAYU_API_AUTHORIZATION", _AUTH_HEADERS["Authorization"])
+    server, _, _ = addition_environment(auth=_authenticate_curation)
+    monkeypatch.setenv("CAYU_API_AUTHORIZATION", _CURATION_AUTHORIZATION)
 
     with _served(server, monkeypatch) as client:
         selector, parent = _destination(client, "authored")
@@ -163,8 +174,8 @@ def test_add_session_previews_then_publishes_the_reviewed_plan_once(
 def test_add_session_refuses_a_stale_plan_and_a_key_bound_to_another_addition(
     addition_environment, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    server, app, _ = addition_environment()
-    monkeypatch.setenv("CAYU_API_AUTHORIZATION", _AUTH_HEADERS["Authorization"])
+    server, app, _ = addition_environment(auth=_authenticate_curation)
+    monkeypatch.setenv("CAYU_API_AUTHORIZATION", _CURATION_AUTHORIZATION)
 
     async def identical_session() -> None:
         async for _ in app.run(
@@ -215,8 +226,8 @@ def test_add_session_refuses_a_stale_plan_and_a_key_bound_to_another_addition(
 def test_a_lost_publication_answer_is_continued_without_publishing_twice(
     addition_environment, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    server, _, _ = addition_environment()
-    monkeypatch.setenv("CAYU_API_AUTHORIZATION", _AUTH_HEADERS["Authorization"])
+    server, _, _ = addition_environment(auth=_authenticate_curation)
+    monkeypatch.setenv("CAYU_API_AUTHORIZATION", _CURATION_AUTHORIZATION)
     send = CayuApi._bounded_request
 
     def answer_lost(self: CayuApi, method: str, url: str, *args, **kwargs):

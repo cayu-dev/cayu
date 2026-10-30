@@ -21,6 +21,7 @@ from cayu.evals.corpus import (
     FinalOutputEqualsAssertionSpec,
     ModelJudgeAssertionSpec,
     RunInputSpec,
+    StructuredOutputFieldAssertionSpec,
     TrialRequestSpec,
     eval_corpus_to_json,
     load_eval_corpus,
@@ -638,6 +639,31 @@ def test_eval_validate_with_a_target_rejects_unknown_evaluator_keys(
     # Without a target, validation stays structural and loads no application code.
     assert main(["eval", "validate", str(unknown)]) == 0
     assert "for target" not in capsys.readouterr().out
+
+
+def test_eval_validate_rejects_a_malformed_structured_output_pointer(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    valid = tmp_path / "valid.json"
+    malformed = tmp_path / "malformed.json"
+    corpus = _corpus(
+        assertions=(
+            StructuredOutputFieldAssertionSpec(
+                id="verdict-confirmed", pointer="/verdict", operator="equals", value="confirmed"
+            ),
+        )
+    )
+    valid.write_text(eval_corpus_to_json(corpus), encoding="utf-8")
+    document = json.loads(eval_corpus_to_json(corpus))
+    document["cases"][0]["assertions"][0]["pointer"] = "/verdict~2"
+    malformed.write_text(json.dumps(document), encoding="utf-8")
+
+    assert main(["eval", "validate", str(valid)]) == 0
+    capsys.readouterr()
+    assert main(["eval", "validate", str(malformed), "--json"]) == 2
+    message = json.loads(capsys.readouterr().out)["error"]["message"]
+    assert "`pointer` may escape only '~' as '~0' and '/' as '~1'." in message
 
 
 def test_eval_run_cli_executes_an_application_evaluator(tmp_path: Path, monkeypatch) -> None:

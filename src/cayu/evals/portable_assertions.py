@@ -16,6 +16,7 @@ from cayu.evals.assertions import EvalAssertion
 from cayu.evals.corpus import (
     _MODEL_JUDGE_RESULT_METADATA_KEY,
     _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
+    _STRUCTURED_OUTPUT_FIELD_RESULT_METADATA_KEY,
     EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS,
     ApplicationEvaluatorAssertionSpec,
     ArtifactAssertionSpec,
@@ -35,6 +36,7 @@ from cayu.evals.corpus import (
     PublicJudgeReferenceV1,
     RootStatusAssertionSpec,
     StructuredModelJudgeAssertionSpec,
+    StructuredOutputFieldAssertionSpec,
     ToolArgumentsContainAssertionSpec,
     ToolResultContainsAssertionSpec,
     WorkspaceFileAssertionSpec,
@@ -350,6 +352,7 @@ class _CompiledPortableAssertion(EvalAssertion):
     _evidence_policy: EvaluationEvidencePolicySpec
     _pricing_binding: _CompiledPricingBinding
     _spec: AssertionSpec
+    _structured_output_revision: str | None
 
     __slots__ = (
         "_app",
@@ -357,6 +360,7 @@ class _CompiledPortableAssertion(EvalAssertion):
         "_evidence_policy",
         "_pricing_binding",
         "_spec",
+        "_structured_output_revision",
     )
 
     def __init__(
@@ -366,6 +370,7 @@ class _CompiledPortableAssertion(EvalAssertion):
         app: CayuApp,
         evidence_policy: EvaluationEvidencePolicySpec,
         pricing_binding: _CompiledPricingBinding,
+        structured_output_revision: str | None = None,
     ) -> None:
         validated_spec = _validated_assertion_spec(spec)
         object.__setattr__(self, "_spec", validated_spec)
@@ -378,6 +383,13 @@ class _CompiledPortableAssertion(EvalAssertion):
             pricing_binding
             if type(validated_spec) is MaxEstimatedCostAssertionSpec
             else _NO_PRICING,
+        )
+        object.__setattr__(
+            self,
+            "_structured_output_revision",
+            structured_output_revision
+            if type(validated_spec) is StructuredOutputFieldAssertionSpec
+            else None,
         )
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -411,6 +423,7 @@ class _CompiledPortableAssertion(EvalAssertion):
         return type(self._spec) in (
             FinalOutputContainsAssertionSpec,
             FinalOutputEqualsAssertionSpec,
+            StructuredOutputFieldAssertionSpec,
         )
 
     def required_probes(self) -> ProbeRequirements:
@@ -456,10 +469,28 @@ class _CompiledPortableAssertion(EvalAssertion):
             raise ValueError(
                 "Assertion evidence pricing profile does not match the compiled contract."
             )
-        return _evaluate_validated_assertion_spec(
-            self._spec,
-            evidence,
-            known_revision=self._assertion_revision,
+        return self._with_public_contract(
+            _evaluate_validated_assertion_spec(
+                self._spec,
+                evidence,
+                known_revision=self._assertion_revision,
+            )
+        )
+
+    def _with_public_contract(self, result: EvalAssertionResult) -> EvalAssertionResult:
+        # A field's meaning depends on the structured output the trusted target
+        # requested, so its revision joins the published comparison contract.
+        if type(self._spec) is not StructuredOutputFieldAssertionSpec:
+            return result
+        return result.model_copy(
+            update={
+                "metadata": {
+                    **result.metadata,
+                    _STRUCTURED_OUTPUT_FIELD_RESULT_METADATA_KEY: {
+                        "structured_output_revision": self._structured_output_revision
+                    },
+                }
+            }
         )
 
 
@@ -490,12 +521,14 @@ def _blocked_portable_assertion_result(
                     )
                 ],
             }
-        return EvalAssertionResult(
-            name=assertion.name,
-            assertion_revision=assertion.assertion_revision,
-            outcome=outcome,
-            message=message,
-            metadata=metadata,
+        return assertion._with_public_contract(
+            EvalAssertionResult(
+                name=assertion.name,
+                assertion_revision=assertion.assertion_revision,
+                outcome=outcome,
+                message=message,
+                metadata=metadata,
+            )
         )
     if type(assertion) is _CompiledModelJudgeAssertion:
         return assertion._with_public_contract(
@@ -1212,6 +1245,7 @@ def _compile_corpus_assertion_specs(
     trusted_pricing_identity: PricingProfileIdentityV1 | None = None,
     trusted_model_judges: Sequence[_TrustedModelJudgeBinding] = (),
     application_evaluators: Sequence[ApplicationEvaluator] = (),
+    structured_output_revision: str | None = None,
 ) -> tuple[EvalAssertion, ...]:
     """Compile one corpus suite with a single shared pricing binding."""
 
@@ -1334,6 +1368,7 @@ def _compile_corpus_assertion_specs(
                     app=app,
                     evidence_policy=validated_policy,
                     pricing_binding=pricing_binding,
+                    structured_output_revision=structured_output_revision,
                 )
             )
     return tuple(compiled)

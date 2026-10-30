@@ -184,7 +184,7 @@ test("inactive complete eval results are released from the browser cache immedia
 
 test("eval corpus import preflight bounds work without authorizing normalized content", async () => {
   const corpus = {
-    schema_version: 5,
+    schema_version: 6,
     revision: "sha256:corpus",
     target_key: "support.regressions",
     evidence_policy: { schema_version: 1 },
@@ -196,7 +196,7 @@ test("eval corpus import preflight bounds work without authorizing normalized co
   await assert.rejects(preflightEvalCorpusFile(new Blob(["not json"])), /not valid JSON/)
   await assert.rejects(
     preflightEvalCorpusFile(new Blob([JSON.stringify({ ...corpus, schema_version: 1 })])),
-    /corpus v5/,
+    /corpus v6/,
   )
   await assert.rejects(
     preflightEvalCorpusFile(new Blob([new Uint8Array(MAX_EVAL_CORPUS_FILE_BYTES + 1)])),

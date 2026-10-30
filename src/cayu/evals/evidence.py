@@ -7,7 +7,15 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal, cast
 
-from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
+from pydantic import (
+    Field,
+    JsonValue,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import (
     DurableValueError,
@@ -22,6 +30,7 @@ from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
+from cayu.evals._structured_output_fields import copy_structured_output_evidence
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
     EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS,
@@ -59,6 +68,7 @@ from cayu.evals.models import (
     Trajectory,
     WorkspaceStructuralProbe,
     _artifact_text_media_type_supported,
+    _current_run_events,
     _model_instance_python_input,
     _validate_trajectory_record_contract,
 )
@@ -67,7 +77,7 @@ from cayu.messages import Message, ToolCallPart
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.tools.base import ToolResult
 
-ASSERTION_EVIDENCE_SCHEMA_VERSION = 5
+ASSERTION_EVIDENCE_SCHEMA_VERSION = 6
 ASSERTION_EVIDENCE_MAX_BYTES = 10 << 20
 ASSERTION_EVIDENCE_MAX_TOOL_NAME_CHARS = 256
 ASSERTION_EVIDENCE_MAX_COST_CURRENCIES = 32
@@ -91,6 +101,13 @@ ArtifactTextEvidenceState = Literal[
     "malformed",
 ]
 TerminalEvidenceStatus = Literal["completed", "failed", "interrupted"]
+# "not_validated": the root validated no structured output (or a workflow projected none).
+StructuredOutputEvidenceState = Literal[
+    "complete",
+    "not_validated",
+    "unavailable",
+    "limit_exceeded",
+]
 
 
 _PORTABLE_PROCESS_EVENT_KINDS: dict[str, EvalProcessEventKind] = {
@@ -354,7 +371,7 @@ class ArtifactScopeEvidenceV1(_PortableModel):
 class AssertionEvidenceView(_PortableModel):
     """The bounded, content-minimized data consumed by every portable assertion."""
 
-    schema_version: Literal[5] = ASSERTION_EVIDENCE_SCHEMA_VERSION
+    schema_version: Literal[6] = ASSERTION_EVIDENCE_SCHEMA_VERSION
     revision: StrictStr
     policy_revision: StrictStr
     pricing_profile_fingerprint: StrictStr | None = None
@@ -366,6 +383,8 @@ class AssertionEvidenceView(_PortableModel):
     child_evidence_state: EvidenceState
     final_output: StrictStr
     final_output_state: EvidenceState
+    structured_output: JsonValue = None
+    structured_output_state: StructuredOutputEvidenceState = "unavailable"
     requested_tool_names: tuple[StrictStr, ...] = Field(max_length=EVIDENCE_MAX_TOOL_CALLS)
     started_tool_names: tuple[StrictStr, ...] = Field(max_length=EVIDENCE_MAX_TOOL_CALLS)
     tool_calls_started: StrictInt | None = Field(
@@ -429,7 +448,7 @@ class AssertionEvidenceView(_PortableModel):
     @classmethod
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
-            raise ValueError("schema_version must be the integer 5.")
+            raise ValueError("schema_version must be the integer 6.")
         return value
 
     @field_validator("pricing_profile_fingerprint")
@@ -449,6 +468,11 @@ class AssertionEvidenceView(_PortableModel):
             nonblank=False,
             clean=False,
         )
+
+    @field_validator("structured_output", mode="before")
+    @classmethod
+    def copy_structured_output(cls, value: object, info) -> object:
+        return copy_structured_output_evidence(value, info.field_name)
 
     @field_validator("requested_tool_names", "started_tool_names")
     @classmethod
@@ -476,6 +500,7 @@ class AssertionEvidenceView(_PortableModel):
             derived_states = (
                 self.child_evidence_state,
                 self.final_output_state,
+                self.structured_output_state,
                 self.tool_evidence_state,
                 self.tool_call_evidence_state,
                 self.process_event_evidence_state,
@@ -510,6 +535,8 @@ class AssertionEvidenceView(_PortableModel):
             raise ValueError(
                 "Limited final-output evidence must retain exactly its bounded prefix."
             )
+        if self.structured_output_state != "complete" and self.structured_output is not None:
+            raise ValueError("Only complete structured-output evidence can carry a value.")
         if self.tool_evidence_state == "unavailable":
             if (
                 self.requested_tool_names
@@ -1125,6 +1152,48 @@ def _project_tool_call_evidence(
     return tuple(projected), state
 
 
+def _project_structured_output_evidence(
+    trajectory: Trajectory,
+    *,
+    app: CayuApp | None,
+    root_evidence_available: bool,
+) -> tuple[Any, StructuredOutputEvidenceState]:
+    """Project the last structured output the root validated in its current run.
+
+    A resumed session's earlier runs do not count. A workflow projects its own output.
+    """
+
+    if not root_evidence_available:
+        return None, "unavailable"
+    if trajectory.workflow_output is not None:
+        output = trajectory.workflow_output.structured_output
+        if output is None:
+            return None, "not_validated"
+    else:
+        validated = next(
+            (
+                event
+                for event in reversed(_current_run_events(trajectory))
+                if event.type == EventType.STRUCTURED_OUTPUT_VALIDATED
+            ),
+            None,
+        )
+        if validated is None:
+            return None, "not_validated"
+        if "output" not in validated.payload:
+            return None, "unavailable"
+        output = validated.payload["output"]
+    try:
+        projected = output if app is None else app.redact_json(output)
+        return copy_structured_output_evidence(projected, "structured output evidence"), "complete"
+    except DurableValueError as exc:
+        if exc.code in {"json_value_too_large", "nesting_too_deep", "too_many_json_nodes"}:
+            return None, "limit_exceeded"
+        return None, "unavailable"
+    except (TypeError, ValueError):
+        return None, "unavailable"
+
+
 def _project_structural_evidence(
     trajectory: Trajectory,
     *,
@@ -1295,6 +1364,12 @@ def _build_assertion_evidence_view(
             final_output = redacted_output
             final_output_state = "complete"
 
+    structured_output, structured_output_state = _project_structured_output_evidence(
+        trajectory,
+        app=app,
+        root_evidence_available=root_available,
+    )
+
     requested_tool_names, started_tool_names, tool_count, tool_state = _project_tool_evidence(
         trajectory,
         max_tool_calls=evidence_policy.max_tool_calls,
@@ -1447,6 +1522,8 @@ def _build_assertion_evidence_view(
         "child_evidence_state": child_state,
         "final_output": final_output,
         "final_output_state": final_output_state,
+        "structured_output": structured_output,
+        "structured_output_state": structured_output_state,
         "requested_tool_names": list(requested_tool_names),
         "started_tool_names": list(started_tool_names),
         "tool_calls_started": tool_count,

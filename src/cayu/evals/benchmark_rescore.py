@@ -33,7 +33,7 @@ def _saved_evidence(trial):
     }
     root_status = next(iter(statuses)) if len(statuses) == 1 else None
     material = {
-        "schema_version": 5,
+        "schema_version": 6,
         "policy_revision": EvaluationEvidencePolicySpec.standard().revision,
         "pricing_profile_fingerprint": None,
         "root_evidence_available": complete or root_status is not None,
@@ -42,6 +42,8 @@ def _saved_evidence(trial):
         "child_evidence_state": "unavailable",
         "final_output": output.text if complete else "",
         "final_output_state": "complete" if complete else "unavailable",
+        "structured_output": None,
+        "structured_output_state": "unavailable",
         "requested_tool_names": [],
         "started_tool_names": [],
         "tool_calls_started": None,
