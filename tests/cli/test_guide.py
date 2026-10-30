@@ -125,6 +125,8 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "Check launch" in first
     assert "Approve as baseline" in first
     assert "cayu eval compare" in first
+    assert "cayu eval suites show SUITE" in first
+    assert "cayu eval baseline approve RUN_ID" in first
 
     assert main(["guide", "evals-ai-quality", "--json"]) == 0
     quality = json.loads(capsys.readouterr().out)
@@ -142,6 +144,7 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     production = capsys.readouterr().out
     assert "# Evaluate production sessions, scenarios, and memory" in production
     assert "Add to evals" in production
+    assert "cayu eval add-session SESSION_ID --suite SUITE --mode case --preview" in production
     assert "Score this session" in production
     assert "Open captured evaluation details" in production
     assert "Evaluate a retained session" in production

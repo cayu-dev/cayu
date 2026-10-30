@@ -33,6 +33,19 @@ Open the finished session's action menu in the Developer dashboard and choose
 suite's runnable membership. Review the exact addition before saving. A saved
 request can be retried after a lost response without creating a second operation.
 
+From a terminal or a coding agent, `cayu eval add-session` makes the same addition through
+the same server API; add `--application NAME` for a Cayu Cloud Agent's session:
+
+```console
+cayu eval suites list
+cayu eval add-session SESSION_ID --suite SUITE --mode case --preview
+```
+
+`--mode score` scores the session instead, and `--new-suite ID` creates a suite. The
+preview prints the exact plan and `commands.publish`, the command that saves it; running
+that command again after a lost response returns the original receipt, and a plan the
+session or suite no longer matches is refused (`eval_addition_changed`) rather than saved.
+
 For the detailed capture, export and fresh-run tools, expand **Captured evidence,
 export and fresh execution**, then choose **Open captured evaluation details**.
 

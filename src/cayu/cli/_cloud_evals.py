@@ -314,8 +314,10 @@ def eval_command(
             result = _approve_baseline(
                 api,
                 arguments,
-                application_id=application_id,
-                recovery_arguments=recovery_arguments,
+                command=[
+                    *("cayu", "cloud", *recovery_arguments, "eval", "baseline"),
+                    *("--application", application_id, arguments.run_id),
+                ],
             )
             operation = "eval.baseline"
     return {
@@ -999,14 +1001,14 @@ def _approve_baseline(
     api: CayuApi,
     arguments: argparse.Namespace,
     *,
-    application_id: str,
-    recovery_arguments: Sequence[str],
+    command: Sequence[str],
 ) -> dict[str, Any]:
     """Approve the run's result as its suite's baseline, CAS-bound to one generation.
 
     Without ``--expected-generation`` the decision is made over the current baseline under a
     fresh operation ID. With it (a continuation), both are sent as given, so the Agent replays
-    a decision it already applied and refuses one the baseline has moved past.
+    a decision it already applied and refuses one the baseline has moved past. ``command`` is
+    the command that approved the run; its continuation adds the decision's two options.
     """
 
     run_id = arguments.run_id
@@ -1025,12 +1027,11 @@ def _approve_baseline(
         generation = arguments.expected_generation
     operation_id = arguments.operation_id or "sha256:" + secrets.token_hex(32)
     decision = {"run_id": run_id, "operation_id": operation_id, "expected_generation": generation}
-    command = [
-        *("cayu", "cloud", *recovery_arguments, "eval", "baseline"),
-        *("--application", application_id, run_id),
+    continuation = [
+        *command,
         *("--operation-id", operation_id, "--expected-generation", str(generation)),
     ]
-    commands = {"continue": shlex.join(command)}
+    commands = {"continue": shlex.join(continuation)}
     try:
         answer = api.mutate(
             f"/evals/results/{quote(revision, safe='')}/baseline",
@@ -1225,9 +1226,21 @@ def _agent_api(
         )
     except CayuApiError as exc:
         raise CloudEvalError(exc.category, str(exc), status_code=exc.status_code) from None
+    with eval_api(api) as opened:
+        yield opened
+
+
+@contextmanager
+def eval_api(api: CayuApi) -> Iterator[CayuApi]:
+    """``api`` for eval commands, closed afterwards; its failures become eval command errors.
+
+    Shared by `cayu cloud eval` and `cayu eval suites|runs|add-session|baseline`
+    (`cayu.cli._eval_curation`), which reach a running server or a Cloud Agent.
+    """
+
     try:
-        # Find the Agent's Cayu API first, so a Cayu without eval routes is told apart from an
-        # Agent that serves no Cayu at all.
+        # Find the server's Cayu API first, so a Cayu without eval routes is told apart from
+        # a server that serves no Cayu at all.
         api.get("/app", resource="agent")
         yield api
     except CayuApiError as exc:
@@ -1360,7 +1373,8 @@ def render_runs(answer: Mapping[str, Any]) -> str:
     listed = answer["result"]
     items = listed["items"]
     if not items:
-        return f"No eval runs for {_cell(listed['application_id'])}."
+        # `cayu eval runs list` names a running server instead of an Agent.
+        return f"No eval runs for {_cell(listed.get('application_id') or listed['server_url'])}."
     rows = [
         (
             _cell(item["id"]),

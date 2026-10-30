@@ -30,6 +30,14 @@ tool; choose the specialist whose configuration or saved material you need.
 Fix a readiness diagnostic before running. The browser cannot create a missing
 provider, credential, tool, environment, policy, or store.
 
+From a terminal or a coding agent, the same server API lists the suites and opens one;
+add `--application NAME` to read a Cayu Cloud Agent's instead, and `--table` for text:
+
+```console
+cayu eval suites list
+cayu eval suites show SUITE
+```
+
 ## Create one deterministic suite
 
 1. Open **Evals → New suite** and select the specialist.
@@ -79,7 +87,14 @@ case and trial before trusting the aggregate status.
   to hide evaluator errors or unavailable evidence; those still fail closed.
 
 After a representative passing result, choose **Approve as baseline** on its run
-page. For authored suites, approval applies to the exact execution group; there is no
+page, or from a terminal find the run and approve it:
+
+```console
+cayu eval runs list
+cayu eval baseline approve RUN_ID
+```
+
+For authored suites, approval applies to the exact execution group; there is no
 aggregate baseline across different case selections. Future
 compatible results compare against that exact result revision. Cayu permits a
 new application release to compare, but changed cases, assertions, evidence,

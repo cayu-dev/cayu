@@ -23,7 +23,11 @@ from cayu.cli.diagnostics import (
 from cayu.cli.session import _redact_sensitive
 
 
-def add_action_target_options(parser: argparse.ArgumentParser) -> None:
+def add_action_target_options(
+    parser: argparse.ArgumentParser, *, output_format: str = "table"
+) -> None:
+    """Add ``--server-url``/``--application`` and the output options (default ``output_format``)."""
+
     target = parser.add_mutually_exclusive_group()
     target.add_argument(
         "--server-url", help=f"Running server mount URL (default: {DEFAULT_SERVER_URL})."
@@ -36,7 +40,7 @@ def add_action_target_options(parser: argparse.ArgumentParser) -> None:
         help="Environment variable holding the complete Authorization header.",
     )
     parser.add_argument("--timeout-seconds", type=_positive_seconds, default=30.0)
-    add_output_options(parser, formats=("json", "table"), default="table")
+    add_output_options(parser, formats=("json", "table"), default=output_format)
 
 
 def open_action_api(args: argparse.Namespace) -> CayuApi:
@@ -47,13 +51,19 @@ def open_action_api(args: argparse.Namespace) -> CayuApi:
         )
     if args.context is not None:
         raise ValueError("--context applies only with --application.")
-    url = args.server_url or DEFAULT_SERVER_URL
+    url = action_server_url(args)
     request_cost_endpoint(url)  # Same canonical HTTPS-or-loopback policy as diagnostics.
     return CayuApi(
         url,
         authorization=read_authorization(args.authorization_env),
         timeout_seconds=args.timeout_seconds,
     )
+
+
+def action_server_url(args: argparse.Namespace) -> str:
+    """The running server an action without ``--application`` reaches."""
+
+    return args.server_url or DEFAULT_SERVER_URL
 
 
 def _receipt_identity(value: Any) -> bool:

@@ -130,6 +130,10 @@ Every trial retains:
 - observed judge usage and priced or unavailable cost; and
 - evaluator errors separately from candidate behavior.
 
+`cayu eval suites show SUITE` lists a suite's runs with each run's `judge_score`, and
+`cayu eval runs show RUN_ID` a run's status, progress and result, through the server API
+the dashboard uses.
+
 A timeout, provider failure, malformed typed response, missing required usage,
 or unavailable reference produces an evaluator error with no candidate score.
 It is never converted to numeric zero or reported as a candidate failure.

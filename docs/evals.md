@@ -385,6 +385,10 @@ release, use `cayu cloud eval run --application NAME --corpus FILE --suite ID --
 run.json`; see [Running an Agent's evals](cayu-cloud.md#running-an-agents-evals). Its
 `--output` report is a file `eval report` and `eval compare` read.
 
+The Developer dashboard's suite and run pages, **Add to evals** and **Approve as baseline**
+have CLI forms that call the same server API, on the project's running server or a Cloud
+Agent; see [Curating evals from the CLI](#curating-evals-from-the-cli).
+
 ### Improvement objectives and evals
 
 An improvement loop proposes changes to an agent, runs evals on each candidate,
@@ -3545,6 +3549,62 @@ origin without reading an application or recomputing assertions.
 An incompatible comparison contains only typed mismatch reasons and result
 summaries—never fabricated regressions.
 
+### Curating evals from the CLI
+
+These commands call the server API the Evals area calls, so a terminal or a coding agent
+can list and open suites and runs, add a finished session to a suite and approve a baseline
+without the browser:
+
+```console
+cayu eval suites list
+cayu eval suites show SUITE
+cayu eval runs list
+cayu eval runs show RUN_ID
+cayu eval add-session SESSION_ID --suite SUITE --mode case --preview
+cayu eval baseline approve RUN_ID
+```
+
+| Developer dashboard | CLI | Server API |
+| --- | --- | --- |
+| **Evals** suite list | `cayu eval suites list` | `GET /api/evals/suite-views` |
+| A suite's page | `cayu eval suites show SUITE` | `GET /api/evals/suite-views/{suite_key}` |
+| A target's runs | `cayu eval runs list` | `GET /api/evals/runs` |
+| A run's status and progress | `cayu eval runs show RUN_ID` | `GET /api/evals/runs/{run_id}` and `GET /api/evals/run-views/{run_key}` |
+| **Add to evals** on a session | `cayu eval add-session SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/additions/preview`, then `POST /api/evals/sessions/{session_id}/additions` |
+| **Approve as baseline** on a run | `cayu eval baseline approve RUN_ID` | `GET /api/evals/runs/{run_id}/result`, then `POST /api/evals/results/{result_revision}/baseline` |
+
+They reach the project's running server, `cayu serve`'s `http://127.0.0.1:8000`, or
+`--server-url URL`, including a mount prefix. For a protected server, set the complete
+Authorization header in `CAYU_API_AUTHORIZATION`, or name another variable with
+`--authorization-env`; HTTPS is required outside loopback. With `--application NAME` they
+reach a Cayu Cloud Agent instead, signed in as `cayu cloud` is (`--context` selects its
+context). Each prints a JSON envelope: `{"ok": true, "operation": ..., "result": ...}`, whose
+result names the server (`server_url`) or the Agent (`application_id`), or `{"ok": false,
+"error": {"category": ..., "message": ...}}` with exit code `2`. `--table` prints text.
+
+`suites list` lists authored and corpus suites, each with its opaque `id`, case count, latest
+run and baseline, and the reported series that `cayu eval run --report-to` publishes;
+`--target-key KEY` keeps one eval target's. `suites show SUITE` returns the suite, a page of
+its cases with their latest outcomes and a page of its runs, newest first. A reported series
+(`suite.source` is `reported`) stores no case definitions, so its `cases` is null and its
+`runs` are the reports.
+Pass the `id` to `suites show` and to `add-session --suite`. A page's `next_cursor` goes to
+`--cursor` (`--cases-cursor` and `--runs-cursor` for `suites show`), and `--limit`
+(`--cases-limit`, `--runs-limit`) sets the page size.
+
+`runs list|show` and `baseline approve` are
+[`cayu cloud eval runs` and `cayu cloud eval baseline`](cayu-cloud.md#running-an-agents-evals),
+with the same implementation: with `--application` they give the same answers. `runs list`
+lists the default eval target's runs, or `--target-key KEY`'s, filtered by `--status`.
+`baseline approve` decides over the baseline's current generation; approving the run that is
+already the baseline changes nothing. A run of an authored suite is one execution group, so
+the approval sets that group's baseline. When its answer is lost, the error's
+`commands.continue` repeats the same decision with `--operation-id ID --expected-generation
+N`, and a baseline that has moved past generation `N` since fails with
+`eval_baseline_conflict` instead of being overridden.
+
+`add-session` is [Add a session to a suite](#add-a-session-to-a-suite) from a terminal.
+
 ### Browser acceptance profiles
 
 Browser acceptance is a separate, versioned conformance layer above unit tests and
@@ -4099,6 +4159,23 @@ after source deletion or a lost response. `GET /api/evals/additions/{operation_i
 recovers a receipt for its authenticated owner. Authentication and current role
 policy run before replay; tenant identity is operator provenance, not a new tenant
 isolation mechanism.
+
+From a terminal, `cayu eval add-session SESSION_ID --suite SUITE --mode case|score`, or
+`--new-suite ID [--suite-name NAME]` for a new suite, sends these requests (see
+[Curating evals from the CLI](#curating-evals-from-the-cli)). `--case-id`, `--case-name` and
+the new suite's name default to what the session's capture proposes
+(`POST /api/evals/sessions/{session_id}/evaluation/preview`), as in the dashboard. Each
+`--assertion JSON` is one corpus assertion; without one, the server uses the checks the
+capture proposes. The command previews the addition and publishes that plan under an
+`Idempotency-Key`: `--operation-id ID`, or a fresh one. `--preview` stops after the preview
+and prints `commands.publish`, the command that publishes exactly the reviewed plan: it
+spells out every default and adds `--operation-id`, `--expected-plan-revision` and
+`--expected-source-revision`. Running it again, for example after a lost answer
+(`outcome_unknown`, whose error carries the same command), returns the original receipt. A
+plan the session or suite no longer matches fails with `eval_addition_changed` and publishes
+nothing; a key that already published another request fails with `operation_id_conflict`.
+The result carries the `request`, the `plan`, the server's `receipt` (null for a preview) and
+the destination suite's `id` as `destination`.
 
 Two different additions to the same immutable parent create two independently
 addressable child revisions. There is no mutable suite head or implicit merge.

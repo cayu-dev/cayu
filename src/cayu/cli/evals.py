@@ -283,8 +283,16 @@ def add_eval_parser(subparsers: Any) -> None:
     )
     add_output_options(merge, formats=("json", "table"), default="table")
 
+    from cayu.cli._eval_curation import add_curation_parsers
+
+    add_curation_parsers(inner)
+
 
 def run_eval_command(args: argparse.Namespace) -> int:
+    from cayu.cli import _eval_curation as curation
+
+    if args.eval_command in curation.COMMANDS:
+        return curation.run_curation_command(args)
     try:
         if args.eval_command == "publish":
             from cayu.cli._eval_reporting import publish_saved
