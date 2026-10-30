@@ -32,6 +32,7 @@ cayu cloud service status --application my-agent
   infrastructure, and `schedule run` to run a schedule now;
 - `env list|set|unset` for Agent-owned configuration, and `settings list|set|unset`
   for the Agent's [managed settings](#agent-settings);
+- `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
 - `compass agents|show|enroll|disable|verify|pass|job|missions|findings` for
   [Compass](#compass);
 - `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
@@ -373,7 +374,8 @@ keeps each backup 35 days; ask Cayu support for a restore. It is for files: Clou
 refuses a Release that keeps durable database state in local files there unless
 you acknowledge them (see [Local file acknowledgements](#local-file-acknowledgements)),
 and `cayu cloud service status` reports what it finds under `/data` as
-`storage_audit`.
+`storage_audit`. Cloud names the directory to the Agent's Cayu as `CAYU_DATA_VOLUME`, so
+`cayu cloud data` can [read its files](#reading-an-agents-data-files).
 
 ### What a deploy uploads
 
@@ -1136,6 +1138,49 @@ before a line leaves it, and cuts a line longer than 8,192 characters; `--grep` 
 redacted text. A filter Cloud can't read is refused with its reason (`log_query_invalid`). A
 Cloud from before line times prints the newest lines without times or processes, and refuses
 any option rather than ignore it (`service_logs_filters_unsupported`).
+
+## Reading an Agent's /data files
+
+`cayu cloud data ls|cat|get|stat --application AGENT PATH` reads the files the Agent keeps in
+its [`/data`](#files-under-data), such as a run's record after the run failed:
+
+```console
+$ cayu cloud data ls --application cayu-scout scout/runs
+$ cayu cloud data cat --application cayu-scout scout/runs/RUN/run.json
+$ cayu cloud data stat --application cayu-scout scout/runs/RUN/run.json
+$ cayu cloud data get --application cayu-scout scout/runs/RUN
+Wrote RUN.tar.gz (48211 bytes).
+```
+
+- `ls [PATH]` lists a directory in name order, 200 entries a page (`--limit` up to 1000); when
+  more follow it ends with `More entries follow; go on with --after NAME`. A symbolic link is
+  listed as one, not followed.
+- `stat PATH` shows an entry's type, size and modification time.
+- `cat PATH` prints a file of at most 16 MiB. Piped or redirected, its bytes come out as they
+  are; a terminal gets UTF-8 text only, with control characters shown as `\xNN`.
+- `get PATH` downloads a file of at most 256 MiB, or a directory as one `NAME.tar.gz` archive,
+  to the path's own name in the current directory (`--output FILE` to choose, `--force` to
+  replace an existing file). An archive holds at most 10,000 entries and 64 MiB of files,
+  compresses to at most 16 MiB and is read within 20 seconds; symbolic links and special files
+  are left out and named. Get a larger directory's files one by one.
+- `--json` (except for `cat`) prints the JSON envelope the other `cayu cloud` commands print.
+
+PATH is relative to `/data`, for example `scout/runs/RUN/run.json`; `ls` without one lists
+`/data` itself. Absolute paths, `.` and `..` names are refused, and so is a path that leads out
+of `/data` through a symbolic link: links are followed only while they stay inside it. The
+commands only read. There is no `rm` or `put`: changing `/data` stays with the Agent's own code
+and the web app.
+
+The Agent's own Cayu server serves these reads, the way `cayu task --application` reads its
+state ([how](#reading-an-agents-state-from-the-cli)): the CLI asks Cloud for the Agent's
+Developer dashboard login, which Cloud records as an `agent_operator_credentials_read` audit
+event naming who asked, and the Agent's server writes one `cayu.data_volume.read` line per read
+to its web log (`cayu cloud service logs --process web --grep cayu.data_volume.read`), naming the
+path, the outcome and the bytes returned, never what a file holds. So the Agent must be serving:
+a failed run is readable, but an Agent whose web process is down, or one without a `[web]`
+process, isn't. It also needs a release built with a Cayu that serves these reads, deployed on a
+Cloud that sets `CAYU_DATA_VOLUME`; an older one fails with `unsupported`, or with a message
+saying to deploy the Agent again.
 
 ## Running an Agent's evals
 

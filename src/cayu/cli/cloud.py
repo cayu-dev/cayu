@@ -33,6 +33,7 @@ from cayu.cli._cloud_auth import (
     fresh_cloud_credentials,
 )
 from cayu.cli._cloud_compass import CompassWriteError, add_compass_parser, compass_command
+from cayu.cli._cloud_data import add_data_parser, data_command
 from cayu.cli._cloud_diagnostics import CloudDeploymentFailure as _CloudDeploymentFailure
 from cayu.cli._cloud_diagnostics import parse_build_failure, safe_text
 from cayu.cli._cloud_evals import CloudEvalError, add_eval_parser, eval_command
@@ -1211,6 +1212,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_settings_parser(commands)
 
+    add_data_parser(commands)
+
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
 
     add_eval_parser(commands, seconds=_positive_finite_seconds)
@@ -2014,6 +2017,12 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         return _environment(arguments, client=client)
     if arguments.command == "schedule":
         return _schedule(arguments, client=client)
+    if arguments.command == "data":
+        return data_command(
+            arguments,
+            client=client,
+            application_id=_application_id(client, arguments.application),
+        )
     if arguments.command == "settings":
         return settings_command(
             arguments,

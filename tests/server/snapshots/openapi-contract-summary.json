@@ -8326,6 +8326,285 @@
       "title": "CostLineItem",
       "type": "object"
     },
+    "DataVolumeArchive": {
+      "additionalProperties": false,
+      "description": "A directory as a gzip-compressed tar archive, base64-encoded.\n\nMembers are named under the directory's own name. Symbolic links and special files are\nleft out and named in ``skipped`` (the first ``MAX_ARCHIVE_SKIPPED_NAMED``).",
+      "properties": {
+        "bytes": {
+          "description": "File bytes archived, before compression.",
+          "minimum": 0.0,
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "content_base64": {
+          "maxLength": 22369624,
+          "title": "Content Base64",
+          "type": "string"
+        },
+        "directories": {
+          "minimum": 0.0,
+          "title": "Directories",
+          "type": "integer"
+        },
+        "files": {
+          "minimum": 0.0,
+          "title": "Files",
+          "type": "integer"
+        },
+        "name": {
+          "description": "A file name for the archive.",
+          "maxLength": 262,
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 1024,
+          "title": "Path",
+          "type": "string"
+        },
+        "skipped": {
+          "items": {
+            "$ref": "#/components/schemas/DataVolumeSkipped"
+          },
+          "maxItems": 100,
+          "title": "Skipped",
+          "type": "array"
+        },
+        "skipped_count": {
+          "minimum": 0.0,
+          "title": "Skipped Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "name",
+        "files",
+        "directories",
+        "bytes",
+        "skipped",
+        "skipped_count",
+        "content_base64"
+      ],
+      "title": "DataVolumeArchive",
+      "type": "object"
+    },
+    "DataVolumeContent": {
+      "additionalProperties": false,
+      "description": "Up to ``MAX_READ_BYTES`` of a file from ``offset``, base64-encoded.",
+      "properties": {
+        "content_base64": {
+          "maxLength": 5592408,
+          "title": "Content Base64",
+          "type": "string"
+        },
+        "modified_at": {
+          "format": "date-time",
+          "title": "Modified At",
+          "type": "string"
+        },
+        "offset": {
+          "minimum": 0.0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "path": {
+          "maxLength": 1024,
+          "title": "Path",
+          "type": "string"
+        },
+        "size": {
+          "description": "The file's size when it was read.",
+          "minimum": 0.0,
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "size",
+        "modified_at",
+        "offset",
+        "content_base64"
+      ],
+      "title": "DataVolumeContent",
+      "type": "object"
+    },
+    "DataVolumeEntry": {
+      "additionalProperties": false,
+      "description": "One entry of the volume; ``path`` is relative to the volume, ``\"\"`` for its root.",
+      "properties": {
+        "modified_at": {
+          "format": "date-time",
+          "title": "Modified At",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 255,
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 1280,
+          "title": "Path",
+          "type": "string"
+        },
+        "size": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bytes, for a file.",
+          "title": "Size"
+        },
+        "type": {
+          "enum": [
+            "file",
+            "directory",
+            "symlink",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "name",
+        "type",
+        "modified_at"
+      ],
+      "title": "DataVolumeEntry",
+      "type": "object"
+    },
+    "DataVolumeListing": {
+      "additionalProperties": false,
+      "description": "A page of one directory's entries, in name order.",
+      "properties": {
+        "complete": {
+          "description": "False when the directory holds more than 10000 entries; the pages then hold only the entries the server read.",
+          "title": "Complete",
+          "type": "boolean"
+        },
+        "entries": {
+          "items": {
+            "$ref": "#/components/schemas/DataVolumeEntry"
+          },
+          "maxItems": 1000,
+          "title": "Entries",
+          "type": "array"
+        },
+        "next_after": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When more entries follow: the `after` that reads the next page.",
+          "title": "Next After"
+        },
+        "omitted": {
+          "description": "Entries left out because their names aren't UTF-8.",
+          "minimum": 0.0,
+          "title": "Omitted",
+          "type": "integer"
+        },
+        "path": {
+          "maxLength": 1024,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "entries",
+        "complete",
+        "omitted"
+      ],
+      "title": "DataVolumeListing",
+      "type": "object"
+    },
+    "DataVolumeRefusalDetail": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "data_volume_requires_authentication",
+            "data_volume_not_configured",
+            "data_volume_unavailable",
+            "path_refused",
+            "path_outside_volume",
+            "path_not_found",
+            "path_unreadable",
+            "not_a_file",
+            "not_a_directory",
+            "changed_while_read",
+            "archive_too_large",
+            "archive_busy"
+          ],
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "DataVolumeRefusalDetail",
+      "type": "object"
+    },
+    "DataVolumeRefusalResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "$ref": "#/components/schemas/DataVolumeRefusalDetail"
+        }
+      },
+      "required": [
+        "detail"
+      ],
+      "title": "DataVolumeRefusalResponse",
+      "type": "object"
+    },
+    "DataVolumeSkipped": {
+      "additionalProperties": false,
+      "description": "An entry an archive left out, named as its member would have been.",
+      "properties": {
+        "member": {
+          "maxLength": 9468,
+          "title": "Member",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "symlink",
+            "special_file",
+            "unreadable_name"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "member",
+        "reason"
+      ],
+      "title": "DataVolumeSkipped",
+      "type": "object"
+    },
     "DeclaredTaskCreateBody": {
       "additionalProperties": false,
       "properties": {
@@ -24173,7 +24452,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "84",
+          "default": "85",
           "title": "Contract Version",
           "type": "string"
         },
@@ -31719,7 +31998,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "84",
+          "default": "85",
           "title": "Contract Version",
           "type": "string"
         }
@@ -32968,6 +33247,281 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ServerContractResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/data-volume/archive": {
+      "get": {
+        "operation_id": "read_data_volume_archive_api_data_volume_archive_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "default": "",
+              "description": "The path relative to the data volume, such as `runs/RUN/run.json`; empty for its root. Absolute paths and `.`, `..` or empty names are refused.",
+              "maxLength": 1024,
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeArchive"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/data-volume/content": {
+      "get": {
+        "operation_id": "read_data_volume_content_api_data_volume_content_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "length",
+            "required": false,
+            "schema": {
+              "default": 4194304,
+              "maximum": 4194304,
+              "minimum": 1,
+              "title": "Length",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "description": "The path relative to the data volume, such as `runs/RUN/run.json`; empty for its root. Absolute paths and `.`, `..` or empty names are refused.",
+              "maxLength": 1024,
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeContent"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/data-volume/entries": {
+      "get": {
+        "operation_id": "list_data_volume_entries_api_data_volume_entries_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "default": "",
+              "description": "The path relative to the data volume, such as `runs/RUN/run.json`; empty for its root. Absolute paths and `.`, `..` or empty names are refused.",
+              "maxLength": 1024,
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeListing"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/data-volume/entry": {
+      "get": {
+        "operation_id": "read_data_volume_entry_api_data_volume_entry_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "default": "",
+              "description": "The path relative to the data volume, such as `runs/RUN/run.json`; empty for its root. Absolute paths and `.`, `..` or empty names are refused.",
+              "maxLength": 1024,
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeEntry"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/DataVolumeRefusalResponse"
               }
             }
           }

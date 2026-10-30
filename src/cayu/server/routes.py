@@ -188,6 +188,7 @@ from cayu.server._corpus_routes import (
     register_corpus_launch_routes,
     register_corpus_management_routes,
 )
+from cayu.server._data_volume_routes import register_data_volume_routes
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
 from cayu.server._environment_details import artifact_storage_kind, environment_activity_details
 from cayu.server._eval_addition_routes import register_eval_addition_routes
@@ -5393,6 +5394,11 @@ def create_router(
         cayu_app=cayu_app,
         protected=protected,
         price_book=generated_evals_pricing,
+    )
+    # Bounded like the control-plane actions: private responses, and invalid parameters
+    # named without echoing the request.
+    register_data_volume_routes(
+        bounded_control_plane_router, optional_auth_context=optional_auth_context
     )
 
     @router.post(

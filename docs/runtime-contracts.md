@@ -10636,6 +10636,37 @@ private, no-store`. An Agent needs a release built with this contract before the
 CLI can check models on it; older servers answer 404 or 405, which the CLI
 reports as `unsupported`.
 
+Server contract version 85 adds four protected read-only routes over the host's
+data volume, which `cayu cloud data ls|cat|get|stat --application NAME PATH`
+calls on a Cayu Cloud Agent: `GET /api/data-volume/entry`, `entries`, `content`
+and `archive`, each taking the path relative to the volume as `path`. The host
+names the volume's directory with `CAYU_DATA_VOLUME` (Cayu Cloud sets `/data`);
+without it, or on a server without authentication, every route answers 409 and
+reads nothing. A path is refused with 422 when it is absolute, has `.`, `..` or
+empty names, control characters, more than 1,024 characters or a name over 255
+bytes, or leads out of the volume through a symbolic link. The server resolves a
+path one name at a time from a descriptor of the volume's root, examining each
+name without following it and opening it with `O_NOFOLLOW`; it follows a link
+only by resolving its target the same way, so a target above the root or an
+absolute target outside the volume's directory is refused, and a name swapped
+meanwhile answers 409 `changed_while_read`. Only regular files are read and only
+directories listed or archived; a FIFO, socket or device is never opened. Each
+answer is bounded: `entries` returns a page of at most 1,000 names in name order
+with `next_after`, reads at most 10,000 entries of one directory (`complete:
+false` beyond) and stops a page after 20 seconds; `content` returns at most 4
+MiB from `offset`, base64-encoded, with the file's size and modification time;
+`archive` returns a gzip-compressed tar of a directory, base64-encoded, with
+symbolic links and special files left out and named, and answers 413 past
+10,000 entries, 64 MiB of files, 16 MiB compressed, 32 levels or 20 seconds, and
+429 with `Retry-After` while another archive is being built in the process.
+Refusals carry `{"detail": {"code", "message"}}`. The routes take the API's
+authentication dependency and, under `ControlPlaneRoles`, full-access roles
+only; responses are `Cache-Control: private, no-store`. Every answered request
+writes one JSON line to standard error, `{"event": "cayu.data_volume.read"}`
+with the operation, requested path, outcome, caller subject and amounts, never
+file content. Older servers answer 404 or 405, which the CLI reports as
+`unsupported`.
+
 The local `cayu doctor --bundle OUTPUT` command is a separate support boundary,
 not a server diagnostics route or health probe. It discovers the production
 project/service target, constructs its `CayuApp` once inside a hard-deadline

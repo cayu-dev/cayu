@@ -5507,6 +5507,184 @@ export type CostSessionTotals = {
 };
 
 /**
+ * DataVolumeArchive
+ *
+ * A directory as a gzip-compressed tar archive, base64-encoded.
+ *
+ * Members are named under the directory's own name. Symbolic links and special files are
+ * left out and named in ``skipped`` (the first ``MAX_ARCHIVE_SKIPPED_NAMED``).
+ */
+export type DataVolumeArchive = {
+    /**
+     * Bytes
+     *
+     * File bytes archived, before compression.
+     */
+    bytes: number;
+    /**
+     * Content Base64
+     */
+    content_base64: string;
+    /**
+     * Directories
+     */
+    directories: number;
+    /**
+     * Files
+     */
+    files: number;
+    /**
+     * Name
+     *
+     * A file name for the archive.
+     */
+    name: string;
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Skipped
+     */
+    skipped: Array<DataVolumeSkipped>;
+    /**
+     * Skipped Count
+     */
+    skipped_count: number;
+};
+
+/**
+ * DataVolumeContent
+ *
+ * Up to ``MAX_READ_BYTES`` of a file from ``offset``, base64-encoded.
+ */
+export type DataVolumeContent = {
+    /**
+     * Content Base64
+     */
+    content_base64: string;
+    /**
+     * Modified At
+     */
+    modified_at: string;
+    /**
+     * Offset
+     */
+    offset: number;
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Size
+     *
+     * The file's size when it was read.
+     */
+    size: number;
+};
+
+/**
+ * DataVolumeEntry
+ *
+ * One entry of the volume; ``path`` is relative to the volume, ``""`` for its root.
+ */
+export type DataVolumeEntry = {
+    /**
+     * Modified At
+     */
+    modified_at: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Size
+     *
+     * Bytes, for a file.
+     */
+    size?: number | null;
+    /**
+     * Type
+     */
+    type: 'file' | 'directory' | 'symlink' | 'other';
+};
+
+/**
+ * DataVolumeListing
+ *
+ * A page of one directory's entries, in name order.
+ */
+export type DataVolumeListing = {
+    /**
+     * Complete
+     *
+     * False when the directory holds more than 10000 entries; the pages then hold only the entries the server read.
+     */
+    complete: boolean;
+    /**
+     * Entries
+     */
+    entries: Array<DataVolumeEntry>;
+    /**
+     * Next After
+     *
+     * When more entries follow: the `after` that reads the next page.
+     */
+    next_after?: string | null;
+    /**
+     * Omitted
+     *
+     * Entries left out because their names aren't UTF-8.
+     */
+    omitted: number;
+    /**
+     * Path
+     */
+    path: string;
+};
+
+/**
+ * DataVolumeRefusalDetail
+ */
+export type DataVolumeRefusalDetail = {
+    /**
+     * Code
+     */
+    code: 'data_volume_requires_authentication' | 'data_volume_not_configured' | 'data_volume_unavailable' | 'path_refused' | 'path_outside_volume' | 'path_not_found' | 'path_unreadable' | 'not_a_file' | 'not_a_directory' | 'changed_while_read' | 'archive_too_large' | 'archive_busy';
+    /**
+     * Message
+     */
+    message: string;
+};
+
+/**
+ * DataVolumeRefusalResponse
+ */
+export type DataVolumeRefusalResponse = {
+    detail: DataVolumeRefusalDetail;
+};
+
+/**
+ * DataVolumeSkipped
+ *
+ * An entry an archive left out, named as its member would have been.
+ */
+export type DataVolumeSkipped = {
+    /**
+     * Member
+     */
+    member: string;
+    /**
+     * Reason
+     */
+    reason: 'symlink' | 'special_file' | 'unreadable_name';
+};
+
+/**
  * DeclaredTaskCreateBody
  */
 export type DeclaredTaskCreateBody = {
@@ -24774,6 +24952,190 @@ export type GetContractApiContractGetResponses = {
 };
 
 export type GetContractApiContractGetResponse = GetContractApiContractGetResponses[keyof GetContractApiContractGetResponses];
+
+export type ReadDataVolumeArchiveApiDataVolumeArchiveGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Path
+         *
+         * The path relative to the data volume, such as `runs/RUN/run.json`; empty for its root. Absolute paths and `.`, `..` or empty names are refused.
+         */
+        path?: string;
+    };
+    url: '/api/data-volume/archive';
+};
+
+export type ReadDataVolumeArchiveApiDataVolumeArchiveGetErrors = {
+    /**
+     * The path isn't in the data volume.
+     */
+    404: DataVolumeRefusalResponse;
+    /**
+     * The server serves no data volume (it has no authentication, or `CAYU_DATA_VOLUME` isn't set or names no directory), or the path is the wrong kind of entry, unreadable, or changed while it was read.
+     */
+    409: DataVolumeRefusalResponse;
+    /**
+     * The directory holds more than 10000 entries or 64 MiB of files, compresses to more than 16 MiB, nests too deep, or takes longer than 20 seconds to read.
+     */
+    413: DataVolumeRefusalResponse;
+    /**
+     * The path is refused: absolute, with `.`, `..` or empty names, or leading outside the data volume through a symbolic link. A parameter outside its bounds answers 422 with a plain `detail`.
+     */
+    422: DataVolumeRefusalResponse;
+    /**
+     * Another archive is being built in this process. Retry after the `Retry-After` header.
+     */
+    429: DataVolumeRefusalResponse;
+};
+
+export type ReadDataVolumeArchiveApiDataVolumeArchiveGetError = ReadDataVolumeArchiveApiDataVolumeArchiveGetErrors[keyof ReadDataVolumeArchiveApiDataVolumeArchiveGetErrors];
+
+export type ReadDataVolumeArchiveApiDataVolumeArchiveGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: DataVolumeArchive;
+};
+
+export type ReadDataVolumeArchiveApiDataVolumeArchiveGetResponse = ReadDataVolumeArchiveApiDataVolumeArchiveGetResponses[keyof ReadDataVolumeArchiveApiDataVolumeArchiveGetResponses];
+
+export type ReadDataVolumeContentApiDataVolumeContentGetData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Path
+         *
+         * The path relative to the data volume, such as `runs/RUN/run.json`; empty for its root. Absolute paths and `.`, `..` or empty names are refused.
+         */
+        path: string;
+        /**
+         * Offset
+         */
+        offset?: number;
+        /**
+         * Length
+         */
+        length?: number;
+    };
+    url: '/api/data-volume/content';
+};
+
+export type ReadDataVolumeContentApiDataVolumeContentGetErrors = {
+    /**
+     * The path isn't in the data volume.
+     */
+    404: DataVolumeRefusalResponse;
+    /**
+     * The server serves no data volume (it has no authentication, or `CAYU_DATA_VOLUME` isn't set or names no directory), or the path is the wrong kind of entry, unreadable, or changed while it was read.
+     */
+    409: DataVolumeRefusalResponse;
+    /**
+     * The path is refused: absolute, with `.`, `..` or empty names, or leading outside the data volume through a symbolic link. A parameter outside its bounds answers 422 with a plain `detail`.
+     */
+    422: DataVolumeRefusalResponse;
+};
+
+export type ReadDataVolumeContentApiDataVolumeContentGetError = ReadDataVolumeContentApiDataVolumeContentGetErrors[keyof ReadDataVolumeContentApiDataVolumeContentGetErrors];
+
+export type ReadDataVolumeContentApiDataVolumeContentGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: DataVolumeContent;
+};
+
+export type ReadDataVolumeContentApiDataVolumeContentGetResponse = ReadDataVolumeContentApiDataVolumeContentGetResponses[keyof ReadDataVolumeContentApiDataVolumeContentGetResponses];
+
+export type ListDataVolumeEntriesApiDataVolumeEntriesGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Path
+         *
+         * The path relative to the data volume, such as `runs/RUN/run.json`; empty for its root. Absolute paths and `.`, `..` or empty names are refused.
+         */
+        path?: string;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * After
+         */
+        after?: string | null;
+    };
+    url: '/api/data-volume/entries';
+};
+
+export type ListDataVolumeEntriesApiDataVolumeEntriesGetErrors = {
+    /**
+     * The path isn't in the data volume.
+     */
+    404: DataVolumeRefusalResponse;
+    /**
+     * The server serves no data volume (it has no authentication, or `CAYU_DATA_VOLUME` isn't set or names no directory), or the path is the wrong kind of entry, unreadable, or changed while it was read.
+     */
+    409: DataVolumeRefusalResponse;
+    /**
+     * The path is refused: absolute, with `.`, `..` or empty names, or leading outside the data volume through a symbolic link. A parameter outside its bounds answers 422 with a plain `detail`.
+     */
+    422: DataVolumeRefusalResponse;
+};
+
+export type ListDataVolumeEntriesApiDataVolumeEntriesGetError = ListDataVolumeEntriesApiDataVolumeEntriesGetErrors[keyof ListDataVolumeEntriesApiDataVolumeEntriesGetErrors];
+
+export type ListDataVolumeEntriesApiDataVolumeEntriesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: DataVolumeListing;
+};
+
+export type ListDataVolumeEntriesApiDataVolumeEntriesGetResponse = ListDataVolumeEntriesApiDataVolumeEntriesGetResponses[keyof ListDataVolumeEntriesApiDataVolumeEntriesGetResponses];
+
+export type ReadDataVolumeEntryApiDataVolumeEntryGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Path
+         *
+         * The path relative to the data volume, such as `runs/RUN/run.json`; empty for its root. Absolute paths and `.`, `..` or empty names are refused.
+         */
+        path?: string;
+    };
+    url: '/api/data-volume/entry';
+};
+
+export type ReadDataVolumeEntryApiDataVolumeEntryGetErrors = {
+    /**
+     * The path isn't in the data volume.
+     */
+    404: DataVolumeRefusalResponse;
+    /**
+     * The server serves no data volume (it has no authentication, or `CAYU_DATA_VOLUME` isn't set or names no directory), or the path is the wrong kind of entry, unreadable, or changed while it was read.
+     */
+    409: DataVolumeRefusalResponse;
+    /**
+     * The path is refused: absolute, with `.`, `..` or empty names, or leading outside the data volume through a symbolic link. A parameter outside its bounds answers 422 with a plain `detail`.
+     */
+    422: DataVolumeRefusalResponse;
+};
+
+export type ReadDataVolumeEntryApiDataVolumeEntryGetError = ReadDataVolumeEntryApiDataVolumeEntryGetErrors[keyof ReadDataVolumeEntryApiDataVolumeEntryGetErrors];
+
+export type ReadDataVolumeEntryApiDataVolumeEntryGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: DataVolumeEntry;
+};
+
+export type ReadDataVolumeEntryApiDataVolumeEntryGetResponse = ReadDataVolumeEntryApiDataVolumeEntryGetResponses[keyof ReadDataVolumeEntryApiDataVolumeEntryGetResponses];
 
 export type RunModelCheckApiDiagnosticsModelCheckPostData = {
     body: ModelCheckRequest;
