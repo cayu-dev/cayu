@@ -17,10 +17,11 @@ servicing without another provider dispatch. Its provider is deterministic, not
 a paid service. Use a new directory; the demo does not reset existing evidence.
 
 The supported session boundary is a **completed whole model turn, including its
-complete tool round**, in an ordinary root session. This does not persist an
-arbitrary Python stack, a live provider stream, a workflow activity, or an OS
-process. Participant-owned, child, and task-owned session entrances are not
-supported by `SessionExternalWaitAdapter`.
+complete tool round**, in a top-level session: an ordinary root session, or one a
+task worker runs under a task (see [Waiting inside a task](#waiting-inside-a-task)).
+This does not persist an arbitrary Python stack, a live provider stream, a workflow
+activity, or an OS process. Participant-owned and subagent (child) session entrances
+are not supported by `SessionExternalWaitAdapter`.
 
 Successful native structured output, structured-output tool submission, and
 final-tool completion park at the same boundary as an ordinary text answer.
@@ -178,8 +179,104 @@ On Cayu Cloud the web process sleeps and the worker runs. List the delivery path
 under `[webhooks] paths` in `cayu-cloud.toml`, so a webhook sent while the Agent sleeps
 is kept and delivered once it is ready. A deadline is a delayed task and a delivered
 event a task due now, so a host that starts `cayu worker --until-idle` when work is
-due needs nothing specific to external waits. Hosted waits keep the adapter's
-boundary: ordinary root sessions only.
+due needs nothing specific to external waits.
+
+### Waiting inside a task
+
+The documented way to run an agent in the background is a task handler under
+`cayu worker` that links the session to its task. Such a handler can wait on an
+external event too: it runs its session to the wait under its worker's claim and
+returns `TaskHandlerOutcome.SESSION_INTERRUPTED`.
+
+```python
+from cayu.tasks import TaskHandlerOutcome
+
+
+async def handle(app, task, worker_id):
+    await hosting.run_to_wait(
+        RunRequest(
+            agent_name="renderer",
+            session_id=f"render-{task.id}",
+            task_id=task.id,
+            task_worker_id=worker_id,
+            task_lease_expires_at=task.lease_expires_at,
+            messages=[Message.text("user", "Submit the render, then wait for it.")],
+        ),
+        registration,
+        context=context,
+    )
+    return TaskHandlerOutcome.SESSION_INTERRUPTED
+```
+
+- **Parking.** The worker hands the task off *parked* on the wait: it stays
+  `running` with no worker and no lease, and its handoff names the wait
+  (`TaskParkedWait(kind="external_wait")`). No continuation scan claims it, so it
+  neither backs off nor fails as unproductive while it waits, and `--until-idle`
+  treats it as not ready. A recovered handler can do the same with
+  `hosting.resume_to_wait(...)` and its `task_worker_id` and `task_handoff_id`.
+- **Continuing.** When the event or the timeout is serviced, the service or
+  deadline task claims the parked task with that same wait and continues the
+  session under the task, which then completes, fails or is handed off again with
+  its session. The webhook route, `deliver` and the sweep only schedule that task;
+  any servicing, from any process, continues the session only through the claim,
+  so racing workers continue it once. A service that runs before the worker has
+  handed the task off waits briefly, then retries with its chain's backoff.
+- **A task that ended.** Cancelling a parked task settles it at once. Its wait
+  never continues the session without the task: the next service of its event or
+  timeout, or the worker's sweep, stops the wait instead. A task that ended while
+  its event was already being delivered (its service had started admitting the
+  continuation) can't have its wait stopped, since only delivering it could settle
+  it: the worker reports it once, stops servicing it, and the wait stays pending,
+  counting toward its scope generation's correlation capacity. Reserve later waits
+  in a new generation if that capacity runs out.
+- **Interrupting** the session stops its wait, and the worker then hands the task
+  back unparked to its recovered-task handler. A root session's wait is unchanged
+  by an interruption, as before. The interruption is refused while the event is
+  already being delivered (its service has started admitting the continuation):
+  interrupt the session once it runs. It is refused, too, from a process that
+  doesn't host the waits, which can't stop them. The stopped wait stays stopped:
+  a recovered handler that parks the session again reserves a new correlation
+  and registers a new wait, since replaying the stopped one conflicts.
+- **Deleting** the session is refused while its task runs; cancel the task first.
+- **A worker that dies** while the session is parked leaves the task to the
+  worker's expired-lease recovery, which hands it off parked as usual. One that
+  dies during the turn before it parks: when the turn's answer was complete, the
+  wait's own recovery parks it, without running any model step; that includes a
+  turn a final tool or a structured-output submission completed. One that still
+  had steps to take, such as after an ordinary tool round, is never continued by
+  recovery. Otherwise the turn never runs again blind: its
+  wait is stopped and the session is left to the ordinary recovery of a task whose
+  worker died, where a person can see it (a model call the worker was making
+  still needs `recover_model_completion_stage`, as for any task). Until a worker
+  that hosts the waits does this, `recover_abandoned_sessions` and
+  `recover_incomplete_session(s)` leave such a turn alone and report it skipped,
+  in any process: the wait records the task its turn runs under before the turn
+  starts. If another process interrupted the turn anyway, the hosting worker stops
+  its wait before handing the task back.
+- **A wait that is gone.** A session whose wait is no longer registered (its
+  scope was pruned, say) has nothing left to wait on: its task is handed to its
+  recovered-task handler, an interruption just interrupts it, and a turn that
+  died before parking is recovered plainly.
+- **Other processes.** A process that doesn't host the waits, such as a peer worker
+  of another application on the same stores, still sees the task parked and never
+  hands it to a generic continuation, and leaves a turn that died before parking
+  to a worker that hosts the waits. A process without the application's task
+  store can't tell whether the task ended, so it never stops such a wait: its
+  servicing leaves the wait pending, and it refuses to interrupt or delete the
+  session.
+- **What it needs.** The application hosts its waits with
+  `app.host_external_waits(...)`, and its task store declares bound and parked
+  interrupted-task handoffs, as the built-in stores do. Stopping a wait that has
+  no outcome yet cancels it as the hosting context, so the access policy must
+  grant that context `cancel`; a task-owned wait is refused before its turn runs
+  when it doesn't. A task-backed run that no task worker owns (no
+  `task_worker_id`) is refused, since nothing could hand its task off.
+
+Subagent sessions can't wait on an external event. Only application code enters
+a wait, and a subagent's run is started by its parent's call inside the runtime,
+so nothing could park it at a point where that call waits. Wait in the session at
+the top of the chain (or in the task's session) instead, and call the subagent
+again once the event has arrived.
 
 ## Assemble and reserve before submission
 
@@ -256,8 +353,12 @@ snapshot = await waits.inspect(correlation, context=context)
 ```
 
 `resume_to_wait(ResumeRequest(...), registration, context=...)` applies the same
-whole-turn boundary to a new turn of an existing ordinary root session. Exact
-completed retries return the retained result; changed input conflicts. A pending
+whole-turn boundary to a new turn of an existing top-level session. Exact
+completed retries return the retained result; changed input conflicts. A
+task worker's claim (`task_worker_id`, `task_lease_expires_at`, `task_handoff_id`)
+is not part of that input: the same request under another worker and lease replays.
+Every continuation service binds its resume request the same way, without the claim,
+which the task store still checks when the request is admitted. A pending
 execution is not permission to create a replacement session or invoke the model
 again. Ordinary `app.resume()` cannot bypass a retained external-wait boundary.
 

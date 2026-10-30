@@ -1337,6 +1337,27 @@ class IncompleteSessionRecovery:
                     ),
                 )
 
+        if execution_to_wait is None:
+            from cayu.external_wait_tasks import turn_held_by_task_wait
+
+            held_by = await turn_held_by_task_wait(
+                self._session_store, self._task_store, session.id
+            )
+            if held_by is not None:
+                # Only the external wait's own recovery may bring this turn to the
+                # wait or stop it; plain recovery would leave it to run again blind.
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                    events=(),
+                    message=(
+                        f"Session's turn died before parking on its external wait inside "
+                        f"task {held_by}; a worker that hosts the waits recovers it."
+                    ),
+                )
+
         # Every recovery path (single, batch, task and work attempts) comes
         # here: resolve the environment built from the session's own record,
         # rebuilt separately when its slot name now holds another job's.
@@ -2169,6 +2190,24 @@ class IncompleteSessionRecovery:
                     semantics = await execution_to_wait.require_recovered_result(
                         invocation_context, boundary
                     )
+                    if (
+                        semantics.task_id is not None
+                        and boundary.closed_tool_receipt is not None
+                        and not await self._closed_round_completes_turn(
+                            claim.session,
+                            boundary,
+                            semantics,
+                            invocation_context,
+                            registered_agent,
+                        )
+                    ):
+                        # Continuing it would dispatch another model step without the
+                        # task's claim: its wait is stopped instead.
+                        from cayu.runtime._external_execution_to_wait import (
+                            TaskTurnNotFinished,
+                        )
+
+                        raise TaskTurnNotFinished()
                     resumed = await self._event_writer.emit(
                         Event(
                             type=EventType.SESSION_RESUMED,
@@ -2458,6 +2497,7 @@ class IncompleteSessionRecovery:
                 recovered = await self._recover_incomplete_session(
                     recover_abandoned_model=recover_abandoned_model,
                     abandon_unknown_tool_effects=abandon_unknown_tool_effects,
+                    external_cleanup=external_cleanup,
                     retain_cleanup_context=retain_cleanup_context,
                     preserve_interaction_id=preserve_interaction_id,
                     participant_context=participant_context,
@@ -3078,9 +3118,45 @@ class IncompleteSessionRecovery:
             ),
         )
 
+    async def _closed_round_completes_turn(
+        self,
+        session: Session,
+        boundary,
+        semantics,
+        invocation_context: InvocationContext,
+        registered_agent: runtime_records.RegisteredAgentState,
+    ) -> bool:
+        """Whether a recovered closed tool round completed its turn, as the engine decides.
+
+        A final tool (``ToolCompletionPolicy``) or a validated structured-output
+        submission parks at the same boundary as a text answer; any other closed
+        round is followed by another model step.
+        """
+
+        stage = boundary.completed_stage
+        assert stage is not None
+        structured = await self._model_completion_recovery.load_closed_structured_output_events(
+            session,
+            stage,
+            invocation_context,
+            boundary.closed_tool_receipt,
+            expected_spec=semantics.structured_output,
+        )
+        if any(event.type is EventType.STRUCTURED_OUTPUT_VALIDATED for event in structured):
+            return True
+        completion = await recorded_tool_completion_result(
+            self._session_store,
+            session,
+            policy=semantics.tool_completion,
+            execution_profile=invocation_context.profile,
+            registered_agent=registered_agent,
+        )
+        return completion is not None
+
     async def _recover_incomplete_session(
         self,
         *,
+        external_cleanup: bool = False,
         retain_cleanup_context: Callable[[InvocationContext], None],
         session: Session,
         session_before_fence: Session,
@@ -3870,7 +3946,10 @@ class IncompleteSessionRecovery:
                 )
 
         if (
-            session.status is SessionStatus.RUNNING
+            # Stopping an external wait recovers its session by interruption only: it
+            # never finishes the turn, which for a task's session needs the task's claim.
+            not external_cleanup
+            and session.status is SessionStatus.RUNNING
             and invocation_context is not None
             and invocation_context.work_attempt is None
             and pending_approval is None

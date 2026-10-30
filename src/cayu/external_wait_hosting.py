@@ -60,9 +60,9 @@ from cayu.sessions.external_waits import (
     _Value,
 )
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.parked_continuation import attempt_is_live
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.scheduling import TaskSchedulePolicy
-from cayu.tasks.session_wakes import _attempt_is_live
 from cayu.tasks.worker import complete_managed_task
 
 if TYPE_CHECKING:
@@ -249,6 +249,8 @@ class ExternalWaitHosting:
         self.delivery_path = None if delivery_path is None else _delivery_path(delivery_path)
         # The endpoints delivery_router() built, so a host can tell whether it serves one.
         self._delivery_endpoints: set[Any] = set()
+        # Waits whose task ended during delivery that were already reported.
+        self._ended_during_delivery_reported: set[tuple[ExternalWaitScope, str, str]] = set()
         self.max_request_bytes = _request_bound(
             max_request_bytes, self.waits.limits.payload_bytes + _DELIVERY_ENVELOPE_BYTES
         )
@@ -341,7 +343,7 @@ class ExternalWaitHosting:
         one attempt chain per elected outcome, so they converge on the same tasks.
         An attempt that ended while the wait still needs service gets a successor.
         """
-        if not _needs_service(wait):
+        if not _needs_service(wait) or await self._ended_during_delivery(wait):
             return False
         assert wait.outcome is not None
         chain = f"outcome:{wait.outcome.selected_at_ms}:{wait.retirement_requested}"
@@ -361,7 +363,7 @@ class ExternalWaitHosting:
             attempts.append(task)
         if not attempts:
             request: TaskCreate | None = _attempt(correlation, chain, 1, first_at)
-        elif _attempt_is_live(attempts[-1], now=self.app._clock()):
+        elif attempt_is_live(attempts[-1], now=self.app._clock()):
             return False
         else:
             request = _successor(attempts[-1])
@@ -404,7 +406,7 @@ class ExternalWaitHosting:
                                 row.correlation.request.correlation_key,
                                 scope.application_scope,
                                 scope.generation,
-                                type(exc).__name__,
+                                _failure(exc),
                             )
                     if len(rows) < EXTERNAL_WAIT_PAGE_SIZE:
                         break
@@ -412,7 +414,22 @@ class ExternalWaitHosting:
         return scheduled
 
     async def _sweep_row(self, row: ExternalWaitSnapshot) -> int:
+        from cayu import external_wait_tasks
+
         scheduled = 0
+        if row.handoff == "pending" and row.outcome is None and row.registration is not None:
+            try:
+                if await external_wait_tasks.stop_wait_of_ended_task(self, row.registration):
+                    # Its task ended while it waited: never continue it without the task.
+                    return scheduled
+            except Exception as exc:
+                # The wait's timer and service are still repaired below.
+                _logger.warning(
+                    "Stopping external wait %s, whose task may have ended, failed (%s); the "
+                    "next sweep retries it.",
+                    row.correlation.request.correlation_key,
+                    _failure(exc),
+                )
         if row.pending_timer:
             scheduled += await self.scheduler.reconcile_row(row, context=self.context) is not None
         scheduled += await self._ensure_service(row)
@@ -431,6 +448,27 @@ class ExternalWaitHosting:
             return await handler(app, task, worker_id)
 
         return handle
+
+    def continues_sessions(self, task: Task) -> bool:
+        """Whether ``task`` is one of this hosting's service or deadline tasks."""
+        if task.type == EXTERNAL_WAIT_SERVICE_TASK_TYPE:
+            return True
+        if task.type != EXTERNAL_WAIT_TASK_TYPE:
+            return False
+        return timer_from_task(task).scheduler_id == self.scheduler.scheduler_id
+
+    async def continued_session_id(self, task: Task) -> str | None:
+        """The session a service or deadline task continued, or ``None`` if it had none."""
+        if task.type == EXTERNAL_WAIT_TASK_TYPE:
+            request = timer_from_task(task).correlation.request
+            scope, key = request.scope, request.correlation_key
+        else:
+            scope = ExternalWaitScope.model_validate(task.input["scope"])
+            key = task.input["correlation_key"]
+        record = await self.waits.store._read_external_wait(scope, key)
+        if record is None or record.execution is None:
+            return None
+        return record.execution.intent.session_id
 
     async def _handle_deadline(self, task: Task, timer: ExternalWaitTimer, worker_id: str) -> None:
         snapshot = await self.scheduler.notify(timer, context=self.context)
@@ -486,11 +524,39 @@ class ExternalWaitHosting:
             # staying parked.
             await self._publish_successor(task)
             raise
-        if current.handoff == "pending":
+        if current.handoff == "pending" and not await self._ended_during_delivery(current):
             # A parked session that couldn't continue yet, such as behind a live
             # writer or before the wait store elected the timeout.
             result["retry_at"] = await self._publish_successor(task)
         await complete_managed_task(self.scheduler.task_store, task, worker_id, result)
+
+    async def _ended_during_delivery(self, wait: ExternalWaitSnapshot) -> bool:
+        """Whether the wait's task ended during delivery, so nothing can settle it.
+
+        It is reported once per wait, then only at debug level.
+        """
+        from cayu.external_wait_tasks import task_ended_during_delivery
+
+        if wait.registration is None or wait.handoff != "pending":
+            return False
+        task_id = await task_ended_during_delivery(self, wait.registration)
+        if task_id is None:
+            return False
+        request = wait.correlation.request
+        identity = (request.scope, request.correlation_key, wait.correlation.incarnation)
+        log = _logger.debug if identity in self._ended_during_delivery_reported else _logger.warning
+        self._ended_during_delivery_reported.add(identity)
+        log(
+            "Task %s ended while its event was being delivered; external wait %s is not "
+            "serviced again and its session is not continued. The wait stays pending and "
+            "counts toward the capacity of scope %s generation %d; reserve later waits in a "
+            "new generation if that capacity runs out.",
+            task_id,
+            request.correlation_key,
+            request.scope.application_scope,
+            request.scope.generation,
+        )
+        return True
 
     async def _publish_successor(self, task: Task) -> str | None:
         successor = _successor(task)
@@ -561,6 +627,17 @@ class ExternalWaitHosting:
         if self.delivery_path is None:
             raise ValueError("This hosting serves no external event sources.")
         return external_wait_delivery_router(self, self.delivery_path)
+
+
+def _failure(error: Exception) -> str:
+    """A failure for a sweep's log: its type, and the access refusal it explains.
+
+    Only a refusal's message is included: Cayu writes it, and it names the grant
+    that is missing, such as the hosting context's ``cancel``.
+    """
+    if isinstance(error, PermissionError):
+        return f"{type(error).__name__}: {error}"
+    return type(error).__name__
 
 
 def claims_hosted_tasks(query: TaskQuery | None) -> bool:

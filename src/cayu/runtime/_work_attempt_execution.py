@@ -275,10 +275,12 @@ class WorkAttemptExecution:
         request: RunRequest | ResumeRequest,
         *,
         kind: Literal["initial", "continuation"],
+        without_task_claim: bool = False,
     ) -> str:
         return session_request_boundary.work_attempt_source_request_sha256(
             request,
             kind=kind,
+            without_task_claim=without_task_claim,
             redactor=self._secret_redactor,
             policy_instance_identity=self._execution_profile_continuation.policy_identity_registry.identity_for,
         )

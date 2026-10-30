@@ -20,6 +20,19 @@ from cayu.sessions.external_waits import (
 )
 
 
+class TaskTurnNotFinished(ExternalWaitUnavailable):
+    """Recovery would run more of a task's turn without the task's claim, so it doesn't.
+
+    A task's turn whose answer isn't complete is never continued blind: its wait is
+    stopped instead and the session left to its task's handler.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "External recovery doesn't continue a task's turn that hasn't finished its answer."
+        )
+
+
 class _ExternalExecutionToWait:
     def __init__(
         self,
@@ -30,12 +43,14 @@ class _ExternalExecutionToWait:
         invocation_store,
         source_request_sha256: str | None = None,
         request_loop_policies=(),
+        task_id: str | None = None,
     ):
         self.waits = waits
         self.registration = _snapshot(registration, ExternalWaitRegistration)
         self.context = _snapshot(context, ExternalWaitContext)
         self.source_request_sha256 = source_request_sha256
         self.request_loop_policies = request_loop_policies
+        self.task_id = task_id
         self._invocation_store = invocation_store
         self._preparation_owner_id = str(uuid4())
         # Cache only receiving evidence within this one invocation. Authorization,
@@ -63,12 +78,8 @@ class _ExternalExecutionToWait:
 
     async def prepare_initial(self, request, profile, *, request_sha256):
         self.waits._authorize(self.registration.correlation.request, self.context, "service")
-        if (
-            request.session_id is None
-            or request.parent_session_id is not None
-            or request.task_id is not None
-        ):
-            raise ValueError("External execution requires an ordinary root session identity.")
+        if request.session_id is None or request.parent_session_id is not None:
+            raise ValueError("External execution requires a top-level session identity.")
         command = self.waits._command(
             "prepare_execution",
             self.registration.correlation,
@@ -80,6 +91,7 @@ class _ExternalExecutionToWait:
                 source_request_sha256=self.source_request_sha256,
                 profile_sha256=profile.fingerprint,
                 session_id=request.session_id,
+                task_id=request.task_id,
             ),
         )
         with execution_preparation_scope(command):
@@ -225,7 +237,6 @@ class _ExternalExecutionToWait:
             or semantics is None
             or semantics.interaction_id != invocation.binding.interaction_id
             or semantics.execution_profile_fingerprint != invocation.profile.fingerprint
-            or semantics.task_id is not None
             or (
                 pointer.tool_round_id is None
                 and boundary.transcript_cursor != pointer.transcript_end_cursor
@@ -247,17 +258,60 @@ class _ExternalExecutionToWait:
             )
         ):
             raise ExternalWaitUnavailable("External recovery has no exact completed model result.")
+        # The stage was published by the task's own run, so it names the task. An
+        # unfinished round would run again without the task's claim; a closed one is
+        # refused by recovery unless it completed the turn.
+        if boundary.pending_tool_round is not None and semantics.task_id is not None:
+            raise TaskTurnNotFinished()
         return semantics
 
-    async def service_request(self, retained, stage_id):
-        """Restore controls from the exact immutable stage retained before service."""
+    async def service_task_id(self, retained, stage_id) -> str | None:
+        """The task the waiting turn ran under, from its exact retained stage."""
+        return (await self._service_semantics(retained, stage_id)).task_id
+
+    async def service_request(self, retained, stage_id, *, task_claim=None):
+        """Restore controls from the exact immutable stage retained before service.
+
+        A turn that ran under a task continues only under a claim on that task:
+        ``task_claim`` is the claiming worker and the handoff it claimed.
+        """
         from cayu.messages import Message
+        from cayu.sessions.requests import ResumeRequest
+
+        if retained.projection_json is None:
+            raise ExternalWaitUnavailable("External service has no retained execution controls.")
+        semantics = await self._service_semantics(retained, stage_id)
+        if (semantics.task_id is None) != (task_claim is None):
+            raise ExternalWaitUnavailable(
+                "External service of a task's session requires a claim on that task."
+            )
+        claim = (
+            {}
+            if task_claim is None
+            else {"task_worker_id": task_claim[0], "task_handoff_id": task_claim[1]}
+        )
+        execution = retained.execution
+        return ResumeRequest(
+            session_id=execution.intent.session_id,
+            messages=[Message.text("user", retained.projection_json)],
+            max_steps=semantics.max_steps,
+            limits=semantics.limits,
+            budget_limits=semantics.budget_limits,
+            retry_policy=semantics.retry_policy,
+            structured_output=semantics.structured_output,
+            tool_completion=semantics.tool_completion,
+            thinking=semantics.thinking,
+            metadata=semantics.request_metadata,
+            loop_policies=self.request_loop_policies,
+            **claim,
+        )
+
+    async def _service_semantics(self, retained, stage_id):
         from cayu.runtime._model_completion_contracts import (
             model_completion_recovery_context_from_stage,
         )
-        from cayu.sessions.requests import ResumeRequest
 
-        if retained.execution is None or retained.projection_json is None or stage_id is None:
+        if retained.execution is None or stage_id is None:
             raise ExternalWaitUnavailable("External service has no retained execution controls.")
         execution = retained.execution
         stage = await self.waits.store.load_model_completion_stage(
@@ -273,22 +327,9 @@ class _ExternalExecutionToWait:
             or semantics is None
             or semantics.interaction_id != execution.interaction_id
             or semantics.execution_profile_fingerprint != execution.intent.profile_sha256
-            or semantics.task_id is not None
         ):
             raise ExternalWaitUnavailable("External service execution controls conflict.")
-        return ResumeRequest(
-            session_id=execution.intent.session_id,
-            messages=[Message.text("user", retained.projection_json)],
-            max_steps=semantics.max_steps,
-            limits=semantics.limits,
-            budget_limits=semantics.budget_limits,
-            retry_policy=semantics.retry_policy,
-            structured_output=semantics.structured_output,
-            tool_completion=semantics.tool_completion,
-            thinking=semantics.thinking,
-            metadata=semantics.request_metadata,
-            loop_policies=self.request_loop_policies,
-        )
+        return semantics
 
     async def publish_structured_event(self, invocation, writer, event):
         """Reuse exact post-model validation evidence during native recovery."""
@@ -444,6 +485,7 @@ class _ExternalExecutionToWait:
                 expected_session_instance_id=command.expected_session_instance_id,
                 expected_run_epoch=command.expected_run_epoch,
                 admission_sha256=digest,
+                task_id=self.task_id,
             ),
         )
         with external_resume_preparation(command), execution_preparation_scope(mutation):

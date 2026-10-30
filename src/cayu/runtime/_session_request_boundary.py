@@ -1180,14 +1180,25 @@ def work_attempt_source_document(request: RunRequest | ResumeRequest) -> dict[st
     return document
 
 
+# A task worker's claim on the task a request runs under: authority the task store
+# checks when the request is admitted, not part of the work the request names.
+_TASK_CLAIM_FIELDS = ("task_worker_id", "task_lease_expires_at", "task_handoff_id")
+
+
 def work_attempt_source_request_sha256(
     request: RunRequest | ResumeRequest,
     *,
     redactor: SecretRedactor,
     policy_instance_identity: Callable[[object], str],
     kind: Literal["initial", "continuation"],
+    without_task_claim: bool = False,
 ) -> str:
-    """Bind one public request and its otherwise excluded policy authority."""
+    """Bind one public request and its otherwise excluded policy authority.
+
+    ``without_task_claim`` binds the request as if it carried no task claim, so
+    the same work replayed under another worker and lease keeps its digest. The
+    task itself stays bound, and a request without a claim keeps its digest.
+    """
 
     if kind == "initial":
         if type(request) is not RunRequest:
@@ -1218,9 +1229,20 @@ def work_attempt_source_request_sha256(
                     "identity": identity.model_dump(mode="json", warnings=False),
                 }
             )
+    document = work_attempt_source_document(request)
+    fields_set = set(request.model_fields_set)
+    if without_task_claim and any(
+        getattr(request, name, None) is not None for name in _TASK_CLAIM_FIELDS
+    ):
+        # Only a request that carries a claim is normalized: an unclaimed one keeps
+        # its exact digest, explicit ``None`` claim fields included.
+        for name in _TASK_CLAIM_FIELDS:
+            if name in document:
+                document[name] = None
+        fields_set.difference_update(_TASK_CLAIM_FIELDS)
     return work_attempt_source_digest(
         kind=kind,
-        request=work_attempt_source_document(request),
-        fields_set=tuple(sorted(request.model_fields_set)),
+        request=document,
+        fields_set=tuple(sorted(fields_set)),
         loop_policy_authority=loop_policy_authority,
     )

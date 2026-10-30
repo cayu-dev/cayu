@@ -23,6 +23,7 @@ from cayu import _application_attention as attention
 from cayu import _application_context_views as context_views
 from cayu import _application_event_batches as event_batches
 from cayu import _application_task_creation as task_creation
+from cayu import external_wait_tasks as _external_wait_tasks
 from cayu._application_agent_registry import ApplicationAgentRegistry
 from cayu._application_environment_maintenance import (
     SessionEnvironments,
@@ -1750,7 +1751,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             get_registered_environment_for_session=self._get_registered_environment_for_session,
             model_completion_recovery=self._model_completion_recovery,
             user_input_evidence=self._user_input_evidence,
-            cancel_session_wake=partial(_session_wakes._cancel_session_wake, self),
+            stop_parked_waits=self._stop_parked_waits,
         )
 
         self._session_engine = SessionEngine(
@@ -4626,6 +4627,11 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             project_session_id=self.project_session_id_for_exposure,
         )
 
+    async def _stop_parked_waits(self, session_id: str) -> None:
+        """Stop what an interrupted session waits on: its sleep, or a task's external wait."""
+        await _session_wakes._cancel_session_wake(self, session_id)
+        await _external_wait_tasks.stop_parked_external_wait(self, session_id)
+
     @_tracked_entrance
     async def delete_session(
         self,
@@ -4638,10 +4644,12 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         By default only completed or failed sessions qualify. Running sessions or
         incomplete cleanup raise ValueError. Missing sessions return None.
         Deleting a session asleep in ``sleep_until`` cancels its wake task; one
-        whose owning task still runs is refused until that task is cancelled.
+        whose owning task still runs is refused until that task is cancelled, as is
+        one that waits on an external event inside a running task.
         See ``cayu guide anatomy#process-scoped-application-graph``.
         """
         await _session_wakes._require_deletable(self, session_id)
+        await _external_wait_tasks.require_deletable(self, session_id)
         wake_id = await _session_wakes._open_wake_id(self, session_id)
         report = await delete_app_session(self, session_id, finished_only=finished_only)
         if wake_id is not None and await self.session_store.load(session_id) is None:

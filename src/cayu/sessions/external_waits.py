@@ -34,6 +34,9 @@ EXTERNAL_WAIT_PAGE_LIMIT = 256
 EXTERNAL_WAIT_RETENTION_SECONDS = 24 * 60 * 60
 EXTERNAL_WAIT_MAX_RETENTION_SECONDS = 30 * 24 * 60 * 60
 EXTERNAL_WAIT_MAX_HORIZON_SECONDS = 366 * 24 * 60 * 60
+#: How long a session without an execution lease must be inactive before an
+#: external wait's recovery treats its writer as gone.
+EXTERNAL_RECOVERY_INACTIVITY_S = 60
 
 Identifier = Annotated[StrictStr, Field(min_length=1, max_length=256)]
 Digest = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -215,6 +218,9 @@ class ExternalWaitExecutionIntent(_Value):
     expected_session_instance_id: Identifier | None = None
     expected_run_epoch: StrictInt | None = Field(default=None, ge=0, le=9007199254740991)
     admission_sha256: Digest | None = None
+    #: The task the turn runs under, recorded before it starts: the session store's
+    #: own proof that a task owns the turn. Left out for a root turn.
+    task_id: Identifier | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def exact_destination(self) -> ExternalWaitExecutionIntent:

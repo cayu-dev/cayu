@@ -339,7 +339,9 @@ A session that a worker runs under a task (`RunRequest(task_id=task.id,
 task_worker_id=..., task_lease_expires_at=...)`, see
 [project workers](project-workers.md)) can sleep too. Its handler returns
 `TaskHandlerOutcome.SESSION_INTERRUPTED` when the run ends interrupted, as for
-any pause. The worker then hands the task off **parked** on the wake:
+any pause. The worker then hands the task off **parked** on the wake (a session
+waiting on an external event parks its task the same way; see
+[Waiting inside a task](external-event-waits.md#waiting-inside-a-task)):
 
 - The task stays `running` with no worker and no lease, and nothing renews or
   expires while it sleeps. Its handoff receipt names the wait

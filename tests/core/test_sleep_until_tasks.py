@@ -701,14 +701,14 @@ def test_until_idle_still_asks_to_continue_a_task_its_wake_handed_off_unparked()
         job, wake_id = await _parked_job(app, "job-unparked-by-wake")
         [wake] = await session_wake_attempts(app, wake_id)
         # While its owner stays parked on the sleep, a handled wake leaves nothing.
-        assert await _may_await_continuation(tasks, wake) is False
+        assert await _may_await_continuation(app, tasks, wake) is False
         async for _ in app.interrupt_session(
             InterruptSessionRequest(session_id=_session_id(job.id), reason="stop waiting")
         ):
             pass
         assert await reconcile_parked_handoffs(app) == 1
         # Its owner now waits, unparked, on the generic continuation.
-        assert await _may_await_continuation(tasks, wake) is True
+        assert await _may_await_continuation(app, tasks, wake) is True
 
     asyncio.run(asyncio.wait_for(scenario(), 30))
 

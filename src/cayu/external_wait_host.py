@@ -15,6 +15,7 @@ from cayu.session_external_waits import SessionExternalWaitAdapter
 from cayu.sessions._session_continuation import ContinuationConflict, ContinuationUnavailable
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.external_waits import (
+    EXTERNAL_RECOVERY_INACTIVITY_S,
     EXTERNAL_WAIT_PAGE_SIZE,
     ExternalWaitCapacityExceeded,
     ExternalWaitConflict,
@@ -23,9 +24,6 @@ from cayu.sessions.external_waits import (
     Identifier,
     _Value,
 )
-
-# Matches recover_to_wait()'s default inactivity grace.
-_ORPHANED_PREPARATION_AGE_S = 60
 
 
 class ExternalWaitHostFailure(_Value):
@@ -192,7 +190,7 @@ class ExternalWaitHost:
         # Initial runs prepare before the session exists, and resumes before they claim
         # execution, so without a lost lease only an aged preparation is reported.
         prepared_age_s = time.time() - record.execution.prepared_at_ms / 1000
-        return prepared_age_s >= _ORPHANED_PREPARATION_AGE_S
+        return prepared_age_s >= EXTERNAL_RECOVERY_INACTIVITY_S
 
     async def run(
         self,

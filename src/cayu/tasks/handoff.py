@@ -51,12 +51,14 @@ class TaskParkedWait(BaseModel):
     of a session asleep in ``sleep_until``; its wake task continues the task
     through a bound claim that presents this same wait. ``session_id`` names the
     sleeping session when it is a subagent the task's session waits on, and is
-    left out when the task's own session sleeps.
+    left out when the task's own session sleeps. ``external_wait`` names the
+    registration digest of the external-event wait the task's session parked on;
+    the wait's service continues the task the same way.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    kind: Literal["session_wake"]
+    kind: Literal["session_wake", "external_wait"]
     wait_id: str
     session_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 

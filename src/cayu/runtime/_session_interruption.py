@@ -189,7 +189,7 @@ class SessionInterruption:
         ],
         model_completion_recovery: ModelCompletionRecovery,
         user_input_evidence: UserInputRecoveryEvidence,
-        cancel_session_wake: Callable[[str], Awaitable[None]] | None = None,
+        stop_parked_waits: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.session_store = session_store
         self._event_writer = event_writer
@@ -208,7 +208,7 @@ class SessionInterruption:
         self._get_registered_environment_for_session = get_registered_environment_for_session
         self._model_completion_recovery = model_completion_recovery
         self._user_input_evidence = user_input_evidence
-        self._cancel_session_wake = cancel_session_wake
+        self._stop_parked_waits = stop_parked_waits
 
     async def interrupt_session(
         self,
@@ -235,12 +235,13 @@ class SessionInterruption:
                 field_name=field_name,
                 redactor=self._secret_redactor,
             )
-        if self._cancel_session_wake is not None:
-            # Once the request is admitted, a sleep's pending attempts are cancelled
-            # before the interruption proceeds, so stopping it never depends on how
-            # far the caller reads. The interruption itself supersedes the sleeping
-            # round atomically; an attempt that runs anyway finds it closed.
-            await self._cancel_session_wake(loaded_session.id)
+        if self._stop_parked_waits is not None:
+            # Once the request is admitted, a sleep's pending attempts are cancelled,
+            # and a task-owned session's external wait is retired, before the
+            # interruption proceeds, so stopping it never depends on how far the
+            # caller reads. The interruption itself supersedes the sleeping round
+            # atomically; an attempt that runs anyway finds it closed.
+            await self._stop_parked_waits(loaded_session.id)
         interrupted_pending_user_input = None
         interrupted_ambiguous_user_input = None
         interrupted_foreground_wait = None

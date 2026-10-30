@@ -6,6 +6,12 @@ from contextlib import aclosing
 from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid5
 
+from cayu.external_wait_tasks import (
+    CHILD_SESSION_REFUSAL,
+    ended_during_delivery,
+    service_under_task,
+    task_ended,
+)
 from cayu.external_waits import (
     ExternalEventWaits,
     ExternalWaitContext,
@@ -16,7 +22,9 @@ from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime._external_wait_binding import load_prepared_continuation
 from cayu.runtime._external_wait_observation import external_wait_entrance
 from cayu.sessions.external_waits import (
+    EXTERNAL_RECOVERY_INACTIVITY_S,
     ExternalWaitConflict,
+    ExternalWaitRecord,
     ExternalWaitRegistration,
     ExternalWaitUnavailable,
     Identifier,
@@ -24,6 +32,7 @@ from cayu.sessions.external_waits import (
     external_wait_digest,
 )
 from cayu.sessions.requests import ResumeRequest, RunRequest, copy_resume_request, copy_run_request
+from cayu.tasks.parked_continuation import declares_parked_handoffs
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -56,13 +65,44 @@ class SessionExternalWaitAdapter:
             request_loop_policies, field_name="request_loop_policies"
         )
 
+    def _require_task_parking(
+        self, task_worker_id: str | None, registration: ExternalWaitRegistration
+    ) -> None:
+        """Refuse a task-owned wait that no worker could park, continue or stop."""
+        hosting = self.app._external_wait_hosting
+        if hosting is None or hosting.adapter is not self:
+            raise ValueError(
+                "External waits in a session a task owns need app.host_external_waits(...): "
+                "its worker parks the task and continues it from the wait's service."
+            )
+        if task_worker_id is None:
+            raise ValueError(
+                "External waits in a session a task owns need the task worker's claim "
+                "(task_worker_id): a task-backed run that no task worker owns can't hand "
+                "its task off to wait."
+            )
+        if not declares_parked_handoffs(self.app.task_store):
+            raise ValueError(
+                "External waits in a session a task owns park that task; give the "
+                "application a task store that declares bound and parked interrupted-task "
+                "handoffs, as the built-in stores do."
+            )
+        try:
+            self.waits._authorize(registration.correlation.request, hosting.context, "cancel")
+        except PermissionError:
+            raise ValueError(
+                "External waits in a session a task owns are stopped, when the session is "
+                "interrupted or its task ends, by cancelling them as the hosting context; "
+                "the access policy must grant that context 'cancel'."
+            ) from None
+
     @external_wait_entrance
     async def recover_to_wait(
         self,
         registration: ExternalWaitRegistration,
         *,
         context: ExternalWaitContext,
-        inactive_for_seconds: int = 60,
+        inactive_for_seconds: int = EXTERNAL_RECOVERY_INACTIVITY_S,
     ) -> SessionExternalWaitReceipt:
         """Recover an admitted unfinished turn through the native recovery owner."""
         from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
@@ -218,10 +258,12 @@ class SessionExternalWaitAdapter:
         registration = _snapshot(registration, ExternalWaitRegistration)
         context = _snapshot(context, ExternalWaitContext)
         self.waits._authorize(registration.correlation.request, context, "service")
-        if request.parent_session_id is not None or request.task_id is not None:
-            raise ValueError("External session waits support ordinary root sessions only.")
+        if request.parent_session_id is not None:
+            raise ValueError(CHILD_SESSION_REFUSAL)
+        if request.task_id is not None:
+            self._require_task_parking(request.task_worker_id, registration)
         source_digest = self.app._work_attempt_execution.work_attempt_source_request_sha256(
-            request, kind="initial"
+            request, kind="initial", without_task_claim=True
         )
         session_id = request.session_id or str(
             uuid5(NAMESPACE_URL, "cayu-external-session:" + external_wait_digest(registration))
@@ -249,12 +291,14 @@ class SessionExternalWaitAdapter:
         session = await self.waits.store.load(request.session_id)
         if session is None:
             raise ExternalWaitUnavailable("External resume source is unavailable.")
+        if session.parent_session_id is not None:
+            raise ValueError(CHILD_SESSION_REFUSAL)
         linked_task, _ = await self.app._session_tasks.linked_resume_task_id(request)
-        if session.parent_session_id is not None or linked_task is not None:
-            raise ValueError("External session waits support ordinary root sessions only.")
+        if linked_task is not None:
+            self._require_task_parking(request.task_worker_id, registration)
         await self.app._require_participant_execution(session, None)
         source_digest = self.app._work_attempt_execution.work_attempt_source_request_sha256(
-            request, kind="continuation"
+            request, kind="continuation", without_task_claim=True
         )
         return await self._execute_to_wait(
             request,
@@ -262,6 +306,7 @@ class SessionExternalWaitAdapter:
             context=context,
             source_digest=source_digest,
             session_instance_id=session.instance_id,
+            task_id=linked_task,
         )
 
     async def _execute_to_wait(
@@ -272,6 +317,7 @@ class SessionExternalWaitAdapter:
         context: ExternalWaitContext,
         source_digest: str,
         session_instance_id: str | None = None,
+        task_id: str | None = None,
     ) -> SessionExternalWaitReceipt:
         # Public entrances copy and validate the request before sharing orchestration.
         # The original digest precedes generated session IDs and must not be rebuilt.
@@ -316,6 +362,7 @@ class SessionExternalWaitAdapter:
                 invocation_store=self.app._session_engine.session_store,
                 source_request_sha256=source_digest,
                 request_loop_policies=self._request_loop_policies,
+                task_id=task_id,
             )
             stream = (
                 self.app._run_private(request, execution_to_wait=boundary)
@@ -420,7 +467,7 @@ class SessionExternalWaitAdapter:
                         context=context,
                         inactive_for_seconds=0
                         if self.waits.store.supports_session_execution
-                        else 60,
+                        else EXTERNAL_RECOVERY_INACTIVITY_S,
                     )
             await receiver.retire_released(boundary.owner)
         else:
@@ -448,7 +495,8 @@ class SessionExternalWaitAdapter:
                     raise ExternalWaitUnavailable(
                         "External service lost its completed model boundary."
                     )
-                await boundary.service_request(retained, pointer.stage_id)
+                # The exact retained stage must restore its controls before service.
+                await boundary.service_task_id(retained, pointer.stage_id)
                 latch = elected_external_latch(retained)
                 service = ContinuationService(
                     ticket=native.ticket,
@@ -469,14 +517,91 @@ class SessionExternalWaitAdapter:
                     retained = await self.waits._mutate(command)
             assert retained.service is not None and retained.projection_json is not None
             self.waits._authorize(registration.correlation.request, context, "service")
+            task_id = await boundary.service_task_id(retained, retained.service_stage_id)
+            if task_id is not None:
+                assert retained.continuation is not None
+                native = await load_prepared_continuation(self.waits.store, retained.continuation)
+                if native is not None and native.ticket.state == "CONSUMED":
+                    # An earlier servicing continued it under the task's claim; only
+                    # its handoff is left to settle, which needs no claim.
+                    await receiver.reconcile_handoff()
+                    return SessionExternalWaitReceipt(
+                        session_id=session_id,
+                        wait=await self.waits.inspect(registration.correlation, context=context),
+                    )
+                if await task_ended(self.app, task_id, session_id):
+                    if native is not None and native.consumption is not None:
+                        raise ended_during_delivery(session_id, task_id)
+                    return await self._retire_for_ended_task(registration, task_id, context)
             await boundary.owner.latch(retained.service.latch)
-            await boundary.owner.service(
-                self.app,
-                await boundary.service_request(retained, retained.service_stage_id),
-                retained.service,
-            )
+            if task_id is None:
+                await boundary.owner.service(
+                    self.app,
+                    await boundary.service_request(retained, retained.service_stage_id),
+                    retained.service,
+                )
+            else:
+                await service_under_task(
+                    self,
+                    boundary,
+                    retained,
+                    session_id=session_id,
+                    stage_id=retained.service_stage_id,
+                )
             await receiver.reconcile_handoff()
         return SessionExternalWaitReceipt(
             session_id=session_id,
+            wait=await self.waits.inspect(registration.correlation, context=context),
+        )
+
+    async def _waiting_turn_task_id(
+        self, retained: ExternalWaitRecord, *, context: ExternalWaitContext
+    ) -> str | None:
+        """The task a parked turn ran under, from its exact completed model stage."""
+        from cayu.runtime import _model_completion_publication
+
+        if (
+            retained.registration is None
+            or retained.continuation is None
+            or retained.execution is None
+        ):
+            return None
+        stage_id = retained.service_stage_id
+        if stage_id is None:
+            native = await load_prepared_continuation(self.waits.store, retained.continuation)
+            if native is None or native.ticket.state != "WAITING":
+                return None
+            pointer = _model_completion_publication.model_step_publication_from_checkpoint(
+                await self.app._session_engine.session_store.load_checkpoint(
+                    retained.continuation.intent.session_id
+                )
+            )
+            if pointer is None:
+                return None
+            stage_id = pointer.stage_id
+        boundary = _ExternalExecutionToWait(
+            self.waits,
+            retained.registration,
+            context,
+            invocation_store=self.app._session_engine.session_store,
+        )
+        return await boundary.service_task_id(retained, stage_id)
+
+    async def _retire_for_ended_task(
+        self,
+        registration: ExternalWaitRegistration,
+        task_id: str,
+        context: ExternalWaitContext,
+    ) -> SessionExternalWaitReceipt:
+        """A wait never continues a session without the task it waited under."""
+        await self.retire_execution(
+            registration, operation_key=f"task-ended:{task_id}", context=context
+        )
+        retained = await self.waits.store._read_external_wait(
+            registration.correlation.request.scope, registration.correlation.request.correlation_key
+        )
+        assert retained is not None and retained.continuation is not None
+        return SessionExternalWaitReceipt(
+            session_id=retained.continuation.intent.session_id,
             wait=await self.waits.inspect(registration.correlation, context=context),
         )

@@ -1163,8 +1163,9 @@ class SessionContinuationOwner:
         failure = None
         try:
             copied_request = copy_resume_request(request)
+            # A retry under a new claim on the session's task is the same service.
             request_digest = app._work_attempt_execution.work_attempt_source_request_sha256(
-                copied_request, kind="continuation"
+                copied_request, kind="continuation", without_task_claim=True
             )
         except Exception as error:
             failure = ContinuationConflict("Continuation resume request is invalid.")

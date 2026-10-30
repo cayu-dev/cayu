@@ -22,7 +22,6 @@ the subagent and then each parent up the chain under its claim on that task.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -54,10 +53,19 @@ from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.pending_actions import woken_round_awaits_manual_recovery
 from cayu.sessions.records import PendingActionKind, SessionStatus
 from cayu.sessions.requests import InterruptSessionRequest
-from cayu.tasks.continuation_claims import TaskContinuationExpectation
 from cayu.tasks.creation import TaskCreate
-from cayu.tasks.handoff import TaskInterruptedHandoffReceipt, TaskParkedWait
-from cayu.tasks.queries import TaskQuery
+from cayu.tasks.handoff import TaskParkedWait
+from cayu.tasks.parked_continuation import (
+    TERMINAL_TASK_STATUSES,
+    ParkedOwnerBusy,
+    attempt_is_live,
+    continuation_suffix,
+    declares_parked_handoffs,
+    handed_off_owner,
+    owning_task,
+    release_parked_handoff,
+    run_under_parked_claim,
+)
 from cayu.tasks.records import TaskStatus
 from cayu.tasks.scheduling import TaskScheduleCancelRequest, TaskSchedulePolicy
 
@@ -80,11 +88,6 @@ _MAX_ATTEMPT_SCAN = 128
 # the application clock has not reached yet waits this long at most, holding its
 # lease; a larger disagreement fails the attempt instead of resuming early.
 MAX_WAKE_CLOCK_SKEW = timedelta(minutes=5)
-_TERMINAL_TASK_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED})
-# A wake can come due before the worker that ran its session has handed the task
-# off. Its attempt waits this long for the handoff before failing into a successor.
-_OWNER_HANDOFF_WAIT = timedelta(seconds=5)
-_OWNER_HANDOFF_POLL = timedelta(milliseconds=100)
 # How long the attempt that continues a task-owned session holds its claim at once.
 _CONTINUATION_LEASE_SECONDS = 300
 
@@ -125,14 +128,14 @@ class SessionWakeNotDue(RuntimeError):
         super().__init__(f"Session wake is not due until {deadline.isoformat()}.")
 
 
-class SessionWakeOwnerBusy(RuntimeError):
+class SessionWakeOwnerBusy(ParkedOwnerBusy):
     """The task that owns the session has not handed it off yet; the wake is retried."""
 
     def __init__(self, task_id: str) -> None:
-        self.task_id = task_id
         super().__init__(
+            task_id,
             f"Task {task_id} still holds the sleeping session; its wake continues it once "
-            "the task is handed off."
+            "the task is handed off.",
         )
 
 
@@ -410,20 +413,6 @@ async def _wait_out_clock_skew(app: CayuApp, early: SessionWakeNotDue) -> None:
     await asyncio.sleep(max(remaining.total_seconds(), 0.0))
 
 
-async def _owning_task(app: CayuApp, session_id: str) -> Task | None:
-    """Return the running task that owns a session, or ``None`` for an unowned one."""
-
-    task_store = app.task_store
-    if task_store is None:
-        return None
-    owners = await task_store.list_tasks(
-        TaskQuery(session_id=session_id, status=TaskStatus.RUNNING, limit=2)
-    )
-    if len(owners) > 1:
-        raise RuntimeError("The sleeping session has ambiguous task ownership.")
-    return owners[0] if owners else None
-
-
 async def _deliver_to_owning_task(
     app: CayuApp,
     owner: Task,
@@ -439,10 +428,8 @@ async def _deliver_to_owning_task(
     It does so again after a crash between the two, while the task stays parked.
     """
 
-    from cayu.tasks.worker import TaskHandlerOutcome, _run_recovered_interrupted_task_handler
+    from cayu.tasks.worker import TaskHandlerOutcome
 
-    task_store = app.task_store
-    assert task_store is not None
     subagent = owner.session_id != session_id
     session = await app.session_store.load(session_id)
     delivered = session is not None and await _delivered(app, session_id, wake_id)
@@ -457,7 +444,9 @@ async def _deliver_to_owning_task(
     parked = TaskParkedWait(
         kind="session_wake", wait_id=wake_id, session_id=session_id if subagent else None
     )
-    handed_off = await _handed_off_owner(app, owner, parked=parked, asleep=asleep)
+    handed_off = await handed_off_owner(
+        app, owner, parked=parked, still_waiting=asleep, busy=SessionWakeOwnerBusy
+    )
     if handed_off is None:
         # A competing delivery may have held the task and continued the call meanwhile.
         if await _delivered(app, session_id, wake_id):
@@ -466,16 +455,6 @@ async def _deliver_to_owning_task(
     owner, parked = handed_off
     assert owner.session_id is not None and owner.session_instance_id is not None
     assert owner.interrupted_handoff_id is not None
-    expected = TaskContinuationExpectation(
-        task_id=owner.id,
-        session_id=owner.session_id,
-        session_instance_id=owner.session_instance_id,
-        prior_handoff_id=owner.interrupted_handoff_id,
-        operation_sha256=hashlib.sha256(
-            f"cayu.session-wake-continuation.v1:{wake_id}".encode()
-        ).hexdigest(),
-        parked_wait=parked,
-    )
     outcomes: list[SessionWakeOutcome] = []
     failures: list[Exception] = []
 
@@ -514,18 +493,19 @@ async def _deliver_to_owning_task(
             raise failures[0]
         return None
 
-    page = await _run_recovered_interrupted_task_handler(
+    claimed = await run_under_parked_claim(
         app,
-        task_store,
-        continue_owned,
-        worker_id=f"{worker_id or 'session-wake'}{_wake_continuation_suffix(wake_id)}",
-        expected=expected,
-        apply_unproductive_backoff=False,
+        task_id=owner.id,
+        session_id=owner.session_id,
+        session_instance_id=owner.session_instance_id,
+        handoff_id=owner.interrupted_handoff_id,
+        parked=parked,
+        operation=f"cayu.session-wake-continuation.v1:{wake_id}",
+        worker_id=f"{worker_id or 'session-wake'}{continuation_suffix(wake_id)}",
         lease_seconds=_CONTINUATION_LEASE_SECONDS,
-        query=None,
-        after=None,
+        step=continue_owned,
     )
-    if page.task is None:
+    if not claimed:
         # Another delivery of this wake holds or finished the continuation.
         if await _delivered(app, session_id, wake_id):
             return SessionWakeOutcome.ALREADY_DELIVERED
@@ -578,47 +558,6 @@ async def _run_directly(operation) -> None:
         return None
 
     await operation(no_further_guard)
-
-
-def _wake_continuation_suffix(wake_id: str) -> str:
-    """How the worker id of a wake attempt's claim on its owning task ends."""
-
-    return f":continue:{wake_id}"
-
-
-async def _handed_off_owner(
-    app: CayuApp, owner: Task, *, parked: TaskParkedWait, asleep: bool
-) -> tuple[Task, TaskParkedWait | None] | None:
-    """Wait briefly for the owner's handoff and return it with the wait to present.
-
-    This wake continues a handoff parked on it, and repairs an unparked one while
-    the session still sleeps on it. A handoff parked on another wait, or an
-    unparked one after the sleep closed, belongs to someone else: ``None``.
-    """
-
-    task_store = app.task_store
-    assert task_store is not None
-    waited = timedelta(0)
-    current: Task | None = owner
-    while current is not None and current.status is TaskStatus.RUNNING:
-        if current.worker_id is None and current.interrupted_handoff_id is not None:
-            receipt = await task_store.load_interrupted_task_handoff_receipt(
-                current.id, current.interrupted_handoff_id
-            )
-            if receipt is None:
-                return None
-            presented = receipt.request.parked
-            if presented == parked or (presented is None and asleep):
-                return current, presented
-            return None
-        if not asleep:
-            return None
-        if waited >= _OWNER_HANDOFF_WAIT:
-            raise SessionWakeOwnerBusy(current.id)
-        await asyncio.sleep(_OWNER_HANDOFF_POLL.total_seconds())
-        waited += _OWNER_HANDOFF_POLL
-        current = await task_store.load_task(owner.id)
-    return None
 
 
 async def _stop_sleep(app: CayuApp, session_id: str) -> None:
@@ -685,7 +624,7 @@ async def _ensure_wake_attempt(app: CayuApp, pending: PendingUserInput) -> bool 
         request: TaskCreate | None = _attempt_task(
             pending.session_id, pending.input_id, timer.deadline, 1, timer.deadline
         )
-    elif _attempt_is_live(attempts[-1], now=app._clock()):
+    elif attempt_is_live(attempts[-1], now=app._clock()):
         return False
     else:
         request = _successor(attempts[-1])
@@ -707,21 +646,7 @@ async def wake_retries_spent(task_store: TaskStore, wake_id: str, *, now: dateti
         if task is None:
             break
         last = task
-    return last is not None and not _attempt_is_live(last, now=now) and _successor(last) is None
-
-
-def _attempt_is_live(task: Task, *, now: datetime) -> bool:
-    """An attempt that ended, lost its worker's lease or was fenced is not live."""
-
-    from cayu.tasks import is_fenced_after_worker_loss
-
-    if task.status in _TERMINAL_TASK_STATUSES or is_fenced_after_worker_loss(task):
-        return False
-    return not (
-        task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
-        and task.lease_expires_at is not None
-        and task.lease_expires_at <= now
-    )
+    return last is not None and not attempt_is_live(last, now=now) and _successor(last) is None
 
 
 async def reconcile_session_wakes(app: CayuApp, *, limit: int = 200) -> int:
@@ -827,7 +752,7 @@ async def _stop_chain_if_its_task_ended(app: CayuApp, root_id: str) -> None:
     leaf, wake_id = sleeping
     attempts = await session_wake_attempts(app, wake_id)
     if await _outstanding_wake_id(app, leaf) is not None or (
-        attempts and _attempt_is_live(attempts[-1], now=app._clock())
+        attempts and attempt_is_live(attempts[-1], now=app._clock())
     ):
         # Its due attempt stops it.
         return
@@ -854,14 +779,7 @@ def _require_servable_pause(app: CayuApp, tool: Tool) -> None:
             f"Tool {tool.spec.name!r} schedules a wake task; give the application a "
             "task store that supports task scheduling."
         )
-    declared = type.__getattribute__(type(task_store), "__dict__")
-    if not all(
-        declared.get(capability) is True
-        for capability in (
-            "supports_bound_interrupted_task_handoffs",
-            "supports_parked_interrupted_task_handoffs",
-        )
-    ):
+    if not declares_parked_handoffs(task_store):
         raise ValueError(
             f"Tool {tool.spec.name!r} parks the task that owns a sleeping session; give "
             "the application a task store that declares bound and parked "
@@ -951,12 +869,17 @@ async def reconcile_parked_handoffs(app: CayuApp, *, limit: int = 100) -> int:
         page = await task_store.list_parked_interrupted_task_handoffs(after=after, limit=page_size)
         for receipt in page:
             request = receipt.request
+            if request.parked is not None and not _evaluates(app, request.parked):
+                # This process can't tell whether the session still waits on it.
+                continue
             try:
                 if await _session_parked_wait(app, request.session_id) == request.parked:
                     if request.parked is not None and request.parked.session_id is not None:
                         await _ensure_parent_attempt(app, request.parked)
                     continue
-                if await _release_parked_handoff(app, receipt):
+                if await release_parked_handoff(
+                    app, receipt, lease_seconds=_CONTINUATION_LEASE_SECONDS
+                ):
                     released += 1
             except Exception as exc:
                 _logger.warning(
@@ -967,6 +890,16 @@ async def reconcile_parked_handoffs(app: CayuApp, *, limit: int = 100) -> int:
         if len(page) < page_size:
             return released
         after = page[-1].request.task_id
+
+
+def _evaluates(app: CayuApp, parked: TaskParkedWait) -> bool:
+    """Whether this process can tell if a session still waits on a parked wait.
+
+    A wake is followed only by an application that registered ``sleep_until``; an
+    external wait is read from the session's own continuation index.
+    """
+
+    return parked.kind == "external_wait" or app._uses_session_wakes
 
 
 async def _ensure_parent_attempt(app: CayuApp, parked: TaskParkedWait) -> None:
@@ -987,7 +920,7 @@ async def _ensure_parent_attempt(app: CayuApp, parked: TaskParkedWait) -> None:
     ):
         return
     attempts = await session_wake_attempts(app, parked.wait_id)
-    if not attempts or _attempt_is_live(attempts[-1], now=app._clock()):
+    if not attempts or attempt_is_live(attempts[-1], now=app._clock()):
         return
     successor = _successor(attempts[-1])
     if successor is None:
@@ -998,44 +931,6 @@ async def _ensure_parent_attempt(app: CayuApp, parked: TaskParkedWait) -> None:
         )
         return
     await app.create_task(successor)
-
-
-async def _release_parked_handoff(app: CayuApp, receipt: TaskInterruptedHandoffReceipt) -> bool:
-    """Claim one stale parked handoff with its own wait and hand it off again."""
-
-    from cayu.tasks.worker import TaskHandlerOutcome, _run_recovered_interrupted_task_handler
-
-    task_store = app.task_store
-    assert task_store is not None
-    request = receipt.request
-    expected = TaskContinuationExpectation(
-        task_id=request.task_id,
-        session_id=request.session_id,
-        session_instance_id=request.session_instance_id,
-        prior_handoff_id=request.handoff_id,
-        operation_sha256=hashlib.sha256(
-            f"cayu.parked-handoff-release.v1:{request.handoff_id}".encode()
-        ).hexdigest(),
-        parked_wait=request.parked,
-    )
-
-    async def hand_off_again(owned_app: CayuApp, claimed: Task, claimed_by: str):
-        # The claim already proved the session interrupted; the worker hands the
-        # task off for whatever the session waits on now.
-        return TaskHandlerOutcome.SESSION_INTERRUPTED
-
-    page = await _run_recovered_interrupted_task_handler(
-        app,
-        task_store,
-        hand_off_again,
-        worker_id=f"parked-handoff-release:{request.handoff_id[:16]}",
-        expected=expected,
-        apply_unproductive_backoff=False,
-        lease_seconds=_CONTINUATION_LEASE_SECONDS,
-        query=None,
-        after=None,
-    )
-    return page.task is not None
 
 
 async def _call_closed(app: CayuApp, wait: ForegroundChildWait) -> bool:
@@ -1142,7 +1037,7 @@ async def _wake_owner(app: CayuApp, session_id: str) -> Task | None:
     root = await _chain_root(app, session_id)
     if root is None:
         _chain_too_deep()
-    return await _owning_task(app, root)
+    return await owning_task(app, root)
 
 
 async def _stop_ended_chain(app: CayuApp, session_id: str) -> bool:
@@ -1165,7 +1060,7 @@ async def _stop_ended_chain(app: CayuApp, session_id: str) -> bool:
         if pending is None or pending.task_id is None
         else await app.task_store.load_task(pending.task_id)
     )
-    if task is None or task.status not in _TERMINAL_TASK_STATUSES:
+    if task is None or task.status not in TERMINAL_TASK_STATUSES:
         return False
     # Every call still open in the chain stops, from the top down, before the sleep
     # does: a middle subagent has no task of its own to fence it from continuing, and
@@ -1217,7 +1112,7 @@ async def _leaves_parent_to_its_wake(app: CayuApp, child_session_id: str) -> boo
     if root is None:
         # Deeper than any sleep is admitted: an ordinary delivery.
         return False
-    owner = await _owning_task(app, root)
+    owner = await owning_task(app, root)
     if owner is None:
         return False
     if _held_task_claim(root) == (owner.id, owner.worker_id, owner.interrupted_handoff_id):
@@ -1228,7 +1123,7 @@ async def _leaves_parent_to_its_wake(app: CayuApp, child_session_id: str) -> boo
     leaf, wake_id = sleeping
     if owner.worker_id is not None:
         # Claimed: the wake's attempt holds it, alive or not, or someone else does.
-        return owner.worker_id.endswith(_wake_continuation_suffix(wake_id))
+        return owner.worker_id.endswith(continuation_suffix(wake_id))
     receipt = (
         None
         if owner.interrupted_handoff_id is None
@@ -1374,7 +1269,7 @@ async def _subagent_may_sleep(app: CayuApp, session: Session) -> bool:
     else:
         # Deeper than the runtime follows a chain: nothing could vouch for its sleep.
         return False
-    owner = None if top is session else await _owning_task(app, top.id)
+    owner = None if top is session else await owning_task(app, top.id)
     return owner is None or (owner.worker_id is not None and not gated)
 
 

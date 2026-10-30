@@ -110,6 +110,7 @@ class WorkAttemptOperations(Protocol):
         request: RunRequest | ResumeRequest,
         *,
         kind: Literal["initial", "continuation"],
+        without_task_claim: bool = False,
     ) -> str: ...
 
     def work_attempt_source_snapshot(

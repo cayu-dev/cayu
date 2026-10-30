@@ -1132,7 +1132,7 @@ async def run_task_worker(
             if (
                 until_idle is not None
                 and recovered_interrupted_task_handler is not None
-                and await _may_await_continuation(task_store, task)
+                and await _may_await_continuation(app, task_store, task)
             ):
                 # The handler may have handed off its session for continuation. A
                 # parked handoff is not: only its own trigger, a task, continues it.
@@ -1248,16 +1248,22 @@ async def run_task_worker(
 async def _reconcile_session_wakes(app: CayuApp, task_store: TaskStore) -> int:
     """Give open ``sleep_until`` wakes a live attempt and release stale parked tasks.
 
+    A task parked on an external wait that was retired, for example by an
+    interruption, is released the same way.
+
     Returns how many parked tasks it released for the generic continuation. It
     never stops the worker over a failure.
     """
 
     from cayu.tasks.session_wakes import reconcile_parked_handoffs, reconcile_session_wakes
 
-    if not app._uses_session_wakes or task_store is not app.task_store:
+    if (
+        not app._uses_session_wakes and app._external_wait_hosting is None
+    ) or task_store is not app.task_store:
         return 0
     released = 0
-    for reconcile in (reconcile_session_wakes, reconcile_parked_handoffs):
+    reconciles = (reconcile_session_wakes,) if app._uses_session_wakes else ()
+    for reconcile in (*reconciles, reconcile_parked_handoffs):
         try:
             count = await reconcile(app)
         except Exception as exc:
@@ -3567,16 +3573,18 @@ async def _session_parked_wait(app: CayuApp, session_id: str) -> TaskParkedWait 
     That is its own sleep, or the sleep of a foreground subagent it waits on, down
     its chain of subagents. A woken round that stopped on a tool a person must settle
     waits on that person, not on its timer, so its task is handed off unparked for
-    them to continue.
+    them to continue. Otherwise it is the external-event wait its turn parked on.
     """
 
+    from cayu.external_wait_tasks import external_parked_wait
+
     if not app._uses_session_wakes:
-        return None
+        return await external_parked_wait(app, session_id)
     from cayu.tasks.session_wakes import _sleeping_wait
 
     sleeping = await _sleeping_wait(app, session_id)
     if sleeping is None:
-        return None
+        return await external_parked_wait(app, session_id)
     sleeper, wake_id = sleeping
     return TaskParkedWait(
         kind="session_wake",
@@ -3585,24 +3593,30 @@ async def _session_parked_wait(app: CayuApp, session_id: str) -> TaskParkedWait 
     )
 
 
-async def _may_await_continuation(task_store: TaskStore, handled: Task) -> bool:
+async def _may_await_continuation(app: CayuApp, task_store: TaskStore, handled: Task) -> bool:
     """Whether a handled task may have left a session for the generic continuation.
 
-    A wake task continues its session inside its own attempt, so only an owning
-    task it handed off unparked waits on a continuation. Any other task may, unless
-    it ended parked on a trigger of its own. An unreadable state counts as pending,
-    so the until-idle result asks for another run.
+    A wake task, and a hosted external wait's service or deadline task, continues
+    its session inside its own attempt, so only an owning task it handed off
+    unparked waits on a continuation. Any other task may, unless it ended parked on
+    a trigger of its own. An unreadable state counts as pending, so the until-idle
+    result asks for another run.
     """
 
     from cayu.tasks.session_wakes import SESSION_WAKE_TASK_TYPE
 
     try:
-        if handled.type != SESSION_WAKE_TASK_TYPE:
+        hosting = app._external_wait_hosting
+        if handled.type == SESSION_WAKE_TASK_TYPE:
+            session_id = handled.input.get("session_id")
+        elif hosting is not None and hosting.continues_sessions(handled):
+            session_id = await hosting.continued_session_id(handled)
+            if session_id is None:
+                return False
+        else:
             return await _handoff_state(task_store, handled.id) != "parked"
         owners = await task_store.list_tasks(
-            TaskQuery(
-                session_id=handled.input.get("session_id"), status=TaskStatus.RUNNING, limit=1
-            )
+            TaskQuery(session_id=session_id, status=TaskStatus.RUNNING, limit=1)
         )
         return bool(owners) and await _handoff_state(task_store, owners[0].id) == "unparked"
     except Exception:
@@ -4036,15 +4050,20 @@ async def _recover_expired_interrupted_task_handoffs(
             SessionStatus.RUNNING,
             SessionStatus.INTERRUPTING,
         }:
+            from cayu.external_wait_tasks import recover_before_handoff
+
             try:
-                await app.recover_incomplete_session(
-                    IncompleteSessionRecoveryRequest(
-                        session_id=session.id,
-                        inactive_for_seconds=None,
-                        reason="expired_attached_task_owner",
-                        metadata={"recovery_scope": "attached_task"},
+                # A turn that died before its external wait parked is recovered by
+                # that wait, never plainly, which would leave it to rerun blind.
+                if not await recover_before_handoff(app, session.id):
+                    await app.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(
+                            session_id=session.id,
+                            inactive_for_seconds=None,
+                            reason="expired_attached_task_owner",
+                            metadata={"recovery_scope": "attached_task"},
+                        )
                     )
-                )
             except (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
@@ -4068,6 +4087,20 @@ async def _recover_expired_interrupted_task_handoffs(
             if session is None or session.instance_id != task.session_instance_id:
                 continue
         if session.status is not SessionStatus.INTERRUPTED:
+            continue
+        from cayu.external_wait_tasks import stop_wait_left_arming
+
+        try:
+            # Another process may have interrupted a turn that died before parking on
+            # its external wait; that wait must not stay armed and fence the task.
+            await stop_wait_left_arming(app, session.id)
+        except Exception as exc:
+            logger.warning(
+                "Stopping the external wait of interrupted session %s failed (%s); its task "
+                "is handed off on a later pass.",
+                app.redact_json(session.id),
+                type(exc).__name__,
+            )
             continue
         request = interrupted_task_handoff_request(
             task,
