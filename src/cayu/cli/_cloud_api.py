@@ -512,8 +512,29 @@ def _safe_api_error_detail(
         (status_code, code) in _REPORTED_API_REFUSALS
         or (status_code == 409 and _CLOUD_ERROR_CODE.fullmatch(code))
     ):
-        return safe_text(detail.get("message"), _CONFLICT_DETAIL_LIMIT)
+        return _reported_message(detail.get("message"))
     return allowlisted
+
+
+def _reported_message(value: object) -> str | None:
+    """A refusal's message, or its first line when the whole message can't be shown.
+
+    An Agent's refusal that Cloud passes on can run to many lines of guidance (an
+    execution-profile mismatch lists every difference and next step), which the filter
+    refuses as a whole. Its first line says what happened, so it is shown alone, cut back
+    to whole sentences that fit, rather than leaving the caller with a bare "HTTP 409".
+    """
+
+    whole = safe_text(value, _CONFLICT_DETAIL_LIMIT)
+    if whole is not None or not isinstance(value, str):
+        return whole
+    first = value.split("\n", 1)[0].strip()
+    try:
+        while len(first.encode()) > _CONFLICT_DETAIL_LIMIT and ". " in first:
+            first = first.rsplit(". ", 1)[0] + "."
+    except UnicodeError:
+        return None
+    return safe_text(first, _CONFLICT_DETAIL_LIMIT)
 
 
 def _safe_conflict_detail(response: httpx.Response) -> str | None:

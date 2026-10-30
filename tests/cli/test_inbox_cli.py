@@ -341,6 +341,45 @@ def test_a_refused_cloud_settle_carries_the_items_state() -> None:
     assert refused.value.code == "already_settled" and refused.value.item == state
 
 
+def test_a_long_refusal_from_the_agent_shows_its_first_line_through_cloud(monkeypatch) -> None:
+    """An Agent's multi-line refusal through Cloud is shown by its first line."""
+
+    import httpx
+
+    import cayu.cli._cloud_api as cloud_api
+    from cayu.execution_profiles import ExecutionProfileComponentClass
+    from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
+
+    refusal = ExecutionProfileMismatchError(
+        session_id="scout-1-file",
+        expected_profile_fingerprint="a" * 64,
+        candidate_profile_fingerprint="b" * 64,
+        changed_component_classes=(ExecutionProfileComponentClass.RUNTIME,),
+        boundary="continuation",
+    )
+    state = {**_SETTLED["item"], "status": "pending", "settlement": None}
+    # What Cloud answers for an Agent's refused settle: its code and message, cut at
+    # 1000 characters, with the item's state.
+    detail = {"code": "conflict", "message": str(refusal)[:1000], "item": state}
+    real_client = httpx.Client
+
+    def client(**options):
+        return real_client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(409, json={"detail": detail})),
+            **options,
+        )
+
+    monkeypatch.setattr(cloud_api.httpx, "Client", client)
+    inbox = CloudInbox(cloud_api.CloudApiClient(api_url="https://cloud.example", api_key="k"), "a")
+    with pytest.raises(InboxClientError) as refused:
+        _run(inbox.settle("inbox_a", {"decision": "deny"}))
+    assert str(refused.value) == (
+        "Cayu Cloud API returned HTTP 409: Session scout-1-file execution profile changed "
+        "in: runtime. No resumed work was admitted."
+    )
+    assert refused.value.code == "conflict" and refused.value.item == state
+
+
 def test_the_cli_decides_on_a_cloud_agent_through_the_same_commands(monkeypatch, capsys) -> None:
     cloud = _Cloud(
         {
@@ -567,3 +606,32 @@ def test_the_local_continuation_wait_stops_at_wait_seconds(monkeypatch) -> None:
     assert len(polls) == 2
     # Shutdown gets nothing more: the continuation wait used the whole budget.
     assert inbox.remaining_wait_seconds() == 0.0
+
+
+@pytest.mark.parametrize(
+    "message", ["\ud800 refused. more\nline two", "x" * 600 + "\udfff refused. more\nline two"]
+)
+def test_unencodable_cloud_refusal_preserves_conflict_and_item(monkeypatch, message):
+    import httpx
+
+    import cayu.cli._cloud_api as cloud_api
+
+    state = {**_SETTLED["item"], "status": "pending", "settlement": None}
+    detail = {"code": "conflict", "message": message, "item": state}
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        cloud_api.httpx,
+        "Client",
+        lambda **options: real_client(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(409, content=json.dumps({"detail": detail}).encode())
+            ),
+            **options,
+        ),
+    )
+    inbox = CloudInbox(cloud_api.CloudApiClient(api_url="https://cloud.example", api_key="k"), "a")
+    with pytest.raises(InboxClientError) as refused:
+        _run(inbox.settle("inbox_a", {"decision": "deny"}))
+    assert str(refused.value) == "Cayu Cloud API returned HTTP 409."
+    assert refused.value.code == "conflict"
+    assert refused.value.item == state
