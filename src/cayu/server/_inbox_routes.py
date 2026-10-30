@@ -42,6 +42,7 @@ from cayu.knowledge.records import KnowledgeRevisionConflict, KnowledgeStatus
 from cayu.knowledge.search import decode_knowledge_list_cursor, encode_knowledge_list_cursor
 from cayu.runtime._approval_support import approval_resolution_request_digest
 from cayu.runtime._inbox_continuation import controlled_inbox_continuation
+from cayu.runtime._session_abandonment import stranded_approval_denial
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.human_attention import (
     AttentionKind,
@@ -591,6 +592,10 @@ def register_inbox_routes(
         event_types = (
             (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_BLOCKED)
             if item.kind == "recovery"
+            # A denial that ended its session after a profile change has no
+            # resumption; its denial event is the decision.
+            else (EventType.SESSION_RESUMED, EventType.TOOL_CALL_APPROVAL_DENIED)
+            if item.kind == "approval"
             else (EventType.SESSION_RESUMED,)
         )
         for _page in range(_CLAIM_SCAN_PAGES):
@@ -698,6 +703,9 @@ def register_inbox_routes(
         try:
             checkpoint = await session_store.load_checkpoint(session_id)
             if isinstance(request, ToolApprovalRequest):
+                denial = stranded_approval_denial(checkpoint, action_id)
+                if denial is not None:
+                    return denial["resolution_request_digest"] == digest
                 intent = approval_resolution_intent_from_checkpoint(checkpoint)
                 claimed = None if intent is None else (intent.approval_id, intent)
             else:
@@ -716,6 +724,22 @@ def register_inbox_routes(
     ) -> InboxSettleResponse:
         """Answer a settle of an item that is no longer pending."""
 
+        if isinstance(request, ToolApprovalRequest):
+            denial = stranded_approval_denial(
+                await session_store.load_checkpoint(item.session.id), item.reference.action_id
+            )
+            if denial is not None and denial["resolution_request_digest"] == (
+                approval_resolution_request_digest(request)
+            ):
+                # The session ends before its denial events are written. Replaying
+                # the same denial writes whichever are missing before it's reported.
+                await _accepted_detached_mutation(
+                    cayu_app.resolve_tool_approval(request),
+                    cayu_app=cayu_app,
+                    session_id=item.session.id,
+                    until=lambda event: event.type == EventType.SESSION_FAILED,
+                    conflict_error_types=(RuntimeError, ValueError),
+                )
         state = await session_item_state(item)
         if (
             state.settlement is not None

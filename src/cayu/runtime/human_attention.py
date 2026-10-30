@@ -224,6 +224,12 @@ async def _terminal_state(
                 return "resolved", "durable_closure"
             if decision == "deny":
                 return "cancelled", "durable_closure"
+        from cayu.runtime._session_abandonment import stranded_approval_denial
+
+        # A denial that the changed execution profile wouldn't let continue ended
+        # the session instead of closing the round.
+        if stranded_approval_denial(await store.load_checkpoint(ref.session_id), ref.action_id):
+            return "cancelled", "durable_closure"
     else:
         rows = await store.query_events(
             EventQuery(

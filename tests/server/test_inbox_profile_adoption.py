@@ -22,6 +22,7 @@ from tests.core.test_tool_approval_profile_adoption import (
 from tests.server.test_server_inbox import _as, _authenticate, _items, _settle
 
 from cayu.events import EventType
+from cayu.runtime._incomplete_session_recovery import IncompleteSessionRecovery
 from cayu.runtime.execution_profiles import ExecutionProfilePolicyAction
 from cayu.server import ServerConfig, create_server
 from cayu.sessions.memory import InMemorySessionStore
@@ -193,7 +194,74 @@ def test_a_changed_tool_catalogue_is_a_conflict_not_an_offer_to_adopt(monkeypatc
     app = _app(store, tool=_RedescribedFileBug(), profile_policy=_AdoptExplicitRequests())
     with TestClient(create_server(app, config=ServerConfig.protected(_authenticate))) as client:
         [item] = _items(client, "priya")
-        refused = _settle(client, item["id"], "priya", decision="deny")
+        refused = _settle(client, item["id"], "priya", decision="approve")
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "conflict"
     assert "direct_tools" in refused.json()["detail"]["message"]
+
+
+@pytest.mark.parametrize("tool", [_FileBug(behavior_version="2"), _RedescribedFileBug()])
+def test_the_inbox_settles_a_denial_the_changed_profile_wont_continue(monkeypatch, tool) -> None:
+    store = InMemorySessionStore()
+    _use_cayu(monkeypatch, "0.15.0")
+    asyncio.run(_pause(_app(store)))
+    _use_cayu(monkeypatch, "0.16.0")
+    tool.calls.clear()
+    app = _app(store, tool=tool)
+    with TestClient(create_server(app, config=ServerConfig.protected(_authenticate))) as client:
+        [item] = _items(client, "priya")
+        settled = _settle(client, item["id"], "priya", decision="deny", reason="Not a bug.")
+        assert settled.status_code == 200, settled.text
+        assert settled.json()["replayed"] is False
+        settlement = settled.json()["item"]["settlement"]
+        assert (settlement["decision"], settlement["reason"]) == ("deny", "Not a bug.")
+        assert settlement["decided_by"]["subject"] == "priya"
+        assert _items(client, "priya") == []
+
+        again = _settle(client, item["id"], "priya", decision="deny", reason="Not a bug.")
+        assert again.status_code == 200, again.text
+        assert again.json()["replayed"] is True
+        other = _settle(client, item["id"], "priya", decision="approve")
+        assert other.status_code == 409, other.text
+
+    assert tool.calls == []
+    assert not _still_pending(store)
+
+
+def test_a_retried_denial_writes_the_events_a_crash_left_out(monkeypatch) -> None:
+    store = InMemorySessionStore()
+    _use_cayu(monkeypatch, "0.15.0")
+    asyncio.run(_pause(_app(store)))
+    _use_cayu(monkeypatch, "0.16.0")
+    publish = IncompleteSessionRecovery._publish_stranded_approval_denial
+
+    async def crash_after_ending(self, session, denial):
+        # The session ended with the denial recorded; the process stops before its events.
+        raise RuntimeError("Worker stopped before the denial events were written.")
+
+    monkeypatch.setattr(
+        IncompleteSessionRecovery, "_publish_stranded_approval_denial", crash_after_ending
+    )
+    app = _app(store, tool=_FileBug(behavior_version="2"))
+    with TestClient(create_server(app, config=ServerConfig.protected(_authenticate))) as client:
+        [item] = _items(client, "priya")
+        assert (
+            _settle(client, item["id"], "priya", decision="deny", reason="Not a bug.").status_code
+            == 409
+        )
+        assert not _still_pending(store)
+        events = asyncio.run(store.load_events("bug-report"))
+        assert EventType.TOOL_CALL_APPROVAL_DENIED not in [e.type for e in events]
+
+        monkeypatch.setattr(IncompleteSessionRecovery, "_publish_stranded_approval_denial", publish)
+        again = _settle(client, item["id"], "priya", decision="deny", reason="Not a bug.")
+        assert again.status_code == 200, again.text
+        assert again.json()["replayed"] is True
+        settlement = again.json()["item"]["settlement"]
+        assert (settlement["decision"], settlement["decided_by"]["subject"]) == ("deny", "priya")
+
+    events = asyncio.run(store.load_events("bug-report"))
+    assert [e.type for e in events[-2:]] == [
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.SESSION_FAILED,
+    ]

@@ -18,6 +18,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from hashlib import sha256
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -274,6 +275,7 @@ from cayu.runtime._session_finalization import (
     _interaction_transition_replay_failures,
     _recovery_task_event,
 )
+from cayu.runtime._stranded_approval_denial import require_stranded_approval_review
 from cayu.runtime._terminal_event_publication import TerminalEventPublication
 from cayu.runtime._terminal_evidence_finalization import (
     _RECOVERY_RESUMABLE_SESSION_STATUSES,
@@ -990,6 +992,10 @@ class RecoveryCoordinator:
             policy.audit(action="decide", status="denied" if denying else "accepted")
         except Exception:
             raise HumanReviewDenied() from None
+
+    @property
+    def require_tool_approval_review(self) -> Callable[..., None]:
+        return partial(require_stranded_approval_review, self)
 
     async def _exact_persisted_user_input_manual_recovery(
         self,

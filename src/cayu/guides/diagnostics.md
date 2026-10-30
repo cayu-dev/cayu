@@ -536,12 +536,22 @@ again. The inbox reports a settle that needs adoption as a 409 with code
 `profile_changed`.
 
 One change can't be adopted at all: adding, removing or redescribing one of the
-agent's tools. The paused round froze the tools the model saw, and settling it
-either way continues that round, so approving and denying with
-`profile_adoption` both raise `ToolApprovalProfileAdoptionRefused` before any
-policy runs (without it, the ordinary mismatch above is raised). Settle such
-approvals with the application version that proposed them before you deploy the
-new tool set.
+agent's tools. The paused round froze the tools the model saw, and approving
+continues that round, so approving with `profile_adoption` raises
+`ToolApprovalProfileAdoptionRefused` before any policy runs (without it, the
+ordinary mismatch above is raised). Approve such calls with the application
+version that proposed them before you deploy the new tool set.
+
+A denial always settles. When the round can't continue under the current
+profile, whether the change can't be adopted or no policy adopts it, denying
+ends the session instead of continuing it. Nothing runs: Cayu records
+`tool.call.approval_denied` with the person and reason, removes the round from
+resumable work, and fails the session with `error_type: "SessionAbandoned"` and
+`reason: "tool_approval_denied_after_profile_change"`. The session can't be
+resumed; fork it to continue its conversation. Repeating the same denial replays
+those events. This needs a session with no environment binding and no task of
+its own (a `propose_tool_call` proposal, for example); for any other session the
+mismatch is still raised.
 
 ```python
 from cayu.approvals import ToolApprovalRequest

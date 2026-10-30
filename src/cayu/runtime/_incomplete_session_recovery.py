@@ -15,13 +15,17 @@ from uuid import UUID, uuid4, uuid5
 
 from cayu._validation import (
     canonical_durable_json_bytes,
+    copy_durable_json_value,
     copy_durable_metadata,
     copy_durable_record,
     copy_json_value,
     require_clean_nonblank,
 )
+from cayu.approvals.actors import resolution_actor_payload
 from cayu.approvals.tools import (
     PendingToolApproval,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
 )
 from cayu.approvals.user_input import (
     PENDING_USER_INPUT_CHECKPOINT_KEY,
@@ -49,7 +53,9 @@ from cayu.events import (
     Event,
     EventType,
     copy_event,
+    event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
 )
 from cayu.execution_profiles import (
     ExecutionProfileComponentClass,
@@ -140,8 +146,11 @@ from cayu.runtime._run_limits import (
     SessionUsageTracker,
 )
 from cayu.runtime._session_abandonment import (
+    STRANDED_APPROVAL_DENIAL_REASON,
+    abandoned_session_failure_payload,
     abandoned_session_from_checkpoint,
     abandoned_session_record,
+    stranded_approval_denial,
 )
 from cayu.runtime._session_control import (
     SessionControl,
@@ -242,6 +251,7 @@ from cayu.sessions.records import (
     CheckpointTransform,
     Session,
     SessionStatus,
+    SessionStatusConflict,
     _queued_dispatch_session_instance_fingerprint,
 )
 from cayu.sessions.recovery import (
@@ -274,6 +284,8 @@ _ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY = "abandoned_unreplayable_tool
 _COMPLETION_FINALIZATION_TASK_EVENT_NAMESPACE = UUID("ae86f400-31e6-4cd2-95f3-7d6f115c21a1")
 
 _PROVIDER_OPERATION_UNAVAILABLE_INTERRUPT_NAMESPACE = UUID("c7b311fa-d36b-4ecb-a93a-c96e4c047f01")
+
+_STRANDED_APPROVAL_DENIAL_NAMESPACE = UUID("951440b9-3a08-4b67-b436-b5310cc4c832")
 
 _INCOMPLETE_RECOVERY_CURSOR_VERSION = 1
 
@@ -358,6 +370,9 @@ class _RecoveryPreflightMutationRequired(RuntimeError):
 IncompleteRecoveryScopeHook = Callable[[str], Awaitable[None]]
 AbandonedModelRecoveryHook = Callable[[Session, InvocationContext], Awaitable[tuple[Event, ...]]]
 
+# Checks a tool-approval decision's human review against a checkpoint; accepted
+# requests skip the content check (RecoveryCoordinator.require_tool_approval_review).
+ToolApprovalReviewCheck = Callable[..., None]
 IncompleteRecoveryResultHook = Callable[
     [IncompleteSessionRecoveryResult, InvocationContext | None],
     Awaitable[IncompleteSessionRecoveryResult],
@@ -4761,6 +4776,245 @@ class IncompleteSessionRecovery:
                 steps=(("release_uncommitted_abandonment", release_uncommitted_abandonment),),
             )
             raise
+
+    async def deny_stranded_approval(
+        self,
+        request: ToolApprovalRequest,
+        *,
+        refusal: BaseException,
+        require_review: ToolApprovalReviewCheck,
+    ) -> tuple[Event, ...]:
+        """Settle a denial that the changed execution profile would not let continue.
+
+        A denial continues the paused round, and that continuation keeps the profile
+        the round started with. When the application changed more than Cayu and no
+        ``ExecutionProfilePolicy`` adopts the change, the round can't continue, so
+        the approval would stay pending until its deadline, which settles it the
+        same way. A denial runs nothing, so instead this ends the session without
+        continuing it: the round leaves resumable work, the session fails as
+        abandoned with the denial recorded, and ``tool.call.approval_denied`` then
+        ``session.failed`` are published. No model, tool or environment is touched,
+        so the current profile is never needed.
+
+        Anything else raises ``refusal``: a claimed or partly settled approval, a
+        session with an environment binding or unfinished tasks, or a round with an
+        uncertain tool effect, which ``abandon_session`` owns. The denial's human
+        review is checked against the paused approval, as the approval claim would.
+        Repeating the same denial publishes whichever events are missing, and
+        returns them all.
+        """
+
+        if request.decision is not ToolApprovalDecision.DENY:
+            raise refusal
+        session = await self._session_store.load(request.session_id)
+        if session is None:
+            raise refusal
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        if session.status is SessionStatus.FAILED:
+            denial = stranded_approval_denial(checkpoint, request.approval_id)
+            if denial is None or denial["resolution_request_digest"] != (
+                approval_support.approval_resolution_request_digest(request)
+            ):
+                raise refusal
+            require_review(request, session, checkpoint, accepted_request=True)
+            return await self._publish_stranded_approval_denial(session, denial)
+        if session.status is not SessionStatus.INTERRUPTED or session.environment_name is not None:
+            raise refusal
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        if (
+            pending_approval is None
+            or pending_round is None
+            or (
+                pending_approval.approval_id,
+                pending_approval.tool_round_id,
+                pending_approval.tool_call_id,
+            )
+            != (request.approval_id, request.tool_round_id, request.tool_call_id)
+            or pending_round.task_id is not None
+            or pending_approval_reader.approval_resolution_intent_from_checkpoint(
+                checkpoint, redactor=self._secret_redactor
+            )
+            is not None
+        ):
+            raise refusal
+        events = await self._session_store.load_events(session.id)
+        if approval_support.approval_resolution_history(
+            events=events, approval=pending_approval
+        ).has_resolution_activity or approval_support.recorded_tool_outcomes(
+            events=events, approval=pending_approval
+        ):
+            raise refusal
+        effects = ToolEffectStateOwner(self._session_store)
+        for call in pending_approval.tool_calls:
+            record = await effects.resolve_call(
+                session,
+                tool_round_id=pending_approval.tool_round_id,
+                tool_call_id=call.tool_call_id,
+            )
+            if record is not None:
+                raise refusal
+        tasks = self._session_tasks.task_store
+        if tasks is not None and await tasks.list_tasks(TaskQuery(session_id=session.id, limit=1)):
+            raise refusal
+
+        gating_call = next(
+            call
+            for call in pending_approval.tool_calls
+            if call.tool_call_id == pending_approval.tool_call_id
+        )
+        static_scope = pending_approval.secret_resolution_scope == "static"
+        public_request = request.model_copy(
+            update={"reason": request.reason if static_scope else None, "metadata": {}}
+        )
+        result = approval_support.approval_denied_tool_result(
+            public_request,
+            approval=pending_approval,
+            tool_call=approval_support.tool_call_request_from_pending(gating_call),
+            approval_required=True,
+        )
+        denial = {
+            "approval_id": pending_approval.approval_id,
+            "tool_round_id": pending_approval.tool_round_id,
+            "tool_call_id": pending_approval.tool_call_id,
+            "tool_name": pending_approval.tool_name,
+            "model_step_id": pending_approval.model_step_id,
+            "model_attempt_id": pending_approval.model_attempt_id,
+            "reason": public_request.reason,
+            "resolved_by": resolution_actor_payload(request.resolved_by),
+            "resolution_request_digest": approval_support.approval_resolution_request_digest(
+                request
+            ),
+            "result": self._secret_redactor.redact_json_values(result.model_dump(mode="json")),
+            "denied_at": self._clock().isoformat(),
+        }
+
+        def end_with_denial(
+            current_session: Session, current: dict[str, Any] | None
+        ) -> dict[str, Any]:
+            if current_session.run_epoch != session.run_epoch:
+                raise RuntimeError("Session changed before its denied approval ended it.")
+            if (
+                pending_approval_reader.approval_resolution_intent_from_checkpoint(
+                    current, redactor=self._secret_redactor
+                )
+                is not None
+            ):
+                raise RuntimeError("Tool approval was claimed before its denial ended the session.")
+            require_review(request, current_session, current)
+            copied, durable_round = self._checkpoint_without_pending_approval_round(
+                current_session, current, pending_round, pending_approval
+            )
+            if ABANDONED_SESSION_CHECKPOINT_KEY in copied:
+                raise RuntimeError("Session already retains abandonment evidence.")
+            copied[ABANDONED_SESSION_CHECKPOINT_KEY] = abandoned_session_record(
+                reason=STRANDED_APPROVAL_DENIAL_REASON,
+                metadata={},
+                tool_round=durable_round,
+                unknown_tool_calls=[],
+                denied_approval=denial,
+            )
+            return copied
+
+        from cayu.sessions._abandonment_checkpoint import abandonment_checkpoint_publication
+
+        try:
+            with abandonment_checkpoint_publication():
+                session = await self._session_store.transition_status_and_checkpoint(
+                    session.id,
+                    from_statuses={SessionStatus.INTERRUPTED},
+                    to_status=SessionStatus.FAILED,
+                    checkpoint_transform=end_with_denial,
+                )
+        except (RuntimeError, SessionStatusConflict) as conflict:
+            raise refusal from conflict
+        return await self._publish_stranded_approval_denial(session, denial)
+
+    async def _publish_stranded_approval_denial(
+        self, session: Session, denial: dict[str, Any]
+    ) -> tuple[Event, ...]:
+        """Publish the denial and terminal events of a stranded denial, idempotently."""
+
+        denied_at = datetime.fromisoformat(denial["denied_at"])
+        linkage = ("model_step_id", "model_attempt_id", "tool_round_id", "approval_id")
+        denied = event_with_runtime_payload_authority(
+            event_with_runtime_generated_id(
+                Event(
+                    id=str(
+                        uuid5(
+                            _STRANDED_APPROVAL_DENIAL_NAMESPACE,
+                            f"{session.id}\0denied\0{denial['approval_id']}",
+                        )
+                    ),
+                    type=EventType.TOOL_CALL_APPROVAL_DENIED,
+                    session_id=session.id,
+                    timestamp=denied_at,
+                    agent_name=session.agent_name,
+                    tool_name=denial["tool_name"],
+                    payload={
+                        "model_step_id": denial["model_step_id"],
+                        "model_attempt_id": denial["model_attempt_id"],
+                        "tool_round_id": denial["tool_round_id"],
+                        "approval_id": denial["approval_id"],
+                        "tool_call_id": denial["tool_call_id"],
+                        "approval_required": True,
+                        "reason": denial["reason"],
+                        "resolved_by": denial["resolved_by"],
+                        "expired": False,
+                        "result": copy_durable_json_value(denial["result"], "result"),
+                    },
+                )
+            ),
+            *linkage,
+        )
+        record = abandoned_session_from_checkpoint(
+            await self._session_store.load_checkpoint(session.id)
+        )
+        if record is None:
+            raise RuntimeError("Denied approval lost its abandonment evidence.")
+        failed = event_with_runtime_payload_authority(
+            event_with_runtime_envelope_authority(
+                event_with_runtime_generated_id(
+                    Event(
+                        id=str(
+                            uuid5(
+                                _STRANDED_APPROVAL_DENIAL_NAMESPACE,
+                                f"{session.id}\0failed\0{denial['approval_id']}",
+                            )
+                        ),
+                        type=EventType.SESSION_FAILED,
+                        session_id=session.id,
+                        timestamp=denied_at,
+                        agent_name=session.agent_name,
+                        payload=abandoned_session_failure_payload(record),
+                    )
+                ),
+                "session_id",
+            ),
+            "approval_id",
+            "tool_call_id",
+            "tool_round_id",
+        )
+        published = []
+        for event in (denied, failed):
+            prepared = self._event_writer.prepare(event)
+            existing = await self._session_store.query_events(
+                EventQuery(session_id=session.id, event_id=prepared.id, limit=1)
+            )
+            published.append(
+                existing[0].event if existing else await self._event_writer.persist(prepared)
+            )
+        await self._event_writer.fan_out_persisted(published)
+        return tuple(published)
 
     async def _finalize_interrupting_for_recovery(
         self,

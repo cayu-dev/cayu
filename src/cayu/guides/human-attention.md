@@ -313,8 +313,11 @@ person decides, unless the application configures an `ExecutionProfilePolicy`.
 Any other change needs `profile_adoption` on the request (the inbox answers 409
 `profile_changed` without it) and a policy that adopts it; the paused call is
 checked against the current tool and policy first. An approval whose agent
-gained, lost or redescribed a tool can only be settled by the version that
-proposed it. See
+gained, lost or redescribed a tool can only be approved by the version that
+proposed it. A denial always settles: when the paused round can't continue under
+the changed profile, denying ends the session (`session.failed` with
+`error_type: "SessionAbandoned"`) after recording `tool.call.approval_denied`, as
+long as the session has no environment binding or task of its own. See
 `cayu guide diagnostics#execution-profile-mismatch`.
 
 When human review is configured, pass the current review reference; notifications

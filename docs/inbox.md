@@ -290,17 +290,26 @@ don't reveal what exists.
 A pending approval keeps the execution profile its run started with. When only
 Cayu changed and the application has no `ExecutionProfilePolicy`, approving or
 denying adopts the new Cayu version on its own. Any other change, such as a new
-tool version, answers 409 `profile_changed` until the settle carries
+tool version, answers 409 `profile_changed` to an approval until the settle carries
 `profile_adoption` and the application's policy adopts it. A settle that already
 carried `profile_adoption` and was refused answers 409 `conflict`. Before anything runs,
 the paused call is checked against the current tool and policy; if they would no
 longer authorize it the same way, the settle answers 409 `conflict` and the
 approval stays pending, so deny it and let the agent propose the call again. A
 change to the agent's tool set (a tool added, removed or redescribed) can't be
-adopted: approving or denying answers 409 `conflict`, and only the application
-version that proposed the call can settle it. The
+adopted: approving answers 409 `conflict`. The
 Developer dashboard offers the same decision under the update after a
 `profile_changed` refusal. Use a new `idempotency_key` for each adoption.
+
+A denial always settles. When the change can't be adopted, the paused round can't
+continue, so a denial ends the session instead of continuing it: nothing runs,
+`tool.call.approval_denied` is recorded with the person and reason as usual, and
+the session fails with `error_type: "SessionAbandoned"` and `reason:
+"tool_approval_denied_after_profile_change"`. The settle answers 200 with a `deny`
+settlement; repeating it replays. This applies to a session with no environment
+binding and no task of its own, such as a `propose_tool_call` proposal; any other
+session still answers 409 until the application version that proposed the call
+settles it.
 
 ### Repeating a settle
 

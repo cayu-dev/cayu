@@ -37,20 +37,29 @@ if TYPE_CHECKING:
     from cayu.tasks.store import TaskStore
 
 
+STRANDED_APPROVAL_DENIAL_REASON = "tool_approval_denied_after_profile_change"
+
+
 def abandoned_session_record(
     *,
     reason: str,
     metadata: dict[str, Any],
     tool_round: dict[str, Any],
     unknown_tool_calls: list[dict[str, str]],
+    denied_approval: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "schema_version": 1,
         "reason": reason,
         "metadata": metadata,
         "tool_round": tool_round,
         "unknown_tool_calls": unknown_tool_calls,
     }
+    if denied_approval is not None:
+        # A person denied the round's approval, but the application's execution
+        # profile had changed so the round could not continue under it.
+        record["denied_approval"] = denied_approval
+    return record
 
 
 def abandoned_session_from_checkpoint(
@@ -69,14 +78,68 @@ def abandoned_session_from_checkpoint(
         or type(record.get("tool_round")) is not dict
         or type(record.get("unknown_tool_calls")) is not list
         or any(type(call) is not dict for call in record["unknown_tool_calls"])
+        or ("denied_approval" in record and not _valid_denied_approval(record["denied_approval"]))
     ):
         raise RuntimeError("Session retains malformed abandonment evidence.")
     return record
 
 
+_DENIED_APPROVAL_STRING_FIELDS = (
+    "approval_id",
+    "tool_round_id",
+    "tool_call_id",
+    "tool_name",
+    "model_step_id",
+    "model_attempt_id",
+    "resolution_request_digest",
+    "denied_at",
+)
+
+
+def _valid_denied_approval(denial: Any) -> bool:
+    return (
+        type(denial) is dict
+        and all(type(denial.get(field)) is str for field in _DENIED_APPROVAL_STRING_FIELDS)
+        and (denial.get("reason") is None or type(denial.get("reason")) is str)
+        and (denial.get("resolved_by") is None or type(denial.get("resolved_by")) is dict)
+        and type(denial.get("result")) is dict
+    )
+
+
+def stranded_approval_denial(
+    checkpoint: dict[str, Any] | None, approval_id: str
+) -> dict[str, Any] | None:
+    """The recorded denial of ``approval_id`` that ended its session, if any."""
+
+    record = abandoned_session_from_checkpoint(checkpoint)
+    denial = None if record is None else record.get("denied_approval")
+    if denial is None or denial["approval_id"] != approval_id:
+        return None
+    return denial
+
+
 def abandoned_session_failure_payload(record: dict[str, Any]) -> dict[str, Any]:
     """Terminal ``session.failed`` payload for an abandoned session."""
 
+    if "denied_approval" in record:
+        denial = record["denied_approval"]
+        return {
+            "error": (
+                "The pending approval was denied after the application's execution profile "
+                "changed. The session ended without continuing, because the paused round "
+                "could not continue under the changed profile."
+            ),
+            "error_type": "SessionAbandoned",
+            "abandoned": True,
+            "reason": record["reason"],
+            "metadata": copy_durable_metadata(record["metadata"]),
+            "approval_id": denial["approval_id"],
+            "tool_round_id": denial["tool_round_id"],
+            "tool_call_id": denial["tool_call_id"],
+            "tool_name": denial["tool_name"],
+            "tool_effect_outcome_unknown": [],
+            "recovered": True,
+        }
     return {
         "error": "Session was abandoned with unknown tool outcomes.",
         "error_type": "SessionAbandoned",

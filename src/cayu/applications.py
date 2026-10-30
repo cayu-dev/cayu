@@ -364,6 +364,7 @@ from cayu.resource_access import (
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
+from cayu.runtime import _stranded_approval_denial as stranded
 from cayu.runtime._application_run_defaults import (
     with_resolved_retry_policy,
 )
@@ -9380,6 +9381,10 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         session = await self.session_store.load(request.session_id)
         if session is not None:
             await self._require_participant_execution(session, participant_context)
+        if replayed := await stranded.replay_stranded_denial(self, session, request):
+            for event in replayed:
+                yield event
+            return
         approval_failure_identity = ApprovalTaskFailureIdentity(
             approval_id=request.approval_id,
             tool_round_id=request.tool_round_id,
@@ -9453,6 +9458,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
                 ),
             ),
         )
+        denial = request if task_id is None else None  # see deny_when_stranded below
         del request
         stream = await self._resource_session_stream.restore(stream, session_id)
         # Time the continuation under the planned deadline; it is stored at admission.
@@ -9460,6 +9466,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         stream = continuation_deadline_outcome(
             stream, self.session_store, timed, admission=admission
         )
+        stream = stranded.deny_when_stranded(stream, self, denial)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event

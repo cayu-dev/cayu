@@ -471,17 +471,11 @@ class _RedescribedFileBug(_FileBug):
         self.spec = self.spec.model_copy(update={"description": "File a bug, with labels."})
 
 
-@pytest.mark.parametrize(
-    ("decision", "adopt"),
-    [
-        (ToolApprovalDecision.APPROVE, True),
-        (ToolApprovalDecision.DENY, True),
-        (ToolApprovalDecision.DENY, False),
-    ],
-)
+@pytest.mark.parametrize("adopt", [True, False])
 def test_a_changed_tool_catalogue_is_refused_before_anything_is_committed(
-    monkeypatch, decision: ToolApprovalDecision, adopt: bool
+    monkeypatch, adopt: bool
 ) -> None:
+    # A denial ends the session instead (test_tool_approval_denial_after_profile_change).
     store = InMemorySessionStore()
     _use_cayu(monkeypatch, "0.15.0")
     requested = asyncio.run(_pause(_app(store)))
@@ -490,18 +484,14 @@ def test_a_changed_tool_catalogue_is_refused_before_anything_is_committed(
     policy = _AdoptExplicitRequests()
     settle = _approve(requested, profile_adoption=_intent() if adopt else None)
 
-    # Settling either way continues the round under the catalogue the model saw.
-    # Without an adoption request it stays the ordinary continuation mismatch.
+    # Approving continues the round under the catalogue the model saw. Without an
+    # adoption request it stays the ordinary continuation mismatch.
     with pytest.raises(
         ToolApprovalProfileAdoptionRefused if adopt else ExecutionProfileMismatchError,
         match="whether approved or denied" if adopt else "direct_tools",
     ):
         asyncio.run(
-            _collect(
-                _app(store, tool=tool, profile_policy=policy).resolve_tool_approval(
-                    settle.model_copy(update={"decision": decision})
-                )
-            )
+            _collect(_app(store, tool=tool, profile_policy=policy).resolve_tool_approval(settle))
         )
 
     if adopt:
