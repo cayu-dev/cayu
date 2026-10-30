@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import html
 import json
+from decimal import Decimal
 from functools import partial
 from math import isfinite
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import (
     copy_durable_json_object,
@@ -28,10 +37,18 @@ from cayu.evals.models import (
     EvalStatus,
     Trajectory,
     _model_instance_python_input,
+    _revalidate_model_instance,
     _revalidate_model_iterable,
     _validate_trajectory_record_contract,
 )
 from cayu.evals.operation_outcomes import OperationOutcomeSummary, operation_outcome_summary_text
+from cayu.evals.run_cost import (
+    EvalCostDifference,
+    EvalRunCost,
+    EvalTrialCost,
+    eval_cost_difference,
+    plain_cost_amount,
+)
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -47,6 +64,15 @@ _VERDICT_STATUSES = frozenset({EvalStatus.PASSED, EvalStatus.FAILED})
 # How much of a case's own reason a comparison repeats; an error can carry a whole traceback,
 # whose end names the exception.
 _COMPARISON_REASON_MAX_CHARS = 1000
+_COST_UNAVAILABLE_TEXT = {
+    "no_price_book": "no price book was selected",
+    "not_recorded": "this result did not record cost",
+    "usage_unavailable": "usage wasn't completely recorded",
+    "unpriced_usage": "the price book has no price for some model calls",
+    "baseline_unavailable": "the baseline cost is unavailable",
+    "current_unavailable": "the current cost is unavailable",
+    "pricing_differs": "the runs were priced with different price books",
+}
 
 
 class _TrajectoryDocument(BaseModel):
@@ -112,6 +138,14 @@ class EvalRunComparison(BaseModel):
     # Why the comparison can't decide: each case, or run, that neither passed nor failed.
     inconclusive_reasons: tuple[str, ...] = Field(default_factory=tuple)
     cases: tuple[EvalCaseComparison, ...] = Field(default_factory=tuple)
+    baseline_cost: EvalRunCost = Field(default_factory=EvalRunCost.not_recorded)
+    current_cost: EvalRunCost = Field(default_factory=EvalRunCost.not_recorded)
+    # Current minus baseline; derived from the two costs when omitted.
+    cost_difference: EvalCostDifference = Field(
+        default_factory=lambda data: eval_cost_difference(
+            data["baseline_cost"], data["current_cost"]
+        )
+    )
 
     @field_validator("baseline_run_id", "current_run_id", "baseline_suite_id", "current_suite_id")
     @classmethod
@@ -130,6 +164,22 @@ class EvalRunComparison(BaseModel):
     @classmethod
     def detach_cases(cls, value):
         return _revalidate_model_iterable(value, EvalCaseComparison)
+
+    @field_validator("baseline_cost", "current_cost", mode="before")
+    @classmethod
+    def revalidate_costs(cls, value):
+        return _revalidate_model_instance(value, EvalRunCost)
+
+    @field_validator("cost_difference", mode="before")
+    @classmethod
+    def revalidate_cost_difference(cls, value):
+        return _revalidate_model_instance(value, EvalCostDifference)
+
+    @model_validator(mode="after")
+    def validate_cost_difference(self) -> EvalRunComparison:
+        if self.cost_difference != eval_cost_difference(self.baseline_cost, self.current_cost):
+            raise ValueError("cost_difference must match the baseline and current costs.")
+        return self
 
 
 def _validated_durable_model_document(
@@ -318,7 +368,7 @@ def render_html_report(run: EvalRun) -> str:
     h1 {{ margin: 0 0 8px; font-size: 2rem; }}
     h2 {{ margin: 28px 0 12px; font-size: 1.25rem; }}
     p {{ margin: 0; color: #5d6864; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 24px 0; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin: 24px 0; }}
     .metric, table, .case {{ background: #fff; border: 1px solid #d9dfdc; border-radius: 8px; box-shadow: 0 8px 24px rgba(23, 32, 29, 0.08); }}
     .metric {{ padding: 14px; }}
     .metric strong {{ display: block; font-size: 1.35rem; }}
@@ -347,7 +397,9 @@ def render_html_report(run: EvalRun) -> str:
       <div class="metric"><strong>{_format_score(run.score)}</strong><span>Score</span></div>
       <div class="metric"><strong>{len(run.cases)}</strong><span>Cases</span></div>
       <div class="metric"><strong>{run.duration_ms} ms</strong><span>Duration</span></div>
+      <div class="metric"><strong>{_escape(_cost_amount_text(run.cost))}</strong><span>Cost</span></div>
     </div>
+    <p>Cost: {_escape(_run_cost_text(run.cost, trials=sum(len(case.trials) for case in run.cases)))}</p>
     <h2>Cases</h2>
     <table>
       <thead>
@@ -495,6 +547,8 @@ def compare_eval_runs(
         comparable_cases=comparable_cases,
         inconclusive_reasons=(*inconclusive["baseline"], *inconclusive["current"]),
         cases=tuple(comparisons),
+        baseline_cost=baseline.cost,
+        current_cost=current.cost,
     )
 
 
@@ -548,6 +602,8 @@ def render_comparison_html(comparison: EvalRunComparison) -> str:
     <h1>Cayu Eval Comparison</h1>
     <p>Baseline <code>{_escape(comparison.baseline_run_id)}</code> vs current <code>{_escape(comparison.current_run_id)}</code></p>
     <p>Score: {_format_score(comparison.baseline_score)} -&gt; {_format_score(comparison.current_score)}</p>
+    <p>Cost: {_escape(_run_cost_text(comparison.baseline_cost))} -&gt; {_escape(_run_cost_text(comparison.current_cost))}</p>
+    <p>Cost difference: {_escape(_cost_difference_text(comparison.cost_difference))}</p>
     <p>Memory-attribution comparison: <code>{_escape(comparison.memory_attribution_support)}</code> in this compact report.</p>
     <p>Comparable cases: {comparison.comparable_cases} of {len(comparison.cases)}</p>
     <h2>Inconclusive</h2>
@@ -666,6 +722,7 @@ def _trial_section(trial: Any) -> str:
         if trial.usage_summary is not None
         else ""
     )
+    cost = "" if trial.cost is None else f"<p>Cost: {_escape(_trial_cost_text(trial.cost))}</p>"
     operations = operation_outcome_summary_text(
         trial.operation_outcomes or OperationOutcomeSummary()
     )
@@ -677,7 +734,7 @@ def _trial_section(trial: Any) -> str:
         f"<p>Session <code>{_escape(trial.session_id or 'not created')}</code> · "
         f"score {_format_score(trial.score)} · {trial.duration_ms} ms · "
         f"evidence {'complete' if trial.evidence_complete else 'incomplete'}</p>"
-        f"{execution_html}{diagnostic_html}{failure_evidence_html}{failure_html}{final_output}{usage}"
+        f"{execution_html}{diagnostic_html}{failure_evidence_html}{failure_html}{final_output}{usage}{cost}"
         f"<p>{_escape(operations)}</p>"
         f"<p>Memory attribution: {_escape(memory_summary)} · revision "
         f"<code>{_escape(memory.revision)}</code></p>"
@@ -686,6 +743,53 @@ def _trial_section(trial: Any) -> str:
         "lifecycle transitions.</p>"
         f"<h5>Assertions</h5>{assertions}</div>"
     )
+
+
+def _cost_amount(amount: Decimal, currency: str | None, *, signed: bool = False) -> str:
+    sign = "+" if signed and amount >= 0 else ""
+    return f"{sign}{plain_cost_amount(amount)} {currency}"
+
+
+def _cost_amount_text(cost: EvalRunCost) -> str:
+    if cost.availability == "observed" and cost.estimated_cost is not None:
+        return _cost_amount(cost.estimated_cost, cost.currency)
+    return "unavailable"
+
+
+def _run_cost_text(cost: EvalRunCost, *, trials: int | None = None) -> str:
+    """Say what a run cost, marked observed, or why its cost is unavailable."""
+
+    priced_with = (
+        "" if cost.price_book_version is None else f", price book {cost.price_book_version}"
+    )
+    if cost.availability == "observed" and cost.estimated_cost is not None:
+        return f"{_cost_amount(cost.estimated_cost, cost.currency)} (observed{priced_with})"
+    text = f"unavailable: {_COST_UNAVAILABLE_TEXT[str(cost.unavailable_reason)]}"
+    if cost.estimated_cost is None:
+        return text
+    of_trials = "" if trials is None else f" of {trials}"
+    return (
+        f"{text}; {_cost_amount(cost.estimated_cost, cost.currency)} observed across "
+        f"{cost.observed_trials}{of_trials} trials{priced_with}"
+    )
+
+
+def _trial_cost_text(cost: EvalTrialCost) -> str:
+    if cost.availability == "observed" and cost.estimated_cost is not None:
+        return f"{_cost_amount(cost.estimated_cost, cost.currency)} (observed)"
+    text = f"unavailable: {_COST_UNAVAILABLE_TEXT[str(cost.unavailable_reason)]}"
+    if cost.estimated_cost is None:
+        return text
+    return (
+        f"{text}; {_cost_amount(cost.estimated_cost, cost.currency)} for "
+        f"{cost.priced_model_steps} of {cost.model_steps} model steps"
+    )
+
+
+def _cost_difference_text(difference: EvalCostDifference) -> str:
+    if difference.availability == "observed" and difference.estimated_cost is not None:
+        return f"{_cost_amount(difference.estimated_cost, difference.currency, signed=True)} (observed)"
+    return f"unavailable: {_COST_UNAVAILABLE_TEXT[str(difference.unavailable_reason)]}"
 
 
 def _status_badge(status: EvalStatus | EvalOutcome) -> str:

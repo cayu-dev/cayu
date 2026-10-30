@@ -2752,6 +2752,13 @@ also commit the request base, including its structured output, in the eval
 execution profile's target material and runtime profile.
 `EvalCaseComparison` and `EvalRunComparison` scores are optional finite values in
 the inclusive range from 0 through 1, matching their source eval results.
+`EvalRun.cost` is the sum of its trials' `EvalTrialCost` records. It is derived
+from the trials when omitted, a stated value that disagrees with them is
+rejected, and every priced trial in one run shares one price book and currency.
+A run with a trial that has no cost record, such as one saved before runs
+recorded cost, reads as `not_recorded`.
+`EvalRunComparison.cost_difference` is likewise derived from, and checked
+against, its baseline and current costs.
 `compare_eval_runs` accepts finite nonnegative score tolerances and rejects
 non-finite values before regression detection.
 

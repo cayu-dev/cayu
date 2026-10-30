@@ -1132,6 +1132,9 @@ from cayu.evals.results import eval_result_projection as eval_result_projection
 from cayu.evals.results import (
     validate_captured_result_for_corpus as validate_captured_result_for_corpus,
 )
+from cayu.evals.run_cost import EvalCostDifference as EvalCostDifference
+from cayu.evals.run_cost import EvalRunCost as EvalRunCost
+from cayu.evals.run_cost import EvalTrialCost as EvalTrialCost
 from cayu.evals.runner import EvalCase as EvalCase
 from cayu.evals.runner import EvalPlan as EvalPlan
 from cayu.evals.runner import EvalSuite as EvalSuite

@@ -490,6 +490,38 @@ def test_high_concurrency_process_eval_receipts_can_be_inspected_and_exported(
     _assert_dead([worker.pid for worker in snapshot.workers])
 
 
+@pytest.mark.parametrize("declared", [False, True])
+def test_process_eval_workers_price_with_the_project_eval_price_book(tmp_path, declared):
+    from cayu.budgets import default_price_book
+
+    _project(tmp_path)
+    if declared:
+        with (tmp_path / "pyproject.toml").open("a", encoding="utf-8") as pyproject:
+            pyproject.write('[tool.cayu.evals]\nprice_book = "bundled-public"\n')
+    process = _start(
+        tmp_path,
+        "eval",
+        "run",
+        "--processes",
+        "2",
+        "--max-concurrency",
+        "2",
+        "--process-directory",
+        "workers",
+        "--output",
+        "result.json",
+    )
+    stdout, stderr = _finished(process, 60)
+    assert process.returncode == 0, (stdout, stderr)
+    cost = json.loads((tmp_path / "result.json").read_text())["cost"]
+    if declared:
+        # Every worker priced with the book; the test provider reports no usage.
+        assert cost["price_book_version"] == default_price_book().price_book_version
+        assert cost["unavailable_reason"] == "usage_unavailable"
+    else:
+        assert cost["unavailable_reason"] == "no_price_book"
+
+
 def test_eval_plan_drift_fails_before_dispatch(tmp_path):
     _project(
         tmp_path,

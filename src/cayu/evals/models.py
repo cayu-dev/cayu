@@ -58,6 +58,7 @@ from cayu.evals.memory_attribution import (
     eval_memory_attribution_fingerprint,
 )
 from cayu.evals.operation_outcomes import OperationOutcomeSummary, trajectory_operation_outcomes
+from cayu.evals.run_cost import EvalRunCost, EvalTrialCost, eval_run_cost
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.evals.workflow_target import RetainedWorkflowEvalOutput, WorkflowEvalOutputEvidenceV1
 from cayu.events import Event, EventType
@@ -412,6 +413,9 @@ class EvalTrialResult(BaseModel):
     usage_evidence_state: Literal["complete", "partial", "unavailable"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    # The recorded usage priced with the run's price book. None when the result
+    # predates cost recording or came from a path that doesn't price trials.
+    cost: EvalTrialCost | None = Field(default=None, exclude_if=lambda value: value is None)
     memory_attribution: EvalMemoryAttributionEvidenceV1 = Field(
         default_factory=lambda: EvalMemoryAttributionEvidenceV1.unavailable(
             EvalMemoryEvidenceLimitation.MISSING
@@ -451,6 +455,11 @@ class EvalTrialResult(BaseModel):
     @classmethod
     def revalidate_eval_memory_attribution(cls, value):
         return _revalidate_model_instance(value, EvalMemoryAttributionEvidenceV1)
+
+    @field_validator("cost", mode="before")
+    @classmethod
+    def revalidate_cost(cls, value):
+        return _revalidate_model_instance(value, EvalTrialCost)
 
     @field_validator("error", "unavailable_reason", mode="before")
     @classmethod
@@ -588,6 +597,15 @@ class EvalTrialResult(BaseModel):
             self.session_id is None or self.usage_summary["session_id"] != self.session_id
         ):
             raise ValueError("usage_summary must belong to the trial session_id.")
+        if (
+            self.cost is not None
+            and self.cost.model_steps is not None
+            and (
+                self.usage_summary is None
+                or self.usage_summary["model_steps"] != self.cost.model_steps
+            )
+        ):
+            raise ValueError("A trial's cost must price the usage it recorded.")
         if any(
             assertion.cost_summary is not None
             and (self.session_id is None or assertion.cost_summary.session_id != self.session_id)
@@ -1083,6 +1101,9 @@ class EvalRun(BaseModel):
     duration_ms: StrictInt = Field(default=0, ge=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
     run_contract: EvalRunContractV1 | EvalRunContractV2 | None = None
+    # The trials' costs added up. It is derived from the cases when omitted, and
+    # must match them when given.
+    cost: EvalRunCost = Field(default_factory=lambda data: _default_run_cost(data["cases"]))
 
     @model_validator(mode="before")
     @classmethod
@@ -1127,6 +1148,11 @@ class EvalRun(BaseModel):
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_durable_metadata(value, "metadata")
+
+    @field_validator("cost", mode="before")
+    @classmethod
+    def revalidate_cost(cls, value):
+        return _revalidate_model_instance(value, EvalRunCost)
 
     @field_validator("run_contract", mode="before")
     @classmethod
@@ -1176,7 +1202,24 @@ class EvalRun(BaseModel):
             raise ValueError("Run status does not match its cases.")
         if self.score != expected_score:
             raise ValueError("Run score does not match its cases.")
+        if self.cost != aggregate_eval_cost(self.cases):
+            raise ValueError("Run cost does not match its trials.")
         return self
+
+
+def aggregate_eval_cost(cases: Iterable[EvalCaseResult]) -> EvalRunCost:
+    """Add up the costs of every trial in ``cases``."""
+
+    return eval_run_cost(trial.cost for case in cases for trial in case.trials)
+
+
+def _default_run_cost(cases: Iterable[EvalCaseResult]) -> EvalRunCost:
+    try:
+        return aggregate_eval_cost(cases)
+    except ValueError:
+        # Trials priced with different books. The run validator reports it as a
+        # validation error, which a default factory cannot raise.
+        return EvalRunCost.not_recorded()
 
 
 def _status_from_assertions(assertions: Iterable[EvalAssertionResult]) -> EvalStatus:

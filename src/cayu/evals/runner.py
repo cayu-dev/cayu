@@ -34,6 +34,7 @@ from cayu.artifacts.base import (
     ArtifactScope,
     copy_artifact_read_result,
 )
+from cayu.budgets.pricing import PriceBook
 from cayu.budgets.usage import (
     SessionUsageSummary,
     session_usage_summary_payload,
@@ -95,6 +96,7 @@ from cayu.evals.models import (
     WorkspaceStructuralProbe,
     _artifact_text_media_type_supported,
     _model_instance_python_input,
+    _trajectory_nodes,
     _validate_trajectory_record_contract,
     aggregate_eval_score,
     aggregate_eval_status,
@@ -106,6 +108,7 @@ from cayu.evals.result_contract import (
     EvalTrialOutputPreviewV1,
     _EvalTrialPublicData,
 )
+from cayu.evals.run_cost import EvalTrialCost, eval_trial_cost
 from cayu.evals.testing import (
     ScriptedModelProvider,
     _claim_positional_provider,
@@ -209,7 +212,7 @@ _EXECUTION_LIMITS = frozenset(get_args(EvalExecutionLimit))
 
 if TYPE_CHECKING:
     from cayu.evals.corpus import EvalCorpusDocument
-    from cayu.evals.evidence import AssertionEvidenceView
+    from cayu.evals.evidence import AssertionEvidenceView, _ValidatedPricingSnapshot
     from cayu.evals.execution import CorpusExecutionResult, CorpusTarget, WorkflowEvalTarget
     from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 
@@ -896,6 +899,7 @@ async def _run_workflow_eval_suite(
     run, _ = await _run_eval_suite(
         target.app,
         suite,
+        price_book=target.price_book,
         retain_trajectory=retain_trajectory,
         retain_final_output=retain_final_output,
         max_concurrency=max_concurrency,
@@ -939,6 +943,7 @@ async def run_eval_suite(
     trials: int = 1,
     execution_capacity: EvalExecutionCapacity | None = None,
     trial_policy: EvalSuiteTrialPolicyV1 | None = None,
+    price_book: PriceBook | None = None,
 ) -> EvalRun:
     """Run every case in the suite and aggregate the results.
 
@@ -960,10 +965,15 @@ async def run_eval_suite(
     `retain_final_output=False` discards raw trial output after assertions have
     evaluated. It cannot be combined with trajectory retention because a retained
     trajectory must remain lossless.
+
+    `price_book` prices each trial's recorded model usage in USD, and the run's
+    `cost` adds the trials up. Without one, the run's cost is unavailable with
+    the reason `no_price_book`.
     """
     run, _ = await _run_eval_suite(
         app,
         suite,
+        price_book=price_book,
         retain_trajectory=retain_trajectory,
         retain_final_output=retain_final_output,
         max_concurrency=max_concurrency,
@@ -1042,9 +1052,12 @@ async def _run_eval_suite(
     workflow_target: WorkflowEvalTarget | None = None,
     workflow_execution_profile_fingerprint: str | None = None,
     workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
+    price_book: PriceBook | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
+    if price_book is not None and type(price_book) is not PriceBook:
+        raise TypeError("run_eval_suite price_book must be an exact PriceBook or None.")
     if type(suite) is not EvalSuite:
         raise TypeError("run_eval_suite requires an EvalSuite.")
     suite = _detach_eval_suite(suite)
@@ -1147,10 +1160,14 @@ async def _run_eval_suite(
     )
     if workflow_target is not None and workflow_instance_tracker is None:
         workflow_instance_tracker = _WorkflowInstanceTracker(workflow_target.instance_scope.value)
+    from cayu.evals.evidence import _validated_pricing
+
+    pricing = _validated_pricing(price_book)
     async with memory_attribution_read_lifecycle:
         results, public_data_by_case = await _run_suite_cases(
             app,
             suite,
+            pricing=pricing,
             retain_trajectory=retain_trajectory,
             retain_final_output=retain_final_output,
             max_concurrency=max_concurrency,
@@ -1203,11 +1220,20 @@ async def run_eval_plan(
     case_timeout_seconds: float | None = None,
     trials: int | None = None,
     execution_capacity: EvalExecutionCapacity | None = None,
+    price_book: PriceBook | None = None,
 ) -> EvalRun | CorpusExecutionResult:
+    """Run a plan in its configured mode.
+
+    `price_book` prices a direct app plan's run, as in `run_eval_suite`. A
+    workflow or corpus target prices with its own `price_book`.
+    """
+
     if type(plan) is not EvalPlan:
         raise TypeError("run_eval_plan requires an EvalPlan.")
     if execution_capacity is not None and type(execution_capacity) is not EvalExecutionCapacity:
         raise TypeError("execution_capacity must be an exact EvalExecutionCapacity or None.")
+    if price_book is not None and plan.app is None:
+        raise ValueError("A workflow or corpus EvalPlan prices with its target's price_book.")
     portable_target = plan.corpus_target or (
         plan.workflow_target if plan.workflow_target is not None and plan.suite is None else None
     )
@@ -1254,6 +1280,7 @@ async def run_eval_plan(
         case_timeout_seconds=case_timeout_seconds,
         trials=1 if trials is None else trials,
         execution_capacity=execution_capacity,
+        price_book=price_book,
     )
 
 
@@ -1261,6 +1288,7 @@ async def _run_suite_cases(
     app: CayuApp,
     suite: EvalSuite,
     *,
+    pricing: _ValidatedPricingSnapshot | None,
     retain_trajectory: bool,
     retain_final_output: bool,
     max_concurrency: int,
@@ -1305,6 +1333,7 @@ async def _run_suite_cases(
             workflow_target=workflow_target,
             workflow_instance_tracker=workflow_instance_tracker,
             workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
+            pricing=pricing,
         )
         return result
 
@@ -2093,6 +2122,7 @@ async def _run_workflow_case_once_with_public_projection(
     memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
     workflow_instance_tracker: _WorkflowInstanceTracker,
     workflow_execution_profile_fingerprint: str,
+    pricing: _ValidatedPricingSnapshot | None,
 ) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
     """Execute one workflow trial and bind output to durable current-attempt evidence."""
 
@@ -2853,6 +2883,11 @@ async def _run_workflow_case_once_with_public_projection(
             usage_evidence_state="unavailable"
             if trajectory is not None and trajectory.children_incomplete
             else None,
+            cost=_workflow_trial_cost(
+                pricing,
+                session_id=root_session_id,
+                trajectory=None if failure_capture is not None else trajectory,
+            ),
             operation_outcomes=trajectory_operation_outcomes(trajectory),
             memory_attribution=memory_attribution,
             started_at=started_at,
@@ -2861,6 +2896,29 @@ async def _run_workflow_case_once_with_public_projection(
             trajectory=trajectory if retain_trajectory else None,
         ),
         public_data,
+    )
+
+
+def _workflow_trial_cost(
+    pricing: _ValidatedPricingSnapshot | None,
+    *,
+    session_id: str,
+    trajectory: Trajectory | None,
+) -> EvalTrialCost:
+    """Price the sessions whose usage a workflow trial's usage summary adds up."""
+
+    if trajectory is None or trajectory.children_incomplete or trajectory.usage_summary is None:
+        return eval_trial_cost(pricing, session_id=session_id, events=None, evidence_complete=False)
+    nodes = (
+        _trajectory_nodes(trajectory)[1:]
+        if trajectory.workflow_output is not None
+        else (trajectory,)
+    )
+    return eval_trial_cost(
+        pricing,
+        session_id=session_id,
+        events=[event for node in nodes for event in node.events],
+        evidence_complete=True,
     )
 
 
@@ -2884,6 +2942,7 @@ async def _run_case_once_with_public_projection(
     workflow_target: WorkflowEvalTarget | None = None,
     workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
     workflow_execution_profile_fingerprint: str | None = None,
+    pricing: _ValidatedPricingSnapshot | None = None,
 ) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
     if workflow_target is not None:
         if run_id is None:
@@ -2908,6 +2967,7 @@ async def _run_case_once_with_public_projection(
             memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
             workflow_instance_tracker=workflow_instance_tracker,
             workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
+            pricing=pricing,
         )
     started_at = datetime.now(UTC)
     trial_request = _isolated_trial_request(case.request)
@@ -3525,6 +3585,12 @@ async def _run_case_once_with_public_projection(
             usage_summary=session_usage_summary_payload(usage_summary)
             if usage_summary is not None
             else None,
+            cost=eval_trial_cost(
+                pricing,
+                session_id=None if session is None else session.id,
+                events=None if session is None else events,
+                evidence_complete=evidence_complete,
+            ),
             operation_outcomes=trajectory_operation_outcomes(trajectory),
             memory_attribution=memory_attribution,
             started_at=started_at,

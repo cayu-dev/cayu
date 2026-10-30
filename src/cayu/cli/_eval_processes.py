@@ -13,12 +13,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from cayu.budgets.pricing import PriceBook
 from cayu.build_provenance import current_runtime_build_provenance
 from cayu.cli._eval_process_reporting import (
     ReportedProcessEvalRun,
     combine_worker_reports,
     save_worker_report,
 )
+from cayu.cli.project_control_plane import project_eval_price_book
 from cayu.evals._admission import (
     LaunchAdmission,
     LaunchScheduling,
@@ -28,6 +30,7 @@ from cayu.evals._admission import (
 from cayu.evals._inspection_documents import write_process_document as _write_json
 from cayu.evals._process_progress import ProcessEvalProgress
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
+from cayu.evals.corpus import pricing_profile_identity
 from cayu.evals.models import EvalRun, aggregate_eval_score, aggregate_eval_status
 from cayu.evals.reporting import eval_run_to_json
 from cayu.evals.runner import EvalPlan, EvalSuite, run_eval_suite, run_workflow_eval_suite
@@ -52,7 +55,19 @@ def _read_json(path: Path):
     return json.loads(data)
 
 
-async def _plan_identity(plan: EvalPlan) -> dict:
+def _worker_price_book(plan: EvalPlan) -> PriceBook | None:
+    """The book a worker's runs are priced with, which joins its plan identity.
+
+    A workflow target prices with its own book; an app plan with the project's
+    ``[tool.cayu.evals] price_book``, read from the project root workers run in.
+    """
+
+    if plan.workflow_target is not None:
+        return plan.workflow_target.price_book
+    return project_eval_price_book(Path.cwd())
+
+
+async def _plan_identity(plan: EvalPlan, price_book: PriceBook | None) -> dict:
     if plan.suite is None or plan.corpus_target is not None:
         raise ValueError("Process execution currently requires a native direct EvalSuite.")
     for key in (_METADATA_KEY, "cayu_launch_scheduling"):
@@ -111,6 +126,7 @@ async def _plan_identity(plan: EvalPlan) -> dict:
         "application": app.describe().fingerprint,
         "target": None if target is None else target.identity().model_dump(mode="json"),
         "profiles": profiles,
+        "pricing": None if price_book is None else pricing_profile_identity(price_book).fingerprint,
     }
     fingerprint = hashlib.sha256(
         json.dumps(material, sort_keys=True, allow_nan=False).encode()
@@ -368,7 +384,8 @@ async def _worker(directory: Path, index: int) -> None:
     watcher = asyncio.create_task(watch_supervisor(stop))
     try:
         plan = await _load_eval_plan(launch["target"], label="Process eval target")
-        identity = await _plan_identity(plan)
+        price_book = _worker_price_book(plan)
+        identity = await _plan_identity(plan, price_book)
         _write_json(
             directory / f"ready-{index}.json",
             {
@@ -391,7 +408,7 @@ async def _worker(directory: Path, index: int) -> None:
         if launch["schema_version"] == 3:
             if admission.get("scheduling") != "dynamic_claims" or any(admission["assignments"]):
                 raise RuntimeError("Dynamic case launch has inconsistent admission")
-            await _dynamic_worker(directory, index, launch, identity, plan)
+            await _dynamic_worker(directory, index, launch, identity, plan, price_book)
             return
         assigned = admission["assignments"][index]
         expected = identity["case_ids"][index :: launch["processes"]]
@@ -438,8 +455,9 @@ async def _worker(directory: Path, index: int) -> None:
                     max_concurrency=capacity,
                     case_timeout_seconds=launch["case_timeout_seconds"],
                     trial_policy=policy,
+                    price_book=price_book,
                 )
-            if await _plan_identity(plan) != identity:
+            if await _plan_identity(plan, price_book) != identity:
                 raise RuntimeError("Process eval target changed during execution.")
             _write_json(directory / f"result-{index}.json", json.loads(eval_run_to_json(result)))
             save_worker_report(directory, index, launch, plan, result)
@@ -449,7 +467,7 @@ async def _worker(directory: Path, index: int) -> None:
             await watcher
 
 
-async def _dynamic_worker(directory, index, launch, identity, plan):
+async def _dynamic_worker(directory, index, launch, identity, plan, price_book):
     from types import SimpleNamespace
 
     from cayu.evals._inspection_documents import ProcessDocuments
@@ -501,6 +519,7 @@ async def _dynamic_worker(directory, index, launch, identity, plan):
             max_concurrency=1,
             case_timeout_seconds=launch["case_timeout_seconds"],
             trial_policy=policy,
+            price_book=price_book,
         )
 
     worker_task = asyncio.current_task()
@@ -534,7 +553,7 @@ async def _dynamic_worker(directory, index, launch, identity, plan):
                 # await propagation still cancels and settles it with its owner.
                 result = await asyncio.create_task(run_case(suite))
                 check_cancelled()
-                if await _plan_identity(plan) != identity:
+                if await _plan_identity(plan, price_book) != identity:
                     raise RuntimeError("Process eval target changed during execution")
                 await claims.complete(case_id, slot, result)
                 case_id = None

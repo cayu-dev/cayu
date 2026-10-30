@@ -406,7 +406,9 @@ nor failed, with that result's own reason. A direct-suite comparison also keeps 
 `inconclusive_reasons` and still reports what it could compare: `comparable_cases`
 (cases that passed or failed in both runs), `regressions` and `improvements` (each also
 on its case), and each case's `baseline_reason` and `current_reason`. Direct-suite runs
-use the same `0`/`1`/`2` status mapping. `eval report` and `eval compare`
+use the same `0`/`1`/`2` status mapping. A direct-suite report shows the run's cost and a
+comparison shows both costs and their difference, each marked observed or unavailable; see
+[Run cost](#run-cost). `eval report` and `eval compare`
 auto-detect direct `EvalRun`, captured `CapturedEvaluationResultV1`, and fresh
 `CorpusExecutionResult` documents. Captured and fresh published results can be
 compared with each other through the same compatibility projection and stable
@@ -2081,6 +2083,8 @@ The same suite/assertion surface supports several modes:
   budget is checked and recorded as in production. The session keeps the provider name
   `scripted`, and each estimate's billing evidence records
   `pricing_basis="scripted_test_estimate"`. A real route without a price still fails closed.
+  The same route gives a hermetic run a priced [run cost](#run-cost) when it is run with a
+  `price_book`.
 - **Integration** — run against real providers, tools, runners, and environments to check whether
   the agent actually solves the task and to capture real cost/latency/tool usage. Slower and
   optionally gated behind credentials.
@@ -2158,6 +2162,61 @@ A trial records its candidate runtime outcome in `execution_status`,
 
 The HTML reports and `cayu eval failures` show this as `Candidate run: failed
 (<category>)`, or `(limit_reached: <limit>)` for a run limit.
+
+### Run cost
+
+A direct run prices each trial's recorded model usage with a price book and
+adds the trials up:
+
+```python
+from cayu.budgets import default_price_book
+
+result = await run_eval_suite(app, suite, trials=50, price_book=default_price_book())
+result.cost.estimated_cost       # Decimal, in USD
+result.cases[0].trials[0].cost   # that trial's cost
+```
+
+Pricing uses the estimator behind cost budgets, `get_session_cost` and server
+runs' cost assertions. A trial's cost prices the same events as its
+`usage_summary`: for an app trial that is its own session, so its cost equals
+that session's `get_session_cost` under the same book, and a sub-agent's
+separate sessions aren't included. A workflow run (`run_workflow_eval_suite`) prices the child
+sessions its usage adds up with its `WorkflowEvalTarget.price_book`. `cayu eval run` prices a direct app plan with
+the project's `[tool.cayu.evals] price_book`; see
+[Server-attached durable execution](#server-attached-durable-execution).
+
+Cayu never picks a price book for an eval run on its own: the bundled book is a
+dated snapshot of public rates, and a cost estimated with it would silently
+change between Cayu versions and differ from negotiated or gateway pricing. To
+use it, pass `default_price_book()` or declare `price_book = "bundled-public"`.
+
+`EvalRun.cost` is `observed` when every trial's usage was completely recorded
+and priced. Otherwise it is `unavailable` and `unavailable_reason` says why:
+
+- `no_price_book`: no price book was selected.
+- `usage_unavailable`: some trial's usage wasn't completely recorded, for
+  example because the case timed out.
+- `unpriced_usage`: the price book has no price for some model calls.
+- `not_recorded`: the result was saved before runs recorded their cost.
+
+An unavailable cost still keeps `estimated_cost` for the `observed_trials`
+whose cost was observed. Each trial's `cost` has the same states, and also
+keeps whatever part of an unavailable trial could be priced. The cost is an
+estimate in USD from the price book's rates, not a provider bill, and it names
+the `price_book_version` and `pricing_profile_fingerprint` it used. A run
+saved with a cost that doesn't add up to its trials' costs is rejected when
+loaded.
+
+`cayu eval report` shows the run's cost and each trial's. `cayu eval compare`
+and `compare_eval_runs` show both runs' costs and the `cost_difference`
+(current minus baseline). The difference is `observed` only when both costs
+are observed and were priced with the same price book; otherwise it is
+`unavailable` with `baseline_unavailable`, `current_unavailable` or
+`pricing_differs`. Cost never changes a comparison's exit code.
+
+For a hermetic test of cost, let a scripted route stand in for a priced one
+with `ScriptedModelProvider(..., billing_provider_name="openai",
+usage_dialect=UsageDialect.OPENAI)` (see [Eval modes](#eval-modes)).
 
 For every AI judgment, the presentation retains the safe judge-profile and
 evaluator-implementation identity, independent/same-model label, diagnostic,
@@ -3302,9 +3361,10 @@ and bounded public reference truth; `public-and-transcript` also permits the
 retained transcript. Neither declaration permits private reference content.
 
 `price_book = "bundled-public"` deliberately selects Cayu's packaged, dated
-public-rate snapshot for generated candidate and judge cost enforcement; it is
-never inferred. Applications with negotiated or gateway pricing must continue
-to publish one complete application-owned `PriceBook` through server
+public-rate snapshot for generated candidate and judge cost enforcement, and for
+the [run cost](#run-cost) of direct app plans from `cayu eval run`; it is never
+inferred. Applications with negotiated or gateway pricing must continue to
+publish one complete application-owned `PriceBook` through server
 configuration. A judge cost ceiling requires a configured project price book.
 
 Author-first launch readiness can additionally accept a per-trial candidate

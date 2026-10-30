@@ -587,10 +587,14 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
                 raise ValueError("Corpus EvalPlan execution requires --corpus FILE.")
             if args.suite is not None:
                 raise ValueError("--suite requires --corpus FILE.")
+            from cayu.cli.project_control_plane import project_eval_price_book
+
             run = await run_eval_plan(
                 plan,
                 max_concurrency=args.max_concurrency,
                 case_timeout_seconds=args.case_timeout_seconds,
+                # A workflow target prices with its own price book.
+                price_book=None if plan.app is None else project_eval_price_book(project.root),
             )
             if type(run) is not EvalRun:
                 raise TypeError("Direct EvalPlan returned an unexpected corpus result.")

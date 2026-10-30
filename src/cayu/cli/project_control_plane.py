@@ -116,6 +116,38 @@ def project_eval_worker(root: Path) -> str | None:
     web process doesn't.
     """
 
+    read = _project_evals_table(root)
+    if read is None:
+        return None
+    pyproject, document, evals = read
+    return _eval_worker(document, evals, pyproject=pyproject)
+
+
+def project_eval_price_book(root: Path) -> PriceBook | None:
+    """The price book ``[tool.cayu.evals].price_book`` selects, if any."""
+
+    read = _project_evals_table(root)
+    if read is None:
+        return None
+    pyproject, _, evals = read
+    return _eval_price_book(evals, pyproject=pyproject)
+
+
+def project_eval_target_references(root: Path) -> tuple[str, ...]:
+    """The ``module:function`` references in ``[tool.cayu.evals].targets``, in order."""
+
+    read = _project_evals_table(root)
+    if read is None:
+        return ()
+    pyproject, _, evals = read
+    return _eval_target_references(evals, pyproject=pyproject)
+
+
+def _project_evals_table(
+    root: Path,
+) -> tuple[Path, Mapping[str, object], Mapping[str, object]] | None:
+    """The project's pyproject path, document and ``[tool.cayu.evals]`` table, if declared."""
+
     pyproject = root.resolve() / "pyproject.toml"
     try:
         document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
@@ -124,21 +156,7 @@ def project_eval_worker(root: Path) -> str | None:
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ProjectError(f"Could not read {pyproject}: {exc}") from exc
     evals = _evals_table(document, pyproject=pyproject)
-    return None if evals is None else _eval_worker(document, evals, pyproject=pyproject)
-
-
-def project_eval_target_references(root: Path) -> tuple[str, ...]:
-    """The ``module:function`` references in ``[tool.cayu.evals].targets``, in order."""
-
-    pyproject = root.resolve() / "pyproject.toml"
-    try:
-        document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return ()
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise ProjectError(f"Could not read {pyproject}: {exc}") from exc
-    evals = _evals_table(document, pyproject=pyproject)
-    return () if evals is None else _eval_target_references(evals, pyproject=pyproject)
+    return None if evals is None else (pyproject, document, evals)
 
 
 def close_project_control_plane_context(context: ProjectControlPlaneContext | None) -> None:
@@ -280,6 +298,15 @@ def _eval_worker(
     return worker
 
 
+def _eval_price_book(evals: Mapping[str, object], *, pyproject: Path) -> PriceBook | None:
+    source = evals.get("price_book")
+    if source is None:
+        return None
+    if source == "bundled-public":
+        return default_price_book()
+    raise ProjectError(f'{pyproject}: [tool.cayu.evals].price_book must be "bundled-public".')
+
+
 def _project_evals_configuration(
     document: Mapping[str, object],
     *,
@@ -290,13 +317,7 @@ def _project_evals_configuration(
         return None, None
     _eval_target_references(evals, pyproject=pyproject)
     _eval_worker(document, evals, pyproject=pyproject)
-    price_book_source = evals.get("price_book")
-    if price_book_source is None:
-        eval_price_book = None
-    elif price_book_source == "bundled-public":
-        eval_price_book = default_price_book()
-    else:
-        raise ProjectError(f'{pyproject}: [tool.cayu.evals].price_book must be "bundled-public".')
+    eval_price_book = _eval_price_book(evals, pyproject=pyproject)
     configured = evals.get("default_judge")
     if configured is None:
         return None, eval_price_book

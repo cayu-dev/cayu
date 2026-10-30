@@ -398,7 +398,7 @@ def test_dynamic_slot_stop_retains_claim_and_settles_case(
         async def run():
             async with asyncio.timeout(None) as deadline:
                 deadlines.append(deadline)
-                await _eval_processes._dynamic_worker(tmp_path, 0, launch, identity, plan)
+                await _eval_processes._dynamic_worker(tmp_path, 0, launch, identity, plan, None)
 
         deadlines = []
         worker = asyncio.create_task(run())
