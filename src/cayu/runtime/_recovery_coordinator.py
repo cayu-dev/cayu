@@ -4747,6 +4747,7 @@ class RecoveryCoordinator:
                 request = ToolApprovalRequest(
                     session_id=request.session_id,
                     task_worker_id=request.task_worker_id,
+                    task_handoff_id=request.task_handoff_id,
                     approval_id=request.approval_id,
                     tool_round_id=request.tool_round_id,
                     tool_call_id=request.tool_call_id,
