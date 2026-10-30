@@ -37,6 +37,68 @@ the base including its version path, such as `https://host/v1`, and adds only
 put the version in different places; the one exception is a bare
 `https://api.openai.com`, which it treats as `https://api.openai.com/v1`.
 
+## Check that a model answers
+
+`cayu providers check MODEL` tells you whether a model answers through the
+project's provider and credentials, and whether Cayu can price it, before an
+agent depends on it. `cayu doctor --model MODEL` runs the same check and writes
+no bundle.
+
+```bash
+cayu providers check gpt-6.1-sol
+cayu providers check claude-sonnet-5 --provider anthropic --table
+```
+
+The command builds the application as `cayu check` and `cayu serve` do: the
+maintained service's app when `[tool.cayu].service_factory` is set, else the
+`factory`'s. It sends one request: a fixed short prompt, an output cap of 16 tokens
+(the lowest OpenAI Responses accepts), no tools, and a 30-second deadline. The
+request is billed like any other. Without `--provider` it goes where an agent
+using the model would: the one provider whose `model_patterns` match it, else
+the default provider. `route.resolution` says which (`model_pattern`, `default`
+or `explicit`).
+
+The JSON result reports `ok`, `latency_ms`, the route, the `answer`'s finish
+reason and the token `usage`. The route adds `provider_model` when the provider
+reports a different model ID and `billing_provider` when another provider bills
+the request. `pricing.priced` says whether the price book prices the route:
+`[tool.cayu.serve].price_book` when the project sets one (`source: project`),
+else Cayu's bundled book (`source: bundled`). As for a run, the model the
+provider reports is the one priced, under the billing identity the completion
+settles, such as the service tier that served it. Pricing also carries the check's own
+estimated cost, or the reason the route is unpriced, and is reported even when
+the request fails.
+
+The prompt, the answer text and credentials never appear in the output. Neither
+does the provider's error text, which can echo request content. A failure
+instead carries a fixed `error.category` and message, with the HTTP
+`status_code` and the provider's `provider_error_type` and `provider_error_code`
+when they are plain identifiers:
+
+| Category | Meaning |
+| --- | --- |
+| `authentication_failed`, `permission_denied` | HTTP 401 or 403: the credentials are wrong, or can't use this model. |
+| `not_found` | HTTP 404: the provider doesn't know the model, or the endpoint is wrong. |
+| `rate_limited` | HTTP 429: rate limited, or out of quota. |
+| `request_rejected`, `server_error` | Another 4xx or a 5xx. `error.rejection` names a parameter the model rejected, when the provider says so. |
+| `provider_error` | A failure without an HTTP status, such as a connection error. |
+| `timeout` | No answer before the deadline. |
+| `stream_failed` | The stream ended without an answer or a typed error. |
+| `event_after_completion` | The provider sent another stream event after completing the request, which also fails a run's model attempt. The completion's usage and model are kept. |
+| `generation_failed` | The request completed with an error finish reason, such as Bedrock's `malformed_model_output`. A token-limit finish still counts as an answer. |
+| `preflight_rejected` | The provider refused the model before sending, such as a generated project's placeholder when no API key is set. `error.detail` carries its setup message after the application's secret redaction. |
+| `billing_identity_failed` | The provider couldn't resolve the request's billing identity: before sending (no `latency_ms`), or from the completion, which keeps its usage. |
+| `unsupported` | The provider doesn't implement `prepare_auxiliary_request`, so it can't cap the request; nothing was sent. |
+
+A stream that fails after the provider completed, for example while closing,
+fails the check as it fails a run's model attempt. The result still reports the
+completion's usage and model, and prices them.
+
+The command exits 0 when the model answered and 1 when it didn't. An unknown
+`--provider`, a model that matches several providers' patterns, or a project
+that fails to load exits 2 with a `MODEL_CHECK_NOT_RUN` error before any
+request.
+
 ## Prompt caching
 
 Prompt caching is on by default where the provider needs explicit markers.

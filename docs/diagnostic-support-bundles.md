@@ -7,6 +7,12 @@ Cayu project without running an agent or making a live provider request:
 cayu doctor --bundle cayu-support.zip
 ```
 
+To check instead that a model answers through the project's provider and is
+priced, run `cayu doctor --model MODEL`, the same command as `cayu providers
+check MODEL`. It sends one bounded request and writes no bundle; see
+`cayu guide providers#check-that-a-model-answers`. Everything below describes
+`--bundle`.
+
 The command discovers the same project and maintained-service factories as
 `cayu check`, selects the production bootstrap profile, and constructs the
 application once in a bounded worker process. During that bootstrap, a
@@ -275,10 +281,9 @@ metadata is never treated as authorization or live readiness.
 
 AWS preflight remains the
 owner of AWS-specific configuration and permission probes.
-Live provider verification
-remains the owner of an explicitly requested bounded provider call. `cayu
-doctor` neither runs those probes nor turns their absence into fabricated
-health.
+`cayu providers check MODEL` (or `cayu doctor --model MODEL`)
+remains the owner of an explicitly requested bounded provider call. A bundle
+neither runs those probes nor turns their absence into fabricated health.
 
 ## Outcomes and automation
 

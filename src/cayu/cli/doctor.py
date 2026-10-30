@@ -33,6 +33,7 @@ from cayu.cli.project_control_plane import (
     build_project_control_plane_context,
     close_project_control_plane_context,
 )
+from cayu.cli.providers import model_argument, run_model_check
 from cayu.cli.scaffold_check import check_declared_scaffold_source
 from cayu.project_control_plane import resolve_project_control_plane_context
 from cayu.runtime.checks import DiagnosticSeverity, ProjectControlPlaneCheckEvidence
@@ -88,11 +89,25 @@ def add_doctor_parser(subparsers: Any) -> None:
         nargs="?",
         help="Override project discovery with a module:factory target.",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--bundle",
-        required=True,
         metavar="OUTPUT",
         help="Output ZIP path. The file is written atomically with restrictive permissions.",
+    )
+    mode.add_argument(
+        "--model",
+        metavar="MODEL",
+        type=model_argument,
+        help=(
+            "Instead of writing a bundle, check that MODEL answers through the project's "
+            "provider and is priced, as `cayu providers check MODEL` does."
+        ),
+    )
+    parser.add_argument(
+        "--provider",
+        metavar="NAME",
+        help="With --model, the registered provider to check, as for `cayu providers check`.",
     )
     parser.add_argument(
         "--session",
@@ -144,8 +159,30 @@ def _request_cost_endpoint_argument(value: str) -> str:
 
 
 def run_doctor(args: argparse.Namespace) -> int:
+    if args.model is not None:
+        return _run_doctor_model_check(args)
+    if args.provider is not None:
+        print("error: --provider applies only with --model.", file=sys.stderr)
+        return 2
     with _sigterm_cleanup_boundary():
         return _run_doctor_before_deadline(args)
+
+
+def _run_doctor_model_check(args: argparse.Namespace) -> int:
+    """Run `cayu providers check` under its doctor spelling; no bundle is written."""
+
+    if args.session or args.requests_from is not None:
+        print(
+            "error: --model writes no bundle; drop --session and --requests-from.", file=sys.stderr
+        )
+        return 2
+    return run_model_check(
+        target=args.target,
+        model=args.model,
+        provider_name=args.provider,
+        output_format="json",
+        output=None,
+    )
 
 
 def _run_doctor_before_deadline(args: argparse.Namespace) -> int:
