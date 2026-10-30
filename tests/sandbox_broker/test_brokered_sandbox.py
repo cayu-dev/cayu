@@ -2368,6 +2368,26 @@ def test_a_lapsed_lease_found_by_a_command_closes_the_runner(tmp_path: Path) -> 
     asyncio.run(scenario())
 
 
+def test_a_sandbox_the_broker_lost_says_why(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        broker.expire(runner.sandbox_id)
+        # The broker task holding it stopped, as a Cloud rollout does.
+        broker.sandboxes[runner.sandbox_id].destroy_reason = "worker_lost"
+        with pytest.raises(SandboxLeaseLostError) as caught:
+            await runner.exec(ExecCommand.process("true"))
+        assert str(caught.value) == (
+            "The brokered sandbox is no longer ready: the broker ended it (worker_lost)."
+        )
+        assert caught.value.detail == {"status": "destroyed", "destroy_reason": "worker_lost"}
+        assert runner.loss_reason == "lease_lost"
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
 def test_a_lease_the_keeper_lost_poisons_the_runner(tmp_path: Path) -> None:
     broker = FakeBroker(tmp_path / "cloud")
 

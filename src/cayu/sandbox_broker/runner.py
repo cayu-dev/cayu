@@ -778,10 +778,18 @@ class BrokeredSandboxRunner(Runner):
         # runner can't be reopened: poison it, which admission treats as terminal.
         self._record_loss("lease_lost")
         self._poison_exec("the brokered sandbox is no longer ready")
+        # Why the broker ended it, when it says: a lost broker worker (a Cloud rollout)
+        # reads differently from a lapsed lease or the Agent's own destroy.
+        detail = {} if error is None else error.detail
+        reason = detail.get("destroy_reason") or detail.get("failure")
+        message = "The brokered sandbox is no longer ready."
+        if type(reason) is str:
+            message = f"The brokered sandbox is no longer ready: the broker ended it ({reason})."
         return SandboxLeaseLostError(
-            "The brokered sandbox is no longer ready.",
+            message,
             status=None if error is None else error.status,
             code=None if error is None else error.code,
+            detail=detail,
         )
 
     def _require_lease(self) -> None:

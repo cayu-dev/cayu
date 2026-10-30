@@ -338,7 +338,11 @@ class FakeBroker:
                     await asyncio.wait_for(asyncio.shield(command.task), wait)
             return httpx.Response(200, json=command.view())
         if sandbox.status != "ready":
-            return _error(409, "sandbox_not_ready")
+            # As Cloud answers: the status, and why it ended when it has.
+            detail: dict[str, Any] = {"status": sandbox.status}
+            if sandbox.destroy_reason is not None:
+                detail["destroy_reason"] = sandbox.destroy_reason
+            return _error(409, "sandbox_not_ready", detail)
         if action == ["renew"]:
             seconds = json.loads(request.content)["lease_seconds"]
             sandbox.lease_expires_at = datetime.now(UTC) + timedelta(seconds=seconds)
