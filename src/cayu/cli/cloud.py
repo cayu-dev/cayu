@@ -56,6 +56,7 @@ from cayu.cli._cloud_releases import (
     render_releases,
     show_application,
 )
+from cayu.cli._cloud_service_switch import ServiceStillSwitchingError, send_when_not_switching
 from cayu.cli._cloud_settings import CloudSettingsError, add_settings_parser, settings_command
 from cayu.cli._cloud_task_health import fenced_tasks_warning
 from cayu.cli._output import terminal_safe
@@ -78,6 +79,11 @@ _SERVICE_IN_PROGRESS = {"deleting", "deploying", "sleeping", "starting", "stoppi
 _SERVICE_READY = {"running"}
 # `archived` is readable but never waited on: archive retired the service for good.
 _SERVICE_STATUSES = _SERVICE_FAILURES | _SERVICE_IN_PROGRESS | _SERVICE_READY | {"archived"}
+# `service` changes Cloud refuses while the service switches; they take `--wait`, like
+# `schedule run`.
+_SWITCH_REFUSED_SERVICE_ACTIONS = frozenset(
+    {"destroy", "pause", "restart", "resume", "sleep", "wake"}
+)
 # A service or archive wait tolerates this many consecutive throttled, unavailable or 5xx reads.
 _SERVICE_POLL_TRANSIENT_LIMIT = 5
 _TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
@@ -418,7 +424,11 @@ class _CloudDeploymentStillRunningError(CloudApiError):
 
 
 class _CloudReleaseNotSelectedError(CloudApiError):
-    """Unchanged source resolved to a promoted Release the Agent no longer runs."""
+    """A promoted Release the Agent no longer selects, so its service won't run it.
+
+    `deploy` finds one when unchanged source resolves to it (``reused``), and `deployment
+    wait --live` when it is asked to wait for one.
+    """
 
     def __init__(
         self,
@@ -427,6 +437,7 @@ class _CloudReleaseNotSelectedError(CloudApiError):
         deployment_id: str,
         current_deployment_id: object,
         recovery_arguments: Sequence[str] = (),
+        reused: bool = True,
     ) -> None:
         app = _cloud_application_id(application_id)
         deployment = _cloud_deployment_id(deployment_id)
@@ -445,6 +456,10 @@ class _CloudReleaseNotSelectedError(CloudApiError):
             f"reused it instead of building a new one, but {selected}. Select the reused "
             "Release with `cayu cloud rollback`, or change `version` in cayu-cloud.toml to "
             "build a new Release."
+            if reused
+            else f"{'The Release' if deployment is None else f'Release {deployment}'} was "
+            f"promoted, but {selected}, so the Agent's service won't run it. Select it again "
+            "with `cayu cloud rollback`."
         )
         super().__init__("release_not_selected", message)
         self.details: dict[str, object] = {"current_deployment_id": current}
@@ -762,7 +777,14 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
     if isinstance(
-        exc, (_CloudDeployCheckError, CompassWriteError, CloudSettingsError, CloudEvalError)
+        exc,
+        (
+            _CloudDeployCheckError,
+            CompassWriteError,
+            CloudSettingsError,
+            CloudEvalError,
+            ServiceStillSwitchingError,
+        ),
     ):
         error.update(exc.details)
     if isinstance(
@@ -941,7 +963,19 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "declared in cayu-cloud.toml."
         ),
     )
-    deploy.add_argument("--no-wait", action="store_true")
+    deploy.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Return once Cayu Cloud accepts the release, without following it.",
+    )
+    deploy.add_argument(
+        "--no-wait-live",
+        action="store_true",
+        help=(
+            "Return once the release is promoted, without waiting for the Agent's service to "
+            "run it."
+        ),
+    )
     _add_candidate_arguments(deploy)
     deploy.add_argument(
         "--retry-failed",
@@ -992,7 +1026,10 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "logs": "Read structured publication logs for one release.",
         "status": "Show the current publication status of one release.",
         "timeline": "Show the publication milestones for one release.",
-        "wait": "Wait until one release is promotable or terminal.",
+        "wait": (
+            "Wait until one release is promotable or terminal, or with --live until the "
+            "Agent's service runs it."
+        ),
         "promote": (
             "Select a smoke-tested release for its Agent application. A candidate release "
             "is published instead: Cloud prepares, selects and publishes it while the Agent "
@@ -1020,6 +1057,13 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             operation.add_argument("--diagnostic-offset", type=_diagnostic_offset, default=None)
             operation.add_argument("--diagnostic-limit", type=_diagnostic_limit, default=None)
         if action == "wait":
+            operation.add_argument(
+                "--live",
+                action="store_true",
+                help=(
+                    "Also wait until the Agent's service runs the release, or report why it can't."
+                ),
+            )
             operation.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
             operation.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
             operation.set_defaults(_cloud_preflight=_preflight_wait)
@@ -1088,10 +1132,14 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     for action, description in service_descriptions.items():
         operation = service_commands.add_parser(action, description=description)
         operation.add_argument("--application", required=True)
+        if action in _SWITCH_REFUSED_SERVICE_ACTIONS:
+            _add_switch_wait_argument(operation)
         if action == "destroy":
             operation.add_argument("--poll-seconds", type=_positive_finite_seconds, default=2.0)
             operation.add_argument("--wait-seconds", type=_positive_finite_seconds, default=180.0)
             operation.set_defaults(_cloud_preflight=_preflight_wait)
+        elif action in _SWITCH_REFUSED_SERVICE_ACTIONS:
+            _add_switch_wait_seconds_arguments(operation)
 
     environment = commands.add_parser(
         "env",
@@ -1149,6 +1197,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "(at most 4096 bytes compact; never a secret)."
         ),
     )
+    _add_switch_wait_argument(schedule_run)
+    _add_switch_wait_seconds_arguments(schedule_run)
 
     add_settings_parser(commands)
 
@@ -1175,6 +1225,24 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "verify",
         description="Verify the integrity of every local evidence record.",
     )
+
+
+def _add_switch_wait_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help=(
+            "If Cayu Cloud refuses because the Agent's service is being deployed or changed "
+            "right now, wait for that to finish and send the request again, for up to "
+            "--wait-seconds."
+        ),
+    )
+
+
+def _add_switch_wait_seconds_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
+    parser.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
+    parser.set_defaults(_cloud_preflight=_preflight_switch_wait)
 
 
 def _add_acknowledge_breaking_argument(parser: argparse.ArgumentParser) -> None:
@@ -2305,6 +2373,9 @@ def _deploy(
     # through its retry family, is not published again by any promotion. A retry this
     # deploy submitted is published by Cloud itself.
     previously_promoted = retry is None and _deployment_status(deployment) == "promoted"
+    # Whether the deploy waits until the Agent's service runs the release, not only until
+    # it is promoted (`--no-wait-live`) or accepted (`--no-wait`).
+    wait_live = not arguments.no_wait and not getattr(arguments, "no_wait_live", False)
     if not arguments.no_wait:
         followed_id = str(deployment["id"])
 
@@ -2320,6 +2391,7 @@ def _deploy(
                 sleep=sleep,
                 monotonic=monotonic,
                 until_built=until_built,
+                until_promoted=not wait_live,
                 candidate=staging,
             )
 
@@ -2445,7 +2517,7 @@ def _deploy(
             # Publish it as `rollback` does; Cloud leaves a running service unchanged.
             service = client.request("PUT", f"/v1/applications/{application['id']}/service")
             service_publication_requested = True
-        if not arguments.no_wait:
+        if wait_live:
             service = _wait_for_service(
                 client,
                 application_id=str(application["id"]),
@@ -2489,7 +2561,7 @@ def _deploy(
         result["retry"] = retry
     # Without processes there's no publication for the choice to govern.
     check_preflight = promoted_with_choice and project.manifest.runtime_payload() is not None
-    if check_preflight and not arguments.no_wait:
+    if check_preflight and wait_live:
         # What Cloud recorded once the service ran this Release.
         deployment = client.request(
             "GET", f"/v1/applications/{application['id']}/deployments/{deployment['id']}"
@@ -2529,7 +2601,7 @@ def _deploy(
         service=service,
         running_tasks=running_tasks,
         reread=not check_preflight,
-        waited=not arguments.no_wait,
+        waited=wait_live,
         # A rerun that found the release already selected replaced no worker.
         replaced=selected_before != deployment.get("id"),
     )
@@ -3316,6 +3388,30 @@ def _deployment(
                 recovery_arguments=_cloud_recovery_arguments(arguments),
                 release=result,
             )
+        if arguments.live:
+            # A release without processes has no service, so it is live once it is ready,
+            # as `deploy` treats it.
+            service = (
+                None
+                if _release_runs_no_service(result)
+                else _wait_until_serving(
+                    client,
+                    application_id=application_id,
+                    deployment_id=arguments.deployment_id,
+                    release=result,
+                    poll_seconds=arguments.poll_seconds,
+                    recovery_arguments=_cloud_recovery_arguments(arguments),
+                    wait_seconds=arguments.wait_seconds,
+                    sleep=sleep,
+                    monotonic=monotonic,
+                )
+            )
+            return {
+                "operation": "deployment.wait",
+                # The Release as Cloud records it once its service runs it, selected.
+                "result": client.request("GET", base),
+                "service": service,
+            }
     else:
         application = client.request("GET", f"/v1/applications/{application_id}")
         result = client.request(
@@ -3400,6 +3496,19 @@ def _service(
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
     application_id = _application_id(client, arguments.application)
     path = f"/v1/applications/{application_id}/service"
+
+    def change(method: str, target: str) -> dict[str, Any]:
+        return send_when_not_switching(
+            lambda: client.request(method, target),
+            wait=arguments.wait,
+            application_id=application_id,
+            poll_seconds=arguments.poll_seconds,
+            wait_seconds=arguments.wait_seconds,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
+            sleep=sleep,
+            monotonic=monotonic,
+        )
+
     if action == "status":
         result = client.request("GET", path)
         _service_status(result)
@@ -3418,13 +3527,11 @@ def _service(
         ]
         if warnings:
             return {"operation": "service.status", "result": result, "warnings": warnings}
-    elif action == "restart":
-        result = client.request("POST", f"{path}/restart")
-    elif action in {"sleep", "wake"}:
-        result = client.request("POST", f"{path}/{action}")
+    elif action in {"restart", "sleep", "wake"}:
+        result = change("POST", f"{path}/{action}")
     elif action in {"pause", "resume"}:
         result = _unsupported_when_missing(
-            lambda: client.request("POST", f"{path}/{action}"),
+            lambda: change("POST", f"{path}/{action}"),
             "service_pause_unsupported",
             "This Cayu Cloud can't pause Agents yet.",
         )
@@ -3433,7 +3540,7 @@ def _service(
     elif action == "credentials":
         result = _operator_credentials(client, application_id=application_id)
     else:
-        result = client.request("DELETE", path)
+        result = change("DELETE", path)
         result_status = None if not result else _service_status(result)
         if result_status == "deleting":
             _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
@@ -3469,13 +3576,28 @@ def _unsupported_when_missing(
         raise
 
 
-def _schedule(arguments: argparse.Namespace, *, client: CloudApiClient) -> dict[str, Any]:
+def _schedule(
+    arguments: argparse.Namespace,
+    *,
+    client: CloudApiClient,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
     application_id = _application_id(client, arguments.application)
     name = quote(arguments.name, safe="")
     payload = None if arguments.input is None else {"input": arguments.input}
     result = _unsupported_when_missing(
-        lambda: client.request(
-            "POST", f"/v1/applications/{application_id}/schedules/{name}/run", payload=payload
+        lambda: send_when_not_switching(
+            lambda: client.request(
+                "POST", f"/v1/applications/{application_id}/schedules/{name}/run", payload=payload
+            ),
+            wait=arguments.wait,
+            application_id=application_id,
+            poll_seconds=arguments.poll_seconds,
+            wait_seconds=arguments.wait_seconds,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
+            sleep=sleep,
+            monotonic=monotonic,
         ),
         "schedule_run_unsupported",
         "This Cayu Cloud can't run a schedule on demand yet.",
@@ -3674,11 +3796,14 @@ def _wait_for_deployment(
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
     until_built: bool = False,
+    until_promoted: bool = False,
     candidate: bool = False,
 ) -> dict[str, Any]:
     """Wait until the Release is ready, or only until it is built with `until_built`.
 
-    A `candidate` discarded or expired meanwhile is reported as such, not as a failure.
+    With `until_promoted`, a promoted Release is returned even while Cloud holds its
+    publication for unfinished sessions. A `candidate` discarded or expired meanwhile is
+    reported as such, not as a failure.
     """
 
     _validate_wait(poll_seconds, wait_seconds)
@@ -3702,7 +3827,9 @@ def _wait_for_deployment(
         # A built Release whose publication waits for the serving release's sessions is
         # not ready yet: Cloud selects and publishes it, or refuses it, once they settle.
         deadline = hold.observe(deployment, deadline)
-        if status in _DEPLOYMENT_READY and (hold.waiting is None or until_built):
+        if status in _DEPLOYMENT_READY and (
+            hold.waiting is None or until_built or (until_promoted and status == "promoted")
+        ):
             return deployment
         if status in _DEPLOYMENT_FAILURES:
             if candidate and _candidate_discarded(client, path=path, status=status):
@@ -4359,6 +4486,123 @@ def _wait_for_service(
         transient_failures = 0
 
 
+def _wait_until_serving(
+    client: CloudApiClient,
+    *,
+    application_id: str,
+    deployment_id: str,
+    release: dict[str, Any],
+    poll_seconds: float,
+    recovery_arguments: Sequence[str],
+    wait_seconds: float,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> dict[str, Any]:
+    """Wait until the Agent's service runs ``release``, a Release that is ready.
+
+    Cloud selects and publishes a smoke-tested Release itself, unless it is staged and waits
+    for someone to promote it; a promoted Release runs only while the Agent selects it.
+    Neither of those is waited for. A Release the service already runs counts while its web
+    process sleeps, as for a deploy that reuses one. Those decisions need the service as it
+    is, so a throttled or unavailable read is retried first, as the service wait retries it.
+    """
+
+    path = f"/v1/applications/{application_id}/service"
+    deadline = monotonic() + wait_seconds
+    failures = 0
+    while True:
+        try:
+            service = _read_or_none(client, path)
+        except CloudApiError as exc:
+            if (
+                not _transient_api_error(exc)
+                or failures >= _SERVICE_POLL_TRANSIENT_LIMIT
+                or monotonic() >= deadline
+            ):
+                raise
+            failures += 1
+            sleep(poll_seconds)
+            continue
+        break
+    serving = service is not None and service.get("deployment_id") == deployment_id
+    status = _deployment_status(release)
+    if (
+        not serving
+        and status == "smoke_tested"
+        and (release.get("stage_only") is True or isinstance(release.get("candidate"), dict))
+        and not _selection_in_progress(client, application_id, deployment_id)
+    ):
+        named = _cloud_deployment_id(deployment_id)
+        raise CloudCommandError(
+            "release_not_promoted",
+            f"{'The Release' if named is None else f'Release {named}'} is staged, so Cayu "
+            "Cloud publishes it only once someone promotes it with `cayu cloud deployment "
+            "promote`.",
+        )
+    if (
+        not serving
+        and status == "promoted"
+        and not _selection_in_progress(client, application_id, deployment_id)
+    ):
+        application = client.request("GET", f"/v1/applications/{application_id}")
+        if (
+            "current_deployment_id" in application
+            and application["current_deployment_id"] != deployment_id
+        ):
+            raise _CloudReleaseNotSelectedError(
+                application_id=application_id,
+                deployment_id=deployment_id,
+                current_deployment_id=application["current_deployment_id"],
+                recovery_arguments=recovery_arguments,
+                reused=False,
+            )
+    return _wait_for_service(
+        client,
+        application_id=application_id,
+        initial=service,
+        expected_deployment_id=deployment_id,
+        allow_sleeping=True,
+        poll_seconds=poll_seconds,
+        recovery_arguments=recovery_arguments,
+        wait_seconds=wait_seconds,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+
+
+def _release_runs_no_service(release: dict[str, Any]) -> bool:
+    """Whether Cloud recorded the Release's manifest as declaring no web, worker or schedule.
+
+    Cloud's canonical manifest omits an absent runtime.
+    """
+
+    manifest = release.get("manifest")
+    return isinstance(manifest, dict) and manifest.get("runtime") is None
+
+
+def _selection_in_progress(client: CloudApiClient, application_id: str, deployment_id: str) -> bool:
+    """Whether Cloud is selecting the Release now, as its timeline's selection step says.
+
+    A staged candidate someone promoted is prepared before it is selected, and a held
+    publication waits for sessions; both show the step as active. An unreadable timeline
+    counts as in progress, so a wait never refuses on a guess.
+    """
+
+    try:
+        timeline = client.request(
+            "GET", f"/v1/applications/{application_id}/deployments/{deployment_id}/timeline"
+        )
+    except CloudApiError:
+        return True
+    items = timeline.get("items")
+    return not isinstance(items, list) or any(
+        isinstance(item, dict)
+        and item.get("key") == "release_selected"
+        and item.get("state") == "active"
+        for item in items
+    )
+
+
 def _service_status(service: dict[str, Any]) -> str:
     status = service.get("status")
     if not isinstance(status, str) or status not in _SERVICE_STATUSES:
@@ -4697,6 +4941,11 @@ def _preflight_acknowledgements(arguments: argparse.Namespace) -> None:
 
 def _preflight_rollback_wait(arguments: argparse.Namespace) -> None:
     _session_choice(arguments)
+    if arguments.wait:
+        _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
+
+
+def _preflight_switch_wait(arguments: argparse.Namespace) -> None:
     if arguments.wait:
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
 

@@ -220,6 +220,64 @@ def test_list_prints_the_newest_releases_first(
     assert "GET /v1/applications/my-agent/deployments?limit=3" in fake.requests
 
 
+# Cloud refused to publish the selected release; it stays promoted and selected.
+_REFUSAL = {
+    "acknowledge_sessions": ["s-input"],
+    "code": "unfinished_sessions",
+    "detail": "s-input is paused on a pending user_input. Nothing was changed.",
+    "hint": (
+        "Answer or finish them and retry, or accept that they may not resume: `cayu cloud "
+        "deployment retry dep_live --application my-agent --acknowledge-session s-input`."
+    ),
+    "message": "1 unfinished session of the serving release may not resume on this Release.",
+    "retryable": True,
+}
+_REFUSED = {**_LIVE, "publication_error": _REFUSAL}
+
+
+def test_list_marks_a_release_cloud_refused_to_publish_with_its_reason_and_hint(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud({("GET", "/v1/applications/my-agent/deployments?limit=20"): _page(_REFUSED, _OLD)})
+
+    assert main(["cloud", "deployment", "list", "--application", "my-agent"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "promoted, not published" in lines[1]
+    assert "not published" not in lines[2]
+    assert lines[3:] == [
+        "",
+        "dep_live:",
+        f"  Not published: {_REFUSAL['message']}",
+        f"  {_REFUSAL['hint']}",
+    ]
+
+
+def test_list_json_keeps_the_publication_error(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud({("GET", "/v1/applications/my-agent/deployments?limit=20"): _page(_REFUSED)})
+
+    assert main(["cloud", "deployment", "list", "--application", "my-agent", "--json"]) == 0
+    (item,) = json.loads(capsys.readouterr().out)["result"]["items"]
+    assert item["status"] == "promoted"
+    assert item["publication_error"] == _REFUSAL
+
+
+def test_show_says_the_selected_release_was_not_published(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    routes = _show_routes(_REFUSED, _OLD)
+    routes[("GET", "/v1/applications/my-agent/deployments/dep_live")] = httpx.Response(
+        200, json=_REFUSED
+    )
+    cloud(routes)
+
+    assert main(["cloud", "applications", "show", "my-agent"]) == 0
+    out = capsys.readouterr().out
+    assert "Selected release: dep_live (version v-dep_live, promoted, not published)" in out
+    assert f"\n  Not published: {_REFUSAL['message']}\n  {_REFUSAL['hint']}\n" in out
+
+
 def test_list_follows_pages_up_to_the_limit(
     cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
 ) -> None:

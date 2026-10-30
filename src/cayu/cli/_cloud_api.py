@@ -116,6 +116,7 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "no_schedule"),
         (409, "no_selected_release"),
         (409, "release_source_unreadable"),
+        (409, "service_busy"),
         (409, "settings_revision_conflict"),
         (422, "invalid_setting"),
         (422, "invalid_settings"),

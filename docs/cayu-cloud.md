@@ -79,6 +79,14 @@ runtime its image is built with, then any candidate or in-flight release.
 and the Cayu runtime. Both print a table; `--json` prints the usual envelope, whose
 `result` carries `schema_version` 1.
 
+Selected isn't the same as serving. Cloud keeps the status of a release it refused to
+publish, for example for the serving release's [unfinished
+sessions](#unfinished-sessions): one a promotion selected first stays `promoted` and
+selected while the previous release keeps serving, and only its `publication_error` says
+so. Both commands mark such a release `not published` and print Cloud's reason and its hint
+for getting past it under the release; `--json` keeps `publication_error` as Cloud returned
+it. `service status` names the release the service runs as `deployment_id`.
+
 ```console
 $ cayu cloud applications show my-agent
 Agent: My Agent (my-agent)
@@ -328,7 +336,9 @@ input = { prompt = "Look for new pricing pages", limit = 20 }
 schedule now, as its expression would, and prints the run Cloud started (its
 output is in the logs); `--input JSON` gives that run its own input instead of
 the schedule's. A Release that declares no such schedule is refused with `code`
-`schedule_not_found`.
+`schedule_not_found`. While Cloud deploys or changes the Agent's service it refuses the
+run, and `--wait` sends it again once that finishes ([while the service
+switches](#while-the-service-switches)); so do the `service` changes below.
 
 `cayu cloud service pause --application AGENT` scales the worker to zero and
 stops the schedules starting runs; runs already started finish, and the web
@@ -471,11 +481,16 @@ status. `worker_drains` lists the replaced workers still finishing their tasks
 ([draining](#draining-the-worker-a-deploy-replaces)), each also as a `warnings` line with
 its deadline and the time left.
 
-By default, `deploy` also waits for a declared Agent service to reach `running`. A
+By default, `deploy` returns only once the Agent's service runs the new release: `service
+status` reports the release's `deployment_id` and `running`. Promotion comes first and
+selects the release, so `applications list` shows it as current before that: Cloud then
+migrates the Agent's database and updates the service, and meanwhile refuses service
+changes and schedule runs ([while the service switches](#while-the-service-switches)). A
 `degraded` service ends that wait with a nonzero `service_degraded` result. Its
 `error.issues` array preserves every structured process diagnostic, while `error.message`
-aggregates their safe messages and remediation hints for humans. `--no-wait` keeps the
-explicit asynchronous workflow.
+aggregates their safe messages and remediation hints for humans. `--no-wait-live` returns
+once the release is promoted, and `--no-wait` once Cloud accepts it, without following
+it; `cayu cloud deployment wait DEPLOYMENT_ID --live` waits for the rest later.
 
 The deployment worker publishes the promoted release once. `deploy` reads the service
 and waits for its `deployment_id` to match that release; it does not start another
@@ -483,16 +498,51 @@ rollout. A brief 404 while publication is pending is retried as a read, and up t
 consecutive throttled, unavailable or HTTP 5xx service reads are retried before the wait
 fails. While the service still runs an older release or none, `deploy` also reads the
 release: if Cloud reports a `publication_error` (for example a failed database
-migration), it exits `2` with category `service_publication_failed`, Cloud's message and
-hint, and the structured `error.publication_error`. With `--no-wait`,
-`result.service_publication_pending=true` identifies an absent service or one still
-serving an older release. `rollback` still asks Cloud to publish the selected release and
-returns once Cloud accepts it; `rollback --wait` (with `--poll-seconds` and
-`--wait-seconds`) also waits for the service to run that release and reports a
-`publication_error` the same way. `deployment wait` reports a ready release's
+migration, or unfinished sessions of the serving release), it exits `2` with category
+`service_publication_failed`, Cloud's message and the way past it (for unfinished
+sessions, the `deployment retry` commands that acknowledge them or wait for them again;
+see [Unfinished sessions](#unfinished-sessions)), and the structured
+`error.publication_error`. Cloud doesn't change the status of a release it refused to
+publish: one the promotion selected first stays `promoted` and selected while the
+previous release keeps serving. If the service still runs an older release when
+`--wait-seconds` pass, `deploy` exits `2` with category `service_still_starting`. With
+`--no-wait` or `--no-wait-live`, `result.service_publication_pending=true` identifies an
+absent service or one still serving an older release. `rollback` still asks Cloud to
+publish the selected release and returns once Cloud accepts it; `rollback --wait` (with
+`--poll-seconds` and `--wait-seconds`) also waits for the service to run that release and
+reports a `publication_error` the same way. `deployment wait` reports a ready release's
 `publication_error` the same way instead of returning it as ready. While Cloud holds a
 release's publication for the serving release's unfinished sessions, these waits keep
 going past `--wait-seconds` (see [Unfinished sessions](#unfinished-sessions)).
+
+`deployment wait DEPLOYMENT_ID` returns once the release is ready to promote, or promoted;
+with `--live` it then waits, like `deploy`, until the service runs the release, and prints
+the service as `service` next to the release. Each wait has its own `--wait-seconds`, as
+`deploy`'s do. A staged release isn't waited for (category `release_not_promoted`: Cloud
+publishes it only once someone promotes it), nor is a promoted release the Agent no longer
+selects (category `release_not_selected`, with `commands.rollback` to select it again).
+A release the service already runs counts while its web process sleeps, and a release
+that declares no web, worker or schedule has no service, so `--live` returns it once it
+is ready, as `deploy` does.
+
+<a id="while-the-service-switches"></a>
+
+While Cloud migrates the Agent's database and updates its service, it refuses `service
+restart`, `sleep`, `wake`, `pause`, `resume` and `destroy`, and `schedule run`, with HTTP
+409 and "The Agent's service is being deployed or changed right now; nothing changed. Try
+again once that finishes." Each of these commands takes `--wait`, which sends the same
+request again every `--poll-seconds` (5 by default; `destroy`'s 2) until Cloud takes it,
+writing one line to standard error the first time. The refusal comes before Cloud changes
+anything, so sending it again is safe. If Cloud still refuses once `--wait-seconds` pass
+(1,800 by default; `destroy`'s 180, which also bounds its wait for the teardown), counted
+from the first refusal, the command exits `2` with category `service_busy`,
+`waited_seconds` and a `service status` command. Any other refusal is never sent again.
+Without `--wait`, the error says to pass it. So a script needs no loop between a deploy
+and the next change, even when something else is changing the service too:
+
+```bash
+cayu cloud deploy . && cayu cloud schedule run scout --application my-agent --wait
+```
 
 Cloud's deployment worker promotes a smoke-tested release on its own, so `deploy`'s
 promote request can race it. The request carries the Agent revision read before the

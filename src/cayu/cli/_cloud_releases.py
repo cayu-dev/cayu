@@ -7,7 +7,8 @@ its image is built with) and any candidate or in-flight Release. `deployment lis
 --application NAME` lists the Agent's Releases, newest first.
 
 Both read routes every Cloud has. Older Clouds omit `selected_at` and `cayu_runtime`; the table
-says "not recorded" for those missing fields.
+says "not recorded" for those missing fields. A Release Cloud refused to publish is marked "not
+published", with Cloud's reason and its hint for getting past it.
 
 `release_application_id` finds the Agent of a Release from its id alone (`GET
 /v1/deployments/{id}`), so `deployment status|logs|timeline|wait` take a `dep_...` id without
@@ -35,6 +36,10 @@ MAX_LIMIT = 1000
 _PAGE_LIMIT = 100
 # Releases `applications show` reads for a candidate or in-flight one.
 _RECENT = 20
+# Cloud bounds a publication error's message at 512 bytes and its hint at 1024, so these
+# limits keep them whole.
+_REFUSAL_MESSAGE_LIMIT = 512
+_REFUSAL_HINT_LIMIT = 1024
 _IN_FLIGHT = frozenset(
     {
         "accepted",
@@ -236,7 +241,7 @@ def render_application(result: Mapping[str, Any]) -> str:
     else:
         lines += [
             f"Selected release: {_cell(selected['id'])} (version {_cell(selected['version'])}, "
-            f"{_cell(selected['status'])})",
+            f"{_status(selected)})",
             f"  Selected at: {_when(selected['selected_at'], missing='not recorded')}",
             f"  Created at: {_when(selected['created_at'])}",
             f"  Source: {_source(selected)}",
@@ -245,10 +250,7 @@ def render_application(result: Mapping[str, Any]) -> str:
         provenance = _provenance(selected["cayu_runtime"])
         if provenance is not None:
             lines.append(f"  Cayu installed from: {provenance}")
-        if selected.get("publication_error"):
-            error = selected["publication_error"]
-            message = error.get("message") if isinstance(error, dict) else None
-            lines.append(f"  Not published: {_cell(message)}")
+        lines += [f"  {line}" for line in _refusal(selected)]
     pending = shown["pending_releases"]
     if not pending:
         lines.append("Candidate or in-flight releases: none")
@@ -279,7 +281,7 @@ def render_releases(result: Mapping[str, Any]) -> str:
         (
             _cell(item["id"]),
             _cell(item["version"]),
-            _cell(item["status"]),
+            _status(item),
             _when(item["created_at"]),
             _when(item["selected_at"]),
             _short(item["source_revision"]),
@@ -288,6 +290,10 @@ def render_releases(result: Mapping[str, Any]) -> str:
         for item in items
     ]
     lines = _table(("RELEASE", "VERSION", "STATUS", "CREATED", "SELECTED", "SOURCE", "CAYU"), rows)
+    for item in items:
+        refusal = _refusal(item)
+        if refusal:
+            lines += ["", f"{_cell(item['id'])}:", *(f"  {line}" for line in refusal)]
     if listed.get("next_cursor") is not None:
         lines.append(f"Showing the newest {len(items)}; pass a larger --limit for more.")
     return "\n".join(lines)
@@ -295,6 +301,32 @@ def render_releases(result: Mapping[str, Any]) -> str:
 
 def render_failure(error: Mapping[str, Any]) -> str:
     return f"Error: {error['message']}"
+
+
+def _status(release: Mapping[str, Any]) -> str:
+    """The Release's status, and whether Cloud refused to publish it.
+
+    A Release Cloud refused to publish (for example for the serving release's unfinished
+    sessions) keeps its status, `promoted` and selected when a promotion selected it first;
+    only its `publication_error` says so.
+    """
+
+    status = _cell(release["status"])
+    message = _mapping(release.get("publication_error")).get("message")
+    return f"{status}, not published" if isinstance(message, str) and message else status
+
+
+def _refusal(release: Mapping[str, Any]) -> list[str]:
+    """Why Cloud didn't publish the Release and Cloud's hint for getting past it, if it didn't."""
+
+    error = _mapping(release.get("publication_error"))
+    message, hint = error.get("message"), error.get("hint")
+    if not isinstance(message, str) or not message:
+        return []
+    lines = [f"Not published: {_cell(message, limit=_REFUSAL_MESSAGE_LIMIT)}"]
+    if isinstance(hint, str) and hint:
+        lines.append(_cell(hint, limit=_REFUSAL_HINT_LIMIT))
+    return lines
 
 
 def _source(release: Mapping[str, Any]) -> str:

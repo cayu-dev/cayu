@@ -746,6 +746,7 @@ def test_service_destroy_waits_until_the_application_is_stopped() -> None:
             application="Research Agent",
             poll_seconds=1.0,
             service_command="destroy",
+            wait=False,
             wait_seconds=10.0,
         ),
         client=client,
@@ -775,6 +776,7 @@ def test_service_destroy_is_idempotent_when_no_service_exists() -> None:
             application="outbound-agent",
             poll_seconds=1.0,
             service_command="destroy",
+            wait=False,
             wait_seconds=1.0,
         ),
         client=Client(),
@@ -802,6 +804,7 @@ def test_service_destroy_timeout_reports_the_retained_cloud_operation(
                 application="outbound-agent",
                 poll_seconds=1.0,
                 service_command="destroy",
+                wait=False,
                 wait_seconds=1.0,
             ),
             client=Client(),
@@ -895,7 +898,10 @@ def test_service_sleep_and_wake_use_the_agent_web_service_endpoints(action: str)
     result = cloud_cli._service(
         SimpleNamespace(
             application="Research Agent",
+            poll_seconds=5.0,
             service_command=action,
+            wait=False,
+            wait_seconds=1800.0,
         ),
         client=client,
     )
