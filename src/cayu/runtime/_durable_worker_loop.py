@@ -154,6 +154,12 @@ class DurableWorkerMetrics:
         with self._lock:
             self._active_handlers = max(0, self._active_handlers - 1)
 
+    def active_handler_count(self) -> int:
+        """Handlers running now, without building a whole snapshot."""
+
+        with self._lock:
+            return self._active_handlers
+
     def claim_completed(self, *, claimed: bool) -> None:
         with self._lock:
             self._claim_attempts += 1
@@ -261,10 +267,16 @@ class DurableWorkerMetrics:
 
 def worker_event_loop_lag_monitor(
     metrics: DurableWorkerMetrics | None,
+    *,
+    active_sessions: Callable[[], int] | None,
 ) -> EventLoopLagMonitor:
-    """One sampler for a worker run: it warns on lag and feeds caller-owned metrics."""
+    """One sampler for a worker run: it warns on lag while the worker runs sessions
+    and feeds caller-owned metrics. Without a session count it warns on lag alone."""
 
-    return EventLoopLagMonitor(on_sample=None if metrics is None else metrics.event_loop_lag)
+    return EventLoopLagMonitor(
+        active_sessions=active_sessions,
+        on_sample=None if metrics is None else metrics.event_loop_lag,
+    )
 
 
 def record_task_admission_to_claim_latency(

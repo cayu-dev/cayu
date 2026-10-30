@@ -2837,7 +2837,13 @@ class TaskStoreDispatcher(Dispatcher):
         if durable_runtime.lifecycle_state != "open":
             return
         admission_wakeup = None
-        lag_monitor = worker_event_loop_lag_monitor(metrics)
+        lag_monitor = worker_event_loop_lag_monitor(
+            metrics,
+            # Only the base claim boundary counts the handlers an override runs.
+            active_sessions=(
+                poller.metrics.active_handler_count if uses_base_claim_boundary else None
+            ),
+        )
         try:
             lag_monitor.start()
             admission_wakeup = await self._tasks._task_admission_wakeup(claim_queries)

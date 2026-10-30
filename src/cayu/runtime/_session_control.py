@@ -281,6 +281,11 @@ class SessionControl(Generic[UsageTrackerT]):
             self._active_runs.pop(session_id, None)
             self.execution_presence.discard_unused_progress(session_id)
 
+    def active_session_count(self) -> int:
+        """How many sessions have a run in progress in this process."""
+
+        return len(self._active_runs)
+
     def active_runs(self, session_id: str) -> tuple[ActiveSessionRun[UsageTrackerT], ...]:
         return tuple(self._active_runs.get(session_id, {}).values())
 

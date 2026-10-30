@@ -359,12 +359,20 @@ it's the processes that run sessions that need to scale out.
 
 ## Watch for saturation
 
-`run_task_worker` and `TaskStoreDispatcher.run_worker` measure event-loop
-lag while they run: one timer callback every half second records how late it
-ran. In a healthy process that's a few milliseconds. When it reaches one
-second, the worker logs a warning from the `cayu.observability.event_loop_lag`
-logger, at most once a minute per process, saying that runtime work in this
-process is queuing and to run more worker processes.
+`run_task_worker`, `TaskStoreDispatcher.run_worker` and every eval run measure
+event-loop lag while they run: one timer callback every half second records
+how late it ran. In a healthy process that's a few milliseconds. One sample
+measures one pass of the event loop, and a session step waits for the loop
+many times, so a loop that stays a quarter of a second late can add seconds
+to every step.
+
+When four samples in a row are a quarter of a second late or more while the
+worker or eval is running sessions, it logs a warning from the
+`cayu.observability.event_loop_lag` logger, at most once a minute per process.
+The warning gives the lag and how many sessions were running, and says to run
+sessions in more processes. One slow callback, or lag while no session runs,
+doesn't warn. `run_task_worker` counts the sessions its app is running, the
+dispatcher the tasks it is handling, and an eval its running trials.
 
 A `DurableWorkerMetrics` passed to the worker receives every sample in its
 snapshot, next to the active handler count, for an application's own metrics
@@ -390,15 +398,22 @@ that runs sessions without a task worker can watch the same thing with
 ```python
 from cayu.observability import EventLoopLagMonitor
 
-monitor = EventLoopLagMonitor(on_sample=lag_histogram.observe)
+monitor = EventLoopLagMonitor(
+    on_sample=lag_histogram.observe,
+    active_sessions=lambda: len(running_sessions),  # optional
+)
 monitor.start()  # inside the running event loop, for example at app startup
 ...
 monitor.snapshot().maximum_lag_s
 monitor.stop()
 ```
 
-`interval_s` (0.5 by default), `warning_threshold_s` (1.0; `None` turns the
-warning off) and `warning_interval_s` (60) are keyword options.
+`interval_s` (0.5 by default), `warning_threshold_s` (0.25; `None` turns the
+warning off), `sustained_samples` (4), `warning_interval_s` (60),
+`active_sessions` and `on_sample` are keyword options. `active_sessions` is a
+callable that returns how many sessions the process is running; with it, lag
+counts towards a warning only while that number is above zero, and the
+warning names it. The defaults are the module's `DEFAULT_*` constants.
 
 ## Use multiple CPU cores
 

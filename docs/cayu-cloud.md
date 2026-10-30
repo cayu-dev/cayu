@@ -1168,7 +1168,9 @@ corpus.
 
 It then states the run's bound on standard error, and in the JSON result as `bound`: cases ×
 trials per case = total trials, how many run at once, and each trial's model-step limit and
-timeout. `--max-cost AMOUNT` (with `--currency CODE`, `USD` by default) is a per-trial
+timeout. The trials of one run execute in one process on the Agent, so past about four at
+once each trial slows down; see [how many trials one process runs
+well](evals.md#how-many-trials-one-process-runs-well). `--max-cost AMOUNT` (with `--currency CODE`, `USD` by default) is a per-trial
 candidate cost threshold, `bound.candidate_cost_threshold`: it interrupts a trial's agent once
 its observed cost reaches the amount, and one model call can cross it before its cost is known.
 A target that publishes no pricing refuses `--max-cost`. It doesn't bound AI judges: when the
@@ -1582,6 +1584,16 @@ Cloud rounds these to supported static process sizes. `4000`/`8192` becomes
 4096 ECS CPU units (4 vCPU) / 8192 MiB; `1000`/`2048` becomes 1 vCPU / 2 GiB.
 Memory can require rounding CPU up as well. Deployment creation rejects requests
 above the environment's configured ceiling and names valid sizes.
+
+A Python process runs the runtime's own work for all of its sessions on one CPU
+core, however many vCPUs its task has, and past a few concurrent sessions each
+of them slows down. A worker sized above one vCPU uses the others only through
+more processes, for example `command = "cayu worker reviews --processes 4"` for
+4 vCPU. The processes share the Agent's PostgreSQL database, whose claims keep
+them from taking the same work. Sessions a web process runs itself are bound
+the same way, so move them to the worker. See [one process is one CPU
+core](project-workers.md#one-process-is-one-cpu-core); a worker logs a warning
+when its process stays saturated.
 
 The deploy result and `cayu cloud service status --application AGENT_SLUG` retain
 `service.resources`, with requested millis/MiB and effective ECS CPU units/MiB for

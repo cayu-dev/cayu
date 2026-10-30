@@ -2056,6 +2056,8 @@ def test_run_task_worker_samples_event_loop_lag_into_its_metrics(
     # One sampler per worker run, however many slots; it stops with the worker.
     assert len(monitors) == 1
     assert not monitors[0].running
+    # It warns only while the app runs sessions.
+    assert monitors[0]._active_sessions == app._session_control.active_session_count
     snapshot = metrics.snapshot()
     assert snapshot.event_loop_lag_samples >= 2
     assert snapshot.event_loop_lag_max_s >= 0.05

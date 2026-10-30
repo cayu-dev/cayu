@@ -6504,6 +6504,8 @@ def test_run_worker_samples_event_loop_lag_into_its_metrics(
     asyncio.run(scenario())
     assert len(monitors) == 1
     assert not monitors[0].running
+    # It warns only while the worker runs dispatched sessions.
+    assert monitors[0]._active_sessions == metrics.active_handler_count
     snapshot = metrics.snapshot()
     assert snapshot.event_loop_lag_samples >= 2
     assert snapshot.event_loop_lag_max_s >= 0.05
@@ -7060,6 +7062,45 @@ def test_run_worker_preserves_process_next_override_signature() -> None:
     asyncio.run(scenario())
     assert dispatcher.calls == 2
     assert call_times[1] - call_times[0] >= 0.04
+
+
+def test_run_worker_warns_on_lag_alone_when_process_next_is_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.runtime._durable_worker_loop as worker_loop_module
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    monitors: list[EventLoopLagMonitor] = []
+
+    def recording_monitor(**options: object) -> EventLoopLagMonitor:
+        monitor = EventLoopLagMonitor(**options)
+        monitors.append(monitor)
+        return monitor
+
+    monkeypatch.setattr(worker_loop_module, "EventLoopLagMonitor", recording_monitor)
+    h = _build([_batch("unused")])
+    stop = asyncio.Event()
+
+    class OverrideDispatcher(TaskStoreDispatcher):
+        async def process_next(self, runtime, *, worker_id):
+            del runtime, worker_id
+            stop.set()
+            return None
+
+    async def scenario() -> None:
+        await OverrideDispatcher(h.tasks).run_worker(
+            h.app,
+            worker_id="override-lag-worker",
+            stop=stop,
+            reconcile_terminal_receipts=False,
+            reclaim_expired_leases=False,
+        )
+
+    asyncio.run(scenario())
+    # The override's handlers are never counted, so a count would always read 0
+    # and silence the warning; the monitor counts no sessions instead.
+    assert len(monitors) == 1
+    assert monitors[0]._active_sessions is None
 
 
 def test_run_worker_demand_gates_process_next_overrides() -> None:

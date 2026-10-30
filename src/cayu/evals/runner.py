@@ -153,6 +153,7 @@ from cayu.memory.attribution import (
     MemoryAttributionUnavailableReason,
 )
 from cayu.messages import Message
+from cayu.observability.event_loop_lag import EventLoopLagMonitor
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions._run_identity import eval_trial_scope
@@ -1521,8 +1522,13 @@ async def _schedule_suite_trials(
     }
     semaphore = asyncio.Semaphore(max_concurrency)
     admission = current_launch_admission()
+    running_trials = 0
+
+    def count_running_trials() -> int:
+        return running_trials
 
     async def _run_slot(index: int, case: EvalCase, trial_number: int) -> None:
+        nonlocal running_trials
         async with semaphore:
             capacity_slot = (
                 nullcontext() if execution_capacity is None else execution_capacity.slot()
@@ -1530,18 +1536,22 @@ async def _schedule_suite_trials(
             async with capacity_slot:
                 if admission is not None:
                     await admission.admit(case.id, trial_number)
-                # Nested evaluations are not additional cases of this CLI launch.
-                with (
-                    admission_scope(None),
-                    observe_eval_trial(case.id, trial_number),
-                    _scripted_eval_trial(
-                        concurrent=max_concurrency > 1,
-                        providers=(scripted_providers_by_case or {}).get(case.id, ()),
-                        require_owned=require_owned_scripted_providers,
-                    ),
-                ):
-                    execution = await execute_trial(case, trial_number)
-                    observe_eval_trial_result(execution[0])
+                running_trials += 1
+                try:
+                    # Nested evaluations are not additional cases of this CLI launch.
+                    with (
+                        admission_scope(None),
+                        observe_eval_trial(case.id, trial_number),
+                        _scripted_eval_trial(
+                            concurrent=max_concurrency > 1,
+                            providers=(scripted_providers_by_case or {}).get(case.id, ()),
+                            require_owned=require_owned_scripted_providers,
+                        ),
+                    ):
+                        execution = await execute_trial(case, trial_number)
+                        observe_eval_trial_result(execution[0])
+                finally:
+                    running_trials -= 1
                 result, public_data = execution
                 if trial_completed is not None:
                     if public_data is None:
@@ -1555,19 +1565,25 @@ async def _schedule_suite_trials(
         for trial_number in range(1, trials + 1)
         if slots[index][trial_number - 1] is None
     )
-    with _scripted_eval_invocation(
-        provider
-        for providers in (scripted_providers_by_case or {}).values()
-        for provider in providers
-    ):
-        if max_concurrency == 1 and not group_serial_trials:
-            # Preserve direct cancellation identity for the sequential policy.
-            for index, case, trial_number in pending_slots:
-                await _run_slot(index, case, trial_number)
-        else:
-            async with asyncio.TaskGroup() as group:
+    # Trials in one process share its one CPU core; warn when they saturate it.
+    lag_monitor = EventLoopLagMonitor(active_sessions=count_running_trials)
+    lag_monitor.start()
+    try:
+        with _scripted_eval_invocation(
+            provider
+            for providers in (scripted_providers_by_case or {}).values()
+            for provider in providers
+        ):
+            if max_concurrency == 1 and not group_serial_trials:
+                # Preserve direct cancellation identity for the sequential policy.
                 for index, case, trial_number in pending_slots:
-                    group.create_task(_run_slot(index, case, trial_number))
+                    await _run_slot(index, case, trial_number)
+            else:
+                async with asyncio.TaskGroup() as group:
+                    for index, case, trial_number in pending_slots:
+                        group.create_task(_run_slot(index, case, trial_number))
+    finally:
+        lag_monitor.stop()
 
     results: list[EvalCaseResult] = []
     public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]] = {}

@@ -5310,9 +5310,11 @@ task-admission-to-claim latency, the narrower hint-consumption-to-claim
 interval, and event-loop lag. Each worker run samples how late the process's
 event loop runs a timer every half second (`event_loop_lag_samples`,
 `event_loop_lag_total_s`, `event_loop_lag_max_s`, `current_event_loop_lag_s`)
-and logs a warning, at most once a minute per process, when a sample reaches
-one second; `cayu.observability.EventLoopLagMonitor` is the same sampler for
-use on its own. Failed and cancelled claims remain distinct from successful empty
+and logs a warning, at most once a minute per process, when four samples in a
+row are a quarter of a second late or more while the worker is running
+sessions; `cayu.observability.EventLoopLagMonitor` is the same sampler for
+use on its own. Eval runs use the same sampler and warning, counting their
+running trials. Failed and cancelled claims remain distinct from successful empty
 claims. A received hint becomes accepted only when it obtains a cohort-gated
 authoritative claim attempt. That attempt is counted as ignored if it fails,
 is cancelled, or returns no task, and as followed by a successful claim only

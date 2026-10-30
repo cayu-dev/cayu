@@ -4,11 +4,13 @@ import asyncio
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Event as ThreadEvent
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -1665,6 +1667,43 @@ def test_max_concurrency_fills_slots_with_trials_from_one_case():
     assert provider.max_active == 3
     assert [trial.trial_number for trial in result.cases[0].trials] == [1, 2, 3]
     assert result.status == EvalStatus.PASSED
+
+
+def test_concurrent_trials_are_the_sessions_the_event_loop_lag_monitor_counts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from cayu.evals import runner as runner_module
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    monitors: list[EventLoopLagMonitor] = []
+    counts: list[Callable[[], int]] = []
+
+    def recording_monitor(**options: Any) -> EventLoopLagMonitor:
+        counts.append(options["active_sessions"])
+        monitor = EventLoopLagMonitor(**options)
+        monitors.append(monitor)
+        return monitor
+
+    monkeypatch.setattr(runner_module, "EventLoopLagMonitor", recording_monitor)
+    observed: list[int] = []
+
+    class CountingProvider(_OverlapProbeProvider):
+        async def stream(self, request):
+            async for event in super().stream(request):
+                observed.append(counts[0]())
+                yield event
+
+    suite = EvalSuite(id="counted", cases=[_case("a"), _case("b")])
+    result = asyncio.run(
+        run_eval_suite(_app_with_provider(CountingProvider(expected=2)), suite, max_concurrency=2)
+    )
+
+    assert result.status == EvalStatus.PASSED
+    # One monitor for the run, started while trials ran and stopped after them.
+    assert len(monitors) == 1
+    assert not monitors[0].running
+    assert max(observed) == 2
+    assert counts[0]() == 0
 
 
 def test_shared_execution_capacity_bounds_trials_across_concurrent_runs():

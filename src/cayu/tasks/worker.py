@@ -1193,7 +1193,9 @@ async def run_task_worker(
             poller.close()
 
     # One lag sampler per worker run, kept until every slot has drained.
-    lag_monitor = worker_event_loop_lag_monitor(metrics)
+    lag_monitor = worker_event_loop_lag_monitor(
+        metrics, active_sessions=app._session_control.active_session_count
+    )
     lag_monitor.start()
     try:
         if concurrency == 1:

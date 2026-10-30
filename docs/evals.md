@@ -74,6 +74,39 @@ also retain the interval in `launch.json` and incremental `admissions-N.json`
 worker evidence, including when a launch is interrupted. Monotonic timestamps
 are comparable within a launch on one host, not between hosts or reboots.
 
+### How many trials one process runs well
+
+`max_concurrency` (`--max-concurrency`, a suite's trial policy, or a durable
+run's `max_concurrency`) is how many trials run at once in one process. Their
+model calls and commands overlap, but the runtime's own work between them
+(preparing requests, recording tool results and evidence, store writes,
+environment setup) runs on that process's one CPU core, shared by every trial.
+On a review service that ran all its sessions in one process, the runtime's
+own time per step went from about 1.2 s with one session running to about 7 s
+with eight or more; see [one process is one CPU
+core](project-workers.md#one-process-is-one-cpu-core). So past about four
+concurrent trials in one process, a higher `max_concurrency` makes each trial
+slower, and latency or timeout assertions can fail for reasons that have
+nothing to do with the candidate.
+
+To run more trials at once, run them in more processes:
+
+- `cayu eval run --processes N` for a direct or workflow suite (below).
+- For durable runs that `cayu serve` admits, an eval worker (`[tool.cayu.evals]
+  worker`, see [server-attached durable
+  execution](#server-attached-durable-execution)) started with `cayu worker
+  NAME --processes N` runs several runs at once, one per process. The trials of
+  one run still execute in the process that claimed it.
+
+Every process must use the same durable store. SQLite allows one writer at a
+time, so sustained writes from several processes want PostgreSQL.
+
+While trials run, the eval watches its process's event-loop lag. When the loop
+stays a quarter of a second late or more for four samples in a row while
+trials are running, it logs a warning from the `cayu.observability.event_loop_lag`
+logger, at most once a minute per process, with the lag and the number of
+running trials. See [watch for saturation](project-workers.md#watch-for-saturation).
+
 ### Multiple CPU cores from the CLI
 
 For a project with a configured native `EvalPlan` factory:
@@ -3398,7 +3431,10 @@ operator-selected values such as 10,000, and remains independent of each run's
 shared capacity bounds how many trials cooperating runs may execute at once.
 The default 100 is the N9 deployment target, not a power-of-two implementation
 choice or a Runtime-wide maximum. Configure it from measured provider, session,
-store, and memory capacity. Durable per-run `max_concurrency` fields have the
+store, memory, and CPU capacity: every trial it admits runs on the same CPU
+core, so past a few trials it buys overlap of model and command time, not
+throughput (see [how many trials one process runs
+well](#how-many-trials-one-process-runs-well)). Durable per-run `max_concurrency` fields have the
 separate portable representation limit 2,147,483,647 so PostgreSQL, SQLite, and
 browser clients reject an out-of-range value before storage.
 

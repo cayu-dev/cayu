@@ -896,6 +896,7 @@ def test_event_loop_lag_monitor_measures_a_blocked_loop_and_warns_once(
     monitor = EventLoopLagMonitor(
         interval_s=0.01,
         warning_threshold_s=0.05,
+        sustained_samples=1,
         on_sample=metrics.event_loop_lag,
     )
 
@@ -921,9 +922,10 @@ def test_event_loop_lag_monitor_measures_a_blocked_loop_and_warns_once(
     assert snapshot.lagging_samples >= 2
     assert snapshot.maximum_lag_s >= 0.05
     assert snapshot.total_lag_s >= 2 * 0.05
-    warnings = [record for record in caplog.records if "ran" in record.getMessage()]
+    warnings = _lag_warnings(caplog)
     assert len(warnings) == 1
-    assert "--processes" in warnings[0].getMessage()
+    assert "for 1 sample in a row" in warnings[0]
+    assert "--processes" in warnings[0]
     worker = metrics.snapshot()
     assert worker.event_loop_lag_samples == snapshot.samples
     assert worker.event_loop_lag_max_s == pytest.approx(snapshot.maximum_lag_s)
@@ -966,10 +968,180 @@ def test_event_loop_lag_monitor_drops_a_failing_callback_and_validates_settings(
     ):
         with pytest.raises(ValueError, match="positive number of seconds"):
             EventLoopLagMonitor(**settings)
+    for samples in (0, -1, True, 2.0):
+        with pytest.raises(ValueError, match="sustained_samples"):
+            EventLoopLagMonitor(sustained_samples=samples)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="on_sample"):
         EventLoopLagMonitor(on_sample=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="active_sessions"):
+        EventLoopLagMonitor(active_sessions=1)  # type: ignore[arg-type]
     with pytest.raises(RuntimeError):
         EventLoopLagMonitor().start()
+
+
+class _FakeWarningClock:
+    """Stands in for ``monotonic`` in the process-wide warning rate limit."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def lag_warning_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeWarningClock:
+    from cayu.observability import event_loop_lag
+
+    clock = _FakeWarningClock()
+    monkeypatch.setattr(event_loop_lag, "_last_warning_at", None)
+    monkeypatch.setattr(event_loop_lag, "monotonic", clock)
+    return clock
+
+
+def _lag_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "cayu.observability.event_loop_lag"
+        and record.getMessage().startswith("The event loop")
+    ]
+
+
+def test_event_loop_lag_warns_only_when_lag_stays_high_while_sessions_run(
+    lag_warning_clock: _FakeWarningClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    sessions = 0
+    counted = 0
+
+    def active_sessions() -> int:
+        nonlocal counted
+        counted += 1
+        return sessions
+
+    monitor = EventLoopLagMonitor(
+        warning_threshold_s=0.25,
+        sustained_samples=3,
+        warning_interval_s=60.0,
+        active_sessions=active_sessions,
+    )
+    # The lag source is injected: each value is one sample of how late the timer ran.
+    with caplog.at_level("WARNING", logger="cayu.observability.event_loop_lag"):
+        # A healthy loop never asks for the session count.
+        for lag in (0.001, 0.01, 0.2):
+            monitor._record(lag)
+        assert counted == 0
+        # Lag with no session running is not saturation by sessions.
+        for _ in range(5):
+            monitor._record(0.5)
+        assert _lag_warnings(caplog) == []
+        # One slow callback, or a run broken by a healthy sample, does not warn.
+        sessions = 2
+        for lag in (0.5, 0.5, 0.1, 0.5, 0.5, 0.01):
+            monitor._record(lag)
+        assert _lag_warnings(caplog) == []
+        # Three lagging samples in a row while sessions run warn once.
+        for lag in (0.3, 0.4, 0.6):
+            monitor._record(lag)
+        warnings = _lag_warnings(caplog)
+        assert len(warnings) == 1
+        assert "0.25 s or more late for 3 samples in a row (0.60 s now)" in warnings[0]
+        assert "while 2 sessions were running" in warnings[0]
+        assert "--processes" in warnings[0]
+        assert "max_concurrency" in warnings[0]
+        # Still lagging inside the interval: rate-limited for the whole process.
+        lag_warning_clock.now += 59.0
+        for _ in range(4):
+            monitor._record(1.0)
+        assert len(_lag_warnings(caplog)) == 1
+        # Once the interval has passed, lag that is still high warns again.
+        sessions = 1
+        lag_warning_clock.now += 1.0
+        monitor._record(1.0)
+    warnings = _lag_warnings(caplog)
+    assert len(warnings) == 2
+    assert "for 8 samples in a row (1.00 s now) while 1 session was running" in warnings[1]
+    snapshot = monitor.snapshot()
+    assert snapshot.samples == 22
+    assert snapshot.lagging_samples == 17
+    assert snapshot.maximum_lag_s == pytest.approx(1.0)
+
+
+def test_event_loop_lag_rate_limit_is_shared_by_every_monitor_in_the_process(
+    lag_warning_clock: _FakeWarningClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    first = EventLoopLagMonitor(sustained_samples=2, active_sessions=lambda: 3)
+    second = EventLoopLagMonitor(sustained_samples=2)
+    with caplog.at_level("WARNING", logger="cayu.observability.event_loop_lag"):
+        for monitor in (first, second, first, second):
+            monitor._record(2.0)
+        assert len(_lag_warnings(caplog)) == 1
+        lag_warning_clock.now += 60.0
+        second._record(2.0)
+    warnings = _lag_warnings(caplog)
+    assert len(warnings) == 2
+    # Without a session count the warning says nothing about sessions.
+    assert "session" not in warnings[1].split("Runtime work")[0]
+
+
+def test_event_loop_lag_restart_does_not_carry_an_earlier_run_of_late_samples(
+    lag_warning_clock: _FakeWarningClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    monitor = EventLoopLagMonitor(sustained_samples=4, active_sessions=lambda: 1)
+
+    async def monitoring_period(late_samples: int) -> None:
+        monitor.start()
+        try:
+            for _ in range(late_samples):
+                monitor._record(1.0)
+        finally:
+            monitor.stop()
+
+    with caplog.at_level("WARNING", logger="cayu.observability.event_loop_lag"):
+        asyncio.run(monitoring_period(3))
+        asyncio.run(monitoring_period(1))
+        assert _lag_warnings(caplog) == []
+        asyncio.run(monitoring_period(4))
+    assert len(_lag_warnings(caplog)) == 1
+    # The measurements still add up across periods.
+    assert monitor.snapshot().lagging_samples == 8
+
+
+def test_event_loop_lag_drops_a_failing_session_count_and_still_warns(
+    lag_warning_clock: _FakeWarningClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from cayu.observability.event_loop_lag import EventLoopLagMonitor
+
+    calls = 0
+
+    def broken_count() -> int:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("session registry is closed")
+
+    monitor = EventLoopLagMonitor(sustained_samples=2, active_sessions=broken_count)
+    invalid = EventLoopLagMonitor(sustained_samples=1, active_sessions=lambda: -1)
+    with caplog.at_level("WARNING", logger="cayu.observability.event_loop_lag"):
+        for _ in range(3):
+            monitor._record(1.0)
+        lag_warning_clock.now += 60.0
+        invalid._record(1.0)
+    assert calls == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages.count("An event-loop lag session count failed and was removed.") == 2
+    warnings = _lag_warnings(caplog)
+    assert len(warnings) == 2
+    assert "for 2 samples in a row (1.00 s now). Runtime work" in warnings[0]
 
 
 def test_worker_metrics_ignore_invalid_event_loop_lag() -> None:
@@ -984,3 +1156,13 @@ def test_worker_metrics_ignore_invalid_event_loop_lag() -> None:
     assert snapshot.event_loop_lag_total_s == pytest.approx(0.875)
     assert snapshot.event_loop_lag_max_s == pytest.approx(0.5)
     assert snapshot.current_event_loop_lag_s == pytest.approx(0.125)
+
+
+def test_worker_metrics_count_active_handlers_without_a_snapshot() -> None:
+    metrics = DurableWorkerMetrics(configured_handler_capacity=2)
+    assert metrics.active_handler_count() == 0
+    metrics.handler_started()
+    metrics.handler_started()
+    assert metrics.active_handler_count() == 2
+    metrics.handler_finished()
+    assert metrics.active_handler_count() == metrics.snapshot().active_handlers == 1

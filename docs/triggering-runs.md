@@ -227,6 +227,15 @@ the worker applies the same cancellation-fence and quiescent-settlement rules to
 every slot as to one worker; ordinary handlers may continue draining. An
 infrastructure exception stops and drains all slots before propagating.
 
+`concurrency` adds sessions to one process, not CPU cores: a process runs the
+runtime's own work for all of its sessions on one core, so past a few
+concurrent sessions each of them slows down. To run more at once, run more
+worker processes (`cayu worker NAME --processes N`, or
+`cayu.runtime.supervise_process_workers` from your own code) over a
+PostgreSQL store; see [one process is one CPU
+core](project-workers.md#one-process-is-one-cpu-core). The worker logs a
+warning when its process stays saturated.
+
 To serialize jobs for the same resource across workers, set a durable key when
 creating the task:
 
