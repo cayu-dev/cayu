@@ -445,11 +445,15 @@ def test_rejected_object_descriptors_are_always_closed(tmp_path, monkeypatch, me
         target.write_bytes(CONTENT)
     actual_open, actual_fstat, actual_fdopen = os.open, os.fstat, os.fdopen
     opened = []
+    operation_descriptors = []
     current = None
 
     def track_open(path, *args, **kwargs):
         nonlocal current
         descriptor = actual_open(path, *args, **kwargs)
+        operation_descriptors.append(descriptor)
+        # Unrelated cleanup must not invalidate the operation's leak checks.
+        unrelated.close()
         if path == target.name:
             current = descriptor
             opened.append(descriptor)
@@ -465,15 +469,14 @@ def test_rejected_object_descriptors_are_always_closed(tmp_path, monkeypatch, me
             raise OSError("injected object wrapper failure")
         return actual_fdopen(descriptor, *args, **kwargs)
 
-    descriptor_directory = Path("/dev/fd")
-    initial_count = len(os.listdir(descriptor_directory)) if descriptor_directory.is_dir() else None
-    with monkeypatch.context() as patch:
+    with source.open("rb") as unrelated, monkeypatch.context() as patch:
         patch.setattr(os, "open", track_open)
         patch.setattr(os, "fstat", fail_fstat)
         patch.setattr(os, "fdopen", fail_fdopen)
         patch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) | {track_open})
         for _ in range(20):
             current = None
+            operation_descriptors.clear()
             if entry in {"directory", "fifo"}:
                 with pytest.raises(AgentBundleError, match="object_path_not_regular"):
                     put(store, source, method)
@@ -481,9 +484,10 @@ def test_rejected_object_descriptors_are_always_closed(tmp_path, monkeypatch, me
                 with pytest.raises(OSError, match="injected object"):
                     put(store, source, method)
             assert current is not None
-            with pytest.raises(OSError) as closed:
-                actual_fstat(current)
-            assert closed.value.errno == errno.EBADF
+            # Check the object and its parent directories before a later call
+            # can reuse their descriptor numbers.
+            for descriptor in operation_descriptors:
+                with pytest.raises(OSError) as closed:
+                    actual_fstat(descriptor)
+                assert closed.value.errno == errno.EBADF
     assert len(opened) == 20
-    if initial_count is not None:
-        assert len(os.listdir(descriptor_directory)) == initial_count

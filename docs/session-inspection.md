@@ -31,8 +31,10 @@ servers read the complete Authorization header from `CAYU_API_AUTHORIZATION`
 or the variable named by `--authorization-env`. Cloud uses the existing login
 and optional `--context` file. These commands do not open database files directly.
 
-`rollup` optionally accepts `--price-book FILE` for the existing estimated
-headline cost and `--top-sessions N` for the current token-ranked session detail.
+`rollup` optionally accepts `--price-book FILE` for estimated headline, provider,
+model and session costs, and `--top-sessions N` for session detail ranked by tokens
+by default. Add `--session-order cost` to rank by estimated cost; incomplete or
+incomparable estimates fall back to tokens with an explicit reason.
 Without a price book, costs are not requested. Counter buckets never claim to
 be cost buckets; partial or unevaluated headline pricing remains explicit in
 JSON. `counts` groups sessions by start time and reports their current failures,
@@ -41,6 +43,11 @@ excluding evaluation trials and forks unless `--include-eval` or
 Activity-session counts cannot be summed across usage buckets. Explicit windows
 and the optional hour/day/week series follow the
 [control-plane contract](control-plane.md#usage-windows-and-series).
+
+The Usage dashboard and rollup API also support parent-session, causal-budget,
+exact-label and label-selector filters. These advanced filters do not yet have
+equivalent options in `cayu usage rollup`; the CLI currently exposes the four
+current-session filters listed above.
 
 ## Developer dashboard list
 

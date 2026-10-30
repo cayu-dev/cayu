@@ -119,8 +119,10 @@ specialists in the same snapshot. If costs cannot be compared completely, the
 page labels the token ranking and explains why; it does not price or sort rows
 locally. Environments show declared MCP names and file storage kind, plus native
 retained-session counts and activity observations without per-row session reads.
-Other backend additions are still pending. The UI does not infer missing values
-or claim an exact result from a partial read.
+Artifacts search and sort the selected stores before paging, with producing-session
+titles returned on each row. System shows the explicitly configured deployment
+kind. The remaining histogram filter limitation is listed below; the UI does not
+infer missing values or claim an exact result from a partial read.
 
 | Page | Remaining work | Current behavior |
 | --- | --- | --- |

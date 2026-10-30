@@ -17,7 +17,6 @@ import type {
   SessionStartSeries,
   UsageAggregateGroup,
   UsageAggregateTotals,
-  UsageCurrencyCost,
   UsageSessionCostSummary,
   UsageTimeSeries,
 } from "@/lib/generated/server-api"
@@ -70,8 +69,6 @@ const compact = (value: string | number) => {
   const n = Number(value)
   return Number.isFinite(n) ? compactFormat.format(n) : "–"
 }
-const money = (currencies: UsageCurrencyCost[]) =>
-  currencies.map((c) => formatCurrencyWithCode(c.total_cost, c.currency)).join(" · ")
 const partialSummary = partialCost
 
 export function UsagePage() {
@@ -433,7 +430,7 @@ function CustomRange({
   const [end, setEnd] = useState(originalEnd)
   const [problem, setProblem] = useState<string | null>(null)
   const field =
-    "h-8 rounded-lg border border-input bg-background px-2 text-sm outline-none focus:border-ring"
+    "h-8 max-w-full rounded-lg border border-input bg-background px-2 py-1 text-center text-sm outline-none focus:border-ring [&::-webkit-datetime-edit]:flex [&::-webkit-datetime-edit]:items-center [&::-webkit-datetime-edit]:justify-center [&::-webkit-datetime-edit]:p-0"
   return (
     <form
       className="mt-3 flex flex-wrap items-end gap-2"
@@ -601,11 +598,23 @@ function Filters({ search, set }: { search: UsageSearch; set: (p: Partial<UsageS
 
 /* ---------- headline and pricing ---------- */
 
-function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+function Stat({
+  label,
+  value,
+  sub,
+  className,
+}: {
+  label: string
+  value: ReactNode
+  sub?: string
+  className?: string
+}) {
   return (
-    <div className="min-w-0 rounded-xl border border-border bg-card px-4 py-3">
+    <div className={cn("min-w-0 rounded-xl border border-border bg-card px-4 py-3", className)}>
       <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="mt-1 truncate text-2xl font-semibold tabular-nums">{value}</div>
+      <div className="mt-1 text-2xl font-semibold tabular-nums [overflow-wrap:anywhere]">
+        {value}
+      </div>
       {sub && <div className="mt-0.5 truncate text-xs text-muted-foreground">{sub}</div>}
     </div>
   )
@@ -616,11 +625,21 @@ function Headline({ data }: { data: UsageRollup }) {
   const priced = data.cost && data.cost.currencies.length > 0 ? data.cost : null
   const tokens = `${compact(usage.total_tokens)} tokens`
   return (
-    <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+    <div
+      className={cn(
+        "mt-5 grid gap-3",
+        priced ? "grid-cols-3 lg:grid-cols-5" : "grid-cols-2 lg:grid-cols-4",
+      )}
+    >
       {priced ? (
         <Stat
           label={partialSummary(priced) ? "Estimated cost (partial)" : "Estimated cost"}
-          value={money(priced.currencies)}
+          className="col-span-3 lg:col-span-2"
+          value={priced.currencies.map((currency) => (
+            <span key={currency.currency} className="block text-xl leading-7">
+              {formatCurrencyWithCode(currency.total_cost, currency.currency)}
+            </span>
+          ))}
           sub={tokens}
         />
       ) : (

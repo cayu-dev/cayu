@@ -38,6 +38,7 @@ pytestmark = pytest.mark.skipif(
 async def _home_browser(
     *,
     role="admin",
+    browser_name="chromium",
     nested=False,
     mobile=False,
     decisions=False,
@@ -283,8 +284,13 @@ async def _home_browser(
                         await task
                     await asyncio.sleep(0.01)
             async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(
-                    executable_path=os.environ.get("CAYU_BROWSER_CONTROL_CHROMIUM"), headless=True
+                browser = await getattr(playwright, browser_name).launch(
+                    executable_path=(
+                        os.environ.get("CAYU_BROWSER_CONTROL_CHROMIUM")
+                        if browser_name == "chromium"
+                        else None
+                    ),
+                    headless=True,
                 )
                 try:
                     context = await browser.new_context(

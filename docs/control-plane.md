@@ -138,10 +138,13 @@ Last 30 days choices start at the first displayed hour or day and end now;
 the headline totals and chart use the same bounds. Custom links retain exact
 timezone and microsecond boundaries. Existing specialist, environment, provider,
 model, parent, budget, label and label-selector URL filters remain valid, and
-model/provider links carry those session filters into Sessions. Chart counts
-currently show all ordinary sessions started in the window, excluding forks and
-eval trials, even when the usage totals are filtered. Models show tokens; top
-sessions are ranked by tokens. Pricing coverage, exact windows and raw billing
+model/provider links carry those session filters into Sessions. The chart shows
+session starts and their current failures, excluding forks and eval trials, with
+the specialist, environment, provider and model filters applied. Parent, budget
+and label filters still apply to the headline; the chart is unavailable for those
+filters. Models show usage and estimated costs when pricing is configured. Top
+sessions are ranked by cost when estimates are complete and comparable, otherwise
+by tokens with an explanation. Pricing coverage, exact windows and raw billing
 breakdowns are available in the collapsed Debug section.
 
 Environments links to `/environments/:name` for runner, workspace, branch,
@@ -153,8 +156,12 @@ they are not an exact count of all open or durable branches. Existing
 `/environments?q=...` links filter the list, while Session links open the exact
 environment detail. Basic recent-session reads remain available without optional
 overview enrichment. Without a runner, Shell, Git and
-text-search tools are unavailable. MCP currently shows a count, and file storage
-says whether files are kept without inferring its storage backend.
+text-search tools are unavailable. MCP shows declared server names, and file
+storage shows its declared kind. Native activity support adds retained-session
+counts and last activity, including eval trials and forks, with the observation
+time available in the detail page. Unsupported activity is shown as unavailable;
+an empty supported environment shows zero sessions. These declarations do not
+imply live MCP or storage health checks.
 
 Artifacts keeps search, sort, filters and paging in the URL. Search matches public
 file metadata and producing-session titles across the selected stores before paging.
