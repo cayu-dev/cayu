@@ -313,7 +313,7 @@ install that runs Agents on Kubernetes, an expression must keep its exact
 meaning as a five-field UTC cron: a minute rate that divides an hour, an hour
 rate that divides a day, `rate(1 day)`, or a `cron()` without `L`, `W`, `#`, a
 year limit, or a stepped day of the week. Each run's output is in
-`cayu cloud service logs`.
+`cayu cloud service logs --process schedule:NAME` ([reading logs](#reading-an-agents-logs)).
 
 A schedule can carry a JSON `input`, a table, array, string, number or boolean
 of at most 4096 bytes as compact JSON once escaped (quotes and backslashes take
@@ -1093,6 +1093,49 @@ older than the command needs.
 `cayu session list|show|interactions|usage|tools|events|transcript --application
 my-agent` reads the Agent's sessions the same way; see
 [Session inspection](session-inspection.md#sessions-of-a-cloud-agent).
+
+## Reading an Agent's logs
+
+`cayu cloud service logs --application AGENT` prints the output of the Agent's web process,
+worker, schedules, database migrations and `/data` audit, newest lines last, each with its time
+(UTC), process and release:
+
+```text
+$ cayu cloud service logs --application my-agent --process worker --since 2026-10-28T21:00-07:00 --grep Error
+2026-10-29T04:06:00.123Z worker dep_6c1f0e2a9b8d4c7e8f0a1b2c3d4e5f60 AttributeError: 'list' object has no attribute 'items'
+```
+
+- `--process web|worker|migrate|storage-audit|schedule:NAME` keeps one process's lines; all of
+  them by default. Lines of a Release deployed before Cloud named each process's logs have no
+  process (`-`) and are left out by `--process`; deploying again names them.
+- `--release DEPLOYMENT_ID` keeps one Release's lines, and with `--process` reads only that
+  Release's process, which is quicker on a busy Agent.
+- `--since` and `--until` take a span back from now (`90s`, `15m`, `1h`, `2d`) or an ISO 8601
+  time; one without an offset is local. A read spans at most 7 days.
+- `--grep TEXT` keeps lines containing the text, plainly and case-sensitively.
+- `--limit N` prints up to N lines (100 by default, at most 1000).
+
+Without `--since` the command prints the newest lines, up to 7 days back. With it, it prints the
+first lines after that time, oldest first, and when more follow it ends with
+`More lines follow; go on with --cursor CURSOR`: run it again with that `--cursor` (and the same
+filters) for the next lines. To read a failed worker task's traceback, find the time with
+`--process worker --grep Traceback`, then read from there with `--since`.
+
+`--follow` prints the lines, then asks Cloud every two seconds for the lines after the last one
+printed, until Ctrl-C, which ends it without an error. It shows each line once. Cloud holds back
+the last 10 seconds of lines, so a line that reaches it late is still shown. With `--until`, it
+stops once that time has been read.
+
+`--json` prints the usual envelope, whose `result.lines` carry `id`, `timestamp`, `process`,
+`release`, `instance` (the ECS task or Kubernetes pod) and `message`, with `next_cursor` and
+`more`. With `--follow`, it prints one envelope per page that has lines, then one with the
+cursor to go on from.
+
+Cloud redacts credential-shaped text (`[redacted]`) and removes terminal control sequences
+before a line leaves it, and cuts a line longer than 8,192 characters; `--grep` matches the
+redacted text. A filter Cloud can't read is refused with its reason (`log_query_invalid`). A
+Cloud from before line times prints the newest lines without times or processes, and refuses
+any option rather than ignore it (`service_logs_filters_unsupported`).
 
 ## Running an Agent's evals
 

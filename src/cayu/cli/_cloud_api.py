@@ -120,6 +120,7 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "settings_revision_conflict"),
         (422, "invalid_setting"),
         (422, "invalid_settings"),
+        (422, "log_query_invalid"),
         (422, "no_objectives"),
         (422, "release_too_large"),
         (503, "agent_domain_unknown"),

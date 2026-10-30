@@ -56,6 +56,7 @@ from cayu.cli._cloud_releases import (
     render_releases,
     show_application,
 )
+from cayu.cli._cloud_service_logs import add_service_logs_arguments, service_logs
 from cayu.cli._cloud_service_switch import ServiceStillSwitchingError, send_when_not_switching
 from cayu.cli._cloud_settings import CloudSettingsError, add_settings_parser, settings_command
 from cayu.cli._cloud_task_health import fenced_tasks_warning
@@ -736,7 +737,10 @@ def _run_cloud(arguments: argparse.Namespace) -> int:
             exc, render=None if render is None else arguments._cloud_render_failure
         )
     if render is not None:
-        print(render(result))
+        text = render(result)
+        # A command that printed its output as it went (`service logs --follow`) renders none.
+        if text:
+            print(text)
         return 0
     print(json.dumps({"ok": True, **result}, sort_keys=True))
     return 0
@@ -1118,7 +1122,10 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "output is a credential: keep it out of logs and shared terminals."
         ),
         "destroy": "Remove the Agent services and schedules but retain its releases.",
-        "logs": "Read recent infrastructure logs from the Agent service.",
+        "logs": (
+            "Read the output of the Agent's web process, worker and schedules, each line "
+            "with its time, process and release."
+        ),
         "pause": (
             "Scale the Agent worker to zero and stop its schedules starting runs; the web "
             "process keeps serving. Deploys and restarts keep the Agent paused until resume."
@@ -1132,6 +1139,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     for action, description in service_descriptions.items():
         operation = service_commands.add_parser(action, description=description)
         operation.add_argument("--application", required=True)
+        if action == "logs":
+            add_service_logs_arguments(operation)
         if action in _SWITCH_REFUSED_SERVICE_ACTIONS:
             _add_switch_wait_argument(operation)
         if action == "destroy":
@@ -3536,7 +3545,7 @@ def _service(
             "This Cayu Cloud can't pause Agents yet.",
         )
     elif action == "logs":
-        result = client.request("GET", f"{path}/logs")
+        return service_logs(arguments, client=client, application_id=application_id, sleep=sleep)
     elif action == "credentials":
         result = _operator_credentials(client, application_id=application_id)
     else:
