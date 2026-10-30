@@ -85,7 +85,7 @@ when they are plain identifiers:
 | `timeout` | No answer before the deadline. |
 | `stream_failed` | The stream ended without an answer or a typed error. |
 | `event_after_completion` | The provider sent another stream event after completing the request, which also fails a run's model attempt. The completion's usage and model are kept. |
-| `generation_failed` | The request completed with an error finish reason, such as Bedrock's `malformed_model_output`. A token-limit finish still counts as an answer. |
+| `generation_failed` | The request completed with an error finish reason, such as Bedrock's `malformed_model_output` or `malformed_tool_use`. A token-limit finish still counts as an answer. |
 | `preflight_rejected` | The provider refused the model before sending, such as a generated project's placeholder when no API key is set. `error.detail` carries its setup message after the application's secret redaction. |
 | `billing_identity_failed` | The provider couldn't resolve the request's billing identity: before sending (no `latency_ms`), or from the completion, which keeps its usage. |
 | `unsupported` | The provider doesn't implement `prepare_auxiliary_request`, so it can't cap the request; nothing was sent. |
@@ -146,6 +146,17 @@ OpenAI Responses caches prefixes automatically; Cayu also sends a stable
 "Prompt-cache affinity" in `docs/runtime-contracts.md`. Chat Completions
 endpoints follow their own provider's caching rules. Measured before/after
 numbers are in `docs/late-system-message-caching-results.md`.
+
+## Malformed Bedrock tool calls
+
+When a Bedrock model writes tool input that isn't a JSON object, for example
+because the output was cut off, `BedrockProvider` drops that call and still
+reports the turn's stop reason and billed usage. On `malformed_tool_use` it
+drops every tool call of the turn, so none of them runs and the step is
+classified as failed. On `max_tokens` or `model_context_window_exceeded` it
+keeps the complete calls before the cut. Bedrock tool calls arrive when the
+turn ends rather than as each block finishes. Any other stop reason after
+malformed tool input is a protocol error.
 
 ## OpenAI subscription
 

@@ -11783,7 +11783,18 @@ when a later stream read or cleanup fails; runtime retains its accounting and
 fails continuation rather than retrying the completed provider operation.
 Native incomplete-output handling remains provider-specific: OpenAI output-limit
 terminals discard unusable partial tool/reasoning state, while an unfinished
-item in a completed response remains a protocol error.
+item in a completed response remains a protocol error. Bedrock tolerates
+finished but invalid tool input: a tool block whose model-generated input is not
+a finite JSON object, or one still open at the terminal, is never emitted when
+the turn ends with `malformed_tool_use`, `max_tokens` or
+`model_context_window_exceeded`, and the turn completes with that stop reason
+and its usage, as OpenAI keeps an incomplete terminal's finish reason and
+usage. On `malformed_tool_use` the call set failed, so Bedrock emits none of
+the turn's tool calls; the two truncation stops keep the complete calls before
+the cut. Bedrock therefore emits a turn's tool calls at `messageStop`, in their
+stream order relative to any later text or reasoning. Invalid tool input with
+any other stop reason, or a stream without `messageStop`, remains a protocol
+error.
 
 OpenAI background streams restore response identity from the exact operation
 state and carry model-identity comparison evidence in private, bounded recovery

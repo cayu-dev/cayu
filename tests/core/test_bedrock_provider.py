@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import threading
+import time
 import traceback
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Iterator
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from decimal import Decimal
 from types import SimpleNamespace
@@ -42,6 +43,7 @@ from cayu.providers.deadlines import (
     bind_provider_deadline_controller,
     reset_provider_deadline_controller,
 )
+from cayu.tools import Tool, ToolContext, ToolResult, ToolSpec
 
 
 class FakeBedrockClient:
@@ -994,6 +996,7 @@ async def test_bedrock_provider_supports_structured_output_via_tools() -> None:
         ("content_filtered", "content_filter"),
         ("model_context_window_exceeded", "length"),
         ("malformed_model_output", "error"),
+        ("malformed_tool_use", "error"),
     ],
 )
 def test_bedrock_provider_normalizes_documented_stop_reasons(
@@ -1504,6 +1507,598 @@ def test_bedrock_provider_reports_unfinished_tool_blocks() -> None:
     assert len(events) == 1
     assert events[0].type == ModelStreamEventType.ERROR
     assert events[0].payload["error"] == "Bedrock provider protocol failure"
+
+
+_MALFORMED_TOOL_CANARY = "bedrock-malformed-tool-canary-0123456789"
+
+
+def _tool_block(index: int, tool_use_id: str, tool_input: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "contentBlockStart": {
+                "contentBlockIndex": index,
+                "start": {"toolUse": {"toolUseId": tool_use_id, "name": "read_file"}},
+            }
+        },
+        {
+            "contentBlockDelta": {
+                "contentBlockIndex": index,
+                "delta": {"toolUse": {"input": tool_input}},
+            }
+        },
+        {"contentBlockStop": {"contentBlockIndex": index}},
+    ]
+
+
+def _malformed_tool_block(index: int = 0) -> list[dict[str, Any]]:
+    return _tool_block(index, "tool-bad", '{"path":"' + _MALFORMED_TOOL_CANARY)
+
+
+def _terminal(stop_reason: str) -> list[dict[str, Any]]:
+    return [
+        {"messageStop": {"stopReason": stop_reason}},
+        {
+            "metadata": {
+                "usage": {
+                    "inputTokens": 10,
+                    "outputTokens": 5,
+                    "totalTokens": 20,
+                    "cacheReadInputTokens": 3,
+                    "cacheWriteInputTokens": 2,
+                }
+            }
+        },
+    ]
+
+
+def _hello_request() -> ModelRequest:
+    return ModelRequest(model="anthropic.claude-test", messages=[Message.text("user", "Hello")])
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "finish_reason"),
+    [
+        ("malformed_tool_use", "error"),
+        ("max_tokens", "length"),
+        ("model_context_window_exceeded", "length"),
+    ],
+)
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        '{"path":',
+        '["README.md"]',
+        "null",
+        '{"x":NaN}',
+        '{"x":-Infinity}',
+        '{"x":1e999}',
+        '{"x":' + "9" * 5000 + "}",
+        '{"x":' + "[" * 100_000 + "]" * 100_000 + "}",
+    ],
+    ids=[
+        "truncated_json",
+        "non_object_json",
+        "null_json",
+        "nan",
+        "negative_infinity",
+        "overflowing_float",
+        "oversized_integer",
+        "deep_nesting",
+    ],
+)
+def test_bedrock_provider_reports_terminal_usage_after_malformed_tool_input(
+    stop_reason: str,
+    finish_reason: str,
+    tool_input: str,
+) -> None:
+    provider = BedrockProvider(
+        client=FakeBedrockClient(
+            [
+                {"messageStart": {"role": "assistant"}},
+                *_tool_block(0, "tool-bad", tool_input),
+                *_terminal(stop_reason),
+            ]
+        )
+    )
+
+    events = collect(provider, _hello_request())
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert events[0].payload["stop_reason"] == stop_reason
+    assert events[0].payload["usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 20,
+        "cache_read_input_tokens": 3,
+        "cache_creation_input_tokens": 2,
+    }
+    assert events[0].completion is not None
+    assert events[0].completion.finish_reason == finish_reason
+
+
+_VALID_TOOL_CALL_PAYLOAD = {
+    "id": "tool-good",
+    "name": "read_file",
+    "arguments": {"path": "README.md"},
+}
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "keeps_complete_calls"),
+    [
+        ("malformed_tool_use", False),
+        ("max_tokens", True),
+        ("model_context_window_exceeded", True),
+    ],
+)
+@pytest.mark.parametrize("malformed_first", [False, True], ids=["valid_first", "malformed_first"])
+def test_bedrock_provider_emits_complete_tool_calls_only_for_truncation(
+    stop_reason: str,
+    keeps_complete_calls: bool,
+    malformed_first: bool,
+) -> None:
+    tool_blocks = [
+        _tool_block(1, "tool-good", '{"path":"README.md"}'),
+        _malformed_tool_block(2),
+    ]
+    if malformed_first:
+        tool_blocks.reverse()
+    provider = BedrockProvider(
+        client=FakeBedrockClient(
+            [
+                {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "Reading."}}},
+                {"contentBlockStop": {"contentBlockIndex": 0}},
+                *tool_blocks[0],
+                *tool_blocks[1],
+                *_terminal(stop_reason),
+            ]
+        )
+    )
+
+    events = collect(provider, _hello_request())
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        *([ModelStreamEventType.TOOL_CALL] if keeps_complete_calls else []),
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].delta == "Reading."
+    if keeps_complete_calls:
+        assert events[1].payload == _VALID_TOOL_CALL_PAYLOAD
+    assert events[-1].payload["stop_reason"] == stop_reason
+    assert events[-1].payload["usage"]["total_tokens"] == 20
+
+
+def test_bedrock_provider_keeps_output_after_withheld_tool_calls() -> None:
+    provider = BedrockProvider(
+        client=FakeBedrockClient(
+            [
+                *_tool_block(0, "tool-good", '{"path":"README.md"}'),
+                {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"text": "And more."}}},
+                {"contentBlockStop": {"contentBlockIndex": 1}},
+                *_malformed_tool_block(2),
+                *_terminal("malformed_tool_use"),
+            ]
+        )
+    )
+
+    events = collect(provider, _hello_request())
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].delta == "And more."
+
+
+@pytest.mark.parametrize("stop_reason", ["malformed_tool_use", "max_tokens"])
+def test_bedrock_provider_drops_every_malformed_block_in_a_turn(stop_reason: str) -> None:
+    provider = BedrockProvider(
+        client=FakeBedrockClient(
+            [*_malformed_tool_block(0), *_malformed_tool_block(1), *_terminal(stop_reason)]
+        )
+    )
+
+    events = collect(provider, _hello_request())
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert events[0].payload["usage"]["total_tokens"] == 20
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "keeps_complete_calls"),
+    [("malformed_tool_use", False), ("max_tokens", True), ("model_context_window_exceeded", True)],
+)
+def test_bedrock_provider_drops_a_tool_block_cut_off_by_its_terminal(
+    stop_reason: str,
+    keeps_complete_calls: bool,
+) -> None:
+    provider = BedrockProvider(
+        client=FakeBedrockClient(
+            [
+                *_tool_block(0, "tool-good", '{"path":"README.md"}'),
+                *_malformed_tool_block(1)[:2],
+                *_terminal(stop_reason),
+            ]
+        )
+    )
+
+    events = collect(provider, _hello_request())
+
+    assert [event.type for event in events] == [
+        *([ModelStreamEventType.TOOL_CALL] if keeps_complete_calls else []),
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[-1].payload["stop_reason"] == stop_reason
+
+
+def test_bedrock_provider_keeps_event_order_for_valid_tool_turns() -> None:
+    provider = BedrockProvider(
+        client=FakeBedrockClient(
+            [
+                *_tool_block(0, "tool-1", '{"path":"A.md"}'),
+                {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"text": "Then B."}}},
+                {"contentBlockStop": {"contentBlockIndex": 1}},
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 2,
+                        "delta": {"reasoningContent": {"text": "B next."}},
+                    }
+                },
+                {"contentBlockStop": {"contentBlockIndex": 2}},
+                *_tool_block(3, "tool-2", ""),
+                *_terminal("tool_use"),
+            ]
+        )
+    )
+
+    events = collect(provider, _hello_request())
+
+    assert [(event.type, event.payload.get("id")) for event in events] == [
+        (ModelStreamEventType.TOOL_CALL, "tool-1"),
+        (ModelStreamEventType.TEXT_DELTA, None),
+        (ModelStreamEventType.THINKING, None),
+        (ModelStreamEventType.TOOL_CALL, "tool-2"),
+        (ModelStreamEventType.COMPLETED, None),
+    ]
+    assert events[3].payload["arguments"] == {}
+
+
+class _PacedBedrockClient(FakeBedrockClient):
+    def __init__(self, events: Iterable[dict[str, Any]], *, pause_s: float) -> None:
+        super().__init__(events)
+        self.pause_s = pause_s
+
+    def converse_stream(self, **kwargs: Any) -> dict[str, Any]:
+        self.converse_calls.append(kwargs)
+
+        def paced() -> Iterator[dict[str, Any]]:
+            for event in self.events:
+                time.sleep(self.pause_s)
+                yield event
+
+        return {"stream": paced()}
+
+
+@pytest.mark.anyio
+async def test_bedrock_held_text_after_a_tool_call_counts_as_semantic_progress() -> None:
+    text_deltas = [
+        {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"text": f"part {index} "}}}
+        for index in range(6)
+    ]
+    provider = BedrockProvider(
+        client=_PacedBedrockClient(
+            [
+                *_tool_block(0, "tool-good", '{"path":"README.md"}'),
+                *text_deltas,
+                {"contentBlockStop": {"contentBlockIndex": 1}},
+                *_terminal("tool_use"),
+            ],
+            pause_s=0.05,
+        ),
+        stream_deadlines=ProviderStreamDeadlines(semantic_progress_timeout_s=0.2),
+    )
+
+    events = [event async for event in provider.runtime_stream(_hello_request())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TOOL_CALL,
+        *[ModelStreamEventType.TEXT_DELTA] * len(text_deltas),
+        ModelStreamEventType.COMPLETED,
+    ]
+
+
+@pytest.mark.anyio
+async def test_bedrock_held_output_reports_the_progress_it_reported_when_yielded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[ProviderProgressKind] = []
+    monkeypatch.setattr(bedrock_module, "observe_provider_semantic_progress", observed.append)
+
+    async def raw_events() -> AsyncIterator[dict[str, Any]]:
+        for raw in [
+            *_tool_block(0, "tool-1", '{"path":"A.md"}'),
+            {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"text": "  "}}},
+            {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"text": "More."}}},
+            {"contentBlockStop": {"contentBlockIndex": 1}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 2,
+                    "delta": {"reasoningContent": {"text": "Next."}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 2}},
+            *_tool_block(3, "tool-2", ""),
+        ]:
+            yield raw
+        yield {"messageStop": {"stopReason": "tool_use"}}
+
+    events = [event async for event in bedrock_module.bedrock_converse_stream_events(raw_events())]
+
+    assert len(events) == 6
+    assert observed == [
+        ProviderProgressKind.TOOL_CALL,
+        ProviderProgressKind.TOOL_CALL,
+        ProviderProgressKind.TOOL_CALL,
+        ProviderProgressKind.CONTENT,
+        ProviderProgressKind.REASONING,
+        ProviderProgressKind.REASONING,
+        ProviderProgressKind.TOOL_CALL,
+        ProviderProgressKind.TOOL_CALL,
+        ProviderProgressKind.TERMINAL,
+    ]
+
+
+@pytest.mark.anyio
+async def test_bedrock_held_whitespace_text_is_recorded_without_progress() -> None:
+    controller = ProviderStreamDeadlineController(ProviderStreamDeadlines())
+    token = bind_provider_deadline_controller(controller)
+    whitespace_evidence: list[bool] = []
+
+    async def raw_events() -> AsyncIterator[dict[str, Any]]:
+        for raw in _tool_block(0, "tool-1", '{"path":"A.md"}'):
+            yield raw
+        yield {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"text": "\n "}}}
+        evidence = controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
+        whitespace_evidence.append(evidence.whitespace_since_progress)
+        yield {"messageStop": {"stopReason": "tool_use"}}
+
+    try:
+        events = [
+            event async for event in bedrock_module.bedrock_converse_stream_events(raw_events())
+        ]
+    finally:
+        reset_provider_deadline_controller(token)
+
+    assert whitespace_evidence == [True]
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+
+
+def test_bedrock_provider_completes_malformed_tool_turn_without_usage_metadata() -> None:
+    provider = BedrockProvider(
+        client=FakeBedrockClient(
+            [*_malformed_tool_block(), {"messageStop": {"stopReason": "malformed_tool_use"}}]
+        )
+    )
+
+    events = collect(provider, _hello_request())
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert events[0].payload == {"stop_reason": "malformed_tool_use"}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tail_events", "error_match"),
+    [
+        ([], "before messageStop"),
+        ([{"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}}], "before messageStop"),
+        (_terminal("tool_use"), "not a JSON object"),
+        (_terminal("end_turn"), "not a JSON object"),
+        (_terminal("tool_use")[::-1], "not a JSON object"),
+    ],
+    ids=[
+        "no_terminal",
+        "metadata_without_message_stop",
+        "tool_use_stop",
+        "end_turn_stop",
+        "metadata_before_tool_use_stop",
+    ],
+)
+async def test_bedrock_stream_fails_malformed_tool_input_without_truncation_terminal(
+    tail_events: list[dict[str, Any]],
+    error_match: str,
+) -> None:
+    async def raw_events():
+        for raw in [*_malformed_tool_block(), *tail_events]:
+            yield raw
+
+    emitted: list[ModelStreamEvent] = []
+    with pytest.raises(bedrock_module.BedrockProtocolError, match=error_match) as raised:
+        async for event in bedrock_module.bedrock_converse_stream_events(raw_events()):
+            emitted.append(event)
+
+    assert emitted == []
+    assert _MALFORMED_TOOL_CANARY not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_bedrock_provider_reports_protocol_error_for_malformed_tool_without_terminal() -> None:
+    provider = BedrockProvider(client=FakeBedrockClient(_malformed_tool_block()))
+
+    events = collect(provider, _hello_request())
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload == {
+        "error": "Bedrock provider protocol failure",
+        "error_type": "BedrockProtocolError",
+    }
+    assert _MALFORMED_TOOL_CANARY not in repr(events[0])
+
+
+@pytest.mark.parametrize(
+    "raw_events",
+    [
+        [
+            *_malformed_tool_block(),
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"toolUse": {"input": "}"}}}},
+            *_terminal("malformed_tool_use"),
+        ],
+        [
+            {"contentBlockStart": {"contentBlockIndex": 0, "start": {"toolUse": {}}}},
+            *_terminal("malformed_tool_use"),
+        ],
+    ],
+    ids=["delta_after_stop", "tool_start_without_identity"],
+)
+def test_bedrock_provider_keeps_invalid_tool_protocol_shapes_as_errors(
+    raw_events: list[dict[str, Any]],
+) -> None:
+    provider = BedrockProvider(client=FakeBedrockClient(raw_events))
+
+    events = collect(provider, _hello_request())
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["error_type"] == "BedrockProtocolError"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("stop_reason", "classification"),
+    [("malformed_tool_use", "failed"), ("max_tokens", "length")],
+)
+async def test_bedrock_malformed_tool_turn_records_billed_usage_without_tool_calls(
+    stop_reason: str,
+    classification: str,
+) -> None:
+    client = FakeBedrockClient(
+        [
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "Reading."}}},
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            *_malformed_tool_block(1),
+            {"messageStop": {"stopReason": stop_reason}},
+            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}}},
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(BedrockProvider(client=client), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="anthropic.claude-test"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(agent_name="assistant", messages=[Message.text("user", "Read it.")])
+        )
+    ]
+
+    assert not [event for event in events if event.type.value.startswith("tool.call")]
+    assert EventType.MODEL_ERROR not in [event.type for event in events]
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["completion"]["raw_finish_reason"] == stop_reason
+    assert completed.payload["step_classification"]["type"] == classification
+    usage_metrics = completed.payload["usage_metrics"]
+    assert usage_metrics["input_tokens"] == 10
+    assert usage_metrics["output_tokens"] == 5
+    assert usage_metrics["total_tokens"] == 15
+    cost = await app.get_session_cost(
+        completed.session_id,
+        PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="bedrock",
+                    model="anthropic.claude-test",
+                    match="exact",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("2"),
+                    pricing_context={
+                        "source_region": ("us-east-1",),
+                        "service_tier": ("default",),
+                    },
+                ),
+            )
+        ),
+    )
+    assert cost.priced_model_steps == 1
+    assert cost.line_items[0].total_cost == Decimal("0.00002")
+    assert _MALFORMED_TOOL_CANARY not in repr(events)
+
+
+class _RecordingReadFileTool(Tool):
+    spec = ToolSpec(
+        name="read_file",
+        description="Read a file.",
+        input_schema={
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+        max_terminal_payload_bytes=1024,
+    )
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        self.paths.append(args["path"])
+        return ToolResult(content="contents")
+
+
+class _TurnsBedrockClient(FakeBedrockClient):
+    def __init__(self, turns: list[list[dict[str, Any]]]) -> None:
+        super().__init__([])
+        self.turns = turns
+
+    def converse_stream(self, **kwargs: Any) -> dict[str, Any]:
+        self.converse_calls.append(kwargs)
+        return {"stream": iter(self.turns[len(self.converse_calls) - 1])}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("stop_reason", "tool_runs"),
+    [("malformed_tool_use", False), ("max_tokens", True)],
+)
+async def test_bedrock_malformed_tool_turn_runs_complete_calls_only_after_truncation(
+    stop_reason: str,
+    tool_runs: bool,
+) -> None:
+    client = _TurnsBedrockClient(
+        [
+            [
+                *_tool_block(0, "tool-good", '{"path":"README.md"}'),
+                *_malformed_tool_block(1),
+                *_terminal(stop_reason),
+            ],
+            [
+                {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "Done."}}},
+                {"contentBlockStop": {"contentBlockIndex": 0}},
+                *_terminal("end_turn"),
+            ],
+        ]
+    )
+    tool = _RecordingReadFileTool()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(BedrockProvider(client=client), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="anthropic.claude-test"), tools=[tool])
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(agent_name="assistant", messages=[Message.text("user", "Read it.")])
+        )
+    ]
+
+    completions = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    assert completions[0].payload["completion"]["raw_finish_reason"] == stop_reason
+    assert completions[0].payload["usage_metrics"]["output_tokens"] == 5
+    assert tool.paths == (["README.md"] if tool_runs else [])
+    assert len(client.converse_calls) == (2 if tool_runs else 1)
+    assert EventType.MODEL_ERROR not in [event.type for event in events]
 
 
 @pytest.mark.parametrize(

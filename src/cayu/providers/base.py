@@ -1385,7 +1385,12 @@ def _normalized_finish_reason(
         "refusal",
     }:
         return ModelFinishReason.CONTENT_FILTER
-    if raw_finish_reason in {"error", "failed", "malformed_model_output"}:
+    if raw_finish_reason in {
+        "error",
+        "failed",
+        "malformed_model_output",
+        "malformed_tool_use",
+    }:
         return ModelFinishReason.ERROR
     if isinstance(incomplete_details, dict):
         reason = _optional_payload_string(cast("dict[str, Any]", incomplete_details), "reason")

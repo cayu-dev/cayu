@@ -14,7 +14,12 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
 
-from cayu._validation import canonical_durable_json_bytes, copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    copy_json_object,
+    copy_json_value,
+    require_clean_nonblank,
+)
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -77,6 +82,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
+    _normalized_provider_progress_kind,
     _preflight_provider_portable_messages,
     _terminal_preserving_provider_stream,
 )
@@ -105,6 +111,14 @@ _BEDROCK_STREAM_POLICY = StreamPolicy(
     max_metadata_tails=1,
     max_total_tails=1,
     max_metadata_events=1,
+)
+# Stop reasons with which Bedrock ends a turn whose model-generated tool input is
+# malformed or cut off: the turn still completes and bills its usage. On
+# malformed_tool_use the whole call set failed, so none of its calls is emitted;
+# a truncation keeps the complete calls before the cut.
+_BEDROCK_MALFORMED_TOOL_USE = "malformed_tool_use"
+_BEDROCK_MALFORMED_TOOL_STOP_REASONS = frozenset(
+    {_BEDROCK_MALFORMED_TOOL_USE, "max_tokens", "model_context_window_exceeded"}
 )
 BedrockResourceType = Literal[
     "foundation_model",
@@ -1056,6 +1070,10 @@ async def bedrock_converse_stream_events(
     tool_blocks: dict[int, _PendingToolUse] = {}
     reasoning_blocks: dict[int, _PendingReasoning] = {}
     started_block_indexes: set[int] = set()
+    malformed_tool_input = False
+    # From the turn's first tool call, output is held until messageStop so that a
+    # malformed_tool_use stop can withhold every call while keeping event order.
+    held_events: list[ModelStreamEvent] = []
     stop_reason: str | None = None
     completion_metadata_payload: dict[str, Any] = {}
     post_terminal_failure: BaseException | None = None
@@ -1070,6 +1088,24 @@ async def bedrock_converse_stream_events(
         return BedrockProtocolError(f"Bedrock {message}.")
 
     lifecycle = StreamLifecycle(_BEDROCK_STREAM_POLICY, error_factory=lifecycle_error)
+
+    def hold(event: ModelStreamEvent) -> None:
+        held_events.append(event)
+        # The deadline guard sees held output only at messageStop, so record the
+        # progress it would have observed had the event been yielded now.
+        if event.type is ModelStreamEventType.TEXT_DELTA:
+            controller = current_provider_deadline_controller()
+            if controller is not None:
+                controller.observe_text(event.delta)
+        progress = _normalized_provider_progress_kind(event)
+        if progress is not None:
+            observe_provider_semantic_progress(progress)
+
+    def held(event: ModelStreamEvent) -> bool:
+        if not held_events:
+            return False
+        hold(event)
+        return True
 
     def validate_terminal_assembly() -> None:
         if tool_blocks:
@@ -1147,7 +1183,9 @@ async def bedrock_converse_stream_events(
                 if type(text) is not str:
                     raise BedrockProtocolError("Bedrock text delta must be a string.")
                 if text:
-                    yield ModelStreamEvent.text_delta(text)
+                    text_event = ModelStreamEvent.text_delta(text)
+                    if not held(text_event):
+                        yield text_event
             tool_delta = delta.get("toolUse")
             if tool_delta is not None:
                 tool = tool_blocks.get(index)
@@ -1207,25 +1245,22 @@ async def bedrock_converse_stream_events(
                     "Bedrock content block mixed tool use and reasoning content."
                 )
             if tool is not None:
-                raw_input = tool.input_json
-                try:
-                    arguments = json.loads(raw_input or "{}")
-                except json.JSONDecodeError as exc:
-                    raise BedrockProtocolError("Bedrock tool input was not valid JSON.") from exc
-                if type(arguments) is not dict:
-                    raise BedrockProtocolError("Bedrock tool input must decode to an object.")
-                yield ModelStreamEvent.tool_call(
-                    id=tool.id,
-                    name=tool.name,
-                    arguments=arguments,
-                )
+                arguments = _model_tool_arguments(tool.input_json)
+                if arguments is None:
+                    # Bedrock still ends the turn with its stop reason and usage;
+                    # messageStop decides whether that terminal admits it.
+                    malformed_tool_input = True
+                else:
+                    hold(
+                        ModelStreamEvent.tool_call(id=tool.id, name=tool.name, arguments=arguments)
+                    )
             elif reasoning is not None:
                 if reasoning.redacted_parts:
                     if reasoning.text_parts or reasoning.signature_parts:
                         raise BedrockProtocolError(
                             "Bedrock reasoning block mixed redacted and plaintext content."
                         )
-                    yield ModelStreamEvent.thinking(
+                    thinking_event = ModelStreamEvent.thinking(
                         provider_state={
                             **reasoning_state(
                                 "redacted_content",
@@ -1244,14 +1279,21 @@ async def bedrock_converse_stream_events(
                     signature = "".join(reasoning.signature_parts)
                     if signature:
                         provider_state["signature"] = signature
-                    yield ModelStreamEvent.thinking(
+                    thinking_event = ModelStreamEvent.thinking(
                         "".join(reasoning.text_parts),
                         provider_state=provider_state,
                     )
+                if not held(thinking_event):
+                    yield thinking_event
             continue
         if "messageStop" in raw:
             message_stop = _mapping(raw["messageStop"], "messageStop")
             candidate_stop_reason = _required_string(message_stop, "stopReason")
+            if candidate_stop_reason in _BEDROCK_MALFORMED_TOOL_STOP_REASONS:
+                # A tool block still open at this stop holds cut-off input.
+                tool_blocks.clear()
+            elif malformed_tool_input:
+                raise BedrockProtocolError("Bedrock tool input was not a JSON object.")
             validate_terminal_assembly()
             accepted = lifecycle.accept(
                 StreamTransition(
@@ -1264,6 +1306,12 @@ async def bedrock_converse_stream_events(
             )
             if accepted.repeated:
                 continue
+            for held_event in held_events:
+                if (
+                    candidate_stop_reason != _BEDROCK_MALFORMED_TOOL_USE
+                    or held_event.type is not ModelStreamEventType.TOOL_CALL
+                ):
+                    yield held_event
             stop_reason = candidate_stop_reason
             observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
             if lifecycle.metadata_received:
@@ -1287,6 +1335,16 @@ async def bedrock_converse_stream_events(
         raw = {}
         del iterator, raw_events
         raise failure from None
+
+
+def _model_tool_arguments(raw_input: str) -> dict[str, Any] | None:
+    """Decode model-generated tool input, or None unless it is a finite JSON object."""
+
+    try:
+        # The copy rejects NaN, infinities and overflowing floats, which json accepts.
+        return copy_json_object(json.loads(raw_input or "{}"), "tool input")
+    except (ValueError, RecursionError):
+        return None
 
 
 async def _boto3_stream_events(
