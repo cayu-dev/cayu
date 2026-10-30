@@ -845,6 +845,18 @@ on `public_web`. No brokered sandbox satisfies
 in the network path; an allowlist is enforced by Cloud's proxy instead.
 Required executables are probed live in the sandbox.
 
+When the Cloud broker serving a sandbox restarts, another broker takes the
+sandbox over and it stays `ready`. Calls made meanwhile get a retryable 503
+`sandbox_handover` (`SandboxHandoverError`, which says nothing was done); the
+client waits out the pause it names, for up to two and a half minutes, and a
+command start asks again under the same id. Taking a sandbox over stops every
+command the earlier broker started: such a command ends `failed` with
+`interrupted: "broker_handover"`, and the runner returns it as cancelled, with
+stderr saying it may have run, and keeps going. Only a sandbox that isn't
+`ready` any more (409 `sandbox_not_ready`, for example destroyed with
+`worker_lost` when no broker took it over in time) loses the runner for good;
+a command the broker never started there reads `interrupted: "never_started"`.
+
 Each part also works alone:
 
 - `SandboxBrokerClient` is the wire client;

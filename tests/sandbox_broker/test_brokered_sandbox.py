@@ -56,6 +56,7 @@ from cayu.sandbox_broker import (
     SandboxBrokerUnavailableError,
     SandboxCopyFailedError,
     SandboxGuarantees,
+    SandboxHandoverError,
     SandboxLeaseKeeper,
     SandboxLeaseLostError,
     SandboxNotFoundError,
@@ -268,6 +269,57 @@ def test_a_lost_transfer_answer_is_retried_with_the_transfer_backoff(monkeypatch
 
     asyncio.run(scenario())
     assert pauses == [2.0, 4.0]
+
+
+def test_a_handover_answer_is_asked_again_after_the_pause_it_names(monkeypatch) -> None:
+    pauses = _sleep_recorder(monkeypatch)
+    answers = iter(["3", "3"])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        retry_after = next(answers, None)
+        if retry_after is not None:
+            return httpx.Response(
+                503,
+                json={"error": {"code": "sandbox_handover", "message": "moving", "detail": {}}},
+                headers={"Retry-After": retry_after},
+            )
+        return httpx.Response(200, json={"files": 1, "bytes": 1})
+
+    client = SandboxBrokerClient(
+        SandboxBrokerSettings(api_url=API_URL, application_id=APPLICATION, token=TOKEN),
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def scenario():
+        # A handover doesn't use up the quick retries: it waits as long as the broker asks.
+        assert await client.put_archive("sbx_1", _tar({"a": b"1"})) == {"files": 1, "bytes": 1}
+        await client.aclose()
+
+    asyncio.run(scenario())
+    assert pauses == [3.0, 3.0]
+
+
+def test_a_handover_answer_says_nothing_was_done() -> None:
+    def answer(retry_after: str | None) -> client_module.SandboxBrokerError:
+        body = json.dumps(
+            {"error": {"code": "sandbox_handover", "message": "moving", "detail": {}}}
+        ).encode()
+        headers = httpx.Headers({} if retry_after is None else {"Retry-After": retry_after})
+        return client_module._broker_error(503, body, headers)
+
+    error = answer("4")
+    assert isinstance(error, SandboxHandoverError)
+    assert isinstance(error, SandboxBrokerUnavailableError)
+    assert (error.code, error.outcome_unknown, error.retry_after_s) == (
+        "sandbox_handover",
+        False,
+        4.0,
+    )
+    # The pause is bounded, and a missing or unreadable one gets the default.
+    assert answer("600").retry_after_s == 10.0
+    assert answer("0").retry_after_s == 0.5
+    assert answer(None).retry_after_s == 2.0
+    assert answer("soon").retry_after_s == 2.0
 
 
 def test_factory_from_env_requires_an_explicit_egress_mode(tmp_path: Path) -> None:
@@ -2388,6 +2440,107 @@ def test_a_sandbox_the_broker_lost_says_why(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_a_command_stopped_by_a_handover_says_so_and_the_runner_goes_on(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        running = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        while not broker.running():
+            await asyncio.sleep(0.01)
+        # Another broker takes the sandbox over, which stops what the old one started.
+        await broker.hand_over(runner.sandbox_id)
+        result = await running
+        assert (result.cancelled, result.exit_code) == (True, -1)
+        assert "may have run" in result.stderr
+        # The command is stopped for certain, so nothing of it can still write.
+        assert runner_workspace_mutation_settlement(result=result, error=None) != "uncertain"
+        assert runner.lifecycle_state != "poisoned"
+        assert runner.loss_reason is None
+        echoed = await runner.exec(ExecCommand.process("echo", "after"))
+        assert echoed.stdout == "after\n"
+        assert (await runner.refresh()).owner_epoch == 2
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_start_during_a_handover_waits_for_the_new_owner(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        await broker.hand_over(runner.sandbox_id, answers=2)
+        result = await runner.exec(ExecCommand.process("echo", "hi"))
+        assert (result.exit_code, result.stdout) == (0, "hi\n")
+        # Each refused start did nothing, so the command ran once.
+        assert broker.started == [["echo", "hi"]]
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_archives_and_renewals_ride_out_a_handover(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker, renew_every_s=30)
+        await broker.hand_over(runner.sandbox_id, answers=1)
+        assert (await runner.put_archive(_tar({"a.txt": b"1"})))["files"] == 1
+        await broker.hand_over(runner.sandbox_id, answers=1)
+        renewals = broker.renewals
+        await runner.lease_keeper.renew_now()
+        assert broker.renewals == renewals + 1
+        assert runner.lease_keeper.lost is None
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_interactive_process_stopped_by_a_handover_ends_without_losing_the_runner(
+    tmp_path: Path,
+) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        capability = runner.interactive_process_capability()
+        assert capability is not None
+        process = await capability.open_interactive_process(
+            ExecCommand.process("sleep", "30"), timeout_s=60
+        )
+        await broker.hand_over(runner.sandbox_id)
+        assert await process.wait() == -1
+        await process.close()
+        assert runner.loss_reason is None
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_sandbox_no_broker_adopted_is_lost_and_says_the_command_never_started(
+    tmp_path: Path,
+) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        running = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        while not broker.running():
+            await asyncio.sleep(0.01)
+        [command_id] = broker.sandboxes[runner.sandbox_id].commands
+        await broker.lose_worker(runner.sandbox_id, never_started=(command_id,))
+        with pytest.raises(SandboxLeaseLostError) as caught:
+            await running
+        assert str(caught.value) == (
+            "The brokered sandbox is no longer ready. The command never started."
+        )
+        assert runner.loss_reason == "lease_lost"
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
 def test_a_lease_the_keeper_lost_poisons_the_runner(tmp_path: Path) -> None:
     broker = FakeBroker(tmp_path / "cloud")
 
@@ -3061,3 +3214,52 @@ def test_the_git_baseline_gives_a_large_tree_time_to_commit() -> None:
     with pytest.raises(ValueError):
         timeouts(timeout_s=0)
     assert ephemeral_git.sync_bound_tree_size({}) == (None, None)
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+@pytest.mark.parametrize("earlier_start_unknown", [False, True])
+def test_cancellation_during_handover_preserves_start_evidence(
+    tmp_path: Path, monkeypatch, interactive, earlier_start_unknown
+) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        original = runner.broker.start_command
+        refused = asyncio.Event()
+        starts = 0
+
+        async def start(*args, **kwargs):
+            nonlocal starts
+            starts += 1
+            if earlier_start_unknown and starts == 1:
+                await original(*args, **kwargs)
+                raise SandboxBrokerUnavailableError("Start answer lost", outcome_unknown=True)
+            refused.set()
+            raise SandboxHandoverError("Moving", retry_after_s=10)
+
+        monkeypatch.setattr(runner.broker, "start_command", start)
+        command = ExecCommand.process("sleep", "30")
+        if interactive:
+            capability = runner.interactive_process_capability()
+            assert capability is not None
+            operation = capability.open_interactive_process(command)
+        else:
+            operation = runner.exec(command)
+        task = asyncio.create_task(operation)
+        try:
+            await asyncio.wait_for(refused.wait(), 30)
+            cancellation = await _cancel(task)
+            assert broker.running() == []
+            assert len(broker.started) == int(earlier_start_unknown)
+            assert runner.lifecycle_state == "reusable"
+            if not interactive:
+                assert _receipts(cancellation) == ["completed"]
+            monkeypatch.setattr(runner.broker, "start_command", original)
+            assert (await runner.exec(ExecCommand.process("echo", "usable"))).stdout == "usable\n"
+        finally:
+            if not task.done():
+                await _cancel(task)
+            await runner.close()
+
+    asyncio.run(scenario())

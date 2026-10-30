@@ -50,6 +50,7 @@ from cayu.runners.base import (
     copy_exec_command,
 )
 from cayu.sandbox_broker.client import (
+    _HANDOVER_WAIT_SECONDS,
     JSON_OUTPUT_EXPANSION,
     MAX_ARCHIVE_BYTES,
     MAX_ARCHIVE_PATHS,
@@ -67,6 +68,7 @@ from cayu.sandbox_broker.client import (
     SandboxCopy,
     SandboxCopyFailedError,
     SandboxGuarantees,
+    SandboxHandoverError,
     SandboxLeaseLostError,
     SandboxNotFoundError,
     SandboxNotReadyError,
@@ -108,6 +110,12 @@ _DEFAULT_TIMEOUT_SECONDS = 300
 # life by the Agent's clock. The broker checks the timeout against its own,
 # later and possibly skewed, clock and refuses one past the remaining lifetime.
 _LIFETIME_CLOCK_MARGIN_SECONDS = 60
+#: What a command stopped by a handover adds to its stderr. Taking a sandbox over stops
+#: every command the earlier broker started, so the command no longer runs.
+_HANDOVER_NOTICE = (
+    "The broker serving this sandbox changed while the command ran, and the command was "
+    "stopped. It may have run, partly or fully: check its effects before running it again."
+)
 # How the broker refuses a timeout past the sandbox's remaining lifetime.
 _REMAINING_LIFETIME_REFUSAL = re.compile(r"remaining lifetime \((\d+) seconds\)")
 _ADMISSION_PROBE_TIMEOUT_SECONDS = 10
@@ -407,17 +415,22 @@ class BrokeredSandboxRunner(Runner):
             raise
         except (SandboxNotReadyError, SandboxNotFoundError) as error:
             raise self._lease_lost(error) from None
-        if finished.status == "failed":
-            raise self._lease_lost(None)
+        handed_over = _stopped_by_handover(finished)
+        if finished.status == "failed" and not handed_over:
+            raise self._lease_lost(None, command=finished)
         stdout, stdout_cut = _bounded_text(finished.stdout, requested_limit)
-        stderr, stderr_cut = _bounded_text(finished.stderr, requested_limit)
-        killed = finished.status in {"timed_out", "cancelled"}
+        stderr, stderr_cut = _bounded_text(
+            _with_handover_notice(finished.stderr) if handed_over else finished.stderr,
+            requested_limit,
+        )
+        # The sandbox is still there: a handover stops the command and the runner goes on.
+        killed = handed_over or finished.status in {"timed_out", "cancelled"}
         return ExecResult(
             stdout=stdout,
             stderr=stderr,
             exit_code=finished.exit_code if finished.exit_code is not None else -1,
             timed_out=finished.status == "timed_out",
-            cancelled=finished.status == "cancelled",
+            cancelled=handed_over or finished.status == "cancelled",
             # The broker reports these only once every process in the command's
             # group has stopped, which is the settlement workspace fencing needs.
             artifacts=[_kill_receipt("completed")] if killed else [],
@@ -634,6 +647,7 @@ class BrokeredSandboxRunner(Runner):
         loop = asyncio.get_running_loop()
         busy_deadline = loop.time() + _BUSY_RETRY_SECONDS
         recovery_deadline = loop.time() + _START_RECOVERY_SECONDS
+        handover_deadline = loop.time() + _HANDOVER_WAIT_SECONDS
         delay = 0.25
         lifetime_retried = False
         while True:
@@ -658,6 +672,15 @@ class BrokeredSandboxRunner(Runner):
             try:
                 # Replaying the same id and body returns the command already started.
                 return await asyncio.shield(attempt)
+            except SandboxHandoverError as error:
+                # The sandbox is moving to another broker and this attempt started nothing;
+                # ask again once it has, under the same id.
+                if loop.time() >= handover_deadline:
+                    if dispatch.outcome_unknown:
+                        await self._settle_cancelled(command_id, dispatch)
+                    raise
+                await asyncio.sleep(error.retry_after_s)
+                continue
             except SandboxBusyError:
                 # This attempt did not start the command; wait for a slot.
                 if loop.time() >= busy_deadline:
@@ -773,7 +796,9 @@ class BrokeredSandboxRunner(Runner):
             return None
         return int((expires_at - datetime.now(UTC)).total_seconds())
 
-    def _lease_lost(self, error: SandboxBrokerError | None) -> SandboxLeaseLostError:
+    def _lease_lost(
+        self, error: SandboxBrokerError | None, *, command: SandboxCommand | None = None
+    ) -> SandboxLeaseLostError:
         # A sandbox that stopped being ready never becomes ready again, so the
         # runner can't be reopened: poison it, which admission treats as terminal.
         self._record_loss("lease_lost")
@@ -785,6 +810,8 @@ class BrokeredSandboxRunner(Runner):
         message = "The brokered sandbox is no longer ready."
         if type(reason) is str:
             message = f"The brokered sandbox is no longer ready: the broker ended it ({reason})."
+        if command is not None and command.interrupted == "never_started":
+            message += " The command never started."
         return SandboxLeaseLostError(
             message,
             status=None if error is None else error.status,
@@ -964,8 +991,8 @@ class _BrokeredInteractiveProcess(RunnerInteractiveProcess):
             )
             if command.finished:
                 break
-        if command.status == "failed":
-            raise runner._lease_lost(None)
+        if command.status == "failed" and not _stopped_by_handover(command):
+            raise runner._lease_lost(None, command=command)
         return command.exit_code if command.exit_code is not None else -1
 
     async def close(self) -> None:
@@ -1522,8 +1549,18 @@ class _Dispatch:
             and attempt is not None
             and attempt.done()
             and not attempt.cancelled()
-            and isinstance(attempt.exception(), SandboxBrokerRefusedError)
+            and isinstance(attempt.exception(), (SandboxBrokerRefusedError, SandboxHandoverError))
         )
+
+
+def _stopped_by_handover(command: SandboxCommand) -> bool:
+    """Whether a command ended because another broker took its sandbox over."""
+
+    return command.status == "failed" and command.interrupted == "broker_handover"
+
+
+def _with_handover_notice(stderr: str) -> str:
+    return f"{stderr.rstrip()}\n{_HANDOVER_NOTICE}" if stderr.strip() else _HANDOVER_NOTICE
 
 
 def _kill_receipt(status: str) -> dict[str, Any]:

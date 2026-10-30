@@ -170,6 +170,14 @@ _RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 _TRANSFER_RETRY_DELAYS_SECONDS = (2.0, 4.0, 8.0)
 #: The pause between attempts once a call retries a broker outage past its quick retries.
 _OUTAGE_RETRY_SECONDS = 1.0
+#: How long a call waits out a sandbox moving between broker owners. A broker that stops
+#: hands its sandboxes over at once; one that is lost lets its hold lapse after a minute,
+#: and another broker adopts the sandbox on its next pass.
+_HANDOVER_WAIT_SECONDS = 150.0
+#: The pause before asking again during a handover when the answer names none, and the
+#: bounds on one it names.
+_HANDOVER_RETRY_SECONDS = 2.0
+_HANDOVER_RETRY_BOUNDS = (0.5, 10.0)
 #: Every code the contract names. A response without one is judged by its status.
 _KNOWN_CODES = frozenset(
     {
@@ -182,6 +190,7 @@ _KNOWN_CODES = frozenset(
         "on_behalf_of_not_allowed",
         "sandboxes_unavailable",
         "sandbox_not_ready",
+        "sandbox_handover",
         "sandbox_busy",
         "command_id_conflict",
         "archive_too_large",
@@ -278,6 +287,17 @@ class SandboxBrokerUnavailableError(SandboxBrokerError):
     def __init__(self, message: str, *, outcome_unknown: bool = False, **kwargs: Any) -> None:
         super().__init__(message, **kwargs)
         self.outcome_unknown = outcome_unknown
+
+
+class SandboxHandoverError(SandboxBrokerUnavailableError):
+    """The sandbox is moving to another broker owner; nothing was done, so ask again.
+
+    It stays ``ready`` throughout. ``retry_after_s`` is the pause the broker asked for.
+    """
+
+    def __init__(self, message: str, *, retry_after_s: float, **kwargs: Any) -> None:
+        super().__init__(message, outcome_unknown=False, **kwargs)
+        self.retry_after_s = retry_after_s
 
 
 class SandboxCopyFailedError(SandboxBrokerError):
@@ -413,6 +433,9 @@ class SandboxRecord(BaseModel):
     max_expires_at: datetime | None = None
     destroyed_at: datetime | None = None
     destroy_reason: str | None = None
+    #: Increases each time another broker takes the sandbox over; ``None`` from a broker
+    #: that doesn't report it.
+    owner_epoch: int | None = None
     #: Set while a ``provisioning`` sandbox waits in Cloud's queue for capacity: when it
     #: gives up and fails with ``capacity_unavailable``. ``None`` once it is admitted.
     queued_until: datetime | None = None
@@ -425,6 +448,11 @@ class SandboxRecord(BaseModel):
     #: The repositories the sandbox fetches with brokered git credentials; ``None`` without
     #: them, and from a broker that predates them.
     git: SandboxGit | None = None
+
+    @field_validator("owner_epoch", mode="before")
+    @classmethod
+    def _owner_epoch_or_none(cls, value: Any) -> Any:
+        return value if type(value) is int and value >= 0 else None
 
     @field_validator("git", mode="before")
     @classmethod
@@ -480,6 +508,15 @@ class SandboxCommand(BaseModel):
     finished_at: datetime | None = None
     duration_ms: int | None = None
     interactive: bool = False
+    #: Why a ``failed`` command ended without its own outcome: ``broker_handover`` when the
+    #: broker serving the sandbox changed while it ran, so it may have run; ``never_started``
+    #: when the sandbox was destroyed before any broker started it. ``None`` otherwise.
+    interrupted: str | None = None
+
+    @field_validator("interrupted", mode="before")
+    @classmethod
+    def _interrupted_or_none(cls, value: Any) -> Any:
+        return value if type(value) is str else None
 
     @property
     def finished(self) -> bool:
@@ -1845,7 +1882,10 @@ class SandboxBrokerClient:
         timeout = self.settings.request_timeout_s if timeout_s is None else timeout_s
         delays = _TRANSFER_RETRY_DELAYS_SECONDS if transfer else _RETRY_DELAYS_SECONDS
         attempts = 1 + len(delays) if retry else 1
-        for attempt in range(attempts):
+        loop = asyncio.get_running_loop()
+        handover_deadline = loop.time() + _HANDOVER_WAIT_SECONDS
+        attempt = 0
+        while True:
             try:
                 async with self._http().stream(
                     method,
@@ -1869,6 +1909,7 @@ class SandboxBrokerClient:
             except httpx.TransportError as exc:
                 if attempt + 1 < attempts:
                     await asyncio.sleep(delays[attempt])
+                    attempt += 1
                     continue
                 # A refused connection never reached the broker; anything later might have.
                 raise SandboxBrokerUnavailableError(
@@ -1877,12 +1918,20 @@ class SandboxBrokerClient:
                 ) from None
             if status < 400:
                 return bytes(body), response_headers
-            error = _broker_error(status, bytes(body))
+            error = _broker_error(status, bytes(body), response_headers)
+            if isinstance(error, SandboxHandoverError):
+                # Nothing was done, so even a call that mustn't be resent blindly may ask
+                # again; one that doesn't retry leaves that to its caller.
+                remaining = handover_deadline - loop.time()
+                if retry and remaining > 0:
+                    await asyncio.sleep(min(error.retry_after_s, remaining))
+                    continue
+                raise error
             if isinstance(error, SandboxBrokerUnavailableError) and attempt + 1 < attempts:
                 await asyncio.sleep(delays[attempt])
+                attempt += 1
                 continue
             raise error
-        raise AssertionError("unreachable broker retry loop")
 
 
 @dataclass(frozen=True)
@@ -1946,7 +1995,20 @@ async def _read_chunks(source: BinaryIO, size: int) -> AsyncIterator[bytes]:
         yield chunk
 
 
-def _broker_error(status: int, body: bytes) -> SandboxBrokerError:
+def _retry_after_seconds(headers: httpx.Headers) -> float:
+    """The pause a ``Retry-After`` header names in seconds, bounded; a default without one."""
+
+    low, high = _HANDOVER_RETRY_BOUNDS
+    try:
+        seconds = float(headers.get("retry-after", str(_HANDOVER_RETRY_SECONDS)))
+    except ValueError:
+        seconds = _HANDOVER_RETRY_SECONDS
+    if seconds != seconds:  # NaN
+        seconds = _HANDOVER_RETRY_SECONDS
+    return min(max(seconds, low), high)
+
+
+def _broker_error(status: int, body: bytes, headers: httpx.Headers) -> SandboxBrokerError:
     code: str | None = None
     message = ""
     detail: dict[str, Any] = {}
@@ -1980,6 +2042,8 @@ def _broker_error(status: int, body: bytes) -> SandboxBrokerError:
         if status == 404:
             return SandboxNotFoundError(text, **kwargs)
         return SandboxBrokerRefusedError(text, **kwargs)
+    if code == "sandbox_handover":
+        return SandboxHandoverError(text, retry_after_s=_retry_after_seconds(headers), **kwargs)
     error_type = {
         "sandbox_quota_exceeded": SandboxQuotaExceededError,
         "archive_too_large": SandboxArchiveTooLargeError,

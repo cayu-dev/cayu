@@ -15,6 +15,10 @@ the identity a broker reports for an image it built.
 ``organization_limit``, ``install_limit`` and the sandboxes not yet destroyed.
 A create with ``queue_seconds`` while the Agent is at ``agent_limit`` waits in the
 queue until a read finds a place free; ``/capacity`` lists the queued ones in order.
+``hand_over`` moves a sandbox to another broker owner as Cloud does when its broker goes
+away: running commands end ``failed`` with ``interrupted: "broker_handover"``, operations
+answer 503 ``sandbox_handover`` a given number of times, then the new owner serves it with
+the next ``owner_epoch``. ``lose_worker`` destroys a sandbox with ``worker_lost`` instead.
 """
 
 from __future__ import annotations
@@ -77,6 +81,7 @@ class FakeCommand:
     stdout_start: int = 0
     stdout_eof: bool = False
     stdout_changed: asyncio.Event = field(default_factory=asyncio.Event)
+    interrupted: str | None = None
 
     @property
     def interactive(self) -> bool:
@@ -98,6 +103,7 @@ class FakeCommand:
             "finished_at": None if self.status == "running" else "2026-10-18T12:00:01Z",
             "duration_ms": 1,
             "interactive": self.interactive,
+            "interrupted": self.interrupted,
         }
 
 
@@ -121,6 +127,9 @@ class FakeSandbox:
     image_identity: dict[str, Any] | None = None
     # Set while the sandbox waits in the queue for a place under the Agent's limit.
     queued_until: datetime | None = None
+    owner_epoch: int = 1
+    # Operations still to answer 503 sandbox_handover before the new owner serves them.
+    handover_answers: int = 0
 
     def record(self) -> dict[str, Any]:
         return {
@@ -142,6 +151,7 @@ class FakeSandbox:
             else self.max_expires_at.isoformat(),
             "destroyed_at": None,
             "destroy_reason": self.destroy_reason,
+            "owner_epoch": self.owner_epoch,
             "queued_until": None if self.queued_until is None else self.queued_until.isoformat(),
             "staged_copies": self.staged_copies,
             "interactive_commands": self.interactive_commands,
@@ -239,6 +249,29 @@ class FakeBroker:
         sandbox.status = "destroyed"
         sandbox.destroy_reason = "lease_expired"
 
+    async def hand_over(self, sandbox_id: str, *, answers: int = 1) -> None:
+        """Move the sandbox to another broker owner, which stops every running command."""
+
+        sandbox = self.sandboxes[sandbox_id]
+        for command in sandbox.commands.values():
+            if command.status == "running":
+                command.interrupted = "broker_handover"
+                await self._kill(command, "failed")
+        sandbox.handover_answers = answers
+        sandbox.owner_epoch += 1
+
+    async def lose_worker(self, sandbox_id: str, *, never_started: tuple[str, ...] = ()) -> None:
+        """Destroy the sandbox as Cloud does when no broker adopts it in time."""
+
+        sandbox = self.sandboxes[sandbox_id]
+        for command_id, command in sandbox.commands.items():
+            if command.status == "running":
+                if command_id in never_started:
+                    command.interrupted = "never_started"
+                await self._kill(command, "failed")
+        sandbox.status = "destroyed"
+        sandbox.destroy_reason = "worker_lost"
+
     async def transport(self, request: httpx.Request) -> httpx.Response:
         if self.unknown_errors:
             self.unknown_errors -= 1
@@ -324,6 +357,10 @@ class FakeBroker:
             return httpx.Response(202, json=sandbox.record())
         if action == ["events"]:
             return httpx.Response(200, json={"items": []})
+        if sandbox.handover_answers and sandbox.status == "ready":
+            # Between owners: nothing is done, and the caller is asked to come back.
+            sandbox.handover_answers -= 1
+            return _error(503, "sandbox_handover", headers={"Retry-After": "0"})
         if action[:1] == ["commands"] and len(action) >= 2 and request.method == "GET":
             command = sandbox.commands.get(action[1])
             if command is None:
@@ -853,9 +890,15 @@ def _json_capped(raw: bytes, limit: int) -> tuple[str, bool]:
 
 
 def _error(
-    status: int, code: str, detail: dict[str, Any] | None = None, *, message: str | None = None
+    status: int,
+    code: str,
+    detail: dict[str, Any] | None = None,
+    *,
+    message: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> httpx.Response:
     return httpx.Response(
         status,
         json={"error": {"code": code, "message": message or code, "detail": detail or {}}},
+        headers=headers,
     )
