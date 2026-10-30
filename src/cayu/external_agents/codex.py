@@ -15,6 +15,11 @@ from typing import Any
 
 from cayu.external_agents._cleanup import close_external_guest
 from cayu.external_agents._codex_transport import BoundedCodexTransport
+from cayu.external_agents._process_exit import (
+    exit_observation,
+    natural_exit,
+    require_successful_exit,
+)
 from cayu.external_agents.base import (
     ExternalAgentContext,
     ExternalAgentError,
@@ -44,12 +49,14 @@ class CodexAgentAdapter:
         effort: str | None = None,
         sandbox: str = "read-only",
         config_overrides: tuple[str, ...] = (),
+        fail_on_nonzero_exit: bool = False,
     ) -> None:
         """``base_url`` routes model calls through a Cayu gateway capability.
 
         Without it Codex uses its own provider configuration and credentials,
         for example an existing login with ``local_agent_launch``.
         """
+        self.fail_on_nonzero_exit = fail_on_nonzero_exit
         self.model = model
         self.launch = launch
         self.effort = effort
@@ -105,6 +112,8 @@ class CodexAgentAdapter:
 
         async with self.launch(context) as launch:
             client = None
+            process = None
+            exited = False
             pending: asyncio.Task[Any] | None = None
             try:
                 launch.protect_secrets(context.protect_secret)
@@ -239,6 +248,8 @@ class CodexAgentAdapter:
                                     "Codex returned invalid structured output."
                                 ) from None
                         yield ExternalAgentEvent("result", {"output": output}, "final:result")
+                        process = client._proc
+                        exited = await natural_exit(process, synchronous=True)
                         break
             finally:
 
@@ -266,3 +277,6 @@ class CodexAgentAdapter:
                                     await asyncio.gather(pending, return_exceptions=True)
 
                 await join_cleanup(close())
+            observation = exit_observation(process, exited)
+            yield observation
+            require_successful_exit(observation, enabled=self.fail_on_nonzero_exit)

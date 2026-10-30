@@ -14,7 +14,7 @@ from cayu.deadlines import ExecutionDeadline
 class ExternalAgentEvent:
     """One SDK observation. Usage is incremental, never a cumulative total."""
 
-    kind: Literal["text", "tool_call", "tool_result", "usage", "result"]
+    kind: Literal["text", "tool_call", "tool_result", "usage", "result", "process_exit"]
     payload: dict[str, Any]
     id: str
     model: str | None = None
@@ -27,6 +27,7 @@ class ExternalAgentEvent:
             "tool_result",
             "usage",
             "result",
+            "process_exit",
         }:
             raise ValueError("Unknown external observation kind.")
         if not isinstance(self.id, str) or not self.id or len(self.id) > 4096:

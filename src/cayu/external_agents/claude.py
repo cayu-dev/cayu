@@ -15,6 +15,11 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from cayu.external_agents._cleanup import close_external_guest
+from cayu.external_agents._process_exit import (
+    exit_observation,
+    natural_exit,
+    require_successful_exit,
+)
 from cayu.external_agents.base import (
     ExternalAgentContext,
     ExternalAgentError,
@@ -37,12 +42,18 @@ async def _owned_messages(sdk, options, prompt):
     accepted = asyncio.Event()
 
     async def receive() -> None:
+        process = None
+        exited = False
         async with sdk.ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             async for message in client.receive_response():
                 await queue.put(message)
                 await accepted.wait()
                 accepted.clear()
+            process = getattr(getattr(client, "_transport", None), "_process", None)
+            exited = await natural_exit(process, synchronous=False)
+        await queue.put(exit_observation(process, exited))
+        await accepted.wait()
 
     owner = asyncio.create_task(receive())
     pending = None
@@ -98,7 +109,9 @@ class ClaudeAgentAdapter:
         effort: str | None = None,
         tools: tuple[str, ...] = ("Read", "Grep", "Glob"),
         mcp_servers: dict[str, Any] | None = None,
+        fail_on_nonzero_exit: bool = False,
     ) -> None:
+        self.fail_on_nonzero_exit = fail_on_nonzero_exit
         self.model = model
         self.launch = launch
         self.effort = effort
@@ -198,7 +211,10 @@ class ClaudeAgentAdapter:
                 async with aclosing(_owned_messages(sdk, options, prompt())) as stream:
                     async for message in stream:
                         sequence += 1
-                        if isinstance(message, sdk.AssistantMessage):
+                        if isinstance(message, ExternalAgentEvent):
+                            yield message
+                            require_successful_exit(message, enabled=self.fail_on_nonzero_exit)
+                        elif isinstance(message, sdk.AssistantMessage):
                             for index, block in enumerate(message.content):
                                 event_id = f"{message.uuid or sequence}:block:{index}"
                                 if isinstance(block, sdk.TextBlock):

@@ -965,3 +965,20 @@ The endpoint supports initialize, ping, tools/list and tools/call over HTTP JSON
 An approval can be resolved through Cayu's normal dashboard/API while the live
 SDK waits. Revocation joins in-flight calls; later approvals cannot execute a
 native tool once the external caller has left or the service has restarted.
+
+## CLI exit after the answer
+
+Both adapters give the CLI transport 0.25 seconds to exit naturally after its
+result, then perform their normal owned cleanup. The session records
+`custom.external_agent.process_exit` with `exit_code` (an integer, or `None` when
+unavailable) and `disposition`: `exited` for a natural exit, or `closed_by_cayu`
+when Cayu initiated shutdown. A long-lived Codex app server normally needs the
+latter. With a remote launcher, this is the local launcher transport's exit;
+its exit code represents the guest only if the launcher propagates it.
+
+A nonzero exit after the answer preserves the result by default. Set
+`fail_on_nonzero_exit=True` on `ClaudeAgentAdapter` or `CodexAgentAdapter` to raise
+`ExternalAgentError` and fail the session for a natural nonzero exit. The result
+and exit observation remain recorded. Cayu-initiated shutdown is not a natural
+nonzero exit and does not trigger that option. Cleanup failures and execution
+deadlines continue to fail the run independently.

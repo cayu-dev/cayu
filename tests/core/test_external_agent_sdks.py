@@ -215,7 +215,7 @@ def test_claude_observations_deduplicate_usage_and_gate_every_tool(
         assert summary.reported_costs.records[0].cost == "0.200000000"
         assert summary.reported_costs.records[0].status == "reported"
         await app.aclose()
-        assert events[-1].payload == {"output": {"answer": 42}}
+        assert next(e for e in events if e.kind == "result").payload == {"output": {"answer": 42}}
         assert len(authorization) == 1 and closed == [True]
         options = options_seen[0]
         assert options.setting_sources == [] and options.allowed_tools == []
@@ -450,7 +450,7 @@ def test_codex_records_incremental_openai_usage_and_only_final_answer(monkeypatc
         assert sum(u["input_tokens"] for u in usage) == 150
         assert sum(u["input_tokens_details"]["cached_tokens"] for u in usage) == 60
         assert all("cache_read_input_tokens" not in u for u in usage)
-        assert events[-1].payload["output"] == {"answer": 42}
+        assert next(e for e in events if e.kind == "result").payload["output"] == {"answer": 42}
         assert clients[0].start_thread == threading.get_ident()
         assert clients[0].closed and closed == [True]
 

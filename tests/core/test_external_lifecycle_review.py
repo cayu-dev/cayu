@@ -148,7 +148,8 @@ def test_claude_structured_result_preserves_run_guards(monkeypatch, guard):
                 [event async for event in adapter.stream(context)]
         else:
             events = [event async for event in adapter.stream(context)]
-            assert events[-1].kind == "result"
+            assert events[-2].kind == "result"
+            assert events[-1].kind == "process_exit"
             assert checks == ([] if guard == "secret" else [True])
             assert decisions == (["StructuredOutput"] if guard == "missing" else [])
 
