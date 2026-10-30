@@ -1396,7 +1396,8 @@ class ToolInvocation:
                             registered_environment,
                             window_id=workspace_window_id,
                             window_exclusive=lambda: (
-                                not workspace_attribution_window.overlap_detected
+                                not workspace_attribution_window.closed
+                                and not workspace_attribution_window.overlap_detected
                             ),
                             successful=(
                                 event.type is EventType.TOOL_CALL_COMPLETED
@@ -1716,6 +1717,10 @@ class ToolInvocation:
                         uncertainty_error,
                         cast("Exception", sanitize_runner_failure(cleanup_error)),
                     ) from None
+                finally:
+                    # Publication can fail before capture closes the window.
+                    # close is idempotent, preserving any captured endpoint.
+                    workspace_attribution_window.close(discard_history=True)
 
             effective_terminal_stager = stage_workspace_terminal
 

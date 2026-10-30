@@ -141,6 +141,11 @@ class WorkspaceMutationWindow:
         return self._state is not None and self._state.overlap_detected
 
     @property
+    def closed(self) -> bool:
+        """Whether this window can no longer prove an active writer's isolation."""
+        return self._closed
+
+    @property
     def prior_observation(self) -> WorkspaceRevisionObservation | None:
         return self._prior_observation
 
