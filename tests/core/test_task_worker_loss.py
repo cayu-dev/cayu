@@ -13,6 +13,7 @@ import pytest
 from cayu.applications import CayuApp
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks import (
+    complete_managed_task,
     is_fenced_after_worker_loss,
     reconcile_abandoned_tasks,
 )
@@ -119,14 +120,68 @@ def test_fenced_tasks_are_told_apart_from_live_claims(backend: str, tmp_path: Pa
             )
         ) == ["draining", "live"]
 
-        # Once the draining worker's lease expires too, it is fenced by the store's clock.
+        # Once the other workers' leases expire too, both are lost by the store's clock,
+        # whether or not reclamation has fenced the started claim yet.
         clock.value = draining.lease_expires_at
         assert _ids(await store.list_tasks(TaskQuery(fenced_after_worker_loss=True))) == [
             "dead",
             "draining",
+            "live",
         ]
         with pytest.raises(ValueError, match="fenced_after_worker_loss"):
             await store.claim_task("worker-d", TaskQuery(fenced_after_worker_loss=True))
+        close = getattr(store, "close", None)
+        if close is not None:
+            await close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_a_started_claim_counts_as_lost_as_soon_as_its_lease_expires(
+    backend: str, tmp_path: Path
+) -> None:
+    from cayu.cloud_reporting import read_cloud_task_health
+
+    async def scenario() -> None:
+        clock = _Clock()
+        store = _store(backend, tmp_path, clock)
+        app = CayuApp(task_store=store, enable_logging=False)
+        lost = await _started_claim(store, "lost", "worker-old")
+        await store.create_task(TaskCreate(task_id="unstarted", type="scan"))
+        unstarted = await store.claim_task(
+            "worker-old", TaskQuery(type="scan"), lease_seconds=LEASE_SECONDS
+        )
+        assert unstarted is not None and unstarted.id == "unstarted"
+        await store.create_task(TaskCreate(task_id="live", type="scan"))
+        live = await store.claim_task("worker-live", TaskQuery(type="scan"), lease_seconds=3600)
+        assert live is not None and live.id == "live" and live.lease_expires_at is not None
+        live = await store.mark_claimed_task_execution_started(
+            "live", "worker-live", live.lease_expires_at
+        )
+        active = TaskQuery(status=TaskStatus.CLAIMED, fenced_after_worker_loss=False)
+        assert _ids(await store.list_tasks(active)) == ["live", "lost", "unstarted"]
+
+        # worker-old's lease expires, and no worker has reclaimed its claims yet.
+        assert lost.lease_expires_at is not None
+        clock.value = lost.lease_expires_at
+        now = clock.value
+        assert lost.status_reason is None
+        assert is_fenced_after_worker_loss(lost, now)
+        # Reclamation returns a claim whose handler never started to pending: still queued.
+        assert not is_fenced_after_worker_loss(unstarted, now)
+        assert not is_fenced_after_worker_loss(live, now)
+        assert _ids(await store.list_tasks(TaskQuery(fenced_after_worker_loss=True))) == ["lost"]
+        assert _ids(await store.list_tasks(active)) == ["live", "unstarted"]
+        health = await read_cloud_task_health(app)
+        assert health is not None and health.fenced_after_worker_loss == 1
+
+        # Reclamation records the fence; the task stays lost, and the other is queued.
+        assert _ids(await store.reclaim_expired(query=TaskQuery(type="scan"))) == ["unstarted"]
+        [fenced] = await store.list_tasks(TaskQuery(fenced_after_worker_loss=True))
+        assert fenced.id == "lost" and fenced.status_reason == "cancellation_requested"
+        assert _ids(await store.list_tasks(active)) == ["live"]
+        await app.aclose()
         close = getattr(store, "close", None)
         if close is not None:
             await close()
@@ -376,6 +431,191 @@ def test_declared_single_worker_settles_fenced_tasks_of_other_workers(
     assert "this worker's own id" in own_message
 
 
+async def _wait_for_task(
+    store: TaskStore, task_id: str, reached: Callable[[Task], bool], *, timeout_s: float = 5.0
+) -> Task:
+    async def poll() -> Task:
+        while True:
+            task = await store.load_task(task_id)
+            assert task is not None
+            if reached(task):
+                return task
+            await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(poll(), timeout=timeout_s)
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("settlement", ["undeclared", "cancel", "restart"])
+def test_a_busy_worker_fences_and_settles_a_task_another_worker_lost(
+    backend: str, settlement: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="cayu.tasks.abandoned")
+    options: dict[str, object] = {}
+    if settlement != "undeclared":
+        options["reconcile_abandoned_after_s"] = 0
+        options["restart_abandoned"] = settlement == "restart"
+
+    async def scenario() -> None:
+        clock = _Clock()
+        store = _store(backend, tmp_path, clock)
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(
+            TaskCreate(task_id="lost", type="scan", restartable=settlement == "restart")
+        )
+        lost = await store.claim_task("worker-old", TaskQuery(type="scan"), lease_seconds=30)
+        assert lost is not None and lost.lease_expires_at is not None
+        await store.mark_claimed_task_execution_started("lost", "worker-old", lost.lease_expires_at)
+        await store.create_task(TaskCreate(task_id="long", type="scan"))
+        busy = asyncio.Event()
+        release = asyncio.Event()
+        stop = asyncio.Event()
+        handled: list[tuple[str, int]] = []
+
+        async def handler(_app: CayuApp, task: Task, worker_id: str) -> None:
+            handled.append((task.id, task.restart_count))
+            if task.id == "long":
+                busy.set()
+                await release.wait()
+            await complete_managed_task(store, task, worker_id, {"ok": True})
+            if len(handled) == (2 if settlement == "restart" else 1):
+                stop.set()
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="worker-new",
+                query=TaskQuery(type="scan"),
+                lease_seconds=3600,
+                poll_interval_s=0.02,
+                reclaim_every_s=0.02,
+                recover_interrupted_handoffs=False,
+                stop=stop,
+                **options,  # type: ignore[arg-type]
+            )
+        )
+        try:
+            await asyncio.wait_for(busy.wait(), timeout=5)
+            # worker-old's lease expires while worker-new's only slot runs "long".
+            clock.value = lost.lease_expires_at + timedelta(seconds=1)
+            if settlement == "undeclared":
+                outcome = await _wait_for_task(
+                    store, "lost", lambda task: task.status_reason == "cancellation_requested"
+                )
+                assert outcome.status is TaskStatus.CLAIMED
+            elif settlement == "cancel":
+                outcome = await _wait_for_task(
+                    store, "lost", lambda task: task.status is TaskStatus.CANCELLED
+                )
+                evidence = outcome.status_payload["cancellation_reconciliation"]["evidence"]  # type: ignore[index]
+                assert evidence["validator_id"] == SINGLE_WORKER_VALIDATOR_ID
+            else:
+                outcome = await _wait_for_task(
+                    store, "lost", lambda task: task.status is TaskStatus.PENDING
+                )
+                assert outcome.restart_count == 1
+            # The handler never returned meanwhile.
+            assert handled == [("long", 0)]
+            running = await store.load_task("long")
+            assert running is not None and running.status is TaskStatus.CLAIMED
+            release.set()
+            assert await asyncio.wait_for(worker, timeout=5) == len(handled)
+        finally:
+            release.set()
+            if not worker.done():
+                worker.cancel()
+                await asyncio.wait({worker}, timeout=5)
+            await app.aclose()
+        # Only the restart policy hands the lost task to a worker again.
+        assert handled == ([("long", 0), ("lost", 1)] if settlement == "restart" else [("long", 0)])
+        close = getattr(store, "close", None)
+        if close is not None:
+            await close()
+
+    asyncio.run(scenario())
+    if settlement == "undeclared":
+        [message] = _warnings(caplog, "is fenced")
+        assert "Task lost (type scan)" in message
+
+
+def test_cancelling_a_worker_stops_a_maintenance_pass_its_handler_left_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.tasks.worker as worker_module
+
+    async def scenario() -> None:
+        handler_started = asyncio.Event()
+        scan_blocked = asyncio.Event()
+        scan_cancelled = asyncio.Event()
+        joining = asyncio.Event()
+        gate = asyncio.Event()
+
+        class StuckScanStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            async def list_tasks(self, query: TaskQuery | None = None, **kwargs):
+                if (
+                    handler_started.is_set()
+                    and query is not None
+                    and query.fenced_after_worker_loss
+                ):
+                    # A fenced-task listing stuck behind, say, a table lock.
+                    scan_blocked.set()
+                    try:
+                        await gate.wait()
+                    except asyncio.CancelledError:
+                        scan_cancelled.set()
+                        raise
+                return await super().list_tasks(query, **kwargs)
+
+        stop_maintenance = worker_module._stop_busy_slot_maintenance
+
+        async def observed_stop(maintenance, idle, failure):
+            if failure is None:
+                joining.set()
+            await stop_maintenance(maintenance, idle, failure)
+
+        monkeypatch.setattr(worker_module, "_stop_busy_slot_maintenance", observed_stop)
+        store = StuckScanStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(TaskCreate(task_id="job", type="scan"))
+
+        async def handler(_app: CayuApp, task: Task, worker_id: str) -> None:
+            handler_started.set()
+            await scan_blocked.wait()
+            await complete_managed_task(store, task, worker_id, {"ok": True})
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="worker-new",
+                query=TaskQuery(type="scan"),
+                poll_interval_s=0.02,
+                reclaim_every_s=0.02,
+                recover_interrupted_handoffs=False,
+            )
+        )
+        try:
+            # The handler returns while the maintenance pass is stuck in the store.
+            await asyncio.wait_for(joining.wait(), timeout=5)
+            await asyncio.sleep(0)
+            worker.cancel()
+            done, _ = await asyncio.wait({worker}, timeout=2)
+            assert worker in done and worker.cancelled()
+            assert scan_cancelled.is_set()
+        finally:
+            gate.set()
+            if not worker.done():
+                await asyncio.wait({worker}, timeout=5)
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_worker_rejects_an_invalid_declaration(monkeypatch: pytest.MonkeyPatch) -> None:
     store = InMemoryTaskStore()
     app = CayuApp(task_store=store, enable_logging=False)
@@ -424,14 +664,17 @@ def test_postgres_lists_fenced_tasks_by_its_own_clock(postgres_dsn: str) -> None
             assert live is not None and live.id == "live"
             # Postgres decides lease expiry by its own clock, so wait it out.
             await asyncio.sleep(1.2)
-            assert await store.reclaim_expired(query=TaskQuery(type="scan")) == []
-
-            fenced = await store.list_tasks(TaskQuery(fenced_after_worker_loss=True))
-            assert _ids(fenced) == ["dead"]
-            assert is_fenced_after_worker_loss(fenced[0])
-            assert _ids(await store.list_tasks(TaskQuery(fenced_after_worker_loss=False))) == [
-                "live"
-            ]
+            # Lost before reclamation records the fence, and still lost after.
+            for reclaimed in (False, True):
+                if reclaimed:
+                    assert await store.reclaim_expired(query=TaskQuery(type="scan")) == []
+                fenced = await store.list_tasks(TaskQuery(fenced_after_worker_loss=True))
+                assert _ids(fenced) == ["dead"]
+                assert is_fenced_after_worker_loss(fenced[0])
+                assert (fenced[0].status_reason == "cancellation_requested") is reclaimed
+                assert _ids(await store.list_tasks(TaskQuery(fenced_after_worker_loss=False))) == [
+                    "live"
+                ]
         finally:
             await store.close()
 

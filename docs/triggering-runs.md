@@ -321,16 +321,23 @@ tasks use `retry_cancellation_requested` and require
 helpers below do not settle them.
 
 A fenced task looks like a live claim unless you check its lease, so Cayu gives
-you ways to tell them apart:
+you ways to tell them apart. Each counts a started task as fenced as soon as its
+worker's lease expires, before reclamation has recorded the fence (until then
+the task is still `claimed` with no `status_reason`):
 
 - `is_fenced_after_worker_loss(task, now=None)` is true for a task held only by
-  a cancellation fence whose worker's lease has expired.
+  a cancellation fence whose worker's lease has expired, or for an ordinary
+  claim whose handler started and whose worker's lease has expired. An expired
+  claim whose handler never started isn't fenced: reclamation returns it to
+  `pending`.
 - `TaskQuery(fenced_after_worker_loss=True)` lists only those tasks, and `False`
   leaves them out. An "is a run already queued or running?" check should use
   `TaskQuery(status=TaskStatus.CLAIMED, fenced_after_worker_loss=False)`, or the
   fenced task blocks new work until it is settled.
-- Every `run_task_worker` that reclaims expired leases logs a warning once for
-  each fenced task in its `query`'s scope, naming the task and how to settle it.
+- Every `run_task_worker` that reclaims expired leases fences such a task and
+  logs a warning once for each fenced task in its `query`'s scope, naming the
+  task and how to settle it. It does this every `reclaim_every_s` (60 by
+  default), also while its handler runs a long task.
 - `cayu inspect --fenced-tasks` lists them, and the Cayu Cloud activity contract
   counts them in `task_health`.
 
@@ -373,9 +380,10 @@ await run_task_worker(
 )
 ```
 
-At its reclaim cadence it settles every fenced task in its `query`'s scope that
-another worker id holds, once it has seen the task fenced for at least 120
-seconds, through `reconcile_abandoned_task_cancellation` with validator
+At its reclaim cadence, whether or not its handler is busy, it settles every
+fenced task in its `query`'s scope that another worker id holds, once it has
+seen the task fenced for at least 120 seconds, through
+`reconcile_abandoned_task_cancellation` with validator
 `cayu.task-worker.single-worker`, and logs a warning for each. It leaves tasks
 under its own worker id, session-attached tasks and retry series alone. `cayu
 worker --reconcile-abandoned-after-seconds 120` sets the same option for a

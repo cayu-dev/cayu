@@ -8,7 +8,9 @@ series). Cancelling ``run_task_worker`` records the same fence, so a process
 that exits before its handler returns leaves the same state once its lease
 expires. Cayu can't prove the old handler stopped, so the task stays claimed
 until the application settles it. A deploy that replaces a worker during a
-non-restartable task is the common way to get here.
+non-restartable task is the common way to get here. From the moment the lease
+expires until reclamation records that fence, the task is still a started
+claim nobody holds, and it already counts as fenced after worker loss.
 
 Each part works on its own:
 
@@ -23,6 +25,8 @@ Each part works on its own:
   --reconcile-abandoned-after-seconds`` use it for a declared single-worker
   deployment (``restart_abandoned=True`` and ``--restart-abandoned`` choose the
   restart), and every task worker logs a warning for each fenced task it finds.
+  The worker reclaims expired claims and looks for fenced tasks on a timer,
+  also while its handler is busy.
 """
 
 from __future__ import annotations
@@ -91,21 +95,42 @@ class AbandonedTaskSettlement(StrEnum):
 
 
 def is_fenced_after_worker_loss(task: Task, now: datetime | None = None) -> bool:
-    """Whether ``task`` is held only by a cancellation fence whose worker's lease expired.
+    """Whether ``task`` lost its worker after its handler started.
 
-    Such a task still lists as ``claimed`` (or ``running``), but no worker will
-    run, claim or reclaim it again until it is reconciled. A live claim, and a
-    cancellation a live worker is still draining, keep a lease that has not
-    expired. ``now`` defaults to the local time, while stores decide lease
-    expiry by their own clock; ``TaskQuery(fenced_after_worker_loss=True)``
-    asks the store.
+    That is a task held only by a cancellation fence whose worker's lease
+    expired, or an ordinary claim whose handler started and whose worker's lease
+    expired before expired-claim reclamation recorded that fence. Either way it
+    still lists as ``claimed`` (or ``running``), but no worker will run or claim
+    it again until it is reconciled. A live claim, a cancellation a live worker
+    is still draining, and an expired claim whose handler never started (which
+    reclamation returns to ``pending``) are not fenced. ``now`` defaults to the
+    local time, while stores decide lease expiry by their own clock;
+    ``TaskQuery(fenced_after_worker_loss=True)`` asks the store.
     """
 
     now = datetime.now(UTC) if now is None else normalize_utc_datetime(now, "now")
     return (
-        has_cancellation_fence(task)
+        held_after_worker_loss(task)
         and task.lease_expires_at is not None
         and task.lease_expires_at <= now
+    )
+
+
+def held_after_worker_loss(task: Task) -> bool:
+    """Whether ``task`` counts as fenced after worker loss once its worker's lease expires.
+
+    It has a cancellation fence, or it is an ordinary claim whose handler
+    started, which expired-claim reclamation fences instead of returning to
+    ``pending``. The lease itself isn't checked, so listings filtered with
+    ``TaskQuery(fenced_after_worker_loss=True)`` keep the store's decision.
+    """
+
+    return has_cancellation_fence(task) or (
+        task.status is TaskStatus.CLAIMED
+        and task.session_id is None
+        and task.started_at is not None
+        and task.worker_id is not None
+        and task.lease_expires_at is not None
     )
 
 
@@ -125,9 +150,18 @@ def has_cancellation_fence(task: Task) -> bool:
 def abandoned_task_settlement(task: Task) -> str:
     """How the application settles a fenced task, in one sentence for logs and CLI output.
 
-    It also says why a task can't be restarted after worker loss, when it can't.
+    It also says why a task can't be restarted after worker loss, when it can't,
+    and that a task worker's expired-claim reclamation fences it first when that
+    fence isn't recorded yet.
     """
 
+    settlement = _fenced_task_settlement(task)
+    if has_cancellation_fence(task):
+        return settlement
+    return f"a task worker's expired-claim reclamation records its fence first; then {settlement}"
+
+
+def _fenced_task_settlement(task: Task) -> str:
     if task.retry_series is not None:
         return (
             "it is a retry-series attempt, which can't be restarted after worker loss: "
@@ -267,7 +301,9 @@ async def _list_fenced(
 
     Returns the tasks and the offset to continue from, or ``None`` once the last
     page was read. Fenced tasks don't change until they are settled, so the
-    order is stable while the pages are read.
+    order is stable while the pages are read. A started claim whose fence
+    reclamation records meanwhile moves to the end, which can shift a later page
+    by one task; the next scan reads it.
     """
 
     tasks: list[Task] = []
@@ -305,7 +341,9 @@ async def reconcile_abandoned_tasks(
     the tasks considered; every fenced task in its scope is read, ``limit`` at a
     time. Session-attached and retry-series tasks are left alone;
     :func:`abandoned_task_settlement` says how to settle them. A task another
-    process settles or changes first is skipped.
+    process settles or changes first is skipped, and so is a started claim
+    whose fence expired-claim reclamation hasn't recorded yet: a later call
+    settles it once a task worker (or ``TaskStore.reclaim_expired``) has.
 
     With ``settlement="restart"``, a task created with ``restartable=True`` is
     requeued through ``restart_abandoned_task`` instead, with the same validator
@@ -600,6 +638,7 @@ __all__ = [
     "AbandonedTaskSettlement",
     "abandoned_task_settlement",
     "has_cancellation_fence",
+    "held_after_worker_loss",
     "is_fenced_after_worker_loss",
     "reconcile_abandoned_tasks",
 ]

@@ -63,7 +63,7 @@ from cayu.sessions.supervision_events import (
     SupervisionEventKind,
     SupervisionMessageOrigin,
 )
-from cayu.tasks.abandoned import has_cancellation_fence
+from cayu.tasks.abandoned import held_after_worker_loss
 from cayu.tasks.queries import TaskQuery
 
 if TYPE_CHECKING:
@@ -305,7 +305,7 @@ class CloudTaskHealth(_ContractModel):
     """Current counts of tasks that need the agent's attention, read with the page.
 
     ``fenced_after_worker_loss`` counts tasks still claimed after their worker
-    stopped renewing its lease with a cancellation pending, as when a deploy
+    stopped renewing its lease once their handler had started, as when a deploy
     replaced the worker during a task that can't be restarted. No worker runs
     them again until the application reconciles them. The count stops at
     ``CLOUD_TASK_HEALTH_MAX_COUNT``; ``complete`` is false when it reached it.
@@ -554,7 +554,7 @@ async def read_cloud_task_health(app: CayuApp) -> CloudTaskHealth | None:
     return CloudTaskHealth(
         # The store decides lease expiry by its own clock; this only guards
         # against a custom store that doesn't apply the filter.
-        fenced_after_worker_loss=sum(1 for task in tasks if has_cancellation_fence(task)),
+        fenced_after_worker_loss=sum(1 for task in tasks if held_after_worker_loss(task)),
         complete=len(tasks) < CLOUD_TASK_HEALTH_MAX_COUNT,
     )
 

@@ -187,7 +187,11 @@ def _inspect_retry_key(app: Any, retry_key: str, output_format: str) -> int:
 
 
 def _inspect_fenced_tasks(app: Any, output_format: str) -> int:
-    from cayu.tasks.abandoned import abandoned_task_settlement, has_cancellation_fence
+    from cayu.tasks.abandoned import (
+        abandoned_task_settlement,
+        has_cancellation_fence,
+        held_after_worker_loss,
+    )
     from cayu.tasks.queries import TaskOrder, TaskQuery
 
     async def load() -> list[Any]:
@@ -209,7 +213,7 @@ def _inspect_fenced_tasks(app: Any, output_format: str) -> int:
 
     # The store decides lease expiry by its own clock; this only guards against
     # a custom store that doesn't apply the filter.
-    tasks = [task for task in asyncio.run(load()) if has_cancellation_fence(task)]
+    tasks = [task for task in asyncio.run(load()) if held_after_worker_loss(task)]
     complete = len(tasks) < _FENCED_TASK_LIMIT
     if output_format == "json":
         print(
@@ -243,10 +247,10 @@ def _inspect_fenced_tasks(app: Any, output_format: str) -> int:
         return 0
     lines = [
         f"{len(tasks)}{'' if complete else '+'} fenced task(s): each stays "
-        "claimed with a pending cancellation until it is reconciled."
+        "claimed, and no worker runs it again, until it is reconciled."
     ]
     for task in tasks:
-        code = _fence_error_code(task)
+        code = _fence_error_code(task) if has_cancellation_fence(task) else "fence not recorded yet"
         lines.append(
             f"- {task.id} ({task.type}): worker {task.worker_id} lease expired "
             f"{task.lease_expires_at.isoformat()}" + (f" [{code}]" if code else "")

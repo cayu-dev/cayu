@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from cayu.cli import main
 
 
@@ -160,10 +162,12 @@ def test_inspect_factory_failure_uses_current_manifest_schema_version(
     }
 
 
+@pytest.mark.parametrize("fence_recorded", [True, False])
 def test_inspect_lists_fenced_tasks_and_how_to_settle_them(
     tmp_path: Path,
     monkeypatch,
     capsys,
+    fence_recorded: bool,
 ) -> None:
     import asyncio
     from datetime import UTC, datetime, timedelta
@@ -183,7 +187,8 @@ def test_inspect_lists_fenced_tasks_and_how_to_settle_them(
             claimed.id, "worker-old", claimed.lease_expires_at
         )
         clock["value"] = claimed.lease_expires_at + timedelta(seconds=1)
-        await store.reclaim_expired(query=TaskQuery(type="scan"))
+        if fence_recorded:
+            await store.reclaim_expired(query=TaskQuery(type="scan"))
         await store.close()
 
     asyncio.run(fence())
@@ -211,12 +216,15 @@ def build_app():
     assert task["task_id"] == "scan-1"
     assert task["worker_id"] == "worker-old"
     assert task["status"] == "claimed"
-    assert task["error_code"] == "task_worker_lease_expired_after_dispatch"
+    code = "task_worker_lease_expired_after_dispatch" if fence_recorded else None
+    assert task["error_code"] == code
     assert "reconcile_abandoned_task_cancellation" in task["settle"]
+    # A started claim whose lease expired is listed before reclamation fences it.
+    assert ("reclamation records its fence first" in task["settle"]) is not fence_recorded
 
     sys.modules.pop("fenced_project", None)
     assert main(["inspect", "--fenced-tasks", "--table"]) == 0
     human = capsys.readouterr().out
     assert "1 fenced task(s)" in human
     assert "- scan-1 (scan): worker worker-old" in human
-    assert "[task_worker_lease_expired_after_dispatch]" in human
+    assert f"[{code or 'fence not recorded yet'}]" in human

@@ -132,9 +132,11 @@ same as ECS and Kubernetes) for the handler to return. When the grace runs out
 first, or the process is killed, the task stays `claimed` with
 `status_reason` `cancellation_requested` and no worker runs it again until it
 is reconciled, because Cayu can't prove the old handler stopped. The next
-worker that looks for expired claims logs a warning naming the task, and
-`cayu inspect --fenced-tasks` lists every such task. Restartable tasks are
-requeued only when their handler stops within the grace. On Cayu Cloud,
+worker that looks for expired claims, which it does every 60 seconds even while
+its handler is busy, records that fence if the old worker couldn't and logs a
+warning naming the task. `cayu inspect --fenced-tasks` lists every such task
+from the moment its lease expires. Restartable tasks are requeued only when
+their handler stops within the grace. On Cayu Cloud,
 `[worker] stop_grace_seconds` gives the worker up to 120 seconds and raises
 `--shutdown-grace-seconds` to match
 ([how the worker stops](cayu-cloud.md#how-the-worker-stops)), and

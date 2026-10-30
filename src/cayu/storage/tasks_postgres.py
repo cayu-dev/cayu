@@ -1768,11 +1768,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 "work_contract IS NOT NULL" if query.has_work_contract else "work_contract IS NULL"
             )
         if query.fenced_after_worker_loss is not None:
-            # Every operand is non-null when the conjunction is evaluated, so NOT is exact.
+            # A cancellation fence, or a started ordinary claim that expired-claim
+            # reclamation will fence (see ``is_fenced_after_worker_loss``). Every
+            # operand is non-null when the conjunction is evaluated, so NOT is exact.
             fenced_sql = (
-                "(status IN (%s, %s) AND status_reason IS NOT NULL AND status_reason IN (%s, %s) "
-                "AND worker_id IS NOT NULL AND lease_expires_at IS NOT NULL "
-                "AND lease_expires_at <= clock_timestamp())"
+                "(status IN (%s, %s) AND worker_id IS NOT NULL AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at <= clock_timestamp() AND ("
+                "(status_reason IS NOT NULL AND status_reason IN (%s, %s)) "
+                "OR (status = %s AND session_id IS NULL AND started_at IS NOT NULL)))"
             )
             clauses.append(fenced_sql if query.fenced_after_worker_loss else f"NOT {fenced_sql}")
             params.extend(
@@ -1781,6 +1784,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     str(TaskStatus.RUNNING),
                     _TASK_CANCELLATION_REQUESTED_REASON,
                     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
+                    str(TaskStatus.CLAIMED),
                 ]
             )
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""

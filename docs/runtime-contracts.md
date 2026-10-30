@@ -7977,13 +7977,19 @@ only owner loss, not handler quiescence or external-effect settlement.
 
 A cancellation-fenced task whose worker's lease has expired is "fenced after
 worker loss": it still lists as `claimed` or `running`, but nothing runs it
-until it is reconciled. `is_fenced_after_worker_loss(task, now=None)` is that
-predicate, and `TaskQuery(fenced_after_worker_loss=True|False)` lists only such
-tasks or leaves them out, deciding expiry by the store's ownership clock
-(PostgreSQL's `clock_timestamp()`). Claim, reclaim, schedule-wakeup and
-task-index queries refuse the filter. `run_task_worker` lists them within its
-`query`'s scope at its reclaim cadence, reading at most 1,000 per scan and
-continuing where it stopped on the next, and logs one warning per task. With
+until it is reconciled. So is an ordinary unattached `claimed` task with
+`started_at` whose worker's lease has expired, which expired-claim reclamation
+fences on its next pass; an expired claim without `started_at` is not, since
+reclamation returns it to `pending`. `is_fenced_after_worker_loss(task,
+now=None)` is that predicate, and `TaskQuery(fenced_after_worker_loss=True|False)`
+lists only such tasks or leaves them out, deciding expiry by the store's
+ownership clock (PostgreSQL's `clock_timestamp()`). Claim, reclaim,
+schedule-wakeup and task-index queries refuse the filter. `run_task_worker`
+reclaims expired claims and lists fenced tasks within its `query`'s scope at its
+reclaim cadence, on a timer of its own while its maintenance slot runs a
+handler, reading at most 1,000 per scan and continuing where it stopped on the
+next, and logs one warning per task once its fence is recorded; a failure while
+the handler runs is logged and retried at the next interval. With
 `reconcile_abandoned_after_s` (or `CAYU_WORKER_RECONCILE_ABANDONED_AFTER_S`,
 which `cayu worker --reconcile-abandoned-after-seconds` sets) it declares itself
 the only worker for that scope and settles each ordinary, unattached fenced
@@ -7995,9 +8001,9 @@ it (lease expiry itself is the store's decision), through
 `lease-expired-at:<lease expiry>`, and the declaring worker as the `SYSTEM`
 actor. `reconcile_abandoned_tasks(...)` settles, at once, every such task held
 by a worker outside caller-supplied live worker ids, with the caller's
-validator. Rechecks after a filtered listing only drop tasks without a
-cancellation fence; they never override the store's expiry decision with the
-local clock.
+validator. Both settle only tasks whose fence is recorded, so a started claim
+waits for reclamation. Rechecks after a filtered listing never override the
+store's expiry decision with the local clock.
 
 With `restart_abandoned=True` (or `CAYU_WORKER_RESTART_ABANDONED`, which `cayu
 worker --restart-abandoned` sets; it requires the single-worker declaration)

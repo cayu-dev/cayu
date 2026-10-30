@@ -27,7 +27,7 @@ import asyncio
 import contextlib
 import logging
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -544,7 +544,10 @@ async def run_task_worker(
       At the same cadence the worker looks for tasks in its ``query``'s scope
       that are fenced after worker loss (see
       :func:`cayu.tasks.is_fenced_after_worker_loss`) and logs a warning once
-      for each, naming the task and how to settle it.
+      for each, naming the task and how to settle it. Both keep their cadence
+      while a handler runs, so a worker busy with a long task still fences,
+      and with ``reconcile_abandoned_after_s`` settles, a task another worker
+      lost; a failure then is logged and retried at the next interval.
     - ``reconcile_abandoned_after_s`` declares that this is the only worker
       claiming tasks in its ``query``'s scope. A task the store reports fenced
       after worker loss, held by another worker id, is then settled once this
@@ -784,6 +787,9 @@ async def run_task_worker(
         reclaim_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
         reclaim_backlog = False
         fenced_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
+        # Set when reconciling session wakes released parked handoffs. The
+        # continuation scan starts over once no scan in flight can overwrite it.
+        handoffs_released = False
 
         def until_idle_skips_scan() -> bool:
             # An until-idle run scans once, in one slot: a session waiting on
@@ -815,10 +821,11 @@ async def run_task_worker(
                 until_idle.continuations_scanned = False
 
         async def reclaim_expired_tasks() -> int:
+            nonlocal handoffs_released
             # The same cadence restores wake attempts a crash or failure left out,
             # and releases parked tasks whose sleep has gone away.
             if await _reconcile_session_wakes(app, task_store):
-                rescan_continuations()
+                handoffs_released = True
             await _sweep_external_waits(app, task_store, query)
             if materialized_work_contract_queue_supported:
                 reclaim_outcome = await capture_task_store_operation(
@@ -838,6 +845,80 @@ async def run_task_worker(
             else:
                 return len(await task_store.reclaim_expired(query=query, **reclaim_bound))
 
+        async def maintain_expired_claims() -> bool:
+            """Reclaim expired claims and look for fenced tasks when each is due.
+
+            Returns whether either changed a task.
+            """
+
+            nonlocal reclaim_backlog
+            loop = asyncio.get_running_loop()
+            changed = False
+            if reclaim:
+                reclaim_ran, reclaimed = await reclaim_cadence.run_if_due(
+                    reclaim_expired_tasks,
+                    now=loop.time(),
+                    clock=loop.time,
+                )
+                if reclaim_ran:
+                    poller.metrics.maintenance(reclaim=True)
+                    # A full batch may leave more; an until-idle run reclaims them first.
+                    reclaim_backlog = bool(reclaimed) and reclaimed >= _RECLAIM_BATCH_SIZE
+                    if until_idle is not None and reclaim_backlog:
+                        reclaim_cadence.expedite()
+                changed = bool(reclaimed)
+            if fenced_monitor is not None:
+                _, settled_fenced = await fenced_cadence.run_if_due(
+                    scan_fenced_tasks,
+                    now=loop.time(),
+                    clock=loop.time,
+                )
+                changed = changed or bool(settled_fenced)
+            return changed
+
+        def rescan_released_handoffs() -> None:
+            nonlocal handoffs_released
+            if handoffs_released:
+                handoffs_released = False
+                rescan_continuations()
+
+        async def maintain_until(idle: asyncio.Event) -> None:
+            # Maintenance otherwise waits for the claim loop, which a handler can
+            # hold for hours: a task another worker lost would stay claimed and
+            # unsettled meanwhile. So it keeps its cadence while the slot is busy.
+            loop = asyncio.get_running_loop()
+            while True:
+                deadlines: list[float] = []
+                if reclaim and reclaim_cadence.next_run_at is not None:
+                    deadlines.append(reclaim_cadence.next_run_at)
+                if fenced_monitor is not None and fenced_cadence.next_run_at is not None:
+                    deadlines.append(fenced_cadence.next_run_at)
+                due_in = max(min(deadlines) - loop.time(), 0.0)
+                if await wait_or_stop(due_in, idle) or slot_should_stop():
+                    return
+                try:
+                    await maintain_expired_claims()
+                except Exception:
+                    logger.exception(
+                        "Reclaiming expired task claims failed while a handler was running; "
+                        "retrying in %g seconds.",
+                        reclaim_every_s,
+                    )
+
+        @contextlib.asynccontextmanager
+        async def maintained_while_busy() -> AsyncIterator[None]:
+            if not owns_maintenance or (not reclaim and fenced_monitor is None):
+                yield
+                return
+            idle = asyncio.Event()
+            maintenance = asyncio.create_task(maintain_until(idle))
+            try:
+                yield
+            except BaseException as failure:
+                await _stop_busy_slot_maintenance(maintenance, idle, failure)
+                raise
+            await _stop_busy_slot_maintenance(maintenance, idle, None)
+
         async def run_step(_now: float, handled: int) -> DurableWorkerStep:
             nonlocal expired_handoff_after
             nonlocal continuation_after
@@ -846,7 +927,6 @@ async def run_task_worker(
             nonlocal continuation_scan_filtered
             nonlocal next_interrupted_handoff_recovery_at
             nonlocal next_interrupted_continuation_scan_at
-            nonlocal reclaim_backlog
 
             loop = asyncio.get_running_loop()
             meaningful_activity = False
@@ -886,20 +966,23 @@ async def run_task_worker(
                 and not until_idle_skips_scan()
                 and loop.time() >= next_interrupted_continuation_scan_at
             ):
-                continuation_page = await _run_recovered_interrupted_task_handler(
-                    app,
-                    task_store,
-                    recovered_interrupted_task_handler,
-                    worker_id=worker_id,
-                    lease_seconds=lease_seconds,
-                    query=query,
-                    after=continuation_after,
-                    max_unproductive_handoffs=max_unproductive_interrupted_handoffs,
-                    stop=slot_stop,
-                    execution_timeout_s=execution_timeout_s,
-                    execution_grace_s=execution_grace_s,
-                    event_budget_check=event_budget_check,
-                )
+                # A handoff released meanwhile is rescanned after this page's
+                # cursor is recorded, at this step's maintenance.
+                async with maintained_while_busy():
+                    continuation_page = await _run_recovered_interrupted_task_handler(
+                        app,
+                        task_store,
+                        recovered_interrupted_task_handler,
+                        worker_id=worker_id,
+                        lease_seconds=lease_seconds,
+                        query=query,
+                        after=continuation_after,
+                        max_unproductive_handoffs=max_unproductive_interrupted_handoffs,
+                        stop=slot_stop,
+                        execution_timeout_s=execution_timeout_s,
+                        execution_grace_s=execution_grace_s,
+                        event_budget_check=event_budget_check,
+                    )
                 continuation_scan_scanned += continuation_page.scanned_candidates
                 continuation_scan_rejected += continuation_page.rejected_candidates
                 continuation_scan_filtered += continuation_page.filtered_candidates
@@ -946,26 +1029,9 @@ async def run_task_worker(
                     stop=True,
                     activity=meaningful_activity,
                 )
-            if owns_maintenance and reclaim:
-                reclaim_ran, reclaimed = await reclaim_cadence.run_if_due(
-                    reclaim_expired_tasks,
-                    now=loop.time(),
-                    clock=loop.time,
-                )
-                if reclaim_ran:
-                    poller.metrics.maintenance(reclaim=True)
-                    # A full batch may leave more; an until-idle run reclaims them first.
-                    reclaim_backlog = bool(reclaimed) and reclaimed >= _RECLAIM_BATCH_SIZE
-                    if until_idle is not None and reclaim_backlog:
-                        reclaim_cadence.expedite()
-                meaningful_activity = meaningful_activity or bool(reclaimed)
-            if owns_maintenance and fenced_monitor is not None:
-                _, settled_fenced = await fenced_cadence.run_if_due(
-                    scan_fenced_tasks,
-                    now=loop.time(),
-                    clock=loop.time,
-                )
-                meaningful_activity = meaningful_activity or bool(settled_fenced)
+            if owns_maintenance:
+                meaningful_activity = await maintain_expired_claims() or meaningful_activity
+                rescan_released_handoffs()
             if (
                 until_idle is not None
                 and owns_maintenance
@@ -1115,19 +1181,21 @@ async def run_task_worker(
                 )
             poller.metrics.handler_started()
             try:
-                await _handle_with_heartbeat(
-                    app,
-                    task_store,
-                    task,
-                    handler,
-                    worker_id,
-                    lease_seconds,
-                    execution_timeout_s=execution_timeout_s,
-                    execution_grace_s=execution_grace_s,
-                    event_budget_check=event_budget_check,
-                )
+                async with maintained_while_busy():
+                    await _handle_with_heartbeat(
+                        app,
+                        task_store,
+                        task,
+                        handler,
+                        worker_id,
+                        lease_seconds,
+                        execution_timeout_s=execution_timeout_s,
+                        execution_grace_s=execution_grace_s,
+                        event_budget_check=event_budget_check,
+                    )
             finally:
                 poller.metrics.handler_finished()
+            rescan_released_handoffs()
             next_interrupted_continuation_scan_at = 0.0
             if (
                 until_idle is not None
@@ -2705,6 +2773,44 @@ def _raise_task_retry_owner_cancellation_with_secondary(
     if cause is None:
         raise owner_cancellation from None
     raise owner_cancellation from cause
+
+
+async def _stop_busy_slot_maintenance(
+    maintenance: asyncio.Task[None],
+    idle: asyncio.Event,
+    failure: BaseException | None,
+) -> None:
+    """Join the maintenance a slot ran while busy, keeping the slot's own outcome.
+
+    After a normal return a pass already under way finishes its store writes,
+    unless the slot is cancelled meanwhile; after ``failure``, or that
+    cancellation, the maintenance is cancelled and joined, the slot's
+    cancellation requests are restored and the slot's error stays the one raised.
+    """
+
+    if failure is None:
+        idle.set()
+        try:
+            await asyncio.wait({maintenance})
+        except asyncio.CancelledError as cancellation:
+            await _stop_busy_slot_maintenance(maintenance, idle, cancellation)
+            raise
+        # A failed pass is logged and retried, so only an unexpected error ends it.
+        maintenance.result()
+        return
+    maintenance.cancel()
+    outcome = await await_shielded_task_outcome(
+        maintenance,
+        cancellation=failure if isinstance(failure, asyncio.CancelledError) else None,
+    )
+    restore_task_cancellation_requests(
+        outcome.cancellation_requests_consumed,
+        cancellation=outcome.cancellation,
+    )
+    if outcome.error is not None and not isinstance(outcome.error, asyncio.CancelledError):
+        _attach_task_worker_secondary_failure(
+            failure, outcome.error, label="Busy-slot maintenance failure"
+        )
 
 
 def _attach_task_worker_secondary_failure(
