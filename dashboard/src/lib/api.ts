@@ -426,8 +426,11 @@ export async function fetchEnvironments(): Promise<EnvironmentsPage> {
   return pageObject as EnvironmentsPage
 }
 
-export async function fetchArtifacts(query: ArtifactsQuery = {}): Promise<ArtifactsPage> {
-  const page = await requestJson<unknown>(`/artifacts${queryString(query)}`)
+export async function fetchArtifacts(
+  query: ArtifactsQuery = {},
+  signal?: AbortSignal,
+): Promise<ArtifactsPage> {
+  const page = await requestJson<unknown>(`/artifacts${queryString(query)}`, { signal })
   const pageObject = objectRecord(page)
   if (pageObject === null || !Array.isArray(pageObject.artifacts)) {
     throw new Error("Unexpected /artifacts response.")
@@ -438,9 +441,11 @@ export async function fetchArtifacts(query: ArtifactsQuery = {}): Promise<Artifa
 export async function fetchArtifact(
   artifactId: string,
   query: ArtifactReadQuery = {},
+  signal?: AbortSignal,
 ): Promise<ArtifactRead> {
   return requestJson<ArtifactRead>(
     `/artifacts/${encodeURIComponent(artifactId)}${queryString(query)}`,
+    { signal },
   )
 }
 

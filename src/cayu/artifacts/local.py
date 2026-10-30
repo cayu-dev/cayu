@@ -13,9 +13,10 @@ import shutil
 import stat
 import sys
 import unicodedata
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Generator, Iterator
 from contextlib import contextmanager, suppress
 from contextvars import copy_context
+from itertools import islice
 from os import PathLike
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -46,6 +47,7 @@ from cayu.artifacts._local_closure import (
     require_publication_open,
 )
 from cayu.artifacts._pin_owner import pin_owner_digest
+from cayu.artifacts._scan import ArtifactBatchConsumer, ArtifactScan, ArtifactScanFilter
 from cayu.artifacts._settlement import (
     _absent_artifact_write,
     _ArtifactWritePhaseReporter,
@@ -319,6 +321,47 @@ class LocalArtifactStore(ArtifactStore):
             raise ArtifactStoreUnavailableError(
                 "Local artifact store could not list artifacts."
             ) from exc
+
+    supports_metadata_scan: ClassVar[bool] = True
+
+    async def scan_metadata(
+        self,
+        consume: ArtifactBatchConsumer,
+        *,
+        scope: ArtifactScope | None = None,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        batch_size: int = 100,
+        max_records: int = 100_000,
+    ) -> int:
+        scan = ArtifactScan(
+            consume,
+            ArtifactScanFilter(scope, session_id, agent_name, environment_name),
+            batch_size=batch_size,
+            max_records=max_records,
+        )
+        records = _iter_artifacts(self.root, self._root_identity)
+        try:
+            while True:
+                try:
+                    batch = await run_thread_to_completion(
+                        lambda: tuple(
+                            islice(records, min(batch_size, max_records - scan.scanned + 1))
+                        )
+                    )
+                except OSError as exc:
+                    raise ArtifactStoreUnavailableError(
+                        "Local artifact inventory is unavailable."
+                    ) from exc
+                if not batch:
+                    break
+                for artifact in batch:
+                    await scan.add(artifact)
+            await scan.flush()
+            return scan.delivered
+        finally:
+            await run_thread_to_completion(records.close)
 
     @property
     def supports_session_closure_claims(self) -> bool:
@@ -1353,6 +1396,16 @@ def _list_artifacts(
     limit: int | None,
 ) -> ArtifactListResult:
     inventory = BoundedArtifactListing(limit)
+    filters = ArtifactScanFilter(scope, session_id, agent_name, environment_name)
+    for artifact in _iter_artifacts(root, root_identity):
+        if filters.matches(artifact):
+            inventory.add(artifact)
+    return inventory.result()
+
+
+def _iter_artifacts(
+    root: Path, root_identity: tuple[int, int]
+) -> Generator[ArtifactMetadata, None, None]:
     with (
         _open_store_root(root, root_identity) as root_fd,
         os.scandir(root_fd if root_fd is not None else root) as entries,
@@ -1373,20 +1426,11 @@ def _list_artifacts(
                 raise ValueError(
                     "Local artifact inventory contains an incomplete artifact."
                 ) from None
-            if scope is not None and artifact.scope != scope:
-                continue
-            if session_id is not None and artifact.session_id != session_id:
-                continue
-            if agent_name is not None and artifact.agent_name != agent_name:
-                continue
-            if environment_name is not None and artifact.environment_name != environment_name:
-                continue
             from cayu.artifacts.access import visible
 
             if not visible(artifact):
                 continue
-            inventory.add(artifact)
-    return inventory.result()
+            yield artifact
 
 
 def _delete_artifact(

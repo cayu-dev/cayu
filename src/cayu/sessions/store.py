@@ -119,6 +119,7 @@ from cayu.sessions.authority import (
     SessionRunFenced,
     checkpoint_value_authority,
 )
+from cayu.sessions.display import SessionTitleQuery, SessionTitleSnapshot
 from cayu.sessions.environment_activity import (
     EnvironmentActivityQuery,
     EnvironmentActivitySnapshot,
@@ -469,6 +470,7 @@ class SessionStore(ABC):
     session_continuation_version: ClassVar[int] = 0
     external_wait_version: ClassVar[int] = 0
     _producer_attachment_version: ClassVar[int] = 0
+    supports_session_titles: ClassVar[bool] = False
     supports_environment_activity: ClassVar[bool] = False
     supports_usage_series: ClassVar[bool] = False
     supports_usage_cost_details: ClassVar[bool] = False
@@ -5149,6 +5151,15 @@ class SessionStore(ABC):
         raise NotImplementedError(
             "This SessionStore does not support child-session lifecycle projections."
         )
+
+    async def read_session_titles(self, query: SessionTitleQuery) -> SessionTitleSnapshot:
+        """Read only bounded title fields for requested IDs, including missing IDs.
+
+        Optional trusted-operator projection. Advertise supports_session_titles;
+        return one row per requested ID in order, with null for missing/invalid
+        titles. Do not hydrate events, transcripts, checkpoints or whole sessions.
+        """
+        raise NotImplementedError("Batched session title reads are unsupported.")
 
     async def aggregate_environment_activity(
         self, query: EnvironmentActivityQuery

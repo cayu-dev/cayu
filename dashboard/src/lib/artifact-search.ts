@@ -1,5 +1,15 @@
+export const ARTIFACT_ORDERS = [
+  "created_at_desc",
+  "created_at_asc",
+  "filename_asc",
+  "filename_desc",
+  "size_bytes_desc",
+  "size_bytes_asc",
+] as const
+export type ArtifactOrder = (typeof ARTIFACT_ORDERS)[number]
 export type ArtifactSearch = {
   q?: string
+  order_by?: ArtifactOrder
   session_id?: string
   agent_name?: string
   environment_name?: string
@@ -21,6 +31,9 @@ export function validateArtifactSearch(search: Record<string, unknown>): Artifac
       : Number.NaN
   return {
     q: text(search.q),
+    order_by: ARTIFACT_ORDERS.includes(search.order_by as ArtifactOrder)
+      ? (search.order_by as ArtifactOrder)
+      : undefined,
     session_id: text(search.session_id),
     agent_name: text(search.agent_name),
     environment_name: text(search.environment_name),

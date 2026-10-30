@@ -43,6 +43,7 @@ import type {
 } from "@/lib/generated/server-api"
 import { resolveUsageWindow } from "@/lib/usage-rollup"
 import type { TaskInfo, TaskItem, TaskScheduleEvent } from "../../api/types"
+import { kindOf } from "../../routes/artifacts/artifact-model"
 import type { AppSeed, SeedSession } from "../model"
 import { inMockTimeWindow, mockTimeBuckets } from "../time-series"
 import { CONTRACT } from "./contract"
@@ -1507,6 +1508,7 @@ function sessionFiles(s: SeedSession, index: number): StoredArtifact[] {
         artifact_store_id: storeOf(environmentName),
         scope: "session",
         session_id: s.session.id,
+        session_title: s.overview.title ?? null,
         agent_name: s.session.agent_name,
         environment_name: environmentName,
         filename,
@@ -1634,12 +1636,41 @@ function listArtifacts({ query }: LegacyRequest, context: LegacyContext): Artifa
   const matching = allArtifacts(context.records(), context.now())
     .map((a) => a.summary)
     .filter((a) => keys.every((key) => !query.get(key) || a[key] === query.get(key)))
+  const needle = (query.get("q") ?? "").trim().toLowerCase()
+  const order = query.get("order_by") ?? "created_at_desc"
+  const rows = matching.filter(
+    (a) =>
+      !needle ||
+      [
+        a.filename,
+        kindOf(a).label,
+        a.content_type,
+        a.agent_name,
+        a.environment_name,
+        a.session_title,
+        a.id,
+      ].some((value) => value?.toLowerCase().includes(needle)),
+  )
+  const primary = (a: ArtifactSummary) =>
+    order.startsWith("filename_")
+      ? a.filename.toLowerCase()
+      : order.startsWith("size_bytes_")
+        ? a.size_bytes
+        : Date.parse(a.created_at)
+  const compare = (a: string | number, b: string | number) => (a < b ? -1 : a > b ? 1 : 0)
+  rows.sort(
+    (a, b) =>
+      (order.endsWith("_desc") ? -1 : 1) *
+      (compare(primary(a), primary(b)) ||
+        compare(a.artifact_store_id ?? "", b.artifact_store_id ?? "") ||
+        compare(a.id, b.id)),
+  )
   const limit = integer(query, "limit", 50)
   const offset = integer(query, "offset", 0)
-  const more = offset + limit < matching.length
+  const more = offset + limit < rows.length
   return {
-    artifacts: matching.slice(offset, offset + limit),
-    total_count: matching.length,
+    artifacts: rows.slice(offset, offset + limit),
+    total_count: rows.length,
     limit,
     offset,
     truncated: more,

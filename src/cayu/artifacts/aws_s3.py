@@ -5,7 +5,7 @@ import importlib
 import json
 import mimetypes
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha256
@@ -39,6 +39,7 @@ from cayu.artifacts._s3_pins import (
     PINNED_MESSAGE,
     S3ArtifactPinState,
 )
+from cayu.artifacts._scan import ArtifactBatchConsumer, ArtifactScan, ArtifactScanFilter
 from cayu.artifacts._settlement import (
     _absent_artifact_write,
     _ArtifactWritePhaseReporter,
@@ -780,6 +781,56 @@ class S3ArtifactStore(ArtifactStore):
             ) from exc
         return inventory.result()
 
+    supports_metadata_scan: ClassVar[bool] = True
+
+    async def scan_metadata(
+        self,
+        consume: ArtifactBatchConsumer,
+        *,
+        scope: ArtifactScope | None = None,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        batch_size: int = 100,
+        max_records: int = 100_000,
+    ) -> int:
+        scan = ArtifactScan(
+            consume,
+            ArtifactScanFilter(scope, session_id, agent_name, environment_name),
+            batch_size=batch_size,
+            max_records=max_records,
+        )
+        client = await self._get_client()
+        records = self._iter_metadata_ids(client)
+        try:
+            while True:
+                try:
+                    artifact_id = await anext(records)
+                except StopAsyncIteration:
+                    break
+                except Exception as exc:
+                    raise ArtifactStoreUnavailableError(
+                        "S3 artifact inventory is unavailable."
+                    ) from exc
+                try:
+                    try:
+                        artifact = await self._read_metadata(client, artifact_id)
+                    except FileNotFoundError:
+                        await self._require_no_surviving_content(client, artifact_id)
+                        continue
+                except Exception as exc:
+                    raise ArtifactStoreUnavailableError(
+                        "S3 artifact inventory is unavailable."
+                    ) from exc
+                from cayu.artifacts.access import visible
+
+                if visible(artifact):
+                    await scan.add(artifact)
+            await scan.flush()
+            return scan.delivered
+        finally:
+            await records.aclose()
+
     @runtime_artifact_operation("delete")
     async def delete(self, artifact_id: str) -> None:
         artifact_id = _validate_artifact_id(artifact_id)
@@ -1090,14 +1141,14 @@ class S3ArtifactStore(ArtifactStore):
                 "S3 artifact inventory contains content without ownership metadata."
             )
 
-    async def _iter_metadata_ids(self, client: Any) -> AsyncIterator[str]:
+    async def _iter_metadata_ids(self, client: Any) -> AsyncGenerator[str, None]:
         prefix = f"{self.prefix}/" if self.prefix else ""
         continuation: str | None = None
         while True:
             options: dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": 1000}
             if continuation is not None:
                 options["ContinuationToken"] = continuation
-            response = await asyncio.to_thread(client.list_objects_v2, **options)
+            response = await run_thread_to_completion(client.list_objects_v2, **options)
             if not isinstance(response, Mapping):
                 raise ArtifactStoreUnavailableError(
                     "S3 artifact store received an invalid list response."

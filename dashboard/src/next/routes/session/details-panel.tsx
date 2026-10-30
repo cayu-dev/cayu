@@ -1,5 +1,4 @@
 import { Dialog } from "@base-ui/react/dialog"
-import { useQuery } from "@tanstack/react-query"
 import { X } from "lucide-react"
 import { type RefObject, useRef, useSyncExternalStore } from "react"
 import { BrowserOperator } from "@/components/dashboard/browser-operator"
@@ -7,7 +6,7 @@ import { BrowserRecordings } from "@/components/dashboard/browser-recordings"
 import { SessionAnnotations } from "@/components/dashboard/session-annotations"
 import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
-import { fetchArtifacts } from "@/lib/api"
+import { useArtifacts } from "@/lib/artifact-query"
 import { cn } from "@/lib/utils"
 import type { SessionDetail, SessionOverview } from "../../api/types"
 import type { SessionRow } from "../../app/queries"
@@ -80,11 +79,10 @@ export function DetailsPanel({
   const desktop = useSyncExternalStore(subscribePanelWidth, widePanel, () => false)
   const { prototype } = useServices()
   const viewer = useViewer()
-  const artifacts = useQuery({
-    queryKey: ["session-artifacts", session.id],
-    queryFn: () => fetchArtifacts({ session_id: session.id, limit: 6 }),
-    enabled: tab === "artifacts" && artifactsEnabled,
-  })
+  const artifacts = useArtifacts(
+    { session_id: session.id, limit: 6 },
+    tab === "artifacts" && artifactsEnabled,
+  )
   const tabs = PANEL_TABS.filter(
     (t) => (t !== "browser" || overview?.uses.browser) && (t !== "artifacts" || artifactsEnabled),
   )

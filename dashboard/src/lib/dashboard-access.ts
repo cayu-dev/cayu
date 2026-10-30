@@ -31,6 +31,7 @@ const MEMBER_READ_SURFACES = new Set([
   "eval_suite_views",
   "app_info",
   "artifacts",
+  "artifact_search",
   "dashboard",
   "inbox",
   "inbox_queries",

@@ -246,6 +246,7 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     reviewed_knowledge: OptionalSurfaceCapability
     kept_knowledge: OptionalSurfaceCapability | None = None
     artifacts: OptionalSurfaceCapability
+    artifact_search: OptionalSurfaceCapability | None = None
     usage: OptionalSurfaceCapability
     pricing: OptionalSurfaceCapability
     evaluation_promotion: OptionalSurfaceCapability

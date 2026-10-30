@@ -261,6 +261,7 @@ from cayu.sessions.authority import (
     SessionRunFenced,
     checkpoint_root_field_projection_from_storage,
 )
+from cayu.sessions.display import SessionTitleQuery, SessionTitleSnapshot
 from cayu.sessions.environment_activity import (
     EnvironmentActivityQuery,
     EnvironmentActivitySnapshot,
@@ -1099,6 +1100,7 @@ class SQLiteSessionStore(
 
         return await self._run_read(snapshot)
 
+    supports_session_titles: ClassVar[bool] = True
     supports_environment_activity: ClassVar[bool] = True
     supports_usage_series: ClassVar[bool] = True
     supports_usage_cost_details: ClassVar[bool] = True
@@ -6857,6 +6859,9 @@ class SQLiteSessionStore(
         query: ChildSessionLifecycleQuery,
     ) -> ChildSessionLifecyclePage:
         return await session_queries.query_child_session_lifecycle(self._run_read, query)
+
+    async def read_session_titles(self, query: SessionTitleQuery) -> SessionTitleSnapshot:
+        return await session_queries.read_session_titles(self._run_read, query)
 
     async def aggregate_environment_activity(
         self, query: EnvironmentActivityQuery

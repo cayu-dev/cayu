@@ -37,6 +37,12 @@ from cayu.sessions.authority import (
     CheckpointRootFieldGuard,
     checkpoint_root_field_projection,
 )
+from cayu.sessions.display import (
+    SessionTitleQuery,
+    SessionTitleSnapshot,
+    copy_title_query,
+    title_snapshot,
+)
 from cayu.sessions.environment_activity import (
     EnvironmentActivityQuery,
     EnvironmentActivitySnapshot,
@@ -345,6 +351,21 @@ async def aggregate_operational_snapshot(
             total_count=total_count,
             counts_by_status=SessionStatusCounts.model_validate(counts),
             accuracy=EXACT_AGGREGATE.model_copy(),
+        )
+
+
+async def read_session_titles(
+    read: LockedSessionQuery, query: SessionTitleQuery
+) -> SessionTitleSnapshot:
+    query = copy_title_query(query)
+    async with read() as state:
+        return title_snapshot(
+            query,
+            {
+                key: state.sessions[key].metadata.get("cayu:title")
+                for key in query.session_ids
+                if key in state.sessions
+            },
         )
 
 

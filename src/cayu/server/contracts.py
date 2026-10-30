@@ -2873,6 +2873,7 @@ class ApiArtifactSummary(ApiBaseModel):
     size_bytes: StrictInt = Field(ge=0)
     scope: str
     session_id: str | None
+    session_title: str | None = None
     agent_name: str | None
     environment_name: str | None
     created_at: str

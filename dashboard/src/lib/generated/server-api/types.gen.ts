@@ -549,6 +549,10 @@ export type ApiArtifactSummary = {
      */
     session_id: string | null;
     /**
+     * Session Title
+     */
+    session_title?: string | null;
+    /**
      * Size Bytes
      */
     size_bytes: number;
@@ -4775,6 +4779,7 @@ export type ControlPlaneMutationCapabilities = {
  */
 export type ControlPlaneSurfaceCapabilities = {
     app_info?: OptionalSurfaceCapability | null;
+    artifact_search?: OptionalSurfaceCapability | null;
     artifacts: OptionalSurfaceCapability;
     browser_recordings?: OptionalSurfaceCapability | null;
     dashboard: OptionalSurfaceCapability;
@@ -24177,6 +24182,14 @@ export type ListArtifactsApiArtifactsGetData = {
     body?: never;
     path?: never;
     query?: {
+        /**
+         * Q
+         */
+        q?: string | null;
+        /**
+         * Order By
+         */
+        order_by?: 'created_at_desc' | 'created_at_asc' | 'filename_asc' | 'filename_desc' | 'size_bytes_desc' | 'size_bytes_asc';
         /**
          * Limit
          */

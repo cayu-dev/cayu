@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -441,6 +441,34 @@ class ArtifactStore(ABC):
         Implementations should raise ``ArtifactStoreUnavailableError`` for
         operational backend failures.
         """
+
+    supports_metadata_scan: ClassVar[bool] = False
+
+    async def scan_metadata(
+        self,
+        consume: Callable[[tuple[ArtifactMetadata, ...]], Awaitable[None]],
+        *,
+        scope: ArtifactScope | None = None,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        batch_size: int = 100,
+        max_records: int = 100_000,
+    ) -> int:
+        """Visit a complete filtered inventory in bounded batches, without file bytes.
+
+        Optional trusted-operator read; opt in with supports_metadata_scan.
+        Success returns the exact number delivered to the awaited consumer.
+        Each identity occurs once. Exhaustion, including empty, proves completeness;
+        partial/unreadable inventories and max_records exhaustion must raise.
+        max_records bounds delivered/processed metadata before caller filters; one
+        extra record may be read to detect overflow. batch_size bounds each
+        callback (1..500); max_records is at most 100000. The callback
+        may fail or be cancelled: stop reading, close scan resources, and propagate
+        its exception. Thread-backed reads must settle before their iterator closes.
+        Existing list ordering and unknown-count contracts are independent.
+        """
+        raise NotImplementedError("Artifact metadata scanning is unsupported.")
 
     @property
     def supports_session_closure_claims(self) -> bool:

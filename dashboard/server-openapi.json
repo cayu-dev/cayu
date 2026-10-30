@@ -932,6 +932,17 @@
             ],
             "title": "Session Id"
           },
+          "session_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Title"
+          },
           "size_bytes": {
             "minimum": 0.0,
             "title": "Size Bytes",
@@ -9776,6 +9787,16 @@
         "additionalProperties": false,
         "properties": {
           "app_info": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "artifact_search": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/OptionalSurfaceCapability"
@@ -39134,7 +39155,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "80",
+            "default": "81",
             "title": "Contract Version",
             "type": "string"
           },
@@ -47323,7 +47344,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "80",
+            "default": "81",
             "title": "Contract Version",
             "type": "string"
           }
@@ -48158,6 +48179,41 @@
       "get": {
         "operationId": "list_artifacts_api_artifacts_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order_by",
+            "required": false,
+            "schema": {
+              "default": "created_at_desc",
+              "enum": [
+                "created_at_desc",
+                "created_at_asc",
+                "filename_asc",
+                "filename_desc",
+                "size_bytes_desc",
+                "size_bytes_asc"
+              ],
+              "title": "Order By",
+              "type": "string"
+            }
+          },
           {
             "in": "query",
             "name": "limit",

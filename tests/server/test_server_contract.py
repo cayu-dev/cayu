@@ -153,7 +153,12 @@ def _openapi_contract_summary(schema: dict) -> dict:
 
 
 def test_openapi_contract_summary_matches_snapshot() -> None:
-    schema = _client().get("/openapi.json").json()
+    client = _client()
+    schema = client.get("/openapi.json").json()
+    contract = client.get("/api/contract").json()
+    browser = client.get(contract["client"]["module_url"])
+    assert browser.status_code == 200
+    assert f'CONTRACT_VERSION = "{SERVER_CONTRACT_VERSION}"' in browser.text
     assert all(
         path in schema["paths"]
         for path in (
@@ -169,6 +174,11 @@ def test_openapi_contract_summary_matches_snapshot() -> None:
         parameter["name"] == "placement"
         for parameter in schema["paths"]["/api/evals/run-views/{run_key}"]["get"]["parameters"]
     )
+    artifact_parameters = {
+        item["name"] for item in schema["paths"]["/api/artifacts"]["get"]["parameters"]
+    }
+    assert {"q", "order_by"} <= artifact_parameters
+    assert "session_title" in schema["components"]["schemas"]["ApiArtifactSummary"]["properties"]
     expected = json.loads(_SNAPSHOT_PATH.read_text())
 
     assert _openapi_contract_summary(schema) == expected
@@ -229,6 +239,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert body["capabilities"]["configured_store_roles"] == ["session"]
     assert body["capabilities"]["actor"] is None
     assert body["capabilities"]["surfaces"] == {
+        "artifact_search": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
         "usage_cost_details": {
             "configured": True,
             "read": {"enabled": True, "unavailable_reason": None},

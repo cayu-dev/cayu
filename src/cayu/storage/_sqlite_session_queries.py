@@ -40,6 +40,12 @@ from cayu.sessions._tool_round_publication_rules import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     _validate_tool_round_call_ids,
 )
+from cayu.sessions.display import (
+    SessionTitleQuery,
+    SessionTitleSnapshot,
+    copy_title_query,
+    title_snapshot,
+)
 from cayu.sessions.environment_activity import (
     EnvironmentActivityQuery,
     EnvironmentActivitySnapshot,
@@ -1312,6 +1318,26 @@ async def query_child_session_lifecycle(
             return read_snapshot(connection)
         finally:
             connection.rollback()
+
+    return await run_read(read)
+
+
+async def read_session_titles(
+    run_read: SQLiteOperationRunner, query: SessionTitleQuery
+) -> SessionTitleSnapshot:
+    query = copy_title_query(query)
+    placeholders = ", ".join("?" for _ in query.session_ids)
+
+    def read(connection: sqlite3.Connection) -> SessionTitleSnapshot:
+        rows = connection.execute(
+            f"""SELECT id, CASE
+                WHEN json_type(metadata_json, '$."cayu:title"') = 'text'
+                AND length(json_extract(metadata_json, '$."cayu:title"')) <= 256
+                THEN json_extract(metadata_json, '$."cayu:title"') END AS title
+                FROM cayu_sessions WHERE id IN ({placeholders})""",
+            query.session_ids,
+        ).fetchall()
+        return title_snapshot(query, {row["id"]: row["title"] for row in rows})
 
     return await run_read(read)
 

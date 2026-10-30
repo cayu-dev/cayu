@@ -66,9 +66,12 @@ class ControlPlaneCapabilitySnapshot:
         actor: AuthContext | None,
         *,
         artifacts_configured: bool,
+        artifact_search_supported: bool = False,
     ) -> ControlPlaneCapabilities:
         """Add request-time actor and registration state without retaining either."""
 
+        if type(artifact_search_supported) is not bool:
+            raise TypeError("artifact_search_supported must be a bool.")
         if type(artifacts_configured) is not bool:
             raise TypeError("artifacts_configured must be a bool.")
         configured_store_roles: tuple[ConfiguredStoreRole, ...] = tuple(
@@ -180,6 +183,11 @@ class ControlPlaneCapabilitySnapshot:
                 reviewed_knowledge=_optional_surface(
                     self.knowledge_configured,
                     mutation_supported=True,
+                ),
+                artifact_search=_optional_surface(
+                    artifacts_configured,
+                    read_supported=artifact_search_supported,
+                    mutation_supported=False,
                 ),
                 artifacts=_optional_surface(
                     artifacts_configured,

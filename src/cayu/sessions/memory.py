@@ -159,6 +159,7 @@ from cayu.sessions.authority import (
     SessionRunFenced,
     checkpoint_root_field_projection,
 )
+from cayu.sessions.display import SessionTitleQuery, SessionTitleSnapshot
 from cayu.sessions.environment_activity import (
     EnvironmentActivityQuery,
     EnvironmentActivitySnapshot,
@@ -766,6 +767,7 @@ class InMemorySessionStore(
                 self._session_closure_tombstones[(root_id, plan_id, child_id)] = tombstone
             return tuple(tombstones)
 
+    supports_session_titles: ClassVar[bool] = True
     supports_environment_activity: ClassVar[bool] = True
     supports_usage_series: ClassVar[bool] = True
     supports_usage_cost_details: ClassVar[bool] = True
@@ -6827,6 +6829,11 @@ class InMemorySessionStore(
         query: ChildSessionLifecycleQuery,
     ) -> ChildSessionLifecyclePage:
         return await memory_session_queries.query_child_session_lifecycle(
+            self._read_session_query_state, query
+        )
+
+    async def read_session_titles(self, query: SessionTitleQuery) -> SessionTitleSnapshot:
+        return await memory_session_queries.read_session_titles(
             self._read_session_query_state, query
         )
 

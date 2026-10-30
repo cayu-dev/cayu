@@ -22,6 +22,7 @@ type Services = {
   usageSeriesEnabled?: boolean
   sessionOverviewSeriesEnabled?: boolean
   artifactsEnabled?: boolean
+  artifactSearchEnabled?: boolean
   taskIndexEnabled?: boolean
   taskCreationEnabled?: boolean
   taskMutationsEnabled?: boolean

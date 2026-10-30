@@ -9,12 +9,8 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
-import {
-  type ArtifactRead,
-  type ArtifactSummary,
-  artifactContentUrl,
-  fetchArtifact,
-} from "@/lib/api"
+import { type ArtifactRead, type ArtifactSummary, artifactContentUrl } from "@/lib/api"
+import { useArtifact } from "@/lib/artifact-query"
 import { formatBytes } from "@/lib/format"
 import type { SessionOverview } from "../../api/types"
 import { useApi, useNow, useServices } from "../../app/services"
@@ -51,15 +47,14 @@ export function ArtifactDrawer({
   const { overviewQueriesEnabled = true } = useServices()
   const now = useNow()
   // A file with no preview (an archive, a PDF) only needs its summary, which the list has.
-  const read = useQuery({
-    enabled: !known || kindOf(known).preview !== "none",
-    queryKey: ["artifact-preview", artifactId, known?.artifact_store_id ?? storeId ?? null],
-    queryFn: () =>
-      fetchArtifact(artifactId, {
-        artifact_store_id: known?.artifact_store_id ?? storeId,
-        max_bytes: PREVIEW_BYTES,
-      }),
-  })
+  const read = useArtifact(
+    artifactId,
+    {
+      artifact_store_id: known?.artifact_store_id ?? storeId,
+      max_bytes: PREVIEW_BYTES,
+    },
+    !known || kindOf(known).preview !== "none",
+  )
   const artifact = known ?? read.data?.artifact
   const sessionId = artifact?.session_id
   const overview = useQuery({

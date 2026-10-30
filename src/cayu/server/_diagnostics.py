@@ -43,6 +43,7 @@ class SystemDiagnosticsSnapshot:
         *,
         artifact_store_fingerprints: tuple[str, ...],
         artifact_store_total_count: int,
+        artifact_search_supported: bool = False,
     ) -> SystemDiagnosticsResponse:
         """Project request identity and the bounded dynamic registration snapshot."""
 
@@ -73,6 +74,7 @@ class SystemDiagnosticsSnapshot:
             capabilities=self.capabilities.project(
                 actor,
                 artifacts_configured=artifacts_configured,
+                artifact_search_supported=artifact_search_supported,
             ),
             artifact_stores=ArtifactStoreDiagnostics(
                 registrations=tuple(

@@ -199,6 +199,11 @@ export const CONTRACT: ServerContract = {
           unavailable_reason: null,
         },
       },
+      artifact_search: {
+        configured: true,
+        read: { enabled: true, unavailable_reason: null },
+        mutate: { enabled: false, unavailable_reason: "unsupported" },
+      },
       artifacts: {
         configured: true,
         read: {

@@ -82,7 +82,7 @@ reported series expose their supported read-only evidence and downloads.
 | Usage: range chips (Last 24 hours, Last 7 days, Last 30 days, custom); cost or tokens, sessions, model steps and tool calls; sessions per day with failures; models grouped by provider, linking to filtered Sessions; the sessions that used the most, by title; a quiet note when pricing is off or partial; Debug with window, accuracy and pricing coverage | Usage (rollup cards, "authoritative store rollup" wording, breakdown tables) | `/usage?range=&agent_name=&environment_name=…` |
 | Environments: one row per environment with where it runs, workspace and branches, whether files are kept, knowledge store, declared MCP servers, retained-session counts and last activity | Environments (wiring tables) | `/environments` |
 | Environment: Runs on, Workspace, Files, Knowledge, MCP servers, recent sessions by title, recent files; Debug with IDs, branch capabilities and lifecycle | – (new) | `/environments/:name` |
-| Artifacts: files with kind, size, the session that made them (by title) and specialist; filters and paging in the URL; a preview drawer with Download and Open raw (its `preview_store_id` is separate from the list’s `artifact_store_id`); Debug with store, scope and metadata | Artifacts (ID-first table, side preview) | `/artifacts?artifact=…` |
+| Artifacts: files with kind, size, the session that made them (by title) and specialist; global public-text search and newest/oldest/name/size sort before paging; filters and paging in the URL; a preview drawer with Download and Open raw (its `preview_store_id` is separate from the list’s `artifact_store_id`); Debug with store, scope and metadata | Artifacts (ID-first table, side preview) | `/artifacts?artifact=…` |
 | System (full access only): About this agent (version, deployment, who you're signed in as, stores, pricing); what's turned off and why; Evals readiness; Debug with the feature tables, store fingerprints and raw diagnostics | System (diagnostics matrices) | `/system` |
 
 ## Current runtime contracts
@@ -121,8 +121,6 @@ or claim an exact result from a partial read.
 | Page | Remaining work | Current behavior |
 | --- | --- | --- |
 | Usage | Start counts for labels, parent sessions and causal budgets | Headline keeps these filters; chart explicitly unavailable because the histogram API cannot apply them |
-| Artifacts | Text search and sort | `q` filters the loaded page; newest first only |
-| Artifacts | Session titles on artifact rows | One overview read per page |
 | System | Deployment kind (local, Cloud, embedded) | Shows the deployment name and whether sign-in is required |
 
 ## Production ownership and navigation

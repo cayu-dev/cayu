@@ -156,13 +156,15 @@ overview enrichment. Without a runner, Shell, Git and
 text-search tools are unavailable. MCP currently shows a count, and file storage
 says whether files are kept without inferring its storage backend.
 
-Artifacts keeps filters and paging in the URL. Search currently filters only
-the loaded page, ordered newest first. A preview link uses both `artifact` and
-`artifact_store_id` because an artifact ID alone is not globally unique. The
-drawer offers Download and Open raw where supported, with internal identities
-in Debug. Session and environment links remain within the configured dashboard
-mount. Usage and Artifacts respect their server capability gates; optional
-session-title/count reads are omitted when overview queries are unavailable.
+Artifacts keeps search, sort, filters and paging in the URL. Search matches public
+file metadata and producing-session titles across the selected stores before paging.
+Sort by newest, oldest, filename or size. A preview link uses `artifact` and
+`preview_store_id`; `artifact_store_id` independently filters the list. Existing
+store-scoped preview links remain supported. The drawer offers Download and Open raw
+where supported, with internal identities in Debug. Session and environment links
+remain within the configured dashboard mount. Usage and Artifacts respect their
+server capability gates. Artifact titles come from a bounded store projection;
+missing or untitled producers display “Untitled session” without an overview read.
 
 System is for full-access viewers. It shows agent setup, disabled-feature reasons
 and Evals readiness; capability matrices and raw diagnostics stay in Debug.
@@ -1064,3 +1066,56 @@ storage health check.
 Environment links preserve exact registered names. The special names `.` and `..`
 use `/environments?name=.` and `/environments?name=..` so browser path normalization
 cannot discard them; other names keep the existing named detail URLs.
+
+
+### Global artifact queries
+
+`GET /api/artifacts` accepts optional `q` (at most 256 characters) and `order_by`:
+`created_at_desc` (default), `created_at_asc`, `filename_asc`, `filename_desc`,
+`size_bytes_desc`, or `size_bytes_asc`. Search compares a literal substring after locale-independent Unicode lowercasing
+of the query and public filename, kind, MIME type, specialist, environment, producing-session title
+or artifact ID. File contents and private metadata are never searched. Redaction
+precedes matching. Sort ties use store ID and artifact ID in the same direction.
+Existing store, owner, specialist, environment and session filters apply before
+search, sorting and paging. `session_title` is nullable on each returned row.
+
+The `artifact_search.read.enabled` capability requires a native batched title
+projection, at least one artifact store, and scan support from every registered
+artifact store. A query selecting any
+unsupported store returns 501 before scanning; select a supported store explicitly
+with `artifact_store_id` in a mixed deployment. Basic newest-first listing without
+`q` remains available for extensions that only implement `list`, including unknown
+counts. It uses each store’s bounded listing and resolves titles only for the returned
+page. Unavailable or incomplete inventories never return a partial global result.
+
+Local and S3 stores implement the optional operator-only
+`ArtifactStore.scan_metadata(consume, ...)` contract. Consumers receive awaited
+batches of at most 500 immutable metadata records; the returned integer is exactly
+the number delivered. Implementations must stop on callback failure/cancellation,
+close their readers, and wait for dispatched threads before closing an iterator.
+A scan counts records before its optional filters and may inspect one extra record
+to detect overflow. Each identity occurs once; unreadable or incomplete inventories
+raise instead of returning a successful count. Custom stores opt in with
+`supports_metadata_scan = True` only when they meet that contract. Model-facing
+artifact access does not gain this operator method.
+
+For text search or a nondefault sort, the HTTP query caps scanned metadata at
+100,000 records across selected stores,
+uses batches of 100 and retains at most `offset + limit` matches. Its title cache
+holds at most 5,000 IDs; native Memory, SQLite and PostgreSQL title reads return
+only the requested title fields, at most 500 IDs per call. Query bound exhaustion
+returns 503; selecting one store can narrow the inventory. These are observational
+reads, not a frozen snapshot across stores: concurrent saves or removals can change
+later pages. The supported pagination bounds remain `limit` 1–500 and `offset`
+0–10,000.
+
+The CLI uses the same protected API, filters and pagination:
+
+```sh
+cayu artifact list --server-url http://localhost:8000 --query report --order-by filename_asc
+cayu artifact list --application my-agent --artifact-store-id files --limit 25 --offset 25 --json
+```
+
+Use `--session`, `--agent`, `--environment` and `--scope` for owner filters. JSON
+retains exact store/file identities, nullable titles, unknown counts and continuation
+fields; table output shows titles and the next offset.

@@ -156,6 +156,8 @@ function IdentityGate() {
             serverContract.capabilities.surfaces.usage_series?.read.enabled === true,
           sessionOverviewSeriesEnabled:
             serverContract.capabilities.surfaces.session_overview_series?.read.enabled === true,
+          artifactSearchEnabled:
+            serverContract.capabilities.surfaces.artifact_search?.read.enabled === true,
           artifactsEnabled: serverContract.capabilities.surfaces.artifacts?.read.enabled === true,
           taskIndexEnabled: serverContract.capabilities.surfaces.task_index?.read.enabled === true,
           taskCreationEnabled:

@@ -83,6 +83,7 @@ def test_prototype_artifact_native_links_stay_inside_fake_data(prototype_url, tm
             context.route(re.compile(r"^https?://[^/]+/api/"), refuse_real_api)
             page = context.new_page()
             page.goto(f"{prototype_url}#/artifacts")
+            page.get_by_role("link", name="agent-handbook.md", exact=True).click()
             raw = page.get_by_role("link", name="Open raw", exact=True)
             download = page.get_by_role("link", name="Download", exact=True)
             playwright.expect(
@@ -159,7 +160,7 @@ def test_prototype_reset_refreshes_mounted_suite_list(prototype_url):
             browser.close()
 
 
-def test_prototype_legacy_hash_filters_survive_links_edits_and_reload(prototype_url):
+def test_prototype_artifact_query_filters_survive_edits_reload_and_new_tab(prototype_url):
     from urllib.parse import parse_qs, urlsplit
 
     playwright = pytest.importorskip("playwright.sync_api")
@@ -167,34 +168,37 @@ def test_prototype_legacy_hash_filters_survive_links_edits_and_reload(prototype_
         browser = driver.chromium.launch(headless=True)
         try:
             page = browser.new_page()
-            page.goto(prototype_url + "#/environments")
-            links = page.locator('a[href*="#/artifacts?"][href*="q="]')
-            playwright.expect(links.first).to_be_visible()
-            link = links.last
-            target = link.get_attribute("href")
-            assert target is not None
-            expected = parse_qs(urlsplit(target).fragment.partition("?")[2])
-            link.click()
-            search = page.get_by_placeholder(
-                "Filter loaded page by file, session, agent, environment..."
+            page.goto(
+                prototype_url
+                + "#/artifacts?q=report&order_by=filename_asc&artifact_store_id=files&offset=25"
             )
-            playwright.expect(search).to_have_value(expected["q"][0])
-            playwright.expect(
-                page.get_by_text("store: " + expected["artifact_store_id"][0], exact=True)
-            ).to_be_visible()
+            search = page.get_by_role("textbox", name="Search files")
+            playwright.expect(search).to_have_value("report")
+            playwright.expect(page.get_by_role("combobox", name="Sort files")).to_have_value(
+                "filename_asc"
+            )
             page.reload()
-            playwright.expect(search).to_have_value(expected["q"][0])
+            playwright.expect(search).to_have_value("report")
             search.fill("edited-filter")
-            page.get_by_role("button", name="Clear links", exact=True).click()
+            search.press("Enter")
             page.wait_for_function("location.hash.includes('q=edited-filter')")
-            page.reload()
-            playwright.expect(search).to_have_value("edited-filter")
-            page.goto("about:blank")
-            page.goto(prototype_url + "#/artifacts?q=direct-filter&environment_name=direct-env")
-            playwright.expect(search).to_have_value("direct-filter")
-            playwright.expect(
-                page.get_by_text("environment: direct-env", exact=True)
-            ).to_be_visible()
+            query = parse_qs(urlsplit(page.url).fragment.partition("?")[2])
+            assert query == {
+                "q": ["edited-filter"],
+                "order_by": ["filename_asc"],
+                "artifact_store_id": ["files"],
+            }
+            second = browser.new_page()
+            second.goto(page.url)
+            playwright.expect(second.get_by_role("textbox", name="Search files")).to_have_value(
+                "edited-filter"
+            )
+            playwright.expect(second.get_by_role("combobox", name="Sort files")).to_have_value(
+                "filename_asc"
+            )
+            page.get_by_role("button", name="Clear filters", exact=True).click()
+            playwright.expect(search).to_have_value("")
+            assert not parse_qs(urlsplit(page.url).fragment.partition("?")[2])
         finally:
             browser.close()
 

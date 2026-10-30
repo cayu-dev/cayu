@@ -46,6 +46,12 @@ from cayu.sessions._tool_round_publication_rules import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     _validate_tool_round_call_ids,
 )
+from cayu.sessions.display import (
+    SessionTitleQuery,
+    SessionTitleSnapshot,
+    copy_title_query,
+    title_snapshot,
+)
 from cayu.sessions.environment_activity import (
     EnvironmentActivityQuery,
     EnvironmentActivitySnapshot,
@@ -1262,6 +1268,29 @@ async def query_child_session_lifecycle(
             await conn.rollback()
             raise
     return result
+
+
+async def read_session_titles(
+    connect: PostgresConnection, query: SessionTitleQuery
+) -> SessionTitleSnapshot:
+    query = copy_title_query(query)
+    async with connect() as conn:
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """SELECT id, CASE
+                    WHEN jsonb_typeof(metadata -> 'cayu:title') = 'string'
+                    AND length(metadata ->> 'cayu:title') <= 256
+                    THEN metadata ->> 'cayu:title' END AS title
+                    FROM cayu_sessions WHERE id = ANY(%s::text[])""",
+                    (list(query.session_ids),),
+                )
+                rows = await cursor.fetchall()
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+    return title_snapshot(query, {row[0]: row[1] for row in rows})
 
 
 async def aggregate_environment_activity(

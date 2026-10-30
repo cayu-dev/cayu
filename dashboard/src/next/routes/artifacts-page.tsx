@@ -3,24 +3,22 @@
  * environment, session, scope, page offset); a file opens in a drawer (`?artifact=<id>`, with
  * `preview_store_id`, since IDs are only unique within a store). The separate
  * `artifact_store_id` filters the list and remains supported in direct preview bookmarks.
- * The drawer offers a preview, Download and Open raw. The API has no text search,
- * so the search box filters the loaded page only.
+ * Search and sort run across the selected server inventory before pagination.
  */
-import { keepPreviousData, useQuery } from "@tanstack/react-query"
 import { useSearch } from "@tanstack/react-router"
 import { ChevronLeft, ChevronRight, Search, X } from "lucide-react"
 import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
-import { type ArtifactSummary, fetchArtifacts } from "@/lib/api"
-import type { ArtifactSearch } from "@/lib/artifact-search"
+import type { ArtifactSummary } from "@/lib/api"
+import { useArtifacts } from "@/lib/artifact-query"
+import { ARTIFACT_ORDERS, type ArtifactOrder, type ArtifactSearch } from "@/lib/artifact-search"
 import { formatBytes } from "@/lib/format"
 import { cn } from "@/lib/utils"
-import type { SessionOverview } from "../api/types"
 import { useEnvironments, useSpecialists } from "../app/queries"
-import { useApi, useNow, useServices } from "../app/services"
+import { useNow, useServices } from "../app/services"
 import { relativeTime } from "../app/session-model"
 import { ArtifactDrawer } from "./artifacts/artifact-drawer"
-import { kindOf, sessionTitle } from "./artifacts/artifact-model"
+import { kindOf } from "./artifacts/artifact-model"
 import {
   EmptyState,
   ErrorState,
@@ -35,6 +33,14 @@ import {
 } from "./common"
 
 const PAGE_SIZE = 25
+const ORDER_LABELS: Record<ArtifactOrder, string> = {
+  created_at_desc: "Newest first",
+  created_at_asc: "Oldest first",
+  filename_asc: "Name A–Z",
+  filename_desc: "Name Z–A",
+  size_bytes_desc: "Largest first",
+  size_bytes_asc: "Smallest first",
+}
 const SCOPES = [
   { id: "session", label: "Saved by a session" },
   { id: "environment", label: "Shared in an environment" },
@@ -53,11 +59,10 @@ const field =
 
 export function ArtifactsPage() {
   const search = useSearch({ from: "/artifacts" })
-  const { overviewQueriesEnabled = true } = useServices()
+  const { artifactSearchEnabled = false } = useServices()
   const go = useGo()
   const rowClick = useRowClick()
   const now = useNow()
-  const api = useApi()
   const [draft, setDraft] = useState(search.q ?? "")
   useEffect(() => setDraft(search.q ?? ""), [search.q])
   const set = (patch: Partial<ArtifactSearch>) =>
@@ -68,6 +73,8 @@ export function ArtifactsPage() {
   const offset = offsetOf(search.offset)
   const scope = scopeOf(search.scope)
   const query = {
+    q: artifactSearchEnabled ? search.q : undefined,
+    order_by: artifactSearchEnabled ? search.order_by : undefined,
     session_id: search.session_id,
     agent_name: search.agent_name,
     environment_name: search.environment_name,
@@ -76,51 +83,23 @@ export function ArtifactsPage() {
     limit: PAGE_SIZE,
     offset,
   }
-  const artifacts = useQuery({
-    queryKey: ["artifacts", query],
-    queryFn: () => fetchArtifacts(query),
-    placeholderData: keepPreviousData,
-  })
+  const queryEnabled = artifactSearchEnabled || (!search.q && !search.order_by)
+  const artifacts = useArtifacts(query, queryEnabled)
   const specialists = useSpecialists()
   const environments = useEnvironments()
 
   const loaded = artifacts.data?.artifacts ?? []
-  const sessionIds = [
-    ...new Set([
-      ...loaded.flatMap((a) => (a.session_id ? [a.session_id] : [])),
-      ...(search.session_id ? [search.session_id] : []),
-    ]),
-  ].sort()
-  const overviews = useQuery({
-    queryKey: ["artifact-session-overviews", sessionIds],
-    enabled: overviewQueriesEnabled && sessionIds.length > 0,
-    placeholderData: keepPreviousData,
-    queryFn: () => api.overviews(sessionIds),
-  })
-  const overviewOf = (id: string | null) =>
-    id && overviewQueriesEnabled ? overviews.data?.find((o) => o.session_id === id) : undefined
-
-  const needle = (search.q ?? "").trim().toLocaleLowerCase()
-  const rows = needle
-    ? loaded.filter((a) =>
-        [
-          a.filename,
-          kindOf(a).label,
-          a.content_type,
-          a.agent_name,
-          a.environment_name,
-          a.session_id ? sessionTitle(overviewOf(a.session_id)) : null,
-          a.id,
-        ].some((value) => value?.toLocaleLowerCase().includes(needle)),
-      )
-    : loaded
+  const selectedSessionTitle = loaded.find(
+    (row) => row.session_id === search.session_id,
+  )?.session_title
   const total = artifacts.data?.total_count
   const filtered = !!(
     search.session_id ||
     search.agent_name ||
     search.environment_name ||
     search.artifact_store_id ||
-    scope
+    scope ||
+    search.order_by
   )
   const agents = [
     ...new Set([
@@ -158,11 +137,13 @@ export function ArtifactsPage() {
             <span className="sr-only">Search files</span>
             <input
               value={draft}
+              disabled={!artifactSearchEnabled}
+              maxLength={256}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") set({ q: e.currentTarget.value || undefined })
+                if (e.key === "Enter") filter({ q: e.currentTarget.value || undefined })
               }}
-              onBlur={(e) => set({ q: e.currentTarget.value || undefined })}
+              onBlur={(e) => filter({ q: e.currentTarget.value || undefined })}
               placeholder="Search by file name, kind or session"
               className="grouped-field-input w-full min-w-0 bg-transparent outline-none placeholder:text-muted-foreground"
             />
@@ -206,6 +187,19 @@ export function ArtifactsPage() {
               </option>
             ))}
           </select>
+          <select
+            aria-label="Sort files"
+            className={field}
+            value={search.order_by ?? "created_at_desc"}
+            disabled={!artifactSearchEnabled}
+            onChange={(e) => filter({ order_by: e.target.value as ArtifactOrder })}
+          >
+            {ARTIFACT_ORDERS.map((order) => (
+              <option key={order} value={order}>
+                {ORDER_LABELS[order]}
+              </option>
+            ))}
+          </select>
           {(filtered || search.q) && (
             <Button
               variant="ghost"
@@ -224,9 +218,7 @@ export function ArtifactsPage() {
           <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
             <span className="inline-flex h-7 max-w-full items-center gap-1.5 rounded-full border border-border bg-muted/50 pr-1 pl-3">
               <span className="shrink-0 text-muted-foreground">Session</span>
-              <span className="min-w-0 truncate">
-                {overviews.isFetching ? "…" : sessionTitle(overviewOf(search.session_id))}
-              </span>
+              <span className="min-w-0 truncate">{selectedSessionTitle || "Selected session"}</span>
               <button
                 type="button"
                 aria-label="Show files from every session"
@@ -239,40 +231,41 @@ export function ArtifactsPage() {
           </div>
         )}
 
-        {needle && total !== null && total !== undefined && total > loaded.length && (
+        {!artifactSearchEnabled && (
           <p className="mt-3 text-xs text-muted-foreground">
-            Search looks at the {loaded.length} files on this page only.
+            Global file search and sorting are unavailable for this agent.
           </p>
         )}
 
         {artifacts.error && (
           <div className="mt-4">
             <ErrorState error={artifacts.error} />
+            {loaded.length > 0 && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                Showing the last successful result for these filters.
+              </p>
+            )}
           </div>
         )}
-        {artifacts.isPending && (
+        {queryEnabled && artifacts.isPending && (
           <p role="status" className="mt-4 text-sm text-muted-foreground">
             Loading files…
           </p>
         )}
 
-        {artifacts.isSuccess && rows.length === 0 ? (
+        {artifacts.isSuccess && loaded.length === 0 ? (
           <div className="mt-4">
-            {!filtered && !needle && offset === 0 ? (
+            {!filtered && !search.q?.trim() && offset === 0 ? (
               <EmptyState title="No files yet">
                 Files show up here when an agent saves output, like a report or a chart, to its
                 environment's ArtifactStore.
               </EmptyState>
             ) : (
-              <EmptyState title="No files match">
-                {needle && loaded.length > 0
-                  ? `None of the files on this page match “${search.q}”.`
-                  : "Try removing a filter."}
-              </EmptyState>
+              <EmptyState title="No files match">Try removing a filter.</EmptyState>
             )}
           </div>
         ) : (
-          rows.length > 0 && (
+          loaded.length > 0 && (
             <div
               className={cn(
                 "mt-3 overflow-x-auto rounded-xl border border-border",
@@ -290,7 +283,7 @@ export function ArtifactsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((a) => {
+                  {loaded.map((a) => {
                     const kind = kindOf(a)
                     const Icon = kind.icon
                     return (
@@ -316,7 +309,7 @@ export function ArtifactsPage() {
                           </div>
                           <div className="mt-0.5 truncate pl-6 text-xs text-muted-foreground sm:hidden">
                             {kind.label} · {formatBytes(a.size_bytes)} ·{" "}
-                            {a.session_id ? sessionTitle(overviewOf(a.session_id)) : "Shared file"}
+                            {a.session_id ? artifactTitle(a) : "Shared file"}
                           </div>
                         </td>
                         <td className="hidden px-3 py-2 whitespace-nowrap text-muted-foreground sm:table-cell">
@@ -326,7 +319,7 @@ export function ArtifactsPage() {
                           {formatBytes(a.size_bytes)}
                         </td>
                         <td className="hidden max-w-[20rem] px-3 py-2 sm:table-cell">
-                          <MadeBy artifact={a} overview={overviewOf(a.session_id)} />
+                          <MadeBy artifact={a} />
                         </td>
                         <td className="px-3 py-2 text-right whitespace-nowrap tabular-nums text-muted-foreground">
                           {relativeTime(Date.parse(a.created_at), now())}
@@ -345,7 +338,7 @@ export function ArtifactsPage() {
             offset={offset}
             count={loaded.length}
             total={total ?? null}
-            next={artifacts.data.next_offset ?? null}
+            next={artifacts.data?.next_offset ?? null}
             onPage={(next) => set({ offset: next ? String(next) : undefined })}
           />
         )}
@@ -364,13 +357,10 @@ export function ArtifactsPage() {
   )
 }
 
-function MadeBy({
-  artifact,
-  overview,
-}: {
-  artifact: ArtifactSummary
-  overview: SessionOverview | undefined
-}) {
+const artifactTitle = (artifact: ArtifactSummary) =>
+  artifact.session_title?.trim() || "Untitled session"
+
+function MadeBy({ artifact }: { artifact: ArtifactSummary }) {
   if (!artifact.session_id)
     return (
       <div className="min-w-0">
@@ -386,7 +376,7 @@ function MadeBy({
         {...sessionRoute(artifact.session_id)}
         className="block truncate underline-offset-4 hover:underline"
       >
-        {sessionTitle(overview)}
+        {artifactTitle(artifact)}
       </NavLink>
       <div className="truncate text-xs text-muted-foreground">{artifact.agent_name ?? "–"}</div>
     </div>

@@ -77,6 +77,7 @@ from cayu.approvals.tools import (
     ToolApprovalRequest,
 )
 from cayu.approvals.user_input import UserInputRecoveryRequest, UserInputResponse
+from cayu.artifacts._scan import ArtifactScanFilter
 from cayu.artifacts.base import (
     ArtifactListResult,
     ArtifactScope,
@@ -166,6 +167,12 @@ from cayu.runtime.request_costs import (
 )
 from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.server._app_info_routes import register_app_info_routes
+from cayu.server._artifact_query import (
+    ArtifactOrder,
+    artifact_search_available,
+    query_artifacts,
+    read_titles,
+)
 from cayu.server._browser_client import (
     BROWSER_CLIENT_MODULE,
     BROWSER_CLIENT_TYPES,
@@ -3704,11 +3711,12 @@ def _serialize_artifact(cayu_app: Any, metadata: Any, *, artifact_store_id: str)
     return {
         "id": metadata.id,
         "artifact_store_id": artifact_store_id,
-        "filename": metadata.filename,
-        "content_type": metadata.content_type,
+        "filename": _redact_control_plane_json(cayu_app, metadata.filename, "filename"),
+        "content_type": _redact_control_plane_json(cayu_app, metadata.content_type, "content_type"),
         "size_bytes": metadata.size_bytes,
         "scope": metadata.scope.value,
         "session_id": metadata.session_id,
+        "session_title": None,
         "agent_name": metadata.agent_name,
         "environment_name": metadata.environment_name,
         "created_at": metadata.created_at.isoformat(),
@@ -5174,6 +5182,9 @@ def create_router(
             capabilities=capability_snapshot.project(
                 auth_context,
                 artifacts_configured=cayu_app.has_registered_artifact_store(),
+                artifact_search_supported=artifact_search_available(
+                    _artifact_stores_by_id(cayu_app), session_store
+                ),
             ),
         )
 
@@ -5335,6 +5346,9 @@ def create_router(
             auth_context,
             artifact_store_fingerprints=fingerprints,
             artifact_store_total_count=total_count,
+            artifact_search_supported=artifact_search_available(
+                _artifact_stores_by_id(cayu_app), session_store
+            ),
         )
 
     @router.get(
@@ -7174,6 +7188,8 @@ def create_router(
         dependencies=protected,
     )
     async def list_artifacts(
+        q: Annotated[str | None, Query(max_length=256)] = None,
+        order_by: ArtifactOrder = "created_at_desc",
         limit: Annotated[int, Query(ge=1, le=_ARTIFACT_PAGE_LIMIT_MAX)] = 100,
         offset: Annotated[int, Query(ge=0, le=_ARTIFACT_PAGE_OFFSET_MAX)] = 0,
         artifact_store_id: Annotated[str | None, Query()] = None,
@@ -7200,6 +7216,24 @@ def create_router(
             selected_stores = {requested_store_id: store}
         else:
             selected_stores = stores
+
+        filters = ArtifactScanFilter(
+            scope, requested_session_id, requested_agent_name, requested_environment_name
+        )
+        if q is not None or order_by != "created_at_desc":
+            return await query_artifacts(
+                selected_stores,
+                session_store,
+                serialize=lambda artifact, store_id: _serialize_artifact(
+                    cayu_app, artifact, artifact_store_id=store_id
+                ),
+                redact=lambda value: _redact_control_plane_json(cayu_app, value, "artifact search"),
+                filters=filters,
+                q=q,
+                order_by=order_by,
+                offset=offset,
+                limit=limit,
+            )
 
         artifacts: list[dict[str, Any]] = []
         total_count: int | None = 0
@@ -7244,6 +7278,13 @@ def create_router(
 
         artifacts.sort(key=_artifact_sort_key, reverse=True)
         page_artifacts = artifacts[offset : offset + limit]
+        titles = await read_titles(
+            session_store,
+            tuple(dict.fromkeys(row["session_id"] for row in page_artifacts if row["session_id"])),
+            lambda value: _redact_control_plane_json(cayu_app, value, "session title"),
+        )
+        for row in page_artifacts:
+            row["session_title"] = titles.get(row["session_id"])
         next_offset = None
         has_more = False
         if total_count is None:

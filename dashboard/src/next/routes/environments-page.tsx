@@ -9,7 +9,8 @@ import { useParams, useSearch } from "@tanstack/react-router"
 import { Box, ChevronRight, RefreshCw } from "lucide-react"
 import type { ReactNode } from "react"
 import { Button } from "@/components/ui/button"
-import { type EnvironmentSummary, fetchArtifacts } from "@/lib/api"
+import type { EnvironmentSummary } from "@/lib/api"
+import { useArtifacts } from "@/lib/artifact-query"
 import { formatBytes, formatCount } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { overviewForDisplay } from "../api/overview"
@@ -382,11 +383,10 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
       }
     },
   })
-  const files = useQuery({
-    queryKey: ["environment-files", env.name],
-    enabled: artifactsEnabled && savesFiles(env),
-    queryFn: () => fetchArtifacts({ environment_name: env.name, limit: 5 }),
-  })
+  const files = useArtifacts(
+    { environment_name: env.name, limit: 5 },
+    artifactsEnabled && savesFiles(env),
+  )
   const workspace = workspaceText(env)
   const branches = branchDetails(env)
   const fileCount = files.data?.total_count
@@ -614,12 +614,15 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
             )
           )}
           {artifactsEnabled && files.error && <ErrorState error={files.error} />}
-          {artifactsEnabled && files.isSuccess && files.data.artifacts.length === 0 && (
-            <EmptyState title="No files yet">
-              Files that sessions here save show up here.
-            </EmptyState>
-          )}
-          {artifactsEnabled && files.isSuccess && files.data.artifacts.length > 0 && (
+          {artifactsEnabled &&
+            files.isSuccess &&
+            files.data &&
+            files.data.artifacts.length === 0 && (
+              <EmptyState title="No files yet">
+                Files that sessions here save show up here.
+              </EmptyState>
+            )}
+          {artifactsEnabled && files.isSuccess && files.data && files.data.artifacts.length > 0 && (
             <List>
               {files.data.artifacts.map((artifact) => {
                 const kind = kindOf(artifact)
