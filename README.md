@@ -19,7 +19,7 @@ for approvals, timers, retries and recovery. `cayu guide --help` lists every top
 | Spend caps | `BudgetLimit` per request and `BudgetPolicy` per app (`cayu.budgets`), checked before each model call |
 | Timers and background work | `TaskStore` workers and `TaskSchedulePolicy` for scheduled follow-ups (`cayu.tasks`) |
 | Multi-agent collaboration | `SubagentTool` (`cayu.tools`), forks, and participants with durable requests (`cayu.collaboration`) |
-| Claude Code or Codex runs | `run_external_agent` with `ClaudeAgentAdapter` or `CodexAgentAdapter` (`cayu.external_agents`, extras `cayu[claude-agent-sdk]` and `cayu[codex]`) and a launcher such as `local_agent_launch`, recorded as sessions with usage and deadlines; see `cayu guide external-agents` |
+| Claude Code or Codex runs | `run_external_agent` with `ClaudeAgentAdapter` or `CodexAgentAdapter` (`cayu.external_agents`, extras `cayu[claude-agent-sdk]` and `cayu[codex]`) and a launcher: `linux_agent_launch` (Docker-free Linux confinement with Landlock ABI 6 and seccomp), `local_agent_launch` (no sandbox), or `docker_agent_launch`, recorded as sessions with usage and deadlines; see `cayu guide external-agents` |
 
 Cayu is Python only and is not a graph DSL: agents, tools and workflows are
 ordinary Python. It is not only a hosted service: run it on your own

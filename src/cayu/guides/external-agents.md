@@ -1,5 +1,6 @@
 # External agents: Claude Code and Codex as Cayu sessions
 
+<!-- cayu-guide-discovery: {"names": ["linux_agent_launch", "local_agent_launch", "docker_agent_launch"], "readme_row": "Claude Code or Codex runs", "authoring_row": "Run Claude Code or Codex as a whole agent, visible in Cayu", "reference": "external-agents"} -->
 Use this guide when you want to run a vendor's whole coding agent, such as
 Claude Code or Codex, and still see each run in Cayu. Every run becomes a Cayu
 session and task. Its token usage and estimated cost are recorded like any other
@@ -421,7 +422,8 @@ A launcher starts the vendor CLI for one run and stops it again. It is an async
 context manager that takes the run's `ExternalAgentContext` and yields an
 `ExternalAgentLaunch`. Pass it to either adapter as `launch=`.
 
-Cayu ships `local_agent_launch`, `docker_agent_launch` and `runner_agent_launch`.
+Cayu ships `linux_agent_launch`, `local_agent_launch`, `docker_agent_launch` and
+`runner_agent_launch`.
 The local launcher runs the CLI on the host without a sandbox, as in the
 [quick start](#quick-start-without-docker-or-a-gateway). The Docker launcher
 starts one container per run on an existing `--internal` network (it refuses

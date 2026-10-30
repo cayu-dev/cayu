@@ -43,7 +43,9 @@ CAYU_CAPABILITIES = (
         "Claude Code or Codex runs",
         "`run_external_agent` with `ClaudeAgentAdapter` or `CodexAgentAdapter` "
         "(`cayu.external_agents`, extras `cayu[claude-agent-sdk]` and `cayu[codex]`) "
-        "and a launcher such as `local_agent_launch`, recorded as sessions with usage "
+        "and a launcher: `linux_agent_launch` (Docker-free Linux confinement with Landlock ABI 6 "
+        "and seccomp), `local_agent_launch` (no sandbox), or `docker_agent_launch`, "
+        "recorded as sessions with usage "
         "and deadlines; see `cayu guide external-agents`",
     ),
 )

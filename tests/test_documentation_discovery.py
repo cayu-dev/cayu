@@ -114,3 +114,47 @@ def test_cayu_version_pin_pattern_matches_install_commands() -> None:
         assert _CAYU_VERSION_PIN.search(pinned), pinned
     for unpinned in ("pip install cayu", "uvx cayu new", "install `cayu==X.Y.Z`", "mycayu==1"):
         assert _CAYU_VERSION_PIN.search(unpinned) is None, unpinned
+
+
+def test_guides_keep_their_declared_discovery_names_in_short_entry_points() -> None:
+    """Guides own the names readers must see before opening the full guide.
+
+    Add a cayu-guide-discovery JSON comment to any guide, naming its README row,
+    authoring-map row, reference section and essential public API names. Keep the
+    declaration with the guide so new names extend this check without test edits.
+    """
+    import json
+
+    guides = ROOT / "src/cayu/guides"
+    readme = (ROOT / "README.md").read_text()
+    authoring = (guides / "authoring.md").read_text()
+    references = (guides / "references.md").read_text()
+    declared = []
+    for path in sorted(guides.glob("*.md")):
+        source = path.read_text()
+        markers = re.findall(r"<!-- cayu-guide-discovery: (.*?) -->", source)
+        assert source.count("<!-- cayu-guide-discovery:") == len(markers), path
+        for marker in markers:
+            contract = json.loads(marker)
+            assert set(contract) == {"names", "readme_row", "authoring_row", "reference"}, path
+            names = contract["names"]
+            assert names and len(set(names)) == len(names), path
+            entry_points = {}
+            for label, text, row in (
+                ("README", readme, contract["readme_row"]),
+                ("authoring map", authoring, contract["authoring_row"]),
+            ):
+                rows = [line for line in text.splitlines() if line.startswith(f"| {row} |")]
+                assert len(rows) == 1, (path, label, row)
+                entry_points[label] = rows[0]
+            heading = f"## {contract['reference']}\n"
+            assert references.count(heading) == 1, (path, heading)
+            entry_points["references"] = references.split(heading, 1)[1].split("\n## ", 1)[0]
+            guide_body = re.sub(r"<!--.*?-->", "", source, flags=re.S)
+            for name in names:
+                assert re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name), (path, name)
+                assert f"`{name}`" in guide_body, (path, name)
+                for label, text in entry_points.items():
+                    assert f"`{name}`" in text, f"{path.name}: {label} omits {name}"
+            declared.append(path.stem)
+    assert "external-agents" in declared

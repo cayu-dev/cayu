@@ -330,9 +330,10 @@ background behavior rather than treating delegation as an in-process function.
 To run a vendor's whole agent, such as Claude Code or Codex, as a Cayu session
 with recorded tokens and cost, a deadline, a USD cap and secret scrubbing,
 install `cayu[claude-agent-sdk]` or `cayu[codex]` and run
-`cayu guide external-agents`. Docker and the credential gateway are optional:
-`local_agent_launch` runs the CLI on the host, without a sandbox, for trusted
-code and tests.
+`cayu guide external-agents`. Choose `linux_agent_launch` for Docker-free Linux
+confinement with Landlock ABI 6 and seccomp, `local_agent_launch` for trusted
+code and tests without a sandbox, or `docker_agent_launch` for a container.
+The credential gateway is optional.
 
 ## evals
 
