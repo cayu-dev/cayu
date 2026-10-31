@@ -551,8 +551,14 @@ def test_wait_follows_a_retry_series_and_stops_at_the_wait_limit(
 
 
 def test_wait_sees_a_worker_finish_the_task_in_the_local_store(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The worker completes the task through its own connection right after the wait reads
+    it claimed, so the wait's next read must see that write. Tying the completion to the
+    read, not to a clock, keeps a slow CLI start from letting the worker finish first."""
+
+    from cayu.cli._task_readers import StoreTaskReader
+
     path = tmp_path / "cayu.db"
 
     async def claim() -> Any:
@@ -566,7 +572,6 @@ def test_wait_sees_a_worker_finish_the_task_in_the_local_store(
     claimed = asyncio.run(claim())
 
     async def complete() -> None:
-        await asyncio.sleep(0.3)
         store = SQLiteTaskStore(path)
         try:
             await store.complete_task(
@@ -578,16 +583,22 @@ def test_wait_sees_a_worker_finish_the_task_in_the_local_store(
         finally:
             await store.close()
 
-    worker = threading.Thread(target=lambda: asyncio.run(complete()))
-    worker.start()
-    try:
-        code, shown, err = _wait(capsys, "live", "--sqlite", str(path), "--wait-seconds", "30")
-    finally:
-        worker.join()
+    read_task = StoreTaskReader.load_task
+
+    async def read_then_finish(reader: StoreTaskReader, task_id: str) -> dict[str, Any] | None:
+        task = await read_task(reader, task_id)
+        if task is not None and task["status"] == "claimed":
+            await complete()
+        return task
+
+    monkeypatch.setattr(StoreTaskReader, "load_task", read_then_finish)
+
+    code, shown, err = _wait(capsys, "live", "--sqlite", str(path), "--wait-seconds", "30")
 
     assert code == 0
     assert shown["task"]["result"] == {"findings": 1}
-    assert "Task live is claimed." in err and "Task live is completed." in err
+    assert shown["wait"] == {"task_id": "live", "outcome": "completed"}
+    assert err.splitlines() == ["Task live is claimed.", "Task live is completed."]
 
 
 def test_application_wait_reads_through_until_the_task_ends(
