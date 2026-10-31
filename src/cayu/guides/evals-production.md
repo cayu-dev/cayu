@@ -78,6 +78,29 @@ away or previewing different evidence requires explicitly abandoning its recover
 once the request is no longer pending. Abandoning is not cancellation, and the
 original work may already be running. Reloading cannot restore private evidence.
 
+From a terminal or a coding agent, `cayu eval capture` does the same through the same server
+API; add `--application NAME` for a Cayu Cloud Agent's session:
+
+```console
+cayu eval capture preview SESSION_ID
+cayu eval capture save SESSION_ID --expected-candidate-revision REV
+cayu eval baseline approve --result RESULT_REVISION
+cayu eval capture run SESSION_ID --expected-candidate-revision REV
+```
+
+`capture preview` is **Preview score**: it returns the retained `evidence` (in `candidate`),
+the suite and case the capture proposes, their `captured_score` over that evidence, and
+whether the session can run afresh (`runnable_conversion`). `--suite-id`, `--suite-name`,
+`--case-id`, `--case-name` and `--assertion JSON` (repeatable, in the corpus assertion format,
+in place of the proposed checks) edit them as the details do. The preview prints
+`commands.save` and, for a runnable session, `commands.run`, both for that exact candidate.
+`capture save` is **Save evaluation** and prints `commands.baseline`, which is **Approve
+baseline**. `capture run` is **Run on current app**, with `--trials`, `--max-concurrency`,
+`--trial-timeout-seconds`, `--max-steps`, the per-trial limits and `--max-cost`; after a lost
+response its `commands.continue` repeats that launch and answers with the run it admitted. A
+deploy changes the captured evaluation, so after one the continuation lists the runs instead
+of repeating the launch.
+
 ## Build a controlled multi-stage scenario
 
 Use **Production scenario** from a captured session, or choose **Multi-stage

@@ -66,7 +66,7 @@ from cayu.cli._cloud_settings import _cell, _table
 from cayu.cli._output import output_destination
 
 COMMANDS = frozenset(
-    {"targets", "suites", "runs", "add-session", "baseline", "calibrate", "scenario"}
+    {"targets", "suites", "runs", "add-session", "capture", "baseline", "calibrate", "scenario"}
 )
 # The `source` of a suite view whose runs are external eval reports (`EvalReportedSuiteView`).
 _REPORTED = "reported"
@@ -295,14 +295,19 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
     baseline_actions = baseline.add_subparsers(dest="eval_baseline_command", required=True)
     approve = baseline_actions.add_parser(
         "approve",
-        help="Approve a completed run's result as its suite's baseline.",
+        help="Approve a completed run's result, or a saved result, as its suite's baseline.",
         description=(
-            "Approve a completed run's result as the baseline later runs of its suite are "
-            "compared with, over the baseline's current generation. A run of an authored suite "
-            "is one execution group, and the baseline is that group's."
+            "Approve a completed run's result, or with --result a saved result such as a "
+            "captured evaluation, as the baseline later runs of its suite are compared with, "
+            "over the baseline's current generation. A run of an authored suite is one "
+            "execution group, and the baseline is that group's."
         ),
     )
-    approve.add_argument("run_id", metavar="RUN_ID")
+    from cayu.cli._eval_captures import add_result_baseline_option
+
+    subject = approve.add_mutually_exclusive_group(required=True)
+    subject.add_argument("run_id", metavar="RUN_ID", nargs="?")
+    add_result_baseline_option(subject)
     approve.add_argument(
         "--expected-generation",
         type=_generation,
@@ -321,7 +326,7 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
             "continuation command."
         ),
     )
-    _add_target_options(approve, render_baseline)
+    _add_target_options(approve, render_approval)
 
     from cayu.cli._eval_calibration import (
         CALIBRATION_TIMEOUT_SECONDS,
@@ -334,6 +339,10 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
     _add_target_options(calibrate, render_calibration)
     calibrate.set_defaults(timeout_seconds=CALIBRATION_TIMEOUT_SECONDS)
     for parser, render in add_scenario_parser(commands):
+        _add_target_options(parser, render)
+    from cayu.cli._eval_captures import add_capture_parser
+
+    for parser, render in add_capture_parser(commands):
         _add_target_options(parser, render)
 
 
@@ -434,11 +443,18 @@ def _same_file(first: Path, second: Path) -> bool:
 
 def _execute(args: argparse.Namespace) -> dict[str, Any]:
     from cayu.cli import _eval_calibration as calibration
+    from cayu.cli import _eval_captures as captures
     from cayu.cli import _eval_scenarios as scenarios
     from cayu.cli import _eval_suite_authoring as authoring
 
     action = args.eval_command
     suite_draft = authoring.check_suite_options(args) if action == "suites" else None
+    if action == "capture":
+        captures.check_capture_options(args)
+    elif action == "baseline":
+        from cayu.cli._cloud_evals import _check_baseline_options
+
+        _check_baseline_options(args)
     # Options and input files are checked before any request.
     if action == "add-session":
         _check_addition_options(args)
@@ -473,12 +489,18 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         elif action == "add-session":
             result = _add_session(api, args, target=target)
             operation = "eval.add-session"
+        elif action == "capture":
+            result = captures.run_capture_command(api, args, target=target)
+            operation = f"eval.capture.{args.eval_capture_command}"
         elif action == "calibrate":
             result = calibration.calibrate(api, args, calibration_inputs, target=target)
             operation = "eval.calibrate"
         elif action == "scenario":
             result = scenarios.run_scenario_command(api, args, scenario_draft, target=target)
             operation = f"eval.scenario.{args.eval_scenario_command}"
+        elif action == "baseline" and args.result is not None:
+            result = captures.approve_result_baseline(api, args, target=target)
+            operation = "eval.baseline"
         else:
             result = _approve_baseline(
                 api, args, command=["cayu", "eval", "baseline", "approve", args.run_id, *target]
@@ -920,6 +942,25 @@ def _baseline_text(suite: Mapping[str, Any]) -> str:
     if not isinstance(baseline, dict):
         return "none"
     return f"generation {_text(baseline.get('generation'))}"
+
+
+def render_approval(answer: Mapping[str, Any]) -> str:
+    """`baseline approve`'s text: a run's, as `cayu cloud eval baseline` prints it, or a saved
+    result's."""
+
+    result = answer["result"]
+    if "run" in result:
+        return render_baseline(answer)
+    record, baseline = result["record"], result["baseline"]
+    subject = f"Result {_text(record['revision'])}"
+    suite = _text(record.get("suite_id"))
+    if not result["changed"]:
+        return (
+            f"{subject} was already the baseline of suite {suite} "
+            f"(generation {_text(baseline.get('generation'))})."
+        )
+    applied = result["mutation"].get("resulting_generation")
+    return f"{subject} is now the baseline of suite {suite} (generation {_text(applied)})."
 
 
 def render_addition(answer: Mapping[str, Any]) -> str:

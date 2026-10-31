@@ -1037,28 +1037,65 @@ def _approve_baseline(
 ) -> dict[str, Any]:
     """Approve the run's result as its suite's baseline, CAS-bound to one generation.
 
-    Without ``--expected-generation`` the decision is made over the current baseline under a
-    fresh operation ID. With it (a continuation), both are sent as given, so the Agent replays
-    a decision it already applied and refuses one the baseline has moved past. ``command`` is
-    the command that approved the run; its continuation adds the decision's two options.
+    ``command`` is the command that approved the run; its continuation adds the decision's two
+    options (`_decide_baseline`).
     """
 
     run_id = arguments.run_id
+    _check_baseline_options(arguments)
+    run, revision, current = _run_result(api, run_id)
+    decided = _decide_baseline(
+        api,
+        arguments,
+        revision=revision,
+        current=current,
+        current_baseline=lambda: _run_result(api, run_id)[2],
+        subject=f"eval run {run_id}",
+        suite_id=run["suite_id"],
+        command=command,
+        details={"run_id": run_id},
+    )
+    return {"run": run, **decided}
+
+
+def _check_baseline_options(arguments: argparse.Namespace) -> None:
     if arguments.operation_id is not None and arguments.expected_generation is None:
         raise CloudEvalError(
             "invalid_input",
             "--operation-id repeats an earlier approval; pass it with that approval's "
             "--expected-generation.",
         )
-    run, revision, current = _run_result(api, run_id)
+
+
+def _decide_baseline(
+    api: CayuApi,
+    arguments: argparse.Namespace,
+    *,
+    revision: str,
+    current: Mapping[str, Any] | None,
+    current_baseline: Callable[[], Mapping[str, Any] | None],
+    subject: str,
+    suite_id: object,
+    command: Sequence[str],
+    details: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Approve result ``revision`` as its suite's baseline, over ``current``'s generation.
+
+    Without ``--expected-generation`` the decision is made over the current baseline under a
+    fresh operation ID. With it (a continuation), both are sent as given, so the Agent replays
+    a decision it already applied and refuses one the baseline has moved past, which
+    ``current_baseline`` reads again to tell apart. ``subject`` names what is approved in
+    messages, and ``details`` identify it in errors.
+    """
+
     if arguments.expected_generation is None:
         if current is not None and current.get("result_revision") == revision:
-            return {"run": run, "baseline": current, "changed": False}
+            return {"baseline": current, "changed": False}
         generation = _baseline_generation(current)
     else:
         generation = arguments.expected_generation
     operation_id = arguments.operation_id or "sha256:" + secrets.token_hex(32)
-    decision = {"run_id": run_id, "operation_id": operation_id, "expected_generation": generation}
+    decision = {**details, "operation_id": operation_id, "expected_generation": generation}
     continuation = [
         *command,
         *("--operation-id", operation_id, "--expected-generation", str(generation)),
@@ -1078,21 +1115,20 @@ def _approve_baseline(
         if exc.category == "outcome_unknown":
             raise CloudEvalError(
                 "outcome_unknown",
-                f"The Agent did not confirm approving eval run {run_id} as the baseline; it "
-                f"may have. `{commands['continue']}` repeats this decision rather than making "
-                "another.",
+                f"The Agent did not confirm approving {subject} as the baseline; it may have. "
+                f"`{commands['continue']}` repeats this decision rather than making another.",
                 status_code=exc.status_code,
                 details={**decision, "commands": commands},
             ) from None
         if exc.status_code == 409:
-            moved = _run_result(api, run_id)[2]
+            moved = current_baseline()
             if _baseline_generation(moved) != generation:
                 raise CloudEvalError(
                     "eval_baseline_conflict",
-                    f"The baseline of suite {run['suite_id']} moved to generation "
+                    f"The baseline of suite {suite_id} moved to generation "
                     f"{_baseline_generation(moved)} after this approval was decided over "
-                    f"generation {generation}, so it was not applied. Approve run {run_id} "
-                    "again without --expected-generation to decide over the current baseline.",
+                    f"generation {generation}, so it was not applied. Approve {subject} again "
+                    "without --expected-generation to decide over the current baseline.",
                     status_code=exc.status_code,
                     details={**decision, "baseline": moved},
                 ) from None
@@ -1107,7 +1143,7 @@ def _approve_baseline(
     ):
         raise CloudEvalError("api_response_invalid", "The Agent did not confirm the baseline.")
     # A replayed decision answers the mutation it applied and the baseline as it is now.
-    return {**decision, "run": run, "baseline": baseline, "mutation": mutation, "changed": True}
+    return {**decision, "baseline": baseline, "mutation": mutation, "changed": True}
 
 
 def _run_result(api: CayuApi, run_id: str) -> tuple[dict[str, Any], str, dict[str, Any] | None]:

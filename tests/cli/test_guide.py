@@ -167,6 +167,9 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "Settings → Production scenarios" in production
     assert "cayu eval scenario check --session SESSION_ID" in production
     assert "cayu eval scenario run --scenario REVISION" in production
+    assert "cayu eval capture preview SESSION_ID" in production
+    assert "cayu eval capture run SESSION_ID --expected-candidate-revision REV" in production
+    assert "cayu eval baseline approve --result RESULT_REVISION" in production
     assert "cayu eval scenario prepare-fixture REQUIREMENT_ID --session SESSION_ID" in production
     assert "cayu eval scenario approve RUN_ID --event CHECKPOINT_ID" in production
     assert "cayu eval runs cancel RUN_ID" in production

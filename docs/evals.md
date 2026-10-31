@@ -4127,6 +4127,10 @@ cayu eval scenario approve RUN_ID --event CHECKPOINT_ID
 | **Download JSON** and **Download HTML** on a run | `cayu eval runs report RUN_ID --json-output FILE [--html-output FILE]` | `GET /api/evals/runs/{run_id}/report.json` |
 | **Add to evals** on a session | `cayu eval add-session SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/additions/preview`, then `POST /api/evals/sessions/{session_id}/additions` |
 | **Approve as baseline** on a run | `cayu eval baseline approve RUN_ID` | `GET /api/evals/runs/{run_id}/result`, then `POST /api/evals/results/{result_revision}/baseline` |
+| A session's captured evaluation details: **Preview score** | `cayu eval capture preview SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/evaluation/preview` |
+| **Save evaluation** | `cayu eval capture save SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/evaluation/preview`, then `POST /api/evals/sessions/{session_id}/evaluation/save` |
+| **Approve baseline** of a saved captured evaluation | `cayu eval baseline approve --result REVISION` | `GET /api/evals/results/{result_revision}`, then `POST /api/evals/results/{result_revision}/baseline` |
+| **Run on current app** | `cayu eval capture run SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/evaluation/preview` and `GET /api/evals/targets`, then `POST /api/evals/sessions/{session_id}/evaluation/launch` |
 | **Judges and calibration**: **Check calibration**, **Run calibration** | `cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID ...` | `GET /api/evals/suite-views/{suite_key}` and the suite's `GET /api/evals/suites/{suite_revision}` or `GET /api/evals/corpora/{corpus_revision}`, then `POST /api/evals/judge-calibrations/preview` and `POST /api/evals/judge-calibrations` |
 | **Production scenarios** library | `cayu eval scenario list`, `cayu eval scenario show REVISION` | `GET /api/evals/scenarios`, `GET /api/evals/scenarios/{scenario_revision}` |
 | **Check readiness** and **Save** | `cayu eval scenario check ... [--save]` | `POST /api/evals/scenarios/preview`, and `POST /api/evals/scenarios` |
@@ -4256,6 +4260,36 @@ the earlier run stopped before storing its report. A calibration answers once it
 finish, so its `--timeout-seconds` defaults to `600`. Calibration never runs the candidate
 agent, its tools or its sessions. The two files are the calibration's draft, which the
 workbench keeps only in its open tab.
+
+`capture` is a session's [captured evaluation details](#click-to-evaluate-captured-sessions).
+`capture preview SESSION_ID` is **Preview score**: it returns the capture's `baseline_revision`,
+the `candidate` (the retained `evidence`, the suite and case, and their checks), its
+`captured_score` over that evidence, and whether the session can run afresh
+(`runnable_conversion`) or as a scenario (`scenario_conversion`). Without options the candidate
+is the one the capture proposes; `--suite-id`, `--suite-name`, `--case-id`, `--case-name` and
+`--assertion JSON` (repeatable, in the corpus assertion format, in place of the proposed
+checks) edit its draft, as the details do. Nothing runs or is saved. The preview prints
+`commands.save` and, for a runnable session, `commands.run`, which repeat the options with
+`--expected-candidate-revision REV`: when the session's evidence or the options no longer give
+that candidate, they fail with `capture_changed` and do nothing. `capture save` is **Save
+evaluation**: it records the captured result (`record`) and its suite's `suite` id, and
+prints `commands.baseline` and `commands.show`; a result is its content, so saving it again
+changes nothing. `baseline approve --result REVISION` approves a saved result, such as that
+one, as its suite's baseline, with the same decision, continuation and
+`eval_baseline_conflict` as `baseline approve RUN_ID`. `capture run` is **Run on current
+app**: it runs the session's input afresh on the current release with the candidate's checks,
+under an operation ID, with `--trials`, `--max-concurrency`, `--trial-timeout-seconds` (default
+`300`), `--max-steps`, the per-trial limits `--max-total-tokens`, `--max-tool-calls` and
+`--max-elapsed-seconds`, and `--max-cost AMOUNT [--currency CODE]`. It returns the captured
+`record` and the admitted `run`, with `commands.show`. Its `commands.continue` repeats that
+admission with `--operation-id ID --expected-candidate-revision REV
+--expected-execution-profile-revision REV`, so it answers with the run the key admitted while
+the session's captured evaluation is unchanged. The candidate records the release it is
+evaluated on, so a deploy changes it too, and the server checks it before it replays a launch:
+a continue command whose candidate changed fails with `capture_changed` and `commands.list`,
+since whether its key admitted a run is then unknown. A session that can't run afresh fails
+with `capture_not_runnable`, an operation ID that admitted another run with
+`operation_id_conflict`, and a lost answer with `outcome_unknown` and `commands.continue`.
 
 `scenario` is the [production scenario editor](#portable-multi-stage-scenarios). `check` and
 `run` take the scenario from `--file FILE` (a revision `scenario show` printed, as
