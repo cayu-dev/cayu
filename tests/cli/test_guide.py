@@ -175,6 +175,8 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "cayu eval runs cancel RUN_ID" in production
     assert "stay in the Developer dashboard" not in production
     assert "Settings → Memory reports" in production
+    assert "cayu eval corpora import evals.json" in production
+    assert "cayu eval corpora download REVISION --json-output evals.json" in production
 
 
 def test_objectives_guide_examples_parse_as_cloud_compass_reads_them(capsys) -> None:

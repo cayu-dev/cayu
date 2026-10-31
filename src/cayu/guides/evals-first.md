@@ -28,7 +28,8 @@ Evals lists your suites and their latest runs. Open **Settings** for readiness,
 **Memory reports**, and **Import / export**. Settings links reopen the selected
 tool; choose the specialist whose configuration or saved material you need.
 Fix a readiness diagnostic before running. The browser cannot create a missing
-provider, credential, tool, environment, policy, or store.
+provider, credential, tool, environment, policy, or store. `cayu guide evals-production`
+shows the terminal path for **Memory reports** and **Import / export**.
 
 From a terminal or a coding agent, the same server API lists the eval targets with their
 readiness, execution profile and judge profiles, as Settings shows them, and lists the suites

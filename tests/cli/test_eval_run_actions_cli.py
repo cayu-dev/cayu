@@ -501,6 +501,7 @@ def test_report_files_are_checked_before_any_request(
     context = tmp_path / "context.json"
     context.write_text("{}", encoding="utf-8")
     monkeypatch.setenv("CAYU_CLOUD_CONTEXT", str(context))
+    monkeypatch.setenv("CAYU_CLOUD_CONFIG", str(tmp_path / "cloud-config.json"))
     error = _refused(
         capsys, "runs", "report", "run-1", "--html-output", str(context), "--application", "a"
     )
@@ -509,6 +510,15 @@ def test_report_files_are_checked_before_any_request(
         "--html-output and the Cloud context name the same file.",
     )
     assert context.read_text(encoding="utf-8") == "{}"
+    # Nor the API key file it signs in with. (The key is a placeholder.)
+    key = tmp_path / "cloud.key"
+    key.write_text("placeholder", encoding="utf-8")
+    monkeypatch.setenv("CAYU_CLOUD_API_KEY_FILE", str(key))
+    error = _refused(
+        capsys, "runs", "report", "run-1", "--json-output", str(key), "--application", "a"
+    )
+    assert error["message"] == "--json-output and the Cloud API key file name the same file."
+    assert key.read_text(encoding="utf-8") == "placeholder"
 
 
 def test_refusals_the_cli_tells_apart_are_the_servers_own() -> None:

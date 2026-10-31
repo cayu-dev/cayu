@@ -4110,6 +4110,7 @@ cayu eval add-session SESSION_ID --suite SUITE --mode case --preview
 cayu eval baseline approve RUN_ID
 cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID \
   --evidence evidence.json --labels labels.json --preview
+cayu eval corpora import evals.json
 cayu eval scenario check --session SESSION_ID
 cayu eval scenario prepare-fixture REQUIREMENT_ID --session SESSION_ID
 cayu eval scenario run --scenario REVISION
@@ -4136,6 +4137,7 @@ cayu eval scenario approve RUN_ID --event CHECKPOINT_ID
 | **Approve baseline** of a saved captured evaluation | `cayu eval baseline approve --result REVISION` | `GET /api/evals/results/{result_revision}`, then `POST /api/evals/results/{result_revision}/baseline` |
 | **Run on current app** | `cayu eval capture run SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/evaluation/preview` and `GET /api/evals/targets`, then `POST /api/evals/sessions/{session_id}/evaluation/launch` |
 | **Judges and calibration**: **Check calibration**, **Run calibration** | `cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID ...` | `GET /api/evals/suite-views/{suite_key}` and the suite's `GET /api/evals/suites/{suite_revision}` or `GET /api/evals/corpora/{corpus_revision}`, then `POST /api/evals/judge-calibrations/preview` and `POST /api/evals/judge-calibrations` |
+| **Settings → Import / export**: import, saved corpora, **Download** | `cayu eval corpora import FILE`, `cayu eval corpora list`, `cayu eval corpora download REVISION --json-output FILE` | `POST /api/evals/corpora`, `GET /api/evals/corpora`, `GET /api/evals/corpora/{corpus_revision}/download` |
 | **Production scenarios** library | `cayu eval scenario list`, `cayu eval scenario show REVISION` | `GET /api/evals/scenarios`, `GET /api/evals/scenarios/{scenario_revision}` |
 | **Check readiness** and **Save** | `cayu eval scenario check ... [--save]` | `POST /api/evals/scenarios/preview`, and `POST /api/evals/scenarios` |
 | **Run scenario** | `cayu eval scenario run ...` | `POST /api/evals/scenarios/preview` and `POST /api/evals/scenarios`, then `POST /api/evals/scenarios/{scenario_revision}/runs` |
@@ -4150,6 +4152,16 @@ reach a Cayu Cloud Agent instead, signed in as `cayu cloud` is (`--context` sele
 context). Each prints a JSON envelope: `{"ok": true, "operation": ..., "result": ...}`, whose
 result names the server (`server_url`) or the Agent (`application_id`), or `{"ok": false,
 "error": {"category": ..., "message": ...}}` with exit code `2`. `--table` prints text.
+
+`corpora` is **Settings → Import / export**. `corpora import FILE` checks a portable corpus
+file locally, then imports it into the server's eval store, checked against the eval target it
+names, and returns its catalog `entry` and each suite's `id` with the `suites show` command
+that opens it; a revision is its content, so importing it again changes nothing. `corpora
+list` lists the default eval target's saved corpora, or `--target-key KEY`'s, newest first.
+`corpora download REVISION --json-output FILE` writes a saved revision as the server's
+**Download** serves it, the file `cayu eval validate` and `cayu eval run --corpus` read.
+**Settings → Memory reports** has no server command: `cayu eval memory-report REQUEST_JSON`
+builds the same report from the same request, without checking it against stored results.
 
 `suites list` lists authored and corpus suites, each with its opaque `id`, case count, latest
 run and baseline, and the reported series that `cayu eval run --report-to` publishes;

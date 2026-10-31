@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import shlex
 import sys
@@ -66,7 +67,17 @@ from cayu.cli._cloud_settings import _cell, _table
 from cayu.cli._output import output_destination
 
 COMMANDS = frozenset(
-    {"targets", "suites", "runs", "add-session", "capture", "baseline", "calibrate", "scenario"}
+    {
+        "targets",
+        "suites",
+        "runs",
+        "add-session",
+        "capture",
+        "baseline",
+        "calibrate",
+        "scenario",
+        "corpora",
+    }
 )
 # The `source` of a suite view whose runs are external eval reports (`EvalReportedSuiteView`).
 _REPORTED = "reported"
@@ -344,6 +355,10 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
 
     for parser, render in add_capture_parser(commands):
         _add_target_options(parser, render)
+    from cayu.cli._eval_corpora import add_corpus_parser
+
+    for parser, render in add_corpus_parser(commands):
+        _add_target_options(parser, render)
 
 
 def run_curation_command(args: argparse.Namespace) -> int:
@@ -398,7 +413,10 @@ def _output_collision(args: argparse.Namespace) -> str | None:
     written = _named_files(args, _WRITTEN_FILES)
     if args.output is not None:
         written.append(("--output", Path(args.output).expanduser()))
-    read = [*_named_files(args, _READ_FILES), *_cloud_context(args)]
+    if not written:
+        # Nothing is written, so nothing is read here either.
+        return None
+    read = [*_named_files(args, _READ_FILES), *_cloud_files(args)]
     for index, (option, path) in enumerate(written):
         for other, other_path in [*written[index + 1 :], *read]:
             if _same_file(path, other_path):
@@ -414,20 +432,48 @@ def _named_files(args: argparse.Namespace, names: Sequence[str]) -> list[tuple[s
     ]
 
 
-def _cloud_context(args: argparse.Namespace) -> list[tuple[str, Path]]:
-    """The Cloud context file an `--application` command signs in with, wherever it is
-    selected: `--context`, `CAYU_CLOUD_CONTEXT` or the active context."""
+def _cloud_files(args: argparse.Namespace) -> list[tuple[str, Path]]:
+    """The files an `--application` command may sign in to Cayu Cloud with: the active
+    selection, the context it selects (`--context`, `CAYU_CLOUD_CONTEXT` or the selection), the
+    API key file that context or `CAYU_CLOUD_API_KEY_FILE` names, and the saved login."""
 
     if getattr(args, "application", None) is None:
         return []
-    from cayu.cli.cloud import CloudCommandError, _selected_context_path
+    from cayu.cli._cloud_auth import _default_auth_path
+    from cayu.cli.cloud import (
+        CloudCommandError,
+        _active_config_path,
+        _context_file_path,
+        _read_context,
+        _selected_context_path,
+    )
 
+    files = [
+        ("the Cloud selection", _active_config_path()),
+        ("the Cloud login", _default_auth_path()),
+    ]
+    key_file = os.environ.get("CAYU_CLOUD_API_KEY_FILE")
+    if key_file:
+        files.append(("the Cloud API key file", Path(key_file).expanduser()))
     try:
-        path = _selected_context_path(getattr(args, "context", None))
+        context = _selected_context_path(getattr(args, "context", None))
+        if context is not None:
+            files.append(("the Cloud context", context))
+            if _rereadable(context):
+                named = _context_file_path(context, str(_read_context(context)["api_key_file"]))
+                files.append(("the Cloud API key file", named))
     except CloudCommandError:
         # No valid context is selected; signing in reports that.
-        return []
-    return [] if path is None else [("the Cloud context", path)]
+        pass
+    return files
+
+
+def _rereadable(path: Path) -> bool:
+    """Whether signing in can still read ``path`` after this check reads it: a regular file,
+    not a pipe or a descriptor (`/dev/stdin`) that one read drains."""
+
+    resolved = path.resolve()
+    return resolved.parts[1:2] not in {("dev",), ("proc",)} and resolved.is_file()
 
 
 def _same_file(first: Path, second: Path) -> bool:
@@ -444,6 +490,7 @@ def _same_file(first: Path, second: Path) -> bool:
 def _execute(args: argparse.Namespace) -> dict[str, Any]:
     from cayu.cli import _eval_calibration as calibration
     from cayu.cli import _eval_captures as captures
+    from cayu.cli import _eval_corpora as corpora
     from cayu.cli import _eval_scenarios as scenarios
     from cayu.cli import _eval_suite_authoring as authoring
 
@@ -455,6 +502,7 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         from cayu.cli._cloud_evals import _check_baseline_options
 
         _check_baseline_options(args)
+    corpus = corpora.read_corpus_file(args) if action == "corpora" else None
     # Options and input files are checked before any request.
     if action == "add-session":
         _check_addition_options(args)
@@ -498,6 +546,9 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         elif action == "scenario":
             result = scenarios.run_scenario_command(api, args, scenario_draft, target=target)
             operation = f"eval.scenario.{args.eval_scenario_command}"
+        elif action == "corpora":
+            result = corpora.run_corpus_command(api, args, corpus, target=target)
+            operation = f"eval.corpora.{args.eval_corpora_command}"
         elif action == "baseline" and args.result is not None:
             result = captures.approve_result_baseline(api, args, target=target)
             operation = "eval.baseline"

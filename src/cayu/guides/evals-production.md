@@ -230,6 +230,17 @@ it does not launch a memory campaign or fill in missing trial evidence.
 8 MiB) and lists saved corpora for the selected specialist. **Download** exports
 the exact stored revision, without running trials.
 
+From a terminal, the same server API imports, lists and downloads corpora; add `--application
+NAME` for a Cayu Cloud Agent. `cayu eval memory-report` builds the memory report from the same
+request without a server, so it doesn't check the request against stored results:
+
+```console
+cayu eval corpora import evals.json
+cayu eval corpora list
+cayu eval corpora download REVISION --json-output evals.json
+cayu eval memory-report request.json --format html --output memory-report.html
+```
+
 Session-scoped memory aliases are diagnostic labels, not stable case identity
 across fresh runs. Results retain bounded source/lifecycle evidence and safe
 immutable references, never raw private memory identity or content.
