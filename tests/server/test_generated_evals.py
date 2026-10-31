@@ -227,7 +227,9 @@ def test_project_context_generates_multi_agent_targets_and_keeps_all_work_target
         assert beta_runs.status_code == 200
         assert [item["spec"]["run_id"] for item in beta_runs.json()["items"]] == [run_ids["beta"]]
 
-        foreign_record = asyncio.run(store.load_run(foreign_run.run_id))
+        # The server's eval worker polls this store on the server's event loop, so it is
+        # read there.
+        foreign_record = client.portal.call(store.load_run, foreign_run.run_id)
         assert foreign_record is not None
         assert foreign_record.status is EvalRunStatus.QUEUED
         assert foreign_record.ownership is None

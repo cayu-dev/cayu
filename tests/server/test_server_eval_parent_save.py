@@ -317,8 +317,6 @@ def test_parent_save_cancellation_keeps_writer_fenced_until_real_dispatch_settle
 def test_memory_parent_save_uses_positive_publication_and_restores_partial_mutation(
     addition_environment, monkeypatch
 ):
-    import asyncio
-
     from cayu.evals.store import EvalAuthoredSuiteConflict, InMemoryEvalStore
     from cayu.storage.evals_sqlite import SQLiteEvalStore
 
@@ -384,7 +382,9 @@ def test_memory_parent_save_uses_positive_publication_and_restores_partial_mutat
             )
             assert await imported.load_case_addition(selector, case_id) is None
 
-        asyncio.run(exercise())
+        # The durable store belongs to the server's event loop, where its eval run
+        # coordinator polls it, so the exercise runs there.
+        client.portal.call(exercise)
 
 
 @pytest.mark.parametrize("cancel_owner", [False, True])
@@ -486,12 +486,18 @@ def test_parent_save_failed_rollback_fences_writer_and_restart_recovers_exactly(
                         pytest.fail("failed publication cannot return success")
                     assert isinstance(propagated, BaseExceptionGroup)
                     assert list(propagated.exceptions) == [primary, rollback_error]
-                    assert faulted.closed and not store._lock.locked()
+                    assert faulted.closed
+                    # The server's eval run coordinator takes this lock on its own schedule,
+                    # so it may hold it right now; a lock the failed publication leaked would
+                    # never come free.
+                    await asyncio.wait_for(store._lock.acquire(), timeout=10)
+                    store._lock.release()
                 finally:
                     release.set()
                     await asyncio.gather(owner, return_exceptions=True)
 
-        asyncio.run(exercise())
+        # Run on the server's event loop: its eval run coordinator shares this store's lock.
+        client.portal.call(exercise)
         failed = TestClient(server, raise_server_exceptions=False)
         assert _save(failed, child, parent).status_code == 500
 
