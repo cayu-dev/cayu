@@ -2290,6 +2290,10 @@ The same suite/assertion surface supports several modes:
   budget is checked and recorded as in production. The session keeps the provider name
   `scripted`, and each estimate's billing evidence records
   `pricing_basis="scripted_test_estimate"`. A real route without a price still fails closed.
+  Each scripted completion must then report usage, for example
+  `ModelStreamEvent.completed({"usage": {"input_tokens": 1000, "output_tokens": 100}})`:
+  a model step without usage can't be priced, so the budget stops the trial with
+  `1 model step(s) have missing or invalid completion usage`.
   The same route gives a hermetic run a priced [run cost](#run-cost) when it is run with a
   `price_book`.
 - **Integration** — run against real providers, tools, runners, and environments to check whether

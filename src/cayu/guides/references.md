@@ -369,7 +369,9 @@ dated public prices shipped with your Cayu release, each with a source URL and
 `as_of` date. To change one price, pass
 `pricing=default_price_book().with_prices(ModelPrice.fixed(...))`, or pass your
 own `PriceBook`. A model the book does not price is refused before dispatch
-unless `allow_unpriced=True`. Other scopes: `"run"`, `"agent"` (key = agent name), `"causal"` (key = causal budget id, which
+unless `allow_unpriced=True`; a model call that completes without usage can't be
+priced either, so the cap stops the session after it. The stop message names
+which cause applies. Other scopes: `"run"`, `"agent"` (key = agent name), `"causal"` (key = causal budget id, which
 defaults to the root session id and is shared by its subagents) and `"app"`;
 the last three can also go in `CayuApp(budget_policy=BudgetPolicy(limits=...))`.
 `window=BudgetWindow.rolling(seconds=3600)` or

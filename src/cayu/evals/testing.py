@@ -266,7 +266,9 @@ class ScriptedModelProvider(ModelProvider):
     (for example ``"openai"`` with model ``"gpt-5.6-luna"``), and its usage dialect as
     `usage_dialect`, to estimate the scripted usage at that provider's rates, as the
     budget does in production. The session keeps this provider's own name, and its
-    billing evidence records ``pricing_basis="scripted_test_estimate"``.
+    billing evidence records ``pricing_basis="scripted_test_estimate"``. Each scripted
+    completion must then report usage: a model step without it can't be priced, so
+    the budget stops the run, saying the step has missing completion usage.
     """
 
     name = "scripted"

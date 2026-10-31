@@ -10965,10 +10965,14 @@ creating a start event, or executing the skipped effect.
 Budget limits are estimates, not billing records. They use normalized usage
 metrics and the app's pricing table. By default, a request-scoped interrupt
 budget fails closed when a newly observed model step has no matching pricing
-entry; Cayu interrupts instead of silently treating unknown usage as free. A
-request-scoped notify budget emits `budget.limit_reached` for the same
-unverifiable usage and continues. Apps that intentionally allow missing prices
-can set `allow_unpriced=True` for that request.
+entry or no valid completion usage; Cayu interrupts instead of silently treating
+unknown usage as free. The stop message counts the steps for each cause, for
+example `1 model step(s) have missing or invalid completion usage` for a provider
+or scripted route that reported no usage, or `1 model step(s) have no matching
+pricing` for a model the price book does not price. A request-scoped notify
+budget emits `budget.limit_reached` for the same unverifiable usage and
+continues. Apps that intentionally allow missing prices can set
+`allow_unpriced=True` for that request.
 
 Request `budget_limits` may use `scope="session"` or `scope="run"` for direct
 request budgets. They may also use `scope="agent"` or `scope="causal"` for
@@ -11031,7 +11035,9 @@ with `action="notify"` and continues. Apps can route those durable notify events
 to email, Slack, webhooks, or dashboards through trusted app/event-sink code.
 A resume under the same exhausted matching interrupt budget stops again until
 the app changes policy, raises the limit, fixes missing pricing, or opts into
-unpriced usage with `allow_unpriced=True`.
+unpriced usage with `allow_unpriced=True`. Adding a price reprices recorded
+steps; a step recorded without usage stays unpriced, so only a policy change or
+`allow_unpriced=True` clears that stop.
 
 `SessionBudgetStore` is the default budget store. It reads from the same durable
 event stream already configured for sessions, including timestamp filters for

@@ -8,8 +8,13 @@ import pytest
 from tests.core._explicit_compaction_fixtures import _create_profiled_session
 
 from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest
-from cayu.budgets.base import BudgetLimit, budget_check_from_events, budget_check_from_totals
-from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost
+from cayu.budgets.base import (
+    BudgetLimit,
+    _unpriced_cost,
+    budget_check_from_events,
+    budget_check_from_totals,
+)
+from cayu.budgets.pricing import ModelPrice, PriceBook, SessionCostTotals, estimate_session_cost
 from cayu.context import CheckpointCompactionContextPolicy, ModelCompactor
 from cayu.context.base import ContextBuildError
 from cayu.providers import ModelProvider, ModelProviderError
@@ -209,3 +214,30 @@ def test_bounded_unpriced_categories(payload, prices, category, message):
     )
     assert check.limit_reached
     assert message in check.message
+
+
+def _unpriced_totals(*, missing_usage: int, missing_pricing: int) -> SessionCostTotals:
+    unpriced = missing_usage + missing_pricing
+    return SessionCostTotals(
+        session_id="usage",
+        currency="USD",
+        model_steps=unpriced,
+        priced_model_steps=0,
+        unpriced_model_steps=unpriced,
+        missing_usage_model_steps=missing_usage,
+        missing_pricing_model_steps=missing_pricing,
+        total_cost=Decimal(0),
+    )
+
+
+def test_a_run_scoped_count_names_only_the_causes_its_run_added():
+    before_run = _unpriced_totals(missing_usage=1, missing_pricing=0)
+    after_run = _unpriced_totals(missing_usage=1, missing_pricing=1)
+
+    assert _unpriced_cost(after_run).reasons() == (
+        "1 model step(s) have missing or invalid completion usage; "
+        "1 model step(s) have no matching pricing"
+    )
+    assert _unpriced_cost(after_run, since=before_run).reasons() == (
+        "1 model step(s) have no matching pricing"
+    )

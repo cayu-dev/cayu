@@ -3473,6 +3473,69 @@ def budget_check_from_events(
     )
 
 
+class _UnpricedCost(NamedTuple):
+    """Cost evidence a budget cannot verify, counted by cause."""
+
+    model_steps: int
+    missing_usage_model_steps: int
+    missing_pricing_model_steps: int
+    unsupported_pricing_model_steps: int
+    auxiliary_attempts: int
+
+    def any_unpriced(self) -> bool:
+        return self.model_steps + self.auxiliary_attempts > 0
+
+    def reasons(self) -> str:
+        """Name each cause with its count, so the fix it needs is clear."""
+
+        reasons = [
+            f"{count} model step(s) {description}"
+            for count, description in (
+                (self.missing_usage_model_steps, "have missing or invalid completion usage"),
+                (self.missing_pricing_model_steps, "have no matching pricing"),
+                (self.unsupported_pricing_model_steps, "have unsupported pricing inputs"),
+            )
+            if count
+        ]
+        # Totals recorded before the categories existed carry only the overall count.
+        uncategorized = self.model_steps - (
+            self.missing_usage_model_steps
+            + self.missing_pricing_model_steps
+            + self.unsupported_pricing_model_steps
+        )
+        if uncategorized > 0:
+            reasons.append(f"{uncategorized} model step(s) have unavailable cost evidence")
+        if self.auxiliary_attempts:
+            reasons.append(
+                f"{self.auxiliary_attempts} auxiliary attempt(s) have unavailable cost evidence"
+            )
+        return "; ".join(reasons)
+
+
+def _unpriced_cost(
+    summary: SessionCostTotals,
+    *,
+    since: SessionCostTotals | None = None,
+) -> _UnpricedCost:
+    """Count ``summary``'s unpriced evidence, less what ``since`` already held."""
+
+    def counts(totals: SessionCostTotals) -> _UnpricedCost:
+        return _UnpricedCost(
+            model_steps=totals.unpriced_model_steps,
+            missing_usage_model_steps=totals.missing_usage_model_steps,
+            missing_pricing_model_steps=totals.missing_pricing_model_steps,
+            unsupported_pricing_model_steps=totals.unsupported_pricing_model_steps,
+            auxiliary_attempts=totals.unpriced_auxiliary_attempts,
+        )
+
+    current = counts(summary)
+    if since is None:
+        return current
+    return _UnpricedCost(
+        *(max(count - before, 0) for count, before in zip(current, counts(since), strict=True))
+    )
+
+
 def budget_check_from_totals(
     *,
     limit: BudgetLimit,
@@ -3491,31 +3554,10 @@ def budget_check_from_totals(
         raise ValueError("Cost accounting currency does not match the budget limit.")
     summary.session_id = _budget_summary_id(limit)
     limit_reached = False
-    if (
-        summary.unpriced_model_steps + summary.unpriced_auxiliary_attempts
-    ) > 0 and not limit.allow_unpriced:
+    unpriced = _unpriced_cost(summary)
+    if unpriced.any_unpriced() and not limit.allow_unpriced:
         limit_reached = True
-        reasons = []
-        for count, description in (
-            (summary.missing_usage_model_steps, "have missing or invalid completion usage"),
-            (summary.missing_pricing_model_steps, "have no matching pricing"),
-            (summary.unsupported_pricing_model_steps, "have unsupported pricing inputs"),
-        ):
-            if count:
-                reasons.append(f"{count} model step(s) {description}")
-        unknown = summary.unpriced_model_steps - (
-            summary.missing_usage_model_steps
-            + summary.missing_pricing_model_steps
-            + summary.unsupported_pricing_model_steps
-        )
-        if unknown:
-            reasons.append(f"{unknown} model step(s) have unavailable cost evidence")
-        if summary.unpriced_auxiliary_attempts:
-            reasons.append(
-                f"{summary.unpriced_auxiliary_attempts} auxiliary attempt(s) have unavailable cost evidence"
-            )
-        message = "Budget cannot be verified because " + "; ".join(reasons) + "."
-
+        message = f"Budget cannot be verified because {unpriced.reasons()}."
     elif summary.total_cost >= limit.max_estimated_cost:
         limit_reached = True
         message = (

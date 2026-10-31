@@ -40,6 +40,9 @@ from cayu.sessions.requests import ResumeRequest, RunRequest
 # bundled book, so 500k input tokens cost exactly $1.00.
 _MODEL = "claude-sonnet-5"
 _ONE_DOLLAR_OF_INPUT = 500_000
+_UNPRICED_MODEL = "claude-unreleased"
+_MISSING_USAGE = "1 model step(s) have missing or invalid completion usage"
+_MISSING_PRICING = "1 model step(s) have no matching pricing"
 
 
 class _AnthropicFake(FakeProvider):
@@ -80,6 +83,30 @@ def _tool_call_step(call_id: str, input_tokens: int) -> list[ModelStreamEvent]:
                     "output_tokens": 0,
                     "total_tokens": input_tokens,
                 },
+            }
+        ),
+    ]
+
+
+def _step_without_usage(call_id: str) -> list[ModelStreamEvent]:
+    """A step whose provider, like a script without usage, reports no token counts."""
+
+    return [
+        ModelStreamEvent.tool_call(id=call_id, name="side_effect", arguments={}),
+        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+    ]
+
+
+def _step_on_an_unpriced_model(call_id: str) -> list[ModelStreamEvent]:
+    """A step the provider served with a model the price book has no entry for."""
+
+    return [
+        ModelStreamEvent.tool_call(id=call_id, name="side_effect", arguments={}),
+        ModelStreamEvent.completed(
+            {
+                "finish_reason": "tool_calls",
+                "model": _UNPRICED_MODEL,
+                "usage": {"input_tokens": 1_000, "output_tokens": 0, "total_tokens": 1_000},
             }
         ),
     ]
@@ -339,7 +366,7 @@ def test_one_line_cap_refuses_an_unpriced_model_before_dispatch() -> None:
         store = InMemorySessionStore()
         app = CayuApp(session_store=store)
         app.register_provider(provider, default=True)
-        app.register_agent(AgentSpec(name="assistant", model="claude-unreleased"))
+        app.register_agent(AgentSpec(name="assistant", model=_UNPRICED_MODEL))
         events = await collect_events(
             app,
             RunRequest(
@@ -361,3 +388,78 @@ def test_one_line_cap_refuses_an_unpriced_model_before_dispatch() -> None:
     ]
     assert "no matching pricing" in events[1].payload["message"]
     assert provider.requests == []
+
+
+@pytest.mark.parametrize(
+    ("step", "cause"),
+    [
+        pytest.param(_step_without_usage, _MISSING_USAGE, id="missing-usage"),
+        pytest.param(_step_on_an_unpriced_model, _MISSING_PRICING, id="missing-pricing"),
+    ],
+)
+def test_cap_stop_names_why_a_completed_step_could_not_be_priced(step, cause) -> None:
+    async def run():
+        tool = SideEffectTool()
+        provider = _AnthropicFake([step("call_1"), _final_step()])
+        app, _ = _application(provider, tool)
+        return await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_unverifiable_cap",
+                messages=[Message.text("user", "work")],
+                budget_limits=(BudgetLimit.usd(5),),
+                max_steps=5,
+            ),
+        )
+
+    events = asyncio.run(run())
+
+    [reached] = [event for event in events if event.type == EventType.SESSION_LIMIT_REACHED]
+    assert reached.payload["limit"] == "estimated_cost"
+    assert reached.payload["message"] == (
+        f"Estimated cost budget cannot be verified because {cause}."
+    )
+    assert events[-1].payload["interruption_type"] == "limit_reached"
+
+
+def test_cap_stop_names_both_missing_usage_and_missing_pricing() -> None:
+    async def run():
+        tool = SideEffectTool()
+        provider = _AnthropicFake(
+            [
+                _step_without_usage("call_1"),
+                _step_on_an_unpriced_model("call_2"),
+                _final_step(),
+            ]
+        )
+        app, _ = _application(provider, tool, policy=_AdoptSpendCapChanges())
+        # A cap that admits unpriced steps lets both kinds of step complete.
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_both_unpriced",
+                messages=[Message.text("user", "work")],
+                budget_limits=(BudgetLimit.usd(5, allow_unpriced=True),),
+                max_steps=2,
+            ),
+        )
+        return await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_both_unpriced",
+                messages=[Message.text("user", "continue")],
+                budget_limits=(BudgetLimit.usd(5),),
+                profile_adoption=_adoption("strict-cap"),
+            ),
+        ), provider
+
+    resumed, provider = asyncio.run(run())
+
+    [reached] = [event for event in resumed if event.type == EventType.SESSION_LIMIT_REACHED]
+    assert reached.payload["message"] == (
+        f"Estimated cost budget cannot be verified because {_MISSING_USAGE}; {_MISSING_PRICING}."
+    )
+    # The strict cap stopped the session before another provider call.
+    assert len(provider.requests) == 2

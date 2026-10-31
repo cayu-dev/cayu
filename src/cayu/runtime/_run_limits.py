@@ -53,6 +53,8 @@ from cayu.budgets.base import (
     _is_expired_reservation_reason,
     _operation_budget_limits_for_session,
     _reservation_result,
+    _unpriced_cost,
+    _UnpricedCost,
     budget_actual_cost_for_event,
     budget_check_from_events,
     budget_check_from_totals,
@@ -5908,27 +5910,16 @@ def _first_budget_limit_outcome(
         raise TypeError("cost_baseline must be SessionCostTotals.")
 
     actual_cost = _budget_actual_cost(limit, cost_summary, cost_baseline)
-    unpriced_model_steps = cost_summary.unpriced_model_steps
-    unpriced_auxiliary_attempts = cost_summary.unpriced_auxiliary_attempts
-    if limit.scope == "run" and cost_baseline is not None:
-        unpriced_model_steps = max(
-            unpriced_model_steps - cost_baseline.unpriced_model_steps,
-            0,
-        )
-        unpriced_auxiliary_attempts = max(
-            unpriced_auxiliary_attempts - cost_baseline.unpriced_auxiliary_attempts, 0
-        )
-
-    if unpriced_model_steps + unpriced_auxiliary_attempts > 0 and not limit.allow_unpriced:
+    unpriced = _unpriced_cost(
+        cost_summary,
+        since=cost_baseline if limit.scope == "run" else None,
+    )
+    if unpriced.any_unpriced() and not limit.allow_unpriced:
         decision = StopDecision(
             limit=StopLimit.ESTIMATED_COST,
             maximum=limit.max_estimated_cost,
             actual=actual_cost,
-            message=(
-                "Estimated cost budget cannot be verified because "
-                f"{unpriced_model_steps} model step(s) and {unpriced_auxiliary_attempts} "
-                "auxiliary attempt(s) have no matching pricing."
-            ),
+            message=f"Estimated cost budget cannot be verified because {unpriced.reasons()}.",
         )
         return _BudgetLimitOutcome(
             decision=decision,
@@ -5936,8 +5927,7 @@ def _first_budget_limit_outcome(
                 limit=limit,
                 decision=decision,
                 cost_summary=cost_summary,
-                unpriced_model_steps=unpriced_model_steps,
-                unpriced_auxiliary_attempts=unpriced_auxiliary_attempts,
+                unpriced=unpriced,
             ),
         )
     preflight_error = _budget_limit_preflight_error(
@@ -5961,8 +5951,7 @@ def _first_budget_limit_outcome(
                 limit=limit,
                 decision=decision,
                 cost_summary=cost_summary,
-                unpriced_model_steps=unpriced_model_steps,
-                unpriced_auxiliary_attempts=unpriced_auxiliary_attempts,
+                unpriced=unpriced,
             ),
         )
     if actual_cost >= limit.max_estimated_cost:
@@ -5981,8 +5970,7 @@ def _first_budget_limit_outcome(
                 limit=limit,
                 decision=decision,
                 cost_summary=cost_summary,
-                unpriced_model_steps=unpriced_model_steps,
-                unpriced_auxiliary_attempts=unpriced_auxiliary_attempts,
+                unpriced=unpriced,
             ),
         )
     return None
@@ -5993,8 +5981,7 @@ def _budget_check_from_stop_decision(
     limit: _EffectiveBudgetLimit,
     decision: StopDecision,
     cost_summary: SessionCostTotals,
-    unpriced_model_steps: int,
-    unpriced_auxiliary_attempts: int = 0,
+    unpriced: _UnpricedCost,
 ) -> BudgetCheck:
     if decision.limit != StopLimit.ESTIMATED_COST:
         raise ValueError("Budget checks can only be created for estimated-cost decisions.")
@@ -6010,8 +5997,8 @@ def _budget_check_from_stop_decision(
         actual=decision.actual,
         action=limit.action,
         model_steps=cost_summary.model_steps,
-        unpriced_model_steps=unpriced_model_steps,
-        unpriced_auxiliary_attempts=unpriced_auxiliary_attempts,
+        unpriced_model_steps=unpriced.model_steps,
+        unpriced_auxiliary_attempts=unpriced.auxiliary_attempts,
         limit_reached=True,
         message=decision.message,
         cost_summary=cost_summary,

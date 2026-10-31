@@ -284,6 +284,29 @@ def test_a_scripted_route_without_a_billing_provider_still_fails_closed_on_a_bud
     )
 
 
+def test_a_priced_scripted_route_without_usage_stops_a_budgeted_trial_for_its_usage() -> None:
+    app = _scripted_luna_app(
+        ScriptedModelProvider(
+            completed("done"),
+            billing_provider_name="openai",
+            usage_dialect=UsageDialect.OPENAI,
+        )
+    )
+
+    run = asyncio.run(run_eval_suite(app, EvalSuite(id="budgets", cases=[_budgeted_case()])))
+
+    (case,) = run.cases
+    (trial,) = case.trials
+    assert trial.execution_failure_category == "limit_reached"
+    events = asyncio.run(app.session_store.load_events(trial.session_id))
+    [reached] = [event for event in events if event.type == EventType.SESSION_LIMIT_REACHED]
+    # openai/gpt-5.6-luna is priced; what the budget lacks is the script's usage.
+    assert reached.payload["message"] == (
+        "Estimated cost budget cannot be verified because "
+        "1 model step(s) have missing or invalid completion usage."
+    )
+
+
 def test_omitted_billing_options_keep_a_subclass_declaration() -> None:
     class OpenAIShapedScript(ScriptedModelProvider):
         billing_provider_name = "openai"
