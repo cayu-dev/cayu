@@ -291,9 +291,10 @@ def test_add_session_starts_the_case_at_the_sessions_commit(
         )
         assert "workspace" not in scored and "workspace" not in scored["case_definition"]
 
-        # The published suite keeps the fixture on its case.
+        # The published suite keeps the fixture on its case. The store belongs to the server's
+        # event loop, where its eval worker polls it, so it is read there.
         destination = EvalSuiteViewIdentity.model_validate(plan["destination"])
-        saved = asyncio.run(store.load_authored_suite(destination.revision))
+        saved = client.portal.call(store.load_authored_suite, destination.revision)
         assert saved is not None and saved.cases[0].workspace == fixture
 
 
