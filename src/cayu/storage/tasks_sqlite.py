@@ -5452,7 +5452,8 @@ class SQLiteTaskStore(TaskStore):
                 "SELECT * FROM cayu_tasks WHERE status = ? "
                 "AND session_id IS NOT NULL AND session_instance_id IS NOT NULL "
                 "AND worker_id IS NOT NULL AND lease_expires_at IS NOT NULL "
-                "AND lease_expires_at <= ? AND status_reason IS NULL "
+                "AND lease_expires_at <= ? "
+                "AND (status_reason IS NULL OR status_reason = ?) "
                 "AND NOT EXISTS ("
                 "SELECT 1 FROM cayu_work_attempt_admissions "
                 "WHERE cayu_work_attempt_admissions.task_id = cayu_tasks.id"
@@ -5462,6 +5463,7 @@ class SQLiteTaskStore(TaskStore):
                 (
                     str(TaskStatus.RUNNING),
                     sqlite_records.format_datetime(self._ownership_clock()),
+                    _TASK_CANCELLATION_REQUESTED_REASON,
                     *after_params,
                     limit,
                 ),

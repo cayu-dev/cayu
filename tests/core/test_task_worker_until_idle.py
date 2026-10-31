@@ -302,7 +302,7 @@ def test_until_idle_continues_handoffs_that_recovery_finds_after_the_scan(monkey
         recoveries = 0
         scans = 0
 
-        async def recover(_app, _store, *, after, limit, stop):
+        async def recover(_app, _store, *, worker_id, after, limit, stop):
             nonlocal recoveries
             recoveries += 1
             return pages[recoveries - 1]
@@ -374,7 +374,7 @@ def test_until_idle_finishes_a_whole_expired_handoff_recovery_pass(monkeypatch):
         ]
         afters = []
 
-        async def recover(_app, _store, *, after, limit, stop):
+        async def recover(_app, _store, *, worker_id, after, limit, stop):
             afters.append(after)
             return pages[len(afters) - 1]
 
@@ -470,7 +470,7 @@ def test_until_idle_rescans_continuations_from_the_start_after_recovery(monkeypa
         recoveries = 0
         scanned_after = []
 
-        async def recover(_app, _store, *, after, limit, stop):
+        async def recover(_app, _store, *, worker_id, after, limit, stop):
             nonlocal recoveries
             recoveries += 1
             return pages[recoveries - 1]

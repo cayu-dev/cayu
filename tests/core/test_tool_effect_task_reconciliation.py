@@ -260,7 +260,7 @@ def test_elected_worker_reconciles_real_external_call_without_replay(
                     await asyncio.gather(owner, return_exceptions=True)
                 app = await reopen()
                 handoffs = await _recover_expired_interrupted_task_handoffs(
-                    app, task_store, after=None, limit=10, stop=None
+                    app, task_store, worker_id="recovery-worker", after=None, limit=10, stop=None
                 )
                 assert handoffs.recovered == 1
                 replacement = (

@@ -175,8 +175,10 @@ def _fenced_task_settlement(task: Task) -> str:
     if task.session_id is not None:
         return (
             f"it is attached to session {task.session_id}, so it can't be restarted after "
-            "worker loss: settle the session first, then reconcile the task with "
-            "TaskStore.reconcile_task_cancellation"
+            "worker loss: a task worker that recovers interrupted handoffs (the default) "
+            "settles it as cancelled once its session can be interrupted, unless the "
+            "session needs a person or waits on a subagent; then settle the session first "
+            "and reconcile the task with TaskStore.reconcile_task_cancellation"
         )
     if task.restartable:
         return (

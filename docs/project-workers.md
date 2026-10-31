@@ -190,6 +190,18 @@ own worker ID (as in the example above), so a restarted worker doesn't share
 the dead one's ID. Otherwise settle fenced tasks yourself once you know the old
 process exited; see [when a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task).
 
+A cancelled task that runs an agent session usually needs neither. Its session
+fences the old worker's run, so once the dead worker's lease expires, the next
+worker that recovers interrupted handoffs (long-running or `--until-idle`; every
+`run_task_worker` does unless it passes `recover_interrupted_handoffs=False`)
+settles it as `cancelled` as soon as its session can be interrupted, whether the
+task was mid-turn, asleep in `sleep_until` or parked on an external wait. It never
+runs the model or a tool again for it. Two cases aren't settled automatically yet:
+a session that needs a person to interrupt it (a model call in flight), and a
+session that waits on a subagent. `cayu inspect --fenced-tasks` lists them; settle
+the session first, then reconcile the task with
+`TaskStore.reconcile_task_cancellation`.
+
 To run a task created with `TaskCreate(restartable=True)` again instead of
 cancelling it, add `--restart-abandoned`:
 

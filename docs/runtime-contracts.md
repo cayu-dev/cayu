@@ -7751,12 +7751,30 @@ scanner for a task store and leave the flag false on the other workers. Each
 scheduler turn examines at most ten candidates, retains its cursor, and then
 yields to ordinary task claiming; it never drains an unbounded recovery backlog
 before fresh work or after the worker's stop or `max_tasks` boundary. Terminal,
-cancel-draining, admitted-work, wrong-owner, different-incarnation, and
+retry-cancel-draining, admitted-work, wrong-owner, different-incarnation, and
 unrecoverable session states are not released by this recovery path. A live
 `pending`, `running`, or `interrupting` session is first fenced through
 `recover_incomplete_session(...)` using the expired task lease as its inactivity
 boundary; the task owner is released only if the exact attached session then
-reaches `interrupted`. A
+reaches `interrupted`. A task whose ordinary cancellation was requested before
+its worker was lost is not released: once its session reaches `interrupted`,
+which fences the lost worker's run, recovery settles the exact expired claim as
+`cancelled` through `reconcile_task_cancellation(...)` with validator
+`cayu.task-worker.expired-attached-owner` and the session's incarnation and run
+epoch as evidence. A settlement another recovery worker committed first is not
+counted again. Nothing runs the model or a tool again for the task; a sleep or
+external wait it was parked on is stopped by the ordinary ended-task paths. A
+cancelled task whose session needs a person to interrupt it, or whose session is
+part of a live chain of foreground subagent calls (it is an unfinished one, has an
+open call to one, or has one that hasn't finished), is left fenced and reported as
+before. A foreground subagent counts as finished as its parent's call judges it:
+completed, failed or interrupted, with nothing pending; settle the
+session first, then reconcile the task with `reconcile_task_cancellation(...)`. A
+wake attempt whose worker was lost, whose fence reclamation recorded and whose
+lease expired is settled as `cancelled` on the reclaim cadence once every task of
+its session has ended and the session neither runs nor takes part in such a
+chain, validator `cayu.task-worker.wake-attempt-of-ended-task`, however long the
+attempt outlived its task; an until-idle run does this before it returns. A
 complete recovery scan is rate-limited, so an unchanged ineligible set is not
 re-read on every idle poll or before every fresh claim. A control-plane process
 may later resolve an approval or user-input request. Application recovery code

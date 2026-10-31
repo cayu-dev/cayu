@@ -148,6 +148,7 @@ from cayu.tasks.admission import (
     work_attempt_execution_claim_request_sha256,
 )
 from cayu.tasks.cancellation import (
+    _TASK_CANCELLATION_REQUESTED_REASON,
     TaskCancellationReconciliationRequest,
     TaskCancellationReconciliationResult,
     TaskRetryCancellationReconciliationRequest,
@@ -3552,7 +3553,7 @@ class InMemoryTaskStore(TaskStore):
                     and task.worker_id is not None
                     and task.lease_expires_at is not None
                     and task.lease_expires_at <= now
-                    and task.status_reason is None
+                    and task.status_reason in {None, _TASK_CANCELLATION_REQUESTED_REASON}
                     and self._latest_admission_id_by_task.get(task.id) is None
                     and (after is None or (task.lease_expires_at, task.id) > after)
                 ),

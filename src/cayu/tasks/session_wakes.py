@@ -760,6 +760,170 @@ async def _stop_chain_if_its_task_ended(app: CayuApp, root_id: str) -> None:
     await _stop_ended_chain(app, leaf)
 
 
+# Recorded on a wake attempt settled after the task it would continue ended.
+WAKE_ATTEMPT_OF_ENDED_TASK_VALIDATOR_ID = "cayu.task-worker.wake-attempt-of-ended-task"
+_WAKE_ATTEMPT_OF_ENDED_TASK_VALIDATOR_VERSION = "1"
+# Tasks or subagents of a session read at a time.
+_OWNER_PAGE_SIZE = 100
+_LIVE_SESSION_STATUSES = frozenset(
+    {SessionStatus.PENDING, SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+)
+
+
+async def settle_wake_attempts_of_ended_tasks(app: CayuApp, *, actor: ResolutionActor) -> int:
+    """Cancel fenced wake attempts whose task ended; return how many this settled.
+
+    A wake attempt whose worker was lost stays fenced like any started task. When the
+    task that owns its session has ended (for example, it was cancelled after its
+    worker died), the attempt could continue nothing: it acts only through a claim on
+    that task, and the session is no longer running. So it is settled as cancelled,
+    with the task's end and the session's run epoch as evidence. Only attempts whose
+    fence is recorded and whose lease expired by the store's clock are read, and the
+    store refuses a live one. A run on the reclaim cadence after expired-claim
+    reclamation finds them, however long the attempt outlived its task.
+    """
+
+    from cayu.tasks import worker
+    from cayu.tasks.abandoned import _list_fenced, has_cancellation_fence
+    from cayu.tasks.queries import TaskOrder, TaskQuery
+    from cayu.tasks.records import TaskClaimLost
+    from cayu.tasks.terminalization import TaskTerminalizationConflict
+
+    task_store = app.task_store
+    if task_store is None:
+        return 0
+    fenced, _ = await _list_fenced(
+        task_store,
+        TaskQuery(
+            type=SESSION_WAKE_TASK_TYPE,
+            fenced_after_worker_loss=True,
+            limit=100,
+            order_by=TaskOrder.UPDATED_AT_ASC,
+        ),
+    )
+    settled = 0
+    for attempt in fenced:
+        if not has_cancellation_fence(attempt):
+            continue
+        try:
+            evidence_id = await _ended_owner_evidence(app, task_store, attempt)
+            if evidence_id is None:
+                continue
+            await worker._reconcile_observed_abandoned_task_cancellation(
+                task_store,
+                attempt,
+                validator_id=WAKE_ATTEMPT_OF_ENDED_TASK_VALIDATOR_ID,
+                validator_version=_WAKE_ATTEMPT_OF_ENDED_TASK_VALIDATOR_VERSION,
+                evidence_id=evidence_id,
+                reconciled_by=actor,
+            )
+        except (TaskTerminalizationConflict, TaskClaimLost):
+            continue
+        except Exception as exc:
+            # The next pass reads it again.
+            _logger.warning(
+                "Settling wake attempt %s of an ended task failed (%s); retrying later.",
+                app.redact_json(attempt.id),
+                type(exc).__name__,
+            )
+            continue
+        settled += 1
+        _logger.warning(
+            "Settled wake attempt %s as cancelled: its worker stopped renewing its lease and "
+            "the task it would continue has ended.",
+            app.redact_json(attempt.id),
+        )
+    return settled
+
+
+async def _ended_owner_evidence(app: CayuApp, task_store: TaskStore, attempt: Task) -> str | None:
+    """Evidence that the task owning an attempt's session ended, or ``None``.
+
+    Every task the attempt's session has must be terminal, and the session may be
+    neither running nor part of a chain of foreground subagent calls.
+    """
+
+    from cayu.tasks.queries import TaskOrder, TaskQuery
+
+    session_id = attempt.input.get("session_id")
+    if type(session_id) is not str:
+        return None
+    session = await app.session_store.load(session_id)
+    if (
+        session is None
+        or session.status in _LIVE_SESSION_STATUSES
+        or await in_subagent_chain(app, session)
+    ):
+        return None
+    offset = 0
+    while True:
+        owners = await task_store.list_tasks(
+            TaskQuery(
+                session_id=session.id,
+                limit=_OWNER_PAGE_SIZE,
+                offset=offset,
+                order_by=TaskOrder.CREATED_AT_ASC,
+            )
+        )
+        if any(owner.status not in TERMINAL_TASK_STATUSES for owner in owners):
+            return None
+        offset += len(owners)
+        if len(owners) < _OWNER_PAGE_SIZE:
+            break
+    if offset == 0:
+        return None
+    return f"task-ended:{session.instance_id}:{session.run_epoch}"
+
+
+async def in_subagent_chain(app: CayuApp, session: Session) -> bool:
+    """Whether a session takes part in a live chain of foreground subagent calls.
+
+    That is a foreground subagent that hasn't finished, a session whose foreground
+    subagent call is still open, or one with a foreground subagent that hasn't
+    finished. A subagent is finished as its parent's call judges it: it ended
+    (completed, failed or interrupted) with nothing pending. Settling such a
+    session's task after worker loss needs the whole chain to be quiescent, which is
+    not established yet, so those tasks are left alone.
+    """
+
+    from cayu.runtime._foreground_child_wait import foreground_child_finished
+    from cayu.sessions.queries import SessionOrder, SessionQuery
+
+    store = app.session_store
+    if _foreground_subagent(session) and not await foreground_child_finished(store, session):
+        return True
+    wait, _ = foreground_child_state_from_checkpoint(await store.load_checkpoint(session.id))
+    if wait is not None and not await _call_closed(app, wait):
+        return True
+    offset = 0
+    while True:
+        children = (
+            await store.list_sessions(
+                SessionQuery(
+                    parent_session_id=session.id,
+                    limit=_OWNER_PAGE_SIZE,
+                    offset=offset,
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
+            )
+        ).sessions
+        for child in children:
+            if _foreground_subagent(child) and not await foreground_child_finished(store, child):
+                return True
+        offset += len(children)
+        if len(children) < _OWNER_PAGE_SIZE:
+            return False
+
+
+def _foreground_subagent(session: Session) -> bool:
+    subagent = session.metadata.get("subagent")
+    return (
+        session.parent_session_id is not None
+        and type(subagent) is dict
+        and subagent.get("mode") == "foreground"
+    )
+
+
 def _require_servable_pause(app: CayuApp, tool: Tool) -> None:
     """Refuse a pausing tool this application cannot serve, at registration."""
 

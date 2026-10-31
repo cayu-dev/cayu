@@ -255,6 +255,48 @@ async def _load_matching_foreground_child(
     return child
 
 
+# A foreground child in one of these statuses has ended its run.
+FOREGROUND_CHILD_TERMINAL_STATUSES = frozenset(
+    {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.INTERRUPTED}
+)
+
+
+def _awaits_pending_action(child: Session, checkpoint: dict[str, Any] | None) -> bool:
+    return (
+        pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is not None
+        or user_input_lifecycle_authority_from_checkpoint(
+            checkpoint, current_run_epoch=child.run_epoch
+        )[0]
+        is not None
+        or pending_session_wake_from_checkpoint(checkpoint) is not None
+    )
+
+
+def _profile_released(child: Session, checkpoint: dict[str, Any] | None) -> bool:
+    profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    return profile is not None and active_invocation_execution_profile_is_released(
+        profile, session_id=child.id, run_epoch=child.run_epoch
+    )
+
+
+async def foreground_child_finished(store: SessionStore, child: Session) -> bool:
+    """Whether a foreground child is finished, so that its parent takes its result.
+
+    That is the rule its parent's call applies: the child ended (completed, failed
+    or interrupted), owns no delegated wait, waits on no approval, user input or
+    wake, and released its invocation profile.
+    """
+
+    if child.status not in FOREGROUND_CHILD_TERMINAL_STATUSES:
+        return False
+    checkpoint = await store.load_checkpoint(child.id)
+    return (
+        await owned_delegated_wait(store, child=child, checkpoint=checkpoint) is None
+        and not _awaits_pending_action(child, checkpoint)
+        and _profile_released(child, checkpoint)
+    )
+
+
 async def project_current_foreground_child_result(
     store: SessionStore,
     *,
@@ -282,11 +324,7 @@ async def project_current_foreground_child_result(
             tool_round_id=intent.tool_round_id,
             tool_call_id=intent.tool_call_id,
         )
-    if child.status not in {
-        SessionStatus.COMPLETED,
-        SessionStatus.FAILED,
-        SessionStatus.INTERRUPTED,
-    }:
+    if child.status not in FOREGROUND_CHILD_TERMINAL_STATUSES:
         return None
     checkpoint = await store.load_checkpoint(child.id)
     if await owned_delegated_wait(store, child=child, checkpoint=checkpoint) is not None:
@@ -296,19 +334,9 @@ async def project_current_foreground_child_result(
             tool_call_id=intent.tool_call_id,
         )
     pending_action_evidence_round_from_checkpoint(checkpoint)
-    if (
-        pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is not None
-        or user_input_lifecycle_authority_from_checkpoint(
-            checkpoint, current_run_epoch=child.run_epoch
-        )[0]
-        is not None
-        or pending_session_wake_from_checkpoint(checkpoint) is not None
-    ):
+    if _awaits_pending_action(child, checkpoint):
         return None
-    profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-    if profile is None or not active_invocation_execution_profile_is_released(
-        profile, session_id=child.id, run_epoch=child.run_epoch
-    ):
+    if not _profile_released(child, checkpoint):
         raise ForegroundSubagentRecoveryRequired(
             child_session_id=child.id,
             tool_round_id=intent.tool_round_id,

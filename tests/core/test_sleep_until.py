@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import pytest
 
@@ -775,11 +776,38 @@ def _stores(backend: str, tmp_path, request, clock):
     from cayu.storage.migrations import SchemaMode
     from cayu.storage.tasks_postgres import PostgresTaskStore
 
-    dsn = request.getfixturevalue("postgres_dsn")
+    dsn = _own_postgres_database(request)
     return (
         PostgresSessionStore(dsn, schema_mode=SchemaMode.CREATE),
         PostgresTaskStore(dsn, schema_mode=SchemaMode.CREATE),
     )
+
+
+def _own_postgres_database(request) -> str:
+    """A database only this test uses, dropped when it ends.
+
+    The module's database outlives each test, and so do the wake tasks a test leaves
+    behind. One that comes due later would be claimed by another test's worker in
+    place of that test's own wake.
+    """
+
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    server = request.getfixturevalue("postgres_dsn")
+    database = f"cayu_sleep_{uuid4().hex}"
+    with psycopg.connect(server, autocommit=True) as connection:
+        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+
+    def drop() -> None:
+        with psycopg.connect(server, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database))
+            )
+
+    request.addfinalizer(drop)
+    return make_conninfo(server, dbname=database)
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

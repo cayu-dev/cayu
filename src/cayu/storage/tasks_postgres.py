@@ -3104,7 +3104,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                   AND worker_id IS NOT NULL
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at <= %s
-                  AND status_reason IS NULL
+                  AND (status_reason IS NULL OR status_reason = %s)
                   AND NOT EXISTS (
                       SELECT 1 FROM cayu_work_attempt_admissions
                       WHERE cayu_work_attempt_admissions.task_id = cayu_tasks.id
@@ -3113,7 +3113,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 ORDER BY lease_expires_at ASC, id ASC
                 LIMIT %s
                 """,
-                (str(TaskStatus.RUNNING), now, *after_params, limit),
+                (
+                    str(TaskStatus.RUNNING),
+                    now,
+                    _TASK_CANCELLATION_REQUESTED_REASON,
+                    *after_params,
+                    limit,
+                ),
             )
             rows = await cur.fetchall()
         return [pg_support.task_from_row(row) for row in rows]

@@ -4570,6 +4570,7 @@ def test_recovered_continuation_session_fence_defers_to_expired_owner_recovery()
         recovery = await task_worker_module._recover_expired_interrupted_task_handoffs(
             app,
             task_store,
+            worker_id="recovery-worker",
             after=None,
             limit=10,
             stop=None,

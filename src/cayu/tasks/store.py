@@ -1191,7 +1191,11 @@ class TaskStore(ABC):
         after: tuple[datetime, str] | None = None,
         limit: int = 100,
     ) -> list[Task]:
-        """List one stable page of expired owners using store-authoritative time."""
+        """List one stable page of expired attached owners using store-authoritative time.
+
+        A task with no status reason or with a pending (non-retry) cancellation is
+        listed; recovery hands off the first and settles the second as cancelled.
+        """
 
         raise NotImplementedError(
             "This TaskStore does not support interrupted-task handoff recovery."

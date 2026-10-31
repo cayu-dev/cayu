@@ -198,7 +198,7 @@ async def _recover_with(monkeypatch, error: Exception, *, parked: bool = False):
     monkeypatch.setattr(external_wait_tasks, "stop_wait_left_arming", raises)
     try:
         return await task_worker._recover_expired_interrupted_task_handoffs(
-            app, store, after=None, limit=10, stop=None
+            app, store, worker_id="recovery-worker", after=None, limit=10, stop=None
         )
     finally:
         await app.aclose()
@@ -249,7 +249,7 @@ def test_until_idle_retries_a_failed_recovery_pass_once_before_it_reports(
         app = CayuApp(task_store=store, enable_logging=False)
         calls = []
 
-        async def recover(_app, _store, *, after, limit, stop):
+        async def recover(_app, _store, *, worker_id, after, limit, stop):
             calls.append(after)
             return passes[min(len(calls), len(passes)) - 1]
 

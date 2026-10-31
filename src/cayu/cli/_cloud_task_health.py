@@ -32,5 +32,6 @@ def fenced_tasks_warning(service: Mapping[str, Any]) -> str | None:
         "CAYU_WORKER_EXITS_URL), an ordinary task without an attached session settles with "
         "`reconcile_abandoned_task_cancellation`, or a single worker run with "
         "`cayu worker --reconcile-abandoned-after-seconds` settles such tasks itself. "
-        "Retry-series and session-attached tasks need the step inspect gives for them."
+        "A task worker settles most session-attached tasks itself; inspect gives the "
+        "step for the rest."
     )

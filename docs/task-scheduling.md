@@ -385,7 +385,7 @@ How the parked task meets task policy:
 | `TaskRetryPolicy` | Applies to the owning task only. A failed wake attempt is retried as a wake, never as an attempt of the owning task. |
 | `max_tasks` | The wake task counts as one task. The continuation it runs is part of the owning task and is not counted again. |
 | Schedule policy | Expiry and `skip` apply only to pending tasks, so a running parked task never expires. The wake task uses the default `fire_once` policy and runs late rather than not at all. |
-| Cancellation | `cancel_task` cancels a parked task at once, since no worker holds it. When its wake is due, the wake finds the task ended and stops the sleep instead of continuing the session without it. |
+| Cancellation | `cancel_task` cancels a parked task at once, since no worker holds it. When its wake is due, the wake finds the task ended and stops the sleep instead of continuing the session without it. A task whose worker died before parking it, or whose wake's continuation died, is cancelled by the next worker once that lease expires. |
 | Interrupting the session | Cancels the wake's attempts. On its reclaim cadence, a worker's `reconcile_parked_handoffs` finds the task parked on the closed sleep and hands it off unparked, so a `recovered_interrupted_task_handler` gets it like any interrupted task. |
 | Deleting the session | Refused while the task still runs, as for any session whose task is active, so the parked task is never left without its session. Cancel the task first, which settles a parked task at once, then delete the session; deletion cancels the wake's attempts. |
 

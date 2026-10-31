@@ -361,8 +361,14 @@ work should run again. The store refuses while the original lease is live, but
 lease expiry does not prove that the handler stopped: a cancellation-fenced handler
 may still be draining after expiry. The application must independently establish
 quiescence before calling this helper. This helper does not support session-attached
-tasks. Interrupted-handoff recovery covers attached tasks without pending
-cancellation; cancellation-fenced attached tasks require separate reconciliation.
+tasks: their session fences the old worker's run instead. Once a session-attached
+task's lease expires, a task worker that recovers interrupted handoffs (the default,
+`recover_interrupted_handoffs=True`) interrupts its session if it still runs, and
+once the session is interrupted it settles a pending cancellation as `cancelled`
+(or hands an uncancelled task off for continuation). It never runs the model or a
+tool again for it. A session that needs a person to interrupt it (a model call in
+flight) or that waits on a subagent isn't settled automatically yet: settle the
+session first, then reconcile the task with `TaskStore.reconcile_task_cancellation`.
 
 In a deployment with one worker, a task held by another worker id whose lease
 expired minutes ago has no live owner, and that is enough evidence. Declare it

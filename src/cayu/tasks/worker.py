@@ -129,6 +129,7 @@ from cayu.tasks._terminalization import (
 from cayu.tasks.abandoned import (
     AbandonedTaskSettlement,
     FencedTaskMonitor,
+    _declaring_worker_actor,
     reconcile_abandoned_after_from_environment,
     restart_abandoned_from_environment,
 )
@@ -222,6 +223,9 @@ _INTERRUPTED_HANDOFF_MAX_ATTEMPTS = 3
 _INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS = 0.05
 _INTERRUPTED_HANDOFF_MAX_BACKOFF_SECONDS = 1.0
 _INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE = 10
+# Recorded on the cancellation of an attached task whose worker's lease expired.
+_EXPIRED_ATTACHED_OWNER_VALIDATOR_ID = "cayu.task-worker.expired-attached-owner"
+_EXPIRED_ATTACHED_OWNER_VALIDATOR_VERSION = "1"
 _RECLAIM_BATCH_SIZE = 100
 _INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS = 30.0
 _DEFAULT_MAX_UNPRODUCTIVE_INTERRUPTED_HANDOFFS = 8
@@ -320,9 +324,9 @@ async def reconcile_abandoned_task_cancellation(
     the original lease is live, but lease expiry does not prove that the handler
     stopped. Independently establish quiescence before calling this helper;
     a cancellation-fenced handler can still run after its lease expires.
-    Session-attached tasks are not supported. Interrupted-handoff recovery covers
-    attached tasks without pending cancellation; fenced attachments need separate
-    reconciliation.
+    Session-attached tasks are not supported: once their lease expires, a task
+    worker's interrupted-handoff recovery interrupts the session, which fences the
+    old run, and settles the cancellation itself.
 
     Returns the cancelled task; a task this already settled is returned unchanged.
     """
@@ -361,8 +365,9 @@ async def _reconcile_observed_abandoned_task_cancellation(
 
     if current.session_id is not None:
         raise TaskTerminalizationConflict(
-            "Session-attached tasks are not supported; interrupted-handoff recovery "
-            "only covers tasks without a pending cancellation."
+            "Session-attached tasks are not supported; a task worker's interrupted-handoff "
+            "recovery interrupts the session and settles the cancellation once the lease "
+            "expires."
         )
     if current.retry_series is not None:
         raise TaskTerminalizationConflict(
@@ -857,9 +862,14 @@ async def run_task_worker(
                     raise_task_store_operation_failure(failure)
                 reclaimed = reclaim_outcome.result
                 del reclaim_outcome
-                return 0 if reclaimed is None else len(reclaimed)
+                reclaimed_count = 0 if reclaimed is None else len(reclaimed)
             else:
-                return len(await task_store.reclaim_expired(query=query, **reclaim_bound))
+                reclaimed_count = len(
+                    await task_store.reclaim_expired(query=query, **reclaim_bound)
+                )
+            # Reclamation has just recorded the fences of lost wake attempts.
+            await _settle_wake_attempts_of_ended_tasks(app, task_store, worker_id)
+            return reclaimed_count
 
         async def maintain_expired_claims() -> bool:
             """Reclaim expired claims and look for fenced tasks when each is due.
@@ -956,6 +966,7 @@ async def run_task_worker(
                 recovery_page = await _recover_expired_interrupted_task_handoffs(
                     app,
                     task_store,
+                    worker_id=worker_id,
                     after=expired_handoff_after,
                     limit=_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE,
                     stop=slot_stop,
@@ -969,6 +980,11 @@ async def run_task_worker(
                     # Recovery follows lease expiry and the scan creation time, so
                     # a recovered task may sort behind the cursor.
                     rescan_continuations()
+                    if until_idle is not None:
+                        # A task it settled may leave a lost wake attempt to settle,
+                        # and fences to read again, before the run returns.
+                        reclaim_cadence.expedite()
+                        fenced_cadence.expedite()
                 if recovery_page.exhausted:
                     expired_handoff_after = None
                     next_interrupted_handoff_recovery_at = (
@@ -1336,6 +1352,24 @@ async def run_task_worker(
         return sum(slot.result() for slot in slots)
     finally:
         lag_monitor.stop()
+
+
+async def _settle_wake_attempts_of_ended_tasks(
+    app: CayuApp, task_store: TaskStore, worker_id: str
+) -> None:
+    """Settle the lost wake attempts of tasks that ended; never stops the worker."""
+
+    from cayu.tasks.session_wakes import settle_wake_attempts_of_ended_tasks
+
+    if not app._uses_session_wakes or task_store is not app.task_store:
+        return
+    try:
+        await settle_wake_attempts_of_ended_tasks(app, actor=_declaring_worker_actor(worker_id))
+    except Exception as exc:
+        logger.warning(
+            "Settling the wake attempts of ended tasks failed (%s); retrying later.",
+            type(exc).__name__,
+        )
 
 
 async def _reconcile_session_wakes(app: CayuApp, task_store: TaskStore) -> int:
@@ -3328,7 +3362,7 @@ def _owner_lost_cancellation_request(
     evidence_id: str,
     evidence_sha256: str,
 ) -> TaskCancellationReconciliationRequest:
-    """Build the exact owner-lost reconciliation for a cancellation-fenced ordinary task."""
+    """Build the exact owner-lost reconciliation for a cancellation-fenced task's claim."""
 
     if current.lease_expires_at is None:
         raise TaskTerminalizationConflict("Task cancellation reconciliation lost its lease.")
@@ -3367,6 +3401,7 @@ def _owner_lost_cancellation_request(
     return TaskCancellationReconciliationRequest(
         task_id=current.id,
         original_worker_id=worker_id,
+        original_handoff_id=current.interrupted_handoff_id,
         original_lease_expires_at=current.lease_expires_at,
         cancellation_requested_at=cancellation_requested_at,
         cancellation_idempotency_key=cancellation_idempotency_key,
@@ -4147,6 +4182,7 @@ async def _recover_expired_interrupted_task_handoffs(
     app: CayuApp,
     task_store: TaskStore,
     *,
+    worker_id: str,
     after: tuple[datetime, str] | None,
     limit: int,
     stop: asyncio.Event | None,
@@ -4180,6 +4216,18 @@ async def _recover_expired_interrupted_task_handoffs(
             or session.instance_id != task.session_instance_id
         ):
             continue
+        if _task_cancellation_requested(task):
+            from cayu.tasks.session_wakes import in_subagent_chain
+
+            # A foreground subagent may still run under the same lost claim: a
+            # cancelled task in a chain of subagent calls is left fenced, as before,
+            # and nothing of its sessions is touched.
+            try:
+                if await in_subagent_chain(app, session):
+                    continue
+            except Exception:
+                failed.add(task.id)
+                continue
         if session.status in {
             SessionStatus.PENDING,
             SessionStatus.RUNNING,
@@ -4242,6 +4290,31 @@ async def _recover_expired_interrupted_task_handoffs(
             )
             failed.add(task.id)
             continue
+        if _task_cancellation_requested(task):
+            # Nobody is left to drain the cancellation, and the interrupted session
+            # fences the lost worker's run: settle it instead of handing it off. A
+            # session in a chain of subagent calls was left alone above.
+            try:
+                if await _settle_expired_owner_cancellation(
+                    task_store,
+                    task,
+                    actor=_declaring_worker_actor(worker_id),
+                    evidence_id=f"session-interrupted:{session.instance_id}:{session.run_epoch}",
+                ):
+                    recovered += 1
+                    logger.warning(
+                        "Settled task %s as cancelled: its cancellation was pending when its "
+                        "worker stopped renewing its lease, and its session is interrupted.",
+                        app.redact_json(task.id),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Settling the cancellation of task %s failed (%s); a later pass retries it.",
+                    app.redact_json(task.id),
+                    type(exc).__name__,
+                )
+                failed.add(task.id)
+            continue
         request = interrupted_task_handoff_request(
             task,
             session_run_epoch=session.run_epoch,
@@ -4280,6 +4353,63 @@ async def _recover_expired_interrupted_task_handoffs(
         failed=frozenset(failed),
         manual_recovery_required=manual_recovery_required,
     )
+
+
+async def _settle_expired_owner_cancellation(
+    task_store: TaskStore,
+    task: Task,
+    *,
+    actor: ResolutionActor,
+    evidence_id: str,
+) -> bool:
+    """Cancel an attached task whose worker's lease expired with its cancellation pending.
+
+    Its session is interrupted, which fences the lost worker's run, so nothing of it
+    can continue; ``evidence_id`` names that session incarnation and run epoch. The
+    store settles only the exact expired claim ``task`` shows; a claim that changed,
+    a lease that is live again, or a settlement another worker made first is left
+    alone. Returns whether this call settled the task.
+    """
+
+    worker_id = task.worker_id
+    if worker_id is None:
+        return False
+    try:
+        terminalization = _task_cancellation_terminalization_request(task, worker_id=worker_id)
+        if terminalization is None:
+            return False
+        evidence_sha256 = sha256(
+            canonical_durable_json_bytes(
+                {
+                    "schema": "cayu.expired-attached-task-cancellation.v1",
+                    "task_id": task.id,
+                    "worker_id": worker_id,
+                    "handoff_id": task.interrupted_handoff_id,
+                    "cancellation_idempotency_key": terminalization.idempotency_key,
+                    "evidence_id": evidence_id,
+                },
+                "expired_attached_task_cancellation",
+            )
+        ).hexdigest()
+        request = _owner_lost_cancellation_request(
+            task,
+            worker_id,
+            cancellation_idempotency_key=terminalization.idempotency_key,
+            reconciliation_idempotency_key=(
+                f"expired-attached-task-cancellation:v1:{evidence_sha256}"
+            ),
+            # The recovering worker, so a peer that settled it first makes this conflict.
+            reconciled_by=actor,
+            validator_id=_EXPIRED_ATTACHED_OWNER_VALIDATOR_ID,
+            validator_version=_EXPIRED_ATTACHED_OWNER_VALIDATOR_VERSION,
+            evidence_id=evidence_id,
+            evidence_sha256=evidence_sha256,
+        )
+        await task_store.reconcile_task_cancellation(request)
+    except (TaskTerminalizationConflict, TaskClaimLost):
+        return False
+    else:
+        return True
 
 
 def _manual_recovery_errors() -> tuple[type[Exception], ...]:
