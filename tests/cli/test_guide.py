@@ -127,6 +127,7 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "cayu eval compare" in first
     assert "cayu eval suites show SUITE" in first
     assert "cayu eval baseline approve RUN_ID" in first
+    assert "cayu eval runs report RUN_ID --json-output result.eval-result.json" in first
 
     assert main(["guide", "evals-ai-quality", "--json"]) == 0
     quality = json.loads(capsys.readouterr().out)
@@ -159,6 +160,10 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "Settings → Production scenarios" in production
     assert "cayu eval scenario check --session SESSION_ID" in production
     assert "cayu eval scenario run --scenario REVISION" in production
+    assert "cayu eval scenario prepare-fixture REQUIREMENT_ID --session SESSION_ID" in production
+    assert "cayu eval scenario approve RUN_ID --event CHECKPOINT_ID" in production
+    assert "cayu eval runs cancel RUN_ID" in production
+    assert "stay in the Developer dashboard" not in production
     assert "Settings → Memory reports" in production
 
 

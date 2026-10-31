@@ -932,7 +932,7 @@ def _write_report(
     # Written as the Agent renders it: sorted keys, two-space indent, a final newline.
     text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     try:
-        path.write_text(text, encoding="utf-8")
+        path.write_text(text, encoding="utf-8", newline="\n")
     except OSError as exc:
         raise CloudEvalError(
             "output_unwritable",
@@ -960,7 +960,17 @@ def _list_runs(api: CayuApi, arguments: argparse.Namespace) -> dict[str, Any]:
 
 
 def _show_run(api: CayuApi, run_id: str) -> dict[str, Any]:
-    return {"run": _read_run(api, run_id), "progress": _read_progress(api, run_id)}
+    """The run, its trial progress and, for a scenario run, each trial's phase: the trials
+    awaiting a fresh approval name the checkpoint (`pending_event_id`) and its tool."""
+
+    record = api.get(_run_path(run_id), resource="eval run")
+    run = _run_summary(record)
+    scenario = record.get("scenario_progress")
+    return {
+        "run": run,
+        "progress": _read_progress(api, run_id),
+        "scenario_progress": scenario if isinstance(scenario, dict) else None,
+    }
 
 
 def _cancel_run(api: CayuApi, run_id: str) -> dict[str, Any]:
@@ -1392,6 +1402,15 @@ def render_run_detail(answer: Mapping[str, Any]) -> str:
         lines.append(f"Finished: {_text(run['finished_at'])}")
     if run["result"] is not None or run["failure_code"] is not None:
         lines.append(f"Result: {_result_cell(run)}")
+    scenario = result["scenario_progress"]
+    for trial in (scenario or {}).get("trials") or ():
+        line = f"Trial {_text(trial.get('trial_number'))}: {_text(trial.get('phase'))}"
+        if trial.get("phase") == "awaiting_approval" and trial.get("approval") is None:
+            line += (
+                f", a fresh approval of {_text(trial.get('pending_tool_name'))} "
+                f"(event {_text(trial.get('pending_event_id'))})"
+            )
+        lines.append(line)
     return "\n".join(lines)
 
 

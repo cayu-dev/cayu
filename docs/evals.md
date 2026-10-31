@@ -4069,20 +4069,25 @@ summaries—never fabricated regressions.
 ### Curating evals from the CLI
 
 These commands call the server API the Evals area calls, so a terminal or a coding agent
-can list and open suites and runs, add a finished session to a suite, approve a baseline,
-calibrate an AI judge and check and run production scenarios without the browser:
+can list and open suites and runs, cancel a run and download its report, add a finished
+session to a suite, approve a baseline, calibrate an AI judge and check, prepare, run and
+approve production scenarios without the browser:
 
 ```console
 cayu eval suites list
 cayu eval suites show SUITE
 cayu eval runs list
 cayu eval runs show RUN_ID
+cayu eval runs cancel RUN_ID
+cayu eval runs report RUN_ID --json-output result.eval-result.json --html-output report.html
 cayu eval add-session SESSION_ID --suite SUITE --mode case --preview
 cayu eval baseline approve RUN_ID
 cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID \
   --evidence evidence.json --labels labels.json --preview
 cayu eval scenario check --session SESSION_ID
+cayu eval scenario prepare-fixture REQUIREMENT_ID --session SESSION_ID
 cayu eval scenario run --scenario REVISION
+cayu eval scenario approve RUN_ID --event CHECKPOINT_ID
 ```
 
 | Developer dashboard | CLI | Server API |
@@ -4091,12 +4096,16 @@ cayu eval scenario run --scenario REVISION
 | A suite's page | `cayu eval suites show SUITE` | `GET /api/evals/suite-views/{suite_key}` |
 | A target's runs | `cayu eval runs list` | `GET /api/evals/runs` |
 | A run's status and progress | `cayu eval runs show RUN_ID` | `GET /api/evals/runs/{run_id}` and `GET /api/evals/run-views/{run_key}` |
+| **Cancel** on a run | `cayu eval runs cancel RUN_ID` | `POST /api/evals/runs/{run_id}/cancel` |
+| **Download JSON** and **Download HTML** on a run | `cayu eval runs report RUN_ID --json-output FILE [--html-output FILE]` | `GET /api/evals/runs/{run_id}/report.json` |
 | **Add to evals** on a session | `cayu eval add-session SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/additions/preview`, then `POST /api/evals/sessions/{session_id}/additions` |
 | **Approve as baseline** on a run | `cayu eval baseline approve RUN_ID` | `GET /api/evals/runs/{run_id}/result`, then `POST /api/evals/results/{result_revision}/baseline` |
 | **Judges and calibration**: **Check calibration**, **Run calibration** | `cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID ...` | `GET /api/evals/suite-views/{suite_key}` and the suite's `GET /api/evals/suites/{suite_revision}` or `GET /api/evals/corpora/{corpus_revision}`, then `POST /api/evals/judge-calibrations/preview` and `POST /api/evals/judge-calibrations` |
 | **Production scenarios** library | `cayu eval scenario list`, `cayu eval scenario show REVISION` | `GET /api/evals/scenarios`, `GET /api/evals/scenarios/{scenario_revision}` |
 | **Check readiness** and **Save** | `cayu eval scenario check ... [--save]` | `POST /api/evals/scenarios/preview`, and `POST /api/evals/scenarios` |
 | **Run scenario** | `cayu eval scenario run ...` | `POST /api/evals/scenarios/preview` and `POST /api/evals/scenarios`, then `POST /api/evals/scenarios/{scenario_revision}/runs` |
+| **Prepare fixture**, then **Save** | `cayu eval scenario prepare-fixture REQUIREMENT_ID ...` | `POST /api/evals/scenarios/preview`, `POST /api/evals/scenarios/artifacts/{requirement_id}/materialize`, then `POST /api/evals/scenarios` |
+| **Approve** and **Deny** on a scenario run | `cayu eval scenario approve RUN_ID`, `cayu eval scenario deny RUN_ID` | `GET /api/evals/runs/{run_id}`, then `POST /api/evals/runs/{run_id}/scenario-approval` |
 
 They reach the project's running server, `cayu serve`'s `http://127.0.0.1:8000`, or
 `--server-url URL`, including a mount prefix. For a protected server, set the complete
@@ -4117,10 +4126,18 @@ Pass the `id` to `suites show` and to `add-session --suite`. A page's `next_curs
 `--cursor` (`--cases-cursor` and `--runs-cursor` for `suites show`), and `--limit`
 (`--cases-limit`, `--runs-limit`) sets the page size.
 
-`runs list|show` and `baseline approve` are
+`runs list|show|cancel` and `baseline approve` are
 [`cayu cloud eval runs` and `cayu cloud eval baseline`](cayu-cloud.md#running-an-agents-evals),
 with the same implementation: with `--application` they give the same answers. `runs list`
 lists the default eval target's runs, or `--target-key KEY`'s, filtered by `--status`.
+`runs show` also returns a scenario run's `scenario_progress`: each trial's `phase`, and for
+a trial awaiting approval the checkpoint it waits on (`pending_event_id`) and its tool
+(`pending_tool_name`). `runs cancel` asks the server to cancel the run; its running trials
+stop and it ends `cancelled`, and cancelling a run that already ended changes nothing.
+`runs report` writes a completed run's JSON report to `--json-output FILE`, as the server
+renders it (the file `cayu eval report` and `cayu eval compare` read), and its standalone HTML
+report to `--html-output FILE`, rendered from that JSON by the renderer the server's
+`report.html` uses; a run without a completed result fails with `eval_run_unfinished`.
 `baseline approve` decides over the baseline's current generation; approving the run that is
 already the baseline changes nothing. A run of an authored suite is one execution group, so
 the approval sets that group's baseline. When its answer is lost, the error's
@@ -4193,6 +4210,35 @@ session that no longer holds the checked revision then fails with `scenario_chan
 answer fails with `outcome_unknown` and `commands.continue`. A scenario the server can't run
 now fails with `scenario_not_ready` and its diagnostics, and an operation ID that already
 admitted another run with `operation_id_conflict`.
+
+`scenario prepare-fixture REQUIREMENT_ID` is **Prepare fixture** for a file requirement that
+a check reports as `artifact_binding_required`. It takes the same scenario source and launch
+settings as `check`, and the retained file comes from the requirement's own reference or
+from `--artifact REQUIREMENT_ID=ARTIFACT_ID`. The server copies that file into a fixture of
+the scenario's environment, under an ID derived from its content, and returns the scenario
+revision whose requirement points at it; the command saves that revision to the library, as
+**Save** does, and returns it with its `preflight`. A ready revision prints `commands.run`,
+which names it with `--scenario` and leaves out the spent `--artifact`. Preparing again
+changes nothing. A requirement the scenario doesn't have fails with `requirement_not_found`,
+and a file the server can't copy, such as one no longer retained, with
+`fixture_not_prepared` and the server's reason.
+
+`scenario approve RUN_ID` and `scenario deny RUN_ID` are the run page's **Approve** and
+**Deny**: they decide the fresh tool call a trial waits on at an approval checkpoint, with
+`--reason TEXT` recorded beside the decision and its actor. The command reads the run and
+decides the checkpoint of the only trial awaiting approval, or of `--trial N`; `--event
+CHECKPOINT_ID` decides only while the trial still awaits that checkpoint, and
+`--trial-session SESSION_ID` only while the trial runs in that session, and otherwise it
+fails with `scenario_approval_changed`. The server records a decision only over the run's
+current progress revision, so a checkpoint takes one decision: a run that isn't running, or
+a trial that awaits no decision now, fails with `scenario_approval_not_pending`, and several
+awaiting trials without `--trial` with `trial_required`. When another trial changes the
+run's progress before the decision lands, the command sends it again over the new revision,
+for the same trial and checkpoint only. A lost answer fails with `outcome_unknown`,
+`commands.show` and `commands.continue`, which repeats the decision with `--trial N --event
+CHECKPOINT_ID --trial-session SESSION_ID`. Every trial of a run has the same checkpoint IDs,
+and a trial that starts over does so in a new session, so the continuation decides only the
+checkpoint the lost answer was for, and records nothing new if that decision was recorded.
 
 ### Browser acceptance profiles
 

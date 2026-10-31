@@ -107,10 +107,11 @@ make results explicitly incomparable.
 
 The run’s **Details** disclosure retains lifecycle, all six result dimensions,
 manifest, evidence, pricing and trial policies, revisions and raw JSON. Download
-JSON for automation and standalone HTML for review. The same files are
-accepted by the package CLI:
+JSON for automation and standalone HTML for review, or from a terminal write both with
+`cayu eval runs report`. The same files are accepted by the package CLI:
 
 ```console
+cayu eval runs report RUN_ID --json-output result.eval-result.json --html-output report.html
 cayu eval report result.eval-result.json --html --output report.html
 cayu eval compare baseline.eval-result.json result.eval-result.json \
   --json --output comparison.json

@@ -2,13 +2,14 @@
 terminal.
 
 These commands do what the Developer dashboard's Evals area does, through the same server
-API: list suites and runs and open one, add a finished session to a suite, approve a run as
-its suite's baseline, calibrate an AI judge (`cayu.cli._eval_calibration`) and check and run
-production scenarios (`cayu.cli._eval_scenarios`). They reach the project's running server
-(`--server-url`, `cayu serve`'s address by default) or, with `--application NAME`, a Cayu
-Cloud Agent, signed in as `cayu cloud` is. `runs` and `baseline approve` are `cayu cloud eval
-runs` and `cayu cloud eval baseline` (`cayu.cli._cloud_evals`), so with `--application` they
-answer the same.
+API: list suites and runs and open one, cancel a run and download its report, add a finished
+session to a suite, approve a run as its suite's baseline, calibrate an AI judge
+(`cayu.cli._eval_calibration`) and check, prepare, run and approve production scenarios
+(`cayu.cli._eval_scenarios`). They reach the project's running server (`--server-url`, `cayu
+serve`'s address by default) or, with `--application NAME`, a Cayu Cloud Agent, signed in as
+`cayu cloud` is. `runs list|show|cancel` and `baseline approve` are `cayu cloud eval runs` and
+`cayu cloud eval baseline` (`cayu.cli._cloud_evals`), so with `--application` they answer the
+same.
 
 `add-session` previews the addition (`POST /evals/sessions/{id}/additions/preview`) and
 publishes the plan it previewed under an idempotency key (`POST .../additions`); `--preview`
@@ -26,11 +27,13 @@ import shlex
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError
 from cayu.cli._cloud_evals import (
+    _REPORT_RECORD_TYPE,
     DEFAULT_LIST_LIMIT,
     MAX_LIST_LIMIT,
     RUN_STATUSES,
@@ -38,15 +41,20 @@ from cayu.cli._cloud_evals import (
     CloudEvalError,
     _agent_api,
     _approve_baseline,
+    _cancel_run,
     _eval_revision,
     _generation,
     _list_limit,
     _list_runs,
     _operation_id,
+    _report_summary,
+    _run_path,
     _show_run,
     _text,
+    _write_report,
     eval_api,
     render_baseline,
+    render_cancel,
     render_failure,
     render_run_detail,
     render_runs,
@@ -62,6 +70,9 @@ _REPORTED = "reported"
 # another request.
 _ADDITION_CHANGED = "The reviewed addition changed; preview it again."
 _ADDITION_KEY_CONFLICT = "The operation key is already bound to another addition."
+# The server's answer for the report of a run without a result
+# (`cayu.server._evaluation_run_routes`).
+_NO_RESULT = "Eval run has no completed result."
 
 
 def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -117,8 +128,11 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
 
     runs = commands.add_parser(
         "runs",
-        help="List eval runs, or show one.",
-        description="List an eval target's runs, or show one run's status, progress and result.",
+        help="List, show and cancel eval runs, and download a run's report.",
+        description=(
+            "List an eval target's runs, show one run's status, progress and result, cancel a "
+            "run, or download a completed run's report."
+        ),
     )
     run_actions = runs.add_subparsers(dest="eval_runs_command", required=True)
     listing = run_actions.add_parser(
@@ -144,10 +158,41 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
     show = run_actions.add_parser(
         "show",
         help="Show one eval run.",
-        description="Show one eval run: its status, progress and result.",
+        description=(
+            "Show one eval run: its status, progress and result, and for a scenario run each "
+            "trial's phase, with the checkpoint a trial awaiting approval waits on."
+        ),
     )
     show.add_argument("run_id", metavar="RUN_ID")
     _add_target_options(show, render_run_detail)
+    cancel = run_actions.add_parser(
+        "cancel",
+        help="Cancel an eval run.",
+        description=(
+            "Ask the server to cancel an eval run, as the run page's Cancel does: its running "
+            "trials stop and it ends cancelled. Cancelling a run that already ended changes "
+            "nothing."
+        ),
+    )
+    cancel.add_argument("run_id", metavar="RUN_ID")
+    _add_target_options(cancel, render_cancel)
+    report = run_actions.add_parser(
+        "report",
+        help="Download a completed run's report.",
+        description=(
+            "Download a completed run's report, as the run page's Download JSON and Download "
+            "HTML do. The JSON report is the file `cayu eval report` and `cayu eval compare` "
+            "read; the HTML report is rendered from it as `cayu eval report --html` renders it."
+        ),
+    )
+    report.add_argument("run_id", metavar="RUN_ID")
+    report.add_argument(
+        "--json-output", type=Path, metavar="FILE", help="Write the JSON report to FILE."
+    )
+    report.add_argument(
+        "--html-output", type=Path, metavar="FILE", help="Write the HTML report to FILE."
+    )
+    _add_target_options(report, render_report)
 
     addition = commands.add_parser(
         "add-session",
@@ -291,6 +336,10 @@ def run_curation_command(args: argparse.Namespace) -> int:
         print("error: output must not refer to an input file.", file=sys.stderr)
         return 1
     table = args.output_format == "table"
+    collision = _output_collision(args)
+    if collision is not None:
+        # Before --output is opened, so neither file is touched.
+        return _cloud_failure(ValueError(collision), render=render_failure if table else None)
     try:
         with output_destination(args.output):
             try:
@@ -314,6 +363,62 @@ def run_curation_command(args: argparse.Namespace) -> int:
         return 1
 
 
+# The options naming a file a command writes besides its answer (`--output`), and the ones
+# naming a file it reads (those `_output_aliases_input` protects from `--output`).
+_WRITTEN_FILES = ("json_output", "html_output")
+_READ_FILES = ("file", "input_file", "payload_file", "context", "evidence", "labels")
+
+
+def _output_collision(args: argparse.Namespace) -> str | None:
+    """Why a file the command writes is another file it writes or reads, compared by
+    identity, so that links to one file count; ``None`` when they are all different."""
+
+    written = _named_files(args, _WRITTEN_FILES)
+    if args.output is not None:
+        written.append(("--output", Path(args.output).expanduser()))
+    read = [*_named_files(args, _READ_FILES), *_cloud_context(args)]
+    for index, (option, path) in enumerate(written):
+        for other, other_path in [*written[index + 1 :], *read]:
+            if _same_file(path, other_path):
+                return f"{option} and {other} name the same file."
+    return None
+
+
+def _named_files(args: argparse.Namespace, names: Sequence[str]) -> list[tuple[str, Path]]:
+    return [
+        (f"--{name.replace('_', '-')}", Path(value).expanduser())
+        for name in names
+        if (value := getattr(args, name, None)) is not None
+    ]
+
+
+def _cloud_context(args: argparse.Namespace) -> list[tuple[str, Path]]:
+    """The Cloud context file an `--application` command signs in with, wherever it is
+    selected: `--context`, `CAYU_CLOUD_CONTEXT` or the active context."""
+
+    if getattr(args, "application", None) is None:
+        return []
+    from cayu.cli.cloud import CloudCommandError, _selected_context_path
+
+    try:
+        path = _selected_context_path(getattr(args, "context", None))
+    except CloudCommandError:
+        # No valid context is selected; signing in reports that.
+        return []
+    return [] if path is None else [("the Cloud context", path)]
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    if first.resolve() == second.resolve():
+        return True
+    try:
+        return first.samefile(second)
+    except OSError:
+        # A file that doesn't exist yet, or that can't be read, is no file already named
+        # twice; writing it reports what is wrong.
+        return False
+
+
 def _execute(args: argparse.Namespace) -> dict[str, Any]:
     from cayu.cli import _eval_calibration as calibration
     from cayu.cli import _eval_scenarios as scenarios
@@ -322,6 +427,8 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
     # Options and input files are checked before any request.
     if action == "add-session":
         _check_addition_options(args)
+    elif action == "runs" and args.eval_runs_command == "report":
+        _check_report_options(args)
     elif action == "calibrate":
         calibration_inputs = calibration.read_calibration_inputs(args)
     elif action == "scenario":
@@ -336,8 +443,12 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         elif action == "runs":
             if args.eval_runs_command == "list":
                 result = _list_runs(api, args)
-            else:
+            elif args.eval_runs_command == "show":
                 result = _show_run(api, args.run_id)
+            elif args.eval_runs_command == "cancel":
+                result = _cancel_run(api, args.run_id)
+            else:
+                result = _download_report(api, args, target=target)
             operation = f"eval.runs.{args.eval_runs_command}"
         elif action == "add-session":
             result = _add_session(api, args, target=target)
@@ -419,6 +530,77 @@ def _show_suite(api: CayuApi, args: argparse.Namespace) -> dict[str, Any]:
         "cases": None if reported else _page(detail.get("cases"), "eval suite's case list"),
         "runs": _page(detail.get("runs"), "eval suite's run list"),
     }
+
+
+def _check_report_options(args: argparse.Namespace) -> None:
+    # That the files are different files is checked before --output is opened.
+    if args.json_output is None and args.html_output is None:
+        raise ValueError("Name the report's file: --json-output FILE, --html-output FILE or both.")
+
+
+def _download_report(
+    api: CayuApi, args: argparse.Namespace, *, target: Sequence[str]
+) -> dict[str, Any]:
+    """Write the run's JSON report as the server renders it, and the HTML report rendered from
+    it by the renderer the server's own HTML report uses."""
+
+    from cayu.evals.execution import CorpusExecutionResult
+    from cayu.evals.execution_reporting import render_corpus_execution_html
+    from cayu.evals.result_presentation import eval_result_report_from_json
+
+    run_id = args.run_id
+    command = ["cayu", "eval", "runs", "report", run_id]
+    for option, path in (("--json-output", args.json_output), ("--html-output", args.html_output)):
+        if path is not None:
+            command += [option, str(path)]
+    commands = {"continue": shlex.join([*command, *target])}
+    try:
+        report = api.get(f"{_run_path(run_id)}/report.json", resource="eval report")
+    except CayuApiError as exc:
+        if exc.detail != _NO_RESULT:
+            raise
+        show = shlex.join(["cayu", "eval", "runs", "show", run_id, *target])
+        raise CloudEvalError(
+            "eval_run_unfinished",
+            f"Eval run {run_id} has no completed result, so it has no report yet. `{show}` "
+            "shows its status.",
+            status_code=exc.status_code,
+            details={"run_id": run_id, "commands": {"show": show}},
+        ) from None
+    if not isinstance(report, dict) or report.get("record_type") != _REPORT_RECORD_TYPE:
+        raise CloudEvalError(
+            "api_response_invalid", f"The server's report for eval run {run_id} is invalid."
+        )
+    summary = _report_summary(report, run_id=run_id)
+    files: dict[str, str] = {}
+    if args.json_output is not None:
+        _write_report(args.json_output, report, run_id=run_id, commands=commands)
+        files["json"] = str(args.json_output)
+    if args.html_output is not None:
+        text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        try:
+            result = eval_result_report_from_json(text).result
+        except ValueError:
+            result = None
+        if type(result) is not CorpusExecutionResult:
+            raise CloudEvalError(
+                "api_response_invalid", f"The server's report for eval run {run_id} is invalid."
+            )
+        _write_text(args.html_output, render_corpus_execution_html(result), commands=commands)
+        files["html"] = str(args.html_output)
+    return {"run_id": run_id, "summary": summary, "files": files, "commands": commands}
+
+
+def _write_text(path: Path, text: str, *, commands: Mapping[str, str]) -> None:
+    try:
+        path.write_text(text, encoding="utf-8", newline="\n")
+    except OSError as exc:
+        raise CloudEvalError(
+            "output_unwritable",
+            f"Could not write {path}: {exc.strerror or type(exc).__name__}. "
+            f"`{commands['continue']}` downloads the report again.",
+            details={"commands": dict(commands)},
+        ) from None
 
 
 def _add_session(
@@ -744,3 +926,16 @@ def render_addition(answer: Mapping[str, Any]) -> str:
         f"Added case {_text(plan['case_id'])}: {change}.{detail}\n"
         f"Suite: {_text(result['destination'])}"
     )
+
+
+def render_report(answer: Mapping[str, Any]) -> str:
+    result = answer["result"]
+    summary = result["summary"]
+    score = summary["score"]
+    lines = [
+        f"Run {_text(result['run_id'])}: {_text(summary['status'])}"
+        + ("" if score is None else f", score {score:g}")
+    ]
+    for kind, path in result["files"].items():
+        lines.append(f"{kind.upper()} report: {_text(path)}")
+    return "\n".join(lines)

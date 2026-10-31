@@ -127,13 +127,40 @@ checked revision. A ready check prints `commands.run`, which runs that revision 
 operation ID and the binding it reviewed. `run` saves the revision and admits the run, and
 its `commands.continue` repeats that admission after a lost response. Repeating either
 command answers with the run it admitted, even after a deploy, without starting a second
-one. Fixture
-preparation and checkpoint approvals stay in the Developer dashboard.
+one.
+
+A check that names a file requirement with `artifact_binding_required` needs **Prepare
+fixture**. From a terminal, name the requirement and the same scenario source:
+
+```console
+cayu eval scenario prepare-fixture REQUIREMENT_ID --session SESSION_ID
+```
+
+It copies the retained file into a reusable fixture of the scenario's environment (from the
+requirement's own reference, or `--artifact REQUIREMENT_ID=ARTIFACT_ID`), saves the scenario
+revision that uses it, and, once that revision is ready, prints `commands.run`. Preparing
+again changes nothing.
 
 During execution, the run page shows queued, running, awaiting-input,
 awaiting-approval, cancelling, and terminal trial phases. Approve or deny only
 the displayed fresh request. Cancellation is a durable server request, not a
-browser-only status change.
+browser-only status change. From a terminal, `cayu eval runs show RUN_ID` lists each trial's
+phase, and for a trial awaiting approval the tool and the checkpoint (`pending_event_id`)
+it waits on:
+
+```console
+cayu eval runs show RUN_ID
+cayu eval scenario approve RUN_ID --event CHECKPOINT_ID
+cayu eval scenario deny RUN_ID --event CHECKPOINT_ID --reason "Not the reviewed action."
+cayu eval runs cancel RUN_ID
+```
+
+`approve` and `deny` decide the checkpoint the trial awaits (`--trial N` when several do).
+`--event` decides only while the trial still awaits that checkpoint, and a checkpoint takes
+one decision. Every trial of a run has the same checkpoints, so after a lost answer run the
+error's `commands.continue`: it names the trial, its session and the checkpoint, and records
+nothing new if the decision was recorded, where the bare command would decide whichever
+trial awaits approval by then.
 
 ## Check tool and process behavior
 
@@ -266,9 +293,11 @@ repository's `docs/evals.md`.
 ## Compare and automate
 
 Captured, fresh simple, and scenario results share the same result, baseline,
-report, and comparison contracts. Download JSON/HTML from the Developer dashboard or use:
+report, and comparison contracts. Download JSON/HTML from the Developer dashboard, or from a
+terminal with `cayu eval runs report`, and use the files:
 
 ```console
+cayu eval runs report RUN_ID --json-output result.eval-result.json --html-output report.html
 cayu eval report result.eval-result.json --html --output report.html
 cayu eval compare baseline.eval-result.json result.eval-result.json \
   --json --output comparison.json
