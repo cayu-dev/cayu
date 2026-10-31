@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import gzip
 import hashlib
 import io
@@ -14,6 +15,7 @@ import stat
 import subprocess
 import tarfile
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import TypeGuard, cast
@@ -24,7 +26,6 @@ import httpx
 from cayu._operator_credentials import (
     ENVIRONMENT_AUTH_TARGETS,
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
-    LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH,
     OPERATOR_PASSWORD_VARIABLE,
     OPERATOR_USERNAME_VARIABLE,
 )
@@ -994,7 +995,10 @@ def _init_sign_in_mode(setup: ServeSetupPlan) -> str:
 def _plan_init_serve_setup(pyproject_path: Path) -> ServeSetupPlan:
     """Make sure the `cayu serve` web process init writes can start on Cloud."""
 
-    setup = plan_serve_setup(pyproject_path.read_text(), root=pyproject_path.parent)
+    root = pyproject_path.parent
+    setup = plan_serve_setup(
+        pyproject_path.read_text(), root=root, uploaded=deploy_upload_includes(root)
+    )
     if setup.manual_edits:
         edits = "\n".join(f"- {edit}" for edit in setup.manual_edits)
         raise CloudApiError(
@@ -1031,10 +1035,9 @@ def _auth_module_needs_writing(root: Path, setup: ServeSetupPlan) -> bool:
     raise CloudApiError(
         "serve_setup_required",
         "cayu cloud init writes a `cayu serve` web process, which needs an "
-        "authentication target to start outside --dev. The declared cayu requirement "
-        f"allows cayu {LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} or older, which lack "
-        f"{ENVIRONMENT_OPERATOR_AUTH_TARGET}, so init would create {module.path} for "
-        f"auth = {json.dumps(module.target)}, but {path if path.exists() else package} "
+        f"authentication target to start outside --dev. It would create {module.path} "
+        f"for auth = {json.dumps(module.target)} because "
+        f"{setup.environment_auth_unavailable}, but {path if path.exists() else package} "
         "already exists and init never replaces it. Either set [tool.cayu.serve].auth "
         "to your own auth dependency, or make these edits, run `uv lock`, and set auth = "
         f"{json.dumps(ENVIRONMENT_OPERATOR_AUTH_TARGET)}:\n"
@@ -1079,10 +1082,9 @@ def _serve_setup_report(setup: ServeSetupPlan, *, created_auth_module: bool) -> 
         notes.append(
             f"Set [tool.cayu.serve].auth to {module.target}, defined in {module.path}, "
             "which builds BasicAuth from "
-            f"{OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE}. The declared "
-            f"cayu requirement allows cayu {LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} or "
-            f"older, which lack {ENVIRONMENT_OPERATOR_AUTH_TARGET}; this module works on "
-            f"every release. Commit {module.path}. Cayu Cloud provides both variables to "
+            f"{OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE} and works on "
+            f"every release, because {setup.environment_auth_unavailable}. Commit "
+            f"{module.path}. Cayu Cloud provides both variables to "
             "each Agent; read them with `cayu cloud service credentials --application APP`. "
             "Run `cayu serve --dev` locally without them."
         )
@@ -1093,13 +1095,13 @@ def _serve_setup_report(setup: ServeSetupPlan, *, created_auth_module: bool) -> 
             "to each Agent; read them with `cayu cloud service credentials "
             "--application APP`. Run `cayu serve --dev` locally without them."
         )
-    elif setup.auth.target == ENVIRONMENT_OPERATOR_AUTH_TARGET and not (
-        setup.ships_environment_auth
+    elif (
+        setup.auth.target == ENVIRONMENT_OPERATOR_AUTH_TARGET
+        and setup.environment_auth_unavailable is not None
     ):
         notes.append(
-            f"[tool.cayu.serve].auth names {ENVIRONMENT_OPERATOR_AUTH_TARGET}, but the "
-            f"declared cayu requirement allows cayu {LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} "
-            "or older, which lack it, so `cayu serve` would not start. "
+            f"[tool.cayu.serve].auth names {ENVIRONMENT_OPERATOR_AUTH_TARGET}, but "
+            f"{setup.environment_auth_unavailable}, so `cayu serve` would not start. "
             + " ".join(setup.environment_auth_upgrade)
             + " Then run `uv lock`."
         )
@@ -1431,6 +1433,21 @@ def _archive_project(root: Path, *, required_file: Path) -> bytes:
         )
     _validate_python_build_inputs(root, bundle)
     return bundle
+
+
+def deploy_upload_includes(root: Path) -> Callable[[Path], bool]:
+    """Whether Cloud's copy of the project has a path relative to `root`.
+
+    That is a file `cayu cloud deploy` uploads, or a directory holding one. The
+    files are listed as the upload lists them, once, on the first call.
+    """
+
+    @functools.cache
+    def uploaded() -> frozenset[Path]:
+        files = _listed_project_files(root)
+        return frozenset(files).union(*(path.parents for path in files))
+
+    return lambda path: path in uploaded()
 
 
 def _listed_project_files(root: Path) -> tuple[Path, ...]:

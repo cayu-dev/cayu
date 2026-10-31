@@ -13,18 +13,16 @@ import json
 import shlex
 import sys
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from cayu._operator_credentials import (
-    ENVIRONMENT_OPERATOR_AUTH_TARGET,
-    LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH,
-)
+from cayu._operator_credentials import ENVIRONMENT_OPERATOR_AUTH_TARGET
+from cayu.cli._cloud_project import deploy_upload_includes
 from cayu.cli._serve_readiness import (
     GENERATED_AUTH_MODULE,
-    declared_runtime_ships_environment_auth,
+    environment_auth_unavailable_reason,
     environment_auth_upgrade_edits,
     is_cayu_serve_command,
     lock_installs_server_extra,
@@ -195,7 +193,8 @@ def check_serve_can_start(
     any callable auth dependency. Only the ready-made environment target, when the
     declared cayu release ships it, and the module `cayu cloud init` generates are
     accepted without importing them, because their credentials come from Cayu
-    Cloud rather than this shell.
+    Cloud rather than this shell. A cayu path source must be among the files the
+    deploy uploads.
     """
 
     pyproject = root / "pyproject.toml"
@@ -204,6 +203,7 @@ def check_serve_can_start(
         document = tomllib.loads(text)
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         return (), f"Could not read {pyproject}: {exc}"
+    uploaded = deploy_upload_includes(root)
     findings: list[ProjectDiagnostic] = []
     extra = server_extra_state(document)
     if extra.status != "present":
@@ -299,7 +299,7 @@ def check_serve_can_start(
                 path=_AUTH_PATH,
                 message="`cayu serve` refuses [tool.cayu.serve].auth unless it is a "
                 "non-empty module:attribute string.",
-                hint=_auth_setting_hint(document, root),
+                hint=_auth_setting_hint(document, root, uploaded),
             )
         )
         return tuple(findings), None
@@ -314,12 +314,13 @@ def check_serve_can_start(
                     "`cayu serve` refuses to start an unauthenticated server outside --dev, "
                     "and neither [tool.cayu.serve].auth nor --auth names a target."
                 ),
-                hint=_auth_setting_hint(document, root),
+                hint=_auth_setting_hint(document, root, uploaded),
             )
         )
     elif target == ENVIRONMENT_OPERATOR_AUTH_TARGET:
-        if not declared_runtime_ships_environment_auth(document, root=root):
-            findings.append(_environment_auth_unavailable(document, path=path))
+        unavailable = environment_auth_unavailable_reason(document, root=root, uploaded=uploaded)
+        if unavailable is not None:
+            findings.append(_environment_auth_unavailable(document, unavailable, path=path))
     elif not _is_generated_auth_module(root, target):
         finding, reason = _resolve_auth_target(root, target, path=path)
         if finding is not None:
@@ -327,8 +328,11 @@ def check_serve_can_start(
     return tuple(findings), reason
 
 
-def _auth_setting_hint(document: Mapping[str, Any], root: Path) -> str:
-    if declared_runtime_ships_environment_auth(document, root=root):
+def _auth_setting_hint(
+    document: Mapping[str, Any], root: Path, uploaded: Callable[[Path], bool]
+) -> str:
+    unavailable = environment_auth_unavailable_reason(document, root=root, uploaded=uploaded)
+    if unavailable is None:
         return (
             f'Set auth = "{ENVIRONMENT_OPERATOR_AUTH_TARGET}" (or your own auth '
             "dependency) under [tool.cayu.serve], or run `cayu cloud init --force`."
@@ -336,9 +340,8 @@ def _auth_setting_hint(document: Mapping[str, Any], root: Path) -> str:
     module = GENERATED_AUTH_MODULE
     return (
         f"Run `cayu cloud init --force`, which writes {module.path} and sets auth = "
-        f"{json.dumps(module.target)} because the declared cayu requirement allows "
-        f"{LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} or older, or set [tool.cayu.serve].auth "
-        "to your own auth dependency."
+        f"{json.dumps(module.target)} because {unavailable}, or set "
+        "[tool.cayu.serve].auth to your own auth dependency."
     )
 
 
@@ -363,15 +366,16 @@ def _dev_finding(host: str) -> ProjectDiagnostic:
     )
 
 
-def _environment_auth_unavailable(document: Mapping[str, Any], *, path: str) -> ProjectDiagnostic:
+def _environment_auth_unavailable(
+    document: Mapping[str, Any], unavailable: str, *, path: str
+) -> ProjectDiagnostic:
     module = GENERATED_AUTH_MODULE
     return _serve_diagnostic(
         "SERVE_AUTH_TARGET_UNRESOLVABLE",
         path=path,
         message=(
             f"`cayu serve` cannot load its auth target {ENVIRONMENT_OPERATOR_AUTH_TARGET}: "
-            "the declared cayu requirement allows cayu "
-            f"{LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} or older, which do not ship that module."
+            f"{unavailable}."
         ),
         hint=" ".join(environment_auth_upgrade_edits(document))
         + " Then run `uv lock`. Or point the auth target at a project module that builds "

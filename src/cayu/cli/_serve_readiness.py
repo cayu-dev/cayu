@@ -7,20 +7,25 @@ they work where the server extra is not installed locally.
 
 The ready-made target `cayu.server.environment_auth:OPERATOR_BASIC_AUTH` exists
 only in releases newer than 0.8.1. It is chosen only when the declared `cayu`
-requirement guarantees such a release; otherwise a small project module composes
-`BasicAuth` from the same variables, which every released version supports.
+requirement guarantees such a release, or when a local path source inside the
+project ships the module; otherwise a small project module composes `BasicAuth`
+from the same variables, which every released version supports.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import shlex
+import tarfile
 import tomllib
-from collections.abc import Mapping
+import zipfile
+import zlib
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
 from cayu._operator_credentials import (
@@ -40,6 +45,31 @@ _VERSION = re.compile(r"v?(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)(?P<suff
 _SERVE_HEADER = re.compile(r"^\[\s*tool\s*\.\s*cayu\s*\.\s*serve\s*\][ \t]*(?:#[^\n]*)?$", re.M)
 # Each of these runtime extras includes every dependency in the server extra.
 _SERVER_RUNTIME_EXTRAS = frozenset({"server", "server-settings", "all", "oidc"})
+_ENVIRONMENT_AUTH_MODULE = ENVIRONMENT_OPERATOR_AUTH_TARGET.partition(":")[0]
+# The module's file inside a wheel, and inside a source tree or the top directory
+# of a source distribution, with or without a `src` layout.
+_ENVIRONMENT_AUTH_FILE = PurePosixPath(*_ENVIRONMENT_AUTH_MODULE.split(".")).with_suffix(".py")
+_SOURCE_TREE_ENVIRONMENT_AUTH_FILES = (
+    PurePosixPath("src") / _ENVIRONMENT_AUTH_FILE,
+    _ENVIRONMENT_AUTH_FILE,
+)
+_LEADS_OUTSIDE = (
+    "leads outside the project directory, and Cayu Cloud receives only the project's files"
+)
+# Linux's own limit on symlinks followed in one path lookup.
+_SYMLINK_LIMIT = 40
+# What zipfile and tarfile raise while listing a damaged archive, which then
+# does not count as shipping the module.
+_ARCHIVE_ERRORS = (
+    OSError,
+    EOFError,
+    ValueError,
+    NotImplementedError,
+    zipfile.BadZipFile,
+    tarfile.TarError,
+    # tarfile wraps zlib errors in a member header, not in the data it seeks past.
+    zlib.error,
+)
 
 ServerExtraStatus = Literal[
     "present",
@@ -123,9 +153,9 @@ class ServeSetupPlan:
     `auth_module` is the project module the added auth target names, when the
     declared runtime does not guarantee the ready-made target. The caller writes
     it and must refuse rather than overwrite a different existing file.
-    `ships_environment_auth` says whether the declared runtime guarantees the
-    ready-made target, and `environment_auth_upgrade` lists the requirement edits
-    it needs otherwise.
+    `environment_auth_unavailable` says why the declared runtime does not
+    guarantee the ready-made target (None when it does), and
+    `environment_auth_upgrade` lists the edits it needs then.
     """
 
     server_extra: ServerExtraState
@@ -135,7 +165,7 @@ class ServeSetupPlan:
     manual_edits: tuple[str, ...]
     auth_target: str | None = None
     auth_module: GeneratedAuthModule | None = None
-    ships_environment_auth: bool = True
+    environment_auth_unavailable: str | None = None
     environment_auth_upgrade: tuple[str, ...] = ()
 
     @property
@@ -200,7 +230,9 @@ def serve_auth_state(document: Mapping[str, Any]) -> ServeAuthState:
     return ServeAuthState("configured", target=target.strip())
 
 
-def plan_serve_setup(text: str, *, root: Path | None = None) -> ServeSetupPlan:
+def plan_serve_setup(
+    text: str, *, root: Path | None = None, uploaded: Callable[[Path], bool] | None = None
+) -> ServeSetupPlan:
     """Plan the smallest safe `pyproject.toml` edit that lets `cayu serve` start.
 
     An existing auth target is never replaced. A missing one becomes the
@@ -209,6 +241,7 @@ def plan_serve_setup(text: str, *, root: Path | None = None) -> ServeSetupPlan:
     which composes `BasicAuth` and works on every release. Edits are made only
     when the re-parsed result equals the original document plus the intended
     values; anything else becomes a manual edit for the caller to report.
+    `root` and `uploaded` are as for `environment_auth_unavailable_reason`.
     """
 
     document = tomllib.loads(text)
@@ -237,20 +270,22 @@ def plan_serve_setup(text: str, *, root: Path | None = None) -> ServeSetupPlan:
 
     # The ready-made target is named only when every release the project may
     # install ships it; otherwise a project module composes BasicAuth directly.
-    ships_environment_auth = declared_runtime_ships_environment_auth(document, root=root)
-    auth_module = None if ships_environment_auth else GENERATED_AUTH_MODULE
+    environment_auth_unavailable = environment_auth_unavailable_reason(
+        document, root=root, uploaded=uploaded
+    )
+    auth_module = None if environment_auth_unavailable is None else GENERATED_AUTH_MODULE
     auth_target = ENVIRONMENT_OPERATOR_AUTH_TARGET if auth_module is None else auth_module.target
     if auth.status == "missing":
         added = _add_auth_target(updated, auth_target)
         if added is None:
-            manual.append(serve_auth_edit(document, ships_environment_auth))
+            manual.append(serve_auth_edit(document, environment_auth_unavailable))
         else:
             updated = added
             cayu = expected.setdefault("tool", {}).setdefault("cayu", {})
             cayu.setdefault("serve", {})["auth"] = auth_target
             changes.append(f"[tool.cayu.serve].auth = {json.dumps(auth_target)}")
     elif auth.status == "invalid":
-        manual.append(serve_auth_edit(document, ships_environment_auth))
+        manual.append(serve_auth_edit(document, environment_auth_unavailable))
 
     if changes and not manual:
         try:
@@ -265,7 +300,7 @@ def plan_serve_setup(text: str, *, root: Path | None = None) -> ServeSetupPlan:
         if extra.status != "present":
             manual.append(server_extra_edit(extra))
         if auth.status in {"missing", "invalid"}:
-            manual.append(serve_auth_edit(document, ships_environment_auth))
+            manual.append(serve_auth_edit(document, environment_auth_unavailable))
         changes = []
     adds_auth = auth.status == "missing" and bool(changes)
     return ServeSetupPlan(
@@ -276,9 +311,9 @@ def plan_serve_setup(text: str, *, root: Path | None = None) -> ServeSetupPlan:
         manual_edits=tuple(manual),
         auth_target=auth_target if adds_auth else None,
         auth_module=auth_module if adds_auth else None,
-        ships_environment_auth=ships_environment_auth,
+        environment_auth_unavailable=environment_auth_unavailable,
         environment_auth_upgrade=(
-            () if ships_environment_auth else environment_auth_upgrade_edits(document)
+            () if environment_auth_unavailable is None else environment_auth_upgrade_edits(document)
         ),
     )
 
@@ -296,32 +331,46 @@ def requirement_ships_environment_auth(requirement: str) -> bool:
     )
 
 
-def declared_runtime_ships_environment_auth(
-    document: Mapping[str, Any], *, root: Path | None = None
-) -> bool:
-    """Whether the declared `cayu` runtime guarantees `cayu.server.environment_auth`.
+def environment_auth_unavailable_reason(
+    document: Mapping[str, Any],
+    *,
+    root: Path | None = None,
+    uploaded: Callable[[Path], bool] | None = None,
+) -> str | None:
+    """Why the declared `cayu` runtime may lack `cayu.server.environment_auth`.
 
-    The `cayu` requirements in `[project].dependencies`, or the uv overrides that
-    replace them, must exclude every release up to and including 0.8.1. When
-    `[tool.uv.sources]` installs `cayu` from elsewhere, only a local path source
-    under `root` that contains the module counts.
+    Returns None when it guarantees the module: the `cayu` requirements in
+    `[project].dependencies`, or the uv overrides that replace them, exclude every
+    release up to and including 0.8.1. When `[tool.uv.sources]` installs `cayu`
+    from elsewhere, only a local path source inside `root` counts: a source
+    tree, wheel, or `.tar.gz` source distribution that contains the module, named
+    by a relative path that, with any symlinks on the way, stays inside `root`.
+    `uploaded`, when given, says whether Cayu Cloud receives a file (a path
+    relative to `root`); the archive or the source tree's module file, and every
+    directory and symlink on the way to it, must be among them. Otherwise returns a lowercase
+    clause naming the cause, for messages.
     """
 
     project = document.get("project")
     dependencies = project.get("dependencies") if isinstance(project, Mapping) else None
     requirements = _cayu_requirements(dependencies)
     if not requirements:
-        return False
+        return "[project].dependencies does not declare cayu"
     uv = _uv_settings(document)
     source = _cayu_source(uv.get("sources"))
     if source is not None:
-        return _path_source_ships_environment_auth(source, root)
+        return _path_source_unavailable_reason(source, root, uploaded)
     effective = _cayu_requirements(uv.get("override-dependencies")) or requirements
     unconditional = [item for item in effective if not _requirement_marker(item)]
     # Requirements combine, so one unconditional guarantee is enough; conditional
     # ones guarantee it only when all of them do.
-    return any(requirement_ships_environment_auth(item) for item in unconditional) or all(
+    if any(requirement_ships_environment_auth(item) for item in unconditional) or all(
         requirement_ships_environment_auth(item) for item in effective
+    ):
+        return None
+    return (
+        f"the declared cayu requirement allows cayu {LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} "
+        f"or older, which lack {_ENVIRONMENT_AUTH_MODULE}"
     )
 
 
@@ -359,7 +408,16 @@ def environment_auth_upgrade_edits(document: Mapping[str, Any]) -> tuple[str, ..
             edits.append(
                 f"In {location}, change {json.dumps(requirement)} to {json.dumps(replacement)}."
             )
-    if _cayu_source(uv.get("sources")) is not None:
+    source = _cayu_source(uv.get("sources"))
+    if source is not None and _source_path(source) is not None:
+        edits.append(
+            "Point the cayu path source in [tool.uv.sources] at a cayu wheel, source "
+            f"distribution, or source tree inside the project that contains "
+            f"{_ENVIRONMENT_AUTH_MODULE} (any release newer than "
+            f"{LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH}), or remove "
+            "the cayu entry so a released cayu is installed."
+        )
+    elif source is not None:
         edits.append(
             "Remove the cayu entry from [tool.uv.sources] so a released cayu is installed."
         )
@@ -436,8 +494,8 @@ def server_extra_edit(extra: ServerExtraState) -> str:
     )
 
 
-def serve_auth_edit(document: Mapping[str, Any], ships_environment_auth: bool) -> str:
-    if ships_environment_auth:
+def serve_auth_edit(document: Mapping[str, Any], environment_auth_unavailable: str | None) -> str:
+    if environment_auth_unavailable is None:
         return (
             "Set [tool.cayu.serve].auth to an authentication target, for example:\n"
             "[tool.cayu.serve]\n"
@@ -446,14 +504,14 @@ def serve_auth_edit(document: Mapping[str, Any], ships_environment_auth: bool) -
     module = GENERATED_AUTH_MODULE
     upgrade = " ".join(environment_auth_upgrade_edits(document))
     return (
-        "Set [tool.cayu.serve].auth to an authentication target. The declared cayu "
-        f"requirement allows cayu {LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} or older, which "
-        f"lack {ENVIRONMENT_OPERATOR_AUTH_TARGET}, so either add {module.path} with "
+        "Set [tool.cayu.serve].auth to an authentication target. "
+        f"{ENVIRONMENT_OPERATOR_AUTH_TARGET} is not guaranteed because "
+        f"{environment_auth_unavailable}, so either add {module.path} with "
         f"`OPERATOR_BASIC_AUTH = BasicAuth(username=..., password=...)` built from "
         f"{OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE} and set:\n"
         "[tool.cayu.serve]\n"
         f"auth = {json.dumps(module.target)}\n"
-        f"or require a newer cayu ({upgrade}) and set:\n"
+        f"or install a cayu that ships it ({upgrade}) and set:\n"
         "[tool.cayu.serve]\n"
         f"auth = {json.dumps(ENVIRONMENT_OPERATOR_AUTH_TARGET)}"
     )
@@ -522,15 +580,139 @@ def _cayu_source(table: object) -> object | None:
     return None
 
 
-def _path_source_ships_environment_auth(source: object, root: Path | None) -> bool:
+def _source_path(source: object) -> str | None:
     path = cast("Mapping[str, object]", source).get("path") if isinstance(source, Mapping) else None
-    if root is None or not isinstance(path, str):
-        return False
-    checkout = root / path
-    return any(
-        (checkout / prefix / "cayu" / "server" / "environment_auth.py").is_file()
-        for prefix in ("src", ".")
+    return path if isinstance(path, str) else None
+
+
+def _path_source_unavailable_reason(
+    source: object, root: Path | None, uploaded: Callable[[Path], bool] | None
+) -> str | None:
+    """Why a `[tool.uv.sources]` cayu entry may lack the module, or None when it ships it."""
+
+    path = _source_path(source)
+    if path is None:
+        return (
+            "[tool.uv.sources] installs cayu from a source that is not a local path, "
+            f"which the check cannot inspect for {_ENVIRONMENT_AUTH_MODULE}"
+        )
+    described = f"the cayu path source {json.dumps(path)} in [tool.uv.sources]"
+    if root is None:
+        return f"{described} was not checked for {_ENVIRONMENT_AUTH_MODULE}"
+    if Path(path).is_absolute():
+        # uv.lock records it as written, and Cayu Cloud builds the project elsewhere.
+        return f"{described} is an absolute path, which exists only on this machine"
+    project = root.resolve()
+    route = _follow_in_project(project, Path(path))
+    if isinstance(route, str):
+        return f"{described} {route}"
+    evidence = _environment_auth_evidence(project, route, Path(path).name)
+    if evidence is None:
+        return f"{described} does not contain {_ENVIRONMENT_AUTH_MODULE}"
+    if uploaded is None:
+        return None
+    # Name the deepest entry the copy lacks; it is the most specific.
+    missing = next((item for item in reversed(evidence) if not uploaded(item)), None)
+    if missing is None:
+        return None
+    return (
+        f"{described} contains {_ENVIRONMENT_AUTH_MODULE}, but Cayu Cloud would not "
+        f"receive {missing.as_posix()}: Git ignores it, or it is under a directory "
+        "`cayu cloud deploy` never uploads, such as dist or build"
     )
+
+
+@dataclass(frozen=True)
+class _Route:
+    """Where a path inside the project leads, as Cayu Cloud's copy of it would follow it."""
+
+    # The path reached, relative to the project, without symlinks.
+    reached: Path
+    # The directories entered and symlinks followed on the way, which the copy
+    # must hold too; it holds symlinks as they are.
+    passed: tuple[Path, ...]
+
+
+def _follow_in_project(project: Path, relative: Path) -> _Route | str:
+    """Follow a relative path from `project` one component at a time.
+
+    The deploy uploads symlinks as they are, so each symlink on the way must be
+    relative and lead somewhere inside `project`. Every directory entered must
+    exist, even one a later `..` leaves again. Returns the route, or a clause
+    saying why there is none.
+    """
+
+    reached = Path()
+    passed: list[Path] = []
+    links = 0
+    pending = list(relative.parts)
+    while pending:
+        part = pending.pop(0)
+        if part == "..":
+            if reached == Path():
+                return _LEADS_OUTSIDE
+            reached = reached.parent
+            continue
+        step = reached / part
+        if not (project / step).is_symlink():
+            if pending:
+                if not (project / step).is_dir():
+                    return f"goes through {step.as_posix()}, which is not a directory"
+                passed.append(step)
+            reached = step
+            continue
+        if links == _SYMLINK_LIMIT:
+            return "goes through a symlink loop"
+        links += 1
+        passed.append(step)
+        try:
+            target = Path(os.readlink(project / step))
+        except OSError:
+            return "goes through a symlink that cannot be read"
+        if target.is_absolute():
+            return _LEADS_OUTSIDE
+        pending[:0] = target.parts
+    return _Route(reached, tuple(passed))
+
+
+def _environment_auth_evidence(
+    project: Path, route: _Route, declared_name: str
+) -> tuple[Path, ...] | None:
+    """The files that show a path source ships the module, relative to `project`.
+
+    For a source tree, that is the module file; for a wheel or `.tar.gz` sdist that
+    contains the module, the archive. Each comes with the directories and symlinks
+    on the way to it. Like uv, the declared file name, not a symlink
+    target's, says which kind of archive it is. Archives are read by member name
+    only; nothing is extracted or imported.
+    """
+
+    location = project / route.reached
+    if location.is_dir():
+        for relative in _SOURCE_TREE_ENVIRONMENT_AUTH_FILES:
+            module = _follow_in_project(project, route.reached / relative)
+            if not isinstance(module, str) and (project / module.reached).is_file():
+                return (*route.passed, *module.passed, module.reached)
+        return None
+    name = declared_name.lower()
+    try:
+        if name.endswith(".whl"):
+            with zipfile.ZipFile(location) as wheel:
+                found = _ENVIRONMENT_AUTH_FILE.as_posix() in wheel.namelist()
+        elif name.endswith(".tar.gz"):
+            # An sdist holds one top directory, `{name}-{version}/`, around the source tree.
+            with tarfile.open(location, "r:gz") as sdist:
+                found = any(
+                    member.isfile()
+                    and PurePosixPath(*PurePosixPath(member.name).parts[1:])
+                    in _SOURCE_TREE_ENVIRONMENT_AUTH_FILES
+                    for member in sdist
+                )
+        else:
+            found = False
+    except _ARCHIVE_ERRORS:
+        found = False
+    return (*route.passed, route.reached) if found else None
 
 
 def _cayu_requirements(items: object) -> list[str]:

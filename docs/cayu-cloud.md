@@ -144,15 +144,23 @@ Outside `--dev`, the `cayu serve` command needs the `server` extra of `cayu` and
   `CAYU_OPERATOR_PASSWORD`, which Cayu Cloud provides to each Agent. Read them with
   `cayu cloud service credentials --application APP`.
 - That module ships only in cayu releases newer than 0.8.1. When the `cayu`
-  requirement still allows 0.8.1 or older (for example `cayu[postgres]==0.8.1`,
-  `cayu>=0.8`, or a `[tool.uv.sources]` entry), init instead creates
+  requirement still allows 0.8.1 or older (for example `cayu[postgres]==0.8.1` or
+  `cayu>=0.8`), or a `[tool.uv.sources]` entry installs cayu from somewhere that
+  can't be shown to contain the module, init instead creates
   `server_auth.py`, which builds `BasicAuth` from the same two variables and works
   on every release, and sets `auth = "server_auth:OPERATOR_BASIC_AUTH"`.
   `result.serve.auth_module` reports it; commit it with `pyproject.toml`. Init never
   replaces an existing `server_auth.py` or `server_auth/`; it refuses instead and
   lists the requirement edits (including development pins) that would let you use
   the ready-made target. After the project requires a newer release you can switch
-  to the ready-made target and delete the file.
+  to the ready-made target and delete the file. A `[tool.uv.sources]` path source
+  counts only when it is a wheel, a `.tar.gz` source distribution, or a source tree
+  that contains `cayu/server/environment_auth.py`; archives are read by file name
+  only. Its path must be relative and stay inside the project, and any symlink on
+  the way must be relative and stay inside it too, since Cloud builds a copy of the
+  project somewhere else. The deploy must [upload](#what-a-deploy-uploads) that
+  archive or module file and each of those symlinks. A git, URL, or index source
+  never counts.
 - An existing auth target is never replaced; init reports that it left it alone.
   A project with a `service_factory` keeps its own product and Developer dashboard access.
 
@@ -1466,13 +1474,14 @@ and don't need `cayu[server]` installed locally:
 | `SERVE_RELOAD_MODE` | The web command passes development-only `--reload`. Remove it before deploying; Cloud must not run the file watcher or restart on source edits. |
 | `SERVE_DEV_MODE` | The web command passes `--dev`. `cayu serve` refuses it on a non-loopback host such as `0.0.0.0`, and on loopback it is unauthenticated and unreachable from Cloud. |
 | `SERVE_AUTH_MISSING` | Neither `--auth` nor `[tool.cayu.serve].auth` names a target and there is no `service_factory`, or `[tool.cayu.serve].auth` is not a non-empty string (which `cayu serve` rejects even with `--auth`). |
-| `SERVE_AUTH_TARGET_UNRESOLVABLE` | The effective target's project module or attribute doesn't exist, it isn't callable, or it is the ready-made target and the declared `cayu` requirement allows 0.8.1 or older, which don't ship it. |
+| `SERVE_AUTH_TARGET_UNRESOLVABLE` | The effective target's project module or attribute doesn't exist, it isn't callable, or it is the ready-made target and the declared runtime may not ship it: the `cayu` requirement allows 0.8.1 or older, or the `[tool.uv.sources]` entry for `cayu` isn't an uploaded path source inside the project that contains the module. The message names which. |
 | `SERVE_AUTH_WITH_SERVICE_FACTORY` | A public service also sets `[tool.cayu.serve].auth` or `--auth`, which `cayu serve` rejects. |
 
 Any callable auth dependency is accepted, not only Basic auth. The ready-made
 `cayu.server.environment_auth:OPERATOR_BASIC_AUTH` target is accepted by name without
 reading `CAYU_OPERATOR_USERNAME` or `CAYU_OPERATOR_PASSWORD`, because Cloud provides
-them, but only when the declared `cayu` requirement excludes 0.8.1 and older. The
+them, but only when the declared `cayu` requirement excludes 0.8.1 and older, or a
+`[tool.uv.sources]` path source inside the project, which the deploy uploads, ships the module. The
 unmodified `server_auth.py` that `cayu cloud init` writes is accepted by name for the
 same reason. Any other target is imported in the project context; if it can't be loaded here
 for another reason, such as an environment variable or package only Cloud has, the

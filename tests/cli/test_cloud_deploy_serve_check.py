@@ -8,7 +8,9 @@ accepts any auth dependency, not only Basic auth.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -16,12 +18,15 @@ from typing import Any, cast
 import pytest
 
 from cayu.cli import cloud as cloud_cli
+from cayu.cli import scaffold
 from cayu.cli._cloud_deploy_check import check_serve_can_start, run_cloud_deploy_check
 from cayu.cli._serve_readiness import GENERATED_AUTH_MODULE
 from cayu.cli.scaffold import project_files
 
 _SERVE = "cayu serve --host 0.0.0.0 --port 8000"
 _TARGET = "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"
+_MODULE_FILE = "cayu/server/environment_auth.py"
+_WHEEL = "vendor/cayu-0.16.3-py3-none-any.whl"
 
 
 @pytest.fixture(autouse=True)
@@ -68,18 +73,49 @@ def _codes(root: Path) -> tuple[str, tuple[str, ...]]:
     return check.status, check.codes
 
 
-@pytest.mark.parametrize("preset", ("agent", "coding"))
-def test_a_fresh_scaffold_passes_without_local_operator_credentials(
-    tmp_path: Path, preset: str
-) -> None:
+def _write_scaffold(root: Path, *, preset: str) -> None:
     for relative, content in project_files("smoke-agent", preset=preset).items():
-        path = tmp_path / relative
+        path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.parametrize("preset", ("agent", "coding"))
+def test_a_fresh_scaffold_passes_without_local_operator_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preset: str
+) -> None:
+    # A release install pins the release it scaffolds with.
+    monkeypatch.setattr(scaffold, "_cayu_source_checkout", lambda: None)
+    monkeypatch.setattr(scaffold, "_installed_cayu_version", lambda: "0.16.3")
+    _write_scaffold(tmp_path, preset=preset)
 
     assert _codes(tmp_path) == ("passed", ())
     # The environment target is accepted by name; Cloud supplies its credentials.
     assert "cayu.server.environment_auth" not in sys.modules
+
+
+def test_a_scaffold_from_a_source_checkout_points_outside_the_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "cayu"
+    (checkout / "src" / "cayu" / "server").mkdir(parents=True)
+    (checkout / "src" / _MODULE_FILE).write_text("")
+    monkeypatch.setattr(
+        scaffold,
+        "_cayu_source_checkout",
+        lambda: scaffold._CayuSourceCheckout(root=checkout, version="0.16.3"),
+    )
+    project = tmp_path / "agent"
+    _write_scaffold(project, preset="agent")
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=_SERVE)
+
+    # Cloud receives only the project directory, so the checkout is not there.
+    assert check.codes == ("SERVE_AUTH_TARGET_UNRESOLVABLE",)
+    assert (
+        f"the cayu path source {json.dumps(str(checkout))} in [tool.uv.sources] is an "
+        "absolute path, which exists only on this machine"
+    ) in check.blocking[0].message
 
 
 def test_missing_auth_target_blocks_with_the_edit_to_make(tmp_path: Path) -> None:
@@ -404,6 +440,188 @@ def test_the_ready_made_target_needs_a_runtime_that_ships_it(tmp_path: Path, com
     )
     assert "server_auth.py" in (finding.hint or "")
     assert "cayu.server.environment_auth" not in sys.modules
+
+
+def _vendored_project(root: Path, source: str) -> Path:
+    """The project shape that bundles a Cayu build and installs it by path."""
+
+    project = _project(root, dependencies='["cayu[postgres,server]>=0.16.1"]')
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text() + f"\n[tool.uv.sources]\ncayu = {{ path = {json.dumps(source)} }}\n",
+        encoding="utf-8",
+    )
+    return project
+
+
+def _wheel(path: Path, *members: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as wheel:
+        for member in members:
+            wheel.writestr(member, "")
+
+
+def test_a_vendored_wheel_that_ships_the_module_passes(tmp_path: Path) -> None:
+    project = _vendored_project(tmp_path, _WHEEL)
+    _wheel(project / _WHEEL, "cayu/__init__.py", _MODULE_FILE)
+
+    assert _codes(project) == ("passed", ())
+    assert "cayu.server.environment_auth" not in sys.modules
+
+
+def test_a_vendored_wheel_without_the_module_names_the_path_source(tmp_path: Path) -> None:
+    project = _vendored_project(tmp_path, _WHEEL)
+    _wheel(project / _WHEEL, "cayu/__init__.py", "cayu/server/app.py")
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=_SERVE)
+
+    assert check.codes == ("SERVE_AUTH_TARGET_UNRESOLVABLE",)
+    finding = check.blocking[0]
+    assert finding.message == (
+        f"`cayu serve` cannot load its auth target {_TARGET}: the cayu path source "
+        f'"{_WHEEL}" in [tool.uv.sources] does not contain cayu.server.environment_auth.'
+    )
+    hint = finding.hint or ""
+    assert hint.startswith(
+        "Point the cayu path source in [tool.uv.sources] at a cayu wheel, source "
+        "distribution, or source tree inside the project that contains "
+        "cayu.server.environment_auth"
+    )
+    assert "server_auth.py" in hint
+    assert "0.8.1 or older" not in finding.message + hint
+
+
+def test_a_vendored_wheel_left_out_of_the_upload_is_refused(tmp_path: Path) -> None:
+    # A deploy never uploads dist/ or build/, even when Git tracks them.
+    project = _vendored_project(tmp_path, "dist/cayu-0.16.3-py3-none-any.whl")
+    _wheel(project / "dist" / "cayu-0.16.3-py3-none-any.whl", _MODULE_FILE)
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=_SERVE)
+
+    assert check.codes == ("SERVE_AUTH_TARGET_UNRESOLVABLE",)
+    assert check.blocking[0].message == (
+        f"`cayu serve` cannot load its auth target {_TARGET}: the cayu path source "
+        '"dist/cayu-0.16.3-py3-none-any.whl" in [tool.uv.sources] contains '
+        "cayu.server.environment_auth, but Cayu Cloud would not receive "
+        "dist/cayu-0.16.3-py3-none-any.whl: Git ignores it, or it is under a directory "
+        "`cayu cloud deploy` never uploads, such as dist or build."
+    )
+
+
+def test_a_git_ignored_vendored_wheel_is_refused_until_it_is_tracked(tmp_path: Path) -> None:
+    project = _vendored_project(tmp_path, _WHEEL)
+    _wheel(project / _WHEEL, _MODULE_FILE)
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / ".gitignore").write_text("*.whl\n")
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=_SERVE)
+
+    assert check.codes == ("SERVE_AUTH_TARGET_UNRESOLVABLE",)
+    assert f"Cayu Cloud would not receive {_WHEEL}: Git ignores it" in check.blocking[0].message
+    subprocess.run(["git", "-C", str(project), "add", "-f", _WHEEL], check=True)
+    assert _codes(project) == ("passed", ())
+
+
+@pytest.mark.parametrize(
+    ("ignored", "missing"),
+    [
+        # The symlink uv installs from is ignored, though the wheel it names is not.
+        ("vendor/\n", _WHEEL),
+        # The wheel is ignored, though the symlink to it is not.
+        ("wheels/\n", "wheels/cayu-0.16.3-py3-none-any.whl"),
+    ],
+    ids=["symlink-ignored", "wheel-ignored"],
+)
+def test_every_symlink_and_file_on_the_way_must_be_uploaded(
+    tmp_path: Path, ignored: str, missing: str
+) -> None:
+    project = _vendored_project(tmp_path, _WHEEL)
+    _wheel(project / "wheels" / "cayu-0.16.3-py3-none-any.whl", _MODULE_FILE)
+    (project / "vendor").mkdir()
+    (project / _WHEEL).symlink_to("../wheels/cayu-0.16.3-py3-none-any.whl")
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / ".gitignore").write_text(ignored)
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=_SERVE)
+
+    assert check.codes == ("SERVE_AUTH_TARGET_UNRESOLVABLE",)
+    assert f"Cayu Cloud would not receive {missing}: Git ignores it" in check.blocking[0].message
+    (project / ".gitignore").write_text("")
+    assert _codes(project) == ("passed", ())
+
+
+def test_a_directory_a_symlink_passes_through_must_be_in_the_upload(tmp_path: Path) -> None:
+    project = _vendored_project(tmp_path, _WHEEL)
+    _wheel(project / "wheels" / "cayu-0.16.3-py3-none-any.whl", _MODULE_FILE)
+    (project / "vendor").mkdir()
+    (project / _WHEEL).symlink_to("../empty/../wheels/cayu-0.16.3-py3-none-any.whl")
+    # An empty directory holds no uploaded file, so Cloud's copy lacks it.
+    (project / "empty").mkdir()
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=_SERVE)
+
+    assert check.codes == ("SERVE_AUTH_TARGET_UNRESOLVABLE",)
+    assert "Cayu Cloud would not receive empty: Git ignores it" in check.blocking[0].message
+    (project / "empty" / "README").write_text("")
+    assert _codes(project) == ("passed", ())
+
+
+def test_a_source_tree_whose_module_file_is_not_uploaded_is_refused(tmp_path: Path) -> None:
+    project = _vendored_project(tmp_path, "vendor/cayu")
+    module = project / "vendor" / "cayu" / "src" / _MODULE_FILE
+    module.parent.mkdir(parents=True)
+    module.write_text("")
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / ".gitignore").write_text("vendor/cayu/src/\n")
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=_SERVE)
+
+    assert check.codes == ("SERVE_AUTH_TARGET_UNRESOLVABLE",)
+    assert (
+        "Cayu Cloud would not receive vendor/cayu/src/cayu/server/environment_auth.py"
+    ) in check.blocking[0].message
+
+
+def test_a_missing_auth_target_hint_names_the_path_source(tmp_path: Path) -> None:
+    project = _vendored_project(tmp_path, _WHEEL)
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text().replace(f'\n[tool.cayu.serve]\nauth = "{_TARGET}"\n', "")
+    )
+    _wheel(project / _WHEEL, "cayu/__init__.py")
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=_SERVE)
+
+    assert check.codes == ("SERVE_AUTH_MISSING",)
+    assert (
+        f'because the cayu path source "{_WHEEL}" in [tool.uv.sources] does not contain '
+        "cayu.server.environment_auth"
+    ) in (check.blocking[0].hint or "")
+
+
+def test_a_path_source_outside_the_project_is_refused(tmp_path: Path) -> None:
+    project = _vendored_project(tmp_path / "agent", "../cayu")
+    module = tmp_path / "cayu" / "src" / _MODULE_FILE
+    module.parent.mkdir(parents=True)
+    module.write_text("")
+
+    check = run_cloud_deploy_check(project, serves_web=True, web_command=_SERVE)
+
+    assert check.codes == ("SERVE_AUTH_TARGET_UNRESOLVABLE",)
+    assert check.blocking[0].message == (
+        f"`cayu serve` cannot load its auth target {_TARGET}: the cayu path source "
+        '"../cayu" in [tool.uv.sources] leads outside the project directory, and Cayu '
+        "Cloud receives only the project's files."
+    )
+
+
+def test_a_source_tree_inside_the_project_still_passes(tmp_path: Path) -> None:
+    project = _vendored_project(tmp_path, "vendor/cayu")
+    module = project / "vendor" / "cayu" / "src" / _MODULE_FILE
+    module.parent.mkdir(parents=True)
+    module.write_text("")
+
+    assert _codes(project) == ("passed", ())
 
 
 def test_the_module_init_generates_is_accepted_without_local_credentials(tmp_path: Path) -> None:
