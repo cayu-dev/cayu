@@ -32,7 +32,7 @@ from urllib.parse import quote
 
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError
 from cayu.cli._cloud_evals import CloudEvalError, _eval_revision, _positive_count, _text
-from cayu.cli._eval_curation import _REPORTED, _diagnosed_refusal
+from cayu.cli._eval_curation import _diagnosed_refusal, _suite_identity
 
 # The dashboard workbench's defaults (`newJudgeCalibrationDraft`): three judge calls, and
 # ids derived from the check's.
@@ -246,26 +246,13 @@ def calibrate(
 def _judge_check(
     api: CayuApi, args: argparse.Namespace
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    """The suite's eval target, the case and its compiled structured judge check."""
+    """The suite's eval target, the case and its compiled structured judge check.
 
-    detail = api.get(
-        f"/evals/suite-views/{quote(args.suite, safe='')}",
-        query={"cases_limit": "1", "runs_limit": "1"},
-        resource="eval suite",
-    )
-    suite = detail.get("suite") if isinstance(detail, dict) else None
-    if not isinstance(suite, dict):
-        raise CloudEvalError("api_response_invalid", "The server's eval suite is invalid.")
-    if suite.get("source") == _REPORTED:
-        raise CloudEvalError(
-            "invalid_input",
-            f"Suite {args.suite} is a reported series, which stores no checks to calibrate.",
-        )
-    identity = suite.get("identity")
-    if not isinstance(identity, dict) or not all(
-        isinstance(identity.get(key), str) for key in ("source", "target_key", "revision")
-    ):
-        raise CloudEvalError("api_response_invalid", "The server's eval suite is invalid.")
+    The suite's id names its source, target and revision, so only the suite or corpus
+    document holding the cases is read.
+    """
+
+    identity = _suite_identity(args.suite)
     revision = quote(identity["revision"], safe="")
     if identity["source"] == "authored":
         document = api.get(f"/evals/suites/{revision}", resource="eval suite")
@@ -278,7 +265,7 @@ def _judge_check(
             cases = [
                 case
                 for case in cases
-                if isinstance(case, dict) and case.get("suite_id") == identity.get("suite_id")
+                if isinstance(case, dict) and case.get("suite_id") == identity["suite_id"]
             ]
     if not isinstance(cases, list) or not all(isinstance(case, dict) for case in cases):
         raise CloudEvalError("api_response_invalid", "The server's eval suite is invalid.")

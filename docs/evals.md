@@ -4122,7 +4122,7 @@ cayu eval scenario approve RUN_ID --event CHECKPOINT_ID
 | **Evals** suite list | `cayu eval suites list` | `GET /api/evals/suite-views` |
 | A suite's page | `cayu eval suites show SUITE` | `GET /api/evals/suite-views/{suite_key}` |
 | **Settings**: readiness, **Execution profiles**, the project's judges | `cayu eval targets list` | `GET /api/evals/targets` |
-| **New suite**, **Edit suite** | `cayu eval suites draft (--new SUITE_ID \| SUITE) --file FILE` | `GET /api/evals/targets`, or `GET /api/evals/suite-views/{suite_key}` and `GET /api/evals/suites/{suite_revision}` |
+| **New suite**, **Edit suite** | `cayu eval suites draft (--new SUITE_ID \| SUITE) --file FILE` | `GET /api/evals/targets`, or `GET /api/evals/suites/{suite_revision}` |
 | **Check suite**, **Save revision** | `cayu eval suites check --file FILE [--save] [--parent REVISION]` | `POST /api/evals/suites/preview`, then `POST /api/evals/suites` |
 | **Run saved revision**: **Check launch**, **Run selected** | `cayu eval suites run SUITE [--case CASE_ID ...] [--preview]` | `POST /api/evals/suites/{suite_revision}/runs/preview`, then `POST /api/evals/suites/{suite_revision}/runs` |
 | A corpus suite's **Run suite** | `cayu eval suites run SUITE [--max-concurrency N] [--preview]` | `GET /api/evals/targets` and `GET /api/evals/corpora/{corpus_revision}`, then `POST /api/evals/runs` |
@@ -4136,7 +4136,7 @@ cayu eval scenario approve RUN_ID --event CHECKPOINT_ID
 | **Save evaluation** | `cayu eval capture save SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/evaluation/preview`, then `POST /api/evals/sessions/{session_id}/evaluation/save` |
 | **Approve baseline** of a saved captured evaluation | `cayu eval baseline approve --result REVISION` | `GET /api/evals/results/{result_revision}`, then `POST /api/evals/results/{result_revision}/baseline` |
 | **Run on current app** | `cayu eval capture run SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/evaluation/preview` and `GET /api/evals/targets`, then `POST /api/evals/sessions/{session_id}/evaluation/launch` |
-| **Judges and calibration**: **Check calibration**, **Run calibration** | `cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID ...` | `GET /api/evals/suite-views/{suite_key}` and the suite's `GET /api/evals/suites/{suite_revision}` or `GET /api/evals/corpora/{corpus_revision}`, then `POST /api/evals/judge-calibrations/preview` and `POST /api/evals/judge-calibrations` |
+| **Judges and calibration**: **Check calibration**, **Run calibration** | `cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID ...` | The suite's `GET /api/evals/suites/{suite_revision}` or `GET /api/evals/corpora/{corpus_revision}`, then `POST /api/evals/judge-calibrations/preview` and `POST /api/evals/judge-calibrations` |
 | **Settings → Import / export**: import, saved corpora, **Download** | `cayu eval corpora import FILE`, `cayu eval corpora list`, `cayu eval corpora download REVISION --json-output FILE` | `POST /api/evals/corpora`, `GET /api/evals/corpora`, `GET /api/evals/corpora/{corpus_revision}/download` |
 | **Production scenarios** library | `cayu eval scenario list`, `cayu eval scenario show REVISION` | `GET /api/evals/scenarios`, `GET /api/evals/scenarios/{scenario_revision}` |
 | **Check readiness** and **Save** | `cayu eval scenario check ... [--save]` | `POST /api/evals/scenarios/preview`, and `POST /api/evals/scenarios` |

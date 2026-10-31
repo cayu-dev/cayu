@@ -53,7 +53,7 @@ from cayu.cli._cloud_evals import (
 )
 from cayu.cli._cloud_settings import _cell, _table
 from cayu.cli._eval_calibration import _json_object
-from cayu.cli._eval_curation import _diagnosed_refusal
+from cayu.cli._eval_curation import _diagnosed_refusal, _suite_identity
 
 # The dashboard's new suite (`newEvalSuiteDraft`): one simple case with sample input and the
 # completed-session check.
@@ -497,29 +497,6 @@ def _save(api: CayuApi, suite: Mapping[str, Any], *, parent: str | None) -> dict
     ):
         raise CloudEvalError("api_response_invalid", "The server did not confirm the suite.")
     return entry
-
-
-def _suite_identity(suite: str) -> dict[str, Any]:
-    """The suite an id from `suites list` names: its source, eval target and revision.
-
-    The id encodes them (`EvalSuiteViewIdentity`), so it is decoded as the server decodes it,
-    with no request: the suite's view would carry its cases, however large they are.
-    """
-
-    from cayu.evals.read_views import EvalSuiteViewIdentity, decode_suite_view
-
-    try:
-        identity = decode_suite_view(suite)
-    except ValueError:
-        raise CloudEvalError(
-            "invalid_input", f"{suite} is not a suite id from `cayu eval suites list`."
-        ) from None
-    if not isinstance(identity, EvalSuiteViewIdentity):
-        raise CloudEvalError(
-            "invalid_input",
-            f"Suite {suite} is a reported series of external eval reports, which runs nowhere.",
-        )
-    return identity.model_dump(mode="json")
 
 
 def _run_authored(

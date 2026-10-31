@@ -12,7 +12,7 @@ import ast
 import asyncio
 import inspect
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -46,6 +46,7 @@ from cayu.evals import (
     eval_corpus_to_json,
     model_judge_profile,
 )
+from cayu.evals.corpus import FinalOutputContainsAssertionSpec
 from cayu.server import (
     AuthContext,
     DashboardConfig,
@@ -74,11 +75,15 @@ def _authenticate(request: Request) -> AuthContext:
 
 @contextmanager
 def _judged_server(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, judge_calls: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    judge_calls: int,
+    other_checks: Sequence[FinalOutputContainsAssertionSpec] = (),
 ) -> Iterator[tuple[list, str, str]]:
     """A server with two suites that have the same structured judge check, an authored suite
-    and a corpus suite, and an application that won't publish ``_SECRET``. Yields the judge's
-    requests and the two suites' `suites list` ids."""
+    whose case also has ``other_checks`` and a corpus suite, and an application that won't
+    publish ``_SECRET``. Yields the judge's requests and the two suites' `suites list` ids."""
 
     judge, judge_provider = _judge_with_trials(judge_calls)
     target, candidate_provider = _judged_target(judge, secret_redactor=SecretRedactor(_SECRET))
@@ -113,6 +118,7 @@ def _judged_server(
                         rubric=StructuredRubricDraftV1.from_rubric(_rubric()),
                         threshold="0.6",
                     ),
+                    *other_checks,
                 ),
             ),
         ),
@@ -284,6 +290,34 @@ def test_calibrate_reaches_a_cloud_agent_with_the_cli_login(
         )
         assert len(judge_requests) == 1
     assert "GET /v1/applications/bug-hunter-agent/operator-credentials" in cloud.requests
+
+
+def test_calibrate_reads_a_suite_however_large_its_cases_are(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Checks that make the case larger than a suite view's default byte limit (1 MiB).
+    facts = [
+        FinalOutputContainsAssertionSpec(id=f"fact-{index}", expected="x" * 65_536)
+        for index in range(17)
+    ]
+    with _judged_server(tmp_path, monkeypatch, judge_calls=1, other_checks=facts) as (
+        judge_requests,
+        suite,
+        _,
+    ):
+        files = _files(tmp_path, final_output="Refunds are available within 30 days.")
+        check = ("calibrate", "--case", _CASE, "--assertion", _CHECK, *files, *_LOCAL)
+        calibrated = _ok(capsys, *check, "--suite", suite, "--trials", "1")
+        assert calibrated["draft"]["assertion"]["id"] == _CHECK
+        assert len(calibrated["report"]["trials"]) == 1
+        assert len(judge_requests) == 1
+
+        error = _refused(capsys, *check, "--suite", "not-a-suite")
+        assert (error["category"], error["message"]) == (
+            "invalid_input",
+            "not-a-suite is not a suite id from `cayu eval suites list`.",
+        )
+        assert len(judge_requests) == 1
 
 
 def test_calibration_inputs_are_checked_against_the_check(

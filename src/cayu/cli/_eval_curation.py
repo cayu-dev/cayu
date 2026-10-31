@@ -625,6 +625,29 @@ def _show_suite(api: CayuApi, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _suite_identity(suite: str) -> dict[str, Any]:
+    """The suite an id from `suites list` names: its source, eval target and revision.
+
+    The id encodes them (`EvalSuiteViewIdentity`), so it is decoded as the server decodes it,
+    with no request: the suite's view would carry its cases, however large they are.
+    """
+
+    from cayu.evals.read_views import EvalSuiteViewIdentity, decode_suite_view
+
+    try:
+        identity = decode_suite_view(suite)
+    except ValueError:
+        raise CloudEvalError(
+            "invalid_input", f"{suite} is not a suite id from `cayu eval suites list`."
+        ) from None
+    if not isinstance(identity, EvalSuiteViewIdentity):
+        raise CloudEvalError(
+            "invalid_input",
+            f"Suite {suite} is a reported series of external eval reports, which stores no cases.",
+        )
+    return identity.model_dump(mode="json")
+
+
 def _check_report_options(args: argparse.Namespace) -> None:
     # That the files are different files is checked before --output is opened.
     if args.json_output is None and args.html_output is None:
