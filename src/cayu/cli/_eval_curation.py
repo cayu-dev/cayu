@@ -1,5 +1,5 @@
-"""`cayu eval suites|runs|add-session|baseline|calibrate|scenario`: curate evals from the
-terminal.
+"""`cayu eval targets|suites|runs|add-session|baseline|calibrate|scenario`: curate evals from
+the terminal.
 
 These commands do what the Developer dashboard's Evals area does, through the same server
 API: list suites and runs and open one, cancel a run and download its report, add a finished
@@ -16,6 +16,9 @@ publishes the plan it previewed under an idempotency key (`POST .../additions`);
 stops after the preview. The printed publish command repeats the request with that key and
 the plan's revisions, so it publishes that reviewed plan, replays the receipt of a
 publication that already happened, or is refused when the session or suite has changed since.
+
+`targets list` and `suites draft|check|run` read the eval targets and author, save and run
+suites (`cayu.cli._eval_suite_authoring`).
 """
 
 from __future__ import annotations
@@ -62,7 +65,9 @@ from cayu.cli._cloud_evals import (
 from cayu.cli._cloud_settings import _cell, _table
 from cayu.cli._output import output_destination
 
-COMMANDS = frozenset({"suites", "runs", "add-session", "baseline", "calibrate", "scenario"})
+COMMANDS = frozenset(
+    {"targets", "suites", "runs", "add-session", "baseline", "calibrate", "scenario"}
+)
 # The `source` of a suite view whose runs are external eval reports (`EvalReportedSuiteView`).
 _REPORTED = "reported"
 # The server's own refusals of a publication (`cayu.server._eval_addition_routes`): the
@@ -81,10 +86,11 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
 
     suites = commands.add_parser(
         "suites",
-        help="List eval suites, or show one with its cases and runs.",
+        help="List, show, author and run eval suites.",
         description=(
-            "List the authored and corpus suites of a running server or Cloud Agent, or show "
-            "one with its cases and run history, as the Developer dashboard's Evals area does."
+            "List the authored and corpus suites of a running server or Cloud Agent and show "
+            "one with its cases and run history, write, check and save an authored suite, and "
+            "run a saved suite, as the Developer dashboard's Evals area does."
         ),
     )
     suite_actions = suites.add_subparsers(dest="eval_suites_command", required=True)
@@ -125,6 +131,13 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
             f"--{name}-cursor", help=f"The next page of {name}: the previous next_cursor."
         )
     _add_target_options(show, render_suite)
+    from cayu.cli._eval_suite_authoring import add_suite_authoring_parsers, add_target_parser
+
+    for parser, render in (
+        *add_suite_authoring_parsers(suite_actions),
+        *add_target_parser(commands),
+    ):
+        _add_target_options(parser, render)
 
     runs = commands.add_parser(
         "runs",
@@ -422,8 +435,10 @@ def _same_file(first: Path, second: Path) -> bool:
 def _execute(args: argparse.Namespace) -> dict[str, Any]:
     from cayu.cli import _eval_calibration as calibration
     from cayu.cli import _eval_scenarios as scenarios
+    from cayu.cli import _eval_suite_authoring as authoring
 
     action = args.eval_command
+    suite_draft = authoring.check_suite_options(args) if action == "suites" else None
     # Options and input files are checked before any request.
     if action == "add-session":
         _check_addition_options(args)
@@ -434,11 +449,16 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
     elif action == "scenario":
         scenario_draft = scenarios.check_scenario_options(args)
     with _target_api(args) as (api, source, target):
-        if action == "suites":
+        if action == "targets":
+            result = authoring.run_target_command(api)
+            operation = "eval.targets.list"
+        elif action == "suites":
             if args.eval_suites_command == "list":
                 result = _list_suites(api, args)
-            else:
+            elif args.eval_suites_command == "show":
                 result = _show_suite(api, args)
+            else:
+                result = authoring.run_suite_command(api, args, suite_draft, target=target)
             operation = f"eval.suites.{args.eval_suites_command}"
         elif action == "runs":
             if args.eval_runs_command == "list":

@@ -53,6 +53,8 @@ Restart `cayu serve` after changing the declaration. Evals should show
 **Project default judge** with the exact public provider/model, privacy,
 token/time ceilings, and candidate-route relation. A missing or mismatched
 provider fails configuration instead of silently choosing another route.
+`cayu eval targets list` shows the same from a terminal: each target's `judge_profiles` and
+their `judge_profile_routes`, with the candidate-route relation.
 
 ## Author a rubric
 
@@ -77,6 +79,31 @@ Write criteria that a reviewer could score consistently. Separate factual
 correctness, groundedness, and task completion rather than asking for one vague
 "quality" score. Do not place secrets, credentials, private customer data, or
 instructions for the candidate in a public reference.
+
+From a terminal, the check is one entry of a case's `assertions` in a suite draft (`cayu eval
+suites draft`; `cayu guide evals-first` shows the commands), with the judge profile's `key`
+and `revision` from `cayu eval targets list`:
+
+```json
+{
+  "id": "answer-quality",
+  "kind": "structured_model_judge",
+  "judge_profile_key": "PROFILE_KEY",
+  "judge_profile_revision": "PROFILE_REVISION",
+  "rubric": {
+    "id": "answer-quality",
+    "criteria": [
+      {"id": "correctness", "name": "Correctness", "weight": "0.7",
+       "description": "States the refund decision the policy requires."},
+      {"id": "usefulness", "name": "Usefulness", "weight": "0.3",
+       "description": "Tells the customer what happens next."}
+    ]
+  },
+  "threshold": "0.7"
+}
+```
+
+`cayu eval suites check --file suite.json` then compiles it as **Check suite** does.
 
 A target with an existing keyed evaluator can instead use **Configured evaluator with a rubric**. Set its evaluator key, rubric, version, threshold and transcript
 selection. This does not create a provider or evaluator: **Check suite** must

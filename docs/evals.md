@@ -4092,8 +4092,12 @@ session to a suite, approve a baseline, calibrate an AI judge and check, prepare
 approve production scenarios without the browser:
 
 ```console
+cayu eval targets list
 cayu eval suites list
 cayu eval suites show SUITE
+cayu eval suites draft --new refund-regressions --file suite.json
+cayu eval suites check --file suite.json --save
+cayu eval suites run SUITE --preview
 cayu eval runs list
 cayu eval runs show RUN_ID
 cayu eval runs cancel RUN_ID
@@ -4112,6 +4116,11 @@ cayu eval scenario approve RUN_ID --event CHECKPOINT_ID
 | --- | --- | --- |
 | **Evals** suite list | `cayu eval suites list` | `GET /api/evals/suite-views` |
 | A suite's page | `cayu eval suites show SUITE` | `GET /api/evals/suite-views/{suite_key}` |
+| **Settings**: readiness, **Execution profiles**, the project's judges | `cayu eval targets list` | `GET /api/evals/targets` |
+| **New suite**, **Edit suite** | `cayu eval suites draft (--new SUITE_ID \| SUITE) --file FILE` | `GET /api/evals/targets`, or `GET /api/evals/suite-views/{suite_key}` and `GET /api/evals/suites/{suite_revision}` |
+| **Check suite**, **Save revision** | `cayu eval suites check --file FILE [--save] [--parent REVISION]` | `POST /api/evals/suites/preview`, then `POST /api/evals/suites` |
+| **Run saved revision**: **Check launch**, **Run selected** | `cayu eval suites run SUITE [--case CASE_ID ...] [--preview]` | `POST /api/evals/suites/{suite_revision}/runs/preview`, then `POST /api/evals/suites/{suite_revision}/runs` |
+| A corpus suite's **Run suite** | `cayu eval suites run SUITE [--max-concurrency N] [--preview]` | `GET /api/evals/targets` and `GET /api/evals/corpora/{corpus_revision}`, then `POST /api/evals/runs` |
 | A target's runs | `cayu eval runs list` | `GET /api/evals/runs` |
 | A run's status, progress and failed candidate runs | `cayu eval runs show RUN_ID` | `GET /api/evals/runs/{run_id}` and `GET /api/evals/run-views/{run_key}` |
 | **Cancel** on a run | `cayu eval runs cancel RUN_ID` | `POST /api/evals/runs/{run_id}/cancel` |
@@ -4167,6 +4176,57 @@ N`, and a baseline that has moved past generation `N` since fails with
 runnable case starts from the commit its session's coding checkout was at, when the
 environment recorded it; the plan's `workspace` says whether it did and why not
 ([A session's workspace as a fixture](#a-sessions-workspace-as-a-fixture)).
+
+`targets list` is **Settings**' readiness: every eval target the server publishes and its
+`default_target_key`, each with `execution_profile_ready`, its `execution_profile` or the
+`execution_profile_diagnostics` that say why it can't run, its `max_trials`,
+`max_concurrency`, `max_timeout_seconds` and `max_steps`, its pricing
+(`cost_budget_available`, `cost_budget_currencies`), and its `judge_profiles` with their
+candidate-route relation (`judge_profile_routes`).
+
+`suites draft|check|run` are the [suite editor](#developer-dashboard-create-and-run-an-evaluation).
+A suite draft is the editor's material (`schema_version` 3): the suite's `id`, `target_key`,
+`name`, `description`, `trial_request` (`trials`, `timeout_seconds`, `minimum_passed_trials`,
+`max_concurrency`) and `cases`. Each case has an `id`, a `name`, a `stimulus`, either
+`{"kind": "simple_input", "input": {"messages": [{"role": "user", "text": ...}]}}` or a saved
+scenario's `{"kind": "scenario", "scenario_id": ..., "scenario_revision": ...}`, and its
+`assertions` in the corpus assertion format; an AI judge with weighted criteria is a
+`structured_model_judge` check with its `rubric`, `threshold` and judge profile
+(`judge_profile_key`, `judge_profile_revision`). `suites draft --new SUITE_ID --file FILE`
+writes **New suite**'s draft: one case with sample input and the completed-session check, on
+`--target-key KEY` (default: the server's default target) and named `--name NAME`. `suites
+draft SUITE --file FILE` writes a saved authored suite's draft, as **Edit suite** opens it, and
+prints `commands.check`, which saves the edited file as that revision's child (`--parent
+REVISION`), so cases it leaves unchanged keep their link to the session they were added from.
+The file must not exist yet, so no edits are overwritten.
+
+`suites check --file FILE` is **Check suite**: it returns the canonical `suite` revision, its
+`suite_id` (the id `suites show` and `suites run` take), `ready`, and the `diagnostics` that
+block saving. The file may also hold a saved revision's JSON, made a draft as **Edit suite**
+makes it. A ready check prints `commands.save`; `--save` saves the revision, as **Save
+revision** does, and prints `commands.check_launch`. A revision is its content, so saving it
+again changes nothing and a lost save answer is retried by running the command again. A
+revision already saved under another parent, or a `--parent` that isn't a saved revision of
+the same suite on that server, fails with `suite_conflict`, and a scenario a case runs that changed after the check with
+`suite_scenarios_changed`.
+
+`suites run SUITE` runs a saved suite under an operation ID, its `Idempotency-Key`, and
+returns once the runs are admitted, with `commands.list` to follow them. For an authored suite
+it is **Run saved revision**: `--case CASE_ID` (repeatable) selects a subset, `--max-cost
+AMOUNT [--currency CODE]` sets the maximum cost per trial, and the suite's trial policy sets
+the concurrency. The command checks the launch first (`preview`: the selection, one launch
+group per execution profile, and the maximum work, `exposure`), then admits one run per
+group. `--preview` is **Check launch**: it runs nothing and prints `commands.run`, which admits
+that reviewed launch with `--operation-id ID --expected-exposure-revision REV` and one
+`--expected-execution-profile CASE_ID[,CASE_ID...]=REV` per group. For a corpus suite it is
+**Run suite**: the whole suite, `--max-concurrency N` (default `1`) trials at a time, with the
+`bound` `cayu cloud eval run` states, and its `commands.run` pins `--operation-id ID
+--expected-execution-profile-revision REV`. A run with these pins sends that admission first,
+as given, so it answers with the runs the key already admitted, also after a deploy changed
+the current execution profiles. A selection the server can't run fails with
+`suite_launch_not_ready` and its diagnostics, reviewed work that changed since with
+`suite_launch_changed`, an operation ID that admitted another launch with
+`operation_id_conflict`, and a lost answer with `outcome_unknown` and `commands.continue`.
 
 `calibrate` is the [calibration workbench](#developer-dashboard-calibrate-an-ai-judge). It
 picks one structured AI judge check (`structured_model_judge`) of one case of a saved suite,

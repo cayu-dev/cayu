@@ -728,11 +728,13 @@ def _admit(
     operation_id: str,
     commands: Mapping[str, str],
     import_corpus: Callable[[], None] | None,
+    profile_option: str = "--execution-profile-revision",
 ) -> dict[str, Any]:
     """Admit the run, or replay the admission ``operation_id`` already made.
 
     ``import_corpus`` (a continuation) runs only when the Agent answers that it doesn't store
-    the corpus; the same request then goes again under the same key.
+    the corpus; the same request then goes again under the same key. ``profile_option`` is the
+    command's option that pins the execution profile.
     """
 
     body: dict[str, Any] = {
@@ -752,7 +754,11 @@ def _admit(
             return api.mutate("/evals/runs", body, resource="eval run", operation_id=operation_id)
         except CayuApiError as exc:
             refusal = _admission_refusal(
-                exc, operation_id=operation_id, profile_changed=profile_changed, commands=commands
+                exc,
+                operation_id=operation_id,
+                profile_changed=profile_changed,
+                commands=commands,
+                profile_option=profile_option,
             )
             if refusal is None:
                 raise
@@ -775,8 +781,10 @@ def _admission_refusal(
     operation_id: str,
     profile_changed: bool,
     commands: Mapping[str, str],
+    profile_option: str = "--execution-profile-revision",
 ) -> CloudEvalError | None:
-    """What an admission's failure means for its operation ID, when that is known."""
+    """What an admission's failure means for its operation ID, when that is known;
+    ``profile_option`` is the command's option that pins the execution profile."""
 
     if exc.category == "outcome_unknown":
         return CloudEvalError(
@@ -802,7 +810,7 @@ def _admission_refusal(
             "eval_release_changed",
             "The Agent's release changed before this run was admitted, so there is no run "
             f"to continue ({exc}). Start a new run without --operation-id and "
-            "--execution-profile-revision.",
+            f"{profile_option}.",
             status_code=exc.status_code,
             details={"operation_id": operation_id},
         )

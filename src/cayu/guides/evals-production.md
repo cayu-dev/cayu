@@ -98,6 +98,9 @@ before selecting another scenario.
   digest-bound artifact requirement; a browser path or upload cannot create
   server-side file authority.
 
+In a suite draft from `cayu eval suites draft`, a case runs a saved scenario with
+`"stimulus": {"kind": "scenario", "scenario_id": "ID", "scenario_revision": "REVISION"}`.
+
 Choose **Check readiness** before saving. The preview binds the exact current
 target, execution profile, scenario revision, environment, fixtures, secrets,
 effects, evidence policy, limits, trials, concurrency, timeout, and cost bound.

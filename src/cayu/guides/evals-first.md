@@ -30,10 +30,13 @@ tool; choose the specialist whose configuration or saved material you need.
 Fix a readiness diagnostic before running. The browser cannot create a missing
 provider, credential, tool, environment, policy, or store.
 
-From a terminal or a coding agent, the same server API lists the suites and opens one;
-add `--application NAME` to read a Cayu Cloud Agent's instead, and `--table` for text:
+From a terminal or a coding agent, the same server API lists the eval targets with their
+readiness, execution profile and judge profiles, as Settings shows them, and lists the suites
+and opens one; add `--application NAME` to read a Cayu Cloud Agent's instead, and `--table`
+for text:
 
 ```console
+cayu eval targets list
 cayu eval suites list
 cayu eval suites show SUITE
 ```
@@ -63,6 +66,25 @@ show them.
    or observed-only. Choose **Run selected** only when that exposure is
    acceptable.
 
+From a terminal, the suite is a draft file, and each step is a command:
+
+```console
+cayu eval suites draft --new refund-regressions --file suite.json
+cayu eval suites check --file suite.json --save
+cayu eval suites run SUITE --preview
+```
+
+`suites draft --new` writes **New suite**'s draft: one case with sample input and the
+completed-session check (`--target-key` picks the specialist and `--name` names the suite).
+In the file, replace the case's `stimulus.input` with a representative request, add checks to
+its `assertions`, such as `{"id": "approved", "kind": "final_output_contains", "expected":
+"approved"}`, and set `trial_request`. `suites check` is **Check suite**: it returns the
+canonical revision and every readiness diagnostic, and `--save` is **Save revision**, which
+prints `commands.check_launch`. That command, `suites run SUITE --preview`, is **Check
+launch**: it states the maximum candidate work and judge evaluations and prints
+`commands.run`, pinned to that reviewed work; running it is **Run selected**.
+`--max-cost AMOUNT` sets the maximum cost per trial.
+
 The result separates candidate status, deterministic assertions, runtime
 health, evidence availability, usage, and observed or unavailable cost. Open a
 case and trial before trusting the aggregate status.
@@ -89,6 +111,20 @@ case and trial before trusting the aggregate status.
   previous work may already be running. Check existing runs before abandoning it.
 - A repeated-trial policy retains every outcome. Required passes are not a way
   to hide evaluator errors or unavailable evidence; those still fail closed.
+
+From a terminal, duplicate a case by copying it in the draft file under a new `id`, and run a
+subset with `cayu eval suites run SUITE --case CASE_ID`. To edit a saved suite, write its
+draft and save the edit as its next revision with the `commands.check` the draft prints:
+
+```console
+cayu eval suites draft SUITE --file suite.json
+cayu eval suites check --file suite.json --save --parent REVISION
+```
+
+Saving a saved revision again changes nothing, so a lost save answer is retried by running the
+command again. A lost launch answer prints `commands.continue`, which admits nothing the key
+already admitted. A corpus suite runs whole with `cayu eval suites run SUITE`, as **Run
+suite** does, and `--max-concurrency N`.
 
 After a representative passing result, choose **Approve as baseline** on its run
 page, or from a terminal find the run and approve it:

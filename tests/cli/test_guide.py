@@ -127,6 +127,11 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
     assert "cayu eval compare" in first
     assert "cayu eval suites show SUITE" in first
     assert "cayu eval baseline approve RUN_ID" in first
+    assert "cayu eval targets list" in first
+    assert "cayu eval suites draft --new refund-regressions --file suite.json" in first
+    assert "cayu eval suites check --file suite.json --save" in first
+    assert "cayu eval suites run SUITE --preview" in first
+    assert "cayu eval suites draft SUITE --file suite.json" in first
     assert "cayu eval runs report RUN_ID --json-output result.eval-result.json" in first
 
     assert main(["guide", "evals-ai-quality", "--json"]) == 0
@@ -144,6 +149,8 @@ def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> No
         "cayu eval calibrate --suite SUITE --case CASE_ID --assertion ASSERTION_ID"
         in quality["content"]
     )
+    assert '"kind": "structured_model_judge"' in quality["content"]
+    assert "cayu eval targets list" in quality["content"]
 
     assert main(["guide", "evals-production"]) == 0
     production = capsys.readouterr().out
