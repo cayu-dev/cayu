@@ -46,6 +46,7 @@ import {
   saveCapturedEvaluation,
   selectEvalBaseline,
 } from "@/lib/api"
+import { evalSuiteTrialPolicy } from "@/lib/eval-trial-policy"
 import {
   createEvalIdempotencyKey,
   EVAL_TARGET_QUERY_KEY,
@@ -133,10 +134,7 @@ export function EvaluationPromotionAction({
   })
   const [scenarioReset, setScenarioReset] = useState(0)
   const [transition, setTransition] = useState<"close" | "preview" | null>(null)
-  const [launchAttempt, setLaunchAttempt] = useState<{
-    key: string
-    request: CapturedEvaluationLaunch
-  } | null>(null)
+  const [launchAttempt, setLaunchAttempt] = useState<FreshLaunchAttempt | null>(null)
   const scenarioOwned = scenarioState.edited || scenarioState.pending
   const owned = scenarioOwned || launchAttempt !== null
   const routeBlocker = useBlocker({
@@ -162,6 +160,8 @@ export function EvaluationPromotionAction({
   const [error, setError] = useState<string | null>(null)
   const previewRequestRef = useRef<{ generation: number; controller: AbortController } | null>(null)
   const exportControllerRef = useRef<AbortController | null>(null)
+  // Set from a launch's first click until it settles, so a second click starts no other launch.
+  const launchInFlightRef = useRef(false)
   const generationRef = useRef(0)
   const targets = useQuery({
     queryKey: EVAL_TARGET_QUERY_KEY,
@@ -408,8 +408,8 @@ export function EvaluationPromotionAction({
   }
 
   const launchFreshTrial = async () => {
-    if (launching || scenarioOwned) return
-    let attempt = launchAttempt
+    if (launchInFlightRef.current || scenarioOwned) return
+    let attempt: FreshLaunchAttempt | Promise<FreshLaunchAttempt> | null = launchAttempt
     if (!attempt) {
       if (
         !freshSourceEligible ||
@@ -422,24 +422,13 @@ export function EvaluationPromotionAction({
         !selectedTarget?.execution_profile
       )
         return
-      try {
-        attempt = {
-          key: createEvalIdempotencyKey(),
-          request: structuredClone({
-            candidate: preview.candidate,
-            expected_candidate_revision: preview.candidate.revision,
-            expected_execution_profile_revision: selectedTarget.execution_profile.revision,
-            ...freshLaunch.request,
-          }),
-        }
-        setLaunchAttempt(attempt)
-      } catch (error) {
-        setError(promotionErrorMessage(error))
-        return
-      }
+      attempt = freshLaunchAttempt(
+        preview.candidate,
+        selectedTarget.execution_profile.revision,
+        freshLaunch.request,
+      )
     }
-    // Candidate evidence stays only with this private owner, never in browser storage.
-    const dispatched = attempt
+    launchInFlightRef.current = true
     exportControllerRef.current?.abort()
     const controller = new AbortController()
     exportControllerRef.current = controller
@@ -448,6 +437,11 @@ export function EvaluationPromotionAction({
     setLaunchedRunId(null)
     setError(null)
     try {
+      // Candidate evidence stays only with this private owner, never in browser storage. The
+      // attempt is kept before it is sent, so a lost answer is retried with the same key.
+      const dispatched = await attempt
+      if (controller.signal.aborted) return
+      setLaunchAttempt(dispatched)
       const launched = await launchCapturedEvaluation(
         sessionId,
         dispatched.request,
@@ -473,6 +467,7 @@ export function EvaluationPromotionAction({
         void queryClient.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
       setError(promotionErrorMessage(launchError))
     } finally {
+      launchInFlightRef.current = false
       if (exportControllerRef.current === controller) {
         exportControllerRef.current = null
         setLaunching(false)
@@ -934,8 +929,16 @@ function toolValueEvidenceSummary(
 
 type FreshLaunchRequest = Omit<
   CapturedEvaluationLaunch,
-  "candidate" | "expected_candidate_revision" | "expected_execution_profile_revision"
->
+  | "candidate"
+  | "expected_candidate_revision"
+  | "expected_execution_profile_revision"
+  | "trial_request"
+  | "max_concurrency"
+> & {
+  trial_request: { trials: number; timeout_seconds: number }
+  max_concurrency: number
+}
+type FreshLaunchAttempt = { key: string; request: CapturedEvaluationLaunch }
 type FreshLaunchValidation =
   | { ok: true; request: FreshLaunchRequest }
   | { ok: false; error: string }
@@ -1090,6 +1093,29 @@ function FreshExecutionField({
       />
     </PromotionField>
   )
+}
+
+/** A new launch of ``candidate`` with the validated settings, under its own idempotency key. */
+async function freshLaunchAttempt(
+  candidate: CapturedEvaluationLaunch["candidate"],
+  executionProfileRevision: string,
+  settings: FreshLaunchRequest,
+): Promise<FreshLaunchAttempt> {
+  const key = createEvalIdempotencyKey()
+  const { trial_request: trialRequest, ...rest } = settings
+  // The trial policy bounds the run's concurrency, so it carries the one asked for; without
+  // one the server allows a single trial at a time.
+  const trialPolicy = await evalSuiteTrialPolicy(trialRequest.trials, rest.max_concurrency)
+  return {
+    key,
+    request: structuredClone({
+      candidate,
+      expected_candidate_revision: candidate.revision,
+      expected_execution_profile_revision: executionProfileRevision,
+      ...rest,
+      trial_request: { ...trialRequest, trial_policy: trialPolicy },
+    }),
+  }
 }
 
 function validateFreshExecution(
