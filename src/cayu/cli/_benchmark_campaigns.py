@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from cayu.budgets.run_limits import RunLimits
+from cayu.cli._output import terminal_safe
 from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals.benchmark_campaign import (
     BenchmarkCampaignSettingsV1,
@@ -22,7 +23,9 @@ from cayu.evals.benchmark_inspection import (
     render_benchmark_campaign_html,
 )
 from cayu.evals.benchmark_package import benchmark_suite_selection, load_benchmark_package
+from cayu.evals.models import failure_evidence_reason
 from cayu.evals.store import EvalRunCostBudget, EvalRunRecoveryPolicyV1
+from cayu.failure_evidence import FailureEvidence
 from cayu.sessions._model_failover import ModelTarget
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 
@@ -444,7 +447,7 @@ async def inspect_benchmark(args) -> int:
         text = [
             f"{inspection.campaign.id}: {inspection.status}",
             json.dumps(inspection.counts, sort_keys=True),
-            "CASE\tTRIAL\tSTATUS\tCATEGORY\tSCORE\tEVIDENCE\tSESSION",
+            "CASE\tTRIAL\tSTATUS\tCATEGORY\tSCORE\tEVIDENCE\tSESSION\tREASON",
         ]
         text.extend(
             "\t".join(
@@ -457,12 +460,24 @@ async def inspect_benchmark(args) -> int:
                     trial.score if trial.score is not None else "unavailable",
                     trial.evidence_state,
                     trial.session_id or "unavailable",
+                    _failure_reason(trial.failure_evidence),
                 )
             )
             for trial in rows
         )
         _write_or_print("\n".join(text), args.output)
     return 0
+
+
+def _failure_reason(evidence: dict | None) -> str:
+    """The candidate run's failure, for one tab-separated cell."""
+
+    reason = (
+        None
+        if evidence is None
+        else failure_evidence_reason(FailureEvidence.model_validate(evidence))
+    )
+    return "-" if reason is None else terminal_safe(reason)
 
 
 async def maintain_benchmark(args) -> int:

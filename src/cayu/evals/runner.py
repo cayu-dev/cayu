@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, get_args
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from cayu._exception_groups import exception_tree_contains
 from cayu._task_wait import capture_awaitable_outcome
@@ -153,7 +153,11 @@ from cayu.evals.workflow_target import (
 )
 from cayu.evals.workspace_fixtures import WorkspaceFixtureSpec
 from cayu.events import Event, EventType, event_durable_sequence
-from cayu.failure_evidence import FailureEvidence
+from cayu.failure_evidence import (
+    FAILURE_EVIDENCE_MESSAGE_MAX_CHARS,
+    FailureEvidence,
+    exception_evidence,
+)
 from cayu.memory.attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
@@ -162,6 +166,7 @@ from cayu.memory.attribution import (
 )
 from cayu.messages import Message
 from cayu.observability.event_loop_lag import EventLoopLagMonitor
+from cayu.runtime._exception_detail import failure_evidence_message
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions._run_identity import eval_trial_scope
@@ -183,6 +188,8 @@ from cayu.tools._operation_boundary import (
     await_invocation_operation,
     retained_invocation_operation_outcome_if_done,
 )
+from cayu.tools._terminal_controls import _redacted_failure_evidence
+from cayu.vaults.redaction import SecretRedactor
 from cayu.workflows.journal import WORKFLOW_ATTEMPT_EVENT_TYPE, WORKFLOW_JOURNAL_PROVIDER
 from cayu.workflows.workflow import WorkflowSupersededError
 from cayu.workspaces.base import Workspace, WorkspaceReadResult
@@ -248,6 +255,13 @@ _NOT_EVALUATED_MESSAGES = {
     ),
     _CANDIDATE_RUN_FAILED: f"Not evaluated ({_CANDIDATE_RUN_FAILED}): the candidate's run failed.",
 }
+# The candidate-run failures whose reason a trial records, and a corpus result publishes,
+# in failure_evidence. Their message describes the trial's environment or setup. A
+# provider's or the candidate's own failure can quote what the candidate was sent or did,
+# so those stay a category without text.
+_FAILURE_CATEGORIES_WITH_PUBLISHED_REASON: frozenset[EvalExecutionFailureCategory] = frozenset(
+    {"environment_failure", "setup_failure"}
+)
 _ENVIRONMENT_FAILURE_EVENT_TYPES = frozenset(
     {
         EventType.ENVIRONMENT_BINDING_FAILED,
@@ -3256,6 +3270,8 @@ async def _run_session_case_once(
     run_drained = False
     session_id: str | None = None
     run_error: str | None = None
+    # The exception that ended the candidate's run, when the run raised.
+    run_exception: BaseException | None = None
     # Set when the candidate's own run raised or failed while it was being set up.
     not_evaluated_reason: str | None = None
     unavailable_reason: str | None = None
@@ -3344,6 +3360,7 @@ async def _run_session_case_once(
                 # A provider-originated TimeoutError is an eval run error, not the case
                 # deadline. Deadline expiry arrives as cancellation and is handled below.
                 run_error = _format_exception(exc)
+                run_exception = exc
                 diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
                 not_evaluated_reason = (
                     _CANDIDATE_DID_NOT_RUN if observed_session_id is None else _CANDIDATE_RUN_FAILED
@@ -3355,6 +3372,7 @@ async def _run_session_case_once(
                 ):
                     raise
                 run_error = _format_exception(exc)
+                run_exception = exc
                 diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
                 not_evaluated_reason = (
                     _CANDIDATE_DID_NOT_RUN if observed_session_id is None else _CANDIDATE_RUN_FAILED
@@ -3804,6 +3822,19 @@ async def _run_session_case_once(
         execution_limit = _execution_limit(events)
         if execution_limit is not None:
             failure_category = "limit_reached"
+    failure_evidence: FailureEvidence | None = None
+    if failure_category in _FAILURE_CATEGORIES_WITH_PUBLISHED_REASON:
+        failure_evidence = _candidate_failure_evidence(
+            (
+                root_failure_event
+                if session is None
+                else next(
+                    (event for event in events if event.type == EventType.SESSION_FAILED), None
+                )
+            ),
+            run_exception,
+            redactor=app._secret_redactor,
+        )
     # Without a terminal snapshot, the drained runtime stream is the run's only record.
     execution_failed = not_evaluated_reason is not None and session is None
     from cayu.budgets.usage import count_model_steps_with_usage
@@ -3845,6 +3876,7 @@ async def _run_session_case_once(
             execution_status="failed" if execution_failed else None,
             execution_failure_category=failure_category,
             execution_limit=execution_limit,
+            failure_evidence=failure_evidence,
             usage_evidence_state=usage_state,
             trial_number=trial_number,
             status=status,
@@ -4685,6 +4717,66 @@ def _session_failure_reason(events: Iterable[Event]) -> str:
                 return f"Session failed: {error}"
             return "Session failed."
     return "Session ended in a failed state."
+
+
+def _candidate_failure_evidence(
+    failure_event: Event | None,
+    run_exception: BaseException | None,
+    *,
+    redactor: SecretRedactor,
+) -> FailureEvidence | None:
+    """Why the candidate's environment or setup failed, as the trial's ``failure_evidence``.
+
+    A session that failed names its cause in its ``session.failed`` event, whose
+    ``error`` the trial's error repeats; a run that raised names it in its exception.
+    The message is masked and bounded as a tool failure's is. Session identities and
+    branch snapshots stay out, as a published trial carries no session identity.
+    """
+
+    if failure_event is not None:
+        payload = failure_event.payload
+        recorded = _recorded_failure_evidence(payload)
+        error = payload.get("error")
+        message = (
+            redactor.with_python_repr_forms().redact_text_bounded(
+                error.strip(), max_bytes=FAILURE_EVIDENCE_MESSAGE_MAX_CHARS
+            )
+            if isinstance(error, str) and error.strip()
+            else None
+        )
+    elif run_exception is not None:
+        try:
+            recorded = exception_evidence(run_exception)
+        except BaseException:
+            # A hostile exception never replaces the candidate's failure with its own.
+            recorded = FailureEvidence(classification="failure")
+        message = failure_evidence_message(run_exception, redactor=redactor)
+    else:
+        return None
+    snapshot = FailureEvidence(
+        classification=recorded.classification,
+        deadline=recorded.deadline,
+        deadline_phase=recorded.deadline_phase,
+        exception_types=recorded.exception_types,
+        truncated=recorded.truncated or bool(recorded.branch_failures),
+        secondary_failures=recorded.secondary_failures,
+        exception_message=message or None,
+    )
+    return FailureEvidence.model_validate(_redacted_failure_evidence(snapshot, redactor=redactor))
+
+
+def _recorded_failure_evidence(payload: Mapping[str, Any]) -> FailureEvidence:
+    """The evidence a ``session.failed`` event records, else the error type it names."""
+
+    for recorded in (
+        payload.get("failure_evidence"),
+        {"classification": "failure", "exception_types": [payload.get("error_type")]},
+    ):
+        try:
+            return FailureEvidence.model_validate(recorded)
+        except ValidationError:
+            continue
+    return FailureEvidence(classification="failure")
 
 
 _EXTERNAL_TARGET_DIAGNOSTIC_BY_PROVIDER_CODE = {

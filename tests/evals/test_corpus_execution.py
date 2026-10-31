@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 from decimal import Decimal
 
@@ -17,12 +18,16 @@ from cayu.budgets.base import BudgetLimit
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.configuration import EvalConfig
 from cayu.context.footprints import RequestFootprintConfig
-from cayu.environments import Environment, EnvironmentSpec
+from cayu.environments import Environment, EnvironmentSpec, LocalWorkspaceEnvironmentFactory
 from cayu.evals import (
+    EvalCase,
     EvalExecutionCapacity,
     EvalOutcome,
+    EvalSuite,
     EvalTrialDiagnosticCode,
+    FinalOutputContains,
     ScriptedModelProvider,
+    run_eval_suite,
 )
 from cayu.evals.benchmark_inspection import benchmark_failure_category
 from cayu.evals.benchmark_rescore import _saved_evidence
@@ -88,6 +93,7 @@ from cayu.evals.result_contract import EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES
 from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.runner import EvalPlan, _blocked_assertion_results, run_eval_plan
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.failure_evidence import FailureEvidence
 from cayu.memory import ContextExposurePage
 from cayu.memory.base import AutomaticRecallPolicy
 from cayu.memory.context import (
@@ -109,6 +115,7 @@ from cayu.sessions import InMemorySessionStore
 from cayu.storage import SQLiteSessionStore
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.tools import AlwaysRequireApprovalToolPolicy
+from cayu.tools.search import SearchTextTool
 from cayu.vaults import SecretRedactor
 from cayu.workspaces import LocalWorkspace, WorkspaceBranchRequest
 from cayu.workspaces.revisions import (
@@ -857,12 +864,82 @@ def test_corpus_trial_whose_candidate_did_not_start_is_a_runtime_failure():
     assert dimensions.runtime == "failed"
     assert dimensions.candidate == "not_scored"
     assert dimensions.evaluator_health == "unavailable"
-    assert "Candidate run: failed (setup_failure)." in render_corpus_execution_html(result)
+    assert trial.failure_evidence is not None
+    assert trial.failure_evidence.exception_message is not None
+    assert "Environment not registered: no_environment" in trial.failure_evidence.exception_message
+    assert html.escape(
+        "Candidate run: failed (setup_failure): KeyError: 'Environment not registered"
+    ) in render_corpus_execution_html(result)
     assert benchmark_failure_category(trial) == "execution_failure"
     saved = _saved_evidence(trial)
     assert (saved.final_output_state, saved.root_evidence_available) == ("unavailable", False)
     assert candidate_provider.requests == []
     assert judge_provider.requests == []
+
+
+def test_corpus_trial_whose_environment_refused_a_tool_publishes_why(tmp_path, monkeypatch):
+    # The local runner admits search_text only where rg is on PATH; here nothing is.
+    monkeypatch.setenv("PATH", str(tmp_path / "no-executables"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def searching_app() -> CayuApp:
+        app = CayuApp(enable_logging=False)
+        app.register_provider(_provider(trials=1), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="local"),
+            LocalWorkspaceEnvironmentFactory(
+                allowed_roots=[workspace], root_from_request=lambda request: workspace
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="agent", model="fixture-model"), tools=[SearchTextTool()])
+        return app
+
+    direct = asyncio.run(
+        run_eval_suite(
+            searching_app(),
+            EvalSuite(
+                id="direct",
+                cases=[
+                    EvalCase(
+                        id="refund-approval",
+                        request=RunRequest(
+                            agent_name="agent", messages=[Message.text("user", "Refund order 42.")]
+                        ),
+                        assertions=[FinalOutputContains("Approved")],
+                    )
+                ],
+            ),
+        )
+    )
+    error = direct.cases[0].trials[0].error
+    assert error is not None and error.startswith("Session failed: ")
+    reason = error.removeprefix("Session failed: ")
+    assert "executable rg [unsupported_capability]" in reason
+    target = CorpusTarget(
+        key="refund-agent",
+        app=searching_app(),
+        request_base=RunRequest(agent_name="agent", messages=[], max_steps=1),
+        application_release_id="release-2026-08-06",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+
+    result = asyncio.run(run_corpus_suite(target, _corpus(trials=1), "refund-regressions"))
+
+    trial = result.run.cases[0].trials[0]
+    assert (trial.status, trial.code) == ("error", EvalTrialDiagnosticCode.SESSION_FAILED)
+    assert trial.execution_failure_category == "environment_failure"
+    # The published trial says why, as the direct run's error does.
+    assert trial.failure_evidence == FailureEvidence(
+        classification="failure",
+        exception_types=("ExecutionAdmissionError",),
+        exception_message=reason,
+    )
+    assert corpus_execution_result_from_json(corpus_execution_result_to_json(result)) == result
+    assert html.escape(
+        f"Candidate run: failed (environment_failure): ExecutionAdmissionError: {reason}"
+    ) in render_corpus_execution_html(result)
 
 
 def test_run_corpus_suite_resolves_trusted_model_judge_and_publishes_its_contract():
@@ -1742,6 +1819,30 @@ def test_corpus_execution_publishes_stable_safe_failure_diagnostics():
     report = render_corpus_execution_html(result)
     assert "The trial session failed." in report
     assert "secret-token" not in report
+
+
+def test_corpus_trial_whose_provider_failed_publishes_no_failure_text():
+    # Only an environment's or setup's failure is published with its text: a provider's
+    # error can quote what the candidate sent it.
+    app = CayuApp(enable_logging=False)
+    app.register_provider(_FailingProvider(), default=True)
+    app.register_agent(AgentSpec(name="agent", model="fixture-model"))
+    target = CorpusTarget(
+        key="refund-agent",
+        app=app,
+        request_base=RunRequest(agent_name="agent", messages=[], max_steps=1),
+        application_release_id="release",
+    )
+
+    result = asyncio.run(run_corpus_suite(target, _corpus(trials=1), "refund-regressions"))
+
+    trial = result.run.cases[0].trials[0]
+    assert trial.execution_failure_category == "provider_failure"
+    assert trial.failure_evidence is None
+    assert "provider exploded" not in corpus_execution_result_to_json(result)
+    report = render_corpus_execution_html(result)
+    assert "Candidate run: failed (provider_failure)." in report
+    assert "provider exploded" not in report
 
 
 def test_corpus_execution_distinguishes_safe_evidence_preparation_failures(monkeypatch):

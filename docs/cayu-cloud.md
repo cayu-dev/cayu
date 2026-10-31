@@ -1266,9 +1266,10 @@ commands; the run goes on in the Agent.
 
 `runs list` lists one eval target's runs, newest first: the Agent's default target, or
 `--target-key KEY`, filtered by `--status` and limited by `--limit` (20 by default, at most
-200). `runs show` shows a run's status, trial progress and result, and for a scenario run each
-trial's phase and the approval checkpoint a trial waits on; `runs cancel` asks the Agent to
-stop it. `compare` compares two completed runs of the same suite on the Agent and
+200). `runs show` shows a run's status, trial progress and result, how the candidate's run
+failed in the trials of its first five failing cases, and for a scenario run each trial's phase
+and the approval checkpoint a trial waits on; `runs cancel` asks the Agent to stop it. `compare`
+compares two completed runs of the same suite on the Agent and
 lists the current run's regressions; for a pass/fail exit in CI, compare the downloaded
 reports with `cayu eval compare`. `baseline` approves a completed run's result as its suite's
 baseline, the result the Developer dashboard compares later runs with, over the baseline's

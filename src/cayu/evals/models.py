@@ -261,6 +261,27 @@ EvalExecutionLimit = Literal[
 ]
 
 
+def failure_evidence_reason(evidence: FailureEvidence | None) -> str | None:
+    """The failure's exception type and message, as Python prints an exception's last line."""
+
+    if evidence is None or not evidence.exception_message:
+        return None
+    if evidence.exception_types:
+        return f"{evidence.exception_types[0]}: {evidence.exception_message}"
+    return evidence.exception_message
+
+
+def candidate_run_failure_text(
+    category: EvalExecutionFailureCategory,
+    limit: EvalExecutionLimit | None = None,
+    reason: str | None = None,
+) -> str:
+    """``Candidate run: failed (<category>)``, with the limit that stopped it or the reason."""
+
+    cause = category if limit is None else f"{category}: {limit}"
+    return f"Candidate run: failed ({cause})" + ("." if reason is None else f": {reason}")
+
+
 class EvalOutcome(StrEnum):
     """One evaluated assertion outcome.
 

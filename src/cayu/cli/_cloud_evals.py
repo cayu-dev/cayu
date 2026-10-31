@@ -59,6 +59,8 @@ _CURRENCY = re.compile(r"[A-Z0-9._-]{1,16}")
 # Reading an asleep Agent wakes its web process, which can take a minute or more.
 _WAKE_TIMEOUT_SECONDS = 150.0
 _REPORT_RECORD_TYPE = "cayu.eval-result-report"
+# `runs show` names the failed candidate runs of at most this many failing cases.
+_SHOWN_FAILING_CASES = 5
 # Eval revisions, such as execution-profile revisions and baseline operation IDs.
 _EVAL_REVISION = re.compile(r"sha256:[0-9a-f]{64}")
 # The Agent's own refusals of a run admission (`cayu.server._eval_run_admission` and
@@ -960,15 +962,29 @@ def _list_runs(api: CayuApi, arguments: argparse.Namespace) -> dict[str, Any]:
 
 
 def _show_run(api: CayuApi, run_id: str) -> dict[str, Any]:
-    """The run, its trial progress and, for a scenario run, each trial's phase: the trials
-    awaiting a fresh approval name the checkpoint (`pending_event_id`) and its tool."""
+    """The run, its trial progress and why its failing cases' candidate runs failed, and for
+    a scenario run each trial's phase: the trials awaiting a fresh approval name the
+    checkpoint (`pending_event_id`) and its tool."""
+
+    from cayu.evals.store import EVAL_STORE_MAX_PAGE_BYTES
 
     record = api.get(_run_path(run_id), resource="eval run")
     run = _run_summary(record)
     scenario = record.get("scenario_progress")
+    view = _read_run_view(
+        api,
+        run_id,
+        query={
+            "case_filter": "failing",
+            "cases_limit": str(_SHOWN_FAILING_CASES),
+            # The Agent's largest page, so that cases with many trials still fit.
+            "max_result_bytes": str(EVAL_STORE_MAX_PAGE_BYTES),
+        },
+    )
     return {
         "run": run,
-        "progress": _read_progress(api, run_id),
+        "progress": _view_progress(view),
+        "candidate_run_failures": _candidate_run_failures(view),
         "scenario_progress": scenario if isinstance(scenario, dict) else None,
     }
 
@@ -1113,20 +1129,75 @@ def _read_run(api: CayuApi, run_id: str) -> dict[str, Any]:
 def _read_progress(api: CayuApi, run_id: str) -> dict[str, Any] | None:
     """The run's trial progress, or ``None`` from an Agent whose store has no run views."""
 
+    return _view_progress(_read_run_view(api, run_id, query={"cases_limit": "1"}))
+
+
+def _read_run_view(api: CayuApi, run_id: str, *, query: Mapping[str, str]) -> Any:
+    """The run's view, or ``None`` from an Agent whose store has no run views."""
+
     from cayu.evals.read_views import run_view_id
 
     try:
-        view = api.get(
+        return api.get(
             f"/evals/run-views/{run_view_id('run', run_id)}",
-            query={"cases_limit": "1"},
-            resource="eval run progress",
+            query=dict(query),
+            resource="eval run view",
         )
     except CayuApiError as exc:
         if exc.category in {"request_rejected", "unsupported"}:
             return None
         raise
+
+
+def _view_progress(view: Any) -> dict[str, Any] | None:
     progress = view.get("progress") if isinstance(view, dict) else None
     return progress if isinstance(progress, dict) else None
+
+
+def _candidate_run_failures(view: Any) -> dict[str, Any] | None:
+    """The failing cases' trials whose candidate run failed, each with why.
+
+    The view presents each case and carries its published result as evidence: the
+    presentation names the category, and the published trial's failure evidence the
+    reason. ``None`` from an Agent whose store has no run views.
+    """
+
+    from cayu.evals.models import failure_evidence_reason
+    from cayu.failure_evidence import FailureEvidence
+
+    if view is None:
+        return None
+    results = view.get("results") if isinstance(view, dict) else None
+    if not isinstance(results, dict) or not isinstance(results.get("items"), list):
+        raise CloudEvalError("api_response_invalid", "The Agent's eval run view is invalid.")
+    failures: list[dict[str, Any]] = []
+    for item in results["items"]:
+        presentation = item.get("presentation") if isinstance(item, dict) else None
+        if not isinstance(presentation, dict):
+            raise CloudEvalError("api_response_invalid", "The Agent's eval run view is invalid.")
+        evidence = item.get("evidence")
+        published = {
+            trial.get("trial_number"): trial
+            for trial in (evidence.get("trials") or [] if isinstance(evidence, dict) else [])
+            if isinstance(trial, dict)
+        }
+        for trial in presentation.get("trials") or []:
+            category = trial.get("execution_failure_category") if isinstance(trial, dict) else None
+            if category is None:
+                continue
+            recorded = (published.get(trial.get("trial_number")) or {}).get("failure_evidence")
+            failures.append(
+                {
+                    "case_id": presentation.get("case_id"),
+                    "trial_number": trial.get("trial_number"),
+                    "execution_failure_category": category,
+                    "execution_limit": trial.get("execution_limit"),
+                    "reason": None
+                    if recorded is None
+                    else failure_evidence_reason(FailureEvidence.model_validate(recorded)),
+                }
+            )
+    return {"items": failures, "has_more": results.get("has_more") is True}
 
 
 def _run_summary(record: Any) -> dict[str, Any]:
@@ -1390,6 +1461,8 @@ def render_runs(answer: Mapping[str, Any]) -> str:
 
 
 def render_run_detail(answer: Mapping[str, Any]) -> str:
+    from cayu.evals.models import candidate_run_failure_text
+
     result = answer["result"]
     run, progress = result["run"], result["progress"]
     lines = [
@@ -1402,6 +1475,22 @@ def render_run_detail(answer: Mapping[str, Any]) -> str:
         lines.append(f"Finished: {_text(run['finished_at'])}")
     if run["result"] is not None or run["failure_code"] is not None:
         lines.append(f"Result: {_result_cell(run)}")
+    failures = result["candidate_run_failures"]
+    if failures is not None:
+        for failure in failures["items"]:
+            text = candidate_run_failure_text(
+                failure["execution_failure_category"],
+                failure["execution_limit"],
+                failure["reason"],
+            )
+            lines.append(
+                f"{_text(failure['case_id'])} trial {_text(failure['trial_number'])}: {_text(text)}"
+            )
+        if failures["has_more"]:
+            lines.append(
+                f"Candidate runs of the first {_SHOWN_FAILING_CASES} failing cases only; "
+                "the run's report has the rest."
+            )
     scenario = result["scenario_progress"]
     for trial in (scenario or {}).get("trials") or ():
         line = f"Trial {_text(trial.get('trial_number'))}: {_text(trial.get('phase'))}"

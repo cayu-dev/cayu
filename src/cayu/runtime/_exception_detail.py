@@ -19,6 +19,7 @@ from cayu._exception_groups import (
     exception_group_children,
     exception_suppresses_context,
 )
+from cayu.failure_evidence import FAILURE_EVIDENCE_MESSAGE_MAX_CHARS
 from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_UTF8_BYTES, exception_diagnostic
 from cayu.vaults import SecretRedactor
 
@@ -149,6 +150,30 @@ def exception_detail(
         omitted_leaf_count=omitted,
         traversal_truncated=traversal_truncated,
     )
+
+
+def failure_evidence_message(
+    exception: BaseException,
+    *,
+    redactor: SecretRedactor,
+) -> str | None:
+    """``FailureEvidence.exception_message`` for ``exception``: masked and bounded.
+
+    It keeps the cause chain or group leaves. Python's quoted forms of each
+    secret are masked too, since exception text often quotes values with repr.
+    """
+
+    try:
+        detail = exception_detail(exception, redactor=redactor.with_python_repr_forms())
+        message = redactor.redact_text_bounded(
+            (detail.message + exception_detail_suffix(detail)).strip(),
+            # A UTF-8 byte bound is also a character bound.
+            max_bytes=FAILURE_EVIDENCE_MESSAGE_MAX_CHARS,
+        )
+    except BaseException:
+        # The type tree is still retained; never lose the outcome to a message.
+        return None
+    return message or None
 
 
 def exception_detail_suffix(detail: ExceptionDetail) -> str:

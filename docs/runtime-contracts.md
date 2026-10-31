@@ -19433,7 +19433,10 @@ Optional trial `execution_failure_category` and `usage_evidence_state` distingui
 typed execution failure and incomplete accounting independently of assertion
 outcomes. The categories are `provider_failure`, `environment_failure`,
 `execution_failure`, `setup_failure` (the run failed before its session started)
-and `limit_reached`, which comes with `execution_limit` naming the run limit. Missing usage remains unavailable. Campaign comparison binds package,
+and `limit_reached`, which comes with `execution_limit` naming the run limit. An
+`environment_failure` or `setup_failure` comes with `failure_evidence` whose `exception_message`
+says why, masked and bounded like a failed tool call's and without session identity; the other
+categories carry no exception text. Missing usage remains unavailable. Campaign comparison binds package,
 cohort, scorer, execution profile, budget, and retry identities; static rescoring
 uses retained facts and never dispatches candidate or judge work. See
 [benchmark campaigns](benchmark-campaigns.md) for supported modes and acceptance.

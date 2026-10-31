@@ -27,6 +27,7 @@ from cayu.evals.execution_comparison import (
     EvalToolJsonAssertionComparisonV1,
 )
 from cayu.evals.memory_attribution import eval_memory_attribution_summary
+from cayu.evals.models import candidate_run_failure_text, failure_evidence_reason
 from cayu.evals.operation_outcomes import OperationOutcomeSummary, operation_outcome_summary_text
 from cayu.evals.result_presentation import (
     EVAL_RESULT_REPORT_MAX_BYTES,
@@ -918,14 +919,19 @@ def _trial_section(trial: Any, presentation: EvalTrialPresentationV1) -> str:
         else ""
     )
     failure_category = presentation.execution_failure_category
-    run_failure_html = ""
-    if failure_category is not None:
-        cause = (
-            failure_category
-            if presentation.execution_limit is None
-            else f"{failure_category}: {presentation.execution_limit}"
+    run_failure_html = (
+        ""
+        if failure_category is None
+        else "<p>"
+        + _escape(
+            candidate_run_failure_text(
+                failure_category,
+                presentation.execution_limit,
+                failure_evidence_reason(failure_evidence),
+            )
         )
-        run_failure_html = f"<p>Candidate run: failed ({_escape(cause)}).</p>"
+        + "</p>"
+    )
     capture_diagnostic = getattr(trial, "capture_diagnostic", None)
     capture_html = (
         "<h5>Capture failure</h5><pre>"

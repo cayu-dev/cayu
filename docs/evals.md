@@ -2367,8 +2367,26 @@ A trial records its candidate runtime outcome in `execution_status`,
   events, usage and output, and its assertions still score what the candidate
   did before the limit, so its candidate outcome comes from them.
 
-The HTML reports and `cayu eval failures` show this as `Candidate run: failed
-(<category>)`, or `(limit_reached: <limit>)` for a run limit.
+A trial whose candidate run failed with `environment_failure` or `setup_failure`
+also records why in `failure_evidence`, which a published corpus result keeps. Its
+`exception_message` is the message of the session's `session.failed` event, the
+message the trial's `error` repeats after `Session failed: `, such as an
+environment that refused a tool at admission, or of the exception that kept the
+run from starting, such as the checkout of a workspace fixture that fails.
+`exception_types` names the exception. The message is masked with the
+application's workload secret redactor, also in the quoted forms Python uses in
+exception text, and bounded to 2,048 UTF-8 bytes, as a failed tool call's is. The
+evidence carries no session identity. Other failures, such as `provider_failure`,
+record no failure evidence, so a published result keeps no text of theirs: a
+provider's error can quote what the candidate sent it. The direct trial's `error`
+and the session's events still have it.
+
+The HTML reports, `cayu eval failures` and `cayu eval runs show` show this as
+`Candidate run: failed (<category>): <type>: <message>`, or `Candidate run:
+failed (<category>).` without a message, and `(limit_reached: <limit>)` for a
+run limit. A benchmark campaign's `cayu eval failures` table gives the reason in
+its `REASON` column. `cayu eval runs show` names the failed candidate runs of the
+run's first five failing cases, in `candidate_run_failures` in its JSON.
 
 ### Run cost
 
@@ -4095,7 +4113,7 @@ cayu eval scenario approve RUN_ID --event CHECKPOINT_ID
 | **Evals** suite list | `cayu eval suites list` | `GET /api/evals/suite-views` |
 | A suite's page | `cayu eval suites show SUITE` | `GET /api/evals/suite-views/{suite_key}` |
 | A target's runs | `cayu eval runs list` | `GET /api/evals/runs` |
-| A run's status and progress | `cayu eval runs show RUN_ID` | `GET /api/evals/runs/{run_id}` and `GET /api/evals/run-views/{run_key}` |
+| A run's status, progress and failed candidate runs | `cayu eval runs show RUN_ID` | `GET /api/evals/runs/{run_id}` and `GET /api/evals/run-views/{run_key}` |
 | **Cancel** on a run | `cayu eval runs cancel RUN_ID` | `POST /api/evals/runs/{run_id}/cancel` |
 | **Download JSON** and **Download HTML** on a run | `cayu eval runs report RUN_ID --json-output FILE [--html-output FILE]` | `GET /api/evals/runs/{run_id}/report.json` |
 | **Add to evals** on a session | `cayu eval add-session SESSION_ID ...` | `POST /api/evals/sessions/{session_id}/additions/preview`, then `POST /api/evals/sessions/{session_id}/additions` |

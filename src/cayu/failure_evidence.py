@@ -26,8 +26,10 @@ class _FailureEvidenceFields(BaseModel):
 
     ``exception_message`` is the caught exception's message with its cause
     chain or group leaves, redacted with the workload secret redactor and
-    bounded. Only Runtime's tool-invocation boundary sets it; it is omitted
-    when absent, including for old durable events.
+    bounded. Runtime's tool-invocation boundary sets it, and so does an eval
+    trial whose candidate's environment or setup failed, from the session's
+    ``session.failed`` error or the exception that ended the run. It is
+    omitted when absent, including for old durable events.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)

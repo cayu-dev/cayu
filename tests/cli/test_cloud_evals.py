@@ -25,6 +25,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 from tests.cli.test_session_cli_cloud import _FakeCloud
+from tests.evals.test_candidate_runtime_outcomes import _ExplodingProvider, _RefusingFactory
 from tests.evals.test_corpus_execution import (
     _corpus,
     _model_judge_corpus,
@@ -44,6 +45,7 @@ from cayu.cli import _cloud_evals as cloud_evals
 from cayu.cli import cloud as cloud_cli
 from cayu.cli import main
 from cayu.cli._cloud_agent_api import CayuApi
+from cayu.environments import EnvironmentFactory, EnvironmentSpec
 from cayu.evals.corpus import EvalCorpusDocument, eval_corpus_to_json
 from cayu.evals.execution import CorpusExecutionLimits, ModelJudgeTarget
 from cayu.evals.store import EVAL_STORE_MAX_PAGE_SIZE, TERMINAL_EVAL_RUN_STATUSES, EvalRunStatus
@@ -74,11 +76,13 @@ def _agent(
     release: str = "release-2026-08-06",
     limits: CorpusExecutionLimits | None = None,
     model_judges: tuple[ModelJudgeTarget, ...] = (),
+    environment_factory: EnvironmentFactory | None = None,
 ) -> Iterator[TestClient]:
     """The Agent's `cayu serve` with one eval target, reached as `cayu cloud` reaches it.
 
     Its eval store lives under ``tmp_path``, so a later `_agent` with another ``release`` is
-    the same Agent after a deploy.
+    the same Agent after a deploy. ``environment_factory`` is the target's default
+    environment, when given.
     """
 
     target = _target(
@@ -88,6 +92,10 @@ def _agent(
         limits=limits,
         model_judges=model_judges,
     )
+    if environment_factory is not None:
+        target.app.register_environment_factory(
+            EnvironmentSpec(name="target-environment"), environment_factory, default=True
+        )
     store = SQLiteEvalStore(tmp_path / "evals.db")
     policy = (
         {"execution_profile_policy": _repeatable_execution_policy(target)} if repeatable else {}
@@ -324,6 +332,68 @@ def test_run_prints_a_summary_and_sends_the_candidate_cost_threshold(
         table = capsys.readouterr().out.splitlines()
         assert table[0].split() == ["RUN", "STATUS", "SUITE", "CREATED", "RESULT"]
         assert table[1].split()[:3] == [run_id, "completed", corpus.suites[0].id]
+
+
+@pytest.mark.parametrize(
+    ("failure", "category", "reason", "trial_status"),
+    [
+        (
+            "environment_refused",
+            "environment_failure",
+            "RuntimeError: sandbox quota exhausted",
+            "error",
+        ),
+        # A provider's error can quote what the candidate sent it, so it isn't published.
+        # The case's root-status check scores the failed session, so its trial failed.
+        ("provider_failed", "provider_failure", None, "failed"),
+    ],
+)
+def test_runs_show_names_how_a_candidate_run_failed(
+    failure: str,
+    category: str,
+    reason: str | None,
+    trial_status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    corpus = _corpus(trials=1)
+    run = _run_arguments(_corpus_file(tmp_path, corpus), corpus)
+    agent = (
+        _agent(
+            tmp_path, monkeypatch, environment_factory=_RefusingFactory("sandbox quota exhausted")
+        )
+        if failure == "environment_refused"
+        else _agent(tmp_path, monkeypatch, provider=_ExplodingProvider())
+    )
+
+    with agent:
+        code, answer, _ = _cloud(capsys, *run, *_FAST)
+        assert (code, answer["result"]["summary"]["trials"][trial_status]) == (0, 1), answer
+        run_id = answer["result"]["run"]["id"]
+
+        shown = _ok(capsys, "runs", "show", "--application", _AGENT, run_id)
+        assert shown["candidate_run_failures"] == {
+            "items": [
+                {
+                    "case_id": "refund-approval",
+                    "trial_number": 1,
+                    "execution_failure_category": category,
+                    "execution_limit": None,
+                    "reason": reason,
+                }
+            ],
+            "has_more": False,
+        }
+        assert main(["cloud", "eval", "runs", "show", "--application", _AGENT, run_id]) == 0
+        lines = capsys.readouterr().out.splitlines()
+        expected = (
+            f"Candidate run: failed ({category})."
+            if reason is None
+            else f"Candidate run: failed ({category}): {reason}"
+        )
+        assert f"refund-approval trial 1: {expected}" in lines
+        assert not any("model exploded" in line for line in lines)
 
 
 def test_refuses_a_corpus_for_a_target_this_release_does_not_have(

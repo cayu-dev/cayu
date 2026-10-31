@@ -40,6 +40,8 @@ from cayu.evals.models import (
     _revalidate_model_instance,
     _revalidate_model_iterable,
     _validate_trajectory_record_contract,
+    candidate_run_failure_text,
+    failure_evidence_reason,
 )
 from cayu.evals.operation_outcomes import OperationOutcomeSummary, operation_outcome_summary_text
 from cayu.evals.run_cost import (
@@ -734,18 +736,17 @@ def _trial_section(trial: Any) -> str:
     )
     execution = getattr(trial, "execution_status", None)
     failure_category = getattr(trial, "execution_failure_category", None)
-    execution_limit = getattr(trial, "execution_limit", None)
-    if failure_category is not None:
-        cause = (
-            failure_category
-            if execution_limit is None
-            else f"{failure_category}: {execution_limit}"
-        )
-        execution_html = f"<p>Candidate run: failed ({_escape(cause)}).</p>"
-    else:
-        execution_html = f"<p>Workflow execution: {_escape(execution)}.</p>" if execution else ""
     failure_capture = getattr(trial, "failure_capture", None)
     failure_evidence = getattr(trial, "failure_evidence", None)
+    if failure_category is not None:
+        text = candidate_run_failure_text(
+            failure_category,
+            getattr(trial, "execution_limit", None),
+            failure_evidence_reason(failure_evidence),
+        )
+        execution_html = f"<p>{_escape(text)}</p>"
+    else:
+        execution_html = f"<p>Workflow execution: {_escape(execution)}.</p>" if execution else ""
     failure_evidence_html = (
         "<h5>Execution failure evidence</h5><pre>"
         + _escape(failure_evidence.model_dump_json(indent=2))

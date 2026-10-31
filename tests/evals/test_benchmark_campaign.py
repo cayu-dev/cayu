@@ -5,6 +5,8 @@ import asyncio
 import pytest
 
 from cayu.budgets.run_limits import RunLimits
+from cayu.cli import main
+from cayu.cli._benchmark_campaigns import _failure_reason
 from cayu.evals.benchmark_campaign import (
     BenchmarkCampaignSettingsV1,
     admit_benchmark_campaign,
@@ -29,6 +31,7 @@ from cayu.evals.benchmark_synthetic import (
 )
 from cayu.evals.runner import EvalPlan
 from cayu.evals.store import EvalRunClaimLost, EvalRunRecoveryPolicyV1
+from cayu.failure_evidence import FailureEvidence
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.storage.migrations import SchemaMode
 
@@ -201,7 +204,7 @@ def test_trial_stopped_by_a_run_limit_keeps_its_retry_category_and_output(tmp_pa
     }
 
 
-def test_typed_failures_selective_retry_and_retained_native_links(tmp_path):
+def test_typed_failures_selective_retry_and_retained_native_links(tmp_path, capsys):
     async def scenario():
         loaded = load_benchmark_package(
             write_synthetic_benchmark_package(tmp_path / "package", failure_modes=True)
@@ -248,6 +251,24 @@ def test_typed_failures_selective_retry_and_retained_native_links(tmp_path):
             await plan.corpus_target.app.session_store.close()
 
     asyncio.run(scenario())
+
+    # The failures table gives a reason only for an environment or setup failure: a
+    # provider's error is not published.
+    assert main(["eval", "failures", str(tmp_path / "campaign"), "--no-sessions"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[2].split("\t")[-1] == "REASON"
+    (row,) = (line.split("\t") for line in lines[3:] if line.startswith("provider-failure\t"))
+    assert (row[3], row[-1]) == ("provider_failure", "-")
+    assert "Synthetic provider failure." not in "\n".join(lines)
+    (wrong,) = (line.split("\t") for line in lines[3:] if line.startswith("wrong-answer\t"))
+    assert wrong[-1] == "-"
+    refused = FailureEvidence(
+        exception_types=("ExecutionAdmissionError",),
+        exception_message="Execution candidate 'local' was refused\tduring pre_create.",
+    )
+    assert _failure_reason(refused.model_dump(mode="json")) == (
+        "ExecutionAdmissionError: Execution candidate 'local' was refused\\x09during pre_create."
+    )
 
 
 @pytest.mark.parametrize("prior_claims,allowance,expected_calls", [(1, 1, 0), (1, 2, 1), (2, 2, 0)])

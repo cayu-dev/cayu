@@ -20,11 +20,7 @@ from cayu._validation import (
 )
 from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
 from cayu.environments.admission import ExecutionAdmissionError
-from cayu.failure_evidence import (
-    FAILURE_EVIDENCE_MESSAGE_MAX_CHARS,
-    FailureEvidence,
-    exception_evidence,
-)
+from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.resource_access import model_data_access
 from cayu.runners._adapter_identity import trusted_runner_adapter_name
 from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError, runner_error_text
@@ -35,7 +31,7 @@ from cayu.runtime._durable_subagents import (
     durable_subagent_unsettled_cancellation_outcome,
     is_durable_subagent_submission_unsettled,
 )
-from cayu.runtime._exception_detail import exception_detail, exception_detail_suffix
+from cayu.runtime._exception_detail import failure_evidence_message
 from cayu.runtime._isolated_tool_process import (
     IsolatedToolCleanupUnproven,
     IsolatedToolDeadlineExceeded,
@@ -367,7 +363,9 @@ def _finish_raised_outcome(
     if exception is None:
         return outcome
     _log_tool_exception(exception, tool=tool, ctx=ctx, redactor=redactor)
-    message = _failure_evidence_message(exception, redactor=redactor)
+    # Masked with the invocation's workload redactor, as the tool result transcript
+    # is, and again when the sealed scope publishes the event.
+    message = failure_evidence_message(exception, redactor=redactor)
     if message is None:
         return outcome
     payload = outcome.terminal_payload_fields()
@@ -380,31 +378,6 @@ def _finish_raised_outcome(
         update={"exception_message": message}
     ).model_dump(mode="json")
     return _execution_outcome(outcome.result, payload)
-
-
-def _failure_evidence_message(
-    exception: BaseException,
-    *,
-    redactor: SecretRedactor,
-) -> str | None:
-    """Masked, bounded message with its cause chain or group leaves.
-
-    It is redacted with the invocation's workload redactor, as the tool result
-    transcript is, and again when the sealed scope publishes the event.
-    """
-
-    try:
-        # Exception text often quotes values with repr; match those forms too.
-        detail = exception_detail(exception, redactor=redactor.with_python_repr_forms())
-        message = redactor.redact_text_bounded(
-            (detail.message + exception_detail_suffix(detail)).strip(),
-            # A UTF-8 byte bound is also a character bound.
-            max_bytes=FAILURE_EVIDENCE_MESSAGE_MAX_CHARS,
-        )
-    except BaseException:
-        # The type tree is still retained; never lose the outcome to a message.
-        return None
-    return message or None
 
 
 def _log_tool_exception(
