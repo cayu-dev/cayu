@@ -11,15 +11,17 @@ from fastapi.testclient import TestClient
 from tests.core.test_tool_completion import FinalTool
 
 import cayu.sessions._call_inspection as call_inspection
-from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu import AgentSpec, CayuApp, Message, ResumeRequest, RunRequest
 from cayu.cli import main
-from cayu.evals.testing import ScriptedModelProvider
+from cayu.context import StructuredOutputSpec
+from cayu.evals.testing import ScriptedModelProvider, scripted_structured_output
 from cayu.events import Event, EventType
 from cayu.providers import ModelStreamEvent
 from cayu.server import ServerConfig, create_server
 from cayu.server.auth import BasicAuth
 from cayu.sessions.records import SessionIdentity
 from cayu.storage import SQLiteSessionStore
+from cayu.tools import AlwaysRequireApprovalToolPolicy
 
 _USAGE = {"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}
 _SESSION = "sess_cloud"
@@ -163,6 +165,72 @@ def _seed_ledger(path: Path) -> None:
     asyncio.run(run())
 
 
+def _seed_outputs(path: Path) -> None:
+    """A session answered twice with structured output, and one paused for an approval."""
+
+    async def run() -> None:
+        store = SQLiteSessionStore(path)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            ScriptedModelProvider(
+                [
+                    list(scripted_structured_output({"verdict": "bug", "score": 0.9})),
+                    list(scripted_structured_output({"verdict": "not a bug", "score": 0.2})),
+                    [
+                        ModelStreamEvent.tool_call(name="ask_customer", arguments={}, id="c1"),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                ],
+                name="fixture",
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="judge", model="scripted-model"))
+        app.register_agent(
+            AgentSpec(name="gated", model="scripted-model"),
+            tools=[FinalTool()],
+            tool_policy=AlwaysRequireApprovalToolPolicy(tools=["ask_customer"]),
+        )
+        spec = StructuredOutputSpec(
+            name="Verdict",
+            json_schema={
+                "type": "object",
+                "properties": {"verdict": {"type": "string"}, "score": {"type": "number"}},
+                "required": ["verdict", "score"],
+                "additionalProperties": False,
+            },
+        )
+        try:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="judge",
+                    session_id="sess_answer",
+                    messages=[Message.text("user", "Is this a bug?")],
+                    structured_output=spec,
+                )
+            ):
+                pass
+            async for _ in app.resume(
+                ResumeRequest(
+                    session_id="sess_answer", messages=[Message.text("user", "Look again.")]
+                )
+            ):
+                pass
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="gated",
+                    session_id="sess_paused",
+                    messages=[Message.text("user", "Ask the customer.")],
+                )
+            ):
+                pass
+        finally:
+            await app.aclose()
+            await store.close()
+
+    asyncio.run(run())
+
+
 @pytest.fixture
 def agent(tmp_path: Path, monkeypatch):
     """A seeded store, the same store served as a Cloud Agent, and a signed-in CLI."""
@@ -170,6 +238,7 @@ def agent(tmp_path: Path, monkeypatch):
     database = tmp_path / "cayu.db"
     _seed(database)
     _seed_ledger(database)
+    _seed_outputs(database)
     cloud = _FakeCloud()
     monkeypatch.setattr("cayu.cli.cloud.cloud_client", lambda **_: cloud)
     server = create_server(
@@ -393,3 +462,87 @@ def test_server_disclosure_redacts_arguments_before_bounding_them() -> None:
     # Bounding first would leave a prefix of the secret that an exact-match redactor misses.
     assert "SECRET" in local
     assert "SECRET" not in server and len(server.encode()) <= 256
+
+
+def test_session_output_prints_the_latest_interactions_structured_output(agent, capsys) -> None:
+    database, _, _ = agent
+
+    local, remote = _both(capsys, database, "output", "sess_answer")
+
+    assert remote == local
+    assert (local["name"], local["output"]) == ("Verdict", {"verdict": "not a bug", "score": 0.2})
+    assert local["session_status"] == "completed"
+    interactions = _json(capsys, "interactions", "sess_answer", "--sqlite", str(database))
+    first, latest = interactions["interactions"][1], interactions["interactions"][0]
+    assert local["interaction_id"] == latest["interaction_id"]
+
+    # An earlier interaction's answer is read by naming it.
+    local = _json(
+        capsys,
+        "output",
+        "sess_answer",
+        "--interaction-id",
+        first["interaction_id"],
+        "--sqlite",
+        str(database),
+    )
+    assert local["output"] == {"verdict": "bug", "score": 0.9}
+
+    assert main(["session", "output", "sess_answer", "--sqlite", str(database), "--table"]) == 0
+    table = capsys.readouterr().out
+    assert "Verdict" in table and '"verdict": "not a bug"' in table
+
+
+@pytest.mark.parametrize(
+    ("session_id", "code", "exit_code", "message"),
+    [
+        (
+            _SESSION,
+            "NO_STRUCTURED_OUTPUT",
+            3,
+            "Session sess_cloud has no structured output from its latest interaction; "
+            "it is completed.",
+        ),
+        (
+            "sess_paused",
+            "SESSION_NOT_FINISHED",
+            4,
+            "Session sess_paused hasn't finished: it is interrupted and its latest interaction "
+            "is paused, waiting for an approval or an answer.",
+        ),
+        ("sess_ledger", "SESSION_NOT_FINISHED", 4, "Session sess_ledger hasn't finished: it is"),
+    ],
+)
+def test_session_output_says_when_there_is_none_or_the_session_hasnt_finished(
+    agent, capsys, session_id, code, exit_code, message
+) -> None:
+    database, _, _ = agent
+
+    for target in (("--sqlite", str(database)), ("--application", "bug-hunter-agent")):
+        assert main(["session", "output", session_id, *target, "--json"]) == exit_code
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert error["code"] == code, target
+        assert error["message"].startswith(message), target
+
+    assert (
+        main(["session", "output", session_id, "--sqlite", str(database), "--table"]) == exit_code
+    )
+    assert capsys.readouterr().err.startswith(f"error: {message}")
+
+
+def test_session_output_escapes_a_hostile_agents_status_for_people(
+    agent, capsys, monkeypatch
+) -> None:
+    from cayu.cli._agent_session_reader import AgentSessionReader
+
+    async def hostile(self, session_id: str) -> str:
+        return "completed\x1b]52;c;ZWNobyBwd25lZA==\x07\x1b[2J"
+
+    monkeypatch.setattr(AgentSessionReader, "session_status", hostile)
+
+    code = main(["session", "output", _SESSION, "--application", "bug-hunter-agent", "--table"])
+
+    err = capsys.readouterr().err
+    assert code == 3
+    assert "\x1b" not in err and "\x07" not in err
+    assert "it is completed\\x1b]52;c;" in err

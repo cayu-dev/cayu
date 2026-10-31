@@ -217,6 +217,7 @@ the project's configured or canonical store), read-only, or reads a Cayu Cloud A
 cayu task list --status running
 cayu task list --application my-agent --type scan --limit 20
 cayu task show TASK_ID --json
+cayu task wait TASK_ID --application my-agent --wait-seconds 3600
 ```
 
 `list` prints the newest-updated tasks first with their status, the reason for it, the
@@ -227,6 +228,28 @@ asked for or done, the reason, and for a task cancelled after its worker was los
 reconciliation outcome such as `quiescent`), and every attempt of the task's retry series
 found through its predecessor and successor links. Table output is the default;
 `--json` (and `--jsonl` for `list`) prints the same data with a `schema_version`.
+
+`wait` reads the task every `--poll-seconds` (default 5) until it ends, then prints it as
+`show` does, with `wait.task_id` (the task you named) and `wait.outcome` added to the JSON.
+It notes each status it sees on stderr. An attempt that failed with a retry scheduled is
+not the end: the wait goes on with the next attempt of its retry series, so the task shown
+can be a later attempt than the one named. A paused, blocked or `needs_attention` task
+hasn't ended either, so the wait goes on while it waits for a person. Reads that fail
+because a Cloud Agent is waking, unreachable or answering 5xx are tried again until the
+wait runs out; an attempt of the retry series that can't be read that way when the task is
+printed is left out, with `retry_series.attempts_complete` false. `--wait-seconds`
+(default 21600, six hours) bounds the wait; `--timeout-seconds` stays the limit for each
+request, as for the other commands. The limit is checked between reads, so a read under
+way when it passes (such as one waking a sleeping Agent) finishes first. The exit code
+says how the task ended:
+
+| Exit | `wait.outcome` | Meaning |
+| ---: | --- | --- |
+| `0` | `completed` | The task completed; `task.result` has its result. |
+| `1` | | The task or its store couldn't be read, for example `Task not found`. |
+| `3` | `failed`, `dependency_skipped` | The task failed, or was skipped because a prerequisite didn't complete. |
+| `4` | `cancelled` | The task was cancelled; `cancellation` says why. |
+| `124` | `timed_out` | The task is still unfinished after `--wait-seconds`; it goes on, and the output shows it as last read. |
 
 ## Run due tasks and exit
 

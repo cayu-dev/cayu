@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any, cast
 
-from cayu.cli._cloud_agent_api import open_cloud_agent_api
+from cayu.cli._cloud_agent_api import CayuApiError, open_cloud_agent_api
 from cayu.cli._output import (
     add_output_options,
+    note,
     print_table,
     terminal_safe,
 )
-from cayu.cli._read_targets import ReadTarget, add_read_target_options, run_read_command
+from cayu.cli._read_targets import (
+    ReadTarget,
+    _positive_seconds,
+    add_read_target_options,
+    run_read_command,
+)
 from cayu.cli._task_readers import (
     MAX_TASK_PAGE,
     ApiTaskReader,
@@ -30,6 +38,24 @@ _MAX_SERIES_ATTEMPTS = 100
 _CANCELLATION_REQUEST_REASONS = frozenset(
     {"cancellation_requested", "retry_cancellation_requested"}
 )
+
+#: ``cayu task wait`` exit codes. 1 remains any other error and 2 an argparse usage error.
+EXIT_TASK_COMPLETED = 0
+#: The task failed, or was skipped because a prerequisite didn't complete.
+EXIT_TASK_FAILED = 3
+EXIT_TASK_CANCELLED = 4
+#: The task is still unfinished after ``--wait-seconds``, as `timeout` reports it.
+EXIT_WAIT_TIMED_OUT = 124
+# A task ends in one of these statuses; each has its exit code.
+_TERMINAL_EXIT_CODES = {
+    TaskStatus.COMPLETED.value: EXIT_TASK_COMPLETED,
+    TaskStatus.FAILED.value: EXIT_TASK_FAILED,
+    TaskStatus.DEPENDENCY_SKIPPED.value: EXIT_TASK_FAILED,
+    TaskStatus.CANCELLED.value: EXIT_TASK_CANCELLED,
+}
+_TIMED_OUT = "timed_out"
+DEFAULT_WAIT_SECONDS = 6 * 60 * 60.0
+DEFAULT_POLL_SECONDS = 5.0
 
 
 def add_task_parser(subparsers: Any) -> None:
@@ -134,6 +160,36 @@ def add_task_parser(subparsers: Any) -> None:
     add_read_target_options(show_parser)
     add_output_options(show_parser, formats=("table", "json"), default="table")
 
+    wait_parser = commands.add_parser(
+        "wait",
+        help="Wait until a task ends, then show it.",
+        description=(
+            "Wait until a task completes, fails or is cancelled, then show it as "
+            "`cayu task show` does. A failed attempt whose retry series goes on is followed "
+            f"to its next attempt. Exits {EXIT_TASK_COMPLETED} when the task completed, "
+            f"{EXIT_TASK_FAILED} when it failed or was skipped, {EXIT_TASK_CANCELLED} when it "
+            f"was cancelled, {EXIT_WAIT_TIMED_OUT} when it is still unfinished after "
+            "--wait-seconds, and 1 when it can't be read."
+        ),
+    )
+    wait_parser.add_argument("task_id")
+    wait_parser.add_argument(
+        "--wait-seconds",
+        type=_positive_seconds,
+        default=DEFAULT_WAIT_SECONDS,
+        metavar="SECONDS",
+        help=f"How long to wait for the task (default: {DEFAULT_WAIT_SECONDS:.0f}).",
+    )
+    wait_parser.add_argument(
+        "--poll-seconds",
+        type=_positive_seconds,
+        default=DEFAULT_POLL_SECONDS,
+        metavar="SECONDS",
+        help=f"How often to read the task (default: {DEFAULT_POLL_SECONDS:.0f}).",
+    )
+    add_read_target_options(wait_parser)
+    add_output_options(wait_parser, formats=("table", "json"), default="table")
+
 
 def run_task(args: argparse.Namespace) -> int:
     if args.task_command in {"create", "graph-create", "block", "hold"}:
@@ -153,6 +209,8 @@ async def _run_task_command(args: argparse.Namespace, target: ReadTarget) -> int
     try:
         if args.task_command == "list":
             return await _list_tasks(args, reader)
+        if args.task_command == "wait":
+            return await _wait_for_task(args, reader)
         return await _show_task(args, reader)
     finally:
         await reader.close()
@@ -225,7 +283,82 @@ async def _show_task(args: argparse.Namespace, reader: TaskReader) -> int:
     task = await reader.load_task(args.task_id)
     if task is None:
         raise ValueError(f"Task not found: {args.task_id}")
-    payload = _redact_sensitive(
+    _render_task(args, await _task_payload(reader, task))
+    return 0
+
+
+async def _wait_for_task(args: argparse.Namespace, reader: TaskReader) -> int:
+    """Read the task until it ends or ``--wait-seconds`` pass, then show it.
+
+    A terminal attempt with a successor in its retry series hands the wait to that attempt.
+    Failures to reach a server say nothing about the task, so they are read through.
+    """
+
+    deadline = time.monotonic() + args.wait_seconds
+    task_id = args.task_id
+    task: dict[str, Any] | None = None
+    unread: CayuApiError | None = None
+    shown: str | None = None
+    followed = {task_id}
+    while True:
+        try:
+            current = await reader.load_task(task_id)
+        except CayuApiError as exc:
+            if not exc.transient:
+                raise
+            if unread is None:
+                note(f"{exc} Reading task {task_id} again.")
+            unread = exc
+        else:
+            unread = None
+            if current is None:
+                raise ValueError(f"Task not found: {task_id}")
+            task = current
+            status = task["status"]
+            successor = _object(task.get("retry_series")).get("successor_task_id")
+            if status in _TERMINAL_EXIT_CODES and isinstance(successor, str):
+                if successor in followed or len(followed) >= _MAX_SERIES_ATTEMPTS:
+                    # A series links each attempt to a new one, at most 100 of them.
+                    raise ValueError(
+                        f"Task {args.task_id}'s retry series can't be followed past task "
+                        f"{task_id}: its attempts link back to an earlier one or exceed "
+                        f"{_MAX_SERIES_ATTEMPTS}."
+                    )
+                note(f"Task {task_id} {status}; its retry series goes on as task {successor}.")
+                followed.add(successor)
+                task_id = successor
+                # Only the attempt waited on now says how the work ended.
+                task = None
+                continue
+            line = f"Task {task_id} is {status}."
+            if line != shown:
+                note(line)
+                shown = line
+            if status in _TERMINAL_EXIT_CODES:
+                break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(args.poll_seconds, remaining))
+    if task is None:
+        # Every read of the attempt waited on failed until the wait ran out.
+        assert unread is not None
+        raise unread
+    outcome = task["status"] if task["status"] in _TERMINAL_EXIT_CODES else _TIMED_OUT
+    payload = await _task_payload(reader, task)
+    payload["wait"] = {"task_id": args.task_id, "outcome": outcome}
+    _render_task(args, payload)
+    if outcome == _TIMED_OUT:
+        note(
+            f"Task {task['id']} is still {task['status']} after waiting "
+            f"{args.wait_seconds:g}s; it goes on."
+        )
+        return EXIT_WAIT_TIMED_OUT
+    return _TERMINAL_EXIT_CODES[outcome]
+
+
+async def _task_payload(reader: TaskReader, task: dict[str, Any]) -> dict[str, Any]:
+    return _redact_sensitive(
         {
             "schema_version": CLI_SCHEMA_VERSION,
             "source": reader.source,
@@ -234,11 +367,13 @@ async def _show_task(args: argparse.Namespace, reader: TaskReader) -> int:
             "retry_series": await _retry_series(reader, task),
         }
     )
+
+
+def _render_task(args: argparse.Namespace, payload: dict[str, Any]) -> None:
     if args.output_format == "json":
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     else:
         _print_task(payload)
-    return 0
 
 
 def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:
@@ -301,9 +436,16 @@ async def _retry_series(reader: TaskReader, task: dict[str, Any]) -> dict[str, A
                 # More links than a series can have; stop rather than follow them all.
                 complete = False
                 break
-            loaded = await reader.load_task(linked)
+            try:
+                loaded = await reader.load_task(linked)
+            except CayuApiError as exc:
+                if not exc.transient:
+                    raise
+                # The server didn't answer for this attempt just now; the task itself was
+                # read, so show it with the attempts read so far.
+                loaded = None
             if loaded is None:
-                # The linked attempt is gone (for example, retention removed it).
+                # The linked attempt is gone (for example, retention removed it) or unread.
                 complete = False
                 break
             attempts[linked] = loaded

@@ -25,7 +25,6 @@ import json
 import re
 import secrets
 import shlex
-import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -38,7 +37,7 @@ from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, CayuApiNotFound, cl
 from cayu.cli._cloud_api import CloudApiError
 from cayu.cli._cloud_releases import add_output_argument
 from cayu.cli._cloud_settings import _cell, _table
-from cayu.cli._output import terminal_safe
+from cayu.cli._output import note, terminal_safe
 
 if TYPE_CHECKING:
     from cayu.cli._cloud_api import CloudApiClient
@@ -59,9 +58,6 @@ _DEFAULT_CURRENCY = "USD"
 _CURRENCY = re.compile(r"[A-Z0-9._-]{1,16}")
 # Reading an asleep Agent wakes its web process, which can take a minute or more.
 _WAKE_TIMEOUT_SECONDS = 150.0
-# Reads that fail this way say nothing about the run, which goes on in the Agent; a deploy
-# that replaces the Agent's web process mid-run answers like this for a while.
-_TRANSIENT_CATEGORIES = frozenset({"starting", "timeout", "unreachable"})
 _REPORT_RECORD_TYPE = "cayu.eval-result-report"
 # Eval revisions, such as execution-profile revisions and baseline operation IDs.
 _EVAL_REVISION = re.compile(r"sha256:[0-9a-f]{64}")
@@ -393,7 +389,7 @@ def _run(
         bound = _bound(
             target, corpus, suite, max_concurrency=arguments.max_concurrency, cost_cap=cost_cap
         )
-        _say(_bound_text(bound))
+        note(_bound_text(bound))
 
         def import_corpus() -> None:
             imported = api.post(
@@ -408,7 +404,7 @@ def _run(
         # no longer satisfy; its admission replays without one while the corpus is stored.
         if not continuing:
             import_corpus()
-        _say(
+        note(
             f"Admitting the run with operation ID {operation_id}. If this command stops before "
             f"it names the run, `{commands['continue']}` admits nothing new and continues."
         )
@@ -834,17 +830,19 @@ def _wait_for_run(
             current = _read_run(api, run_id)
             progress = _read_progress(api, run_id)
         except CayuApiError as exc:
-            if not _transient(exc):
+            # A transient failure says nothing about the run, which goes on in the Agent; a
+            # deploy that replaces the Agent's web process mid-run answers like this a while.
+            if not exc.transient:
                 raise
             if not unreachable:
-                _say(f"{exc} Run {run_id} goes on in the Agent; reading it again.")
+                note(f"{exc} Run {run_id} goes on in the Agent; reading it again.")
             unreachable = True
         else:
             unreachable = False
             run = current
             line = _progress_line(run, progress)
             if line != shown:
-                _say(line)
+                note(line)
                 shown = line
             if run["status"] in TERMINAL_RUN_STATUSES:
                 return run, progress
@@ -1264,16 +1262,6 @@ def _application_id(client: CloudApiClient, reference: str) -> str:
 
 def _run_path(run_id: str) -> str:
     return f"/evals/runs/{quote(run_id, safe='')}"
-
-
-def _transient(exc: CayuApiError) -> bool:
-    if exc.category in _TRANSIENT_CATEGORIES:
-        return True
-    return exc.category == "server_error" and (exc.status_code or 0) >= 500
-
-
-def _say(text: str) -> None:
-    print(terminal_safe(text, keep_lines=True), file=sys.stderr, flush=True)
 
 
 def _count(number: object, noun: str) -> str:

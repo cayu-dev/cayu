@@ -75,6 +75,10 @@ class SessionReader(Protocol):
         """Raise `ValueError("Session not found: ...")` unless the session exists."""
         ...
 
+    async def session_status(self, session_id: str) -> str:
+        """The session's status, such as ``completed``; raises like `require_session`."""
+        ...
+
     async def overview(self, session_id: str) -> dict[str, Any]: ...
 
     async def latest_interactions(
@@ -178,6 +182,12 @@ class StoreSessionReader:
     async def require_session(self, session_id: str) -> None:
         if await self.store.load(session_id) is None:
             raise ValueError(f"Session not found: {session_id}")
+
+    async def session_status(self, session_id: str) -> str:
+        state = await self.store.load_state(session_id)
+        if state is None:
+            raise ValueError(f"Session not found: {session_id}")
+        return state.status.value
 
     async def overview(self, session_id: str) -> dict[str, Any]:
         try:

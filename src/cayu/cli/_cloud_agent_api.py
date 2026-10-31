@@ -41,6 +41,9 @@ _MAX_DETAIL_CHARS = 512
 _SUCCESS_STATUSES = frozenset({200, 201, 202})
 # Agent states in which its web process can't answer; Cloud wakes a sleeping one.
 _NOT_SERVING_STATUSES = frozenset({"stopping", "stopped", "deleting", "archived", "failed"})
+# Failures of one read that say nothing about the next: the Agent was waking, or the request
+# timed out or could not connect.
+_TRANSIENT_CATEGORIES = frozenset({"starting", "timeout", "unreachable"})
 
 
 class CayuApiError(RuntimeError):
@@ -62,6 +65,15 @@ class CayuApiError(RuntimeError):
         self.category = category
         self.status_code = status_code
         self.detail = detail
+
+    @property
+    def transient(self) -> bool:
+        """Whether the same read may succeed later: the server was starting, slow, out of
+        reach, or failed with a 5xx. A command that waits on the server reads again."""
+
+        if self.category in _TRANSIENT_CATEGORIES:
+            return True
+        return self.category == "server_error" and (self.status_code or 0) >= 500
 
 
 class CayuApiNotFound(CayuApiError):

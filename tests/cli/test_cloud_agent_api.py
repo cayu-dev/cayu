@@ -149,6 +149,61 @@ def test_reader_bounds_multi_type_event_reads_at_one_high_water_mark() -> None:
     assert {params.get("before_sequence") for params in asked[1:]} == {"5"}
 
 
+def test_reader_pages_newest_first_reads_back_from_each_page() -> None:
+    from cayu.sessions.event_queries import EventOrder
+
+    stored = {
+        "custom.a": [1, 4, 6],
+        "custom.b": [2, 5],
+    }
+    asked: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sessions"):
+            return httpx.Response(200, json=_SESSIONS)
+        params = dict(request.url.params)
+        asked.append(params)
+        before = int(params.get("before_sequence") or 1_000)
+        if "event_type" not in params:
+            newest = max(max(sequences) for sequences in stored.values())
+            matching = [newest] if newest < before else []
+        else:
+            matching = sorted((n for n in stored[params["event_type"]] if n < before), reverse=True)
+        # This Agent answers at most two events a page.
+        limit = min(int(params["limit"]), 2)
+        events = [
+            {
+                "sequence": n,
+                "id": f"e{n}",
+                "type": params.get("event_type", "custom.a"),
+                "session_id": "s",
+                "payload": {},
+                "timestamp": "2026-10-28T12:00:00+00:00",
+            }
+            for n in matching[:limit]
+        ]
+        return httpx.Response(200, json={"events": events, "has_more": len(matching) > limit})
+
+    reader = AgentSessionReader(_api(handler))
+    records = asyncio.run(
+        reader.query_events(
+            EventQuery(
+                session_id="s",
+                event_types=("custom.a", "custom.b"),
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=4,
+            )
+        )
+    )
+
+    assert [record.sequence for record in records] == [6, 5, 4, 2]
+    assert all(params["order_by"] == "sequence_desc" for params in asked)
+    # Every type is read below one high-water mark; a type's next page continues below the
+    # oldest event of its previous page.
+    pages_of_a = [params for params in asked if params.get("event_type") == "custom.a"]
+    assert [params["before_sequence"] for params in pages_of_a] == ["7", "4"]
+
+
 def test_reader_names_rollups_an_older_agent_does_not_serve() -> None:
     from cayu.sessions._rollup import SessionRollupQuery
 

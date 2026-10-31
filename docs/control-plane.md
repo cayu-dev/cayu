@@ -772,12 +772,15 @@ cayu task create report --input-file report.json --operation-id report-2026-10-2
 cayu task hold TASK_ID --reason "Waiting for review"
 cayu task block TASK_ID --reason "Missing source data"
 cayu task list --server-url http://127.0.0.1:8000 --json
+cayu task wait TASK_ID --server-url http://127.0.0.1:8000 --json
 ```
 
-`hold` uses the task pause transition; it does not interrupt work already owned
-by a worker. The server applies the same lifecycle and full-access checks as
-the dashboard. `--payload-file` accepts a JSON object of hold details. The
-input defaults to `{}` when `--input-file` is omitted.
+`wait` reads the task until it ends and exits with how it ended
+([exit codes](project-workers.md#inspect-tasks)). `hold` uses the task pause
+transition; it does not interrupt work already owned by a worker. The server
+applies the same lifecycle and full-access checks as the dashboard.
+`--payload-file` accepts a JSON object of hold details. The input defaults to
+`{}` when `--input-file` is omitted.
 
 `cayu task graph-create graph.json --operation-id daily-report --json` admits
 a whole dependency graph atomically. For example, `graph.json` can contain:

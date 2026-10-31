@@ -20,7 +20,7 @@ import httpx
 
 from cayu._validation import compact_json_utf8_size
 from cayu.budgets.pricing import PriceBook, default_price_book, load_price_book
-from cayu.cli._output import add_output_options, output_destination
+from cayu.cli._output import add_output_options, output_destination, print_table, terminal_safe
 from cayu.cli._session_reader import (
     SessionReader,
     StoreSessionReader,
@@ -48,6 +48,7 @@ from cayu.sessions._rollup import (
     top_failure_kinds,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.interactions import InteractionStatus
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.sessions.store import SessionStore
@@ -62,6 +63,25 @@ _MAX_SERVER_ERROR_BODY_BYTES = 128 * 1024
 _MAX_SERVER_ERROR_DETAIL_BYTES = 8 * 1024
 _MAX_SERVER_ERROR_DETAIL_SOURCE_BYTES = 64 * 1024
 _MAX_TRANSCRIPT_SUMMARY_PARTS = 100
+#: ``cayu session output`` exit codes besides 0 (printed), 1 (any other error) and 2
+#: (argparse usage error).
+EXIT_NO_STRUCTURED_OUTPUT = 3
+EXIT_SESSION_NOT_FINISHED = 4
+_UNFINISHED_SESSION_STATUSES = frozenset(
+    {SessionStatus.PENDING.value, SessionStatus.RUNNING.value, SessionStatus.INTERRUPTING.value}
+)
+_UNFINISHED_INTERACTION_STATUSES = frozenset(
+    {InteractionStatus.ACTIVE.value, InteractionStatus.PAUSED.value}
+)
+
+
+class SessionOutputUnavailable(ValueError):
+    """`session output` has nothing to print yet, or nothing at all; ``code`` says which."""
+
+    def __init__(self, code: str, message: str, *, exit_code: int) -> None:
+        super().__init__(message)
+        self.code = code
+        self.exit_code = exit_code
 
 
 def add_session_parser(subparsers: Any) -> None:
@@ -306,6 +326,24 @@ def add_session_parser(subparsers: Any) -> None:
     )
     add_output_options(transcript_parser, formats=FORMAT_CHOICES)
 
+    output_parser = commands.add_parser(
+        "output",
+        help="Print a finished session's structured output.",
+        description=(
+            "Print the structured output the session's latest interaction validated, or "
+            "that of --interaction-id. Exits "
+            f"{EXIT_NO_STRUCTURED_OUTPUT} when there is none and {EXIT_SESSION_NOT_FINISHED} "
+            "when the session hasn't finished."
+        ),
+    )
+    output_parser.add_argument("session_id")
+    _add_target_options(output_parser)
+    output_parser.add_argument(
+        "--interaction-id",
+        help="Read this interaction's output instead (see `cayu session interactions`).",
+    )
+    add_output_options(output_parser, formats=("json", "table"))
+
     resolution_parser = commands.add_parser(
         "resolve-provider-operation",
         help="Explicitly retry or fail unavailable provider work.",
@@ -386,6 +424,9 @@ def _run_session(args: argparse.Namespace) -> int:
         return asyncio.run(
             _run_session_command(args, lambda: StoreSessionReader(_open_read_only_store(target)))
         )
+    except SessionOutputUnavailable as exc:
+        _render_session_error(str(exc), args.output_format, code=exc.code)
+        return exc.exit_code
     except (SessionStoreTargetError, ValueError, OSError, RuntimeError) as exc:
         _render_session_error(_safe_error(str(exc), dsn), args.output_format)
         return 1
@@ -531,20 +572,22 @@ def _safe_server_error_detail(
     return head + marker
 
 
-def _render_session_error(message: str, output_format: str) -> None:
+def _render_session_error(
+    message: str, output_format: str, *, code: str = "SESSION_INSPECTION_FAILED"
+) -> None:
     if output_format in {"json", "jsonl"}:
         print(
             json.dumps(
                 {
                     "schema_version": CLI_SCHEMA_VERSION,
-                    "error": {"code": "SESSION_INSPECTION_FAILED", "message": message},
+                    "error": {"code": code, "message": message},
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             )
         )
         return
-    print(f"error: {message}", file=sys.stderr)
+    print(f"error: {terminal_safe(message)}", file=sys.stderr)
 
 
 def _open_cloud_reader(args: argparse.Namespace) -> SessionReader:
@@ -592,6 +635,8 @@ async def _run_session_command(
             return await _session_events(args, reader)
         if args.session_command == "transcript":
             return await _session_transcript(args, reader)
+        if args.session_command == "output":
+            return await _session_output(args, reader)
         return 1
     finally:
         await reader.close()
@@ -1233,6 +1278,95 @@ def _event_row(record: EventRecord, *, payload_limit: int | None) -> dict[str, A
         row["payload_preview"] = _truncate_utf8(preview, max_bytes=payload_limit)
         row["payload_truncated"] = len(preview.encode("utf-8")) > payload_limit
     return row
+
+
+async def _session_output(args: argparse.Namespace, reader: SessionReader) -> int:
+    """Print the last structured output validated in the session's latest (or the named)
+    interaction: the answer to the request that started it."""
+
+    session_id = args.session_id
+    status = await reader.session_status(session_id)
+    if status in _UNFINISHED_SESSION_STATUSES:
+        raise SessionOutputUnavailable(
+            "SESSION_NOT_FINISHED",
+            f"Session {session_id} hasn't finished: it is {status}.",
+            exit_code=EXIT_SESSION_NOT_FINISHED,
+        )
+    latest = (await reader.latest_interactions(session_id, before_sequence=None, limit=1)).rows
+    interaction_id = args.interaction_id or (latest[0]["interaction_id"] if latest else None)
+    if latest and interaction_id == latest[0]["interaction_id"]:
+        interaction_status = latest[0]["status"]
+        if interaction_status in _UNFINISHED_INTERACTION_STATUSES:
+            raise SessionOutputUnavailable(
+                "SESSION_NOT_FINISHED",
+                f"Session {session_id} hasn't finished: it is {status} and its latest "
+                f"interaction is {interaction_status}"
+                + (
+                    ", waiting for an approval or an answer."
+                    if interaction_status == InteractionStatus.PAUSED.value
+                    else "."
+                ),
+                exit_code=EXIT_SESSION_NOT_FINISHED,
+            )
+    records = (
+        []
+        if interaction_id is None
+        else await reader.query_events(
+            EventQuery(
+                session_id=session_id,
+                interaction_id=interaction_id,
+                event_types=(EventType.STRUCTURED_OUTPUT_VALIDATED,),
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+    )
+    if not records:
+        which = f"interaction {interaction_id}" if args.interaction_id else "its latest interaction"
+        raise SessionOutputUnavailable(
+            "NO_STRUCTURED_OUTPUT",
+            f"Session {session_id} has no structured output from {which}; it is {status}.",
+            exit_code=EXIT_NO_STRUCTURED_OUTPUT,
+        )
+    record = records[0]
+    event = record.event
+    if "output" not in event.payload:
+        raise ValueError(
+            f"Session {session_id}'s structured output (event {record.sequence}) was "
+            "recorded without its value."
+        )
+    payload = _redact_sensitive(
+        {
+            "schema_version": CLI_SCHEMA_VERSION,
+            "session_id": session_id,
+            "session_status": status,
+            "interaction_id": event.interaction_id,
+            "name": event.payload.get("name"),
+            "attempt": event.payload.get("attempt"),
+            "sequence": record.sequence,
+            "validated_at": event.timestamp.isoformat(),
+            "output": event.payload["output"],
+        }
+    )
+    if args.output_format == "json":
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+    print_table(
+        ("field", "value"),
+        [
+            {"field": key, "value": value}
+            for key, value in payload.items()
+            if key not in {"schema_version", "output"}
+        ],
+    )
+    print("\nOutput")
+    print(
+        terminal_safe(
+            json.dumps(payload["output"], ensure_ascii=False, indent=2, sort_keys=True),
+            keep_lines=True,
+        )
+    )
+    return 0
 
 
 async def _session_transcript(args: argparse.Namespace, reader: SessionReader) -> int:

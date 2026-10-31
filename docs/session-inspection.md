@@ -494,7 +494,28 @@ cayu session events SESSION_ID --interaction-id INTERACTION_ID
 cayu session transcript SESSION_ID --offset 0 --limit 100 --sizes
 cayu session transcript SESSION_ID --include-content 4096 --output json
 cayu session transcript SESSION_ID --interaction-id INTERACTION_ID
+
+# The structured output a finished session answered with.
+cayu session output SESSION_ID
+cayu session output SESSION_ID --interaction-id INTERACTION_ID --table
 ```
+
+### Structured output
+
+`cayu session output SESSION_ID` prints the structured output the session's latest
+interaction validated: the `output` of the last `structured_output.validated` event of
+that interaction. An earlier answer of a continued session is read with `--interaction-id`
+(see `cayu session interactions`). JSON (the default) carries `output` with its `name`,
+`attempt`, `interaction_id`, the event's `sequence` and `validated_at`, and the session's
+`session_status`; `--table` prints those fields and the output indented. Values under secret-looking keys are redacted as in the
+other session commands.
+
+| Exit | `error.code` | Meaning |
+| ---: | --- | --- |
+| `0` | | The output was printed. |
+| `1` | `SESSION_INSPECTION_FAILED` | The session or its store couldn't be read. |
+| `3` | `NO_STRUCTURED_OUTPUT` | The interaction ended without a validated structured output: the run asked for none, or validation never succeeded. |
+| `4` | `SESSION_NOT_FINISHED` | The session is pending, running or interrupting, or its latest interaction is paused for an approval or an answer. Read it again once it ends. |
 
 ### Cost
 
@@ -570,15 +591,16 @@ predates it answers that it doesn't serve rollups yet.
 ### Sessions of a Cloud Agent
 
 Add `--application NAME` to `list`, `rollup`, `show`, `interactions`, `usage`, `tools`,
-`events` or `transcript` to read a Cayu Cloud Agent's sessions instead of a local store. `NAME` is the
-Agent's id, name or slug, as in `cayu cloud` commands. The CLI signs in the same way:
-`CAYU_CLOUD_API_KEY` or an API-key file, the selected private context (`--context PATH`,
-`CAYU_CLOUD_CONTEXT`, or `cayu cloud context use`), or `cayu cloud login`.
+`events`, `transcript` or `output` to read a Cayu Cloud Agent's sessions instead of a local
+store. `NAME` is the Agent's id, name or slug, as in `cayu cloud` commands. The CLI signs
+in the same way: `CAYU_CLOUD_API_KEY` or an API-key file, the selected private context
+(`--context PATH`, `CAYU_CLOUD_CONTEXT`, or `cayu cloud context use`), or `cayu cloud login`.
 
 ```console
 cayu session list --application bug-hunter --status failed
 cayu session tools SESSION_ID --application bug-hunter --table
 cayu session events SESSION_ID --application bug-hunter --type tool.call.failed --include-payload
+cayu session output SESSION_ID --application bug-hunter
 ```
 
 The CLI asks Cayu Cloud where the Agent serves Cayu and for its
@@ -595,8 +617,8 @@ withholds left out:
   as `null`, and `total_count` as `null` with `--since` or `--until`, because an Agent on
   an older Cayu ignores the window and the CLI filters its rows itself. `show` reports record byte sizes, queue counts, `operation` and `budget` as
   `null`.
-- `events` and `interactions` show the Agent's public view of each record: private ids
-  are record-scoped aliases such as `cayu_event_7:tool_call_id`, so payload sizes differ
+- `events`, `interactions` and `output` show the Agent's public view of each record: private
+  ids are record-scoped aliases such as `cayu_event_7:tool_call_id`, so payload sizes differ
   from the store's.
 - `usage` and `tools` pair events by their private identity on the Agent
   (`GET /api/sessions/{id}/model-calls` and `GET /api/sessions/{id}/tool-calls`). A

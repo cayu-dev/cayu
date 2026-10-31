@@ -58,3 +58,8 @@ validation emits `structured_output.validated` with `name`, `step`, `attempt`,
 `max_retries`, `valid`, `errors`, and the redacted validated `output`. The typed
 `StructuredOutputResult` wrapper distinguishes valid JSON `null` from a run
 that produced no validated structured output.
+
+`cayu session output SESSION_ID` prints a finished session's structured output
+from its store, or from a Cayu Cloud Agent with `--application NAME`. It exits
+`3` when the latest interaction validated none and `4` while the session hasn't
+finished.

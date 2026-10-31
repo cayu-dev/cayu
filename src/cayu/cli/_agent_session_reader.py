@@ -4,8 +4,8 @@ The Agent API pages each read with its own bounds (events and transcripts up to 
 interactions up to 100), filters events by one type at a time and omits a few private fields a
 local store reports (`run_epoch`, record byte sizes, queue and budget details). This reader
 follows the API's pages to answer the same queries the CLI asks a local store, reads one stream
-per requested event type and merges them in sequence order, applies `since`/`until` to events
-itself, and leaves what the API doesn't report as `None`.
+per requested event type and merges them in sequence order (either way), applies
+`since`/`until` to events itself, and leaves what the API doesn't report as `None`.
 """
 
 from __future__ import annotations
@@ -111,6 +111,12 @@ class AgentSessionReader:
 
     async def require_session(self, session_id: str) -> None:
         self._session_get(session_id)
+
+    async def session_status(self, session_id: str) -> str:
+        status = self._session_get(session_id).get("status")
+        if not isinstance(status, str):
+            raise CayuApiError("not_cayu", "The Agent's session has no status.")
+        return status
 
     async def overview(self, session_id: str) -> dict[str, Any]:
         detail = self._session_get(session_id)
@@ -278,8 +284,6 @@ class AgentSessionReader:
             raise CayuApiError("not_cayu", "The Agent's session rollup is invalid.") from exc
 
     async def query_events(self, query: EventQuery) -> list[EventRecord]:
-        if query.order_by is not EventOrder.SEQUENCE_ASC:
-            raise ValueError("Cloud Agent event reads are in ascending sequence order.")
         if query.session_id is None:
             raise ValueError("Cloud Agent event reads name one session.")
         types: tuple[str | None, ...] = tuple(str(item) for item in query.event_types) or (
@@ -298,7 +302,11 @@ class AgentSessionReader:
                 return []
             query = query.model_copy(update={"before_sequence": int(newest[0]["sequence"]) + 1})
         streams = [self._event_stream(query, event_type) for event_type in types]
-        merged = heapq.merge(*streams, key=lambda record: record.sequence)
+        merged = heapq.merge(
+            *streams,
+            key=lambda record: record.sequence,
+            reverse=query.order_by is EventOrder.SEQUENCE_DESC,
+        )
         return list(islice(merged, query.limit))
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptView:
@@ -329,7 +337,8 @@ class AgentSessionReader:
         self.api.close()
 
     def _event_stream(self, query: EventQuery, event_type: str | None) -> Iterator[EventRecord]:
-        cursor = query.after_sequence
+        descending = query.order_by is EventOrder.SEQUENCE_DESC
+        after, before = query.after_sequence, query.before_sequence
         page_size = min(_EVENT_PAGE_LIMIT, query.limit)
         while True:
             body = self._session_get(
@@ -341,9 +350,9 @@ class AgentSessionReader:
                     "tool_name": query.tool_name,
                     "agent_name": query.agent_name,
                     "environment_name": query.environment_name,
-                    "after_sequence": cursor,
-                    "before_sequence": query.before_sequence,
-                    "order_by": EventOrder.SEQUENCE_ASC.value,
+                    "after_sequence": after,
+                    "before_sequence": before,
+                    "order_by": query.order_by.value,
                     "limit": page_size,
                 },
             )
@@ -359,7 +368,10 @@ class AgentSessionReader:
                 yield record
             if not page or body.get("has_more") is not True:
                 return
-            cursor = page[-1].sequence
+            if descending:
+                before = page[-1].sequence
+            else:
+                after = page[-1].sequence
 
     def _session_get(
         self,

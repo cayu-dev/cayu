@@ -99,6 +99,12 @@ def terminal_safe(text: str, *, keep_lines: bool = False) -> str:
     return pattern.sub(lambda match: f"\\x{ord(match.group()):02x}", text)
 
 
+def note(text: str) -> None:
+    """Print ``text`` on stderr with controls escaped: progress beside a command's output."""
+
+    print(terminal_safe(text, keep_lines=True), file=sys.stderr, flush=True)
+
+
 def print_table(headers: Sequence[str], rows: Sequence[Mapping[str, object]]) -> None:
     """Print ``rows`` as aligned columns, ``-`` for a missing value, controls escaped."""
 

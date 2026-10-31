@@ -178,6 +178,8 @@ class FakeCloud:
         self.service: dict[str, Any] = {}
         self.agent_status: int | None = None
         self.requests: list[tuple[str, str | None]] = []
+        # Answers to the next reads of one task, before it is read from `tasks`.
+        self.task_answers: list[tuple[int, Any]] = []
 
 
 @pytest.fixture
@@ -216,6 +218,8 @@ def cloud(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[FakeCloud
                 ]
                 return 200, rows
             if route.startswith("/tasks/"):
+                if state.task_answers:
+                    return state.task_answers.pop(0)
                 task_id = route.removeprefix("/tasks/")
                 for task in state.tasks:
                     if task["id"] == task_id:
@@ -497,3 +501,231 @@ def test_table_output_escapes_terminal_control_sequences(
     assert code == 0
     assert "\x1b" not in out and "\x07" not in out
     assert "Review \\x1b]52;c;Zm9v\\x07 \\x1b[2J" in out
+
+
+def _wait(capsys: pytest.CaptureFixture[str], *arguments: str) -> tuple[int, Any, str]:
+    code = main(["task", "wait", *arguments, "--poll-seconds", "0.01", "--json"])
+    captured = capsys.readouterr()
+    return code, json.loads(captured.out), captured.err
+
+
+def test_wait_exits_with_how_the_task_ended(
+    database: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fail() -> None:
+        store = SQLiteTaskStore(database)
+        try:
+            await store.create_task(TaskCreate(task_id="broken", type="scan"))
+            await store.fail_task("broken", {"code": "crash", "message": "boom"})
+        finally:
+            await store.close()
+
+    asyncio.run(fail())
+
+    for task_id, exit_code in (("done", 0), ("broken", 3), ("stopped", 4)):
+        code, shown, err = _wait(capsys, task_id, "--sqlite", str(database))
+        status = shown["task"]["status"]
+        assert code == exit_code, task_id
+        assert shown["wait"] == {"task_id": task_id, "outcome": status}
+        assert f"Task {task_id} is {status}." in err
+
+    code, shown, _ = _wait(capsys, "absent", "--sqlite", str(database))
+    assert code == 1
+    assert shown["error"]["message"] == "Task not found: absent"
+
+
+def test_wait_follows_a_retry_series_and_stops_at_the_wait_limit(
+    database: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, shown, err = _wait(capsys, "retried", "--sqlite", str(database), "--wait-seconds", "0.1")
+
+    # The first attempt failed with a retry scheduled; its successor hasn't run yet.
+    successor = shown["task"]["id"]
+    assert code == 124
+    assert successor != "retried"
+    assert shown["task"]["status"] == "pending"
+    assert shown["wait"] == {"task_id": "retried", "outcome": "timed_out"}
+    assert [row["attempt"] for row in shown["retry_series"]["attempts"]] == [1, 2]
+    assert f"its retry series goes on as task {successor}" in err
+    assert f"Task {successor} is still pending after waiting 0.1s" in err
+
+
+def test_wait_sees_a_worker_finish_the_task_in_the_local_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "cayu.db"
+
+    async def claim() -> Any:
+        store = SQLiteTaskStore(path)
+        try:
+            await store.create_task(TaskCreate(task_id="live", type="scan"))
+            return await store.claim_task("worker-a")
+        finally:
+            await store.close()
+
+    claimed = asyncio.run(claim())
+
+    async def complete() -> None:
+        await asyncio.sleep(0.3)
+        store = SQLiteTaskStore(path)
+        try:
+            await store.complete_task(
+                "live",
+                {"findings": 1},
+                worker_id="worker-a",
+                lease_expires_at=claimed.lease_expires_at,
+            )
+        finally:
+            await store.close()
+
+    worker = threading.Thread(target=lambda: asyncio.run(complete()))
+    worker.start()
+    try:
+        code, shown, err = _wait(capsys, "live", "--sqlite", str(path), "--wait-seconds", "30")
+    finally:
+        worker.join()
+
+    assert code == 0
+    assert shown["task"]["result"] == {"findings": 1}
+    assert "Task live is claimed." in err and "Task live is completed." in err
+
+
+def test_application_wait_reads_through_until_the_task_ends(
+    cloud: FakeCloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud.tasks = [_api_task("scan-1", "completed", result={"findings": 2})]
+    cloud.task_answers = [
+        (200, _api_task("scan-1", "running", worker_id="worker-1")),
+        (502, {"detail": "Bad Gateway"}),
+        (200, _api_task("scan-1", "running", worker_id="worker-1")),
+    ]
+
+    code, shown, err = _wait(capsys, "scan-1", "--application", "bug-hunter")
+
+    assert code == 0
+    assert shown["task"]["result"] == {"findings": 2}
+    assert shown["wait"] == {"task_id": "scan-1", "outcome": "completed"}
+    assert err.count("Task scan-1 is running.") == 1
+    assert "answered HTTP 502" in err and "Reading task scan-1 again." in err
+    assert "Task scan-1 is completed." in err
+    reads = [path for path, _ in cloud.requests if path.startswith("/cayu/api/tasks/scan-1")]
+    assert len(reads) == 4
+
+
+def test_application_wait_names_a_task_still_running_and_a_failure_that_lasts(
+    cloud: FakeCloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud.tasks = [_api_task("scan-1", "running", worker_id="worker-1")]
+
+    code = main(["task", "wait", "scan-1", "--application", "bug-hunter", "--wait-seconds", "0.05"])
+    captured = capsys.readouterr()
+
+    assert code == 124
+    assert "worker-1" in captured.out
+    assert "Task scan-1 is still running after waiting 0.05s; it goes on." in captured.err
+
+    cloud.agent_status = 401
+    code, shown, _ = _wait(capsys, "scan-1", "--application", "bug-hunter")
+    assert code == 1
+    assert shown["error"]["category"] == "credentials_rejected"
+
+
+def test_wait_never_reports_an_earlier_attempts_end_for_an_unread_successor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed attempt handed the wait to its successor; reads of the successor failed
+    until the wait ran out, and the Agent answered again right after. The earlier attempt's
+    failure is not how the work ended."""
+
+    import argparse
+
+    import cayu.cli.task as task_cli
+    from cayu.cli._cloud_agent_api import CayuApiError
+
+    first = _api_task("a", "failed", retry_series={"attempt": 1, "successor_task_id": "b"})
+    second = _api_task("b", "running", retry_series={"attempt": 2, "predecessor_task_id": "a"})
+
+    class Reader:
+        source: dict[str, Any] = {}
+        reachable = False
+
+        async def load_task(self, task_id: str) -> dict[str, Any] | None:
+            if task_id == "a":
+                return first
+            if not self.reachable:
+                raise CayuApiError("unreachable", "Could not connect to the Agent.")
+            return second
+
+        async def close(self) -> None:
+            return None
+
+    reader = Reader()
+    read_series = task_cli._retry_series
+
+    async def after_the_wait(reader_: Any, task: dict[str, Any]) -> Any:
+        reader.reachable = True
+        return await read_series(reader_, task)
+
+    monkeypatch.setattr(task_cli, "_retry_series", after_the_wait)
+    args = argparse.Namespace(
+        task_id="a", wait_seconds=0.05, poll_seconds=0.01, output_format="json"
+    )
+
+    with pytest.raises(CayuApiError, match="Could not connect"):
+        asyncio.run(task_cli._wait_for_task(args, reader))  # type: ignore[arg-type]
+
+
+def test_wait_keeps_the_task_it_read_when_its_series_history_cant_be_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The awaited attempt completed; reading its predecessor for the retry-series history
+    failed the way a waking Agent does. The completion stands, with the history marked
+    incomplete."""
+
+    import argparse
+
+    from cayu.cli._cloud_agent_api import CayuApiError
+    from cayu.cli.task import _wait_for_task
+
+    retry = _api_task(
+        "retry-2",
+        "completed",
+        result={"findings": 1},
+        retry_series={"series_id": "s", "attempt": 2, "predecessor_task_id": "retry-1"},
+    )
+
+    class Reader:
+        source: dict[str, Any] = {}
+
+        async def load_task(self, task_id: str) -> dict[str, Any] | None:
+            if task_id == "retry-2":
+                return retry
+            raise CayuApiError("unreachable", "Could not connect to the Agent.")
+
+        async def close(self) -> None:
+            return None
+
+    args = argparse.Namespace(
+        task_id="retry-2", wait_seconds=1.0, poll_seconds=0.01, output_format="json"
+    )
+
+    code = asyncio.run(_wait_for_task(args, Reader()))  # type: ignore[arg-type]
+
+    shown = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert shown["wait"] == {"task_id": "retry-2", "outcome": "completed"}
+    assert shown["retry_series"]["attempts_complete"] is False
+    assert [row["task_id"] for row in shown["retry_series"]["attempts"]] == ["retry-2"]
+
+
+def test_series_history_still_fails_on_a_refusal_that_wont_pass() -> None:
+    from cayu.cli._cloud_agent_api import CayuApiError
+    from cayu.cli.task import _retry_series
+
+    class Reader:
+        async def load_task(self, task_id: str) -> dict[str, Any] | None:
+            raise CayuApiError("credentials_rejected", "The Agent did not accept the login.")
+
+    task = {"id": "b", "status": "failed", "retry_series": {"predecessor_task_id": "a"}}
+    with pytest.raises(CayuApiError, match="did not accept"):
+        asyncio.run(_retry_series(Reader(), task))  # type: ignore[arg-type]

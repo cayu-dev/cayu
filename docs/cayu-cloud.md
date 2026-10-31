@@ -1092,9 +1092,10 @@ process), `credentials_rejected` when the Agent doesn't accept its Developer das
 login, `not_served` when it doesn't serve Cayu's API, and `unsupported` when its Cayu is
 older than the command needs.
 
-`cayu session list|show|interactions|usage|tools|events|transcript --application
+`cayu session list|show|interactions|usage|tools|events|transcript|output --application
 my-agent` reads the Agent's sessions the same way; see
-[Session inspection](session-inspection.md#sessions-of-a-cloud-agent).
+[Session inspection](session-inspection.md#sessions-of-a-cloud-agent). `cayu task wait
+TASK_ID --application my-agent` waits for one of its tasks to end.
 
 ## Reading an Agent's logs
 

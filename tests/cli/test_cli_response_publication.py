@@ -107,7 +107,12 @@ def test_mutation_echo_is_unknown_without_credential_publication(
 
 
 @pytest.mark.parametrize(
-    "command", [["task", "show", "one"], ["knowledge", "list", "--status", "pending"]]
+    "command",
+    [
+        ["task", "show", "one"],
+        ["task", "wait", "one", "--wait-seconds", "1"],
+        ["knowledge", "list", "--status", "pending"],
+    ],
 )
 @pytest.mark.parametrize("where", ["value", "key"])
 def test_server_url_readers_reject_echoed_credentials(
