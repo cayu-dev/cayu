@@ -715,7 +715,9 @@ already completed or failed, asleep (interrupt it first, which cancels its wake)
 has a task or a child session still running is refused. Repeating a close returns
 the closed session, and closes any child sessions a close that stopped part way
 left open, after checking every remaining child can close. Independent forks of a
-closed session are left alone by a repeated close.
+closed session are left alone by a repeated close. A retry also traverses children
+that already recorded their close, so an interruption deeper in the cascade does
+not strand their descendants.
 
 With `--application NAME` it goes through the Agent's own Cayu API as you, like the
 reads below, which needs a developer or admin. Without it, it opens the project's

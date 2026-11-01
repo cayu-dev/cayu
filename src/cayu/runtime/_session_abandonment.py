@@ -498,32 +498,63 @@ class SessionAbandonment:
         that runs again is refused before any other child is closed.
         """
 
-        # Forks are independent runs, including forks created after this close.
-        # Replaying the source close must neither end nor refuse because of them.
-        children = [
-            child
-            for child in await self._open_children(session_id)
-            if child.invocation.source is not SessionExecutionSource.FORK
-        ]
-        if any(child.status in _CLOSE_BLOCKING_STATUSES for child in children):
+        remaining = await self._remaining_close_descendants(session_id, record)
+        if any(child.status in _CLOSE_BLOCKING_STATUSES for child, _ in remaining):
             raise SessionStatusConflict(
                 "The session is closed, but a child session is still running; interrupt "
                 "it, then repeat the close to close the rest."
             )
-        for child in children:
+        for child, _ in remaining:
+            if child.status is SessionStatus.FAILED:
+                continue
             await self._require_closable(
                 child, await self._session_store.load_checkpoint(child.id), from_parent=True
             )
-        metadata = record["metadata"]
-        reason = metadata.get("reason")
-        actor = metadata.get("resolved_by")
-        for child in children:
+        for child, close_record in remaining:
+            # The full tree was preflighted above. Recurse only through direct
+            # children so each descendant and finalization is executed once.
+            if child.parent_session_id != session_id:
+                continue
+            metadata = close_record["metadata"]
+            reason = metadata.get("reason")
+            actor = metadata.get("resolved_by")
             await self.close(
                 child.id,
                 reason=reason if type(reason) is str and reason.strip() else "Parent closed.",
                 closed_by=ResolutionActor.model_validate(actor) if type(actor) is dict else None,
                 _from_parent=True,
             )
+
+    async def _remaining_close_descendants(
+        self, session_id: str, record: dict[str, Any]
+    ) -> list[tuple[Session, dict[str, Any]]]:
+        """Find descendants needing closure or finalization after a stopped cascade."""
+
+        pending = [(session_id, record)]
+        seen = {session_id}
+        remaining: list[tuple[Session, dict[str, Any]]] = []
+        while pending:
+            parent_id, close_record = pending.pop()
+            for child in await self._open_children(parent_id, include_failed=True):
+                # A fork is an independent run, even when created after the close.
+                if child.invocation.source is SessionExecutionSource.FORK:
+                    continue
+                if child.id in seen:
+                    raise SessionStatusConflict("Session ancestry contains a repeated child.")
+                seen.add(child.id)
+                inherited = close_record
+                if child.status is SessionStatus.FAILED:
+                    child_record = abandoned_session_from_checkpoint(
+                        await self._session_store.load_checkpoint(child.id)
+                    )
+                    if child_record is None or "closed" not in child_record:
+                        continue
+                    inherited = child_record
+                # Retain closed ancestors too: replay must publish their terminal
+                # evidence and release environments after finishing descendants.
+                remaining.append((child, inherited))
+                pending.append((child.id, inherited))
+        return remaining
 
     async def _private_waiting_on(self, session_id: str, waiting_on: str) -> str:
         """The private approval or input ID for ``waiting_on``, which may be a public alias.
@@ -540,8 +571,10 @@ class SessionAbandonment:
             field_name="approval_id" if waiting_on.endswith(":approval_id") else "input_id",
         )
 
-    async def _open_children(self, session_id: str) -> list[Session]:
-        """Every child of the session that hasn't ended, across all listing pages."""
+    async def _open_children(
+        self, session_id: str, *, include_failed: bool = False
+    ) -> list[Session]:
+        """List children across every page, optionally retaining failed ancestors."""
 
         children: list[Session] = []
         cursor: str | None = None
@@ -557,7 +590,8 @@ class SessionAbandonment:
             children.extend(
                 child
                 for child in page.sessions
-                if child.status not in {SessionStatus.COMPLETED, SessionStatus.FAILED}
+                if child.status is not SessionStatus.COMPLETED
+                and (include_failed or child.status is not SessionStatus.FAILED)
             )
             if page.next_cursor is None:
                 return children

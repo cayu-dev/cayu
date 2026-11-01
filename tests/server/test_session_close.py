@@ -593,3 +593,58 @@ def test_repeated_close_leaves_new_forks_alone(status) -> None:
             await app.aclose()
 
     asyncio.run(scenario())
+
+
+def test_parent_close_retry_crosses_an_already_closed_child(monkeypatch) -> None:
+    import asyncio
+
+    from cayu.sessions.records import SessionIdentity
+
+    async def scenario():
+        app, child = await _parent_waiting_on_subagent()
+        original = app._incomplete_recovery.close_waiting_session
+        try:
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="child",
+                    session_id="grandchild",
+                    parent_session_id=child.id,
+                    messages=[Message.text("user", "work")],
+                ),
+                identity=SessionIdentity(provider_name="test", model="test"),
+            )
+
+            async def stop_grandchild(session_id, **options):
+                if session_id == "grandchild" and not options.get("check_only"):
+                    raise RuntimeError("stopped nested cascade")
+                return await original(session_id, **options)
+
+            monkeypatch.setattr(app._incomplete_recovery, "close_waiting_session", stop_grandchild)
+            with pytest.raises(RuntimeError, match="stopped nested cascade"):
+                await app.close_session("parent", reason="Original close.")
+            assert (await app.session_store.load(child.id)).status is SessionStatus.FAILED
+            assert (await app.session_store.load("grandchild")).status is SessionStatus.PENDING
+            monkeypatch.setattr(app._incomplete_recovery, "close_waiting_session", original)
+            finished = []
+            finish = app._session_abandonment._finish
+
+            async def count_finish(session, **options):
+                finished.append(session.id)
+                return await finish(session, **options)
+
+            monkeypatch.setattr(app._session_abandonment, "_finish", count_finish)
+            await app.close_session("parent", reason="Retry.")
+            assert sorted(finished) == sorted(["parent", child.id, "grandchild"])
+            finished.clear()
+            await app.close_session("parent", reason="Replay finished cascade.")
+            assert sorted(finished) == sorted(["parent", child.id, "grandchild"])
+            assert (await app.session_store.load("grandchild")).status is SessionStatus.FAILED
+            events = await app.session_store.load_events("grandchild")
+            [failed] = [event for event in events if event.type is EventType.SESSION_FAILED]
+            assert failed.payload["metadata"]["reason"] == "Original close."
+            child_events = await app.session_store.load_events(child.id)
+            assert sum(event.type is EventType.SESSION_FAILED for event in child_events) == 1
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
