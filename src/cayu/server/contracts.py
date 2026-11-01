@@ -2213,6 +2213,14 @@ class ApiSessionDetail(ApiSession):
     invocation: ApiSessionInvocation
 
 
+class ApiSessionCloseResult(ApiBaseModel):
+    """A closed session, with what the close and its recovery did."""
+
+    session: ApiSessionDetail
+    actions: list[str]
+    message: str | None = None
+
+
 class SessionOverviewTokens(ApiBaseModel):
     input: AggregateCount = Field(ge=0)
     output: AggregateCount = Field(ge=0)

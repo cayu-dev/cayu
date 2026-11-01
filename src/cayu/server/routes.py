@@ -278,6 +278,7 @@ from cayu.server.contracts import (
     ApiInteractionSummary,
     ApiReviewedKnowledgeEntry,
     ApiSession,
+    ApiSessionCloseResult,
     ApiSessionDetail,
     ApiTaskDetail,
     ApiTaskIndex,
@@ -2210,6 +2211,22 @@ class SessionMessageSourceBody(BaseModel):
 
     include_transcript_digest: StrictBool = False
     include_checkpoint_digest: StrictBool = False
+
+
+class CloseSessionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: NonBlankString = Field(
+        max_length=4096, description="Why the session is closed, recorded with it."
+    )
+    closed_by: ResolutionActor | None = Field(
+        default=None,
+        description="Who closed it; only without authentication, which otherwise names the caller.",
+    )
+    waiting_on: NonBlankString | None = Field(
+        default=None,
+        description="An approval or input ID the session must still wait on to be closed.",
+    )
 
 
 class UpdateSessionLabelsBody(BaseModel):
@@ -9328,6 +9345,49 @@ def create_router(
             # deletion as any other unprovable closure does.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return None
+
+    @router.post(
+        "/sessions/{session_id}/close",
+        response_model=ApiSessionCloseResult,
+        dependencies=protected,
+        summary="Close a session that is not running and won't continue",
+    )
+    async def close_session(
+        session_id: NonBlankString,
+        body: CloseSessionBody,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
+        """Fail a pending or interrupted session as closed, keeping its history.
+
+        The session's pending approval or question leaves the inbox, and the
+        reason and the caller are recorded on its ``session.failed`` event. A
+        session that is running, already ended, or has unfinished tasks or child
+        sessions is refused with 409. Repeating a close returns the closed session.
+        """
+
+        try:
+            private_session_id = await cayu_app._resolve_public_session_id(session_id)
+        except PublicSessionAliasNotFound:
+            raise HTTPException(status_code=404, detail="Session not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        closed_by = _request_actor(auth_context, body.closed_by, field_name="resolved_by")
+        try:
+            result = await cayu_app.close_session(
+                session_id, reason=body.reason, closed_by=closed_by, waiting_on=body.waiting_on
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Session not found") from None
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=cayu_app.redact_json(str(exc))) from exc
+        session = await session_store.load(private_session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "session": _serialize_session_detail(cayu_app, session),
+            "actions": [action.value for action in result.actions],
+            "message": result.message,
+        }
 
     @router.patch(
         "/sessions/{session_id}/labels",

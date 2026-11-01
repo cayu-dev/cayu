@@ -38,6 +38,7 @@ from cayu.approvals.user_input import (
     user_input_lifecycle_authority_from_checkpoint,
 )
 from cayu.approvals.wakes import (
+    PENDING_WAKE_CHECKPOINT_KEY,
     WAKE_SCHEDULED_INTERRUPTION_TYPE,
     pending_session_wake_digest,
     pending_session_wake_from_checkpoint,
@@ -1994,18 +1995,30 @@ class IncompleteSessionRecovery:
                         record_rejection=record_profile_rejection and not upgrade_takeover
                     )
                 except ExecutionProfileMismatchError as mismatch:
-                    if not upgrade_takeover or tuple(mismatch.changed_component_classes) != (
-                        ExecutionProfileComponentClass.RUNTIME,
+                    # An abandoned or closed session never continues: its recovery
+                    # only publishes terminal evidence and releases the environment
+                    # binding, dispatching neither provider nor tools, so a session
+                    # stranded by a changed profile can still be finalized.
+                    finalizes_abandonment = (
+                        session.status is SessionStatus.FAILED
+                        and abandoned_session_from_checkpoint(checkpoint) is not None
+                    )
+                    if not finalizes_abandonment and (
+                        not upgrade_takeover
+                        or tuple(mismatch.changed_component_classes)
+                        != (ExecutionProfileComponentClass.RUNTIME,)
                     ):
                         if upgrade_takeover and record_profile_rejection:
                             await validate_continuation(record_rejection=True)
                         raise
                     # Only Cayu's runtime changed, and a takeover's recovery closes the
                     # lost invocation without dispatching a provider or a tool (replay is
-                    # never elected across builds). Keep the invocation's frozen identity,
-                    # as pending completion finalization does, so its evidence stays bound
-                    # to the profile that started it; the next turn adopts the new runtime.
-                    assert active_invocation_profile is not None
+                    # never elected across builds); or the session is abandoned. Keep the
+                    # invocation's frozen identity, as pending completion finalization
+                    # does, so its evidence stays bound to the profile that started it;
+                    # the next turn adopts the new runtime.
+                    if active_invocation_profile is None:
+                        raise
                     execution_profile_snapshot = active_invocation_profile
                 except RuntimeError:
                     current = await self._session_store.load(session.id)
@@ -4762,22 +4775,7 @@ class IncompleteSessionRecovery:
         tool_round_id = held.tool_round_id
         tool_calls = [(call.tool_call_id, call.tool_name) for call in held.tool_calls]
         task_id = held.task_id
-        effects = ToolEffectStateOwner(self._session_store)
-        unknown_tool_calls = []
-        for tool_call_id, tool_name in tool_calls:
-            record = await effects.resolve_call(
-                session,
-                tool_round_id=tool_round_id,
-                tool_call_id=tool_call_id,
-            )
-            if record is not None and record.state in {"executing", "outcome_unknown"}:
-                unknown_tool_calls.append(
-                    {
-                        "tool_round_id": tool_round_id,
-                        "tool_call_id": tool_call_id,
-                        "tool_name": tool_name,
-                    }
-                )
+        unknown_tool_calls = await self._unknown_tool_calls(session, tool_round_id, tool_calls)
         if not unknown_tool_calls:
             return None
 
@@ -4810,6 +4808,44 @@ class IncompleteSessionRecovery:
                 unknown_tool_calls=unknown_tool_calls,
             )
             return copied
+
+        return await self._commit_abandonment(
+            session,
+            task_id=task_id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            checkpoint_transform=abandon,
+        )
+
+    async def _unknown_tool_calls(
+        self, session: Session, tool_round_id: str, tool_calls: list[tuple[str, str]]
+    ) -> list[dict[str, str]]:
+        """The round's calls whose outcome is uncertain: started, or settled as unknown."""
+
+        effects = ToolEffectStateOwner(self._session_store)
+        unknown = []
+        for tool_call_id, tool_name in tool_calls:
+            record = await effects.resolve_call(
+                session, tool_round_id=tool_round_id, tool_call_id=tool_call_id
+            )
+            if record is not None and record.state in {"executing", "outcome_unknown"}:
+                unknown.append(
+                    {
+                        "tool_round_id": tool_round_id,
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                    }
+                )
+        return unknown
+
+    async def _commit_abandonment(
+        self,
+        session: Session,
+        *,
+        task_id: str | None,
+        from_statuses: set[SessionStatus],
+        checkpoint_transform: Callable[[Session, dict[str, Any] | None], dict[str, Any]],
+    ) -> Session:
+        """Freeze the session's task set, then fail it with its abandonment evidence."""
 
         from cayu.runtime._session_abandonment_fence import claim_abandonment_task_fence
         from cayu.sessions._abandonment_checkpoint import abandonment_checkpoint_publication
@@ -4850,9 +4886,9 @@ class IncompleteSessionRecovery:
             with abandonment_checkpoint_publication():
                 return await self._session_store.transition_status_and_checkpoint(
                     session.id,
-                    from_statuses={SessionStatus.INTERRUPTED},
+                    from_statuses=from_statuses,
                     to_status=SessionStatus.FAILED,
-                    checkpoint_transform=abandon,
+                    checkpoint_transform=checkpoint_transform,
                 )
         except BaseException as failure:
             await self._recovery_ownership.run_cleanup_steps(
@@ -4860,6 +4896,146 @@ class IncompleteSessionRecovery:
                 steps=(("release_uncommitted_abandonment", release_uncommitted_abandonment),),
             )
             raise
+
+    async def close_waiting_session(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        metadata: dict[str, Any],
+        waiting_on: str | None = None,
+        check_only: bool = False,
+    ) -> Session:
+        """Fail a pending or interrupted session that nothing will continue.
+
+        This is how a person ends a session that waits on them, such as one paused on
+        a question or an approval it can no longer resume from. Whatever round its
+        pause holds leaves resumable work in the same store transition that fails the
+        session, together with the approval or question and any claim to resolve it,
+        so nothing can answer or continue it afterwards. A call of that round with an
+        uncertain outcome keeps its ``outcome_unknown`` record and is listed as
+        unknown. Transcript, events and evidence are kept. Recovery then publishes the
+        terminal ``session.failed`` and releases the environment binding.
+
+        The transition is fenced like abandonment: it commits only from ``pending`` or
+        ``interrupted`` at the same run epoch, after the session's terminal task set
+        is frozen, so a resumption that started first wins and one that starts later
+        is refused. With ``waiting_on``, the session must still wait on that approval
+        or input, so a pause that replaced it is not closed instead. A sleeping
+        session is refused; its interruption cancels the wake. Raises
+        ``SessionStatusConflict`` otherwise. ``check_only`` runs these checks and
+        returns the session without changing it.
+        """
+
+        from cayu.sessions import _foreground_child_checkpoint as foreground_child_checkpoint
+
+        session = await self._session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        closable = {SessionStatus.PENDING, SessionStatus.INTERRUPTED}
+        if session.status not in closable:
+            raise SessionStatusConflict(
+                f"Only a pending or interrupted session can be closed; this one is "
+                f"{session.status.value}."
+            )
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        if ABANDONED_SESSION_CHECKPOINT_KEY in (checkpoint or {}):
+            raise SessionStatusConflict("Session was already abandoned.")
+        if PENDING_WAKE_CHECKPOINT_KEY in (checkpoint or {}):
+            raise SessionStatusConflict("A sleeping session is interrupted, not closed.")
+        pending_user_input, _intent = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
+            runtime_session=session,
+        )
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        if pending_approval is not None and pending_round is None:
+            raise SessionStatusConflict("Pending tool approval has no durable tool round.")
+        held = pending_user_input if pending_user_input is not None else pending_round
+        closed: dict[str, Any] = {}
+        unknown_tool_calls: list[dict[str, str]] = []
+        if held is not None:
+            closed["tool_round_id"] = held.tool_round_id
+            if pending_user_input is not None:
+                closed["input_id"] = pending_user_input.input_id
+            elif pending_approval is not None:
+                closed["approval_id"] = pending_approval.approval_id
+            unknown_tool_calls = await self._unknown_tool_calls(
+                session,
+                held.tool_round_id,
+                [(call.tool_call_id, call.tool_name) for call in held.tool_calls],
+            )
+        if waiting_on is not None and waiting_on not in {
+            closed.get("input_id"),
+            closed.get("approval_id"),
+        }:
+            raise SessionStatusConflict("Session no longer waits on that approval or question.")
+        if check_only:
+            return session
+
+        def close(current_session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
+            if current_session.run_epoch != session.run_epoch:
+                raise SessionStatusConflict("Session changed before it was closed.")
+            if pending_user_input is not None:
+                copied, durable_round = self._checkpoint_without_pending_user_input_round(
+                    current_session, current, pending_user_input
+                )
+            elif pending_approval is not None:
+                assert pending_round is not None
+                copied, durable_round = self._checkpoint_without_pending_approval_round(
+                    current_session, current, pending_round, pending_approval
+                )
+            elif pending_round is not None:
+                copied, durable_round = self._checkpoint_without_pending_tool_round(
+                    current_session, current, pending_round
+                )
+            else:
+                if any(
+                    key in (current or {})
+                    for key in (
+                        PENDING_USER_INPUT_CHECKPOINT_KEY,
+                        pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+                        pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+                        PENDING_WAKE_CHECKPOINT_KEY,
+                    )
+                ):
+                    raise SessionStatusConflict("Session paused again before it was closed.")
+                copied, durable_round = copy_durable_record(current or {}, "checkpoint"), {}
+            if ABANDONED_SESSION_CHECKPOINT_KEY in copied:
+                raise SessionStatusConflict("Session was already abandoned.")
+            # Its children are closed next; nothing will deliver to this wait.
+            copied.pop(foreground_child_checkpoint.FOREGROUND_CHILD_WAIT_KEY, None)
+            copied[ABANDONED_SESSION_CHECKPOINT_KEY] = abandoned_session_record(
+                reason=reason,
+                metadata=metadata,
+                tool_round=durable_round,
+                unknown_tool_calls=unknown_tool_calls,
+                closed=closed,
+            )
+            return copied
+
+        try:
+            return await self._commit_abandonment(
+                session,
+                task_id=None if held is None else held.task_id,
+                from_statuses=closable,
+                checkpoint_transform=close,
+            )
+        except RuntimeError as exc:
+            # A pause that changed under the close is a conflict for the caller.
+            raise SessionStatusConflict(str(exc)) from exc
 
     async def deny_stranded_approval(
         self,

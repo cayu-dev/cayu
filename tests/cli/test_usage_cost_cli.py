@@ -13,10 +13,16 @@ from fastapi.testclient import TestClient
 from tests.server.test_usage_cost_details import WINDOW, prices, seed
 
 from cayu.applications import CayuApp
-from cayu.cli import main
+from cayu.cli import _build_parser, main
 from cayu.cli._cloud_agent_api import CayuApi
 from cayu.server import ServerConfig, create_server
 from cayu.sessions.memory import InMemorySessionStore
+
+# These tests replace `CayuApi` and `open_cloud_agent_api` in `cayu.cli._cloud_agent_api`.
+# `main` imports the other CLI modules on first use, and several bind those names when
+# imported, so import them now: one first imported under a patch would keep the fake for
+# the rest of the process and send later tests' commands to this file's dead server.
+_build_parser()
 
 
 @pytest.mark.parametrize(

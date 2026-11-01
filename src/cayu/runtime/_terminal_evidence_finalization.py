@@ -943,6 +943,14 @@ class TerminalEvidenceFinalization:
                 event,
                 "interruption_request_id",
             )
+        closed_linkage = tuple(
+            field
+            for field in ("tool_round_id", "approval_id", "input_id")
+            if abandoned is not None and "closed" in abandoned and type(payload.get(field)) is str
+        )
+        if closed_linkage:
+            # A closed session names the round and the pause it waited on.
+            event = event_with_runtime_payload_authority(event, *closed_linkage)
         supersession_payload = payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
         if supersession_payload is not None:
             try:

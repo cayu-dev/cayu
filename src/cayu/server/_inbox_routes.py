@@ -5,8 +5,9 @@ alias), the source event of the pause and its human-attention identity, or a
 knowledge entry and revision. Every read re-derives the exact pending action
 or proposal from durable state, and every settle goes through the Runtime's
 exact-action APIs with the verified caller as the decider. Dismissing a
-recovery item abandons its session (``CayuApp.abandon_session``), recording
-the person and reason with the abandonment.
+recovery item abandons its session (``CayuApp.abandon_session``), and
+dismissing an approval or question closes its session
+(``CayuApp.close_session``), recording the person and reason either way.
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ from cayu.knowledge.search import decode_knowledge_list_cursor, encode_knowledge
 from cayu.runtime._approval_support import approval_resolution_request_digest
 from cayu.runtime._inbox_continuation import controlled_inbox_continuation
 from cayu.runtime._session_abandonment import (
+    SESSION_CLOSED_REASON,
     abandoned_session_failure_payload,
     abandoned_session_from_checkpoint,
     stranded_approval_denial,
@@ -131,6 +133,8 @@ _ACTION_LINKAGE = {"approval": "approval_id", "question": "input_id"}
 # The abandonment reason a dismissed recovery item's session fails with; the
 # person and their reason are its metadata.
 _DISMISSAL_REASON = "inbox_dismissed"
+# Kinds whose dismissal closes the session that waits on the person.
+_CLOSABLE_KINDS = frozenset({"approval", "question"})
 _RESOLVED_DECISIONS: dict[str, InboxSettledDecision] = {
     "approval": "approve",
     "question": "answer",
@@ -340,6 +344,18 @@ def _abandons_call(payload: dict[str, Any], reference: HumanAttentionReference) 
             and call.get("tool_call_id") == reference.tool_call_id
             for call in unknown
         )
+    )
+
+
+def _closes_action(payload: dict[str, Any], item: _SessionItem) -> bool:
+    """Whether a ``session.failed`` payload closed the session while it waited on this item."""
+
+    field = _ACTION_LINKAGE.get(item.kind)
+    return (
+        field is not None
+        and payload.get("error_type") == "SessionAbandoned"
+        and payload.get("closed") is True
+        and payload.get(field) == item.reference.action_id
     )
 
 
@@ -683,10 +699,15 @@ def register_inbox_routes(
             )
             if item.kind == "recovery"
             # A denial that ended its session after a profile change has no
-            # resumption; its denial event is the decision.
-            else (EventType.SESSION_RESUMED, EventType.TOOL_CALL_APPROVAL_DENIED)
+            # resumption; its denial event is the decision. Closing the session
+            # while it waited dismisses the item.
+            else (
+                EventType.SESSION_RESUMED,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+                EventType.SESSION_FAILED,
+            )
             if item.kind == "approval"
-            else (EventType.SESSION_RESUMED,)
+            else (EventType.SESSION_RESUMED, EventType.SESSION_FAILED)
         )
         for _page in range(_CLAIM_SCAN_PAGES):
             records = await session_store.query_events(
@@ -702,7 +723,11 @@ def register_inbox_routes(
                 attribution = payload
                 decision: InboxSettledDecision | None = None
                 if record.event.type is EventType.SESSION_FAILED:
-                    if _abandons_call(payload, reference):
+                    if (
+                        _closes_action(payload, item)
+                        if item.kind in _CLOSABLE_KINDS
+                        else _abandons_call(payload, reference)
+                    ):
                         decision = "dismiss"
                         metadata = payload.get("metadata")
                         attribution = metadata if isinstance(metadata, dict) else {}
@@ -900,6 +925,10 @@ def register_inbox_routes(
         body: InboxSettleRequest,
         auth_context: AuthContext | None,
     ) -> InboxSettleResponse:
+        if body.decision == "dismiss" and item.kind in _CLOSABLE_KINDS:
+            # Not offered among the item's decisions: it ends the session, for an
+            # approval or question whose session can't resume.
+            return await dismiss_waiting_item(item, body, auth_context)
         if body.decision not in INBOX_DECISIONS[item.kind]:
             raise HTTPException(
                 status_code=422,
@@ -1046,6 +1075,69 @@ def register_inbox_routes(
                 state if current is None else await session_item_state(current),
             )
         # Repeating the same person's dismissal with the same reason replays it.
+        decider = _decider(resolved_by)
+        if settled.decided_by == decider and settled.reason == cayu_app.redact_json(body.reason):
+            return InboxSettleResponse(replayed=item.pending is None, item=state)
+        raise _state_conflict(state)
+
+    async def dismiss_waiting_item(
+        item: _SessionItem, body: InboxSettleRequest, auth_context: AuthContext | None
+    ) -> InboxSettleResponse:
+        """Dismiss an approval or question by closing its session.
+
+        For an item whose session will never continue, such as one stranded by a
+        changed execution profile. The session fails as closed with the person and
+        reason recorded (``CayuApp.close_session``), and the item settles as
+        ``dismiss``. A session that is running, has unfinished tasks or child
+        sessions, or was answered first is refused and the item stays as it is.
+        """
+
+        assert body.reason is not None
+        actor = _inbox_actor(auth_context)
+        resolved_by = resolution_actor_payload(actor)
+        refusal: str | None = None
+        accepted = abandoned_session_from_checkpoint(
+            await cayu_app.session_store.load_checkpoint(item.session.id)
+        )
+        retry = (
+            accepted is not None
+            and accepted["reason"] == SESSION_CLOSED_REASON
+            and accepted["metadata"]
+            == cayu_app.redact_json({"reason": body.reason, "resolved_by": resolved_by})
+            and _closes_action(abandoned_session_failure_payload(accepted), item)
+        )
+        if item.pending is not None or retry:
+            try:
+                await cayu_app.close_session(
+                    cayu_app.project_session_id_for_exposure(item.session.id),
+                    reason=body.reason,
+                    closed_by=actor,
+                    # A pause that replaced this item's is not closed in its place.
+                    waiting_on=item.reference.action_id,
+                )
+            except KeyError:
+                raise HTTPException(status_code=404, detail=_NOT_FOUND) from None
+            except (RuntimeError, ValueError) as exc:
+                refusal = cayu_app.redact_json(str(exc))
+        state = await session_item_state(replace(item, pending=None))
+        settled = state.settlement
+        if settled is None or settled.decision != "dismiss":
+            if item.pending is None:
+                raise _state_conflict(state)
+            current = await resolve_session_item(
+                _SessionLocator(
+                    item.kind,
+                    cayu_app.project_session_id_for_exposure(item.session.id),
+                    item.reference.source_sequence,
+                    item.reference.attention_id,
+                )
+            )
+            raise _conflict(
+                "not_settleable",
+                f"This {item.kind}'s session can't be closed now"
+                + (f": {refusal}" if refusal else "."),
+                state if current is None else await session_item_state(current),
+            )
         decider = _decider(resolved_by)
         if settled.decided_by == decider and settled.reason == cayu_app.redact_json(body.reason):
             return InboxSettleResponse(replayed=item.pending is None, item=state)

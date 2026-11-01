@@ -218,6 +218,14 @@ resumed. Pass `abandon_sessions_of_terminal_tasks=True` to the sweep to do this
 for every such session whose tasks are all terminal; later sweeps also pick up
 sessions whose tasks finished after an earlier sweep interrupted them.
 
+A session waiting on a question or an approval that nobody will answer, or one
+interrupted long ago, is ended with `await app.close_session(session_id,
+reason="...", closed_by=actor)`; pass `waiting_on=` the approval or input ID to
+close it only while it still waits on that pause. It fails the session with the reason and actor
+recorded, removes its pending approval or question from the inbox, keeps its
+transcript and events, and releases its environment. `cayu session close` and
+`POST /api/sessions/{id}/close` do the same.
+
 Transient renewal errors do not release the row, and the heartbeat keeps retrying
 for as long as the run is active, even after a store outage outlasts the lease.
 Once the store answers again, the expired lease cannot be renewed, so the same

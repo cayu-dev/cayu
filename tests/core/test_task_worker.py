@@ -5143,6 +5143,13 @@ def test_interrupted_handoff_recovery_retains_bounded_cursor_between_idle_polls(
         stop = asyncio.Event()
 
         async def stop_worker() -> None:
+            # Wait for both bounded listings however slow the host is, then keep
+            # polling a while longer: a retained cursor lists nothing more.
+            deadline = asyncio.get_running_loop().time() + 10
+            while (
+                task_store.recovery_list_calls < 2 and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.01)
             await asyncio.sleep(0.1)
             stop.set()
 

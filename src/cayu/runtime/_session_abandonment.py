@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid5
 
 from cayu._validation import copy_durable_metadata
+from cayu.approvals.actors import ResolutionActor, resolution_actor_payload
 from cayu.approvals.user_input import pending_user_input_from_checkpoint
+from cayu.approvals.wakes import PENDING_WAKE_CHECKPOINT_KEY
 from cayu.events import (
     Event,
     EventType,
@@ -16,6 +19,7 @@ from cayu.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
+from cayu.runtime._event_projection import PUBLIC_EVENT_ID_PREFIX
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.sessions._abandonment_checkpoint import ABANDONED_SESSION_CHECKPOINT_KEY
 from cayu.sessions._completion_finalization import (
@@ -24,6 +28,7 @@ from cayu.sessions._completion_finalization import (
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions._foreground_child_checkpoint import FOREGROUND_CHILD_WAIT_KEY
 from cayu.sessions._pending_approval_reader import pending_approval_from_checkpoint
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.event_queries import EventOrder, EventQuery
@@ -33,18 +38,23 @@ from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryRequest,
 )
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import _TERMINAL_TASK_STATUSES
 
 if TYPE_CHECKING:
     from cayu.runtime._environment_lifecycle import EnvironmentLifecycle
+    from cayu.runtime._incomplete_session_recovery import IncompleteSessionRecovery
     from cayu.runtime._pending_tool_round_recovery import RegisteredEnvironmentResolver
     from cayu.runtime._session_recovery import SessionRecovery
     from cayu.sessions.store import SessionStore
     from cayu.tasks.store import TaskStore
 
 
+# The abandonment reason a session closed by a person fails with; the person and
+# their reason are its metadata.
+SESSION_CLOSED_REASON = "session_closed"
 STRANDED_APPROVAL_DENIAL_REASON = "tool_approval_denied_after_profile_change"
 # The session's execution deadline passed while its approval waited, so the
 # denied round could not continue either.
@@ -98,6 +108,7 @@ def abandoned_session_record(
     tool_round: dict[str, Any],
     unknown_tool_calls: list[dict[str, str]],
     denied_approval: dict[str, Any] | None = None,
+    closed: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     record = {
         "schema_version": 1,
@@ -111,6 +122,9 @@ def abandoned_session_record(
         # the application's execution profile had changed, or the session's
         # execution deadline had passed (``reason`` says which).
         record["denied_approval"] = denied_approval
+    if closed is not None:
+        # A person closed the session while it waited; names what it waited on.
+        record["closed"] = closed
     return record
 
 
@@ -131,6 +145,7 @@ def abandoned_session_from_checkpoint(
         or type(record.get("unknown_tool_calls")) is not list
         or any(type(call) is not dict for call in record["unknown_tool_calls"])
         or ("denied_approval" in record and not _valid_denied_approval(record["denied_approval"]))
+        or ("closed" in record and not _valid_closed(record["closed"]))
     ):
         raise RuntimeError("Session retains malformed abandonment evidence.")
     return record
@@ -146,6 +161,17 @@ _DENIED_APPROVAL_STRING_FIELDS = (
     "resolution_request_digest",
     "denied_at",
 )
+
+
+_CLOSED_FIELDS = frozenset({"tool_round_id", "approval_id", "input_id"})
+
+
+def _valid_closed(closed: Any) -> bool:
+    return (
+        type(closed) is dict
+        and set(closed) <= _CLOSED_FIELDS
+        and all(type(value) is str for value in closed.values())
+    )
 
 
 def _valid_denied_approval(denial: Any) -> bool:
@@ -190,6 +216,18 @@ def abandoned_session_failure_payload(record: dict[str, Any]) -> dict[str, Any]:
             "tool_effect_outcome_unknown": [],
             "recovered": True,
         }
+    if "closed" in record:
+        return {
+            "error": "Session was closed without continuing.",
+            "error_type": "SessionAbandoned",
+            "abandoned": True,
+            "closed": True,
+            "reason": record["reason"],
+            "metadata": copy_durable_metadata(record["metadata"]),
+            **record["closed"],
+            "tool_effect_outcome_unknown": [dict(call) for call in record["unknown_tool_calls"]],
+            "recovered": True,
+        }
     return {
         "error": "Session was abandoned with unknown tool outcomes.",
         "error_type": "SessionAbandoned",
@@ -225,6 +263,8 @@ def _abandonable_tool_round(
 
 
 logger = logging.getLogger(__name__)
+# A child in one of these statuses still runs, so its parent can't be closed.
+_CLOSE_BLOCKING_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
 
 
 def _merged_recovery_results(
@@ -242,6 +282,7 @@ def _merged_recovery_results(
                 result.message
                 for result in results
                 if IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT in result.actions
+                or IncompleteSessionRecoveryAction.CLOSED in result.actions
             ),
             message,
         )
@@ -266,7 +307,13 @@ class SessionAbandonment:
         session_recovery: SessionRecovery,
         environment_lifecycle: EnvironmentLifecycle,
         resolve_registered_environment: RegisteredEnvironmentResolver,
+        incomplete_recovery: IncompleteSessionRecovery,
+        agent_registered: Callable[[str], bool],
+        resolve_action_linkage: Callable[..., Awaitable[str]],
     ) -> None:
+        self._resolve_action_linkage = resolve_action_linkage
+        self._incomplete_recovery = incomplete_recovery
+        self._agent_registered = agent_registered
         self._session_store = session_store
         self._task_store = task_store
         self._session_recovery = session_recovery
@@ -336,6 +383,250 @@ class SessionAbandonment:
             )
         )
         return _merged_recovery_results(passes)
+
+    async def close(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        closed_by: ResolutionActor | None,
+        waiting_on: str | None = None,
+        _from_parent: bool = False,
+    ) -> IncompleteSessionRecoveryResult:
+        """End a non-running session, including one waiting on a person, as abandoned.
+
+        A session stopped on an unknown tool outcome is abandoned as by ``abandon``.
+        Any other pending or interrupted session is failed by
+        ``IncompleteSessionRecovery.close_waiting_session``, after its pending or
+        interrupted child sessions are closed the same way. A second, ordinary
+        recovery pass then publishes the terminal evidence and releases the
+        environment binding. Repeating the call after a close finishes that cleanup.
+        """
+
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("A reason is required to close a session.")
+        if closed_by is not None and type(closed_by) is not ResolutionActor:
+            raise TypeError("closed_by must be a ResolutionActor.")
+        if waiting_on is not None and (type(waiting_on) is not str or not waiting_on):
+            raise ValueError("waiting_on must be a non-empty approval or input ID.")
+        metadata = {"reason": reason, "resolved_by": resolution_actor_payload(closed_by)}
+        session = await self._session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        record = abandoned_session_from_checkpoint(checkpoint)
+        if session.status is SessionStatus.FAILED and record is not None:
+            if waiting_on is not None and waiting_on not in (record.get("closed") or {}).values():
+                raise SessionStatusConflict("Session ended without that approval or question.")
+            return await self._finish(session, metadata=metadata, passes=[])
+        if session.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
+            raise SessionStatusConflict(
+                f"Session already {session.status.value}; there is nothing to close."
+            )
+        if waiting_on is not None and waiting_on.startswith(PUBLIC_EVENT_ID_PREFIX):
+            # The pending-action API shows these as public aliases.
+            waiting_on = await self._resolve_action_linkage(
+                session_id=session_id,
+                value=waiting_on,
+                field_name="approval_id" if waiting_on.endswith(":approval_id") else "input_id",
+            )
+        # Every refusal, the children's included, comes before anything is closed.
+        await self._require_closable(
+            session, checkpoint, from_parent=_from_parent, waiting_on=waiting_on
+        )
+        passes: list[IncompleteSessionRecoveryResult] = []
+        if session.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
+            # Only a session whose process died can be closed; recovery takes it
+            # over (skipping a live owner) and leaves it interrupted. A session that
+            # is already pending or interrupted is closed as it is: its continuation
+            # may be refused (for example after its execution profile changed), and
+            # closing never continues it.
+            passes.append(
+                await self._session_recovery.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=session_id,
+                        inactive_for_seconds=0,
+                        reason=SESSION_CLOSED_REASON,
+                        metadata=metadata,
+                    ),
+                    abandon_unknown_tool_effects=True,
+                )
+            )
+        if not passes or (
+            IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT not in passes[-1].actions
+        ):
+            current = await self._session_store.load(session_id)
+            if current is None or current.instance_id != session.instance_id:
+                raise SessionStatusConflict("Session changed before it was closed.")
+            if current.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
+                raise SessionStatusConflict(
+                    f"Session is {current.status.value}; interrupt it first, then close it."
+                )
+            if current.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
+                # Recovery found the session had already ended.
+                return _merged_recovery_results(passes)
+            closed = await self._incomplete_recovery.close_waiting_session(
+                session_id, reason=SESSION_CLOSED_REASON, metadata=metadata, waiting_on=waiting_on
+            )
+            # The parent closes first, so a refused parent never closes its children;
+            # each child was checked above and is closable now that its parent ended.
+            for child in await self._open_children(session_id):
+                await self.close(child.id, reason=reason, closed_by=closed_by, _from_parent=True)
+            passes.append(
+                IncompleteSessionRecoveryResult(
+                    session_id=session_id,
+                    previous_status=current.status,
+                    status=closed.status,
+                    actions=(IncompleteSessionRecoveryAction.CLOSED,),
+                    message="Closed the session; it can no longer continue.",
+                )
+            )
+        return await self._finish(session, metadata=metadata, passes=passes)
+
+    async def _open_children(self, session_id: str) -> list[Session]:
+        page = await self._session_store.list_sessions(
+            SessionQuery(parent_session_id=session_id, limit=1000)
+        )
+        return [
+            child
+            for child in page.sessions
+            if child.status not in {SessionStatus.COMPLETED, SessionStatus.FAILED}
+        ]
+
+    async def _require_closable(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        *,
+        from_parent: bool,
+        waiting_on: str | None = None,
+    ) -> None:
+        """Refuse a close that couldn't finish, checking every open descendant too."""
+
+        if PENDING_WAKE_CHECKPOINT_KEY in (checkpoint or {}):
+            raise SessionStatusConflict(
+                "Session is asleep until its wake; interrupt it first, which cancels the "
+                "wake, then close it."
+            )
+        pending_round = _abandonable_tool_round(checkpoint)
+        if not await self.tasks_are_terminal(
+            session.id, task_id=None if pending_round is None else pending_round[2]
+        ):
+            raise SessionStatusConflict(
+                "Session has a task that is not finished; cancel it first "
+                "(`cayu task cancel`), then close the session."
+            )
+        if not from_parent and await self._foreground_parent_waits(session):
+            raise SessionStatusConflict(
+                "This subagent's parent session waits on it; close the parent session "
+                "instead, which closes this one too."
+            )
+        if not self._agent_registered(session.agent_name):
+            # Its terminal evidence and environment are settled through its agent.
+            raise SessionStatusConflict(
+                f"The session's agent {session.agent_name!r} isn't registered in this "
+                "application; close it from the application that runs that agent."
+            )
+        if session.status in {SessionStatus.PENDING, SessionStatus.INTERRUPTED}:
+            # The pause itself (and, for a child, that it still waits) is checked
+            # without changing anything.
+            await self._incomplete_recovery.close_waiting_session(
+                session.id,
+                reason=SESSION_CLOSED_REASON,
+                metadata={},
+                waiting_on=waiting_on,
+                check_only=True,
+            )
+        for child in await self._open_children(session.id):
+            if child.status in _CLOSE_BLOCKING_STATUSES:
+                raise SessionStatusConflict(
+                    "Session has child sessions that are still running; interrupt them first."
+                )
+            await self._require_closable(
+                child, await self._session_store.load_checkpoint(child.id), from_parent=True
+            )
+
+    async def _foreground_parent_waits(self, session: Session) -> bool:
+        """Whether a parent that hasn't ended waits on this session as a foreground child."""
+
+        if session.parent_session_id is None:
+            return False
+        parent = await self._session_store.load(session.parent_session_id)
+        if parent is None or parent.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
+            return False
+        wait = (await self._session_store.load_checkpoint(parent.id) or {}).get(
+            FOREGROUND_CHILD_WAIT_KEY
+        )
+        return isinstance(wait, dict) and wait.get("child_session_id") == session.id
+
+    async def _finish(
+        self,
+        session: Session,
+        *,
+        metadata: dict[str, Any],
+        passes: list[IncompleteSessionRecoveryResult],
+    ) -> IncompleteSessionRecoveryResult:
+        """Publish an abandoned session's terminal evidence and release its environment."""
+
+        current = await self._session_store.load(session.id)
+        if (
+            current is None
+            or current.instance_id != session.instance_id
+            or current.status is not SessionStatus.FAILED
+            or abandoned_session_from_checkpoint(
+                await self._session_store.load_checkpoint(session.id)
+            )
+            is None
+        ):
+            raise SessionStatusConflict("Closed session changed before its cleanup.")
+        passes.append(
+            await self._session_recovery.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session.id,
+                    inactive_for_seconds=0,
+                    reason=SESSION_CLOSED_REASON,
+                    metadata=metadata,
+                )
+            )
+        )
+        return _merged_recovery_results(passes)
+
+    async def recover_abandoned(
+        self, *, inactive_for_seconds: int, abandon_sessions_of_terminal_tasks: bool
+    ) -> list[IncompleteSessionRecoveryResult]:
+        """Run ``CayuApp.recover_abandoned_sessions``' sweep, unprojected."""
+
+        if type(inactive_for_seconds) is not int or inactive_for_seconds < 0:
+            raise ValueError("inactive_for_seconds must be a non-negative integer.")
+        if type(abandon_sessions_of_terminal_tasks) is not bool:
+            raise TypeError("abandon_sessions_of_terminal_tasks must be a bool.")
+        if abandon_sessions_of_terminal_tasks and self._task_store is None:
+            raise ValueError("abandon_sessions_of_terminal_tasks requires a task_store.")
+        results: list[IncompleteSessionRecoveryResult] = []
+        cursor: str | None = None
+        while True:
+            page = await self._session_recovery.recover_incomplete_sessions(
+                IncompleteSessionsRecoveryRequest(
+                    statuses={SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
+                    inactive_for_seconds=inactive_for_seconds,
+                    cursor=cursor,
+                    reason="abandoned_session_recovered",
+                ),
+                recover_abandoned_models=True,
+            )
+            for result in page.results:
+                if abandon_sessions_of_terminal_tasks:
+                    result = await self.abandon_swept(result)
+                results.append(result)
+            if page.next_cursor is None:
+                if abandon_sessions_of_terminal_tasks:
+                    results.extend(
+                        await self.abandon_retained(inactive_for_seconds=inactive_for_seconds)
+                    )
+                return results
+            if page.next_cursor == cursor:
+                raise RuntimeError("Abandoned-session recovery returned a repeated cursor.")
+            cursor = page.next_cursor
 
     async def abandon_swept(
         self, result: IncompleteSessionRecoveryResult

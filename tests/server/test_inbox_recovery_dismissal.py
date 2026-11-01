@@ -185,13 +185,22 @@ def test_a_recovery_item_whose_session_cant_be_abandoned_stays_pending() -> None
         assert [listed["id"] for listed in _items(client, "priya")] == [item["id"]]
 
 
-def test_only_a_recovery_item_can_be_dismissed() -> None:
+def test_dismissing_an_approval_closes_its_session_without_deciding_it() -> None:
     app = _app()
     with TestClient(create_server(app, config=ServerConfig.protected(_authenticate))) as client:
         _pause(client, app, "booking", "approver")
         [item] = _items(client, "priya")
-        refused = _settle(client, item["id"], "priya", decision="dismiss", reason="No.")
-        assert refused.status_code == 422, refused.text
+        dismissed = _settle(client, item["id"], "priya", decision="dismiss", reason="No.")
+        assert dismissed.status_code == 200, dismissed.text
+        assert dismissed.json()["item"]["settlement"]["decision"] == "dismiss"
+        events = _portal(client).call(app.session_store.load_events, "booking")
+        assert not any(
+            event.type in {EventType.TOOL_CALL_APPROVED, EventType.TOOL_CALL_APPROVAL_DENIED}
+            for event in events
+        )
+        assert _portal(client).call(app.session_store.load, "booking").status is (
+            SessionStatus.FAILED
+        )
 
 
 def test_racing_dismissal_cannot_claim_another_persons_settlement(recovery_inbox, monkeypatch):

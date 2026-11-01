@@ -61,6 +61,7 @@ from cayu.storage import migrations as schema
 FORMAT_CHOICES = ("json", "table", "jsonl")
 CLI_SCHEMA_VERSION = "9"
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
+_CLOSE_REASON_MAX_CHARS = 4096
 _MAX_SERVER_ERROR_BODY_BYTES = 128 * 1024
 _MAX_SERVER_ERROR_DETAIL_BYTES = 8 * 1024
 _MAX_SERVER_ERROR_DETAIL_SOURCE_BYTES = 64 * 1024
@@ -397,6 +398,56 @@ def add_session_parser(subparsers: Any) -> None:
     )
     add_output_options(output_parser, formats=("json", "table"))
 
+    close_parser = commands.add_parser(
+        "close",
+        help="End a session that is not running and won't continue.",
+        description=(
+            "Close a pending or interrupted session nobody will continue, such as one "
+            "waiting on a question or an approval it can no longer resume from. The "
+            "session fails with your reason and name recorded on its session.failed event, "
+            "its pending approval or question leaves the inbox, and its transcript and "
+            "events are kept. A session that is running, already ended, or has unfinished "
+            "tasks or child sessions is refused. With --application NAME it closes a Cayu "
+            "Cloud Agent's session through the Agent's API (developer or admin). Without it, "
+            "it opens the project's application in this process, as `cayu inbox` does, "
+            "because closing settles the session's environment through that application; "
+            "a bare --sqlite or --postgres store can't do that."
+        ),
+    )
+    close_parser.add_argument("session_id")
+    close_parser.add_argument(
+        "--reason",
+        required=True,
+        help=f"Why, recorded with the session (at most {_CLOSE_REASON_MAX_CHARS} characters).",
+    )
+    close_target = close_parser.add_mutually_exclusive_group()
+    close_target.add_argument(
+        "--application",
+        metavar="NAME",
+        help="A Cayu Cloud Agent's id, name or slug, signed in like `cayu cloud` commands.",
+    )
+    close_target.add_argument(
+        "--target",
+        metavar="MODULE:FACTORY",
+        help="Override project discovery with a module:factory target (local only).",
+    )
+    close_parser.add_argument(
+        "--context",
+        type=Path,
+        metavar="PATH",
+        help="Private Cayu Cloud context JSON for --application; defaults to `cayu cloud`'s.",
+    )
+    close_parser.add_argument(
+        "--as",
+        dest="closed_by",
+        metavar="SUBJECT",
+        help=(
+            "Who a local close is recorded as (default: local:<your user name>). "
+            "A Cloud Agent records your login."
+        ),
+    )
+    add_output_options(close_parser, formats=("json", "table"))
+
     resolution_parser = commands.add_parser(
         "resolve-provider-operation",
         help="Explicitly retry or fail unavailable provider work.",
@@ -455,6 +506,12 @@ def run_session(args: argparse.Namespace) -> int:
 def _run_session(args: argparse.Namespace) -> int:
     """Run after the optional output destination owns stdout."""
 
+    if args.session_command == "close":
+        try:
+            return _close_session(args)
+        except (ValueError, OSError, RuntimeError) as exc:
+            _render_session_error(str(exc), args.output_format, code="SESSION_CLOSE_FAILED")
+            return 1
     if args.session_command == "resolve-provider-operation":
         try:
             return _resolve_provider_operation(args)
@@ -488,6 +545,115 @@ def _run_session(args: argparse.Namespace) -> int:
         # the CLI concise while preserving the existing DSN scrubbing contract.
         _render_session_error(_safe_error(str(exc), dsn), args.output_format)
         return 1
+
+
+def _close_session(args: argparse.Namespace) -> int:
+    reason = args.reason
+    if not reason.strip():
+        raise ValueError("--reason must not be blank.")
+    if len(reason) > _CLOSE_REASON_MAX_CHARS:
+        raise ValueError(f"--reason is longer than {_CLOSE_REASON_MAX_CHARS} characters.")
+    if args.application is not None:
+        if args.closed_by is not None:
+            raise ValueError("--as applies to a local close; a Cloud Agent records your login.")
+        answer = _close_cloud_session(args)
+    else:
+        if args.context is not None:
+            raise ValueError("--context selects the Cayu Cloud for --application NAME.")
+        answer = asyncio.run(_close_local_session(args))
+    reported = answer.get("session")
+    session: dict[str, Any] = reported if isinstance(reported, dict) else {}
+    payload = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "closed": True,
+        "where": "cloud" if args.application is not None else "local",
+        "session_id": session.get("id", args.session_id),
+        "status": session.get("status"),
+        "actions": answer.get("actions", []),
+        "message": answer.get("message"),
+    }
+    if args.output_format == "json":
+        _render_detail("json", payload)
+    else:
+        print(
+            f"Closed session {terminal_safe(str(payload['session_id']))}; "
+            f"it is {terminal_safe(str(payload['status']))}."
+        )
+    return 0
+
+
+def _close_cloud_session(args: argparse.Namespace) -> dict[str, Any]:
+    from urllib.parse import quote
+
+    from cayu.cli._cloud_agent_api import CayuApiError, CayuApiNotFound, open_cloud_agent_api
+
+    try:
+        api = open_cloud_agent_api(args.application, context=args.context)
+    except CayuApiError as exc:
+        raise RuntimeError(str(exc)) from None
+    try:
+        answer = api.mutate(
+            f"/sessions/{quote(args.session_id, safe='')}/close",
+            {"reason": args.reason},
+            resource="session close",
+        )
+    except CayuApiNotFound:
+        raise ValueError(f"Session not found: {args.session_id}") from None
+    except CayuApiError as exc:
+        if exc.category == "request_rejected" and exc.detail:
+            raise ValueError(exc.detail) from None
+        if exc.category == "outcome_unknown":
+            raise RuntimeError(
+                f"{exc} Repeating the same close is safe: `cayu session show "
+                f"{args.session_id} --application {args.application}` shows whether it closed."
+            ) from None
+        raise RuntimeError(str(exc)) from None
+    finally:
+        api.close()
+    if not isinstance(answer, dict):
+        raise RuntimeError("The Agent answered the close without a JSON object.")
+    return answer
+
+
+async def _close_local_session(args: argparse.Namespace) -> dict[str, Any]:
+    import getpass
+
+    from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+    from cayu.cli.project import (
+        ProjectError,
+        build_project_app,
+        close_project_app,
+        project_context,
+        resolve_project,
+    )
+
+    subject = args.closed_by
+    if subject is None:
+        try:
+            subject = f"local:{getpass.getuser()}"
+        except (KeyError, OSError):
+            raise ValueError("Can't tell your user name; name yourself with --as.") from None
+    actor = ResolutionActor(subject=subject, source=ResolutionActorSource.REQUEST)
+    try:
+        project = resolve_project(args.target, command="cayu session close")
+    except ProjectError as exc:
+        raise ValueError(str(exc)) from None
+    with project_context(project.root):
+        try:
+            app = build_project_app(project.target, command="Session close")
+        except ProjectError as exc:
+            raise ValueError(str(exc)) from None
+        try:
+            result = await app.close_session(args.session_id, reason=args.reason, closed_by=actor)
+        except KeyError:
+            raise ValueError(f"Session not found: {args.session_id}") from None
+        finally:
+            await close_project_app(app)
+    return {
+        "session": {"id": args.session_id, "status": result.status.value},
+        "actions": [action.value for action in result.actions],
+        "message": result.message,
+    }
 
 
 def _resolve_provider_operation(args: argparse.Namespace) -> int:

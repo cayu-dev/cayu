@@ -406,7 +406,7 @@ def test_the_cli_decides_on_a_cloud_agent_through_the_same_commands(monkeypatch,
     }
 
 
-def test_the_cli_dismisses_only_a_recovery_item(monkeypatch, capsys) -> None:
+def test_the_cli_dismisses_recovery_items_and_approvals(monkeypatch, capsys) -> None:
     recovery = {
         "id": "inbox_r",
         "kind": "recovery",
@@ -435,6 +435,15 @@ def test_the_cli_dismisses_only_a_recovery_item(monkeypatch, capsys) -> None:
             ("GET", "/inbox_a"): _STATE,
             ("GET", "/inbox_r"): recovery,
             ("POST", "/inbox_r/settle"): dismissed,
+            ("POST", "/inbox_a/settle"): {
+                "replayed": False,
+                "item": {
+                    "id": "inbox_a",
+                    "kind": "approval",
+                    "status": "settled",
+                    "settlement": {"decision": "dismiss", "decided_by": {"subject": "user_1"}},
+                },
+            },
         }
     )
     import cayu.cli.cloud as cloud_cli
@@ -445,8 +454,12 @@ def test_the_cli_dismisses_only_a_recovery_item(monkeypatch, capsys) -> None:
     with pytest.raises(SystemExit):
         main(["inbox", "dismiss", "inbox_r", "--application", "bugs"])
     assert "--reason" in capsys.readouterr().err
-    assert main(["inbox", "dismiss", "inbox_a", "--application", "bugs", "--reason", "x"]) == 1
-    assert "dismisses recovery items; this item is a approval" in capsys.readouterr().err
+    # An approval whose session can't resume is dismissed by closing that session.
+    assert main(["inbox", "dismiss", "inbox_a", "--application", "bugs", "--reason", "x"]) == 0
+    assert capsys.readouterr().out.strip() == "Dismissed inbox_a as user_1."
+    method, path, options = cloud.calls[-1]
+    assert (method, path) == ("POST", "/v1/applications/id-bugs/inbox/inbox_a/settle")
+    assert options["payload"] == {"decision": "dismiss", "reason": "x"}
     assert main(["inbox", "deny", "inbox_r", "--application", "bugs"]) == 1
     assert "settles tool approvals; this item is a recovery" in capsys.readouterr().err
     assert (

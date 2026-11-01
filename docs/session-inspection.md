@@ -663,6 +663,36 @@ record has `record_type: summary` and carries both). A Cloud Agent serves the
 same computation a page at a time at `POST /api/sessions/rollup`; an Agent whose Cayu
 predates it answers that it doesn't serve rollups yet.
 
+### Closing a session nobody will continue
+
+`cayu session close` ends a pending or interrupted session that won't continue, such
+as one waiting on a question or an approval it can no longer resume from:
+
+```console
+cayu session close SESSION_ID --reason "Stranded by the 27 Oct release."
+cayu session close SESSION_ID --application aifinance --reason "Stranded by the 27 Oct release."
+```
+
+It calls `CayuApp.close_session` (`POST /api/sessions/{id}/close`). The session fails
+with a `session.failed` event that has `error_type: "SessionAbandoned"`, `closed:
+true`, the reason and who closed it under `metadata`, and the `approval_id` or
+`input_id` it waited on. Its pending approval or question leaves the inbox, a call
+whose outcome is uncertain stays recorded as unknown and never runs again, and its
+transcript and events are kept. Recovery then releases its environment. Its pending
+or interrupted child sessions are closed with it; a subagent whose parent waits on
+it is refused, so close the parent. A session that is running or interrupting,
+already completed or failed, asleep (interrupt it first, which cancels its wake), or
+has a task or a child session still running is refused. Repeating a close returns
+the closed session.
+
+With `--application NAME` it goes through the Agent's own Cayu API as you, like the
+reads below, which needs a developer or admin. Without it, it opens the project's
+application in this process (`[tool.cayu] factory`, or `--target module:factory`) and
+records the close as `--as SUBJECT`, by default `local:` and your user name. Closing
+settles the session's environment through that application, so it doesn't take
+`--sqlite` or `--postgres` the way the read commands do. JSON output reports
+`closed`, `status`, `actions` and `message`; `--table` prints one line.
+
 ### Sessions of a Cloud Agent
 
 Add `--application NAME` to `list`, `rollup`, `show`, `workflow`, `interactions`, `usage`,

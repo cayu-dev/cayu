@@ -268,7 +268,8 @@ class InboxSettleRequest(_InboxModel):
     ``approve`` can carry the changed ``arguments`` the tool runs with, or an
     ``approval_revision`` naming an edit the application stored itself.
     ``answer`` settles a question. ``dismiss`` settles a recovery item by
-    abandoning its session, and requires a ``reason``. ``keep`` and ``drop``
+    abandoning its session, or an approval or question whose session can't resume
+    by closing that session, and requires a ``reason``. ``keep`` and ``drop``
     settle a knowledge proposal. An approval can carry ``profile_adoption`` to
     settle after an upgrade changed the application's execution profile.
     ``review_reference`` is

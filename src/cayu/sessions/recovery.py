@@ -61,6 +61,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     REPAIRED_PROVIDER_OPERATION_RESOLUTION = "repaired_provider_operation_resolution"
     INTERRUPTED_ABANDONED = "interrupted_abandoned"
     ABANDONED_TOOL_EFFECT = "abandoned_tool_effect"
+    CLOSED = "closed"
     FINALIZED_INTERRUPT = "finalized_interrupt"
     FAILED = "failed"
 

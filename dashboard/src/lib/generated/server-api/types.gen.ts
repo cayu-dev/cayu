@@ -1571,6 +1571,23 @@ export type ApiSessionBase = {
 };
 
 /**
+ * ApiSessionCloseResult
+ *
+ * A closed session, with what the close and its recovery did.
+ */
+export type ApiSessionCloseResult = {
+    /**
+     * Actions
+     */
+    actions: Array<string>;
+    /**
+     * Message
+     */
+    message?: string | null;
+    session: ApiSessionDetail;
+};
+
+/**
  * ApiSessionDetail
  */
 export type ApiSessionDetail = {
@@ -4341,6 +4358,28 @@ export type ClientGenerationContract = {
      * Supported Targets
      */
     supported_targets?: Array<'typescript' | 'python'>;
+};
+
+/**
+ * CloseSessionBody
+ */
+export type CloseSessionBody = {
+    /**
+     * Who closed it; only without authentication, which otherwise names the caller.
+     */
+    closed_by?: ResolutionActor | null;
+    /**
+     * Reason
+     *
+     * Why the session is closed, recorded with it.
+     */
+    reason: string;
+    /**
+     * Waiting On
+     *
+     * An approval or input ID the session must still wait on to be closed.
+     */
+    waiting_on?: string | null;
 };
 
 /**
@@ -12774,7 +12813,8 @@ export type InboxProfileAdoption = {
  * ``approve`` can carry the changed ``arguments`` the tool runs with, or an
  * ``approval_revision`` naming an edit the application stored itself.
  * ``answer`` settles a question. ``dismiss`` settles a recovery item by
- * abandoning its session, and requires a ``reason``. ``keep`` and ``drop``
+ * abandoning its session, or an approval or question whose session can't resume
+ * by closing that session, and requires a ``reason``. ``keep`` and ``drop``
  * settle a knowledge proposal. An approval can carry ``profile_adoption`` to
  * settle after an upgrade changed the application's execution profile.
  * ``review_reference`` is
@@ -29297,6 +29337,36 @@ export type GetSessionApiSessionsSessionIdGetResponses = {
 };
 
 export type GetSessionApiSessionsSessionIdGetResponse = GetSessionApiSessionsSessionIdGetResponses[keyof GetSessionApiSessionsSessionIdGetResponses];
+
+export type CloseSessionApiSessionsSessionIdClosePostData = {
+    body: CloseSessionBody;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/close';
+};
+
+export type CloseSessionApiSessionsSessionIdClosePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CloseSessionApiSessionsSessionIdClosePostError = CloseSessionApiSessionsSessionIdClosePostErrors[keyof CloseSessionApiSessionsSessionIdClosePostErrors];
+
+export type CloseSessionApiSessionsSessionIdClosePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiSessionCloseResult;
+};
+
+export type CloseSessionApiSessionsSessionIdClosePostResponse = CloseSessionApiSessionsSessionIdClosePostResponses[keyof CloseSessionApiSessionsSessionIdClosePostResponses];
 
 export type CompactSessionApiSessionsSessionIdCompactPostData = {
     body: CompactSessionBody;

@@ -336,6 +336,22 @@ A session that abandonment doesn't end is refused with 409 `not_settleable` and 
 item stays pending: one with a live execution owner, a task that isn't finished, or a
 pause other than an unknown tool outcome (such as a question it is still waiting on).
 
+### Dismissing an approval or a question
+
+An approval or a question whose session can never resume, for example one stranded
+when the application's execution profile changed under it, can be dismissed too:
+settle it with `{"decision": "dismiss", "reason": "..."}`. Dismiss isn't listed in
+the item's `decisions`, because it doesn't decide the call or answer the question; it
+closes the session as `CayuApp.close_session` does. The session fails with
+`error_type: "SessionAbandoned"`, `closed: true`, `reason: "session_closed"`, the
+person and reason in its `metadata`, and the `approval_id` or `input_id` it waited
+on. Nothing runs, and its transcript and events are kept. The settlement reads
+`decision: "dismiss"`, and repeating the same person's dismissal replays. A session
+that is running, has a task or a child session still running, or no longer waits
+on this item (it was answered and paused again) is refused with 409
+`not_settleable`. A subagent's item is refused while its parent waits on it; close
+the parent session with `cayu session close`, which closes the subagent too.
+
 ### Repeating a settle
 
 Settling is idempotent per person and decision. Sending the exact same decision
@@ -450,6 +466,8 @@ $ cayu inbox approve inbox_... --reason "Checked against the vendor master."
 $ cayu inbox deny inbox_... --reason "Wrong vendor."
 $ cayu inbox dismiss inbox_... --reason "The run ended on Oct 25."
 ```
+
+`dismiss` takes recovery items, approvals and questions, as described above.
 
 Without `--application`, the commands open the project's application (`[tool.cayu]
 factory`, or `--target module:factory`) and its store in this process, and serve

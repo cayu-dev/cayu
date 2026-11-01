@@ -52,6 +52,7 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.agents import AgentSpec
+from cayu.approvals.actors import ResolutionActor
 from cayu.approvals.review import (
     HumanReviewPolicy,
 )
@@ -666,7 +667,6 @@ from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import (
     EventRecord,
     Session,
-    SessionStatus,
     SessionStatusConflict,
     copy_session,
 )
@@ -1934,6 +1934,9 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             session_recovery=self._session_recovery,
             environment_lifecycle=self._environment_lifecycle,
             resolve_registered_environment=self._get_registered_environment_for_session,
+            incomplete_recovery=self._incomplete_recovery,
+            agent_registered=lambda name: name in self._agent_registry.registrations,
+            resolve_action_linkage=self._resolve_public_action_linkage,
         )
 
         self._work_attempt_execution = WorkAttemptExecution(
@@ -7772,42 +7775,15 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         later, and abandoned sessions whose cleanup did not finish.
         """
 
-        if type(inactive_for_seconds) is not int or inactive_for_seconds < 0:
-            raise ValueError("inactive_for_seconds must be a non-negative integer.")
-        if type(abandon_sessions_of_terminal_tasks) is not bool:
-            raise TypeError("abandon_sessions_of_terminal_tasks must be a bool.")
-        if abandon_sessions_of_terminal_tasks and self.task_store is None:
-            raise ValueError("abandon_sessions_of_terminal_tasks requires a task_store.")
-        results: list[IncompleteSessionRecoveryResult] = []
-        cursor: str | None = None
-        while True:
-            page = await self._session_recovery.recover_incomplete_sessions(
-                IncompleteSessionsRecoveryRequest(
-                    statuses={SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
+        return tuple(
+            [
+                await self._project_incomplete_recovery_result_for_public_api(result)
+                for result in await self._session_abandonment.recover_abandoned(
                     inactive_for_seconds=inactive_for_seconds,
-                    cursor=cursor,
-                    reason="abandoned_session_recovered",
-                ),
-                recover_abandoned_models=True,
-            )
-            for result in page.results:
-                if abandon_sessions_of_terminal_tasks:
-                    result = await self._session_abandonment.abandon_swept(result)
-                results.append(
-                    await self._project_incomplete_recovery_result_for_public_api(result)
+                    abandon_sessions_of_terminal_tasks=abandon_sessions_of_terminal_tasks,
                 )
-            if page.next_cursor is None:
-                if abandon_sessions_of_terminal_tasks:
-                    for result in await self._session_abandonment.abandon_retained(
-                        inactive_for_seconds=inactive_for_seconds
-                    ):
-                        results.append(
-                            await self._project_incomplete_recovery_result_for_public_api(result)
-                        )
-                return tuple(results)
-            if page.next_cursor == cursor:
-                raise RuntimeError("Abandoned-session recovery returned a repeated cursor.")
-            cursor = page.next_cursor
+            ]
+        )
 
     @_admitted_entrance
     @execution_owned_by("recovery")
@@ -7848,6 +7824,29 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             reason=reason,
             metadata={} if metadata is None else metadata,
             inactive_for_seconds=inactive_for_seconds,
+        )
+        return await self._project_incomplete_recovery_result_for_public_api(result)
+
+    @_admitted_entrance
+    @execution_owned_by("recovery")
+    async def close_session(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        closed_by: ResolutionActor | None = None,
+        waiting_on: str | None = None,
+    ) -> IncompleteSessionRecoveryResult:
+        """End a pending or interrupted session nobody will continue, keeping its history.
+
+        ``waiting_on`` is an approval or input ID the session must still wait on.
+        ``docs/runtime-contracts.md`` says what it records, closes and refuses.
+        """
+        result = await self._session_abandonment.close(
+            await self._resolve_public_session_id(session_id),
+            reason=reason,
+            closed_by=closed_by,
+            waiting_on=waiting_on,
         )
         return await self._project_incomplete_recovery_result_for_public_api(result)
 

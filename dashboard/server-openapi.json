@@ -3156,6 +3156,39 @@
         "title": "ApiSessionBase",
         "type": "object"
       },
+      "ApiSessionCloseResult": {
+        "additionalProperties": false,
+        "description": "A closed session, with what the close and its recovery did.",
+        "properties": {
+          "actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Actions",
+            "type": "array"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "session": {
+            "$ref": "#/components/schemas/ApiSessionDetail"
+          }
+        },
+        "required": [
+          "session",
+          "actions"
+        ],
+        "title": "ApiSessionCloseResult",
+        "type": "object"
+      },
       "ApiSessionDetail": {
         "additionalProperties": false,
         "properties": {
@@ -8828,6 +8861,47 @@
           }
         },
         "title": "ClientGenerationContract",
+        "type": "object"
+      },
+      "CloseSessionBody": {
+        "additionalProperties": false,
+        "properties": {
+          "closed_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResolutionActor"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Who closed it; only without authentication, which otherwise names the caller."
+          },
+          "reason": {
+            "description": "Why the session is closed, recorded with it.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "waiting_on": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "An approval or input ID the session must still wait on to be closed.",
+            "title": "Waiting On"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "CloseSessionBody",
         "type": "object"
       },
       "CompactSessionBody": {
@@ -26436,7 +26510,7 @@
       },
       "InboxSettleRequest": {
         "additionalProperties": false,
-        "description": "A person's decision on one inbox item.\n\n``approve`` and ``deny`` settle an approval. Every decision accepts an optional\ndurable ``reason``.\n``approve`` can carry the changed ``arguments`` the tool runs with, or an\n``approval_revision`` naming an edit the application stored itself.\n``answer`` settles a question. ``dismiss`` settles a recovery item by\nabandoning its session, and requires a ``reason``. ``keep`` and ``drop``\nsettle a knowledge proposal. An approval can carry ``profile_adoption`` to\nsettle after an upgrade changed the application's execution profile.\n``review_reference`` is\nrequired when the application configures a human-review policy; read it from\n``GET /api/sessions/{id}/human-review``.\nTask-linked approvals and questions require ordinary worker/handoff authority,\nor explicit ``task_continuation=\"claim\"`` to acquire a new workerless handoff.\nControlled claims never borrow an active worker's authority.",
+        "description": "A person's decision on one inbox item.\n\n``approve`` and ``deny`` settle an approval. Every decision accepts an optional\ndurable ``reason``.\n``approve`` can carry the changed ``arguments`` the tool runs with, or an\n``approval_revision`` naming an edit the application stored itself.\n``answer`` settles a question. ``dismiss`` settles a recovery item by\nabandoning its session, or an approval or question whose session can't resume\nby closing that session, and requires a ``reason``. ``keep`` and ``drop``\nsettle a knowledge proposal. An approval can carry ``profile_adoption`` to\nsettle after an upgrade changed the application's execution profile.\n``review_reference`` is\nrequired when the application configures a human-review policy; read it from\n``GET /api/sessions/{id}/human-review``.\nTask-linked approvals and questions require ordinary worker/handoff authority,\nor explicit ``task_continuation=\"claim\"`` to acquire a new workerless handoff.\nControlled claims never borrow an active worker's authority.",
         "properties": {
           "answer": {
             "anyOf": [
@@ -56734,6 +56808,57 @@
           }
         },
         "summary": "Get Session"
+      }
+    },
+    "/api/sessions/{session_id}/close": {
+      "post": {
+        "description": "Fail a pending or interrupted session as closed, keeping its history.\n\nThe session's pending approval or question leaves the inbox, and the\nreason and the caller are recorded on its ``session.failed`` event. A\nsession that is running, already ended, or has unfinished tasks or child\nsessions is refused with 409. Repeating a close returns the closed session.",
+        "operationId": "close_session_api_sessions__session_id__close_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseSessionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSessionCloseResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Close a session that is not running and won't continue"
       }
     },
     "/api/sessions/{session_id}/compact": {

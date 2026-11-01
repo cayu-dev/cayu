@@ -53,7 +53,7 @@ def add_inbox_parser(subparsers: Any) -> None:
         description=(
             "List an agent's inbox (tool approvals, questions, recovery items and knowledge "
             "proposals), show one item with the arguments the application's human-review "
-            "policy lets you see, approve or deny tool approvals, and dismiss recovery items "
+            "policy lets you see, approve or deny tool approvals, and dismiss items "
             "whose session won't continue. Without --application "
             "it opens the project's application and its store in this process; with "
             "--application NAME it reads that Cayu Cloud Agent with your `cayu cloud login`."
@@ -133,14 +133,16 @@ def add_inbox_parser(subparsers: Any) -> None:
 
     dismiss = commands.add_parser(
         "dismiss",
-        help="Dismiss a recovery item by abandoning its session.",
+        help="Dismiss an item whose session won't continue, ending that session.",
         description=(
-            "Dismiss a recovery item (a tool call that started with no recorded outcome) when "
-            "its session will never continue, such as one from a run that ended long ago. The "
-            "session is abandoned: the call's outcome stays unknown and it never runs again, "
-            "and the session fails and can't be resumed. A session that is still active, "
-            "whose tasks are running, or that waits on something else is refused; recover "
-            "such an item in the Developer dashboard."
+            "Dismiss an item when its session will never continue, such as one from a run "
+            "that ended long ago or one stranded by a changed release. A recovery item (a "
+            "tool call that started with no recorded outcome) abandons its session: the "
+            "call's outcome stays unknown and it never runs again. An approval or a question "
+            "closes its session, as `cayu session close` does: nothing is approved, denied "
+            "or answered. Either way the session fails with your reason recorded, keeps its "
+            "history, and can't be resumed. A session that is still active, whose tasks or "
+            "child sessions are running, or that waits on something else is refused."
         ),
     )
     dismiss.add_argument("item_id", metavar="ITEM_ID")
@@ -383,10 +385,11 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
             f"This item is {state.get('status')}, so there is nothing to {decision}.",
             item=state,
         )
-    if decision == "dismiss" and item.get("kind") != "recovery":
+    if decision == "dismiss" and item.get("kind") not in {"recovery", "approval", "question"}:
         raise InboxClientError(
-            "not_a_recovery_item",
-            f"`cayu inbox dismiss` dismisses recovery items; this item is a {item.get('kind')}.",
+            "not_dismissable",
+            "`cayu inbox dismiss` dismisses recovery items, approvals and questions; "
+            f"this item is a {item.get('kind')}.",
         )
     if decision != "dismiss" and item.get("kind") != "approval":
         raise InboxClientError(

@@ -28,6 +28,7 @@ GATED_ENTRANCES = frozenset(
     {
         "abandon_session",
         "admit_work_attempt",
+        "close_session",
         "compact_session",
         "dispatch",
         "dispatch_inline",
