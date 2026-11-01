@@ -362,8 +362,9 @@ export function useInboxCounts(query: Pick<InboxQuery, "session_id" | "agent_nam
 /** Home lists use the server's bounded filtered pages; their lengths are never totals. */
 export function useHomeSessionRows(scope: "waiting" | "failed" | "recent") {
   const api = useApi()
+  const { overviewFirstMessageEnabled } = useServices()
   const query = useInfiniteQuery({
-    queryKey: ["home", "sessions", scope],
+    queryKey: ["home", "sessions", scope, overviewFirstMessageEnabled === true],
     initialPageParam: null as string | null,
     queryFn: async ({ pageParam, signal }) => {
       const result = await loadSessionList(
@@ -384,6 +385,7 @@ export function useHomeSessionRows(scope: "waiting" | "failed" | "recent") {
         (params, signal) => api.sessions(params, signal),
         (id, params, signal) => api.transcript(id, params, signal),
         signal,
+        { firstMessage: overviewFirstMessageEnabled },
       )
       return {
         rows: result.rows.map((row) => ({

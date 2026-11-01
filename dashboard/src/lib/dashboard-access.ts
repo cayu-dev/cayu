@@ -44,6 +44,7 @@ const MEMBER_READ_SURFACES = new Set([
   "session_trace",
   "session_overview",
   "session_overview_queries",
+  "session_overview_first_message",
   "task_index",
   "task_creation",
   "session_display_metadata",

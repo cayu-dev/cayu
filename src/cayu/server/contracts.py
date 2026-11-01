@@ -2239,6 +2239,10 @@ class SessionOverviewCost(ApiBaseModel):
     complete: StrictBool
 
 
+# Long enough for a list title or preview line; the transcript holds the full text.
+MAX_SESSION_FIRST_MESSAGE_LENGTH = 256
+
+
 class SessionOverviewResponse(ApiBaseModel):
     session_id: str
     run_id: str
@@ -2257,6 +2261,23 @@ class SessionOverviewResponse(ApiBaseModel):
     uses: SessionOverviewUses
     eval: StrictBool
     forked: StrictBool
+    first_message: str | None = Field(
+        default=None,
+        max_length=MAX_SESSION_FIRST_MESSAGE_LENGTH,
+        description=(
+            "Present only for `include=first_message`: the text parts of the session's first "
+            "user message, redacted as `GET /api/sessions/{id}/transcript` redacts them, "
+            f"trimmed and cut to {MAX_SESSION_FIRST_MESSAGE_LENGTH} characters with a trailing "
+            "ellipsis. Null when the session has no user text or the field was not requested."
+        ),
+    )
+    first_message_unavailable: StrictBool = Field(
+        default=False,
+        description=(
+            "True when a requested first-message preview could not be read. "
+            "The session row remains available and first_message is null."
+        ),
+    )
 
 
 class SessionOverviewCountsResponse(ApiBaseModel):

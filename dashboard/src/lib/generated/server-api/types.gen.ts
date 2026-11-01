@@ -4871,6 +4871,7 @@ export type ControlPlaneSurfaceCapabilities = {
     session_follow?: OptionalSurfaceCapability | null;
     session_followups?: OptionalSurfaceCapability | null;
     session_overview?: OptionalSurfaceCapability | null;
+    session_overview_first_message?: OptionalSurfaceCapability | null;
     session_overview_queries?: OptionalSurfaceCapability | null;
     session_overview_series?: OptionalSurfaceCapability | null;
     session_trace?: OptionalSurfaceCapability | null;
@@ -20551,6 +20552,18 @@ export type SessionOverviewResponse = {
      */
     eval: boolean;
     /**
+     * First Message
+     *
+     * Present only for `include=first_message`: the text parts of the session's first user message, redacted as `GET /api/sessions/{id}/transcript` redacts them, trimmed and cut to 256 characters with a trailing ellipsis. Null when the session has no user text or the field was not requested.
+     */
+    first_message?: string | null;
+    /**
+     * First Message Unavailable
+     *
+     * True when a requested first-message preview could not be read. The session row remains available and first_message is null.
+     */
+    first_message_unavailable?: boolean;
+    /**
      * Forked
      */
     forked: boolean;
@@ -29100,7 +29113,7 @@ export type ListSessionsApiSessionsGetData = {
         /**
          * Include
          */
-        include?: Array<'usage' | 'execution_profile' | 'overview'> | null;
+        include?: Array<'usage' | 'execution_profile' | 'overview' | 'first_message'> | null;
     };
     url: '/api/sessions';
 };

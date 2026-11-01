@@ -10110,6 +10110,16 @@
               }
             ]
           },
+          "session_overview_first_message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "session_overview_queries": {
             "anyOf": [
               {
@@ -40192,7 +40202,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "86",
+            "default": "87",
             "title": "Contract Version",
             "type": "string"
           },
@@ -41490,6 +41500,25 @@
           },
           "eval": {
             "title": "Eval",
+            "type": "boolean"
+          },
+          "first_message": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present only for `include=first_message`: the text parts of the session's first user message, redacted as `GET /api/sessions/{id}/transcript` redacts them, trimmed and cut to 256 characters with a trailing ellipsis. Null when the session has no user text or the field was not requested.",
+            "title": "First Message"
+          },
+          "first_message_unavailable": {
+            "default": false,
+            "description": "True when a requested first-message preview could not be read. The session row remains available and first_message is null.",
+            "title": "First Message Unavailable",
             "type": "boolean"
           },
           "forked": {
@@ -48413,7 +48442,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "86",
+            "default": "87",
             "title": "Contract Version",
             "type": "string"
           }
@@ -56273,7 +56302,8 @@
                     "enum": [
                       "usage",
                       "execution_profile",
-                      "overview"
+                      "overview",
+                      "first_message"
                     ],
                     "type": "string"
                   },

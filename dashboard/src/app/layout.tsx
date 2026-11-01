@@ -148,6 +148,9 @@ function IdentityGate() {
           now: Date.now,
           overviewQueriesEnabled:
             serverContract.capabilities.surfaces.session_overview_queries?.read.enabled === true,
+          overviewFirstMessageEnabled:
+            serverContract.capabilities.surfaces.session_overview_first_message?.read.enabled ===
+            true,
           environmentDetailsEnabled:
             serverContract.capabilities.surfaces.environment_details?.read.enabled === true,
           usageCostDetailsEnabled:

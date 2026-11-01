@@ -6,7 +6,7 @@ registration are injected here by router assembly.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -22,8 +22,10 @@ from cayu.artifacts.base import (
     ArtifactStoreUnavailableError,
 )
 from cayu.budgets.pricing import PriceBook
+from cayu.messages import MessageRole, TextPart
 from cayu.server._session_overview_query import SessionOverviewSelection
 from cayu.server.contracts import (
+    MAX_SESSION_FIRST_MESSAGE_LENGTH,
     SessionOverviewCost,
     SessionOverviewCountsResponse,
     SessionOverviewResponse,
@@ -52,6 +54,7 @@ from cayu.sessions.overview import (
 from cayu.sessions.queries import SessionAggregateFilter, SessionOrder, SessionQuery
 from cayu.sessions.records import Session
 from cayu.sessions.store import SessionStore
+from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.tools._browser_usage import has_retained_browser_usage
 from cayu.tools.browser_control import BrowserControlCheckpoint
 
@@ -191,6 +194,64 @@ class SessionOverviewService:
                 raise SessionOverviewUnavailable("Artifact store cannot provide a complete count.")
             total += result.total_count
         return total
+
+    async def with_first_messages(
+        self, sessions: Sequence[Session], overviews: Sequence[SessionOverviewResponse]
+    ) -> list[SessionOverviewResponse]:
+        """Add each session's bounded first user text, read at most a few sessions at a time.
+
+        The caller rechecks every row's incarnation after these reads, as it does
+        for the other optional sibling reads, so a replaced session is dropped.
+        """
+
+        async def preview(session: Session, overview: SessionOverviewResponse):
+            try:
+                text = await self._first_message(session)
+            except Exception:
+                # Preview availability must not decide whether a session is
+                # listed. Cancellation still propagates through the read group.
+                return overview.model_copy(
+                    update={"first_message": None, "first_message_unavailable": True}
+                )
+            return overview.model_copy(
+                update={"first_message": text, "first_message_unavailable": False}
+            )
+
+        return await gather_in_order(
+            [
+                lambda session=session, overview=overview: preview(session, overview)
+                for session, overview in zip(sessions, overviews, strict=True)
+            ]
+        )
+
+    async def _first_message(self, session: Session) -> str | None:
+        # The same store query the transcript route makes for role=user&limit=1;
+        # the store applies the caller's data bounds.
+        try:
+            page = await self.store.query_transcript(
+                TranscriptQuery(session_id=session.id, role=MessageRole.USER, limit=1)
+            )
+        except KeyError:
+            current = await self.store.load(session.id)
+            if current is None or current.instance_id != session.instance_id:
+                return None
+            raise
+        if not page.records:
+            return None
+        message = page.records[0].message
+        # Redact each part as the transcript route does, then the joined text, so a
+        # secret split across parts is still caught. Cut only after redacting.
+        text = self.redact(
+            "".join(
+                str(self.redact(part.text)) for part in message.content if type(part) is TextPart
+            )
+        )
+        text = text.strip() if type(text) is str else ""
+        if not text:
+            return None
+        if len(text) > MAX_SESSION_FIRST_MESSAGE_LENGTH:
+            text = text[: MAX_SESSION_FIRST_MESSAGE_LENGTH - 1] + "…"
+        return text
 
     def _text(self, value: object, *, limit: int) -> str | None:
         # The writer and reader share the same bounded validation boundary.

@@ -17,6 +17,8 @@ type Services = {
   now: () => number
   prototype?: PrototypeControls
   overviewQueriesEnabled?: boolean
+  /** `include=first_message` on overview lists; older servers need a transcript read per row. */
+  overviewFirstMessageEnabled?: boolean
   environmentDetailsEnabled?: boolean
   usageCostDetailsEnabled?: boolean
   usageSeriesEnabled?: boolean

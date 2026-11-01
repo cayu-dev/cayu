@@ -146,6 +146,9 @@ class ControlPlaneCapabilitySnapshot:
                 session_overview=_optional_surface(
                     True, read_supported=self.session_overview_supported, mutation_supported=False
                 ),
+                session_overview_first_message=_optional_surface(
+                    True, read_supported=self.session_overview_supported, mutation_supported=False
+                ),
                 browser_recordings=_optional_surface(
                     self.browser_recordings_configured,
                     mutation_supported=False,

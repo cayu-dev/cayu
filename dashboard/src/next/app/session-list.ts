@@ -2,15 +2,16 @@ import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { activityPollInterval } from "@/lib/polling"
 import { sessionIndexErrorState } from "@/lib/session-index-error"
 import { type SessionIndexSearch, sessionOverviewQuery } from "@/lib/session-index-search"
-import { useApi } from "./services"
+import { useApi, useServices } from "./services"
 import { loadSessionList } from "./session-list-loader"
 
 export function useSessionList(search: SessionIndexSearch) {
   const api = useApi()
+  const { overviewFirstMessageEnabled } = useServices()
   const client = useQueryClient()
   const selection = sessionOverviewQuery(search)
   return useQuery({
-    queryKey: ["session-list", selection],
+    queryKey: ["session-list", selection, overviewFirstMessageEnabled === true],
     queryFn: ({ signal }) =>
       loadSessionList(
         selection,
@@ -23,6 +24,7 @@ export function useSessionList(search: SessionIndexSearch) {
             retry: false,
           }),
         signal,
+        { firstMessage: overviewFirstMessageEnabled },
       ),
     gcTime: 0,
     retry: (count, error) => count < 3 && sessionIndexErrorState(error).retryable,

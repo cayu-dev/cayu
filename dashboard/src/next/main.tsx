@@ -37,6 +37,7 @@ function App() {
       usageCostDetailsEnabled: true,
       usageSeriesEnabled: true,
       sessionOverviewSeriesEnabled: true,
+      overviewFirstMessageEnabled: true,
       prototype: {
         seeds: api.seeds,
         seedId,

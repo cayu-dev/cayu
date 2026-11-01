@@ -54,7 +54,10 @@ Existing URLs remain valid: `/pending-actions` redirects to Inbox at `/inbox`,
 `/run` opens Home with the shared Start form, and Specialists uses `/specialists`; `/agents?q=...` redirects there with its search intact. Tools at `/tools` retains each specialist declaration, including differing schemas or policies with the same public name. Search sessions from the sidebar; `Ctrl+K` or
 `Cmd+K` focuses search, and Enter opens the session index with its `q` filter.
 The Sessions page uses `GET /api/sessions?include=overview`, displays authored titles
-and completion summaries, and preserves the existing filter links. Eval trials and
+and completion summaries, and preserves the existing filter links. A row with no
+title or labels is named from its first message, which comes with the overview
+(`include=first_message`) when the server advertises it, or from one bounded
+transcript read per such row against an older server. Eval trials and
 forks are excluded by default and can be included explicitly. Its footer shows loaded
 rows, not a matching population count; sidebar and Home counts remain separate reads.
 The sidebar can be collapsed on desktop or opened as a drawer on mobile.
@@ -516,6 +519,21 @@ require complete pending evidence, including for terminal sessions whose pending
 state cannot be materialized. Check
 `capabilities.surfaces.session_overview.read.enabled` before using the overview include. The capability describes session accounting support;
 individual reads can still fail when a backing service is unavailable.
+
+Add `include=first_message` (together with `include=overview`) to fill each
+overview's `first_message`: the text parts of the session's first user message,
+redacted exactly as `GET /api/sessions/{id}/transcript?role=user&limit=1`
+redacts them and then as one joined string, trimmed, and cut to 256 characters
+with a trailing ellipsis. It is null when that message has no text (images,
+files and withheld peer content are skipped) or the session has no user
+message, and always null without the include. The server reads one transcript
+row per listed session, at most four sessions at a time, through the same store
+query and data bounds as the transcript route, and drops a row whose session is
+replaced meanwhile. Without `overview` the include returns 422. Check
+`capabilities.surfaces.session_overview_first_message.read.enabled` before
+sending it; an older server rejects the unknown include value with 422.
+If a preview read fails, that row returns null with `first_message_unavailable: true`;
+other rows remain available. Empty or unrequested previews keep the flag false.
 
 Generate typed clients from the current OpenAPI schema;
 existing session listing and Cloud v1 fields remain available. Display metadata

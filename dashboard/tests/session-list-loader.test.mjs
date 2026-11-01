@@ -89,3 +89,87 @@ test("missing overview fails; title-read errors stay explicit and cancellation p
     { name: "AbortError" },
   )
 })
+
+test("first_message from the overview replaces per-row transcript reads when the server has it", async () => {
+  const queries = []
+  const reads = []
+  const page = {
+    sessions: [session("message"), session("empty"), session("labels", { x: "y" })],
+    overviews: [
+      { ...overview("message"), first_message: "Question\nwith details" },
+      { ...overview("empty"), first_message: null },
+      { ...overview("labels"), first_message: "Ignored" },
+    ],
+    next_cursor: null,
+    total_count: null,
+  }
+  const readPage = async (query) => {
+    queries.push(query)
+    return page
+  }
+  const readFirstUser = async (id, query) => {
+    reads.push([id, query])
+    return { messages: [] }
+  }
+  const result = await loadSessionList(
+    { include: ["overview"], include_eval: false },
+    readPage,
+    readFirstUser,
+    signal(),
+    { firstMessage: true },
+  )
+  assert.deepEqual(queries[0].include, ["overview", "first_message"])
+  assert.deepEqual(
+    result.rows.map((row) => row.title),
+    ["Question", "empty", "x=y"],
+  )
+  assert.equal(result.rows[0].titleUnavailable, false)
+  assert.deepEqual(reads, [])
+
+  // Older servers: the include is never sent and rows fall back to one bounded read each.
+  queries.length = 0
+  await loadSessionList({ include: ["overview"] }, readPage, readFirstUser, signal(), {
+    firstMessage: false,
+  })
+  assert.deepEqual(queries[0].include, ["overview"])
+  assert.deepEqual(reads, [
+    ["message", { role: "user", limit: 1 }],
+    ["empty", { role: "user", limit: 1 }],
+  ])
+})
+
+test("overview preview failures stay local to untitled rows", async () => {
+  const rows = [
+    session("unavailable"),
+    session("empty"),
+    session("titled"),
+    session("labelled", { x: "y" }),
+  ]
+  const result = await loadSessionList(
+    { include: ["overview"] },
+    async () => ({
+      sessions: rows,
+      overviews: rows.map((row) => ({
+        ...overview(row.id),
+        title: row.id === "titled" ? "Saved title" : null,
+        first_message: null,
+        first_message_unavailable: row.id !== "empty",
+      })),
+      next_cursor: null,
+      total_count: null,
+    }),
+    async () => {
+      throw new Error("No transcript fallback expected")
+    },
+    signal(),
+    { firstMessage: true },
+  )
+  assert.deepEqual(
+    result.rows.map((row) => row.titleUnavailable),
+    [true, false, false, false],
+  )
+  assert.deepEqual(
+    result.rows.map((row) => row.title),
+    ["unavailable", "empty", "Saved title", "x=y"],
+  )
+})

@@ -455,6 +455,7 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
           },
           eval: isEvalTrialMetadata(row.metadata),
           forked: row.overview.forked === true,
+          first_message: query.include?.includes("first_message") ? mockFirstMessage(row) : null,
         })),
         next_cursor: offset + limit < rows.length ? `mock-session:${offset + limit}` : null,
         total_count: null,
@@ -1031,4 +1032,15 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
   }
 
   return api
+}
+
+/** Like the server's `include=first_message`: the first user record's text, trimmed and bounded. */
+function mockFirstMessage(row: SeedSession): string | null {
+  const first = row.transcript.find((message) => message.role === "user")
+  const text = (first?.content ?? [])
+    .map((part) => (part.type === "text" && typeof part.text === "string" ? part.text : ""))
+    .join("")
+    .trim()
+  if (!text) return null
+  return text.length > 256 ? `${text.slice(0, 255)}…` : text
 }

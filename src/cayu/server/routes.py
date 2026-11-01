@@ -7887,7 +7887,8 @@ def create_router(
         include_eval: bool = True,
         include_forks: bool = True,
         include: Annotated[
-            list[Literal["usage", "execution_profile", "overview"]] | None, Query()
+            list[Literal["usage", "execution_profile", "overview", "first_message"]] | None,
+            Query(),
         ] = None,
     ):
         selection = SessionOverviewSelection(
@@ -7903,6 +7904,8 @@ def create_router(
                 422,
                 detail="Overview filters require include=overview and cursor paging without IDs or offset.",
             )
+        if include is not None and "first_message" in include and "overview" not in include:
+            raise HTTPException(422, detail="include=first_message requires include=overview.")
         query_binding = ""
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
@@ -7989,6 +7992,8 @@ def create_router(
                 sessions, overviews = await overview_service.read(
                     result.sessions, selection=selection
                 )
+                if "first_message" in include:
+                    overviews = await overview_service.with_first_messages(sessions, overviews)
                 result = result.model_copy(update={"sessions": sessions})
             except (
                 SessionOverviewUnavailable,

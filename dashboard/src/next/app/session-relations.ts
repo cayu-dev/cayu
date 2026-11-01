@@ -2,18 +2,20 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query"
 import { overviewForDisplay } from "../api/overview"
 import type { SessionListQuery } from "../api/types"
 import type { SessionRow } from "./queries"
-import { useApi } from "./services"
+import { useApi, useServices } from "./services"
 import { loadSessionList } from "./session-list-loader"
 
 /** Parent identity and direct children are queried explicitly, never from a capped global list. */
 export function useSessionRelations(id: string, parentId: string | null | undefined) {
   const api = useApi()
+  const { overviewFirstMessageEnabled } = useServices()
   const read = (query: SessionListQuery, signal: AbortSignal) =>
     loadSessionList(
       query,
       (selection, signal) => api.sessions(selection, signal),
       (sessionId, selection, signal) => api.transcript(sessionId, selection, signal),
       signal,
+      { firstMessage: overviewFirstMessageEnabled },
     )
   const parent = useQuery({
     queryKey: ["session-parent", id, parentId],
