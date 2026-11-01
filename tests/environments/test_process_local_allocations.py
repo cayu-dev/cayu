@@ -7,6 +7,8 @@ import gc
 import os
 import subprocess
 import sys
+import time
+import weakref
 from dataclasses import fields, replace
 from types import SimpleNamespace
 
@@ -232,6 +234,22 @@ def exit_registry(monkeypatch):
     return holders
 
 
+def _collect_until_gone(ref: weakref.ref) -> None:
+    """Collect until ``ref``'s object is gone.
+
+    ``gc.collect()`` returns without collecting while another thread (an xdist
+    worker's execnet thread, or one an earlier test left running) is inside its
+    own collection, so a single call can leave a dropped app alive.
+    """
+
+    deadline = time.monotonic() + 10
+    while ref() is not None:
+        assert time.monotonic() < deadline, "the dropped app was never collected"
+        gc.collect()
+        if ref() is not None:
+            time.sleep(0.01)
+
+
 def test_exit_release_closes_only_factory_runners_still_held(monkeypatch, exit_registry):
     app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
     setups = app._environment_lifecycle._active_environment_setups
@@ -244,8 +262,9 @@ def test_exit_release_closes_only_factory_runners_still_held(monkeypatch, exit_r
         }
     )
     # The app is dropped without aclose(): what it held is still released at exit.
+    lifecycle = weakref.ref(app._environment_lifecycle)
     del app
-    gc.collect()
+    _collect_until_gone(lifecycle)
     assert len(exit_registry) == 1
 
     # A forked child that exits never releases its parent's allocations.
@@ -262,8 +281,9 @@ def test_exit_release_closes_only_factory_runners_still_held(monkeypatch, exit_r
 def test_collected_app_holding_nothing_leaves_no_exit_registration(exit_registry):
     app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
     assert len(exit_registry) == 1
+    lifecycle = weakref.ref(app._environment_lifecycle)
     del app
-    gc.collect()
+    _collect_until_gone(lifecycle)
     assert exit_registry == {}
 
 

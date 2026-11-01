@@ -96,6 +96,15 @@ DEADLINES = ProviderStreamDeadlines(
     protocol_idle_timeout_s=1,
     absolute_stream_timeout_s=2,
 )
+# For tests where only the 50 ms post-terminal drain may end the stream. The
+# 150 ms semantic budget above spans request setup and the drain, so a loop
+# stall on a loaded CI runner can expire it before or during the drain.
+DRAIN_ONLY_DEADLINES = ProviderStreamDeadlines(
+    semantic_progress_timeout_s=5,
+    transport_idle_timeout_s=5,
+    protocol_idle_timeout_s=5,
+    absolute_stream_timeout_s=10,
+)
 REQUEST = ModelRequest(model="synthetic", messages=[Message.text("user", "Synthetic probe")])
 
 
@@ -174,7 +183,9 @@ async def consume(body, *, subscription=False, direct=False, background=False, d
 def test_validated_terminal_does_not_require_http_eof(subscription, status, split):
     data = frame(terminal(status))
     body = Body([data[:13], data[13:]] if split else [data])
-    events, error = asyncio.run(consume(body, subscription=subscription))
+    events, error = asyncio.run(
+        consume(body, subscription=subscription, deadlines=DRAIN_ONLY_DEADLINES)
+    )
     assert error is None
     completions = [e for e in events if e.type is ModelStreamEventType.COMPLETED]
     assert len(completions) == 1
@@ -188,7 +199,7 @@ def test_validated_terminal_does_not_require_http_eof(subscription, status, spli
 
 def test_direct_parser_acknowledges_its_own_transport_without_runtime_scope():
     body = Body([frame(terminal())])
-    events, error = asyncio.run(consume(body, direct=True))
+    events, error = asyncio.run(consume(body, direct=True, deadlines=DRAIN_ONLY_DEADLINES))
     assert error is None
     assert sum(e.type is ModelStreamEventType.COMPLETED for e in events) == 1
     assert body.closed and body.tail_read
@@ -243,7 +254,7 @@ def test_heartbeats_do_not_extend_terminal_drain():
                 yield b": heartbeat\n\n"
 
     body = Heartbeats([])
-    events, error = asyncio.run(consume(body))
+    events, error = asyncio.run(consume(body, deadlines=DRAIN_ONLY_DEADLINES))
     assert error is None
     assert sum(e.type is ModelStreamEventType.COMPLETED for e in events) == 1
     assert body.closed and body.count > 0
@@ -348,6 +359,7 @@ def test_nested_tail_cleanup_outcome_survives_drain_expiry(mode, close_failure):
             subscription=mode == "subscription",
             direct=mode == "direct",
             background=mode == "background",
+            deadlines=DRAIN_ONLY_DEADLINES,
         )
     )
     if close_failure:
@@ -547,7 +559,7 @@ def test_background_reconnect_terminal_does_not_require_eof(status):
     if status == "failed":
         event["response"]["error"] = {"code": "server_error", "message": "synthetic"}
     body = Body([frame(event)])
-    events, error = asyncio.run(consume(body, background=True))
+    events, error = asyncio.run(consume(body, background=True, deadlines=DRAIN_ONLY_DEADLINES))
     assert error is None
     assert events[-1].type is (
         ModelStreamEventType.COMPLETED

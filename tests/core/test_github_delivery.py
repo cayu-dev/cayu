@@ -246,6 +246,16 @@ class FakeTransport:
         return self.review_bundle
 
 
+async def _wait_while_running(event, owner, message, *, timeout=30):
+    """Wait for ``event``, failing at once if ``owner`` finishes first."""
+    waiter = asyncio.ensure_future(event.wait())
+    try:
+        await asyncio.wait((waiter, owner), timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+    assert event.is_set(), message
+
+
 def _connector(
     tmp_path,
     request,

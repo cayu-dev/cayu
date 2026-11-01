@@ -588,30 +588,48 @@ def test_a_helper_keeps_its_claim_while_it_prepares_and_never_runs_a_trial_twice
         owner_store = SQLiteEvalStore(tmp_path / "evals.db")
         helper_store = SQLiteEvalStore(tmp_path / "evals.db")
         owner_runtime = _runtime(owner_store, owner_declared, worker_processes=2)
-        # The helper's lease is shorter than its preparation takes.
+        # The helper's lease is shorter than its preparation takes. It still
+        # outlasts a loaded runner stalling the event loop between two renewals,
+        # which would let a one-second lease lapse and hand the trial to the owner.
         helper_runtime = replace(
-            _runtime(helper_store, helper_declared, worker_processes=2), lease_seconds=1
+            _runtime(helper_store, helper_declared, worker_processes=2), lease_seconds=3
         )
         await _admit(owner_runtime, owner_store, owner_declared, "slow-helper-run")
         owner = EvalRunCoordinator(owner_runtime)
         helper = EvalRunCoordinator(helper_runtime)
+        loop = asyncio.get_running_loop()
         preparing = asyncio.Event()
+        renewed_past_lease = asyncio.Event()
+        lease_ends_at: float | None = None
+        heartbeat = helper_store.heartbeat_run_trial
+
+        async def observed_heartbeat(*args, **kwargs):
+            observation = await heartbeat(*args, **kwargs)
+            if lease_ends_at is not None and loop.time() >= lease_ends_at:
+                renewed_past_lease.set()
+            return observation
+
+        monkeypatch.setattr(helper_store, "heartbeat_run_trial", observed_heartbeat)
         prepare = helper._preflight_run
 
         async def slow_preflight(run_record, registration):
+            nonlocal lease_ends_at
+            # The trial was just claimed, so the lease it was claimed with ends by then.
+            lease_ends_at = loop.time() + helper_runtime.lease_seconds
             preparing.set()
-            await asyncio.sleep(2.5)
+            # Prepare until the claim was renewed after that lease ran out.
+            await asyncio.wait_for(renewed_past_lease.wait(), timeout=30)
             return await prepare(run_record, registration)
 
         monkeypatch.setattr(helper, "_preflight_run", slow_preflight)
         try:
             owner.start()
-            for _ in range(200):
-                record = await owner_store.load_run("slow-helper-run")
-                assert record is not None
-                if record.status is EvalRunStatus.RUNNING:
-                    break
-                await asyncio.sleep(0.01)
+            # The owner claims the run first, so the helper only helps with it.
+            async with asyncio.timeout(30):
+                while (
+                    await owner_store.load_run("slow-helper-run")
+                ).status is not EvalRunStatus.RUNNING:
+                    await asyncio.sleep(0.01)
             helper.start()
             await asyncio.wait_for(preparing.wait(), timeout=10)
             # The owner frees up while the helper still prepares its trial.

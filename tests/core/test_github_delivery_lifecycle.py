@@ -4,7 +4,13 @@ import asyncio
 import threading
 
 import pytest
-from tests.core.test_github_delivery import FakeTransport, _connector, _pr, _request
+from tests.core.test_github_delivery import (
+    FakeTransport,
+    _connector,
+    _pr,
+    _request,
+    _wait_while_running,
+)
 
 from cayu.applications import CayuApp
 from cayu.artifacts.settlement import (
@@ -42,8 +48,10 @@ def test_invalid_close_does_not_seal(tmp_path, timeout):
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_managed_worker_retains_delivery_after_waiter_timeout(tmp_path, monkeypatch, backend):
     request = _request(reviewers=("reviewer",))
+    # The connector's run timeout starts before its local artifact writes, not at
+    # the provider call, so it leaves room for slow writes on a loaded runner.
     request = request.model_copy(
-        update={"limits": request.limits.model_copy(update={"timeout_seconds": 1})}
+        update={"limits": request.limits.model_copy(update={"timeout_seconds": 5})}
     )
     transport = FakeTransport(request)
     connector, _ = _connector(tmp_path, request, transport)
@@ -89,8 +97,9 @@ def test_managed_worker_retains_delivery_after_waiter_timeout(tmp_path, monkeypa
             )
         )
         try:
-            await asyncio.wait_for(entered.wait(), timeout=5)
-            await asyncio.wait_for(draining.wait(), timeout=5)
+            await _wait_while_running(entered, worker, "worker stopped before dispatching create")
+            # Draining starts once the connector's run times out with the create held.
+            await asyncio.wait_for(draining.wait(), timeout=30)
             worker.cancel("stop delivery worker")
             for _ in range(100):
                 current = await store.load_task("github-delivery-task")

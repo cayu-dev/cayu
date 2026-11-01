@@ -838,6 +838,22 @@ def reset_fake_module() -> None:
     FakeSandboxApi.start_calls = []
 
 
+@pytest.fixture(autouse=True)
+def _settle_retained_constructor_rollbacks():
+    """Settle constructor rollback a test leaves in the process-wide registry.
+
+    Tests that make removal fail leave their rollback retained. A later test in the
+    same worker that drains failed creations would otherwise retry it and record its
+    removal as its own.
+    """
+
+    yield
+    reset_fake_module()
+    unsettled = asyncio.run(MicrosandboxRunner.drain_failed_creations(timeout_s=30))
+    reset_fake_module()
+    assert unsettled == 0, "a test left constructor rollback that never settled"
+
+
 def cleanup_diagnostic(error: BaseException) -> dict[str, Any]:
     diagnostic = error.__dict__.get("diagnostic")
     assert isinstance(diagnostic, dict)

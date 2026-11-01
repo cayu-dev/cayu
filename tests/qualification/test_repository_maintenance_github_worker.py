@@ -17,7 +17,12 @@ from cayu.delivery.github import (
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
-from tests.core.test_github_delivery import FakeTransport, _connector, _pr
+from tests.core.test_github_delivery import (
+    FakeTransport,
+    _connector,
+    _pr,
+    _wait_while_running,
+)
 from tests.qualification.test_repository_maintenance_github_intake import configuration, enqueue
 from tests.qualification.test_repository_maintenance_github_intake import (
     github_intake as github_intake,
@@ -33,7 +38,9 @@ def test_saved_approval_execution_retains_task_until_connector_settles(
     worker_module = importlib.import_module("operations.maintenance_github")
     config = configuration()
     config["requested_at"] = datetime.now(UTC).isoformat()
-    config["limits"] = {"poll_interval_seconds": 1, "timeout_seconds": 1, "max_elapsed_seconds": 30}
+    # The connector's run timeout starts before its local artifact writes, not at
+    # the provider call, so it leaves room for slow writes on a loaded runner.
+    config["limits"] = {"poll_interval_seconds": 1, "timeout_seconds": 5, "max_elapsed_seconds": 30}
     config["security"].update(
         {
             "connector_id": "github-connector",
@@ -81,7 +88,8 @@ def test_saved_approval_execution_retains_task_until_connector_settles(
             },
         )
         connector.clock = lambda: datetime.now(UTC)
-        entered, release = asyncio.Event(), asyncio.Event()
+        entered, release, closing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        close = connector.aclose
         factories = 0
 
         def factory():
@@ -96,7 +104,12 @@ def test_saved_approval_execution_retains_task_until_connector_settles(
             transport.pull_request = _pr(request)
             return transport.pull_request, "worker-create"
 
+        async def observe_close(**kwargs):
+            closing.set()
+            return await close(**kwargs)
+
         monkeypatch.setattr(transport, "create_pull_request", create)
+        monkeypatch.setattr(connector, "aclose", observe_close)
 
         async def handle(_app, task, worker_id):
             await worker_module.handle_github_delivery_task(
@@ -119,7 +132,7 @@ def test_saved_approval_execution_retains_task_until_connector_settles(
             )
         )
         try:
-            await asyncio.wait_for(entered.wait(), 5)
+            await _wait_while_running(entered, owner, "worker stopped before dispatching create")
             if cancel:
                 owner.cancel("stop-github-worker")
                 for _ in range(100):
@@ -128,6 +141,10 @@ def test_saved_approval_execution_retains_task_until_connector_settles(
                     await asyncio.sleep(0.01)
                 else:
                     pytest.fail("Missing cancellation fence")
+                # The observer closes the connector only after the connector's run
+                # has timed out with the create still in flight. The task must stay
+                # claimed past its lease until that create settles.
+                await asyncio.wait_for(closing.wait(), timeout=30)
                 await asyncio.sleep(1.05)
                 assert not owner.done()
                 assert await store.reclaim_expired(query=query) == []
@@ -145,7 +162,7 @@ def test_saved_approval_execution_retains_task_until_connector_settles(
             assert final.status is (TaskStatus.CANCELLED if cancel else TaskStatus.COMPLETED)
             assert final.worker_id is None and final.lease_expires_at is None
             assert factories == 1 and transport.create_calls == 1
-            assert await connector.aclose(timeout_s=0) is True
+            assert await close(timeout_s=0) is True
             if cancel:
                 assert not final.result
             else:
@@ -160,7 +177,7 @@ def test_saved_approval_execution_retains_task_until_connector_settles(
             if not owner.done():
                 owner.cancel()
             await asyncio.gather(owner, return_exceptions=True)
-            assert await connector.aclose(timeout_s=5) is True
+            assert await close(timeout_s=5) is True
 
     asyncio.run(scenario())
 

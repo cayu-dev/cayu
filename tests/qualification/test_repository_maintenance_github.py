@@ -22,7 +22,13 @@ from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
-from tests.core.test_github_delivery import FakeTransport, _connector, _pr, _request
+from tests.core.test_github_delivery import (
+    FakeTransport,
+    _connector,
+    _pr,
+    _request,
+    _wait_while_running,
+)
 from tests.qualification.test_repository_maintenance_application import project as project
 
 
@@ -32,8 +38,11 @@ def phase(project, tmp_path):
     request = request.model_copy(
         update={
             "requested_at": datetime.now(UTC).isoformat(),
+            # The connector's run timeout starts before its local artifact writes,
+            # not at the provider call, so it leaves room for slow writes on a
+            # loaded runner.
             "limits": request.limits.model_copy(
-                update={"poll_interval_seconds": 1, "timeout_seconds": 1, "max_elapsed_seconds": 30}
+                update={"poll_interval_seconds": 1, "timeout_seconds": 5, "max_elapsed_seconds": 30}
             ),
             "reviews": GitHubReviewPolicy(),
         }
@@ -117,9 +126,10 @@ def test_cancel_during_dispatched_create_waits_for_positive_close(phase, monkeyp
         monkeypatch.setattr(connector, "aclose", observe_close)
         owner = asyncio.create_task(invoke(phase))
         try:
-            await asyncio.wait_for(entered.wait(), timeout=5)
+            await _wait_while_running(entered, owner, "observer stopped before dispatching create")
             owner.cancel("first-stop")
-            await asyncio.wait_for(closing.wait(), timeout=5)
+            # Closing starts once the connector's run times out with the create held.
+            await asyncio.wait_for(closing.wait(), timeout=30)
             owner.cancel("second-stop")
             await asyncio.sleep(0)
             assert not owner.done() and owner.cancelling() == 2
@@ -160,7 +170,7 @@ def test_cancel_during_poll_wait_prevents_next_observation(phase, monkeypatch):
         monkeypatch.setattr(connector, "run", observe)
         owner = asyncio.create_task(invoke(phase))
         try:
-            await asyncio.wait_for(observed.wait(), timeout=5)
+            await _wait_while_running(observed, owner, "observer stopped before its first run")
             await asyncio.sleep(0)
             owner.cancel("stop-poll")
             with pytest.raises(asyncio.CancelledError, match="stop-poll"):
@@ -179,10 +189,12 @@ def test_cancel_during_poll_wait_prevents_next_observation(phase, monkeypatch):
 @pytest.mark.parametrize("expired", [True, False])
 def test_original_deadline_is_not_renewed(phase, expired):
     _module, _application, connector, transport, request = phase
+    # The unexpired case leaves two seconds of the 30-second deadline, enough for
+    # the local artifact writes before the create on a loaded runner.
     request = request.model_copy(
         update={
             "requested_at": (
-                datetime.now(UTC) - timedelta(seconds=31 if expired else 29.6)
+                datetime.now(UTC) - timedelta(seconds=31 if expired else 28)
             ).isoformat(),
         }
     )
@@ -242,8 +254,9 @@ def test_runtime_worker_retains_fence(phase, monkeypatch, tmp_path, backend):
             )
         )
         try:
-            await asyncio.wait_for(entered.wait(), timeout=5)
-            await asyncio.wait_for(closing.wait(), timeout=5)
+            await _wait_while_running(entered, worker, "worker stopped before dispatching create")
+            # Closing starts once the connector's run times out with the create held.
+            await asyncio.wait_for(closing.wait(), timeout=30)
             worker.cancel("stop-phase-worker")
             for _ in range(100):
                 current = await store.load_task("phase")
