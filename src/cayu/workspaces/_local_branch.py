@@ -2740,6 +2740,35 @@ def _durable_failed_publication_result(
     )
 
 
+def _is_exact_publication_record(
+    record: _DurableBranchRecord,
+    request: WorkspaceBranchPublicationRequest,
+) -> bool:
+    publication = record.publication
+    return (
+        publication is not None
+        and publication.idempotency_key == request.idempotency_key
+        and publication.change_set.digest == request.change_set_digest
+        and record.branch_id == request.branch_id
+        and record.baseline_revision == request.baseline_revision
+    )
+
+
+def _exact_settled_publication_result(
+    record: _DurableBranchRecord,
+    request: WorkspaceBranchPublicationRequest,
+) -> WorkspaceBranchPublicationResult | None:
+    """Replay a terminal publication outcome only to the exact request that produced it."""
+
+    if not _is_exact_publication_record(record, request):
+        return None
+    if record.state is WorkspaceBranchDurableState.COMMITTED:
+        return _durable_publication_result(record)
+    if record.state is WorkspaceBranchDurableState.FAILED:
+        return _durable_failed_publication_result(record)
+    return None
+
+
 def _durable_rollback_result(record: _DurableBranchRecord) -> WorkspaceBranchRollbackResult:
     _require_durable_terminal_expiry_eligible(record)
     rollback = record.rollback
@@ -4652,20 +4681,39 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             raise WorkspaceBranchOperationConflict(
                 "Workspace branch changed under this publication owner."
             )
-        with self._state_lock:
-            self._require_active(allow_publishing=True)
-            if (
-                request.branch_id != self._branch_id
-                or request.baseline_revision != self._baseline_revision
-            ):
-                raise WorkspaceBranchOperationConflict(
-                    "Workspace branch publication authority does not match the branch."
-                )
-            change_set = self._change_set_unlocked()
-            if request.change_set_digest != change_set.digest:
-                raise WorkspaceBranchOperationConflict(
-                    "Workspace branch changed after publication authority was issued."
-                )
+        try:
+            with self._state_lock:
+                self._require_active(allow_publishing=True)
+                if (
+                    request.branch_id != self._branch_id
+                    or request.baseline_revision != self._baseline_revision
+                ):
+                    raise WorkspaceBranchOperationConflict(
+                        "Workspace branch publication authority does not match the branch."
+                    )
+                change_set = self._change_set_unlocked()
+                if request.change_set_digest != change_set.digest:
+                    raise WorkspaceBranchOperationConflict(
+                        "Workspace branch changed after publication authority was issued."
+                    )
+        except (WorkspaceBranchClosedError, WorkspaceBranchFencedError):
+            # Another handle sharing this branch may have settled the same exact
+            # publication after ``current`` was loaded. Replay only that outcome.
+            settled = await _load_durable_branch_record(
+                durable.store,
+                session_id=authority.session_id,
+                storage_key=durable.storage_key,
+            )
+            if settled is None:
+                raise
+            replayed = _exact_settled_publication_result(settled, request)
+            if replayed is None:
+                raise
+            await self._settle_observed_durable_terminal_handle(
+                settled,
+                binding_claim_lease=binding_claim_lease,
+            )
+            return replayed
         if current.publication is not None and (
             current.publication.idempotency_key != request.idempotency_key
             or current.publication.change_set != change_set
@@ -4720,14 +4768,23 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 }
             )
             self._validate_live_binding(binding_claim_lease)
-            current = await _publish_or_reconcile_exact_record(
-                durable.store,
-                session_id=authority.session_id,
-                storage_key=durable.storage_key,
-                expected=current,
-                updated=intended,
-                expected_run_epoch=authority.expected_run_epoch,
-            )
+            try:
+                current = await _publish_or_reconcile_exact_record(
+                    durable.store,
+                    session_id=authority.session_id,
+                    storage_key=durable.storage_key,
+                    expected=current,
+                    updated=intended,
+                    expected_run_epoch=authority.expected_run_epoch,
+                )
+            except WorkspaceBranchOperationConflict:
+                replayed = await self._converge_exact_publication_conflict(
+                    request,
+                    binding_claim_lease=binding_claim_lease,
+                )
+                if replayed is not None:
+                    return replayed
+                raise
             durable.record = current
         with self._state_lock:
             self._lifecycle = WorkspaceBranchLifecycleStatus.PUBLISHING
@@ -4761,32 +4818,12 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 binding_claim_lease=binding_claim_lease,
             )
         except WorkspaceBranchOperationConflict:
-            settled = await _load_durable_branch_record(
-                durable.store,
-                session_id=authority.session_id,
-                storage_key=durable.storage_key,
+            replayed = await self._converge_exact_publication_conflict(
+                request,
+                binding_claim_lease=binding_claim_lease,
             )
-            if settled is not None:
-                settled = await self._converge_and_settle_observed_durable_operation(
-                    settled,
-                    binding_claim_lease=binding_claim_lease,
-                )
-            if (
-                settled is not None
-                and settled.state is WorkspaceBranchDurableState.COMMITTED
-                and settled.publication is not None
-                and settled.publication.idempotency_key == request.idempotency_key
-                and settled.publication.change_set == change_set
-            ):
-                return _durable_publication_result(settled)
-            if (
-                settled is not None
-                and settled.state is WorkspaceBranchDurableState.FAILED
-                and settled.publication is not None
-                and settled.publication.idempotency_key == request.idempotency_key
-                and settled.publication.change_set == change_set
-            ):
-                return _durable_failed_publication_result(settled)
+            if replayed is not None:
+                return replayed
             raise
         except _DurablePublicationConflict as conflict:
             conflicted = current.model_copy(
@@ -4914,6 +4951,38 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             suppress_ordinary_cleanup_failure=True,
         )
         return _durable_publication_result(committed)
+
+    async def _converge_exact_publication_conflict(
+        self,
+        request: WorkspaceBranchPublicationRequest,
+        *,
+        binding_claim_lease: _BindingAuthorityClaimLease,
+    ) -> WorkspaceBranchPublicationResult | None:
+        """After losing a publication write, converge only the same exact publication."""
+
+        durable = self._durable
+        if durable is None:  # pragma: no cover - caller invariant
+            raise AssertionError("Durable publication lost its coordinator.")
+        settled = await _load_durable_branch_record(
+            durable.store,
+            session_id=durable.record.authority.session_id,
+            storage_key=durable.storage_key,
+        )
+        if settled is None:
+            return None
+        if not _is_exact_publication_record(settled, request):
+            # A competing process cannot retire this process's capacity owner.
+            # Settle terminal evidence even when this request must still fail.
+            await self._settle_observed_durable_terminal_handle(
+                settled,
+                binding_claim_lease=binding_claim_lease,
+            )
+            return None
+        settled = await self._converge_and_settle_observed_durable_operation(
+            settled,
+            binding_claim_lease=binding_claim_lease,
+        )
+        return _exact_settled_publication_result(settled, request)
 
     async def _converge_and_record_publication_progress(
         self,

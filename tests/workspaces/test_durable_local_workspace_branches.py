@@ -2996,6 +2996,331 @@ def test_concurrent_exact_publication_attempts_converge_once(tmp_path: Path) -> 
     asyncio.run(scenario())
 
 
+def test_exact_publication_loser_replays_commit_settled_during_convergence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loser's conflict convergence sees progress, then the winner commits."""
+
+    import cayu.workspaces._local_branch as branch_module
+
+    async def scenario() -> None:
+        store = _TemporarySQLiteSessionStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        _source, winner, _request = await _durable_branch(root, store)
+        await winner.write_bytes("answer.txt", b"one answer")
+        recovered = await _workspace(root, store).recover_branch(_recovery_request())
+        assert recovered.branch is not None
+        loser = recovered.branch
+        publication = await _publication_request(winner)
+
+        loser_at_progress = asyncio.Event()
+        winner_progressed = asyncio.Event()
+        release_winner_commit = asyncio.Event()
+        loser_conflicted = False
+        loser_loads_after_conflict = 0
+        tasks: dict[str, asyncio.Task] = {}
+        original_publish = branch_module._publish_or_reconcile_exact_record
+        original_load = branch_module._load_durable_branch_record
+
+        async def ordered_publish(store_arg, **kwargs):
+            nonlocal loser_conflicted
+            state = kwargs["updated"].state
+            current = asyncio.current_task()
+            if current is tasks.get("winner"):
+                if state is WorkspaceBranchDurableState.PUBLICATION_PROGRESS:
+                    await loser_at_progress.wait()
+                elif state is WorkspaceBranchDurableState.COMMITTED:
+                    winner_progressed.set()
+                    await release_winner_commit.wait()
+            elif current is tasks.get("loser"):
+                if state is WorkspaceBranchDurableState.PUBLICATION_PROGRESS:
+                    loser_at_progress.set()
+                    await winner_progressed.wait()
+                try:
+                    return await original_publish(store_arg, **kwargs)
+                except WorkspaceBranchOperationConflict:
+                    loser_conflicted = True
+                    raise
+            return await original_publish(store_arg, **kwargs)
+
+        async def commit_before_loser_rechecks(store_arg, **kwargs):
+            nonlocal loser_loads_after_conflict
+            record = await original_load(store_arg, **kwargs)
+            if asyncio.current_task() is tasks.get("loser") and loser_conflicted:
+                loser_loads_after_conflict += 1
+                if loser_loads_after_conflict == 2:
+                    # Convergence re-entered publication and loaded the in-flight
+                    # record; the winner commits before the active-branch check.
+                    assert record is not None
+                    assert record.state is WorkspaceBranchDurableState.PUBLICATION_PROGRESS
+                    release_winner_commit.set()
+                    await tasks["winner"]
+            return record
+
+        monkeypatch.setattr(branch_module, "_publish_or_reconcile_exact_record", ordered_publish)
+        monkeypatch.setattr(
+            branch_module, "_load_durable_branch_record", commit_before_loser_rechecks
+        )
+
+        tasks["winner"] = asyncio.create_task(winner.publish(publication))
+        tasks["loser"] = asyncio.create_task(loser.publish(publication))
+        winner_result = await tasks["winner"]
+        loser_result = await tasks["loser"]
+
+        assert loser_conflicted
+        assert loser_loads_after_conflict >= 2
+        assert winner_result.status is WorkspaceBranchOutcomeStatus.COMMITTED
+        assert loser_result == winner_result
+        assert (root / "answer.txt").read_bytes() == b"one answer"
+        assert winner.lifecycle_status is WorkspaceBranchLifecycleStatus.COMMITTED
+        assert loser.lifecycle_status is WorkspaceBranchLifecycleStatus.COMMITTED
+
+        await _assert_terminal_handle_released_capacity(root, store)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("exact", [True, False], ids=["exact", "different_key"])
+def test_publication_commit_between_load_and_active_check_replays_only_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exact: bool,
+) -> None:
+    """A commit landing after the loser's load replays only to the same publication."""
+
+    import cayu.workspaces._local_branch as branch_module
+
+    async def scenario() -> None:
+        store = _TemporarySQLiteSessionStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        _source, winner, _request = await _durable_branch(root, store)
+        await winner.write_bytes("answer.txt", b"one answer")
+        recovered = await _workspace(root, store).recover_branch(_recovery_request())
+        assert recovered.branch is not None
+        loser = recovered.branch
+        publication = await _publication_request(winner)
+        loser_publication = (
+            publication if exact else await _publication_request(loser, key="publish-beta")
+        )
+
+        loser_task: asyncio.Task | None = None
+        winner_committed = False
+        original_load = branch_module._load_durable_branch_record
+
+        async def commit_after_loser_load(store_arg, **kwargs):
+            nonlocal winner_committed
+            record = await original_load(store_arg, **kwargs)
+            if asyncio.current_task() is loser_task and not winner_committed:
+                winner_committed = True
+                assert record is not None
+                assert record.state is WorkspaceBranchDurableState.OPEN
+                committed = await winner.publish(publication)
+                assert committed.status is WorkspaceBranchOutcomeStatus.COMMITTED
+            return record
+
+        monkeypatch.setattr(branch_module, "_load_durable_branch_record", commit_after_loser_load)
+
+        loser_task = asyncio.create_task(loser.publish(loser_publication))
+        if exact:
+            loser_result = await loser_task
+            assert loser_result.status is WorkspaceBranchOutcomeStatus.COMMITTED
+            assert loser_result.evidence.change_set_digest == publication.change_set_digest
+            assert loser.lifecycle_status is WorkspaceBranchLifecycleStatus.COMMITTED
+        else:
+            with pytest.raises(WorkspaceBranchClosedError, match="not active: committed"):
+                await loser_task
+        assert winner_committed
+        assert (root / "answer.txt").read_bytes() == b"one answer"
+        settled = await _workspace(root, store).recover_branch(_recovery_request())
+        assert settled.state is WorkspaceBranchDurableState.COMMITTED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("exact", [True, False], ids=["exact", "different_key"])
+def test_publication_intent_conflict_with_in_flight_winner_converges_only_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exact: bool,
+) -> None:
+    """The loser loaded OPEN; the winner is mid-publication when its INTENT write lands."""
+
+    import cayu.workspaces._local_branch as branch_module
+
+    async def scenario() -> None:
+        store = _TemporarySQLiteSessionStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        _source, winner, _request = await _durable_branch(root, store)
+        await winner.write_bytes("answer.txt", b"one answer")
+        recovered = await _workspace(root, store).recover_branch(_recovery_request())
+        assert recovered.branch is not None
+        loser = recovered.branch
+        publication = await _publication_request(winner)
+        loser_publication = (
+            publication if exact else await _publication_request(loser, key="publish-beta")
+        )
+
+        loser_at_intent = asyncio.Event()
+        winner_progressed = asyncio.Event()
+        release_winner_commit = asyncio.Event()
+        loser_intent_conflicted = False
+        loser_released_winner = False
+        tasks: dict[str, asyncio.Task] = {}
+        original_publish = branch_module._publish_or_reconcile_exact_record
+        original_load = branch_module._load_durable_branch_record
+
+        async def ordered_publish(store_arg, **kwargs):
+            nonlocal loser_intent_conflicted
+            state = kwargs["updated"].state
+            current = asyncio.current_task()
+            if current is tasks.get("winner"):
+                if state is WorkspaceBranchDurableState.PUBLICATION_INTENT:
+                    await loser_at_intent.wait()
+                elif state is WorkspaceBranchDurableState.COMMITTED:
+                    winner_progressed.set()
+                    await release_winner_commit.wait()
+            elif (
+                current is tasks.get("loser")
+                and state is WorkspaceBranchDurableState.PUBLICATION_INTENT
+            ):
+                loser_at_intent.set()
+                await winner_progressed.wait()
+                try:
+                    return await original_publish(store_arg, **kwargs)
+                except WorkspaceBranchOperationConflict:
+                    loser_intent_conflicted = True
+                    raise
+            return await original_publish(store_arg, **kwargs)
+
+        async def commit_after_loser_reloads(store_arg, **kwargs):
+            nonlocal loser_released_winner
+            record = await original_load(store_arg, **kwargs)
+            if (
+                asyncio.current_task() is tasks.get("loser")
+                and loser_intent_conflicted
+                and not loser_released_winner
+            ):
+                # The loser's reload sees the winner still in flight; the
+                # winner then commits while the loser converges.
+                loser_released_winner = True
+                assert record is not None
+                assert record.state is WorkspaceBranchDurableState.PUBLICATION_PROGRESS
+                release_winner_commit.set()
+                await tasks["winner"]
+            return record
+
+        monkeypatch.setattr(branch_module, "_publish_or_reconcile_exact_record", ordered_publish)
+        monkeypatch.setattr(
+            branch_module, "_load_durable_branch_record", commit_after_loser_reloads
+        )
+
+        tasks["winner"] = asyncio.create_task(winner.publish(publication))
+        tasks["loser"] = asyncio.create_task(loser.publish(loser_publication))
+        loser_outcome = (await asyncio.gather(tasks["loser"], return_exceptions=True))[0]
+        release_winner_commit.set()
+        winner_result = await tasks["winner"]
+
+        assert loser_intent_conflicted
+        assert winner_result.status is WorkspaceBranchOutcomeStatus.COMMITTED
+        if exact:
+            assert loser_outcome == winner_result
+            assert loser_released_winner
+            assert loser.lifecycle_status is WorkspaceBranchLifecycleStatus.COMMITTED
+        else:
+            assert isinstance(loser_outcome, WorkspaceBranchOperationConflict)
+            assert "changed under another operation" in str(loser_outcome)
+        assert (root / "answer.txt").read_bytes() == b"one answer"
+        assert winner.lifecycle_status is WorkspaceBranchLifecycleStatus.COMMITTED
+        settled = await _workspace(root, store).recover_branch(_recovery_request())
+        assert settled.state is WorkspaceBranchDurableState.COMMITTED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("exact", [True, False], ids=["exact", "different_key"])
+def test_publication_intent_conflict_with_committed_winner_replays_only_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exact: bool,
+) -> None:
+    """The winner commits after the loser's active check but before its INTENT write."""
+
+    import cayu.workspaces._local_branch as branch_module
+
+    async def scenario() -> None:
+        store = _TemporarySQLiteSessionStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        _source, winner, _request = await _durable_branch(root, store)
+        await winner.write_bytes("answer.txt", b"one answer")
+        # Separate process-local capacity registries: the winner's settlement
+        # must not conceal a leaked lease in the losing process.
+        winner_active = branch_module._ACTIVE_BRANCHES
+        monkeypatch.setattr(branch_module, "_ACTIVE_BRANCHES", {})
+        recovered = await _workspace(root, store).recover_branch(_recovery_request())
+        assert recovered.branch is not None
+        loser = recovered.branch
+        loser_active = branch_module._ACTIVE_BRANCHES
+        publication = await _publication_request(winner)
+        loser_publication = (
+            publication if exact else await _publication_request(loser, key="publish-beta")
+        )
+
+        loser_task: asyncio.Task | None = None
+        winner_result = None
+        original_publish = branch_module._publish_or_reconcile_exact_record
+
+        async def commit_before_loser_intent(store_arg, **kwargs):
+            nonlocal winner_result
+            if (
+                asyncio.current_task() is loser_task
+                and winner_result is None
+                and kwargs["updated"].state is WorkspaceBranchDurableState.PUBLICATION_INTENT
+            ):
+                assert kwargs["expected"].state is WorkspaceBranchDurableState.OPEN
+                branch_module._ACTIVE_BRANCHES = winner_active
+                try:
+                    winner_result = await asyncio.create_task(winner.publish(publication))
+                finally:
+                    branch_module._ACTIVE_BRANCHES = loser_active
+            return await original_publish(store_arg, **kwargs)
+
+        monkeypatch.setattr(
+            branch_module, "_publish_or_reconcile_exact_record", commit_before_loser_intent
+        )
+
+        loser_task = asyncio.create_task(loser.publish(loser_publication))
+        if exact:
+            loser_result = await loser_task
+            assert winner_result is not None
+            assert winner_result.status is WorkspaceBranchOutcomeStatus.COMMITTED
+            assert loser_result == winner_result
+            assert loser.lifecycle_status is WorkspaceBranchLifecycleStatus.COMMITTED
+        else:
+            with pytest.raises(
+                WorkspaceBranchOperationConflict,
+                match="changed under another operation",
+            ):
+                await loser_task
+            assert winner_result is not None
+            assert winner_result.status is WorkspaceBranchOutcomeStatus.COMMITTED
+        assert loser.lifecycle_status is WorkspaceBranchLifecycleStatus.COMMITTED
+        await _assert_terminal_handle_released_capacity(root, store)
+        assert (root / "answer.txt").read_bytes() == b"one answer"
+        settled = await _workspace(root, store).recover_branch(_recovery_request())
+        assert settled.state is WorkspaceBranchDurableState.COMMITTED
+
+    asyncio.run(scenario())
+
+
 def test_exact_committed_replay_retires_recovered_handle(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = _TemporarySQLiteSessionStore()
