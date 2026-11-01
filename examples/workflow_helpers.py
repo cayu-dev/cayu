@@ -3,13 +3,25 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from cayu import AgentSpec, CayuApp
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent, OpenAIProvider
-from cayu.workflows import StepRunOptions, WorkflowBase, WorkflowSpec, step
+from cayu.runners import LocalRunner
+from cayu.workflows import StepRunOptions, WorkflowBase, WorkflowSpec, command, step
+
+# A deterministic check the workflow runs after the agent step. Its exit code,
+# not the model's own claim, decides whether the summary is accepted.
+CHECK_SUMMARY = (
+    "import json, sys; out = json.load(sys.stdin); "
+    "sys.exit(0 if out.get('status') == 'ok' and out.get('summary') else 1)"
+)
 
 SUMMARY_SCHEMA = {
     "type": "object",
@@ -43,7 +55,16 @@ class SmokeWorkflow(WorkflowBase):
             schema=SUMMARY_SCHEMA,
             run_options=StepRunOptions(labels={"example": "workflow-helpers"}),
         )
-        yield await ctx.completed({"result": result.output})
+        # Journaled command step: runs in the app's default environment, and a
+        # resumed run returns the journaled result instead of running it again.
+        check = await command(
+            ctx,
+            step_id="check-summary",
+            argv=[sys.executable, "-c", CHECK_SUMMARY],
+            stdin=json.dumps(result.output),
+            timeout_s=30,
+        )
+        yield await ctx.completed({"result": result.output, "check_passed": check.passed})
 
 
 def _scripted_submit(output: dict[str, Any]) -> list[ModelStreamEvent]:
@@ -57,8 +78,13 @@ def _scripted_submit(output: dict[str, Any]) -> list[ModelStreamEvent]:
     ]
 
 
-async def _build_app(provider_name: str) -> tuple[CayuApp, Any]:
+async def _build_app(provider_name: str, workdir: Path) -> tuple[CayuApp, Any]:
     app = CayuApp(enable_logging=False)
+    # Swap this for a Docker or Lambda MicroVM environment to run the same check there.
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), runner=LocalRunner(workdir)),
+        default=True,
+    )
     if provider_name == "scripted":
         provider = ScriptedModelProvider(
             [
@@ -85,7 +111,12 @@ async def _build_app(provider_name: str) -> tuple[CayuApp, Any]:
 
 async def main() -> None:
     provider_name = os.environ.get("CAYU_WORKFLOW_PROVIDER", "scripted")
-    app, provider = await _build_app(provider_name)
+    with tempfile.TemporaryDirectory() as workdir:
+        await _run(provider_name, Path(workdir))
+
+
+async def _run(provider_name: str, workdir: Path) -> None:
+    app, provider = await _build_app(provider_name, workdir)
     workflow = SmokeWorkflow(app)
     try:
         yielded = [event async for event in workflow.run(f"workflow-example-{provider_name}")]
@@ -96,6 +127,7 @@ async def main() -> None:
                 {
                     "provider": provider_name,
                     "result": completed_payload.get("result"),
+                    "check_passed": completed_payload.get("check_passed"),
                     "yielded_events": [str(event.type) for event in yielded],
                     "journal_events": [str(event.type) for event in journal],
                 },

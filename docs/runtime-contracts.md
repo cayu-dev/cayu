@@ -13704,6 +13704,63 @@ payloads. Existing `error`/`message` fields are legacy human-readable diagnostic
 they are not the bounded evidence export. Unknown or malformed old evidence is
 never promoted to expiry or successful settlement.
 
+### Command steps
+
+`command(ctx, step_id=..., argv=[...])` runs one deterministic process, such as a
+test suite, a linter or a checker script, as a journaled workflow step. Use it when
+the program's exit code, not a model's claim, decides what the workflow does next.
+
+```python
+from cayu.workflows import command, gated_loop
+
+tests = await command(
+    ctx,
+    step_id="tests",
+    argv=["pytest", "-q"],
+    timeout_s=600,
+    environment_name="ci",  # omit to use the app's default environment
+)
+if not tests.passed:
+    ...
+
+# Or let the command decide a gated_loop item directly:
+async def gate(item, result):
+    return await command(ctx, step_id=f"tests:{item}", argv=["pytest", "-q"])
+```
+
+The command runs through the runner of a registered environment, so the same
+workflow runs on a local, Docker or Lambda MicroVM runner by registering a different
+environment. The environment must be registered with `register_environment`. A
+factory-backed environment is provisioned per agent session and is refused for now.
+
+`command` journals `workflow.step.started` (`kind="command"`, argv and environment
+name) and `workflow.step.completed` with `exit_code`, `timed_out`, `cancelled`,
+`passed`, `duration_ms`, and `stdout`/`stderr` with their `*_truncated` flags. Output
+is redacted with the application's secret redactor at the runner (`exec_redacted`)
+and bounded to `output_limit_bytes` per stream (default 50,000 bytes, the
+`exec_command` tool's default; at most half the durable event limit, since both
+streams share one event). The streams also share that event with argv and the other
+completion fields, so a large argv lowers the per-stream bound to whatever still fits,
+and argv plus step metadata above half the completion payload is refused with
+`ValueError` before the command runs. NUL characters and lone surrogates are replaced
+with U+FFFD. Values passed in `env` reach the process but are not treated as secrets.
+
+A non-zero exit, a timeout or a cancellation reported by the runner is a normal
+`CommandResult`; `passed` is true only for exit code 0 without timeout or
+cancellation. A runner failure, for example a closed or unavailable runner, raises
+`StepError` and journals no completion, so a resume runs the command again.
+
+On resume, a `step_id` with a journaled completion returns that result with
+`replayed=True` instead of running the command again. Replay matches by `step_id`
+only; a changed argv does not invalidate it. Pass `rerun=True` when the check must
+see current state; the newest completion then wins on later resumes. Replay reads
+the completed event through the optional `WorkflowJournalStepCompletion` journal
+capability, which `EventStoreJournal` implements; a custom journal without it
+must pass `rerun=True`. `CommandResult` is accepted by `normalize_gate_outcome`, and
+`CommandResult.gate_outcome()` carries the step id, exit code, `timed_out` and
+`cancelled` as the gate detail. `command` returns a `CommandResult`, not a
+`StepResult`, so it is not a `parallel` or `pipeline` stage.
+
 ## Runner
 
 Runner execution failures publish fixed-message `cayu.runner_execution_error.v1`

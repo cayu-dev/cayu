@@ -1,6 +1,7 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "CommandResult": ("cayu.workflows.models", "CommandResult"),
     "EventStoreJournal": ("cayu.workflows.journal", "EventStoreJournal"),
     "FailureEvidence": ("cayu.failure_evidence", "FailureEvidence"),
     "GateOutcome": ("cayu.workflows.models", "GateOutcome"),
@@ -20,6 +21,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "WorkflowJournal": ("cayu.workflows.journal", "WorkflowJournal"),
     "WorkflowJournalContext": ("cayu.workflows.journal", "WorkflowJournalContext"),
     "WorkflowJournalReplayEvidence": ("cayu.workflows.journal", "WorkflowJournalReplayEvidence"),
+    "WorkflowJournalStepCompletion": ("cayu.workflows.journal", "WorkflowJournalStepCompletion"),
     "WorkflowSpec": ("cayu.workflows.base", "WorkflowSpec"),
     "WorkflowStepCompletionSnapshot": ("cayu.workflows.journal", "WorkflowStepCompletionSnapshot"),
     "WorkflowSupersededError": ("cayu.workflows.workflow", "WorkflowSupersededError"),
@@ -31,6 +33,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.workflows.journal",
         "copy_workflow_step_completion_snapshot",
     ),
+    "command": ("cayu.workflows.commands", "command"),
     "gated_loop": ("cayu.workflows.workflow", "gated_loop"),
     "normalize_gate_outcome": ("cayu.workflows.models", "normalize_gate_outcome"),
     "parallel": ("cayu.workflows.workflow", "parallel"),
@@ -39,6 +42,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "CommandResult",
     "EventStoreJournal",
     "FailureEvidence",
     "GateOutcome",
@@ -58,10 +62,12 @@ PUBLIC_NAMES = [
     "WorkflowJournal",
     "WorkflowJournalContext",
     "WorkflowJournalReplayEvidence",
+    "WorkflowJournalStepCompletion",
     "WorkflowSpec",
     "WorkflowStepCompletionSnapshot",
     "WorkflowSupersededError",
     "canonical_workflow_step_completion_ids",
+    "command",
     "copy_workflow_step_completion_snapshot",
     "gated_loop",
     "normalize_gate_outcome",

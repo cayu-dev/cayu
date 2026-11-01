@@ -114,10 +114,52 @@ class ParallelStepError(Exception):
         super().__init__(f"{len(self.failures)} parallel step(s) failed: {summary}")
 
 
-def normalize_gate_outcome(value: GateOutcome | bool) -> GateOutcome:
-    """Accept either a :class:`GateOutcome` or a bare bool from a gate callable."""
+def normalize_gate_outcome(value: GateOutcome | CommandResult | bool) -> GateOutcome:
+    """Accept a :class:`GateOutcome`, a :class:`CommandResult`, or a bare bool from a gate."""
     if isinstance(value, GateOutcome):
         return value
+    if isinstance(value, CommandResult):
+        return value.gate_outcome()
     if isinstance(value, bool):
         return GateOutcome(passed=value)
-    raise TypeError("A gate must return a GateOutcome or a bool.")
+    raise TypeError("A gate must return a GateOutcome, a CommandResult, or a bool.")
+
+
+@dataclass(frozen=True, slots=True)
+class CommandResult:
+    """Outcome of one :func:`~cayu.workflows.command` step, as journaled.
+
+    ``stdout`` and ``stderr`` are the bounded, redacted text the journal holds,
+    so a live run and a resumed run return the same value. ``replayed`` is true
+    when the result came from the journal instead of a new execution.
+    """
+
+    step_id: str
+    argv: tuple[str, ...]
+    exit_code: int
+    timed_out: bool = False
+    cancelled: bool = False
+    stdout: str = ""
+    stderr: str = ""
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    duration_ms: int = 0
+    environment_name: str | None = None
+    replayed: bool = False
+
+    @property
+    def passed(self) -> bool:
+        """True when the command exited 0 and was neither timed out nor cancelled."""
+        return self.exit_code == 0 and not self.timed_out and not self.cancelled
+
+    def gate_outcome(self) -> GateOutcome:
+        """Return this result as a :func:`gated_loop` gate verdict."""
+        return GateOutcome(
+            passed=self.passed,
+            detail={
+                "step_id": self.step_id,
+                "exit_code": self.exit_code,
+                "timed_out": self.timed_out,
+                "cancelled": self.cancelled,
+            },
+        )

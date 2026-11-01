@@ -750,12 +750,16 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         }
     },
     EventType.WORKFLOW_STEP_STARTED: {
-        ("kind",): frozenset({"gated_loop"}),
+        ("kind",): frozenset({"gated_loop", "command"}),
     },
     EventType.WORKFLOW_STEP_COMPLETED: {
-        ("kind",): frozenset({"gated_loop"}),
+        ("kind",): frozenset({"gated_loop", "command"}),
         ("outcome",): frozenset({"pass", "fail"}),
         ("passed",): frozenset({True, False}),
+        ("timed_out",): frozenset({True, False}),
+        ("cancelled",): frozenset({True, False}),
+        ("stdout_truncated",): frozenset({True, False}),
+        ("stderr_truncated",): frozenset({True, False}),
     },
     EventType.SERVER_MUTATION_ACCEPTED: {
         ("accepted_event_publication_uncertain",): frozenset({True, False}),

@@ -111,6 +111,7 @@ from cayu.workflows.journal import (
     validate_workflow_journal_event_type,
 )
 from cayu.workflows.models import (
+    CommandResult,
     GateOutcome,
     ParallelResult,
     StepError,
@@ -1761,7 +1762,7 @@ async def gated_loop(
     items: Iterable[Any],
     *,
     do: Callable[[Any], Awaitable[StepResult]],
-    gate: Callable[[Any, StepResult], Awaitable[GateOutcome | bool]],
+    gate: Callable[[Any, StepResult], Awaitable[GateOutcome | CommandResult | bool]],
     on_pass: Callable[[Any, StepResult, GateOutcome], Awaitable[None]] | None = None,
     on_fail: Callable[[Any, StepResult, GateOutcome], Awaitable[None]] | None = None,
     key: Callable[[Any], str] | None = None,
@@ -1769,6 +1770,8 @@ async def gated_loop(
 ):
     """Process items sequentially with resumable pass/fail journaling.
 
+    A gate may return a :class:`GateOutcome`, a bool, or the
+    :class:`CommandResult` of a :func:`~cayu.workflows.command` step.
     Use stable item keys when the item list can change across resumes. Hooks run
     before the item completion is journaled, so ``on_pass`` and ``on_fail`` must
     tolerate at-least-once execution after a crash.

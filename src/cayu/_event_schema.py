@@ -3295,8 +3295,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
 
     workflow_policy = _observed_policy(
         "agent attempt_id child_session_id detail gate has_output item_key kind n outcome "
-        "passed step_id total workflow",
-        untrusted_container_keys={"detail"},
+        "passed step_id total workflow "
+        "argv cancelled duration_ms environment_name exit_code stderr stderr_truncated "
+        "stdout stdout_truncated timed_out",
+        untrusted_container_keys={"argv", "detail"},
     )
     for event_type in (
         EventType.WORKFLOW_STARTED,

@@ -282,6 +282,29 @@ class WorkflowJournalReplayEvidence(Protocol):
         ...
 
 
+@runtime_checkable
+class WorkflowJournalStepCompletion(Protocol):
+    """Optional journal capability that returns a step's journaled completion.
+
+    :func:`~cayu.workflows.command` replays its result from the completed
+    event's payload, so a journal must expose the event itself, not only a
+    child session id.
+    """
+
+    async def completed_step_event(
+        self,
+        *,
+        step_id: str,
+        attempt_id: str,
+    ) -> Event | None:
+        """Newest attempt-fenced ``workflow.step.completed`` event for ``step_id``.
+
+        Return ``None`` when the step has no valid completion or when
+        ``attempt_id`` is no longer the latest attempt.
+        """
+        ...
+
+
 class EventStoreJournal:
     """Default ``WorkflowJournal`` backed by cayu's event store."""
 
@@ -445,6 +468,30 @@ class EventStoreJournal:
             ),
         )
         return completed, started
+
+    async def completed_step_event(
+        self,
+        *,
+        step_id: str,
+        attempt_id: str,
+    ) -> Event | None:
+        step_id = require_clean_nonblank(step_id, "step_id")
+        attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+        latest_attempt_id, _sequence = await self._latest_attempt()
+        if latest_attempt_id != attempt_id:
+            return None
+        records = await self._store.query_events(
+            EventQuery(
+                session_id=self._session_id,
+                workflow_name=self._workflow_name,
+                workflow_step_id=step_id,
+                workflow_attempt_fenced=True,
+                event_type=EventType.WORKFLOW_STEP_COMPLETED,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        return records[0].event if records else None
 
     async def _latest_fenced_step_child_session_id(
         self,
