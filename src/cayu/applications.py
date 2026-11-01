@@ -4634,6 +4634,13 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             project_session_id=self.project_session_id_for_exposure,
         )
 
+    @_tracked_entrance
+    async def release_session_closure(
+        self, session_id: str, *, policy: SessionClosurePolicy | None = None
+    ) -> bool:
+        """Give up a stopped deletion that erased no descendant; ``docs/runtime-contracts.md``."""
+        return await self._environment_registry.session_closure.release(session_id, policy=policy)
+
     async def _stop_parked_waits(self, session_id: str) -> None:
         """Stop what an interrupted session waits on: its sleep, or a task's external wait."""
         await _session_wakes._cancel_session_wake(self, session_id)

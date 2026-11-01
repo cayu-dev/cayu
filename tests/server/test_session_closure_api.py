@@ -5,7 +5,12 @@ import asyncio
 from fastapi.testclient import TestClient
 
 from cayu import CayuApp, RunRequest
-from cayu.runtime.session_closure import SessionClosureDisposition, SessionClosureRecord
+from cayu.artifacts import ArtifactListResult
+from cayu.runtime.session_closure import (
+    ArtifactSessionClosureStore,
+    SessionClosureDisposition,
+    SessionClosureRecord,
+)
 from cayu.server import ServerConfig, create_server
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
@@ -100,3 +105,52 @@ def test_deleted_public_alias_remains_absent_after_receipt_eviction():
     malformed = "cayu_authority_invalid"
     assert client.delete(f"/api/sessions/{malformed}").status_code == 409
     assert client.get(f"/api/sessions/{malformed}").status_code == 409
+
+
+def test_http_delete_refuses_an_artifact_store_that_cannot_fence_closure():
+    class UnfencedArtifacts:
+        id = "unfenced-artifacts"
+
+        async def list(self, **kwargs):
+            return ArtifactListResult(artifacts=(), total_count=0)
+
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        session_closure_stores=(ArtifactSessionClosureStore(UnfencedArtifacts()),),
+    )
+    asyncio.run(
+        store.create(
+            RunRequest(session_id="unfenced-http", agent_name="worker", messages=[]),
+            identity=SessionIdentity(provider_name="scripted", model="test"),
+        )
+    )
+    client = TestClient(create_server(app, config=ServerConfig.local_development()))
+    for _attempt in range(2):
+        response = client.delete("/api/sessions/unfenced-http")
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Artifact store cannot fence session closure."}
+    # The refused deletions left no lineage claim behind.
+    asyncio.run(store.delete_session("unfenced-http"))
+    assert asyncio.run(store.load("unfenced-http")) is None
+
+
+def test_http_delete_answers_conflict_for_an_unsupported_closure(monkeypatch):
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    asyncio.run(
+        store.create(
+            RunRequest(session_id="unsupported-http", agent_name="worker", messages=[]),
+            identity=SessionIdentity(provider_name="scripted", model="test"),
+        )
+    )
+
+    async def unsupported(session_id, *, finished_only):
+        raise NotImplementedError("Closure is unsupported by this store.")
+
+    monkeypatch.setattr(app, "delete_session", unsupported)
+    client = TestClient(create_server(app, config=ServerConfig.local_development()))
+    response = client.delete("/api/sessions/unsupported-http")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Closure is unsupported by this store."}

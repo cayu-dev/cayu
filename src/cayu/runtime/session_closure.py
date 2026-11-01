@@ -60,6 +60,7 @@ from cayu.tasks.records import TaskSessionClosureClaim, TaskStatus, copy_task_se
 from cayu.vaults.redaction import SecretRedactor
 
 SESSION_CLOSURE_SCHEMA_VERSION = 1
+ARTIFACT_CLOSURE_UNFENCED = "Artifact store cannot fence session closure."
 SESSION_CLOSURE_DEFAULT_MAX_RECORDS = 10_000
 SESSION_CLOSURE_DEFAULT_MAX_BYTES = 16 * 1024 * 1024
 SESSION_CLOSURE_MAX_FIELD_CHARS = 4096
@@ -700,6 +701,11 @@ class ArtifactSessionClosureStore:
                 ), False
         return await self._inventory(session_id, policy)
 
+    @property
+    def can_fence_closure(self) -> bool:
+        """Whether the store can claim its session artifacts, which erasure requires."""
+        return getattr(self._store, "supports_session_closure_claims", False) is True
+
     async def claim_session_closure(self, session_id, policy, plan_id):
         retained = await self._retained_claim(session_id, policy)
         if retained is not None:
@@ -709,8 +715,8 @@ class ArtifactSessionClosureStore:
             _artifacts, truncated = await self._inventory(session_id, policy)
             if truncated:
                 raise ValueError("Artifact closure inventory is truncated.")
-        if getattr(self._store, "supports_session_closure_claims", False) is not True:
-            raise NotImplementedError("Artifact store cannot fence session closure.")
+        if not self.can_fence_closure:
+            raise NotImplementedError(ARTIFACT_CLOSURE_UNFENCED)
         claim = copy_artifact_closure_claim(
             await self._store.claim_session_closure(
                 session_id, plan_id, max_records=policy.max_records, max_bytes=policy.max_bytes
@@ -1386,6 +1392,10 @@ class SessionClosureCoordinator:
         self, session_id: str, policy: SessionClosurePolicy
     ) -> None:
         for store in self._dependent_stores:
+            if type(store) is ArtifactSessionClosureStore and not store.can_fence_closure:
+                # Refuse before the closure claims anything: the claim step would
+                # fail on this store anyway, after the lineage claim was published.
+                raise ValueError(ARTIFACT_CLOSURE_UNFENCED)
             try:
                 record = self._copy_adapter_record(
                     await store.inspect_session_closure(session_id, policy=policy)
@@ -1604,6 +1614,39 @@ class SessionClosureCoordinator:
                 expected_plan_id=expected_plan_id,
                 finished_only=finished_only,
             )
+
+    async def release(self, session_id: str, *, policy: SessionClosurePolicy | None = None) -> bool:
+        """Give up an unfinished deletion of ``session_id`` that erased no descendant.
+
+        Returns whether a lineage claim was released. The session and whatever the
+        closure did not erase stay; dependent stores keep their own claims, so the
+        same deletion can still be retried later.
+        """
+        policy = SessionClosurePolicy() if policy is None else policy
+        plan_id = self._plan_id(session_id, policy)
+        release = getattr(self._session_store, "release_session_closure_progress", None)
+        if release is None:
+            raise ValueError("Session store cannot release closure progress.")
+        async with self._erase_lock:
+            if await self._session_store.load(session_id) is None:
+                return False
+            progress = await self._load_progress(session_id, plan_id)
+            if progress is None:
+                return False
+            # ``completed`` is saved after each descendant's deletion commits, so a
+            # crash in between leaves it stale; the descendants themselves are the
+            # evidence of what was erased. The store checks this again atomically.
+            for item in progress.get("descendants", ()):
+                child = await self._session_store.load(item["session_id"])
+                if child is None or child.parent_session_id != item["parent_session_id"]:
+                    raise ValueError(
+                        "Closure progress already erased descendants; retry the same "
+                        "deletion to finish it."
+                    )
+            try:
+                return await release(session_id, plan_id)
+            except NotImplementedError as exc:
+                raise ValueError("Session store cannot release closure progress.") from exc
 
     async def validate(self, session_id: str, *, policy: SessionClosurePolicy | None = None):
         """Run closure admission checks without mutating any owned resource."""

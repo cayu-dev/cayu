@@ -341,6 +341,33 @@ def _check_closure_lineage_owner(
             raise ValueError("Recursive closure deletion owner conflicts.")
 
 
+def _require_releasable_closure_progress(
+    progress: dict[str, Any], parents: Mapping[str, str | None]
+) -> None:
+    """Only a closure that erased no descendant may give up its lineage claim.
+
+    ``parents`` maps each planned descendant that still exists to its current
+    parent, read in the release transaction. ``completed`` is saved after each
+    descendant's deletion commits, so it can lag; a missing or reparented
+    descendant is the evidence that the closure already erased it.
+    """
+    completed = progress.get("completed")
+    if (
+        type(completed) is not list
+        or completed
+        or any(
+            parents.get(item["session_id"], _MISSING) != item["parent_session_id"]
+            for item in progress.get("descendants", ())
+        )
+    ):
+        raise ValueError(
+            "Closure progress already erased descendants; retry the same deletion to finish it."
+        )
+
+
+_MISSING = object()
+
+
 def _validate_closure_progress_update(existing: dict[str, Any], proposed: dict[str, Any]) -> None:
     for key in (
         "schema_version",

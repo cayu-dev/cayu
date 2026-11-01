@@ -8,13 +8,16 @@ from tests.core.session_closure_conformance import create_closure_session
 from tests.core.test_tool_effect_store_conformance import _stores
 
 from cayu import CayuApp, RunRequest
+from cayu.artifacts import ArtifactListResult
 from cayu.events import Event
 from cayu.runtime.session_closure import (
+    ArtifactSessionClosureStore,
     SessionClosureChildPolicy,
     SessionClosureDisposition,
     SessionClosurePolicy,
     SessionClosureRecord,
 )
+from cayu.sessions._closure_records import session_closure_target_plan_id
 from cayu.sessions.forks import fork_session_invocation
 from cayu.sessions.records import SessionIdentity
 
@@ -408,5 +411,124 @@ def test_postgres_cancellation_during_native_admission_rolls_back(
                 if not closing.done():
                     closing.cancel()
                 await asyncio.gather(closing, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+class _UnfencedArtifacts:
+    """An application artifact store that lists session artifacts but can't claim them."""
+
+    id = "unfenced-artifacts"
+
+    async def list(self, **kwargs):
+        return ArtifactListResult(artifacts=(), total_count=0)
+
+
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_unfenced_artifact_store_refuses_deletion_without_leaving_a_lineage_claim(
+    backend, tmp_path, request
+):
+    dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+
+    async def scenario():
+        async with _stores(backend, tmp_path / "unfenced.db", dsn) as open_store:
+            store = open_store()
+            session_id = uuid4().hex
+            await create_closure_session(store, session_id)
+            app = CayuApp(
+                enable_logging=False,
+                session_store=store,
+                session_closure_stores=(ArtifactSessionClosureStore(_UnfencedArtifacts()),),
+            )
+            plan_id = (await app.inspect_session_closure(session_id)).plan_id
+            for _attempt in range(2):
+                with pytest.raises(ValueError, match="Artifact store cannot fence session closure"):
+                    await app.delete_session(session_id, finished_only=False)
+                with pytest.raises(ValueError, match="Artifact store cannot fence session closure"):
+                    await app.erase_session_closure(session_id)
+            assert await store.load_session_closure_progress(session_id, plan_id) is None
+            # Nothing is left that would refuse the store's own deletion.
+            await store.delete_session(session_id)
+            assert await store.load(session_id) is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_release_session_closure_drops_an_orphaned_lineage_claim(backend, tmp_path, request):
+    dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+
+    async def scenario():
+        async with _stores(backend, tmp_path / "orphan.db", dsn) as open_store:
+            store = open_store()
+            session_id = uuid4().hex
+            await create_closure_session(store, session_id)
+            app = CayuApp(enable_logging=False, session_store=store)
+            coordinator = app._environment_registry.session_closure
+            plan_id = (await app.inspect_session_closure(session_id)).plan_id
+            # What a deletion that stopped after claiming lineage leaves behind.
+            await coordinator._claim_progress(
+                session_id, plan_id, SessionClosurePolicy(), phase="reject"
+            )
+            with pytest.raises(ValueError, match="unfinished recursive closure"):
+                await store.delete_session(session_id)
+            assert await app.release_session_closure(session_id) is True
+            assert await app.release_session_closure(session_id) is False
+            assert await store.load_session_closure_progress(session_id, plan_id) is None
+            await store.delete_session(session_id)
+            assert await store.load(session_id) is None
+            assert await app.release_session_closure(session_id) is False
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("progress_saved", [True, False])
+def test_release_session_closure_keeps_a_closure_that_erased_descendants(
+    backend, progress_saved, tmp_path, request
+):
+    dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+
+    async def scenario():
+        async with _stores(backend, tmp_path / "started.db", dsn) as open_store:
+            store = open_store()
+            root, child = uuid4().hex, uuid4().hex
+            await create_closure_session(store, root)
+            await create_closure_session(store, child, root)
+            app = CayuApp(enable_logging=False, session_store=store)
+            policy = SessionClosurePolicy(child_policy=SessionClosureChildPolicy.RECURSIVE)
+            plan_id = (await app.inspect_session_closure(root, policy=policy)).plan_id
+            progress = await app._environment_registry.session_closure._claim_progress(
+                root, plan_id, policy, descendants=((child, root),), phase="recursive"
+            )
+            # The recursive closure deleted the child; without ``progress_saved`` it
+            # stopped before recording that in its progress.
+            await store.delete_session(
+                child,
+                closure_receipt={
+                    "root_session_id": root,
+                    "target_session_id": child,
+                    "original_parent_session_id": root,
+                    "plan_id": session_closure_target_plan_id(plan_id, child),
+                    "operation": "recursive",
+                    "complete": True,
+                },
+            )
+            if progress_saved:
+                progress["completed"] = [child]
+                await store.save_session_closure_progress(progress)
+            with pytest.raises(ValueError, match="retry the same deletion"):
+                await app.release_session_closure(root, policy=policy)
+            # The store refuses it by itself too, from the descendants it reads.
+            with pytest.raises(ValueError, match="retry the same deletion"):
+                await store.release_session_closure_progress(root, plan_id)
+            assert await store.load_session_closure_progress(root, plan_id) is not None
+            # Retrying the same deletion still finishes it.
+            report = await app.erase_session_closure(root, policy=policy)
+            assert report.complete
+            assert await store.load(root) is None
 
     asyncio.run(scenario())

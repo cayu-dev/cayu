@@ -299,6 +299,13 @@ touch the workspace directory, which the application owns. It raises
 or interrupted, has active tasks or child sessions, or has anything the closure
 cannot fully list or erase. `finished_only=False` also deletes pending and
 interrupted sessions. It returns `None` for a session that does not exist.
+A registered artifact store must be able to claim a session's artifacts
+(`supports_session_closure_claims`); otherwise deletion raises
+`ValueError("Artifact store cannot fence session closure.")` and the HTTP route
+answers 409, before anything is claimed or erased. A deletion that stopped part
+way keeps a claim on the session, so other deletions refuse it until the same
+deletion is retried. If you won't retry it, `await
+app.release_session_closure(session_id)` gives that claim up.
 
 With `InMemorySessionStore`, deletion keeps memory bounded. The store keeps a
 closure receipt of a few kilobytes per deleted session, so the id stays retired

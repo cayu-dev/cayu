@@ -9304,7 +9304,9 @@ def create_router(
         try:
             # The HTTP API deletes any session the closure admits, not only finished ones.
             await cayu_app.delete_session(session_id, finished_only=False)
-        except ValueError as exc:
+        except (ValueError, NotImplementedError) as exc:
+            # A store the closure can't use (one that can't fence it) refuses the
+            # deletion as any other unprovable closure does.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return None
 

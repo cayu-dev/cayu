@@ -28,6 +28,7 @@ from cayu.sessions._access_rules import runtime_session_mutation, runtime_sessio
 from cayu.sessions._closure_records import (
     _check_closure_lineage_owner,
     _closure_progress_targets,
+    _require_releasable_closure_progress,
     _validate_closure_progress_update,
     _validate_session_closure_detach_replay,
 )
@@ -2348,6 +2349,38 @@ class SQLiteSessionStore(
                     (progress["root_session_id"], progress["plan_id"], payload),
                 )
                 self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def release_session_closure_progress(self, session_id: str, plan_id: str) -> bool:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        plan_id = require_clean_nonblank(plan_id, "plan_id")
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT progress_json FROM cayu_session_closure_progress "
+                    "WHERE root_session_id = ? AND plan_id = ?",
+                    (session_id, plan_id),
+                ).fetchone()
+                if row is None:
+                    self._connection.rollback()
+                    return False
+                progress = json.loads(row[0])
+                parents = {
+                    item["session_id"]: child.parent_session_id
+                    for item in progress["descendants"]
+                    if (child := self._load_unlocked(item["session_id"])) is not None
+                }
+                _require_releasable_closure_progress(progress, parents)
+                self._connection.execute(
+                    "DELETE FROM cayu_session_closure_progress "
+                    "WHERE root_session_id = ? AND plan_id = ?",
+                    (session_id, plan_id),
+                )
+                self._connection.commit()
+                return True
             except BaseException:
                 self._connection.rollback()
                 raise

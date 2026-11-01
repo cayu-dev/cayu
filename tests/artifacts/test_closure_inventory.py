@@ -177,6 +177,11 @@ def test_artifact_closure_identity_byte_bound_is_checked_before_deletion(delta):
 def test_public_closure_revalidates_artifact_inventory_after_initial_inspection():
     class ChangedInventory(_InventoryStore):
         calls = 0
+        # A store that can fence closure, so admission reaches its inventory.
+        supports_session_closure_claims = True
+
+        async def load_session_closure_claim(self, session_id):
+            return None
 
         async def list(self, **kwargs):
             self.calls += 1

@@ -5438,6 +5438,20 @@ class SessionStore(ABC):
         """
         raise NotImplementedError("This SessionStore does not support closure lineage claims.")
 
+    async def release_session_closure_progress(self, session_id: str, plan_id: str) -> bool:
+        """Atomically drop one exact closure's lineage claim if it erased no descendant.
+
+        Return ``True`` when the claim was removed and ``False`` when there was
+        none. Raise ``ValueError`` and keep the claim when its ``completed``
+        descendants are not empty or, read in the same transaction, a planned
+        descendant no longer exists under its planned parent (``completed`` can
+        lag a committed child deletion): that closure must be finished by
+        retrying it.
+        Only an explicit ``CayuApp.release_session_closure`` calls this, to give
+        up a deletion that no process is running.
+        """
+        raise NotImplementedError("This SessionStore does not support closure progress release.")
+
     async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
         """Replace a session's labels (full replacement, not a merge) and return it.
 

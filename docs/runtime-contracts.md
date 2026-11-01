@@ -19871,7 +19871,14 @@ deletion, and permanently rejects later publication to that session. Exact
 replay returns the original set, including already-deleted items; changed plans
 or replacement metadata conflict. Uncertain earlier writes prevent claim
 acquisition. Stores without this capability can provide inventory/export but
-cannot participate in complete artifact erasure.
+cannot participate in complete artifact erasure. When a registered artifact store
+lacks it, closure admission (`validate_session_closure`, `erase_session_closure`,
+`delete_session`) raises `ValueError("Artifact store cannot fence session closure.")`
+before it claims the session's lineage or calls any dependent store, and
+`DELETE /api/sessions/{id}` answers 409 with that message. The session and its
+history stay. An application that registers its own artifact store and deletes
+sessions must therefore implement these claim operations, as `LocalArtifactStore`
+and `S3ArtifactStore` do.
 Inspection represents an existing claim as `artifact_cleanup_claim`: its counts
 describe the original cleanup set, not current artifact existence. Exact-plan
 erasure can resume from that authority without requiring intact live metadata;
@@ -19911,6 +19918,25 @@ ambiguous topology, and incomplete enumeration fail closed. Closure exports
 include descendant dispositions and retained tombstones. The HTTP session
 DELETE route uses this closure boundary and returns conflict when a complete
 closure cannot be proven.
+
+A closure's lineage claim (its progress record) is published before dependent
+stores are claimed, and it fences every other deletion of the claimed sessions,
+including the store's own `delete_session`, until that exact closure finishes. A
+deletion that stopped keeps its claim, so that retrying the same deletion
+finishes the work. To give it up instead, call
+`CayuApp.release_session_closure(session_id, policy=...)` while no deletion of the
+session runs; `policy` names the deletion, and the default is the one
+`delete_session` and `DELETE /api/sessions/{id}` use. It drops the claim of a
+closure that erased no descendant and returns whether there was one. The session
+stays, and so does anything the stopped closure already erased from dependent
+stores; their own claims stay too, so the same deletion can still be retried. A
+closure that already erased a descendant is refused with `ValueError`: every
+planned descendant must still exist under its planned parent, since the saved
+`completed` list can lag a committed child deletion. Custom session stores that
+advertise `supports_session_closure_progress` implement
+`release_session_closure_progress(session_id, plan_id)` atomically with their
+lineage claims, refusing in the same transaction a claim whose `completed` list is
+not empty or one of whose planned descendants is missing or reparented.
 
 Root admission precedes descendant deletion or detachment. Recursive retries
 accept missing descendants only with matching completion receipts and reject

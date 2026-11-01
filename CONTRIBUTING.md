@@ -127,6 +127,12 @@ the foundational backends, not to absorb every vendor SDK.
   before dispatch, and draining the record permits deliberate reuse. Do not infer
   absence from cancellation, timeout, or an
   unavailable read, and do not return an orphan candidate as `ArtifactMetadata`.
+  An artifact store an application registers must also implement session closure
+  claims (`supports_session_closure_claims`, `load_session_closure_claim`,
+  `claim_session_closure` and `delete_session_closure_artifact`) for that
+  application to delete sessions; without them `delete_session` and
+  `DELETE /api/sessions/{id}` refuse with "Artifact store cannot fence session
+  closure." See the artifact erasure contract in `docs/runtime-contracts.md`.
 
   A standalone adapter does not need in-tree placement to be a first-class integration;
   in-tree placement adds maintenance burden without adding capability for its users.

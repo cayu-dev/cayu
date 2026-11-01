@@ -28,6 +28,7 @@ from cayu.sessions._access_rules import runtime_session_mutation, runtime_sessio
 from cayu.sessions._closure_records import (
     _check_closure_lineage_owner,
     _closure_progress_targets,
+    _require_releasable_closure_progress,
     _validate_closure_progress_update,
     _validate_session_closure_detach_replay,
 )
@@ -1788,6 +1789,33 @@ class PostgresSessionStore(
                 "(root_session_id, plan_id, progress_json) VALUES (%s, %s, %s)",
                 (progress["root_session_id"], progress["plan_id"], Jsonb(progress)),
             )
+
+    async def release_session_closure_progress(self, session_id: str, plan_id: str) -> bool:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        plan_id = require_clean_nonblank(plan_id, "plan_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await self._lock_closure_lineage(cur)
+            await cur.execute(
+                "SELECT progress_json FROM cayu_session_closure_progress "
+                "WHERE root_session_id = %s AND plan_id = %s FOR UPDATE",
+                (session_id, plan_id),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return False
+            progress = dict(row[0])
+            await cur.execute(
+                "SELECT id, parent_session_id FROM cayu_sessions WHERE id = ANY(%s) FOR UPDATE",
+                ([item["session_id"] for item in progress["descendants"]],),
+            )
+            _require_releasable_closure_progress(progress, dict(await cur.fetchall()))
+            await cur.execute(
+                "DELETE FROM cayu_session_closure_progress "
+                "WHERE root_session_id = %s AND plan_id = %s",
+                (session_id, plan_id),
+            )
+        return True
 
     async def _require_available_closure_identity(self, cur: Any, session_id: str) -> None:
         for owner in await self._closure_lineage_owners(cur, (session_id,)):

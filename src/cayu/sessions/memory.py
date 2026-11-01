@@ -682,6 +682,22 @@ class InMemorySessionStore(
                 )
             self._session_closure_progress[key] = progress
 
+    async def release_session_closure_progress(self, session_id: str, plan_id: str) -> bool:
+        require_clean_nonblank(session_id, "session_id")
+        require_clean_nonblank(plan_id, "plan_id")
+        async with self._lock:
+            existing = self._session_closure_progress.get((session_id, plan_id))
+            if existing is None:
+                return False
+            parents = {
+                item["session_id"]: child.parent_session_id
+                for item in existing["descendants"]
+                if (child := self._sessions.get(item["session_id"])) is not None
+            }
+            closure_records._require_releasable_closure_progress(existing, parents)
+            del self._session_closure_progress[(session_id, plan_id)]
+            return True
+
     def _require_available_closure_identity_unlocked(self, session_id: str) -> None:
         for owner in self._session_closure_progress.owners((session_id,)):
             closure_records._check_closure_lineage_owner(owner, (session_id,))
