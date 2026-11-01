@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
+from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
@@ -59,6 +61,7 @@ from cayu.deadlines import (
     effective_deadline,
     resumed_execution_deadline,
 )
+from cayu.environments.shared_allocations import AllocationSharingScope, allocation_sharing_scope
 from cayu.events import (
     Event,
     EventType,
@@ -137,6 +140,42 @@ _LIVE_CHILD_STATUSES = {
     SessionStatus.INTERRUPTING,
 }
 _MISSING = object()
+logger = logging.getLogger(__name__)
+# Set only while WorkflowBase.execute drives its own run one step at a time.
+_EXECUTION_CONTEXTS: ContextVar[list[WorkflowContext] | None] = ContextVar(
+    "cayu_workflow_execution_contexts", default=None
+)
+
+
+async def _reporting_contexts(
+    stream: AsyncIterator[Event], contexts: list[WorkflowContext]
+) -> AsyncIterator[Event]:
+    """Drive ``stream`` so every context it builds is reported to ``contexts``.
+
+    The variable is bound only while the producer runs, never across a yield
+    to the consumer, so another execution's contexts never land here.
+    """
+
+    iterator = aiter(stream)
+    try:
+        while True:
+            token = _EXECUTION_CONTEXTS.set(contexts)
+            try:
+                item = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            finally:
+                _EXECUTION_CONTEXTS.reset(token)
+            yield item
+    finally:
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            token = _EXECUTION_CONTEXTS.set(contexts)
+            try:
+                await aclose()
+            finally:
+                _EXECUTION_CONTEXTS.reset(token)
+
 
 JournalFactory = Callable[[WorkflowJournalContext], WorkflowJournal]
 
@@ -178,6 +217,20 @@ class StepRunOptions(BaseModel):
     task_id: str | None = None
     task_worker_id: str | None = None
     task_lease_expires_at: datetime | None = None
+    #: Which sessions share this step's environment allocation. ``None`` keeps
+    #: the environment's registered scope; ``"parent"`` shares one sandbox with
+    #: the workflow run's other ``"parent"`` steps. See
+    #: ``cayu.environments.AllocationSharingScope``.
+    allocation_scope: AllocationSharingScope | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("allocation_scope", mode="before")
+    @classmethod
+    def validate_allocation_scope(cls, value: object) -> AllocationSharingScope | None:
+        if value is None:
+            return None
+        return allocation_sharing_scope(value)
 
     @field_validator("failover", mode="before")
     @classmethod
@@ -577,6 +630,10 @@ class WorkflowContext:
     async def start(self, payload: dict[str, Any] | None = None) -> Event:
         """Journal + return the ``workflow.started`` event. Use ``yield await``."""
         await self._check_fence()
+        # From here this attempt owns the run's shared allocations.
+        self.app._environment_lifecycle.shared_allocations.open_owner(
+            self.session_id, attempt_id=self.attempt_id
+        )
         boundary = await self.execution_deadline()
         boundary.require_admission("workflow_start")
         event = self.event(
@@ -594,10 +651,31 @@ class WorkflowContext:
         await self._append_current_attempt_event(event)
         return event
 
+    async def release_environments(self, *, outcome: str = "completed") -> None:
+        """Release the allocations this run's steps share (copy-back, then disposal).
+
+        ``completed()`` calls it first; call it yourself when the run ends some
+        other way, for example in a ``finally`` around a run that can raise.
+        ``WorkflowBase.execute`` does that for you. Steps that ran with
+        ``allocation_scope="session"`` own their allocations and are unaffected.
+        A superseded attempt raises instead of releasing what the newer one uses.
+        """
+        await self._check_fence(establish=False)
+        await self.app._environment_lifecycle.shared_allocations.end_owner(
+            self.session_id,
+            outcome=require_clean_nonblank(outcome, "outcome"),
+            attempt_id=self.attempt_id,
+        )
+
     async def completed(self, payload: dict[str, Any] | None = None) -> Event:
-        """Journal + return the ``workflow.completed`` event. Use ``yield await``."""
+        """Journal + return the ``workflow.completed`` event. Use ``yield await``.
+
+        Releases the allocations this run's steps share first, so their work
+        reaches the source workspace before the run reports completion.
+        """
         await self._check_fence(establish=False)
         (await self.execution_deadline()).require_admission("workflow_completion")
+        await self.release_environments(outcome="completed")
         event = self.event(
             EventType.WORKFLOW_COMPLETED,
             payload={"workflow": self.workflow_name, **(payload or {})},
@@ -650,11 +728,49 @@ class WorkflowBase(Workflow):
                 raise ValueError("Cannot tighten an existing workflow on resume; create a child.")
             boundary = resumed_execution_deadline(anchor.execution_deadline)
         boundary.require_admission("workflow")
-        async with contextlib.aclosing(
-            deadline_stream(self.run(session_id), boundary, independent_deadline=execution_deadline)
-        ) as stream:
-            async for event in stream:
-                yield event
+        outcome: str | None = "failed"
+        # The contexts this execution's own run builds, so cleanup acts as
+        # this execution's attempt and never as another execution's.
+        contexts: list[WorkflowContext] = []
+        try:
+            async with contextlib.aclosing(
+                deadline_stream(
+                    _reporting_contexts(self.run(session_id), contexts),
+                    boundary,
+                    independent_deadline=execution_deadline,
+                )
+            ) as stream:
+                async for event in stream:
+                    yield event
+            outcome = "completed"
+        except WorkflowSupersededError:
+            # A newer attempt owns the run, and the sandbox its steps use.
+            outcome = None
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            outcome = "interrupted"
+            raise
+        finally:
+            # A run that ended without completed() still releases what its
+            # steps shared; completed() already released the rest.
+            # Release only as the attempt this execution ran, so a newer attempt
+            # that took the run over keeps its sandbox however this one ended.
+            context = next(
+                (built for built in reversed(contexts) if built.session_id == session_id), None
+            )
+            try:
+                if outcome is not None and context is not None:
+                    await self.app._environment_lifecycle.shared_allocations.end_owner(
+                        session_id, outcome=outcome, attempt_id=context.attempt_id
+                    )
+            except Exception:
+                if outcome == "completed":
+                    raise
+                logger.warning(
+                    "Releasing shared environments of workflow run %s failed.",
+                    session_id,
+                    exc_info=True,
+                )
 
     def context(self, session_id: str) -> WorkflowContext:
         """Build the per-run context (and its journal) for one workflow run."""
@@ -671,12 +787,16 @@ class WorkflowBase(Workflow):
             ),
         )
         journal = self._journal_factory(journal_context)
-        return WorkflowContext(
+        context = WorkflowContext(
             app=self.app,
             spec=context_spec,
             session_id=session_id,
             journal=journal,
         )
+        reported = _EXECUTION_CONTEXTS.get()
+        if reported is not None:
+            reported.append(context)
+        return context
 
 
 def _resolve_structured_output(
@@ -1024,6 +1144,15 @@ async def _run_step(
     # A newer workflow attempt should win before either contender mutates the
     # session store, especially when both derive the same durable child id.
     await ctx._check_fence(establish=False)
+    # Steps that share an allocation scope keep it until this workflow run ends.
+    # Claimed with no await after the fence check, so a superseded attempt
+    # can never take ownership back from a newer one.
+    shared_allocations = ctx.app._environment_lifecycle.shared_allocations
+    shared_allocations.open_owner(ctx.session_id, attempt_id=ctx.attempt_id)
+    if opts.allocation_scope is not None:
+        shared_allocations.assign_session_scope(
+            child_session_id, opts.allocation_scope, owner_session_id=ctx.session_id
+        )
     existing_child = await ctx.app.session_store.load(child_session_id)
     if existing_child is not None:
         if generated_child_ownership.is_generated:

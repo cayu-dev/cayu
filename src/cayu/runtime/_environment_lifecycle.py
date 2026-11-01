@@ -209,6 +209,7 @@ from cayu.runtime._retained_environment_end import (
     RetainedEnvironmentEndWatches,
     release_is_retained,
 )
+from cayu.runtime._shared_environment_allocations import SharedEnvironmentAllocations
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
 from cayu.runtime._workspace_observation_keyring import (
     require_materialized_workspace_observation_keyring,
@@ -873,6 +874,7 @@ class EnvironmentLifecycle:
         max_environment_lifecycle_owners: int = DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
         egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
         execution_presence_stopped: Callable[[str, int], Awaitable[None]] | None = None,
+        shared_allocations: SharedEnvironmentAllocations | None = None,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -891,6 +893,14 @@ class EnvironmentLifecycle:
         self._max_environment_lifecycle_owners = max_environment_lifecycle_owners
         self._egress_authority_adoption_handler = egress_authority_adoption_handler
         self._execution_presence_stopped = execution_presence_stopped
+        # Allocations shared by the sessions of one allocation scope. An agent
+        # session owns its scope while its environment is set up here.
+        self.shared_allocations = shared_allocations or SharedEnvironmentAllocations(
+            session_store=session_store
+        )
+        self.shared_allocations.bind_session_presence(
+            lambda session_id: session_id in self._active_environment_setups
+        )
         # Factory results and bound workspaces contain process-local handles
         # that cannot be reconstructed from durable session state. Retain the
         # authoritative owner across async-generator yield boundaries until the
@@ -948,6 +958,8 @@ class EnvironmentLifecycle:
         # The hook holds the owner table, not this lifecycle: an app dropped
         # without aclose() still has its held allocations released at exit.
         setups = self._active_environment_setups
+        # Hold the shared allocation table, not its registry, which reaches the app.
+        shared_runners = self.shared_allocations.held_runners_source()
 
         def held_runners() -> list[Runner]:
             runners: list[Runner] = []
@@ -963,6 +975,7 @@ class EnvironmentLifecycle:
                     runner = getattr(environment, "runner", None)
                     if isinstance(runner, Runner):
                         runners.append(runner)
+            runners.extend(shared_runners())
             return runners
 
         self._exit_hook = held_runners
@@ -3250,6 +3263,13 @@ class EnvironmentLifecycle:
         factory_registration = registered_environment
         factory = registered_environment.factory
         environment_name = registered_environment.spec.name
+        shared_factory = self.shared_allocations.attachment_factory(
+            factory, session=session, environment_name=environment_name
+        )
+        if shared_factory is not None:
+            # A shared-scope session attaches to its scope's allocation; the
+            # scope's owner, not this session, releases it.
+            factory = shared_factory
         base_payload = _environment_factory_base_payload(
             session=session,
             registered_environment=registered_environment,
@@ -6307,7 +6327,7 @@ class EnvironmentLifecycle:
         copies back into that source workspace, so the source must outlive it.
         """
 
-        return any(
+        return self.shared_allocations.binds_source_workspace(workspace_id) or any(
             (bound := owner.registered_environment.bound_workspace) is not None
             and bound.source_workspace is not None
             and bound.source_workspace.id == workspace_id
@@ -6469,12 +6489,14 @@ class EnvironmentLifecycle:
         owns_cleanup = setup_owner is not None and not setup_owner.cleanup_started
         owns_prebind_tombstone = setup_owner is not None and setup_owner.prebind_release_tombstone
         try:
-            return await self._finalize_terminal_event_once(
+            finalized = await self._finalize_terminal_event_once(
                 event=event,
                 session=session,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
             )
+            await self._end_shared_allocation_owner(session, event)
+            return finalized
         except BaseException as exc:
             if owns_cleanup and setup_owner is not None and setup_owner.cleanup_started:
                 setup_owner.cleanup_error = exc
@@ -6503,6 +6525,24 @@ class EnvironmentLifecycle:
             ):
                 del self._active_environment_setups[session.id]
             self._signal_environment_cleanup_state_changed(session.id)
+
+    async def _end_shared_allocation_owner(self, session: Session, event: Event) -> None:
+        """Release the allocations this session's run owned as a shared scope's owner."""
+
+        try:
+            await self.shared_allocations.end_owner(
+                session.id,
+                outcome=_binding_outcome_for_terminal_event(event.type),
+                run_epoch=session.run_epoch,
+            )
+        except Exception as error:
+            # The allocation stays retained for a retry; the session's own
+            # terminal outcome is unaffected.
+            logger.warning(
+                "Releasing shared environment allocations owned by session %s failed (%s).",
+                session.id,
+                type(error).__name__,
+            )
 
     async def _finalize_terminal_event_once(
         self,

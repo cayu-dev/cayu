@@ -1334,6 +1334,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
                     session_id, run_epoch=run_epoch
                 )
             ),
+            shared_allocations=self._environment_registry.shared_allocations,
         )
         self._run_limit_controller = RunLimitController(
             session_store=self._runtime_session_store,
@@ -6284,6 +6285,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         artifact_store: ArtifactStore | None = None,
         default: bool = False,
         settings: Iterable[ManagedSetting] | None = None,
+        allocation_scope: str = "session",
     ) -> EnvironmentFactory:
         declared = self._part_managed_settings(settings, part="environment", name=spec.name)
         registered = self._environment_registry.register_factory(
@@ -6292,6 +6294,7 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
             artifact_store=artifact_store,
             default=default,
             registration_site=_registration_site(),
+            allocation_scope=allocation_scope,
         )
         self._add_managed_settings(declared)
         return registered

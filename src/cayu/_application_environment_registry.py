@@ -23,11 +23,13 @@ from cayu.environments.rebuild import (
     EnvironmentRebuildRecord,
     declared_rebuild_record,
 )
+from cayu.environments.shared_allocations import allocation_sharing_scope
 from cayu.knowledge.base import KnowledgeStore
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._shared_environment_allocations import SharedEnvironmentAllocations
 from cayu.runtime._workspace_observation_keyring import require_workspace_observation_keyring
 from cayu.runtime.execution_identity import copy_execution_profile_behavior_identity
 from cayu.runtime.session_closure import (
@@ -76,6 +78,9 @@ class ApplicationEnvironmentRegistry:
         self._session_closure_external_stores = tuple(session_closure_stores)
         self._knowledge_store = knowledge_store
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
+        # Allocations shared by the sessions of one allocation scope, and each
+        # registration's default scope.
+        self.shared_allocations = SharedEnvironmentAllocations(session_store=session_store)
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
         self._default_environment_name: str | None = None
         self._rebuilders: dict[str, EnvironmentRebuilder] = {}
@@ -185,9 +190,11 @@ class ApplicationEnvironmentRegistry:
         artifact_store: ArtifactStore | None = None,
         default: bool = False,
         registration_site: tuple[str | None, str | None] = (None, None),
+        allocation_scope: str = "session",
     ) -> EnvironmentFactory:
         if not isinstance(default, bool):
             raise TypeError("Environment factory default flag must be a bool.")
+        scope = allocation_sharing_scope(allocation_scope)
         registered_environment, artifact_store_registration, rebuild_record = (
             self._prepare_factory_registration(
                 spec, factory, artifact_store=artifact_store, registration_site=registration_site
@@ -197,6 +204,7 @@ class ApplicationEnvironmentRegistry:
         if name in self._environments:
             raise ValueError(f"Environment already registered: {name}")
         self._publish(registered_environment, artifact_store_registration, default=default)
+        self.shared_allocations.set_default_scope(name, scope)
         if rebuild_record is not None:
             self._rebuild_records[name] = rebuild_record
         return factory
@@ -335,6 +343,7 @@ class ApplicationEnvironmentRegistry:
         if environment_name == self._default_environment_name:
             raise ValueError(f"The default environment cannot be unregistered: {environment_name}")
         del self._environments[environment_name]
+        self.shared_allocations.clear_default_scope(environment_name)
         self._rebuild_records.pop(environment_name, None)
         lock = self._rebuild_locks.get(environment_name)
         if lock is not None and not lock.locked():

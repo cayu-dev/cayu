@@ -13697,6 +13697,19 @@ it cannot execute pending siblings or another model step. Protected external eff
 still require their registered receipt validator through `reconcile_tool_effect`.
 Unconfigured executions retain the existing unbounded behavior.
 
+### Steps that share a sandbox
+
+Each workflow step is its own child session, so by default each gets its own
+factory allocation. `StepRunOptions(allocation_scope="parent")`, or an
+environment registered with `allocation_scope="parent"`, makes the steps of one
+run share one allocation (one Docker container, one brokered sandbox). The run
+owns it: `ctx.completed()` copies the shared work back and disposes of it
+before journaling completion, and `WorkflowBase.execute` does the same with a
+`failed` or `interrupted` outcome when the run raises. Steps that run in
+parallel in one scope share the sandbox concurrently and can race on the same
+files. See "Sharing one allocation across workflow steps and subagents" in
+`docs/environment-factories.md`.
+
 ### Workflow failure evidence
 
 `StepError.evidence` and `StepFailure.evidence` expose public

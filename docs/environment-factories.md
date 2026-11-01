@@ -1113,6 +1113,124 @@ child environment is part of the spawn fingerprint: recovery reconnects the same
 allocation, and a spec whose `environment_name` changed since the spawn fails
 with an identity conflict instead of moving the child.
 
+### Sharing one allocation across workflow steps and subagents
+
+Every session normally gets its own allocation from a factory: its own Docker
+container, its own brokered sandbox. A workflow whose steps hand work over
+through files (a planner's `plan.md` for the solver, a solver's `solution.py`
+for a repair step) can ask for one allocation for the whole run instead. The
+allocation scope says which sessions share one:
+
+| `allocation_scope` | Sessions that share one allocation |
+| --- | --- |
+| `session` (default) | None: each session has its own, as before. |
+| `parent` | A session and its direct children: the steps of one workflow run, or an agent and its subagents. A subagent of a session that is itself attached (a workflow step's subagent) joins that session's allocation. |
+| `causal_budget` | Every session in one causal budget tree, however deep. |
+
+Set it on the registration, or per step through `StepRunOptions`:
+
+```python
+from cayu.workflows import StepRunOptions, step
+
+app.register_environment_factory(
+    EnvironmentSpec(name="sandbox"), factory, default=True, allocation_scope="parent"
+)
+
+# Or leave the registration per session and opt in one step at a time:
+shared = StepRunOptions(allocation_scope="parent")
+await step(ctx, agent="planner", step_id="plan", prompt=task, run_options=shared)
+await step(ctx, agent="solver", step_id="solve", prompt=task, run_options=shared)
+yield await ctx.completed()
+```
+
+A step's value overrides the registration for that step's session. Only the
+application chooses the scope: run, session and subagent metadata can't set
+it, so a model can't opt a session into a shared sandbox or out of one.
+
+How it works:
+
+- The runtime resolves the scope once, before it calls the factory, so every
+  factory gets it without changes. The first session of a scope gets the
+  allocation from the factory's ordinary `create()`, under a request whose
+  `session_id` is the scope's owner (the workflow run id for `parent` steps)
+  plus a fresh `.shared-<hex>` suffix, and whose `process_local_owner` names
+  this process. Docker coding and the brokered sandbox key their allocation
+  off that `session_id`, so it is one container or one sandbox per scope,
+  and a run resumed in another process never reattaches one a crashed
+  process left behind. In the same process, a retry after a failed creation
+  asks for the same identity, so it adopts or cleans up what the failed
+  attempt left. The factory's own binding then copies the source in
+  once.
+- Every session of the scope, the first one included, attaches to that live
+  allocation: its tools run on the same runner and see the same workspace,
+  including files the previous step left and anything it installed. A
+  session ending only detaches; it never copies back or tears the sandbox
+  down.
+- The scope's owner releases the allocation through the factory's binding
+  (copy-back with the owner's outcome, then disposal). A workflow run
+  releases it in `ctx.completed()`, before journaling completion, so the
+  steps' work is in the source workspace when the run reports completion;
+  `WorkflowBase.execute` releases it with `failed` or `interrupted` when the
+  run raises, but only as the attempt it ran: once a newer attempt of the
+  same run has started, an older one ending (however it ends) leaves the
+  newer one's sandbox alone. `ctx.release_environments()` does it by hand.
+  An agent session
+  that owns a scope releases it when its run reaches its terminal event. If
+  sessions are still attached, the release waits for the last to detach.
+  An agent session publishes its success before that release, so a failed
+  copy-back couldn't fail it: an environment whose binding must copy work
+  back for a completed session to count (the brokered sandbox, or a
+  `SyncBinding` that syncs back, as Docker coding's does) shares only under a
+  workflow run. An agent-owned scope of one fails the session's setup with an
+  error and discards the allocation.
+- A failed release (a copy-back conflict, say) raises and keeps the
+  allocation for another try. So does a failed discard, including one after a
+  creation whose copy-in failed: the allocation stays owned until a discard
+  succeeds, and the owner's end or the next close retries it. `close_idle_environment_resources()`, which
+  application shutdown calls, releases whatever is left within its
+  `timeout_s` and discards an allocation whose release fails, so nothing
+  outlives the app. A release or discard still running at the timeout isn't
+  cancelled; the call returns `False` and a later call waits for that same
+  task.
+- Later sessions of a scope never reach the factory, so the first session's
+  grant has to be the factory's fixed configuration. Sharing is refused for a
+  factory with a dynamic secret scope, or whose result has a vault, a
+  credential proxy, MCP servers, or an artifact store, knowledge store or
+  knowledge scope other than the factory's configured one. Docker coding and the brokered sandbox qualify.
+- Each attaching session is still admitted against the live runner's
+  evidence with its own execution requirements. The first session's request
+  shapes the allocation (its network and image, for example); a later
+  session whose requirements the runner can't meet is refused, not given a
+  new sandbox.
+
+Limits of this first version:
+
+- Ownership is process-local. The shared allocation is not in any session's
+  durable allocation records, and the steps must run in the process that runs
+  the workflow (or the owning agent session). An agent session counts as a
+  running owner while its own environment is set up in this process, so a
+  parent without an environment can't own a scope for its subagents. A
+  session whose scope owner isn't running in this process, or has already
+  ended, fails with a clear
+  error instead of creating an allocation nothing would release. After a
+  crash a resumed run starts a fresh shared allocation; work that was only in
+  the old one is lost. The old one does not leak: Docker coding labels its
+  container with the process-local owner, and since no later process asks
+  for that container's name again, `reap_orphaned_docker_coding_containers`
+  can remove it safely once the process is gone, and a brokered sandbox's lease lapses when nothing renews it.
+- Steps that run at the same time in one scope (for example under
+  `parallel`) work in the same sandbox at the same time. Cayu doesn't
+  serialize their writes, and their bindings report no writer isolation; two
+  steps writing the same files race. Keep such steps on separate paths, run
+  them in sequence, or give them `allocation_scope="session"`.
+- Forked sessions, deferred-materialization factories and factories that
+  declare an egress authority don't share; the last two fail with an error
+  when asked to. A fork keeps its source's causal budget, but its own
+  subagents' `causal_budget` scope stops at the fork, so they never join the
+  source's allocation.
+- `unregister_environment` refuses an environment while a shared allocation
+  of it is live or being released.
+
 ### Per-job environments
 
 Some applications register an environment for each job, for example a factory

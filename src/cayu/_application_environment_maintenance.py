@@ -104,8 +104,23 @@ async def release_idle_environment_resources(
     one still running at the deadline stays owned in ``releases`` (the result
     is False), and a later call waits for that same task instead of starting
     another. A close requested while a trim is still running runs after it.
+    A close also releases every allocation sessions still share, first.
     """
 
+    shared_released = await registry.shared_allocations.close(deadline=deadline) if close else True
+    released = await _release_idle_factory_resources(
+        registry, releases, close=close, deadline=deadline
+    )
+    return shared_released and released
+
+
+async def _release_idle_factory_resources(
+    registry: ApplicationEnvironmentRegistry,
+    releases: dict[str, tuple[bool, asyncio.Task[None]]],
+    *,
+    close: bool,
+    deadline: float,
+) -> bool:
     loop = asyncio.get_running_loop()
     # A factory a recovery rebuilt for itself serves no later session, so its
     # idle resources are closed (not just trimmed) and it is then forgotten.
@@ -295,6 +310,12 @@ async def unregister_application_environment(app: CayuApp, name: str) -> None:
             environment_name,
             "in_process_work",
             "a session started setup in it while it was being unregistered",
+        )
+    if app._environment_lifecycle.shared_allocations.holds_environment(environment_name):
+        raise EnvironmentInUse(
+            environment_name,
+            "in_process_work",
+            "a shared allocation of it is still live or being released",
         )
     # A drain or close may have started a release while the store was read.
     _refuse_while_idle_release_runs(app, environment_name)
