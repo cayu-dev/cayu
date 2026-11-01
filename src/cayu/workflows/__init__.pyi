@@ -26,6 +26,7 @@ from cayu.workflows.models import ParallelStepError as ParallelStepError
 from cayu.workflows.models import StepError as StepError
 from cayu.workflows.models import StepFailure as StepFailure
 from cayu.workflows.models import StepResult as StepResult
+from cayu.workflows.models import StepUsage as StepUsage
 from cayu.workflows.models import normalize_gate_outcome as normalize_gate_outcome
 from cayu.workflows.workflow import JournalFactory as JournalFactory
 from cayu.workflows.workflow import StepRunOptions as StepRunOptions

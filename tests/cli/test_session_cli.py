@@ -533,7 +533,7 @@ def test_session_commands_render_successful_explicit_tables(
     commands = (
         (["list"], "id"),
         (["show", "sess_table"], "field"),
-        (["usage", "sess_table"], "sequence"),
+        (["usage", "sess_table"], "finish_reason"),
         (["tools", "sess_table"], "tool_call_id"),
         (["events", "sess_table"], "timestamp"),
         (["transcript", "sess_table"], "content_kinds"),
@@ -1303,6 +1303,11 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
                     timestamp=started_at + timedelta(seconds=1),
                     payload={
                         "transcript_cursor": 3,
+                        "completion": {
+                            "finish_reason": "length",
+                            "raw_finish_reason": "max_tokens",
+                            "status": "completed",
+                        },
                         "usage_metrics": {
                             "provider_name": "fake",
                             "requested_model": "requested-model",
@@ -1433,6 +1438,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
     assert first["provider"] == "fake"
     assert first["requested_model"] == "requested-model"
     assert first["resolved_model"] == "resolved-model"
+    assert (first["finish_reason"], first["raw_finish_reason"]) == ("length", "max_tokens")
     assert first["transcript_cursor"] == 3
     assert first["pricing_state"] == "unknown"
     assert first["ledger"] == []
@@ -1468,6 +1474,8 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
     second_payload = json.loads(capsys.readouterr().out)
     second = second_payload["calls"][0]
     assert second["input_tokens"] == 1
+    # A call recorded without completion details has no finish reason to show.
+    assert (second["finish_reason"], second["raw_finish_reason"]) == (None, None)
     assert second["pricing_state"] == "unknown"
     assert second["ledger"] == []
     assert second_payload["unmatched_ledger"][0] == {

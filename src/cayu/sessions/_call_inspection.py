@@ -254,6 +254,7 @@ def model_call_usage(
                 "provider": None if metrics is None else metrics.provider_name,
                 "requested_model": None if metrics is None else metrics.requested_model,
                 "resolved_model": None if metrics is None else metrics.model,
+                **_finish_reasons(event.payload.get("completion")),
                 "input_tokens": None if metrics is None else metrics.input_tokens,
                 "output_tokens": None if metrics is None else metrics.output_tokens,
                 "total_tokens": None if metrics is None else metrics.total_tokens,
@@ -1162,6 +1163,13 @@ def usage_inspection_record(record: EventRecord, pricer: CallPricer | None = Non
         transcript_cursor = event.payload.get("transcript_cursor")
         if transcript_cursor is not None:
             payload["transcript_cursor"] = transcript_cursor
+        completion = event.payload.get("completion")
+        if type(completion) is dict:
+            payload["completion"] = {
+                key: completion[key]
+                for key in ("finish_reason", "raw_finish_reason")
+                if key in completion
+            }
         try:
             metrics = summary_usage_metrics_from_event_payload(event.payload)
         except (TypeError, ValueError):
@@ -1314,6 +1322,16 @@ def tool_inspection_record(
 
 def _optional_string(value: object) -> str | None:
     return value if type(value) is str else None
+
+
+def _finish_reasons(completion: object) -> dict[str, str | None]:
+    """Why one model call ended: the normalized reason and the provider's own value."""
+
+    fields = cast("dict[str, object]", completion) if type(completion) is dict else {}
+    return {
+        "finish_reason": _optional_string(fields.get("finish_reason")),
+        "raw_finish_reason": _optional_string(fields.get("raw_finish_reason")),
+    }
 
 
 def _optional_nonnegative_int(value: object) -> int | None:

@@ -1384,6 +1384,7 @@ def _render_usage(
             "provider",
             "requested_model",
             "resolved_model",
+            "finish_reason",
             "input_tokens",
             "output_tokens",
             "total_tokens",

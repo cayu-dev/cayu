@@ -326,6 +326,16 @@ observe or gate documented phases. Keep orchestration state explicit and use
 `workflow_tool_names` when instructions depend on exact registered tool names;
 `cayu check` validates that structural contract.
 
+`step(...)` returns a `StepResult` with the child's `session_id`, final `text`
+and validated `output`, plus how the step's model calls went: `finish_reason`
+(a `ModelFinishReason` from the final call, such as `LENGTH` when the reply was
+cut at the output cap), the provider's `raw_finish_reason`, and `usage`, a
+`StepUsage` summing input, output, reasoning, cached-input and total tokens and
+counting `model_calls` (plus `unmeasured_model_calls` that reported no usage).
+Branch on these instead of reading the child's `model.completed` events. A step
+replayed from the journal on resume rebuilds the same values from the child
+session.
+
 ## subagents
 
 `SubagentTool` delegates model work to a child session with explicit context

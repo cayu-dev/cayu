@@ -1723,6 +1723,12 @@ export type ApiSessionModelCall = {
      */
     cost_state?: 'priced' | 'unpriced' | null;
     /**
+     * Finish Reason
+     *
+     * Why the call ended, normalized: stop, tool_calls, length, content_filter, error or unknown.
+     */
+    finish_reason?: string | null;
+    /**
      * Input Tokens
      */
     input_tokens: number | null;
@@ -1742,6 +1748,12 @@ export type ApiSessionModelCall = {
      * Provider
      */
     provider: string | null;
+    /**
+     * Raw Finish Reason
+     *
+     * The provider's own finish reason, when it reported one.
+     */
+    raw_finish_reason?: string | null;
     /**
      * Reasoning Tokens
      */

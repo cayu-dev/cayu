@@ -538,6 +538,16 @@ as free.
 For a Cloud Agent the CLI sends the price book with the request, so the Agent prices with
 the same book; an Agent whose Cayu predates priced usage returns its calls without cost.
 
+### Why a call ended
+
+Each `session usage` call row carries `finish_reason`, the normalized reason the model
+call ended (`stop`, `tool_calls`, `length`, `content_filter`, `error` or `unknown`), and
+`raw_finish_reason`, the provider's own value (for example `max_tokens`). The table shows
+`finish_reason`; JSON and JSONL carry both. A `length` call was cut at the output cap. Both
+are `null` for a call recorded without completion details. A Cloud Agent whose Cayu
+predates these fields doesn't send them, so its JSON and JSONL rows have no
+`finish_reason` or `raw_finish_reason` keys and the table shows `-`.
+
 ### Workflow runs
 
 `cayu session workflow SESSION_ID` shows one workflow run as a whole. `SESSION_ID` is the

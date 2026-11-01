@@ -3236,6 +3236,18 @@
           "description": "Null unless the request carried a price book.",
           "title": "Cost State"
         },
+        "finish_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the call ended, normalized: stop, tool_calls, length, content_filter, error or unknown.",
+          "title": "Finish Reason"
+        },
         "input_tokens": {
           "anyOf": [
             {
@@ -3279,6 +3291,18 @@
             }
           ],
           "title": "Provider"
+        },
+        "raw_finish_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The provider's own finish reason, when it reported one.",
+          "title": "Raw Finish Reason"
         },
         "reasoning_tokens": {
           "anyOf": [

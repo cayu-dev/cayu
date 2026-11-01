@@ -7,16 +7,47 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cayu.failure_evidence import FailureEvidence, exception_evidence
+from cayu.providers.base import ModelFinishReason
+
+
+@dataclass(frozen=True, slots=True)
+class StepUsage:
+    """Token usage summed over the model calls of one ``step``.
+
+    Counts come from the child session's ``model.completed`` events for the run
+    that completed the step. ``model_calls`` counts every completed model call,
+    including context compaction; ``unmeasured_model_calls`` counts calls whose
+    provider reported no usable usage, so the token totals undercount by them.
+    ``cached_input_tokens`` is the part of ``input_tokens`` the provider served
+    from its prompt cache.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cached_input_tokens: int = 0
+    total_tokens: int = 0
+    model_calls: int = 0
+    unmeasured_model_calls: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class StepResult:
-    """Outcome of one successful ``step``."""
+    """Outcome of one successful ``step``.
+
+    ``finish_reason`` is the normalized reason the step's final model call ended
+    (for example ``ModelFinishReason.LENGTH`` when the reply hit the output cap),
+    and ``raw_finish_reason`` is the provider's own value. Both are ``None`` when
+    the child recorded no model call. ``usage`` sums the step's model calls.
+    """
 
     step_id: str
     session_id: str
     text: str = ""
     output: Any = None
+    finish_reason: ModelFinishReason | None = None
+    raw_finish_reason: str | None = None
+    usage: StepUsage = field(default_factory=StepUsage)
 
     @property
     def has_output(self) -> bool:

@@ -33,8 +33,14 @@ from cayu._validation import (
     require_clean_nonblank,
 )
 from cayu.applications import CayuApp
+from cayu.budgets.aggregates import summary_usage_metrics_from_event_payload
 from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
 from cayu.budgets.run_limits import RunLimits, copy_run_limits
+from cayu.budgets.usage import (
+    ModelCompletionPurpose,
+    add_aggregate_usage,
+    build_aggregate_usage_metrics,
+)
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -66,6 +72,7 @@ from cayu.failure_evidence import (
     retain_child_failure_identity,
 )
 from cayu.messages import Message, MessageRole, TextPart, ToolCallPart
+from cayu.providers.base import ModelFinishReason
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
@@ -117,6 +124,7 @@ from cayu.workflows.models import (
     StepError,
     StepFailure,
     StepResult,
+    StepUsage,
     normalize_gate_outcome,
 )
 
@@ -270,9 +278,70 @@ class _StepRunEventState:
         self.interrupted: str | None = None
         self.evidence = FailureEvidence()
         self.run_epoch: int | None = None
+        self._reset_model_calls()
+
+    def _reset_model_calls(self) -> None:
+        self.finish_reason: ModelFinishReason | None = None
+        self.raw_finish_reason: str | None = None
+        self.usage = build_aggregate_usage_metrics()
+        self.model_calls = 0
+        self.unmeasured_model_calls = 0
+
+    def _record_model_completed(self, payload: dict[str, Any]) -> None:
+        self.model_calls += 1
+        try:
+            metrics = summary_usage_metrics_from_event_payload(payload)
+        except (TypeError, ValueError):
+            metrics = None
+        if metrics is None:
+            self.unmeasured_model_calls += 1
+        else:
+            self.usage = add_aggregate_usage(self.usage, metrics)
+        if payload.get("purpose") == ModelCompletionPurpose.CONTEXT_COMPACTION.value:
+            # A compaction summary is not the step's answer; its tokens still count.
+            return
+        completion = payload.get("completion")
+        completion = completion if type(completion) is dict else {}
+        raw_finish_reason = completion.get("raw_finish_reason")
+        self.raw_finish_reason = raw_finish_reason if type(raw_finish_reason) is str else None
+        finish_reason = completion.get("finish_reason")
+        if type(finish_reason) is not str:
+            # Completions recorded before finish reasons were durable carry none.
+            self.finish_reason = None
+            return
+        try:
+            self.finish_reason = ModelFinishReason(finish_reason)
+        except ValueError:
+            self.finish_reason = ModelFinishReason.UNKNOWN
+
+    def step_usage(self) -> StepUsage:
+        return StepUsage(
+            input_tokens=self.usage.input_tokens,
+            output_tokens=self.usage.output_tokens,
+            reasoning_tokens=self.usage.reasoning_output_tokens,
+            cached_input_tokens=self.usage.cache.cached_input_tokens,
+            total_tokens=self.usage.total_tokens,
+            model_calls=self.model_calls,
+            unmeasured_model_calls=self.unmeasured_model_calls,
+        )
+
+    def step_result(self, *, step_id: str, session_id: str, output: Any) -> StepResult:
+        return StepResult(
+            step_id=step_id,
+            session_id=session_id,
+            text=self.final_text,
+            output=output,
+            finish_reason=self.finish_reason,
+            raw_finish_reason=self.raw_finish_reason,
+            usage=self.step_usage(),
+        )
 
     def record(self, event: Event) -> None:
         event_type = event.type
+        if event_type == EventType.SESSION_STARTED:
+            # Each run of the child starts the step's model calls afresh; a
+            # resume or recovery of that run (session.resumed) keeps adding to it.
+            self._reset_model_calls()
         if event_type in {EventType.SESSION_STARTED, EventType.SESSION_RESUMED}:
             epoch = event.payload.get("run_epoch")
             self.run_epoch = epoch if type(epoch) is int and epoch >= 0 else None
@@ -300,6 +369,7 @@ class _StepRunEventState:
             self.text_buffer.append(str(event.payload.get("delta", "")))
         elif event_type == EventType.MODEL_COMPLETED:
             self.final_text = "".join(self.text_buffer)
+            self._record_model_completed(event.payload)
         elif event_type == EventType.STRUCTURED_OUTPUT_VALIDATED:
             self.output = event.payload.get("output")
             self.output_validated = True
@@ -1409,12 +1479,7 @@ async def _run_step(
         )
     else:
         output = state.output
-    result = StepResult(
-        step_id=step_id,
-        session_id=child_session_id,
-        text=state.final_text,
-        output=output,
-    )
+    result = state.step_result(step_id=step_id, session_id=child_session_id, output=output)
     await _append_step_completed(ctx, agent, result)
     return result
 
@@ -1527,12 +1592,7 @@ async def _step_result_from_completed_child(
             step_id=step_id,
             session_id=child_session_id,
         )
-    return StepResult(
-        step_id=step_id,
-        session_id=child_session_id,
-        text=state.final_text,
-        output=output,
-    )
+    return state.step_result(step_id=step_id, session_id=child_session_id, output=output)
 
 
 async def _resolve_structured_step_output(

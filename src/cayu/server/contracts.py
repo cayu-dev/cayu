@@ -3080,6 +3080,14 @@ class ApiSessionModelCall(ApiBaseModel):
     provider: str | None
     requested_model: str | None
     resolved_model: str | None
+    finish_reason: str | None = Field(
+        default=None,
+        description="Why the call ended, normalized: stop, tool_calls, length, "
+        "content_filter, error or unknown.",
+    )
+    raw_finish_reason: str | None = Field(
+        default=None, description="The provider's own finish reason, when it reported one."
+    )
     input_tokens: StrictInt | None
     output_tokens: StrictInt | None
     total_tokens: StrictInt | None

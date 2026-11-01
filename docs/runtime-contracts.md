@@ -8802,6 +8802,17 @@ loaded as step output, or recovered, so a concurrent foreign identity winner
 remains untouched. Session stores must preserve runtime-owned session metadata
 on create and user-metadata replacement for this readback boundary.
 
+A replayed step's `StepResult` is rebuilt from the completed child session's
+durable events, not from the journal record, so `text`, `output`,
+`finish_reason`, `raw_finish_reason` and `usage` match what the original
+attempt returned. `workflow.step.completed` still records only the step id,
+child session id and `has_output`; journal entries written before these
+`StepResult` fields existed replay unchanged. `usage` sums the
+`model.completed` events of the child's latest run (from its last
+`session.started`, across any `session.resumed`), compaction calls included;
+`finish_reason` comes from the last non-compaction call. A completion recorded
+without a finish reason yields `None`, and an unrecognized one `UNKNOWN`.
+
 `gated_loop` journal identities use the fixed-size `gated-loop:v2:` form derived
 from the canonical `(loop_name, item_key)` tuple. Delimiters, Unicode, and long
 keys therefore cannot make distinct tuples share the old concatenated identity.

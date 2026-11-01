@@ -281,6 +281,8 @@ def test_cloud_agent_reads_match_the_local_store(agent, capsys, argv) -> None:
 
     assert remote == local
     assert remote.get("calls") or remote.get("messages")
+    if argv == ("usage", _SESSION):
+        assert [call["finish_reason"] for call in remote["calls"]] == ["tool_calls", "stop"]
 
 
 def test_cloud_usage_pairs_reservations_on_the_agent_without_publishing_them(
