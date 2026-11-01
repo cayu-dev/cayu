@@ -346,12 +346,37 @@ def test_delegated_pending_read_is_fenced_after_materialization(
     )
 
 
-async def _delegated_replacement_scenario(case, monkeypatch, depth, consumer, change):
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("depth", [1, 2])
+def test_concurrent_overview_reads_never_adopt_a_replacement_childs_wait(
+    session_store_case, monkeypatch, depth
+):
+    asyncio.run(
+        _delegated_replacement_scenario(
+            session_store_case, monkeypatch, depth, "cloud", "replace_before", ordered=False
+        )
+    )
+
+
+async def _delegated_replacement_scenario(
+    case, monkeypatch, depth, consumer, change, *, ordered=True
+):
     from tests.core.test_cloud_reporting import ANSWER, REVIEWER, _pending
     from tests.server.test_cloud_reader_http import TOKEN, _bearer, _digest
 
     from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest, UserInputResponse
     from cayu.server.cloud_reporting import CLOUD_READER_TOKEN_SHA256_VARIABLE
+
+    if ordered:
+        # The barrier below must catch the root's walk down its delegated chain.
+        # A page reads its sessions concurrently, which would let it catch another
+        # session's read of the same child instead, so this scripted interleaving
+        # reads them one at a time.
+        async def in_turn(calls, *, limit=1):
+            return [await call() for call in calls]
+
+        monkeypatch.setattr("cayu.sessions.overview.gather_in_order", in_turn)
+        monkeypatch.setattr("cayu.server._session_overview.gather_in_order", in_turn)
     from cayu.sessions.overview import SessionOverviewReader
 
     monkeypatch.setenv(CLOUD_READER_TOKEN_SHA256_VARIABLE, _digest(TOKEN))
@@ -435,7 +460,12 @@ async def _delegated_replacement_scenario(case, monkeypatch, depth, consumer, ch
             if consumer == "cloud":
                 assert response.status_code == 200, response.text
                 root = next(row for row in response.json()["runs"] if row["session_id"] == "root")
-                assert root["status"] == ("waiting_approval" if change == "same" else "running")
+                if ordered:
+                    assert root["status"] == ("waiting_approval" if change == "same" else "running")
+                else:
+                    # Concurrent reads may see the old child before or after its
+                    # replacement, but never its replacement's question.
+                    assert root["status"] in {"waiting_approval", "running"}
             elif change != "same":
                 assert response.status_code == 503, response.text
                 assert "total_count" not in response.json() and "overviews" not in response.json()

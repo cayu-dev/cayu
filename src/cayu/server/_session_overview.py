@@ -47,6 +47,7 @@ from cayu.sessions.overview import (
     SessionOverviewReader,
     SessionOverviewStatus,
     SessionOverviewUnavailable,
+    gather_in_order,
 )
 from cayu.sessions.queries import SessionAggregateFilter, SessionOrder, SessionQuery
 from cayu.sessions.records import Session
@@ -80,8 +81,7 @@ class SessionOverviewService:
         selection = SessionOverviewSelection() if selection is None else selection
         expected = {session.id: session.instance_id for session in sessions}
         facts = await SessionOverviewReader(self.store, pricing=self.pricing).read(tuple(expected))
-        kept: list[Session] = []
-        result: list[SessionOverviewResponse] = []
+        selected: list[SessionOverviewFacts] = []
         for fact in facts:
             session = fact.session
             if session.instance_id != expected.get(session.id):
@@ -94,6 +94,10 @@ class SessionOverviewService:
                 raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
             if selection.states and fact.status not in selection.states:
                 continue
+            selected.append(fact)
+
+        async def enrich(fact: SessionOverviewFacts) -> SessionOverviewResponse | None:
+            session = fact.session
             try:
                 uses = SessionOverviewUses(
                     browser=await self._uses_browser(session),
@@ -103,13 +107,21 @@ class SessionOverviewService:
             except KeyError:
                 current = await self.store.load(session.id)
                 if current is None or current.instance_id != session.instance_id:
-                    continue
+                    return None
                 raise
             current = await self.store.load(session.id)
             if current is None or current.instance_id != session.instance_id:
-                continue
-            result.append(self._project(fact, uses))
-            kept.append(session)
+                return None
+            return self._project(fact, uses)
+
+        # Each session's reads stay in order; only different sessions overlap.
+        projected = await gather_in_order([lambda fact=fact: enrich(fact) for fact in selected])
+        kept: list[Session] = []
+        result: list[SessionOverviewResponse] = []
+        for fact, overview in zip(selected, projected, strict=True):
+            if overview is not None:
+                result.append(overview)
+                kept.append(fact.session)
         return kept, result
 
     async def _uses_browser(self, session: Session) -> bool:

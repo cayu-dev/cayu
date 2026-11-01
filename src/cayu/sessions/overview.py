@@ -6,11 +6,13 @@ its callers; neither the application facade nor a server is a dependency here.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import Field, model_validator
 
@@ -59,6 +61,39 @@ if TYPE_CHECKING:
 _PENDING_ACTION_STATUSES = frozenset(
     {SessionStatus.INTERRUPTED, SessionStatus.FAILED, SessionStatus.COMPLETED}
 )
+
+# How many sessions of one overview page are read at once. Each session's read is
+# a short sequence of store round trips, so a page costs about (sessions / this)
+# sequences instead of one per session in turn. It stays below the default
+# PostgreSQL pool of 5 so an open dashboard can't hold every connection.
+OVERVIEW_READ_CONCURRENCY = 4
+
+_T = TypeVar("_T")
+
+
+async def gather_in_order(
+    calls: Iterable[Callable[[], Awaitable[_T]]], *, limit: int = OVERVIEW_READ_CONCURRENCY
+) -> list[_T]:
+    """Run the calls at most ``limit`` at a time and return their results in call order.
+
+    The first failure is raised as it is, not wrapped in an ExceptionGroup, after
+    the calls still running are cancelled and have finished.
+    """
+
+    semaphore = asyncio.Semaphore(limit)
+
+    async def bounded(call: Callable[[], Awaitable[_T]]) -> _T:
+        async with semaphore:
+            return await call()
+
+    tasks = [asyncio.ensure_future(bounded(call)) for call in calls]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 class SessionOverviewStatus(StrEnum):
@@ -163,11 +198,40 @@ class SessionOverviewReader:
         self._store = store
         self._pricing = pricing
         self._loaded: dict[str, Session | None] = {}
+        self._loading: dict[str, asyncio.Future[Session | None]] = {}
+        self._load_waiters: dict[asyncio.Future[Session | None], int] = {}
 
     async def _load(self, session_id: str) -> Session | None:
-        if session_id not in self._loaded:
-            self._loaded[session_id] = await self._store.load(session_id)
-        return self._loaded[session_id]
+        # A page's sessions are summarized concurrently. Concurrent loads of one
+        # session (a parent shared by its children) share one read, so every
+        # summary on the page sees the same snapshot of it.
+        if session_id in self._loaded:
+            return self._loaded[session_id]
+        pending = self._loading.get(session_id)
+        if pending is None:
+            pending = asyncio.ensure_future(self._store.load(session_id))
+            # Retrieve the outcome here too, so a read that a cancelled page no
+            # longer awaits never logs an unretrieved exception.
+            pending.add_done_callback(lambda done: done.cancelled() or done.exception())
+            self._loading[session_id] = pending
+        self._load_waiters[pending] = self._load_waiters.get(pending, 0) + 1
+        try:
+            session = await asyncio.shield(pending)
+        finally:
+            remaining = self._load_waiters[pending] - 1
+            if remaining:
+                self._load_waiters[pending] = remaining
+            else:
+                del self._load_waiters[pending]
+                if self._loading.get(session_id) is pending:
+                    del self._loading[session_id]
+                # Shielding protects other readers of this shared load. Once
+                # the last reader leaves, it owns cancelling and draining it.
+                if not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+        self._loaded[session_id] = session
+        return session
 
     async def affected_by(self, session_id: str) -> list[str]:
         """The session and the sessions above it whose summaries a change in it can alter.
@@ -213,11 +277,10 @@ class SessionOverviewReader:
         """
 
         self._loaded.clear()
-        sessions = [
-            session
-            for session_id in session_ids
-            if (session := await self._load(session_id)) is not None
-        ]
+        loaded = await gather_in_order(
+            [lambda session_id=session_id: self._load(session_id) for session_id in session_ids]
+        )
+        sessions = [session for session in loaded if session is not None]
         if not sessions:
             return ()
         query = EventQuery(session_ids=tuple(session.id for session in sessions))
@@ -231,8 +294,8 @@ class SessionOverviewReader:
         cost_by_session = (
             {} if cost is None else {totals.session_id: totals for totals in cost.session_totals}
         )
-        runs = []
-        for session in sessions:
+
+        async def summarize(session: Session) -> SessionOverviewFacts | None:
             run = await self._run(
                 session, usage_by_session.get(session.id), cost_by_session.get(session.id)
             )
@@ -244,8 +307,13 @@ class SessionOverviewReader:
                 and current is not None
                 and current.instance_id == session.instance_id
             ):
-                runs.append(run)
-        return tuple(runs)
+                return run
+            return None
+
+        runs = await gather_in_order(
+            [lambda session=session: summarize(session) for session in sessions]
+        )
+        return tuple(run for run in runs if run is not None)
 
     async def counts(
         self,
