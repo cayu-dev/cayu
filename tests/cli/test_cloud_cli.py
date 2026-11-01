@@ -325,10 +325,10 @@ def test_cloud_env_secret_reads_value_from_file_and_never_returns_it(tmp_path: P
     result = cloud_cli._environment(
         SimpleNamespace(
             application="Voice Agent",
-            assignment="VAPI_API_KEY",
+            assignments=["VAPI_API_KEY"],
             environment_command="set",
             secret=True,
-            value_file=value_file,
+            value_file=[value_file],
         ),
         client=client,
     )
@@ -371,7 +371,7 @@ def test_cloud_env_plain_assignment_list_and_unset_use_agent_scope() -> None:
     set_result = cloud_cli._environment(
         SimpleNamespace(
             application="app_voice",
-            assignment="MODE=demo",
+            assignments=["MODE=demo"],
             environment_command="set",
             secret=False,
             value_file=None,
@@ -386,7 +386,7 @@ def test_cloud_env_plain_assignment_list_and_unset_use_agent_scope() -> None:
         SimpleNamespace(
             application="app_voice",
             environment_command="unset",
-            name="MODE",
+            names=["MODE"],
         ),
         client=client,
     )
@@ -412,10 +412,234 @@ def test_cloud_env_rejects_secret_material_in_argv() -> None:
         cloud_cli._environment(
             SimpleNamespace(
                 application="app_voice",
-                assignment="VAPI_API_KEY=private",
+                assignments=["VAPI_API_KEY=private"],
                 environment_command="set",
                 secret=True,
                 value_file=None,
+            ),
+            client=object(),
+        )
+
+
+class _EnvironmentClient:
+    """Records Cloud requests; answers a batch change, or refuses it like an older Cloud."""
+
+    def __init__(self, *, batch_route: bool = True) -> None:
+        self.batch_route = batch_route
+        self.requests: list[tuple[str, str, dict[str, object]]] = []
+
+    def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+        self.requests.append((method, path, kwargs))
+        if path == "/v1/applications":
+            return {"items": [{"id": "app_voice", "name": "Voice Agent"}]}
+        if method == "PATCH" and not self.batch_route:
+            raise CloudApiError(
+                "api_request_rejected", "Cayu Cloud API returned HTTP 405.", status_code=405
+            )
+        if method == "PATCH":
+            change = kwargs["payload"]
+            assert isinstance(change, dict)
+            return {
+                "configuration": [
+                    {"name": name, "secret": item["secret"], "value": None}
+                    for name, item in sorted(change.get("set", {}).items())
+                ],
+                "unset": sorted(change.get("unset", [])),
+                "service": {"status": "deploying"},
+            }
+        return {"configuration": None, "service": {"status": "deploying"}}
+
+    def changes(self) -> list[tuple[str, str, dict[str, object]]]:
+        return [request for request in self.requests if request[1] != "/v1/applications"]
+
+
+def test_cloud_env_set_sends_several_values_and_secret_files_as_one_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    key_file = tmp_path / "model-key"
+    key_file.write_text("private-model-key\n")
+    client = _EnvironmentClient()
+    monkeypatch.setattr(cloud_cli, "_cloud_client", lambda *_args, **_kwargs: client)
+    monkeypatch.setattr("sys.stdin", io.StringIO("private-webhook-secret\n"))
+
+    assert (
+        main(
+            [
+                "cloud",
+                "env",
+                "set",
+                "MODEL_ENDPOINT=https://models.example.test/v1",
+                "MODEL_API_KEY",
+                "MODEL_PROVIDER=openai",
+                "WEBHOOK_SECRET",
+                "--secret",
+                "--value-file",
+                str(key_file),
+                "--value-file",
+                "-",
+                "--application",
+                "Voice Agent",
+            ]
+        )
+        == 0
+    )
+
+    # One request, so Cloud applies every value or none and restarts the Agent once.
+    assert client.changes() == [
+        (
+            "PATCH",
+            "/v1/applications/app_voice/environment",
+            {
+                "payload": {
+                    "set": {
+                        "MODEL_ENDPOINT": {
+                            "secret": False,
+                            "value": "https://models.example.test/v1",
+                        },
+                        "MODEL_API_KEY": {"secret": True, "value": "private-model-key"},
+                        "MODEL_PROVIDER": {"secret": False, "value": "openai"},
+                        "WEBHOOK_SECRET": {"secret": True, "value": "private-webhook-secret"},
+                    }
+                }
+            },
+        )
+    ]
+    output = capsys.readouterr().out
+    assert json.loads(output)["operation"] == "env.set"
+    assert json.loads(output)["result"]["service"] == {"status": "deploying"}
+    assert "private-model-key" not in output
+    assert "private-webhook-secret" not in output
+
+
+def test_cloud_env_set_one_value_keeps_the_single_variable_request() -> None:
+    client = _EnvironmentClient(batch_route=False)
+
+    cloud_cli._environment(
+        SimpleNamespace(
+            application="app_voice",
+            assignments=["MODE=demo"],
+            environment_command="set",
+            secret=False,
+            value_file=None,
+        ),
+        client=client,
+    )
+
+    assert client.changes() == [
+        (
+            "PUT",
+            "/v1/applications/app_voice/environment/MODE",
+            {"payload": {"secret": False, "value": "demo"}},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("assignments", "secret", "value_files", "category", "message"),
+    [
+        (["A=1", "A=2"], False, [], "environment_name_repeated", "more than once: A."),
+        (["KEY", "KEY"], True, ["a", "b"], "environment_name_repeated", "more than once: KEY"),
+        (["A=1", "KEY"], False, [], "environment_assignment_invalid", "NAME=value"),
+        (["A=1"], False, ["a"], "environment_assignment_invalid", "reserved for secrets"),
+        (["A=1", "KEY=private"], True, [], "secret_value_source_required", "never put"),
+        (["A=1", "KEY"], True, [], "secret_value_source_required", "same order"),
+        (["ONE", "TWO"], True, ["a"], "secret_value_source_required", "same order"),
+        (["ONE", "TWO"], True, ["-", "-"], "secret_value_source_invalid", "standard input"),
+        (["A=1", "not-valid=2"], False, [], "environment_name_invalid", "letters"),
+        (["A=1", "KEY"], True, ["missing"], "secret_value_unavailable", "Could not read"),
+    ],
+)
+def test_cloud_env_set_refuses_a_bad_change_before_asking_cloud(
+    tmp_path: Path,
+    assignments: list[str],
+    secret: bool,
+    value_files: list[str],
+    category: str,
+    message: str,
+) -> None:
+    for name in ("a", "b"):
+        (tmp_path / name).write_text("private-value")
+    files = [path if path == "-" else tmp_path / path for path in value_files]
+
+    with pytest.raises(cloud_cli.CloudCommandError, match=message) as refused:
+        cloud_cli._environment(
+            SimpleNamespace(
+                application="app_voice",
+                assignments=assignments,
+                environment_command="set",
+                secret=secret,
+                value_file=[Path(path) for path in files] or None,
+            ),
+            client=object(),
+        )
+
+    assert refused.value.category == category
+    assert "private" not in str(refused.value)
+
+
+def test_cloud_env_set_several_values_stops_on_an_older_cloud_without_changing_any(
+    tmp_path: Path,
+) -> None:
+    key_file = tmp_path / "key"
+    key_file.write_text("private-key")
+    client = _EnvironmentClient(batch_route=False)
+
+    with pytest.raises(cloud_cli.CloudCommandError, match="nothing changed") as refused:
+        cloud_cli._environment(
+            SimpleNamespace(
+                application="app_voice",
+                assignments=["A=1", "KEY"],
+                environment_command="set",
+                secret=True,
+                value_file=[key_file],
+            ),
+            client=client,
+        )
+
+    assert refused.value.category == "environment_change_unsupported"
+    # No per-variable fallback: that would restart the Agent for each and could apply some.
+    assert [request[:2] for request in client.changes()] == [
+        ("PATCH", "/v1/applications/app_voice/environment")
+    ]
+    assert "private-key" not in str(refused.value)
+
+
+def test_cloud_env_unset_several_names_is_one_change_and_one_name_one_delete() -> None:
+    client = _EnvironmentClient()
+
+    several = cloud_cli._environment(
+        SimpleNamespace(
+            application="app_voice", environment_command="unset", names=["OLD_KEY", "MODE"]
+        ),
+        client=client,
+    )
+    cloud_cli._environment(
+        SimpleNamespace(application="app_voice", environment_command="unset", names=["MODE"]),
+        client=client,
+    )
+
+    assert several == {
+        "operation": "env.unset",
+        "result": {
+            "configuration": [],
+            "unset": ["MODE", "OLD_KEY"],
+            "service": {"status": "deploying"},
+        },
+    }
+    assert client.changes() == [
+        (
+            "PATCH",
+            "/v1/applications/app_voice/environment",
+            {"payload": {"unset": ["OLD_KEY", "MODE"]}},
+        ),
+        ("DELETE", "/v1/applications/app_voice/environment/MODE", {}),
+    ]
+    with pytest.raises(cloud_cli.CloudCommandError, match="more than once: MODE"):
+        cloud_cli._environment(
+            SimpleNamespace(
+                application="app_voice", environment_command="unset", names=["MODE", "MODE"]
             ),
             client=object(),
         )

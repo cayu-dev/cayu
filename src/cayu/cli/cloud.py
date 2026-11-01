@@ -1183,21 +1183,34 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     environment_list.add_argument("--application", required=True)
     environment_set = environment_commands.add_parser(
         "set",
-        description="Set NAME=value, or use NAME --secret --value-file PATH.",
+        description=(
+            "Set NAME=value, or use NAME --secret --value-file PATH. Several assignments in "
+            "one call are one change with one Agent restart: plain NAME=value pairs, and "
+            "secret NAMEs with --secret and one --value-file each, in the same order. Give "
+            "every assignment before the options (for example A=1 B=2 KEY1 KEY2 --secret "
+            "--value-file k1.txt --value-file k2.txt). Either every value is set or none is."
+        ),
     )
-    environment_set.add_argument("assignment")
+    environment_set.add_argument("assignments", nargs="+", metavar="assignment")
     environment_set.add_argument("--application", required=True)
     environment_set.add_argument("--secret", action="store_true")
     environment_set.add_argument(
         "--value-file",
         type=Path,
-        help="Read a secret from PATH; use - for standard input.",
+        action="append",
+        help=(
+            "Read a secret from PATH; use - for standard input. Repeat it once for each "
+            "secret NAME, in the same order as the NAMEs."
+        ),
     )
     environment_unset = environment_commands.add_parser(
         "unset",
-        description="Remove one Agent environment variable.",
+        description=(
+            "Remove Agent environment variables. Several NAMEs in one call are one change "
+            "with one Agent restart."
+        ),
     )
-    environment_unset.add_argument("name")
+    environment_unset.add_argument("names", nargs="+", metavar="name")
     environment_unset.add_argument("--application", required=True)
 
     schedule = commands.add_parser(
@@ -3229,50 +3242,113 @@ def _environment(
     *,
     client: CloudApiClient,
 ) -> dict[str, Any]:
-    if (
-        arguments.environment_command == "set"
-        and arguments.secret
-        and ("=" in str(arguments.assignment) or arguments.value_file is None)
-    ):
+    if arguments.environment_command == "list":
+        application_id = _application_id(client, arguments.application)
+        return {
+            "operation": "env.list",
+            "result": client.request("GET", f"/v1/applications/{application_id}/environment"),
+        }
+    if arguments.environment_command == "unset":
+        names = _distinct_environment_names([_environment_name(name) for name in arguments.names])
+        application_id = _application_id(client, arguments.application)
+        base = f"/v1/applications/{application_id}/environment"
+        if len(names) == 1:
+            result = client.request("DELETE", f"{base}/{names[0]}")
+        else:
+            result = _change_environment(client, base, {"unset": names})
+        return {"operation": "env.unset", "result": result}
+    # Every value, secret files included, is read before Cloud is asked to change anything.
+    variables = _environment_assignments(
+        [str(assignment) for assignment in arguments.assignments],
+        secret=bool(arguments.secret),
+        value_files=list(arguments.value_file or ()),
+    )
+    application_id = _application_id(client, arguments.application)
+    base = f"/v1/applications/{application_id}/environment"
+    if len(variables) == 1:
+        ((name, payload),) = variables.items()
+        result = client.request("PUT", f"{base}/{name}", payload=payload)
+    else:
+        result = _change_environment(client, base, {"set": variables})
+    return {"operation": "env.set", "result": result}
+
+
+def _environment_assignments(
+    assignments: list[str], *, secret: bool, value_files: list[Path]
+) -> dict[str, dict[str, object]]:
+    """Each variable's name and Cloud payload: NAME=value is plain, a bare NAME a secret.
+
+    Secret NAMEs take the --value-file at the same position, so no secret is ever in argv.
+    """
+
+    secret_names = [assignment for assignment in assignments if "=" not in assignment]
+    if secret and not secret_names:
         raise CloudCommandError(
             "secret_value_source_required",
             "Secret values must use NAME --secret --value-file PATH; never put them in argv.",
         )
-    application_id = _application_id(client, arguments.application)
-    base = f"/v1/applications/{application_id}/environment"
-    if arguments.environment_command == "list":
-        return {
-            "operation": "env.list",
-            "result": client.request("GET", base),
-        }
-    if arguments.environment_command == "unset":
-        name = _environment_name(arguments.name)
-        result = client.request("DELETE", f"{base}/{name}")
-        return {
-            "operation": "env.unset",
-            "result": result,
-        }
-    assignment = str(arguments.assignment)
-    if arguments.secret:
-        name = _environment_name(assignment)
-        value = _read_secret_value(arguments.value_file)
-    else:
-        if arguments.value_file is not None or "=" not in assignment:
-            raise CloudCommandError(
-                "environment_assignment_invalid",
-                "Plain values must use NAME=value; --value-file is reserved for secrets.",
-            )
-        raw_name, value = assignment.split("=", 1)
-        name = _environment_name(raw_name)
-    result = client.request(
-        "PUT",
-        f"{base}/{name}",
-        payload={"secret": bool(arguments.secret), "value": value},
-    )
+    if value_files and not secret:
+        raise CloudCommandError(
+            "environment_assignment_invalid",
+            "Plain values must use NAME=value; --value-file is reserved for secrets.",
+        )
+    if secret_names and not secret:
+        raise CloudCommandError(
+            "environment_assignment_invalid",
+            "Plain values must use NAME=value; a secret uses NAME --secret --value-file PATH.",
+        )
+    if len(value_files) != len(secret_names):
+        raise CloudCommandError(
+            "secret_value_source_required",
+            "Give each secret NAME its own --value-file PATH, in the same order as the NAMEs; "
+            "never put secret values in argv.",
+        )
+    if sum(1 for path in value_files if str(path) == "-") > 1:
+        raise CloudCommandError(
+            "secret_value_source_invalid",
+            "Only one secret can be read from standard input (--value-file -).",
+        )
+    names = [_environment_name(assignment.partition("=")[0]) for assignment in assignments]
+    _distinct_environment_names(names)
+    # Files are read in order, and only once every name has passed.
+    files = iter(value_files)
     return {
-        "operation": "env.set",
-        "result": result,
+        name: (
+            {"secret": False, "value": assignment.partition("=")[2]}
+            if "=" in assignment
+            else {"secret": True, "value": _read_secret_value(next(files))}
+        )
+        for name, assignment in zip(names, assignments, strict=True)
     }
+
+
+def _distinct_environment_names(names: list[str]) -> list[str]:
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise CloudCommandError(
+            "environment_name_repeated",
+            f"Name each variable once; named more than once: {', '.join(repeated)}.",
+        )
+    return names
+
+
+def _change_environment(
+    client: CloudApiClient, base: str, change: dict[str, object]
+) -> dict[str, Any]:
+    """Send several variables as one change: Cloud applies all or none, with one restart.
+
+    A Cloud without the batch route changes nothing, so the command stops there rather than
+    falling back to one request per variable, which would restart the Agent for each and
+    could leave only some of them applied.
+    """
+
+    return _unsupported_when_missing(
+        lambda: client.request("PATCH", base, payload=change),
+        "environment_change_unsupported",
+        "This Cayu Cloud can't change several environment variables in one call yet; "
+        "nothing changed. Change them one per call (each restarts the Agent) until Cloud "
+        "is upgraded.",
+    )
 
 
 def _environment_name(value: str) -> str:

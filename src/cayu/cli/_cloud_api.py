@@ -95,7 +95,8 @@ CANDIDATE_REFUSAL_CODES = frozenset({"candidate_baseline_changed", "candidate_ex
 # Cloud's documented refusals whose code and own message the CLI reports, filtered like a
 # conflict's reason, since the message says what to fix: Compass's (`cayu cloud compass`),
 # a schedule run's (`cayu cloud schedule run`), a settings change's (`cayu cloud
-# settings`) and an inbox decision's (`cayu inbox`), whose structured fields (such as a
+# settings`), an environment change's (`cayu cloud env set|unset` with several names) and
+# an inbox decision's (`cayu inbox`), whose structured fields (such as a
 # refused settle's `item`) that command reads from `CloudApiError.body`.
 _REPORTED_API_REFUSALS = frozenset(
     {
@@ -118,6 +119,7 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "release_source_unreadable"),
         (409, "service_busy"),
         (409, "settings_revision_conflict"),
+        (422, "environment_change_invalid"),
         (422, "invalid_setting"),
         (422, "invalid_settings"),
         (422, "log_query_invalid"),

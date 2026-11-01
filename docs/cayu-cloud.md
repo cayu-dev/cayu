@@ -1534,15 +1534,41 @@ printf '%s' "$VAPI_API_KEY" | \
   cayu cloud env set VAPI_API_KEY --secret --value-file - --application my-agent
 ```
 
+Each `env set` or `env unset` call is one change, and a change restarts a live Agent.
+To set several values with one restart, give them in one call. Plain values stay
+`NAME=value`; each secret is a bare `NAME`, and with `--secret` every secret `NAME`
+takes its own `--value-file`, in the same order as the names (at most one of them may be
+`-`, standard input). Give every assignment first and the options after them; a name after
+an option is refused as an unrecognized argument:
+
+```console
+cayu cloud env set \
+  MODEL_ENDPOINT=https://models.example.test/v1 \
+  MODEL_PROVIDER=openai \
+  MODEL_API_KEY \
+  --secret --value-file /private/path/model-key \
+  --application my-agent
+```
+
+Cloud applies all of the values or none of them. The CLI reads every value file first,
+so a missing or empty one stops the command before Cloud is asked to change anything.
+Setting several values needs a Cayu Cloud with the batch environment route; an older
+Cloud refuses it with `environment_change_unsupported` and nothing changes. Set the values
+one per call there instead. The CLI doesn't fall back to that on its own, since it would
+restart the Agent once per value and could leave only some of them set.
+
 List or remove configuration with:
 
 ```console
 cayu cloud env list --application my-agent
 cayu cloud env unset VAPI_API_KEY --application my-agent
+cayu cloud env unset OLD_ENDPOINT OLD_KEY --application my-agent
 ```
 
-Set and unset responses include the Agent service rollout status when a live service
-is being updated.
+Several names in one `env unset` are likewise one change and one restart. Set and unset
+responses include the Agent service rollout status when a live service is being updated.
+With several names, `configuration` lists the variables set (never a secret's value) and
+`unset` the names removed.
 
 Unchanged-source deploys follow the most recent retry with the same manifest and
 policy, including nested `-retry-N-retry-M` versions made by earlier releases. An
