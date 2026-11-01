@@ -81,6 +81,10 @@ class ApplicationEnvironmentRegistry:
         # Allocations shared by the sessions of one allocation scope, and each
         # registration's default scope.
         self.shared_allocations = SharedEnvironmentAllocations(session_store=session_store)
+        environments = self._environments
+        self.shared_allocations.bind_factory_lookup(
+            lambda name: getattr(environments.get(name), "factory", None)
+        )
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
         self._default_environment_name: str | None = None
         self._rebuilders: dict[str, EnvironmentRebuilder] = {}

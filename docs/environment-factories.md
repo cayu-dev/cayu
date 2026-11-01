@@ -1172,14 +1172,13 @@ How it works:
   factory gets it without changes. The first session of a scope gets the
   allocation from the factory's ordinary `create()`, under a request whose
   `session_id` is the scope's owner (the workflow run id for `parent` steps)
-  plus a fresh `.shared-<hex>` suffix, and whose `process_local_owner` names
-  this process. Docker coding and the brokered sandbox key their allocation
-  off that `session_id`, so it is one container or one sandbox per scope,
-  and a run resumed in another process never reattaches one a crashed
-  process left behind. In the same process, a retry after a failed creation
-  asks for the same identity, so it adopts or cleans up what the failed
-  attempt left. The factory's own binding then copies the source in
-  once.
+  plus a `.shared-<hex>` suffix. Docker coding and the brokered sandbox key
+  their allocation off that `session_id`, so it is one container or one
+  sandbox per scope. A workflow run records that identity durably before the
+  factory is called (see "Crashes and resumed runs" below), so a resumed run
+  asks for the same one; a retry after a failed `create()` does too, so it
+  adopts or cleans up what the failed attempt left. The factory's own
+  binding then copies the source in once.
 - Every session of the scope, the first one included, attaches to that live
   allocation: its tools run on the same runner and see the same workspace,
   including files the previous step left and anything it installed. A
@@ -1207,8 +1206,10 @@ How it works:
   creation whose copy-in failed: the allocation stays owned until a discard
   succeeds, and the owner's end or the next close retries it. `close_idle_environment_resources()`, which
   application shutdown calls, releases whatever is left within its
-  `timeout_s` and discards an allocation whose release fails, so nothing
-  outlives the app. A release or discard still running at the timeout isn't
+  `timeout_s` and discards an allocation whose release fails. The exception
+  is a workflow run's allocation that another process can reconnect to, when
+  the session store outlives the process: shutdown leaves it, and its record,
+  for the run to resume. A release or discard still running at the timeout isn't
   cancelled; the call returns `False` and a later call waits for that same
   task.
 - Later sessions of a scope never reach the factory, so the first session's
@@ -1222,21 +1223,104 @@ How it works:
   session whose requirements the runner can't meet is refused, not given a
   new sandbox.
 
-Limits of this first version:
+#### Crashes and resumed runs
 
-- Ownership is process-local. The shared allocation is not in any session's
-  durable allocation records, and the steps must run in the process that runs
-  the workflow (or the owning agent session). An agent session counts as a
-  running owner while its own environment is set up in this process, so a
-  parent without an environment can't own a scope for its subagents. A
-  session whose scope owner isn't running in this process, or has already
-  ended, fails with a clear
-  error instead of creating an allocation nothing would release. After a
-  crash a resumed run starts a fresh shared allocation; work that was only in
-  the old one is lost. The old one does not leak: Docker coding labels its
-  container with the process-local owner, and since no later process asks
-  for that container's name again, `reap_orphaned_docker_coding_containers`
-  can remove it safely once the process is gone, and a brokered sandbox's lease lapses when nothing renews it.
+A workflow run records each allocation its steps share in the run's own
+checkpoint (the workflow journal anchor's), under one record per scope and
+environment. The record is written before the factory is called and names
+the allocation's identity, so it exists before the allocation does. Once the
+factory returns, the record gets the result's reconnect metadata and its
+non-secret metadata, and once the binding has copied the source in, the
+binding's private recovery state: the same bounded state completion recovery
+uses to retry a copy-back without copying in again.
+
+When the run resumes in another process (a new attempt of the same run id,
+after a crash or a deploy), its first step that shares the scope finds the
+record:
+
+- If the factory published reconnect metadata and any binding gave its
+  recovery state (Docker coding does both; an unbound environment needs no binding state), the step reconnects through the
+  factory's RECONNECT path, under the recorded identity, and the binding
+  rebuilds its bound workspace from the recorded state. Nothing is copied in
+  again: the earlier steps' files, and anything they installed, are still
+  there. Copy-back and disposal still happen once, when the run releases the
+  allocation. If the factory proves the allocation gone
+  (`is_allocation_disposed`), the step starts a fresh one; any other reconnect
+  failure fails the step and keeps the record, since the allocation may hold
+  the run's only copy of its work.
+- If not (the brokered sandbox: it can't be reattached), the resumed run gets
+  a fresh allocation, and **work that existed only in the old sandbox is
+  lost**. The old one is kept as an orphan record. Its lease lapses on its own;
+  `recover_incomplete_sessions` destroys it sooner, through the factory's
+  `discard_unreachable_allocation(request, metadata)` hook, which the brokered
+  sandbox implements by destroying the sandbox ID its creation reported.
+- A run whose remaining steps don't attach to the scope (they were all
+  journaled before the crash) still releases the recorded allocation when it
+  completes: `ctx.completed()` reconnects it and copies back. A transient
+  reconnect failure retains the claimant so completion can retry.
+- Docker finalization checkpoints its disposal handoff before container removal.
+  A resumed run finishes that disposal directly, including immutable-input
+  cleanup, instead of trying to reconnect to a container already removed.
+
+Ownership is fenced by the workflow's attempt fence. Each record names the
+attempt that holds it, its journal sequence, and a claim generation. The
+checkpoint transaction refuses a claim older than the recorded attempt,
+so a stale claimant cannot temporarily displace a newer owner. Every change is a
+compare-and-set inside one checkpoint transform. An attempt claims the record
+only between two checks that it is still the run's newest attempt, and puts
+the previous claim back if the second check fails. Before it finalizes or
+discards, a process checks that one of its attempts still holds the record;
+if a newer attempt in another process took it over, the older one lets go of
+its handles without copying back or disposing of anything. Two processes
+resuming the same run therefore never both own the allocation, though an
+older attempt's step that is still running when a newer attempt takes over
+keeps running in the sandbox until its next fence check, as workflow steps
+already do.
+
+The requests of a recorded allocation carry `process_local_owner` only when
+the session store ends with the process (the in-memory store), as an ordinary
+session's do. With a durable store, Docker coding never labels the container,
+so `reap_orphaned_docker_coding_containers` never lists it and can't remove a
+container that a resumed run adopted after the crashed process exited. The
+durable record is what cleans it up instead:
+
+- `recover_incomplete_sessions` checks each workflow run it inspects (runs
+  are stored as `completed` sessions, so include `completed` in `statuses`).
+  It disposes of every orphan, and of every record once the run's newest
+  attempt has journaled `workflow.completed`, and reports
+  `reaped_allocation`. A reconnectable allocation is reconnected and
+  discarded without copy-back; anything else goes through
+  `discard_unreachable_allocation`. Unconfirmed disposal retains the record for
+  another recovery and is not counted as reaped. A record is fenced as `reaping` before
+  disposal, so a resume that races the reaper starts a fresh allocation
+  instead of reattaching one being removed. It leaves alone the allocation of
+  a run that can still resume, and anything this process holds.
+- A run that crashed and is never resumed keeps its allocation. Resume it and
+  let it finish, or start a new attempt and call
+  `ctx.release_environments(outcome="failed")`, which reconnects and releases
+  what the record holds.
+
+What is still process-local:
+
+- An agent session that owns a scope (its subagents share it) keeps no
+  durable record. Its requests always carry the process-local owner, so the
+  reaper removes a Docker container after a crash, a brokered sandbox's lease
+  lapses, and the work is lost.
+- A crash while the factory is creating the allocation leaves a record with
+  only its identity. A resumed run asks for the same identity, which Docker
+  coding adopts by container name; for a factory that can't, what the crashed
+  creation made is left to lapse. Recovery drops such a record once the run
+  has ended.
+
+Limits of this version:
+
+- A session shares only while its scope owner is open in the same process:
+  the steps must run in the process that runs the workflow (or the owning
+  agent session). An agent session counts as a running owner while its own
+  environment is set up in this process, so a parent without an environment
+  can't own a scope for its subagents. A session whose scope owner isn't
+  running in this process, or has already ended, fails with a clear error
+  instead of creating an allocation nothing would release.
 - Steps that run at the same time in one scope (for example under
   `parallel`) work in the same sandbox at the same time. Cayu doesn't
   serialize their writes, and their bindings report no writer isolation; two

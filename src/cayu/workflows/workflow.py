@@ -630,9 +630,10 @@ class WorkflowContext:
     async def start(self, payload: dict[str, Any] | None = None) -> Event:
         """Journal + return the ``workflow.started`` event. Use ``yield await``."""
         await self._check_fence()
-        # From here this attempt owns the run's shared allocations.
+        # From here this attempt owns the run's shared allocations. They are
+        # recorded under this attempt, which the fence checks is still newest.
         self.app._environment_lifecycle.shared_allocations.open_owner(
-            self.session_id, attempt_id=self.attempt_id
+            self.session_id, attempt_id=self.attempt_id, fence=self._shared_allocation_fence
         )
         boundary = await self.execution_deadline()
         boundary.require_admission("workflow_start")
@@ -650,6 +651,9 @@ class WorkflowContext:
         )
         await self._append_current_attempt_event(event)
         return event
+
+    async def _shared_allocation_fence(self) -> None:
+        await self._check_fence(establish=False)
 
     async def release_environments(self, *, outcome: str = "completed") -> None:
         """Release the allocations this run's steps share (copy-back, then disposal).
@@ -1148,7 +1152,9 @@ async def _run_step(
     # Claimed with no await after the fence check, so a superseded attempt
     # can never take ownership back from a newer one.
     shared_allocations = ctx.app._environment_lifecycle.shared_allocations
-    shared_allocations.open_owner(ctx.session_id, attempt_id=ctx.attempt_id)
+    shared_allocations.open_owner(
+        ctx.session_id, attempt_id=ctx.attempt_id, fence=ctx._shared_allocation_fence
+    )
     if opts.allocation_scope is not None:
         shared_allocations.assign_session_scope(
             child_session_id, opts.allocation_scope, owner_session_id=ctx.session_id

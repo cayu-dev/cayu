@@ -13718,11 +13718,23 @@ owns it: `ctx.completed()` copies the shared work back and disposes of it
 before journaling completion, and `WorkflowBase.execute` does the same with a
 `failed` or `interrupted` outcome when the run raises. Steps that run in
 parallel in one scope share the sandbox concurrently and can race on the same
-files. A `command()` step on that environment, with the same scope (registered
+files. The run records each shared allocation in its checkpoint before the
+factory is called, and every record change is a compare-and-set naming the
+workflow attempt that holds it. A run resumed in another process reconnects
+to a recorded allocation through the factory's RECONNECT path and rebuilds
+its binding from the recorded state without copying in again, when the
+factory published reconnect metadata and the binding can be rebuilt (Docker
+coding); otherwise it starts a new allocation and the old one's work is lost
+(a brokered sandbox). A superseded attempt never finalizes or disposes of a
+record a newer attempt holds. `recover_incomplete_sessions` disposes of
+recorded allocations nothing can use any more: orphans, and everything once
+the run's newest attempt journaled `workflow.completed`. See "Sharing one
+allocation across workflow steps and subagents" and its "Crashes and resumed
+runs" in `docs/environment-factories.md`.
+
+A `command()` step on that environment, with the same scope (registered
 or its own `allocation_scope=`), runs in that allocation too (see "Command
-steps"): it attaches while it runs and never releases it. See
-"Sharing one allocation across workflow steps and subagents" in
-`docs/environment-factories.md`.
+steps"): it attaches while it runs and never releases it.
 
 ### Workflow failure evidence
 

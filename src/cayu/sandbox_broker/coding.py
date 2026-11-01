@@ -79,6 +79,7 @@ from cayu.sandbox_broker.client import (
     SandboxBrokerClient,
     SandboxBrokerError,
     SandboxEgressMode,
+    SandboxNotFoundError,
     SandboxProvenance,
     SandboxRecord,
     validate_egress,
@@ -876,6 +877,27 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             metadata=metadata,
             release=release,
         )
+
+    async def discard_unreachable_allocation(
+        self,
+        request: EnvironmentFactoryRequest,
+        metadata: Mapping[str, Any],
+    ) -> bool:
+        """Destroy a sandbox a crashed or superseded run left, by the ID its creation reported.
+
+        A brokered sandbox can't be reattached, so a resumed workflow run gets a
+        new one and the old one, with any work only it held, is lost. Its lease
+        lapses by itself; this destroys it sooner. An already destroyed or
+        unknown sandbox counts as gone.
+        """
+
+        del request
+        sandbox_id = metadata.get("sandbox_id")
+        if type(sandbox_id) is not str or not sandbox_id.strip():
+            return False
+        with contextlib.suppress(SandboxNotFoundError):
+            await self.broker.destroy(sandbox_id)
+        return True
 
     def _require_transfer_capacity(self, sandbox: SandboxRecord) -> None:
         """Refuse a sandbox that can't move the largest file the limits allow.

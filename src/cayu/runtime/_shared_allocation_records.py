@@ -1,0 +1,523 @@
+"""Durable records of the allocations a workflow run's sessions share.
+
+A shared allocation that a workflow run owns is recorded in the run's (the
+workflow journal anchor's) checkpoint, under one key per allocation scope and
+environment. The record is written before the factory is called, so the
+allocation's identity (the ``session_id`` its request names) is durable before
+the allocation exists, and a resumed run in another process asks for the same
+one. It then records what the factory and binding returned: the factory's
+reconnect metadata, and the binding's private recovery state, which lets
+another process rebuild the bound workspace without copying the source in
+again.
+
+Every record carries a claim: the workflow attempt that owns it, and a
+generation that goes up with every change of owner. Every write is a
+compare-and-set inside one ``transform_checkpoint`` call, so two processes
+never both believe they own one record, and a superseded attempt that is still
+running finds out at its next write that it lost the allocation instead of
+disposing of it.
+
+A record that can't be reconnected (its factory published no reconnect
+metadata, or its binding can't be rebuilt) is moved to ``orphans`` when another
+attempt takes the scope over, and the new attempt gets a fresh allocation.
+``recover_incomplete_sessions`` disposes of orphans, and of records whose
+owning attempt has completed.
+"""
+
+from __future__ import annotations
+
+import secrets
+from collections.abc import Callable, Collection
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any, Literal
+
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    copy_durable_json_object,
+    copy_durable_metadata,
+)
+
+if TYPE_CHECKING:
+    from cayu.sessions.records import Session
+    from cayu.sessions.store import SessionStore
+
+SHARED_ALLOCATIONS_CHECKPOINT_KEY = "shared_environment_allocations"
+_SCHEMA_VERSION = 1
+
+RecordState = Literal["creating", "created", "live", "reaping"]
+_STATES = frozenset({"creating", "created", "live", "reaping"})
+
+
+def shared_allocation_session_id(owner_session_id: str) -> str:
+    """Return a fresh identity for one shared allocation, named after its owner."""
+
+    return f"{owner_session_id}.shared-{secrets.token_hex(8)}"
+
+
+@dataclass(frozen=True)
+class SharedAllocationRecord:
+    """What one process knows durably about one shared allocation."""
+
+    allocation_session_id: str
+    scope: str
+    scope_id: str
+    owner_session_id: str
+    environment_name: str
+    agent_name: str
+    attempt_id: str
+    claim_generation: int
+    state: RecordState
+    attempt_sequence: int = 0
+    binding_required: bool = True
+    disposal_state: dict[str, Any] | None = None
+    reconnect_metadata: dict[str, Any] = field(default_factory=dict)
+    binding_state: dict[str, Any] | None = None
+    result_metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def reconnectable(self) -> bool:
+        """Whether another process can attach to this allocation without copying in again.
+
+        A created allocation was never bound, so reconnecting it and binding it
+        loses nothing; a live one needs the binding's recovery state too.
+        """
+
+        if not self.reconnect_metadata:
+            return False
+        if self.state == "created":
+            return True
+        return self.disposal_state is not None or (
+            self.state == "live" and (not self.binding_required or self.binding_state is not None)
+        )
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "version": _SCHEMA_VERSION,
+            "allocation_session_id": self.allocation_session_id,
+            "scope": self.scope,
+            "scope_id": self.scope_id,
+            "owner_session_id": self.owner_session_id,
+            "environment_name": self.environment_name,
+            "agent_name": self.agent_name,
+            "attempt_id": self.attempt_id,
+            "claim_generation": self.claim_generation,
+            "state": self.state,
+            "attempt_sequence": self.attempt_sequence,
+            "binding_required": self.binding_required,
+            "disposal_state": self.disposal_state,
+            "reconnect_metadata": copy_durable_metadata(
+                self.reconnect_metadata, "reconnect_metadata"
+            ),
+            "binding_state": (
+                None
+                if self.binding_state is None
+                else copy_durable_json_object(self.binding_state, "binding_state")
+            ),
+            "result_metadata": copy_durable_metadata(self.result_metadata, "result_metadata"),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> SharedAllocationRecord:
+        if type(payload) is not dict or payload.get("version") != _SCHEMA_VERSION:
+            raise ValueError("Shared allocation record has an unsupported format.")
+        texts = (
+            "allocation_session_id",
+            "scope",
+            "scope_id",
+            "owner_session_id",
+            "environment_name",
+            "agent_name",
+            "attempt_id",
+        )
+        for name in texts:
+            if type(payload.get(name)) is not str or not payload[name]:
+                raise ValueError(f"Shared allocation record field {name!r} is malformed.")
+        generation = payload.get("claim_generation")
+        state = payload.get("state")
+        if type(generation) is not int or generation < 1 or state not in _STATES:
+            raise ValueError("Shared allocation record claim is malformed.")
+        attempt_sequence = payload.get("attempt_sequence", 0)
+        binding_required = payload.get("binding_required", True)
+        disposal_state = payload.get("disposal_state")
+        if type(attempt_sequence) is not int or attempt_sequence < 0:
+            raise ValueError("Shared allocation attempt sequence is malformed.")
+        if type(binding_required) is not bool:
+            raise ValueError("Shared allocation binding requirement is malformed.")
+        if disposal_state is not None:
+            disposal_state = copy_durable_json_object(disposal_state, "disposal_state")
+        binding_state = payload.get("binding_state")
+        if binding_state is not None and type(binding_state) is not dict:
+            raise ValueError("Shared allocation record binding state is malformed.")
+        return cls(
+            allocation_session_id=payload["allocation_session_id"],
+            scope=payload["scope"],
+            scope_id=payload["scope_id"],
+            owner_session_id=payload["owner_session_id"],
+            environment_name=payload["environment_name"],
+            agent_name=payload["agent_name"],
+            attempt_id=payload["attempt_id"],
+            claim_generation=generation,
+            state=state,
+            attempt_sequence=attempt_sequence,
+            binding_required=binding_required,
+            disposal_state=disposal_state,
+            reconnect_metadata=copy_durable_metadata(
+                payload.get("reconnect_metadata") or {}, "reconnect_metadata"
+            ),
+            binding_state=(
+                None
+                if binding_state is None
+                else copy_durable_json_object(binding_state, "binding_state")
+            ),
+            result_metadata=copy_durable_metadata(
+                payload.get("result_metadata") or {}, "result_metadata"
+            ),
+        )
+
+    def same_claim(self, other: SharedAllocationRecord | None) -> bool:
+        return (
+            other is not None
+            and other.allocation_session_id == self.allocation_session_id
+            and other.attempt_id == self.attempt_id
+            and other.claim_generation == self.claim_generation
+        )
+
+
+def shared_allocation_record_id(scope: str, scope_id: str, environment_name: str) -> str:
+    """The checkpoint key of one scope's record for one environment."""
+
+    return sha256(
+        canonical_durable_json_bytes(
+            {"scope": scope, "scope_id": scope_id, "environment_name": environment_name},
+            "shared_allocation_record_id",
+        )
+    ).hexdigest()[:32]
+
+
+@dataclass(frozen=True)
+class SharedAllocationSnapshot:
+    """Every record one owner's checkpoint holds."""
+
+    records: dict[str, SharedAllocationRecord]
+    orphans: dict[str, SharedAllocationRecord]
+
+    def all(self) -> tuple[SharedAllocationRecord, ...]:
+        return (*self.records.values(), *self.orphans.values())
+
+
+@dataclass(frozen=True)
+class SharedAllocationClaim:
+    """The record an attempt holds after claiming its scope, and what it replaced."""
+
+    record: SharedAllocationRecord
+    previous: SharedAllocationRecord | None
+    orphaned_previous: bool
+
+
+class SharedAllocationClaimLost(RuntimeError):
+    """Raised when another workflow attempt took a shared allocation over."""
+
+
+def _read(checkpoint: dict[str, Any] | None) -> tuple[dict[str, Any], SharedAllocationSnapshot]:
+    current = {} if checkpoint is None else checkpoint
+    raw = current.get(SHARED_ALLOCATIONS_CHECKPOINT_KEY)
+    if raw is None:
+        return current, SharedAllocationSnapshot({}, {})
+    if type(raw) is not dict:
+        raise ValueError("Shared allocation records must be an object.")
+    records = raw.get("records") or {}
+    orphans = raw.get("orphans") or {}
+    if type(records) is not dict or type(orphans) is not dict:
+        raise ValueError("Shared allocation records are malformed.")
+    return current, SharedAllocationSnapshot(
+        {key: SharedAllocationRecord.from_payload(value) for key, value in records.items()},
+        {key: SharedAllocationRecord.from_payload(value) for key, value in orphans.items()},
+    )
+
+
+def _write(current: dict[str, Any], snapshot: SharedAllocationSnapshot) -> dict[str, Any]:
+    if not snapshot.records and not snapshot.orphans:
+        current.pop(SHARED_ALLOCATIONS_CHECKPOINT_KEY, None)
+        return current
+    current[SHARED_ALLOCATIONS_CHECKPOINT_KEY] = {
+        "records": {key: record.payload() for key, record in snapshot.records.items()},
+        "orphans": {key: record.payload() for key, record in snapshot.orphans.items()},
+    }
+    return current
+
+
+class SharedAllocationRecords:
+    """Compare-and-set access to the shared allocation records of owner sessions."""
+
+    def __init__(self, store: SessionStore) -> None:
+        self._store = store
+
+    async def load(self, owner_session_id: str) -> SharedAllocationSnapshot | None:
+        """Return the owner's records, or None when the owner session doesn't exist."""
+
+        if await self._store.load(owner_session_id) is None:
+            return None
+        _, snapshot = _read(await self._store.load_checkpoint(owner_session_id))
+        return snapshot
+
+    async def _mutate(
+        self,
+        owner_session_id: str,
+        change: Callable[[SharedAllocationSnapshot], tuple[bool, Any]],
+    ) -> Any:
+        """Apply ``change`` to the owner's records atomically and return its value.
+
+        ``change`` edits the snapshot's dictionaries in place and returns
+        ``(changed, value)``; nothing is written unless ``changed``.
+        """
+
+        outcome: list[Any] = []
+
+        def transform(
+            _session: Session, checkpoint: dict[str, Any] | None
+        ) -> dict[str, Any] | None:
+            outcome.clear()
+            current, snapshot = _read(checkpoint)
+            changed, value = change(snapshot)
+            outcome.append(value)
+            return _write(current, snapshot) if changed else None
+
+        await self._store.transform_checkpoint(owner_session_id, transform)
+        if not outcome:
+            raise RuntimeError("Shared allocation record transform did not run.")
+        return outcome[0]
+
+    async def claim(
+        self,
+        *,
+        record_id: str,
+        scope: str,
+        scope_id: str,
+        owner_session_id: str,
+        environment_name: str,
+        agent_name: str,
+        attempt_id: str,
+        attempt_sequence: int,
+        replace_unreachable: bool = True,
+        keep_allocation_session_id: str | None = None,
+    ) -> SharedAllocationClaim | None:
+        """Claim the scope's record for ``attempt_id``, creating or taking it over.
+
+        A record another attempt holds is taken over: kept when another process
+        can attach to it (or it never got past creation, so a CREATE under the
+        same identity adopts or replaces it), otherwise moved to the orphans
+        and replaced by a fresh one. With ``replace_unreachable=False`` nothing
+        new is created: the result is None when there is no record this
+        attempt can reconnect to. With ``keep_allocation_session_id`` (a
+        process that holds that allocation live) the record is taken over only
+        while it still names that allocation, whatever it is, and the result
+        is None otherwise.
+        """
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            current = snapshot.records.get(record_id)
+            if current is not None and current.attempt_sequence > attempt_sequence:
+                raise SharedAllocationClaimLost("A newer workflow attempt owns this allocation.")
+            reachable = current is not None and current.state != "reaping"
+            if keep_allocation_session_id is not None:
+                if (
+                    current is None
+                    or not reachable
+                    or current.allocation_session_id != keep_allocation_session_id
+                ):
+                    return False, None
+                if current.attempt_id == attempt_id:
+                    return False, SharedAllocationClaim(current, current, False)
+                kept = replace(
+                    current,
+                    attempt_id=attempt_id,
+                    attempt_sequence=attempt_sequence,
+                    claim_generation=current.claim_generation + 1,
+                )
+                snapshot.records[record_id] = kept
+                return True, SharedAllocationClaim(kept, current, False)
+            if reachable and current is not None and current.attempt_id == attempt_id:
+                return False, SharedAllocationClaim(current, current, False)
+            if not replace_unreachable and (
+                current is None or not reachable or not current.reconnectable
+            ):
+                return False, None
+            generation = 1 if current is None else current.claim_generation + 1
+            orphaned = False
+            if (
+                reachable
+                and current is not None
+                and (current.state == "creating" or current.reconnectable)
+            ):
+                claimed = replace(
+                    current,
+                    attempt_id=attempt_id,
+                    attempt_sequence=attempt_sequence,
+                    claim_generation=generation,
+                )
+            else:
+                if current is not None:
+                    snapshot.orphans[current.allocation_session_id] = current
+                    orphaned = True
+                claimed = SharedAllocationRecord(
+                    allocation_session_id=shared_allocation_session_id(owner_session_id),
+                    scope=scope,
+                    scope_id=scope_id,
+                    owner_session_id=owner_session_id,
+                    environment_name=environment_name,
+                    agent_name=agent_name,
+                    attempt_id=attempt_id,
+                    attempt_sequence=attempt_sequence,
+                    claim_generation=generation,
+                    state="creating",
+                )
+            snapshot.records[record_id] = claimed
+            return True, SharedAllocationClaim(claimed, current, orphaned)
+
+        return await self._mutate(owner_session_id, change)
+
+    async def restore(self, record_id: str, claim: SharedAllocationClaim) -> None:
+        """Undo ``claim`` if nothing changed since, as when its attempt turned out superseded."""
+
+        record = claim.record
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            if not record.same_claim(snapshot.records.get(record_id)):
+                return False, None
+            previous = claim.previous
+            if previous is None:
+                del snapshot.records[record_id]
+                return True, None
+            if claim.orphaned_previous:
+                snapshot.orphans.pop(previous.allocation_session_id, None)
+            snapshot.records[record_id] = previous
+            return True, None
+
+        if claim.previous is not None and record.same_claim(claim.previous):
+            return
+        await self._mutate(record.owner_session_id, change)
+
+    async def update(
+        self, record_id: str, record: SharedAllocationRecord, **changes: Any
+    ) -> SharedAllocationRecord:
+        """Replace the record ``record`` with ``changes`` applied, while it is still held.
+
+        Raises ``SharedAllocationClaimLost`` when another attempt holds it now.
+        """
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            current = snapshot.records.get(record_id)
+            if not record.same_claim(current):
+                return False, None
+            updated = replace(record, **changes)
+            snapshot.records[record_id] = updated
+            return True, updated
+
+        updated = await self._mutate(record.owner_session_id, change)
+        if updated is None:
+            raise SharedAllocationClaimLost(
+                f"Another workflow attempt took over the shared allocation of environment "
+                f"{record.environment_name!r}."
+            )
+        return updated
+
+    async def replace_with_fresh(
+        self, record_id: str, record: SharedAllocationRecord
+    ) -> SharedAllocationRecord:
+        """Give the held record a fresh identity, after its allocation proved gone."""
+
+        return await self.update(
+            record_id,
+            record,
+            allocation_session_id=shared_allocation_session_id(record.owner_session_id),
+            claim_generation=record.claim_generation + 1,
+            state="creating",
+            reconnect_metadata={},
+            binding_state=None,
+            result_metadata={},
+            disposal_state=None,
+            binding_required=True,
+        )
+
+    async def orphan(self, record_id: str, record: SharedAllocationRecord) -> bool:
+        """Move the held record to the orphans; False when another attempt holds it."""
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            current = snapshot.records.get(record_id)
+            if current is None or not record.same_claim(current):
+                return False, False
+            del snapshot.records[record_id]
+            snapshot.orphans[current.allocation_session_id] = current
+            return True, True
+
+        return await self._mutate(record.owner_session_id, change)
+
+    async def holds(
+        self, owner_session_id: str, allocation_session_id: str, attempts: Collection[str]
+    ) -> bool:
+        """Whether one of ``attempts`` still holds the allocation (as a record or an orphan)."""
+
+        snapshot = await self.load(owner_session_id)
+        if snapshot is None:
+            return False
+        return any(
+            record.allocation_session_id == allocation_session_id
+            and record.attempt_id in attempts
+            and record.state != "reaping"
+            for record in snapshot.all()
+        )
+
+    async def remove(
+        self, owner_session_id: str, allocation_session_id: str, attempts: Collection[str]
+    ) -> bool:
+        """Forget a disposed allocation one of ``attempts`` held; False when none did."""
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            removed = False
+            for table in (snapshot.records, snapshot.orphans):
+                for key, record in tuple(table.items()):
+                    if (
+                        record.allocation_session_id == allocation_session_id
+                        and record.attempt_id in attempts
+                    ):
+                        del table[key]
+                        removed = True
+            return removed, removed
+
+        return await self._mutate(owner_session_id, change)
+
+    async def mark_reaping(self, record: SharedAllocationRecord) -> SharedAllocationRecord | None:
+        """Fence ``record`` for disposal; None when it changed since it was read.
+
+        A reaping record is never reconnected: a claim moves it to the orphans
+        and starts a fresh allocation, so disposal can't race a reattach.
+        """
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            for table in (snapshot.records, snapshot.orphans):
+                for key, current in tuple(table.items()):
+                    if current.allocation_session_id != record.allocation_session_id:
+                        continue
+                    if not record.same_claim(current):
+                        return False, None
+                    if current.state == "reaping":
+                        return False, current
+                    fenced = replace(current, state="reaping")
+                    table[key] = fenced
+                    return True, fenced
+            return False, None
+
+        return await self._mutate(record.owner_session_id, change)
+
+    async def remove_reaped(self, record: SharedAllocationRecord) -> None:
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            removed = False
+            for table in (snapshot.records, snapshot.orphans):
+                for key, current in tuple(table.items()):
+                    if current.state == "reaping" and record.same_claim(current):
+                        del table[key]
+                        removed = True
+            return removed, None
+
+        await self._mutate(record.owner_session_id, change)

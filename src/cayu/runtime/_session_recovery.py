@@ -796,7 +796,32 @@ class SessionRecovery:
                 request.session_id,
                 invocation_context=retained_invocation_context,
             )
-        return reconciled
+        return await self._reap_shared_allocations(reconciled)
+
+    async def _reap_shared_allocations(
+        self, result: IncompleteSessionRecoveryResult
+    ) -> IncompleteSessionRecoveryResult:
+        """Dispose of shared allocations a workflow run recorded that it can't use any more.
+
+        Orphans (allocations a resumed run couldn't reconnect to) always go, and
+        so does everything once the run's newest attempt has completed. A run
+        that can still resume keeps its allocation.
+        """
+
+        reaped = await self._environment_lifecycle.shared_allocations.reap_recorded(
+            result.session_id
+        )
+        if not reaped:
+            return result
+        return result.model_copy(
+            update={
+                "actions": (*result.actions, IncompleteSessionRecoveryAction.REAPED_ALLOCATION),
+                "message": (
+                    f"{result.message} Disposed of {reaped} shared environment "
+                    "allocation(s) the workflow run left behind."
+                ),
+            }
+        )
 
     async def _release_reconciled_recovery_invocation(
         self,
@@ -913,7 +938,7 @@ class SessionRecovery:
                     result.session_id,
                     invocation_context=invocation_context,
                 )
-            return reconciled
+            return await self._reap_shared_allocations(reconciled)
 
         async def settle_abandoned_model(
             session: Session, invocation_context: InvocationContext

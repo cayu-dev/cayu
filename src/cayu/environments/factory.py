@@ -911,6 +911,28 @@ class EnvironmentFactory(ABC):
         del request
         return False
 
+    async def discard_unreachable_allocation(
+        self,
+        request: EnvironmentFactoryRequest,
+        metadata: Mapping[str, Any],
+    ) -> bool:
+        """Dispose of an allocation this factory created that nothing can reconnect to.
+
+        ``metadata`` is the ``EnvironmentFactoryResult.metadata`` of the result
+        that created it, and ``request`` names the allocation's ``session_id``
+        and environment as that creation did. Cayu calls it during
+        ``recover_incomplete_sessions`` for a shared allocation a workflow run
+        left behind when the factory published no reconnect metadata (so no
+        RECONNECT request can reach it), for example after a resumed run had to
+        start a new one. Validate the metadata, tolerate an allocation that is
+        already gone, never copy work back, and return True once it is gone.
+        The default returns False: the allocation is left to lapse or leak.
+        Wrappers must forward this hook.
+        """
+
+        del request, metadata
+        return False
+
     @property
     def deferred_materialization(self) -> bool:
         """Whether results defer runner creation to first use.

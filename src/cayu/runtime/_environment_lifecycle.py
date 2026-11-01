@@ -901,6 +901,11 @@ class EnvironmentLifecycle:
         self.shared_allocations.bind_session_presence(
             lambda session_id: session_id in self._active_environment_setups
         )
+        # A workflow run's shared allocations are recorded in its checkpoint,
+        # through the same runtime store as every other allocation record.
+        self.shared_allocations.bind_durable_records(
+            session_store, process_local_store=lambda: self._process_local_store
+        )
         # Factory results and bound workspaces contain process-local handles
         # that cannot be reconstructed from durable session state. Retain the
         # authoritative owner across async-generator yield boundaries until the

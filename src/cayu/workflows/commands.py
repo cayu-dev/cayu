@@ -437,7 +437,9 @@ async def _shared_allocation_runner(
         # Claimed with no await after the fence check, as a step claims it, so a
         # superseded attempt never takes ownership back from a newer one.
         await ctx._check_fence(establish=False)
-        shared_allocations.open_owner(ctx.session_id, attempt_id=ctx.attempt_id)
+        shared_allocations.open_owner(
+            ctx.session_id, attempt_id=ctx.attempt_id, fence=ctx._shared_allocation_fence
+        )
         try:
             runner = await stack.enter_async_context(
                 shared_allocations.attach_command(
