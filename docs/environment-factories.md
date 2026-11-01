@@ -1147,6 +1147,25 @@ A step's value overrides the registration for that step's session. Only the
 application chooses the scope: run, session and subagent metadata can't set
 it, so a model can't opt a session into a shared sandbox or out of one.
 
+A workflow `command()` step runs in the same allocation, so the run's test
+command sees what the steps wrote and installed. It takes the registered scope,
+or its own `allocation_scope=` like a step:
+
+```python
+tests = await command(
+    ctx, step_id="tests", argv=["python", "solution.py"], allocation_scope="parent"
+)
+```
+
+The command attaches to the allocation an earlier step created. If it is the
+run's first step, it creates the allocation itself, through the same path a
+step uses: the same request identity, owner and refusals, with the workflow's
+name as `agent_name` and default (trusted) execution requirements. Either way it
+only attaches while it runs. Releasing stays with the workflow run, and a
+release asked for while a command runs waits for it to finish. Under the
+`session` scope a factory-backed command is refused, since no session would own
+its allocation. "Command steps" in `docs/runtime-contracts.md` has the details.
+
 How it works:
 
 - The runtime resolves the scope once, before it calls the factory, so every

@@ -5,16 +5,21 @@ suite, a linter, a checker script) and journals its outcome under the workflow
 run id, the same way ``step`` journals an agent call. On resume the journaled
 result is returned instead of running the command again, unless the caller
 asks for a fresh run.
+
+On a factory-backed environment the command runs in the allocation the
+workflow's steps share (``allocation_scope="parent"`` or ``"causal_budget"``),
+so a test command sees the files the steps wrote.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError, require_clean_nonblank
 from cayu.environments.bindings import (
@@ -22,6 +27,8 @@ from cayu.environments.bindings import (
     NativeBinding,
     NoWorkspaceBinding,
 )
+from cayu.environments.factory import EnvironmentFactoryRequest
+from cayu.environments.shared_allocations import AllocationSharingScope, allocation_sharing_scope
 from cayu.events import Event, EventType
 from cayu.failure_evidence import exception_evidence
 from cayu.runners.base import ExecCommand, ExecResult, Runner
@@ -39,6 +46,10 @@ from cayu.workflows.workflow import (
     WorkflowSupersededError,
     _workflow_lineage_from_anchor,
 )
+
+if TYPE_CHECKING:
+    from cayu.runtime._runtime_records import RegisteredEnvironment
+    from cayu.sessions.records import Session
 
 COMMAND_STEP_KIND = "command"
 # Both streams share one durable workflow.step.completed event.
@@ -60,9 +71,9 @@ _UNSAFE_TEXT = re.compile("[\x00\ud800-\udfff]")
 class _CommandEnvironmentRequest:
     """Where one command step runs, in the terms an environment factory uses.
 
-    The lineage mirrors what ``step`` puts on a child ``RunRequest``, so the
-    resolution can later go through the factory request path and share an
-    allocation with the workflow's agent steps.
+    The lineage mirrors what ``step`` puts on a child ``RunRequest``, so on a
+    factory-backed environment the command resolves the same shared allocation
+    key as the workflow's agent steps.
     """
 
     workflow_session_id: str
@@ -71,6 +82,7 @@ class _CommandEnvironmentRequest:
     environment_name: str | None
     parent_session_id: str | None
     causal_budget_id: str
+    allocation_scope: AllocationSharingScope | None = None
 
 
 async def command(
@@ -85,6 +97,7 @@ async def command(
     env: Mapping[str, str] | None = None,
     output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT_BYTES,
     rerun: bool = False,
+    allocation_scope: AllocationSharingScope | str | None = None,
 ) -> CommandResult:
     """Run one command in a registered environment and journal its outcome.
 
@@ -104,6 +117,13 @@ async def command(
     ``replayed=True``. Pass ``rerun=True`` when the check must see current state.
     ``env`` values are passed to the process but are not treated as secrets;
     supply secrets through the environment's runner or vault instead.
+
+    A factory-backed environment runs the command in the allocation this run's
+    steps share, so it needs a shared ``allocation_scope``: the environment's
+    registered one, or ``allocation_scope=`` here (matching the steps'
+    ``StepRunOptions.allocation_scope``). The command attaches to that
+    allocation, or creates it when no step has yet; either way the workflow
+    run releases it, never the command.
     """
     if not isinstance(ctx, WorkflowContext):
         raise TypeError("command() requires a WorkflowContext.")
@@ -129,6 +149,7 @@ async def command(
             f"{MAX_COMMAND_OUTPUT_LIMIT_BYTES}."
         )
     owned_env = None if env is None else dict(env)
+    scope = None if allocation_scope is None else allocation_sharing_scope(allocation_scope)
 
     await ctx._claim_step_id(step_id)
     await ctx._check_fence()
@@ -152,6 +173,7 @@ async def command(
             timeout_s=timeout_s,
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
+            allocation_scope=scope,
         )
     )
 
@@ -168,6 +190,7 @@ async def _execute_command(
     timeout_s: int | None,
     stdin: str | None,
     output_limit_bytes: int,
+    allocation_scope: AllocationSharingScope | None,
 ) -> CommandResult:
     (await ctx.execution_deadline()).require_admission("workflow_command")
     anchor = await ctx._workflow_anchor()
@@ -179,10 +202,14 @@ async def _execute_command(
         environment_name=environment_name,
         parent_session_id=parent_session_id,
         causal_budget_id=causal_budget_id,
+        allocation_scope=allocation_scope,
     )
-    resolved_environment_name, runner = _resolve_command_runner(ctx, request)
+    registered = _command_environment(ctx, request)
+    resolved_environment_name = registered.spec.name
     redactor = ctx.app._secret_redactor
     journaled_argv = [redactor.redact_text(item) for item in owned_argv]
+    # Refused before any runner is chosen, so an oversized argv never creates
+    # a shared allocation.
     stream_limit = _journal_stream_limit(
         ctx,
         step_id=step_id,
@@ -190,7 +217,37 @@ async def _execute_command(
         environment_name=resolved_environment_name,
         output_limit_bytes=output_limit_bytes,
     )
+    async with _command_runner(ctx, request, registered, anchor=anchor) as runner:
+        return await _run_and_journal(
+            ctx,
+            step_id=step_id,
+            exec_command=exec_command,
+            journaled_argv=journaled_argv,
+            resolved_environment_name=resolved_environment_name,
+            runner=runner,
+            cwd=cwd,
+            owned_env=owned_env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            stream_limit=stream_limit,
+        )
 
+
+async def _run_and_journal(
+    ctx: WorkflowContext,
+    *,
+    step_id: str,
+    exec_command: ExecCommand,
+    journaled_argv: list[str],
+    resolved_environment_name: str,
+    runner: Runner,
+    cwd: str | None,
+    owned_env: dict[str, str] | None,
+    timeout_s: int | None,
+    stdin: str | None,
+    stream_limit: int,
+) -> CommandResult:
+    redactor = ctx.app._secret_redactor
     started_event = ctx.event(
         EventType.WORKFLOW_STEP_STARTED,
         payload={
@@ -273,11 +330,10 @@ async def _execute_command(
     return result
 
 
-def _resolve_command_runner(
-    ctx: WorkflowContext,
-    request: _CommandEnvironmentRequest,
-) -> tuple[str, Runner]:
-    """Return the environment name and runner a command step executes on."""
+def _command_environment(
+    ctx: WorkflowContext, request: _CommandEnvironmentRequest
+) -> RegisteredEnvironment:
+    """Return the registered environment a command step runs in."""
     try:
         registered = ctx.app._get_registered_environment(request.environment_name)
     except KeyError as exc:
@@ -287,13 +343,30 @@ def _resolve_command_runner(
             f"command step {request.step_id!r} needs an environment: register a "
             "default environment or pass environment_name=."
         )
+    return registered
+
+
+@contextlib.asynccontextmanager
+async def _command_runner(
+    ctx: WorkflowContext,
+    request: _CommandEnvironmentRequest,
+    registered: RegisteredEnvironment,
+    *,
+    anchor: Session | None,
+) -> AsyncIterator[Runner]:
+    """Yield the runner a command step executes on, for as long as it runs."""
+    if registered.factory is None:
+        yield _registered_command_runner(request, registered)
+        return
+    async with _shared_allocation_runner(ctx, request, registered, anchor=anchor) as runner:
+        yield runner
+
+
+def _registered_command_runner(
+    request: _CommandEnvironmentRequest, registered: RegisteredEnvironment
+) -> Runner:
+    """Return the runner of an environment registered with ``register_environment``."""
     name = registered.spec.name
-    if registered.factory is not None:
-        raise ValueError(
-            f"command step {request.step_id!r}: environment {name!r} is factory-backed "
-            "and is provisioned per session; command() currently runs only on an "
-            "environment registered with register_environment()."
-        )
     binding = registered.environment.binding
     if binding is not None and type(binding) not in _SETUP_FREE_BINDINGS:
         # The runtime binds and finalizes a workspace binding (checkout, copy-in,
@@ -308,7 +381,80 @@ def _resolve_command_runner(
     runner = registered.environment.runner
     if runner is None:
         raise ValueError(f"command step {request.step_id!r}: environment {name!r} has no runner.")
-    return name, runner
+    return runner
+
+
+@contextlib.asynccontextmanager
+async def _shared_allocation_runner(
+    ctx: WorkflowContext,
+    request: _CommandEnvironmentRequest,
+    registered: RegisteredEnvironment,
+    *,
+    anchor: Session | None,
+) -> AsyncIterator[Runner]:
+    """Lend the command the runner of the allocation this run's steps share.
+
+    The factory's own binding prepared that allocation's workspace when the
+    allocation was created, so the command runs against a prepared workspace
+    whatever the binding is. The command attaches only while it runs; the
+    workflow run, as the scope's owner, releases the allocation.
+    """
+    name = registered.spec.name
+    factory = registered.factory
+    if factory is None:  # pragma: no cover - checked by the caller
+        raise AssertionError("A shared allocation needs a factory-backed environment.")
+    shared_allocations = ctx.app._environment_lifecycle.shared_allocations
+    scope = request.allocation_scope or shared_allocations.default_scope(name)
+    if scope is AllocationSharingScope.SESSION:
+        raise ValueError(
+            f"command step {request.step_id!r}: environment {name!r} is factory-backed "
+            "and is provisioned per session, and a command has no session to own an "
+            "allocation. Give the environment, or this command and the steps it should "
+            "share a sandbox with, allocation_scope='parent' or 'causal_budget'."
+        )
+    if anchor is None or request.parent_session_id is None:
+        # Without the journal's anchor session, steps aren't children of the run
+        # and share nothing, so there is no allocation for the command to join.
+        raise ValueError(
+            f"command step {request.step_id!r}: environment {name!r} shares one "
+            f"allocation per {scope.value} scope, but workflow run {ctx.session_id!r} "
+            "has no anchor session for its steps to share it under."
+        )
+    from cayu.resource_access import require_dispatch
+
+    # The same dispatch check a step's session makes before its factory is called.
+    await require_dispatch()
+    factory_request = EnvironmentFactoryRequest(
+        # Names only the command's attachment. A created allocation is requested
+        # under the scope owner's identity, as it is for a step.
+        session_id=f"{ctx.session_id}.command.{request.step_id}",
+        agent_name=ctx.workflow_name,
+        environment_name=name,
+        parent_session_id=request.parent_session_id,
+        causal_budget_id=request.causal_budget_id,
+    )
+    async with contextlib.AsyncExitStack() as stack:
+        # Claimed with no await after the fence check, as a step claims it, so a
+        # superseded attempt never takes ownership back from a newer one.
+        await ctx._check_fence(establish=False)
+        shared_allocations.open_owner(ctx.session_id, attempt_id=ctx.attempt_id)
+        try:
+            runner = await stack.enter_async_context(
+                shared_allocations.attach_command(
+                    factory, scope=scope, parent=anchor, request=factory_request
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise StepError(
+                f"command step {request.step_id!r} could not use the shared allocation "
+                f"of environment {name!r}: {type(exc).__name__}",
+                step_id=request.step_id,
+                evidence=exception_evidence(exc),
+                workflow_attempt_id=ctx.attempt_id,
+            ) from exc
+        yield runner
 
 
 def _journal_stream_limit(

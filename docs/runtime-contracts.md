@@ -13707,7 +13707,10 @@ owns it: `ctx.completed()` copies the shared work back and disposes of it
 before journaling completion, and `WorkflowBase.execute` does the same with a
 `failed` or `interrupted` outcome when the run raises. Steps that run in
 parallel in one scope share the sandbox concurrently and can race on the same
-files. See "Sharing one allocation across workflow steps and subagents" in
+files. A `command()` step on that environment, with the same scope (registered
+or its own `allocation_scope=`), runs in that allocation too (see "Command
+steps"): it attaches while it runs and never releases it. See
+"Sharing one allocation across workflow steps and subagents" in
 `docs/environment-factories.md`.
 
 ### Workflow failure evidence
@@ -13830,13 +13833,55 @@ async def gate(item, result):
 
 The command runs through the runner of a registered environment, so the same
 workflow runs on a local, Docker or Lambda MicroVM runner by registering a different
-environment. The environment must be registered with `register_environment`. A
-factory-backed environment is provisioned per agent session and is refused for now.
-The runtime binds and finalizes a workspace binding only around an agent session, so
-`command` also refuses an environment whose binding prepares the workspace (for example
-`GitRepositoryBinding` or `SyncBinding`) instead of running against a workspace that
-binding never checked out or copied in. No binding, `NativeBinding`,
-`DeterministicWorkspaceBinding` and `NoWorkspaceBinding` are accepted, by exact type.
+environment.
+
+On an environment registered with `register_environment`, the runtime binds and
+finalizes a workspace binding only around an agent session, so `command` refuses an
+environment whose binding prepares the workspace (for example `GitRepositoryBinding`
+or `SyncBinding`) instead of running against a workspace that binding never checked
+out or copied in. No binding, `NativeBinding`, `DeterministicWorkspaceBinding` and
+`NoWorkspaceBinding` are accepted, by exact type. Every step and command already
+shares such an environment, so `command`'s `allocation_scope=` has no effect on it.
+
+A factory-backed environment (Docker coding, a brokered sandbox, Lambda MicroVM) runs
+the command in the allocation the run's steps share, so a test command sees the files
+the steps wrote:
+
+```python
+shared = StepRunOptions(allocation_scope="parent")
+await step(ctx, agent="planner", step_id="plan", prompt=task, run_options=shared)
+await step(ctx, agent="solver", step_id="solve", prompt=task, run_options=shared)
+tests = await command(
+    ctx, step_id="tests", argv=["python", "-m", "pytest", "-q"], allocation_scope="parent"
+)
+yield await ctx.completed({"passed": tests.passed})
+```
+
+The scope is the environment's registered `allocation_scope`, or `command`'s own
+`allocation_scope=` (which, like `StepRunOptions.allocation_scope`, overrides it for
+this command). It must be `parent` or `causal_budget`: under `session`, the default,
+there is no session to own an allocation, and the command is refused with
+`ValueError` before anything is created. The command resolves the same allocation
+key its run's steps resolve. If an earlier step created the allocation, the command
+attaches to it; if no step has yet, the command creates it the way a step would: the
+same factory `create()` under the scope owner's fresh `.shared-<hex>` identity, the
+same owner (the workflow run, opened under the attempt fence like a step), and the
+same refusals (dynamic secret scope, a vault or credential proxy, MCP servers,
+request-dependent artifact or knowledge stores, deferred materialization, an egress
+authority). That request names the workflow as `agent_name`, carries the run's
+lineage, and has default (trusted) execution requirements, since a command has no
+agent tools to admit; a later step is still admitted against the live runner with
+its own requirements. The factory's own binding prepared the allocation's workspace
+when it was created, so the binding restriction above doesn't apply here. A workflow
+whose journal has no anchor session (a custom journal) has no shared scope for its
+steps, and a factory-backed command there is refused.
+
+The command holds an attachment only while it runs. It never copies back or releases
+the allocation: the workflow run does, in `ctx.completed()` or through
+`WorkflowBase.execute` (see "Steps that share a sandbox"). A release requested while
+a command still runs waits for it to detach. A failure to create or attach raises
+`StepError` before `workflow.step.started` is journaled, so a resume tries again. A
+replayed command result is a journal read and attaches to nothing.
 
 Each command runs as admitted application work, like an agent step's run.
 `seal_admissions()` and `aclose()` refuse a new command unless admitted work started

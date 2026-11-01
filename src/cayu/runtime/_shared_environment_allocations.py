@@ -26,7 +26,7 @@ import contextlib
 import logging
 import secrets
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -232,19 +232,9 @@ class SharedEnvironmentAllocations:
         if scope is AllocationSharingScope.PARENT:
             parent = session.parent_session_id
             if parent is not None:
-                # A child of a session that is itself attached (a workflow
-                # step's subagent) joins that session's allocation, so an agent
-                # and its subagents share one sandbox wherever the agent runs.
-                for key, entry in self._live.items():
-                    if (
-                        key.scope is scope
-                        and key.environment_name == environment_name
-                        and any(
-                            attachment.session_id == parent and not attachment.released
-                            for attachment in entry.attachments
-                        )
-                    ):
-                        return key
+                attached = self._attached_parent_key(parent, environment_name)
+                if attached is not None:
+                    return attached
             owner = parent or session.id
             return SharedAllocationKey(scope, owner, owner, environment_name)
         if scope is AllocationSharingScope.CAUSAL_BUDGET:
@@ -253,6 +243,24 @@ class SharedEnvironmentAllocations:
                 scope, session.causal_budget_id or owner, owner, environment_name
             )
         raise ValueError("A session-scoped allocation is not shared.")
+
+    def _attached_parent_key(
+        self, parent_session_id: str, environment_name: str
+    ) -> SharedAllocationKey | None:
+        # A child of a session that is itself attached (a workflow step's
+        # subagent) joins that session's allocation, so an agent and its
+        # subagents share one sandbox wherever the agent runs.
+        for key, entry in self._live.items():
+            if (
+                key.scope is AllocationSharingScope.PARENT
+                and key.environment_name == environment_name
+                and any(
+                    attachment.session_id == parent_session_id and not attachment.released
+                    for attachment in entry.attachments
+                )
+            ):
+                return key
+        return None
 
     async def _top_ancestor(self, session: Session) -> str:
         current = session
@@ -313,11 +321,13 @@ class SharedEnvironmentAllocations:
     def _owner_generation(self, owner_session_id: str) -> int:
         return self._owner_generations.get(owner_session_id, 0)
 
-    async def _require_open(self, key: SharedAllocationKey, session: Session) -> None:
+    async def _require_open(self, key: SharedAllocationKey, session: Session | None) -> None:
+        """Refuse unless ``key``'s owner is open; ``session`` is None for a workflow command."""
+
         owner = key.owner_session_id
         if owner in self._open_owners:
             return
-        if owner == session.id:
+        if session is not None and owner == session.id:
             # The owner itself is being set up for its own run.
             if self._ended_owners.get(owner, -1) != session.run_epoch:
                 return
@@ -497,7 +507,7 @@ class SharedEnvironmentAllocations:
         key: SharedAllocationKey,
         factory: EnvironmentFactory,
         request: EnvironmentFactoryRequest,
-        session: Session,
+        session: Session | None,
     ) -> _SharedAllocation:
         while True:
             # The owner may have ended while this session waited for another
@@ -742,6 +752,59 @@ class SharedEnvironmentAllocations:
             entry.resources_discarded = True
         return True
 
+    # Workflow commands ----------------------------------------------------
+
+    @contextlib.asynccontextmanager
+    async def attach_command(
+        self,
+        factory: EnvironmentFactory,
+        *,
+        scope: AllocationSharingScope,
+        parent: Session,
+        request: EnvironmentFactoryRequest,
+    ) -> AsyncIterator[Runner]:
+        """Lend a workflow ``command`` step the runner of its scope's shared allocation.
+
+        ``parent`` is the session the command runs under, the workflow run's
+        anchor, so the key is the one that run's step sessions resolve. When no
+        step has created the allocation yet, the command creates it through the
+        same path, owner and refusals a step would, with ``request``. The
+        command only attaches while it runs and detaches after; releasing the
+        allocation stays with the scope's owner, which must be open already.
+        """
+
+        environment_name = request.environment_name
+        if scope is AllocationSharingScope.PARENT:
+            key = self._attached_parent_key(parent.id, environment_name) or SharedAllocationKey(
+                scope, parent.id, parent.id, environment_name
+            )
+        elif scope is AllocationSharingScope.CAUSAL_BUDGET:
+            owner = await self._top_ancestor(parent)
+            key = SharedAllocationKey(
+                scope, request.causal_budget_id or owner, owner, environment_name
+            )
+        else:
+            raise ValueError("A session-scoped allocation is not shared.")
+        _require_shareable_factory(factory)
+        self._in_use = True
+        entry = await self._acquire(key, factory, request, None)
+        attachment = self._attach(entry, request.session_id)
+        try:
+            if self._live.get(key) is not entry:
+                # The owner ended between the creation and this attachment.
+                raise SharedAllocationScopeClosedError(
+                    f"The scope's owner session {key.owner_session_id!r} ended before the "
+                    "command could attach to its shared allocation."
+                )
+            runner = entry.runner
+            if runner is None:
+                raise RuntimeError(
+                    f"The shared allocation of environment {environment_name!r} has no runner."
+                )
+            yield runner
+        finally:
+            self._detach(entry, attachment)
+
     # Inspection -----------------------------------------------------------
 
     def _entries(self) -> tuple[_SharedAllocation, ...]:
@@ -787,6 +850,19 @@ class SharedEnvironmentAllocations:
         """Keys of the allocations that are live or still being released."""
 
         return tuple(entry.key for entry in self._entries())
+
+
+def _require_shareable_factory(factory: EnvironmentFactory) -> None:
+    """Refuse a factory whose allocations can't be shared, before asking it for one."""
+
+    if factory.egress_authority_identity is not None:
+        raise RuntimeError(
+            "An environment factory with an egress authority can't share its allocation."
+        )
+    if getattr(factory, "deferred_materialization", False) is True:
+        raise RuntimeError(
+            "A deferred-materialization environment factory can't share its allocation."
+        )
 
 
 def _require_shareable(
@@ -895,14 +971,7 @@ class _SharedAllocationFactory(EnvironmentFactory):
                 f"environment {request.environment_name!r}; it can't move to a shared "
                 f"{self._scope.value} allocation."
             )
-        if self._inner.egress_authority_identity is not None:
-            raise RuntimeError(
-                "An environment factory with an egress authority can't share its allocation."
-            )
-        if getattr(self._inner, "deferred_materialization", False) is True:
-            raise RuntimeError(
-                "A deferred-materialization environment factory can't share its allocation."
-            )
+        _require_shareable_factory(self._inner)
         registry = self._registry
         key = await registry.resolve_key(self._session, self._environment_name, self._scope)
         entry = await registry._acquire(key, self._inner, request, self._session)
