@@ -2038,8 +2038,12 @@ def test_cloud_deploy_wait_reports_a_nonterminal_deployment_after_local_timeout(
                 "wait": ("cayu cloud deployment wait dep_running --application outbound-agent"),
             },
             "deployment_id": "dep_running",
-            "message": "Cayu Cloud is still processing this deployment.",
+            "message": (
+                "Cayu Cloud is still processing Release dep_running (`image_built`); the CLI "
+                "stopped waiting after 10s, and Cloud keeps working on it."
+            ),
             "status": "image_built",
+            "waited_seconds": 10,
         },
         "ok": False,
     }
@@ -2427,8 +2431,9 @@ def test_cloud_deploy_wait_reports_a_service_that_is_still_starting(
             },
             "last_issue": not_ready,
             "message": (
-                "Cayu Cloud is still starting this Agent service after 10s. "
-                f"Last report: {not_ready}"
+                "Cayu Cloud is still starting this Agent service after 10s. The CLI was "
+                "waiting for the Agent's service to be running; Cayu Cloud reports it as "
+                f"`starting`. Last report: {not_ready}"
             ),
             "status": "starting",
             "waited_seconds": 10,

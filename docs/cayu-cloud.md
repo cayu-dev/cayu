@@ -45,15 +45,21 @@ returns the Cloud-owned structured publication activity for that exact immutable
 release. Both commands use authenticated, tenant-scoped customer API responses and
 emit the same machine-readable JSON envelope as the rest of the Cloud CLI.
 
+A wait is never silent: before it first sleeps, and again whenever that changes, it says on
+standard error what it is waiting for and where things stand: which Release it waits for
+and the status Cloud reports for it, or which Release the Agent's service should run and
+which one it still runs. It stops as soon as Cloud reports a failed Release or service.
+
 If a local deployment wait reaches its deadline while Cayu Cloud is still working, the
-command exits `2` with category `deployment_still_running`; it does not report the
-Release as failed or cancel it. The JSON error includes the current safe status and,
-when Cloud returned canonical IDs, ready-to-run noninteractive `deployment status`,
-`deployment timeline`, and `deployment wait` commands. Explicit `--context` and
-`--api-key-file` selections are preserved in those commands. The validated application
-and deployment identifiers remain available independently if the other identifier is
-invalid. Cayu Cloud owns final promotion and Agent service publication, so these commands
-only need to observe the durable Deployment Operation rather than reproduce those steps.
+command exits `2` with category `deployment_still_running`; it does not report the Release
+as failed or cancel it. The message names the Release, and the JSON error includes
+`waited_seconds`, the current safe status and, when Cloud returned canonical IDs,
+ready-to-run noninteractive `deployment status`, `deployment timeline`, and `deployment
+wait` commands. Explicit `--context` and `--api-key-file` selections are preserved in those
+commands. The validated application and deployment identifiers remain available
+independently if the other identifier is invalid. Cayu Cloud owns final promotion and Agent
+service publication, so these commands only need to observe the durable Deployment Operation
+rather than reproduce those steps.
 
 While it waits, the CLI rides out up to five consecutive unavailable, throttled or HTTP
 5xx reads of the Release, because the Release keeps building in Cloud whether or not one
@@ -62,13 +68,14 @@ poll arrives. A request that fails before Cloud answers exits `2` with category
 `connect_failed`) and `request` naming it as `METHOD /path`. A later `deploy` of the same
 source finds the same Release, so running it again is safe.
 
-If release publication finishes but the Agent service is still starting when the same
-local deadline expires, `deploy` exits `2` with category `service_still_starting` and a
-ready-to-run `service status` command. The error also carries `waited_seconds` and, when
-Cloud reported one, `last_issue`: the last `web_not_ready` message, which includes how
-long the web process has been starting. A timed-out service teardown similarly reports
-`service_deletion_still_running`; neither result marks the retained Cloud operation as
-failed.
+If release publication finishes but the Agent service is still starting when the same local
+deadline expires, `deploy` exits `2` with category `service_still_starting` and a
+ready-to-run `service status` command. Its message says what the CLI was waiting for (the
+service to run which Release, and what it still runs). The error also carries
+`waited_seconds` and, when Cloud reported one, `last_issue`: the last `web_not_ready`
+message, which includes how long the web process has been starting. A timed-out service
+teardown similarly reports `service_deletion_still_running`; neither result marks the
+retained Cloud operation as failed.
 
 ## What an Agent runs
 
@@ -637,15 +644,23 @@ source and includes a `retry` receipt with the old ID, new ID, failure code, and
 The source archive and manifest version are unchanged. A newly submitted attempt that
 fails while waiting is reported to the caller rather than retried again.
 
+Cloud keeps one immutable Release per source, so a deploy of unchanged source builds
+nothing new: Cloud answers it with the Release it already has. The deploy says so on
+standard error before it waits on anything, naming that Release, and reports it as
+`result.unchanged_source` (its `deployment_id`, the `status` Cloud answered with, and the
+same `message`). A Release still building is followed to the end like a new one; to build
+a new Release instead, change the source or `version` in `cayu-cloud.toml`.
+
 When unchanged source resolves to a Release that Cloud promoted earlier, no promotion
-publishes it again, so the deploy checks the Agent itself. If that Release is still the
-Agent's selected Release but no service is running it, for example after `service
-destroy`, the deploy asks Cloud to start the service, as `rollback` does, and reports
-`service_publication_requested: true`. If the Agent has selected a different Release, or
-none, the deploy exits `2` at once with category `release_not_selected`, the
-`current_deployment_id`, and ready-to-run `rollback` and `service status` commands.
-Select the reused Release with `rollback`, or change `version` in `cayu-cloud.toml` to
-build a new one.
+publishes it again, so the deploy checks the Agent itself. If the Agent's service already
+runs that Release, the deploy returns at once, also while its web process sleeps. If that
+Release is still the Agent's selected Release but no service is running it, for example
+after `service destroy`, the deploy asks Cloud to start the service, as `rollback` does, and
+reports `service_publication_requested: true`. If the Agent has selected a different
+Release, or none, the deploy exits `2` at once with category `release_not_selected`, the
+`current_deployment_id`, and ready-to-run `rollback` and `service status` commands. Select
+the reused Release with `rollback`, or change `version` in `cayu-cloud.toml` to build a new
+one.
 
 `--retry-failed` explicitly enables this default; `--no-retry-failed` reports the retained
 attempt without retrying it. Non-retryable source failures include the retained failure and

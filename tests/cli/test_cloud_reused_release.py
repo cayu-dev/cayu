@@ -366,3 +366,144 @@ def test_promoted_retry_found_from_a_failed_original_is_treated_as_reused(
     assert client.count("PUT", "/service") == 1
     assert result["service_publication_requested"] is True
     assert result["service"]["status"] == "running"
+
+
+def test_unchanged_source_says_which_release_already_has_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # cayu#3120: the Agent's selected Release already has this source and its web process
+    # sleeps, as on staging on 27 Oct. The deploy says so and returns without waiting.
+    client = ReusingCloud(
+        service={"deployment_id": "dep_existing", "issues": [], "status": "sleeping"}
+    )
+    sleeps: list[float] = []
+
+    result = _deploy(client, tmp_path, sleeps=sleeps)["result"]
+
+    assert sleeps == []
+    assert result["unchanged_source"] == {
+        "deployment_id": "dep_existing",
+        "message": (
+            "This source is unchanged: Cayu Cloud already built it as Release dep_existing, "
+            "so it reused that Release instead of building a new one. To build a new "
+            "Release, change the source or `version` in cayu-cloud.toml."
+        ),
+        "status": "promoted",
+    }
+    assert f"cayu cloud: {result['unchanged_source']['message']}" in capsys.readouterr().err
+
+
+def test_unchanged_source_still_building_is_followed_and_named(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = ReusingCloud(
+        replay_status="image_built",
+        current="dep_older",
+        service={"deployment_id": "dep_older", "issues": [], "status": "running"},
+    )
+    original = client.request
+    statuses = iter(["image_built", "image_built", "smoke_tested"])
+
+    def request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        if (
+            method == "GET"
+            and path.endswith("/deployments/dep_existing")
+            and client.replay_status != "promoted"
+        ):
+            client.replay_status = next(statuses)
+        if method == "POST" and path.endswith("/dep_existing/promote"):
+            client.service = {"deployment_id": "dep_existing", "issues": [], "status": "running"}
+        return original(method, path, **kwargs)
+
+    client.request = request  # type: ignore[method-assign]
+
+    result = _deploy(client, tmp_path)["result"]
+
+    assert result["deployment"]["status"] == "promoted"
+    assert result["unchanged_source"]["status"] == "image_built"
+    err = capsys.readouterr().err
+    assert (
+        "cayu cloud: This source is already Release dep_existing, which Cayu Cloud reports "
+        "as `image_built`, so this deploy follows that Release instead of building a new one."
+    ) in err
+    # The wait says what it waits for once, not on every unchanged poll.
+    assert err.count("Waiting up to 600s for Release dep_existing to be ready") == 1
+
+
+def test_a_new_release_is_not_reported_as_unchanged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = ReusingCloud(replay_status="accepted", current=None, service=None)
+    original = client.request
+
+    def request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        if (
+            method == "GET"
+            and path.endswith("/deployments/dep_existing")
+            and client.replay_status == "accepted"
+        ):
+            client.replay_status = "smoke_tested"
+        if method == "POST" and path.endswith("/dep_existing/promote"):
+            client.service = {"deployment_id": "dep_existing", "issues": [], "status": "running"}
+        return original(method, path, **kwargs)
+
+    client.request = request  # type: ignore[method-assign]
+
+    result = _deploy(client, tmp_path)["result"]
+
+    assert result["deployment"]["status"] == "promoted"
+    assert "unchanged_source" not in result
+    assert "unchanged" not in capsys.readouterr().err
+
+
+def test_a_reused_release_whose_service_never_settles_ends_the_wait_and_names_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = ReusingCloud(
+        service={"deployment_id": "dep_existing", "issues": [], "status": "stopping"}
+    )
+    sleeps: list[float] = []
+
+    with pytest.raises(cloud_cli._CloudServiceStillRunningError) as raised:
+        _deploy(client, tmp_path, sleeps=sleeps)
+
+    # Bounded by --wait-seconds (600 here), polled every --poll-seconds.
+    assert 0 < len(sleeps) <= 600 / 5
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    streams = capsys.readouterr()
+    waiting_for = (
+        "the Agent's service on Release dep_existing to be running; Cayu Cloud reports it as "
+        "`stopping`"
+    )
+    assert streams.err.count(f"cayu cloud: Waiting up to 600s for {waiting_for}.") == 1
+    error = json.loads(streams.out)["error"]
+    assert error["category"] == "service_still_starting"
+    assert error["status"] == "stopping"
+    assert f"The CLI was waiting for {waiting_for}." in error["message"]
+
+
+def test_a_service_wait_names_the_release_it_waits_for_and_the_one_still_serving(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            if path.endswith("/deployments/dep_new"):
+                return {"id": "dep_new", "publication_error": None, "status": "promoted"}
+            return {"deployment_id": "dep_old", "issues": [], "status": "running"}
+
+    clock = iter(range(0, 10_000, 5))
+    with pytest.raises(cloud_cli._CloudServiceStillRunningError) as raised:
+        cloud_cli._wait_for_service(
+            Client(),  # type: ignore[arg-type]
+            application_id="smoke-agent",
+            initial={"deployment_id": "dep_old", "issues": [], "status": "running"},
+            expected_deployment_id="dep_new",
+            poll_seconds=5.0,
+            wait_seconds=20.0,
+            sleep=lambda _: None,
+            monotonic=lambda: float(next(clock)),
+        )
+
+    waiting_for = "the Agent's service to run Release dep_new; it still runs Release dep_old"
+    assert capsys.readouterr().err.count(f"Waiting up to 20s for {waiting_for}.") == 1
+    assert f"The CLI was waiting for {waiting_for}." in str(raised.value)

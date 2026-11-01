@@ -396,19 +396,30 @@ class _CloudDeploymentStillRunningError(CloudApiError):
         recovery_arguments: Sequence[str] = (),
         status: str,
         last_issue: str | None = None,
+        waited_seconds: float | None = None,
     ) -> None:
-        message = "Cayu Cloud is still processing this deployment."
-        if last_issue is not None:
-            message = f"{message} Last report: {last_issue}"
-        super().__init__("deployment_still_running", message)
         self.application_id = _cloud_application_id(application_id)
         self.deployment_id = _cloud_deployment_id(deployment_id)
         self.recovery_arguments = tuple(recovery_arguments)
         self.status = status if status in _DEPLOYMENT_IN_PROGRESS else "processing"
         self.last_issue = last_issue
+        self.waited_seconds = waited_seconds
+        message = "Cayu Cloud is still processing this deployment."
+        if waited_seconds is not None:
+            # Name what the wait was for, so a wait that ends is never a mystery (cayu#3120).
+            named = "the Release" if self.deployment_id is None else f"Release {self.deployment_id}"
+            message = (
+                f"Cayu Cloud is still processing {named} (`{self.status}`); the CLI stopped "
+                f"waiting after {waited_seconds:.0f}s, and Cloud keeps working on it."
+            )
+        if last_issue is not None:
+            message = f"{message} Last report: {last_issue}"
+        super().__init__("deployment_still_running", message)
 
     def public_details(self) -> dict[str, object]:
         details: dict[str, object] = {"status": self.status}
+        if self.waited_seconds is not None:
+            details["waited_seconds"] = round(self.waited_seconds)
         if self.last_issue is not None:
             details["last_issue"] = self.last_issue
         if self.application_id is not None:
@@ -636,6 +647,7 @@ class _CloudServiceStillRunningError(CloudApiError):
         status: str,
         waited_seconds: float | None = None,
         last_issue: str | None = None,
+        waiting_for: str | None = None,
     ) -> None:
         message = (
             "Cayu Cloud is still deleting this Agent service."
@@ -644,6 +656,9 @@ class _CloudServiceStillRunningError(CloudApiError):
         )
         if waited_seconds is not None:
             message = f"{message[:-1]} after {waited_seconds:.0f}s."
+        if waiting_for is not None:
+            # Name what the wait was for, so a wait that ends is never a mystery (cayu#3120).
+            message = f"{message} The CLI was waiting for {waiting_for}."
         if last_issue is not None:
             message = f"{message} Last report: {last_issue}"
         super().__init__(
@@ -2293,6 +2308,9 @@ def _deploy(
         deployment, requested=candidate, application_id=str(application["id"])
     )
     original = deployment
+    # Cloud answers a new submission with a Release it has only just accepted, so a Release
+    # past that is one it built from this source before (cayu#3120).
+    found_existing = acknowledge_existing or _deployment_status(original) != "accepted"
     if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
         deployment = _latest_source_retry(client, str(application["id"]), original)
     if candidate is not None:
@@ -2391,6 +2409,10 @@ def _deploy(
     # through its retry family, is not published again by any promotion. A retry this
     # deploy submitted is published by Cloud itself.
     previously_promoted = retry is None and _deployment_status(deployment) == "promoted"
+    # Unchanged source builds nothing new; say so before any wait, and which Release has it.
+    unchanged_source = _unchanged_source(deployment) if found_existing and retry is None else None
+    if unchanged_source is not None:
+        print(f"cayu cloud: {unchanged_source['message']}", file=sys.stderr)
     # Whether the deploy waits until the Agent's service runs the release, not only until
     # it is promoted (`--no-wait-live`) or accepted (`--no-wait`).
     wait_live = not arguments.no_wait and not getattr(arguments, "no_wait_live", False)
@@ -2577,6 +2599,8 @@ def _deploy(
         result["message"] = "The Agent is asleep and wakes on its next request."
     if retry is not None:
         result["retry"] = retry
+    if unchanged_source is not None:
+        result["unchanged_source"] = unchanged_source
     # Without processes there's no publication for the choice to govern.
     check_preflight = promoted_with_choice and project.manifest.runtime_payload() is not None
     if check_preflight and wait_live:
@@ -2883,6 +2907,30 @@ def _acknowledge_existing_release(
     elif waiting is not None:
         retry["reason"] = waiting["message"]
     return retried, retry
+
+
+def _unchanged_source(deployment: dict[str, Any]) -> dict[str, Any]:
+    """What `deploy` reports when Cloud answered with a Release it built from this source.
+
+    Cloud keeps one immutable Release per source and answers a deploy of that source again
+    with it, whatever its status, instead of building another.
+    """
+
+    deployment_id = _cloud_deployment_id(str(deployment.get("id")))
+    status = _deployment_status(deployment)
+    named = "an earlier Release" if deployment_id is None else f"Release {deployment_id}"
+    if status == "promoted":
+        message = (
+            f"This source is unchanged: Cayu Cloud already built it as {named}, so it reused "
+            "that Release instead of building a new one. To build a new Release, change the "
+            "source or `version` in cayu-cloud.toml."
+        )
+    else:
+        message = (
+            f"This source is already {named}, which Cayu Cloud reports as `{status}`, so "
+            "this deploy follows that Release instead of building a new one."
+        )
+    return {"deployment_id": deployment_id, "message": message, "status": status}
 
 
 def _published_before(
@@ -3825,10 +3873,13 @@ def _wait_for_deployment(
     """
 
     _validate_wait(poll_seconds, wait_seconds)
-    deadline = monotonic() + wait_seconds
+    started = monotonic()
+    deadline = started + wait_seconds
     path = f"/v1/applications/{application_id}/deployments/{deployment_id}"
     hold = _SessionHoldWatch(wait_seconds=wait_seconds, monotonic=monotonic)
     reads = _ReleaseReads(monotonic)
+    progress = _WaitProgress()
+    target = "built" if until_built else "promoted" if until_promoted else "ready"
     while True:
         deployment = reads.read(client, path, deadline=deadline)
         if deployment is None:
@@ -3861,15 +3912,38 @@ def _wait_for_deployment(
                 if include_failure_diagnostics
                 else None,
             )
-        if monotonic() >= deadline:
+        now = monotonic()
+        if now >= deadline:
             raise _CloudDeploymentStillRunningError(
                 application_id=application_id,
                 deployment_id=deployment_id,
                 recovery_arguments=recovery_arguments,
                 status=status,
                 last_issue=hold.waiting,
+                waited_seconds=now - started,
+            )
+        if hold.waiting is None:
+            # A held publication reports its own wait.
+            named = _cloud_deployment_id(deployment_id)
+            progress.report(
+                f"Waiting up to {wait_seconds:.0f}s for "
+                f"{'the Release' if named is None else f'Release {named}'} to be {target}; "
+                f"Cayu Cloud reports it as `{status}`."
             )
         sleep(poll_seconds)
+
+
+class _WaitProgress:
+    """Say on standard error what a wait is waiting for: before it first sleeps, and again
+    only when that changes, so a long wait is never silent and a steady one isn't noisy."""
+
+    def __init__(self) -> None:
+        self._reported: str | None = None
+
+    def report(self, message: str) -> None:
+        if message != self._reported:
+            self._reported = message
+            print(f"cayu cloud: {message}", file=sys.stderr)
 
 
 class _ReleaseReads:
@@ -4426,6 +4500,7 @@ def _wait_for_service(
     transient_failures = 0
     last_issue: str | None = None
     hold = _SessionHoldWatch(wait_seconds=wait_seconds, monotonic=monotonic)
+    progress = _WaitProgress()
     while True:
         pending = service is None or (
             expected_deployment_id is not None
@@ -4483,6 +4558,9 @@ def _wait_for_service(
                 issues=issues,
             )
         now = monotonic()
+        waiting_for = _service_wait_target(
+            service, pending=pending, expected_deployment_id=expected_deployment_id
+        )
         if now >= deadline:
             raise _CloudServiceStillRunningError(
                 application_id=application_id,
@@ -4491,7 +4569,11 @@ def _wait_for_service(
                 status=status,
                 waited_seconds=now - started,
                 last_issue=last_issue,
+                waiting_for=waiting_for,
             )
+        if hold.waiting is None:
+            # A held publication reports its own wait.
+            progress.report(f"Waiting up to {wait_seconds:.0f}s for {waiting_for}.")
         sleep(poll_seconds)
         try:
             service = _read_or_none(client, path)
@@ -4502,6 +4584,32 @@ def _wait_for_service(
             transient_failures += 1
             continue
         transient_failures = 0
+
+
+def _service_wait_target(
+    service: dict[str, Any] | None, *, pending: bool, expected_deployment_id: str | None
+) -> str:
+    """What a service wait is waiting for, and where the service stands, in plain words."""
+
+    expected = (
+        None if expected_deployment_id is None else _cloud_deployment_id(expected_deployment_id)
+    )
+    release = "" if expected is None else f" Release {expected}"
+    if service is None:
+        return f"the Agent's service to run{release or ' its Release'}; no service runs yet"
+    if expected_deployment_id is not None and pending:
+        serving = service.get("deployment_id")
+        current = _cloud_deployment_id(serving) if isinstance(serving, str) else None
+        return (
+            f"the Agent's service to run{release or ' the Release'}; it still runs "
+            f"{'another Release' if current is None else f'Release {current}'}"
+        )
+    status = service.get("status")
+    shown = status if isinstance(status, str) and status in _SERVICE_STATUSES else "starting"
+    return (
+        f"the Agent's service{'' if expected is None else f' on{release}'} to be running; "
+        f"Cayu Cloud reports it as `{shown}`"
+    )
 
 
 def _wait_until_serving(
