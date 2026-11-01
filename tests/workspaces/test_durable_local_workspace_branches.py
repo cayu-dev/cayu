@@ -1923,6 +1923,56 @@ def test_concurrent_terminal_recovery_converges_during_private_cleanup(
         assert lock_calls == 2
 
 
+@pytest.mark.parametrize("authoritative_path_returns", [False, True])
+def test_private_cleanup_converges_when_concurrent_cleanup_settles_before_claim_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authoritative_path_returns: bool,
+) -> None:
+    import cayu.workspaces._local_branch as branch_module
+
+    owner = "a" * 32
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    (private_root / "private.txt").write_bytes(b"discarded")
+    branch_module._write_private_root_owner(private_root, owner)
+    quarantine = private_root.with_name(f"{private_root.name}.cleanup-{owner}")
+    claim_path = branch_module._cleanup_quarantine_claim_path(quarantine)
+    original_read = branch_module._read_cleanup_quarantine_claim
+    original_settle = branch_module._settle_owned_cleanup_quarantine
+    concurrent_cleanup_ran = False
+
+    def settle_concurrently_before_read(parent_fd, path, read_owner):
+        # The losing cleanup has opened the quarantine; the winner now settles it
+        # completely, removing the quarantine and then its claim.
+        nonlocal concurrent_cleanup_ran
+        if path == quarantine and quarantine.is_dir() and not concurrent_cleanup_ran:
+            concurrent_cleanup_ran = True
+            original_settle(parent_fd, quarantine, private_root, owner)
+            assert not quarantine.exists()
+            assert not claim_path.exists()
+            if authoritative_path_returns:
+                private_root.mkdir()
+        return original_read(parent_fd, path, read_owner)
+
+    monkeypatch.setattr(
+        branch_module,
+        "_read_cleanup_quarantine_claim",
+        settle_concurrently_before_read,
+    )
+
+    if authoritative_path_returns:
+        with pytest.raises(branch_module._CleanupQuarantineClaimMissing):
+            branch_module._remove_owned_private_tree(private_root, owner)
+        assert private_root.is_dir()
+    else:
+        branch_module._remove_owned_private_tree(private_root, owner)
+        assert not private_root.exists()
+    assert concurrent_cleanup_ran
+    assert not quarantine.exists()
+    assert not tuple(tmp_path.glob(".cayu-cleanup-*.claim*"))
+
+
 def test_durable_rollback_is_terminal_before_private_cleanup(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = _TemporarySQLiteSessionStore()

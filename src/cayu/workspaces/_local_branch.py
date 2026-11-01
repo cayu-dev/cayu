@@ -6968,23 +6968,35 @@ def _matching_cleanup_claim_or_settled(
             owner,
             owned_identity,
         )
-    except _CleanupQuarantineClaimMissing as missing_claim:
-        for path in (authoritative_path, quarantine):
-            try:
-                os.stat(
-                    path.name,
-                    dir_fd=parent_fd,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                raise WorkspaceBranchFencedError(
-                    "Durable private cleanup settlement is unavailable."
-                ) from error
-            raise missing_claim
-        return True
+    except _CleanupQuarantineClaimMissing:
+        if _owned_cleanup_paths_are_absent(parent_fd, quarantine, authoritative_path):
+            return True
+        raise
     return False
+
+
+def _owned_cleanup_paths_are_absent(
+    parent_fd: int,
+    quarantine: Path,
+    authoritative_path: Path,
+) -> bool:
+    """Return whether neither the owned branch path nor its quarantine exists."""
+
+    for path in (authoritative_path, quarantine):
+        try:
+            os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise WorkspaceBranchFencedError(
+                "Durable private cleanup settlement is unavailable."
+            ) from error
+        return False
+    return True
 
 
 def _write_or_require_cleanup_quarantine_claim(
@@ -7292,7 +7304,15 @@ def _settle_owned_cleanup_quarantine(
                 "Durable private cleanup quarantine is unavailable."
             ) from error
         owned_identity = os.fstat(directory_fd)
-        claim = _read_cleanup_quarantine_claim(parent_fd, path, owner)
+        try:
+            claim = _read_cleanup_quarantine_claim(parent_fd, path, owner)
+        except _CleanupQuarantineClaimMissing:
+            # A concurrent exact cleanup can finish between opening the quarantine
+            # and reading its claim. It removes the quarantine before the claim, so
+            # a missing claim with both owned paths gone means it already settled.
+            if _owned_cleanup_paths_are_absent(parent_fd, path, authoritative_path):
+                return
+            raise
         if claim.device != owned_identity.st_dev or claim.inode != owned_identity.st_ino:
             _restore_unowned_cleanup_quarantine(
                 parent_fd,
