@@ -8,7 +8,7 @@ import json
 import secrets
 from bisect import bisect_left
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -94,6 +94,7 @@ from cayu.sessions import _model_failover_rules as model_failover_rules
 from cayu.sessions import _model_stage_publication as model_stage_publication
 from cayu.sessions import _model_stage_rules as model_stage_rules
 from cayu.sessions import _operation_records as operation_record_rules
+from cayu.sessions import _page_reads as page_reads
 from cayu.sessions import _runtime_publication as publication_contracts
 from cayu.sessions import _runtime_publication_rules as publication_rules
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
@@ -6895,6 +6896,28 @@ class InMemorySessionStore(
     ) -> PendingActionListResult:
         return await memory_session_queries.query_pending_actions(
             self._read_session_query_state, query, checkpoint_root_guard=checkpoint_root_guard
+        )
+
+    async def query_pending_actions_for_sessions(
+        self,
+        session_ids: Sequence[str],
+        query: PendingActionQuery | None = None,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
+    ) -> PendingActionListResult:
+        page = page_reads.page_session_ids(session_ids)
+        query = PendingActionQuery() if query is None else query
+        if type(query) is not PendingActionQuery:
+            raise TypeError("Pending-action queries must be PendingActionQuery instances.")
+        if query.session_id is not None:
+            raise ValueError("A pending-action page query must not name one session.")
+        if not page:
+            return PendingActionListResult()
+        return await memory_session_queries.query_pending_actions(
+            self._read_session_query_state,
+            query,
+            checkpoint_root_guard=checkpoint_root_guard,
+            session_ids=page,
         )
 
     async def append_transcript_messages(

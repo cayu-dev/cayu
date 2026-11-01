@@ -23,6 +23,7 @@ from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.session_metadata import SummaryTone, summary_metadata
 from cayu.sessions import _deadline_replacement as deadline_replacement
+from cayu.sessions import _page_reads as page_reads
 from cayu.sessions import creation_fence
 from cayu.sessions._access_rules import runtime_session_mutation, runtime_session_query
 from cayu.sessions._closure_records import (
@@ -53,6 +54,7 @@ from cayu.storage import _postgres_event_delivery as event_delivery_ops
 from cayu.storage import _postgres_event_publication as event_publication_ops
 from cayu.storage import _postgres_memory_evidence as memory_evidence_ops
 from cayu.storage import _postgres_model_stage as model_stage_ops
+from cayu.storage import _postgres_page_reads as page_read_ops
 from cayu.storage import _postgres_peer_content as peer_content_ops
 from cayu.storage import _postgres_public_authority as public_authority_ops
 from cayu.storage import _postgres_publication as publication_ops
@@ -1533,6 +1535,98 @@ class PostgresSessionStore(
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             return await self._load(cur, session_id)
+
+    async def load_sessions(self, session_ids: Sequence[str]) -> dict[str, Session]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_sessions(page)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await page_read_ops.load_sessions(cur, page)
+
+    async def load_checkpoints(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_checkpoints(page)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            values = await page_read_ops.load_checkpoints(cur, page)
+        return {
+            session_id: copy_durable_json_object(pg_support._json_obj(value), "checkpoint")
+            for session_id, value in values.items()
+        }
+
+    async def summarize_outcomes(self, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().summarize_outcomes(page)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await page_read_ops.summarize_outcomes(cur, page)
+
+    async def query_latest_events(
+        self, session_ids: Sequence[str], event_types: Sequence[EventType]
+    ) -> dict[str, EventRecord]:
+        page = page_reads.page_session_ids(session_ids)
+        types = tuple(EventType(event_type) for event_type in event_types)
+        if not types:
+            raise ValueError("event_types must not be empty.")
+        if await page_reads.page_reads_are_bounded():
+            return await super().query_latest_events(page, types)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await page_read_ops.query_latest_events(cur, page, types)
+
+    async def load_session_operations(
+        self,
+        session_ids: Sequence[str],
+        idempotency_key: str,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
+    ) -> dict[str, dict[str, Any] | None]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_session_operations(
+                page, idempotency_key, checkpoint_root_guard=checkpoint_root_guard
+            )
+        idempotency_key = _reject_reserved_runtime_publication_key(
+            idempotency_key, "idempotency_key", browser_control_read=True
+        )
+        for session_id in page:
+            _require_session_export_target(session_id, idempotency_key)
+        root_key = (
+            "__cayu_no_checkpoint_root_guard__"
+            if checkpoint_root_guard is None
+            else checkpoint_root_guard.key
+        )
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            rows = await page_read_ops.load_session_operation_rows(
+                cur, page, idempotency_key, root_key, CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS
+            )
+        by_id = {row[0]: row for row in rows}
+        records: dict[str, dict[str, Any] | None] = {}
+        for session_id in page:
+            row = by_id.get(session_id)
+            if row is None:
+                continue
+            if checkpoint_root_guard is not None:
+                checkpoint_root_guard.validate(
+                    session_id,
+                    checkpoint_root_field_projection_from_storage(
+                        json_type=row[2], scalar_text=row[3]
+                    ),
+                )
+            records[session_id] = None if row[1] is None else pg_support._json_obj(row[1])
+        return records
+
+    async def count_child_runs(self, parents: Sequence[Session]) -> dict[str, int]:
+        page = page_reads.page_sessions(parents)
+        if await page_reads.page_reads_are_bounded():
+            return await super().count_child_runs(page)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await page_read_ops.count_child_runs(cur, page)
 
     async def load_state(self, session_id: str) -> SessionStateSnapshot | None:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -6327,6 +6421,36 @@ class PostgresSessionStore(
         *,
         checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> PendingActionListResult:
+        return await self._query_pending_actions(
+            query, checkpoint_root_guard=checkpoint_root_guard, session_ids=None
+        )
+
+    async def query_pending_actions_for_sessions(
+        self,
+        session_ids: Sequence[str],
+        query: PendingActionQuery | None = None,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
+    ) -> PendingActionListResult:
+        page = page_reads.page_session_ids(session_ids)
+        query = PendingActionQuery() if query is None else query
+        if type(query) is not PendingActionQuery:
+            raise TypeError("Pending-action queries must be PendingActionQuery instances.")
+        if query.session_id is not None:
+            raise ValueError("A pending-action page query must not name one session.")
+        if not page:
+            return PendingActionListResult()
+        return await self._query_pending_actions(
+            query, checkpoint_root_guard=checkpoint_root_guard, session_ids=page
+        )
+
+    async def _query_pending_actions(
+        self,
+        query: PendingActionQuery | None,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None,
+        session_ids: tuple[str, ...] | None,
+    ) -> PendingActionListResult:
         from cayu.sessions.pending_actions import (
             pending_action_from_records,
             pending_action_matches_query,
@@ -6353,6 +6477,9 @@ class PostgresSessionStore(
         if query.session_id is not None:
             filters.append("cayu_sessions.id = %s")
             params.append(query.session_id)
+        if session_ids is not None:
+            filters.append("cayu_sessions.id = ANY(%s::text[])")
+            params.append(list(session_ids))
         if query.agent_name is not None:
             filters.append("cayu_sessions.agent_name = %s")
             params.append(query.agent_name)

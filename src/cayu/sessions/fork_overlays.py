@@ -11,7 +11,7 @@ executables come from the host's enrollment of the controller.
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Generator, Mapping
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
@@ -434,6 +434,36 @@ async def resolve_fork_lineage_async(
             parent_id = walk.send(await parent_of(parent_id))
     except StopIteration as done:
         return done.value
+
+
+async def resolve_fork_lineages_async(
+    sessions: Sequence[Session],
+    parents_of: Callable[[tuple[str, ...]], Awaitable[Mapping[str, Session | None]]],
+) -> list[ForkLineage]:
+    """``resolve_fork_lineage_async`` for several sessions, one parent read per level.
+
+    Every walk advances together: each round reads the parents all unsettled
+    walks need at once, so a page costs one read per lineage level.
+    """
+
+    walks = [_lineage_walk(session) for session in sessions]
+    results: list[ForkLineage | None] = [None] * len(walks)
+    waiting: dict[int, str] = {}
+
+    def advance(index: int, parent: Session | None) -> None:
+        try:
+            waiting[index] = walks[index].send(parent)
+        except StopIteration as done:
+            results[index] = done.value
+
+    for index in range(len(walks)):
+        advance(index, None)
+    while waiting:
+        parents = await parents_of(tuple(dict.fromkeys(waiting.values())))
+        level, waiting = waiting, {}
+        for index, parent_id in level.items():
+            advance(index, parents.get(parent_id))
+    return [result if result is not None else ForkLineage(None) for result in results]
 
 
 def fork_lineage_for_fork(

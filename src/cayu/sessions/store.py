@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from bisect import bisect_left
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from types import FunctionType, MethodType
@@ -65,6 +65,7 @@ from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions import _model_stage_rules as model_stage_rules
+from cayu.sessions import _page_reads as page_reads
 from cayu.sessions import _runtime_publication as publication_contracts
 from cayu.sessions import _runtime_publication_rules as publication_rules
 from cayu.sessions import _tool_round_publication_rules as tool_publication_rules
@@ -5160,6 +5161,84 @@ class SessionStore(ABC):
         titles. Do not hydrate events, transcripts, checkpoints or whole sessions.
         """
         raise NotImplementedError("Batched session title reads are unsupported.")
+
+    # Page reads. Each takes the session IDs of one page (at most
+    # MAX_PAGE_READ_SESSIONS) and answers for all of them. The defaults loop over
+    # the single-session methods; native stores override them to read a page in
+    # a fixed number of queries. Results match the single-session reads.
+
+    async def load_sessions(self, session_ids: Sequence[str]) -> dict[str, Session]:
+        """Load several sessions by ID; IDs with no session are absent from the result."""
+
+        return await page_reads.load_sessions_one_by_one(self, session_ids)
+
+    async def load_checkpoints(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Load the latest checkpoint of several sessions; sessions without one are absent."""
+
+        return await page_reads.load_checkpoints_one_by_one(self, session_ids)
+
+    async def summarize_outcomes(self, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
+        """``summarize_outcome`` for several sessions; sessions not found are absent."""
+
+        return await page_reads.summarize_outcomes_one_by_one(self, session_ids)
+
+    async def load_session_operations(
+        self,
+        session_ids: Sequence[str],
+        idempotency_key: str,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
+    ) -> dict[str, dict[str, Any] | None]:
+        """``load_session_operation`` for several sessions and one key.
+
+        Every session found maps to its record, or ``None`` when it has none.
+        Sessions not found are absent.
+        """
+
+        return await page_reads.load_session_operations_one_by_one(
+            self, session_ids, idempotency_key, checkpoint_root_guard=checkpoint_root_guard
+        )
+
+    async def query_latest_events(
+        self, session_ids: Sequence[str], event_types: Sequence[EventType]
+    ) -> dict[str, EventRecord]:
+        """The latest event of the given types in each session; sessions with none are absent."""
+
+        if not event_types:
+            raise ValueError("event_types must not be empty.")
+        return await page_reads.query_latest_events_one_by_one(self, session_ids, event_types)
+
+    async def count_child_runs(self, parents: Sequence[Session]) -> dict[str, int]:
+        """Count each parent's direct, non-fork child runs.
+
+        A child counts when its retained run lineage names the parent's exact
+        incarnation. Every parent maps to a count, zero included.
+        """
+
+        return await page_reads.count_child_runs_one_by_one(self, parents)
+
+    async def query_pending_actions_for_sessions(
+        self,
+        session_ids: Sequence[str],
+        query: PendingActionQuery | None = None,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
+    ) -> PendingActionListResult:
+        """One page of ``query_pending_actions`` restricted to these sessions.
+
+        ``query`` must not name a session. Follow ``next_cursor`` while
+        ``has_more`` to read every session's actions; a cursor belongs to the
+        same session IDs and query. Each action and issue names its session.
+        """
+
+        query = PendingActionQuery() if query is None else query
+        if type(query) is not PendingActionQuery:
+            raise TypeError("Pending-action queries must be PendingActionQuery instances.")
+        if query.session_id is not None:
+            raise ValueError("A pending-action page query must not name one session.")
+        return await page_reads.query_pending_actions_one_by_one(
+            self, session_ids, query, checkpoint_root_guard=checkpoint_root_guard
+        )
 
     async def aggregate_environment_activity(
         self, query: EnvironmentActivityQuery

@@ -319,13 +319,26 @@ def test_incomplete_pending_evidence_cannot_be_filtered_into_success(monkeypatch
         store = app.session_store
         original = store.query_pending_actions
 
+        original_page = store.query_pending_actions_for_sessions
+
+        async def issues(session_ids):
+            return [
+                PendingActionIssue.source_invalid(
+                    PendingActionSession.from_session(await store.load(session_id))
+                )
+                for session_id in session_ids
+            ]
+
         async def incomplete(query=None, **kwargs):
             page = await original(query, **kwargs)
-            session = await store.load(query.session_id)
-            issue = PendingActionIssue.source_invalid(PendingActionSession.from_session(session))
-            return page.model_copy(update={"issues": [issue]})
+            return page.model_copy(update={"issues": await issues([query.session_id])})
+
+        async def incomplete_page(session_ids, query=None, **kwargs):
+            page = await original_page(session_ids, query, **kwargs)
+            return page.model_copy(update={"issues": await issues(session_ids)})
 
         monkeypatch.setattr(store, "query_pending_actions", incomplete)
+        monkeypatch.setattr(store, "query_pending_actions_for_sessions", incomplete_page)
         async with client_for(app) as client:
             response = await client.get(
                 "/api/sessions",

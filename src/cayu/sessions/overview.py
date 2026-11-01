@@ -7,12 +7,12 @@ its callers; neither the application facade nor a server is a dependency here.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import Field, model_validator
 
@@ -38,11 +38,12 @@ from cayu.sessions._run_identity import (
     session_run_lineage,
 )
 from cayu.sessions._supervision_projection import RELEASE_MARKER_EVENT_TYPES
-from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.fork_overlays import resolve_fork_lineage_async
+from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.fork_overlays import resolve_fork_lineage_async, resolve_fork_lineages_async
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.pending_action_contracts import (
     MAX_PENDING_ACTION_RESULT_BYTES,
+    PendingActionListResult,
     PendingActionQuery,
     PendingActionRecord,
 )
@@ -277,10 +278,10 @@ class SessionOverviewReader:
         """
 
         self._loaded.clear()
-        loaded = await gather_in_order(
-            [lambda session_id=session_id: self._load(session_id) for session_id in session_ids]
-        )
-        sessions = [session for session in loaded if session is not None]
+        await self._load_many(session_ids)
+        sessions = [
+            session for session_id in session_ids if (session := self._loaded.get(session_id))
+        ]
         if not sessions:
             return ()
         query = EventQuery(session_ids=tuple(session.id for session in sessions))
@@ -294,26 +295,230 @@ class SessionOverviewReader:
         cost_by_session = (
             {} if cost is None else {totals.session_id: totals for totals in cost.session_totals}
         )
-
-        async def summarize(session: Session) -> SessionOverviewFacts | None:
-            run = await self._run(
-                session, usage_by_session.get(session.id), cost_by_session.get(session.id)
-            )
-            # Accounting and outcome reads are separate store snapshots. A
-            # replacement must never donate its cost or status to the old run.
-            current = await self._store.load(session.id)
-            if (
-                run is not None
-                and current is not None
-                and current.instance_id == session.instance_id
-            ):
-                return run
-            return None
-
-        runs = await gather_in_order(
-            [lambda session=session: summarize(session) for session in sessions]
+        # Every read below covers the whole page, so a page costs the same
+        # number of store reads however many sessions it holds.
+        while sessions:
+            try:
+                outcomes = await self._store.summarize_outcomes(
+                    tuple(session.id for session in sessions)
+                )
+                break
+            except KeyError:
+                current = await self._current(sessions)
+                if len(current) == len(sessions):
+                    raise
+                sessions = [session for session in sessions if session.id in current]
+        if not sessions:
+            return ()
+        if unsummarized := [session for session in sessions if session.id not in outcomes]:
+            # A row can disappear during the preceding accounting reads or
+            # inside this read. Only a confirmed missing/replaced incarnation
+            # explains the absence; otherwise the store failed to summarize it.
+            if still := await self._current(unsummarized):
+                raise KeyError(f"Session not found: {sorted(still)[0]}")
+            sessions = [session for session in sessions if session.id in outcomes]
+            if not sessions:
+                return ()
+        pending = await self._pending_page(
+            [session for session in sessions if session.status in _PENDING_ACTION_STATUSES]
         )
-        return tuple(run for run in runs if run is not None)
+        evidence = [pending.get(session.id, _PendingEvidence()) for session in sessions]
+        waits = await self._waiting_page(list(zip(sessions, evidence, strict=True)), 0)
+        lineages = await resolve_fork_lineages_async(sessions, self._parents)
+        markers = await self._store.query_latest_events(
+            tuple(session.id for session in sessions), RELEASE_MARKER_EVENT_TYPES
+        )
+        runs = []
+        for session, actions, (waiting, children), lineage in zip(
+            sessions, evidence, waits, lineages, strict=True
+        ):
+            marker = markers.get(session.id)
+            release = None if marker is None else recorded_release_identity(marker.event.payload)
+            runs.append(
+                SessionOverviewFacts(
+                    session=session,
+                    status=_run_status(
+                        session.status,
+                        waiting.kinds,
+                        delegated=any(
+                            action.delegated_action is not None for action in actions.actions
+                        ),
+                    ),
+                    outcome=outcomes[session.id],
+                    usage=usage_by_session.get(session.id),
+                    cost=cost_by_session.get(session.id),
+                    forked=lineage.forked,
+                    fork_controller=lineage.owner() if lineage.settled else None,
+                    release_id=None if release is None else release.id,
+                    waiting=tuple(zip(actions.actions, children, strict=True)),
+                    pending_complete=waiting.complete,
+                )
+            )
+        # Accounting and outcome reads are separate store snapshots. A
+        # replacement must never donate its cost or status to the old run.
+        current = await self._current(sessions)
+        return tuple(run for run in runs if run.session.id in current)
+
+    async def _load_many(self, session_ids: Iterable[str]) -> None:
+        """Cache every session not yet loaded for this page with one store read."""
+
+        missing = [
+            session_id
+            for session_id in dict.fromkeys(session_ids)
+            if session_id not in self._loaded
+        ]
+        if missing:
+            loaded = await self._store.load_sessions(missing)
+            for session_id in missing:
+                self._loaded[session_id] = loaded.get(session_id)
+
+    async def _parents(self, session_ids: tuple[str, ...]) -> dict[str, Session | None]:
+        await self._load_many(session_ids)
+        return {session_id: self._loaded.get(session_id) for session_id in session_ids}
+
+    async def _current(self, sessions: Sequence[Session]) -> set[str]:
+        """The sessions whose selected incarnation is still current, from one uncached read."""
+
+        if not sessions:
+            return set()
+        current = await self._store.load_sessions(tuple(session.id for session in sessions))
+        return {
+            session.id
+            for session in sessions
+            if (row := current.get(session.id)) is not None
+            and row.instance_id == session.instance_id
+        }
+
+    async def _pending_page(self, sessions: Sequence[Session]) -> dict[str, _PendingEvidence]:
+        """``_pending`` for several sessions, reading their pages together."""
+
+        if not sessions:
+            return {}
+        collected = _PendingCollector(sessions)
+        cursor = None
+        cursors: set[str] = set()
+        while True:
+            page = await self._store.query_pending_actions_for_sessions(
+                collected.session_ids,
+                PendingActionQuery(
+                    limit=200, cursor=cursor, max_result_bytes=MAX_PENDING_ACTION_RESULT_BYTES
+                ),
+            )
+            collected.add(page)
+            if not page.has_more:
+                evidence = collected.evidence()
+                if cursors:
+                    # Cross-session cursors sort by mutable activity time. A
+                    # session updated between pages may move before the cursor;
+                    # reconcile those rows through their single-session read.
+                    current = await self._store.load_sessions(collected.session_ids)
+                    changed = [
+                        session
+                        for session in sessions
+                        if (row := current.get(session.id)) is not None
+                        and row.instance_id == session.instance_id
+                        and row.updated_at != session.updated_at
+                    ]
+                    refreshed = await gather_in_order(
+                        lambda session=session: self._pending(session) for session in changed
+                    )
+                    evidence.update(
+                        zip((session.id for session in changed), refreshed, strict=True)
+                    )
+                return evidence
+            if page.next_cursor is None or page.next_cursor in cursors:
+                raise SessionOverviewUnavailable("Pending session paging did not advance.")
+            cursors.add(page.next_cursor)
+            cursor = page.next_cursor
+
+    async def _waiting_page(
+        self, items: Sequence[tuple[Session, _PendingEvidence]], depth: int
+    ) -> list[tuple[_WaitingEvidence, tuple[Session | None, ...]]]:
+        """``_waiting_kinds`` for several sessions, one level of delegation at a time.
+
+        Each item also gets the verified child of each of its pending actions,
+        ``None`` for an action that delegates to no current child.
+        """
+
+        if not items:
+            return []
+        # A wait is followed only so deep; the page's own level always resolves
+        # its children, since each overview names the child it waits on.
+        resolved = (
+            await self._delegated_children(
+                [
+                    (session, action)
+                    for session, pending in items
+                    for action in pending.actions
+                    if action.delegated_action is not None
+                ]
+            )
+            if depth < MAX_FOREGROUND_CHAIN_DEPTH
+            else {}
+        )
+        followed = list(
+            {child.id: child for child in resolved.values() if child is not None}.values()
+        )
+        child_pending = await self._pending_page(followed)
+        child_waits = await self._waiting_page(
+            [(child, child_pending[child.id]) for child in followed], depth + 1
+        )
+        waiting_by_child = {
+            child.id: waiting for child, (waiting, _) in zip(followed, child_waits, strict=True)
+        }
+        # The retained waits were verified before the deeper reads. Even an
+        # empty or correctly bound page can outlive its child; use an uncached
+        # fence before contributing any descendant state.
+        current = await self._current(followed)
+        results = []
+        for session, pending in items:
+            kinds: set[PendingActionKind] = set()
+            complete = pending.complete
+            children = tuple(resolved.get((session.id, id(action))) for action in pending.actions)
+            for action, child in zip(pending.actions, children, strict=True):
+                if action.delegated_action is None:
+                    kinds.add(action.kind)
+                elif child is not None:
+                    if child.id not in current:
+                        complete = False
+                        continue
+                    kinds |= waiting_by_child[child.id].kinds
+                    complete = complete and waiting_by_child[child.id].complete
+            results.append((_WaitingEvidence(frozenset(kinds), complete), children))
+        return results
+
+    async def _delegated_children(
+        self, delegated: Sequence[tuple[Session, PendingActionRecord]]
+    ) -> dict[tuple[str, int], Session | None]:
+        """``_delegated_child`` for several actions, keyed by parent ID and action identity."""
+
+        if not delegated:
+            return {}
+        references = [
+            (parent, action, reference.child_session_id)
+            for parent, action in delegated
+            if (reference := action.delegated_action) is not None
+        ]
+        await self._load_many(child_id for _, _, child_id in references)
+        candidates = [
+            (parent, action, child)
+            for parent, action, child_id in references
+            if (child := self._loaded.get(child_id)) is not None
+        ]
+        checkpoints = (
+            await self._store.load_checkpoints(
+                tuple(dict.fromkeys(parent.id for parent, _, _ in candidates))
+            )
+            if candidates
+            else {}
+        )
+        resolved: dict[tuple[str, int], Session | None] = {
+            (parent.id, id(action)): None for parent, action in delegated
+        }
+        for parent, action, child in candidates:
+            if _wait_matches(checkpoints.get(parent.id), parent, child):
+                resolved[(parent.id, id(action))] = child
+        return resolved
 
     async def counts(
         self,
@@ -485,10 +690,8 @@ class SessionOverviewReader:
         )
 
     async def _pending(self, session: Session) -> _PendingEvidence:
-        actions: list[PendingActionRecord] = []
-        complete = session.instance_id is not None
+        collected = _PendingCollector((session,))
         cursor = None
-        seen: set[str] = set()
         cursors: set[str] = set()
         while True:
             page = await self._store.query_pending_actions(
@@ -499,25 +702,9 @@ class SessionOverviewReader:
                     max_result_bytes=MAX_PENDING_ACTION_RESULT_BYTES,
                 )
             )
-            if page.issues:
-                complete = False
-            for action in page.actions:
-                # A pending query is keyed by reusable ID. Never attach another
-                # incarnation's actions to the session this reader selected.
-                if (
-                    session.instance_id is None
-                    or action.session.id != session.id
-                    or action.session.instance_id != session.instance_id
-                ):
-                    complete = False
-                    continue
-                if action.attention_id is None:
-                    actions.append(action)
-                elif action.attention_id not in seen:
-                    actions.append(action)
-                    seen.add(action.attention_id)
+            collected.add(page)
             if not page.has_more:
-                return _PendingEvidence(tuple(actions), complete)
+                return collected.evidence()[session.id]
             if page.next_cursor is None or page.next_cursor in cursors:
                 raise SessionOverviewUnavailable("Pending session paging did not advance.")
             cursors.add(page.next_cursor)
@@ -568,30 +755,7 @@ class SessionOverviewReader:
         return child if await self._retained_wait_matches(parent, child) else None
 
     async def _retained_wait_matches(self, parent: Session, child: Session) -> bool:
-        # A reused child ID can have the same parent. Verify the exact wait's
-        # retained incarnation as well as the relationship, never just names.
-        wait, _ = foreground_child_state_from_checkpoint(
-            await self._store.load_checkpoint(parent.id)
-        )
-        return (
-            wait is not None
-            and wait.parent_effect.session_id == parent.id
-            and wait.parent_effect.session_instance_id == parent.instance_id
-            and wait.child_session_id == child.id
-            and wait.child_session_instance_id == child.instance_id
-        )
-
-    async def _release_id(self, session_id: str) -> str | None:
-        markers = await self._store.query_events(
-            EventQuery(
-                session_id=session_id,
-                event_types=RELEASE_MARKER_EVENT_TYPES,
-                order_by=EventOrder.SEQUENCE_DESC,
-                limit=1,
-            )
-        )
-        release = None if not markers else recorded_release_identity(markers[0].event.payload)
-        return None if release is None else release.id
+        return _wait_matches(await self._store.load_checkpoint(parent.id), parent, child)
 
     async def _state(self, session: Session) -> _StateEvidence:
         """Shared state evidence without outcome or display-only joins."""
@@ -608,41 +772,68 @@ class SessionOverviewReader:
         )
         return _StateEvidence(status, waiting, waiting_kinds.complete)
 
-    async def _run(
-        self,
-        session: Session,
-        usage: SessionUsageSummary | None,
-        cost: SessionCostTotals | None,
-    ) -> SessionOverviewFacts | None:
-        try:
-            outcome = await self._store.summarize_outcome(session.id)
-        except KeyError:
-            # A row can disappear during the preceding accounting reads or
-            # inside this read. Only a confirmed missing/replaced incarnation
-            # explains the error; an unrelated store failure must propagate.
-            current = await self._store.load(session.id)
-            if current is None or current.instance_id != session.instance_id:
-                return None
-            raise
-        state = await self._state(session)
-        lineage = await resolve_fork_lineage_async(session, self._load)
-        return SessionOverviewFacts(
-            session=session,
-            status=state.status,
-            outcome=outcome,
-            usage=usage,
-            cost=cost,
-            forked=lineage.forked,
-            fork_controller=lineage.owner() if lineage.settled else None,
-            release_id=await self._release_id(session.id),
-            waiting=tuple(
-                [
-                    (action, await self._delegated_child(session, action))
-                    for action in state.pending.actions
-                ]
-            ),
-            pending_complete=state.complete,
-        )
+
+class _PendingCollector:
+    """Pending evidence for the sessions of one query, gathered page by page."""
+
+    def __init__(self, sessions: Iterable[Session]) -> None:
+        self._sessions = {session.id: session for session in sessions}
+        self._actions: dict[str, list[PendingActionRecord]] = {key: [] for key in self._sessions}
+        self._seen: dict[str, set[str]] = {key: set() for key in self._sessions}
+        self._complete = {
+            key: session.instance_id is not None for key, session in self._sessions.items()
+        }
+
+    @property
+    def session_ids(self) -> tuple[str, ...]:
+        return tuple(self._sessions)
+
+    def _incomplete(self, session_id: str) -> None:
+        if session_id in self._complete:
+            self._complete[session_id] = False
+        else:
+            # Evidence that names no queried session cannot be attributed.
+            self._complete = dict.fromkeys(self._complete, False)
+
+    def add(self, page: PendingActionListResult) -> None:
+        for issue in page.issues:
+            self._incomplete(issue.session_id)
+        for action in page.actions:
+            session = self._sessions.get(action.session.id)
+            # A pending query is keyed by reusable ID. Never attach another
+            # incarnation's actions to the session this reader selected.
+            if (
+                session is None
+                or session.instance_id is None
+                or action.session.instance_id != session.instance_id
+            ):
+                self._incomplete(action.session.id)
+                continue
+            seen = self._seen[session.id]
+            if action.attention_id is None:
+                self._actions[session.id].append(action)
+            elif action.attention_id not in seen:
+                self._actions[session.id].append(action)
+                seen.add(action.attention_id)
+
+    def evidence(self) -> dict[str, _PendingEvidence]:
+        return {
+            session_id: _PendingEvidence(tuple(actions), self._complete[session_id])
+            for session_id, actions in self._actions.items()
+        }
+
+
+def _wait_matches(checkpoint: dict[str, Any] | None, parent: Session, child: Session) -> bool:
+    # A reused child ID can have the same parent. Verify the exact wait's
+    # retained incarnation as well as the relationship, never just names.
+    wait, _ = foreground_child_state_from_checkpoint(checkpoint)
+    return (
+        wait is not None
+        and wait.parent_effect.session_id == parent.id
+        and wait.parent_effect.session_instance_id == parent.instance_id
+        and wait.child_session_id == child.id
+        and wait.child_session_instance_id == child.instance_id
+    )
 
 
 # A run waiting on several items reports the first of these it waits on.

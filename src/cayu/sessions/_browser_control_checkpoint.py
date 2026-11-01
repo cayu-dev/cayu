@@ -150,16 +150,21 @@ class BrowserControlCloseCheckpointMutation(BrowserControlCheckpointMutation):
 _MUTATION: ContextVar[BrowserControlCheckpointMutation | None] = ContextVar(
     "cayu_exact_browser_control_checkpoint_mutation", default=None
 )
-_READ_SESSION: ContextVar[str | None] = ContextVar(
-    "cayu_browser_control_read_session", default=None
+_READ_SESSION: ContextVar[frozenset[str]] = ContextVar(
+    "cayu_browser_control_read_session", default=frozenset()
 )
 
 
 @contextmanager
-def browser_control_checkpoint_read_scope(session_id: str) -> Iterator[None]:
-    """Expose private control evidence to one runtime-owned admission callback."""
+def browser_control_checkpoint_read_scope(*session_ids: str) -> Iterator[None]:
+    """Expose private control evidence to one runtime-owned admission callback.
 
-    token = _READ_SESSION.set(session_id)
+    A page read names every session of the page; other callers name one.
+    """
+
+    if not all(type(session_id) is str for session_id in session_ids):
+        raise TypeError("Browser control read scopes name sessions by ID.")
+    token = _READ_SESSION.set(frozenset(session_ids))
     try:
         yield
     finally:
@@ -189,7 +194,7 @@ def browser_control_checkpoint_mutation_scope(
 def browser_control_checkpoint_visible(*, session_id: str) -> bool:
     mutation = _MUTATION.get()
     return (mutation is not None and mutation.session_id == session_id) or (
-        _READ_SESSION.get() == session_id
+        session_id in _READ_SESSION.get()
     )
 
 

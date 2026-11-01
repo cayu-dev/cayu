@@ -88,9 +88,24 @@ def test_counts_skip_presentation_reads_and_preserve_old_usage(session_store_cas
                 calls[f"pending:{query.session_id}"] += 1
                 return await pending(query, **kwargs)
 
+            outcomes = store.summarize_outcomes
+            latest = store.query_latest_events
+
+            async def observed_outcomes(*args, **kwargs):
+                calls["outcome"] += 1
+                return await outcomes(*args, **kwargs)
+
+            async def observed_latest(session_ids, event_types):
+                if tuple(event_types) == RELEASE_MARKER_EVENT_TYPES:
+                    calls["release"] += 1
+                return await latest(session_ids, event_types)
+
             monkeypatch.setattr(store, "summarize_outcome", observed_outcome)
             monkeypatch.setattr(store, "query_events", observed_events)
             monkeypatch.setattr(store, "query_pending_actions", observed_pending)
+            # The overview page reads outcomes and releases a page at a time.
+            monkeypatch.setattr(store, "summarize_outcomes", observed_outcomes)
+            monkeypatch.setattr(store, "query_latest_events", observed_latest)
             async with _client(app, pricing=pricing) as client:
                 # The sibling full overview still owns the detailed presentation.
                 listing = await client.get("/api/sessions", params={"include": "overview"})
@@ -366,17 +381,6 @@ async def _delegated_replacement_scenario(
 
     from cayu.approvals import ToolApprovalDecision, ToolApprovalRequest, UserInputResponse
     from cayu.server.cloud_reporting import CLOUD_READER_TOKEN_SHA256_VARIABLE
-
-    if ordered:
-        # The barrier below must catch the root's walk down its delegated chain.
-        # A page reads its sessions concurrently, which would let it catch another
-        # session's read of the same child instead, so this scripted interleaving
-        # reads them one at a time.
-        async def in_turn(calls, *, limit=1):
-            return [await call() for call in calls]
-
-        monkeypatch.setattr("cayu.sessions.overview.gather_in_order", in_turn)
-        monkeypatch.setattr("cayu.server._session_overview.gather_in_order", in_turn)
     from cayu.sessions.overview import SessionOverviewReader
 
     monkeypatch.setenv(CLOUD_READER_TOKEN_SHA256_VARIABLE, _digest(TOKEN))
@@ -392,28 +396,53 @@ async def _delegated_replacement_scenario(
             target = by_agent["middle" if depth == 1 else "leaf"]
             old = await store.load(target)
             native = store.query_pending_actions
+            native_page = store.query_pending_actions_for_sessions
             delegated = SessionOverviewReader._delegated_child
+            delegated_page = SessionOverviewReader._delegated_children
             reached, release = asyncio.Event(), asyncio.Event()
             verified = False
 
-            async def observed_delegation(self, parent, action):
+            def observe(child):
                 nonlocal verified
-                child = await delegated(self, parent, action)
                 if child is not None and child.id == target:
                     assert child.instance_id == old.instance_id
                     verified = True
+
+            # Counts walk one session at a time; overview pages walk a level
+            # of the page at once. Catch the target's read after either verifies it.
+            async def observed_delegation(self, parent, action):
+                child = await delegated(self, parent, action)
+                observe(child)
                 return child
 
-            async def paused(query=None, **kwargs):
-                if query.session_id != target or not verified or reached.is_set():
-                    return await native(query, **kwargs)
-                page = await native(query, **kwargs) if change == "replace_after" else None
+            async def observed_page_delegation(self, delegations):
+                children = await delegated_page(self, delegations)
+                for child in children.values():
+                    observe(child)
+                return children
+
+            async def hold(read, wanted):
+                if not wanted or not verified or reached.is_set():
+                    return await read()
+                page = await read() if change == "replace_after" else None
                 reached.set()
                 await release.wait()
-                return page if page is not None else await native(query, **kwargs)
+                return page if page is not None else await read()
+
+            async def paused(query=None, **kwargs):
+                return await hold(lambda: native(query, **kwargs), query.session_id == target)
+
+            async def paused_page(session_ids, query=None, **kwargs):
+                return await hold(
+                    lambda: native_page(session_ids, query, **kwargs), target in session_ids
+                )
 
             monkeypatch.setattr(SessionOverviewReader, "_delegated_child", observed_delegation)
+            monkeypatch.setattr(
+                SessionOverviewReader, "_delegated_children", observed_page_delegation
+            )
             monkeypatch.setattr(store, "query_pending_actions", paused)
+            monkeypatch.setattr(store, "query_pending_actions_for_sessions", paused_page)
             path, params, headers = {
                 "counts": (PATH, {}, {}),
                 "overview": ("/api/sessions", {"ids": "root", "include": "overview"}, {}),
@@ -423,7 +452,9 @@ async def _delegated_replacement_scenario(
             await asyncio.wait_for(reached.wait(), 5)
             # Do not hold the replacement writer inside the reader's test barrier.
             monkeypatch.setattr(store, "query_pending_actions", native)
+            monkeypatch.setattr(store, "query_pending_actions_for_sessions", native_page)
             monkeypatch.setattr(SessionOverviewReader, "_delegated_child", delegated)
+            monkeypatch.setattr(SessionOverviewReader, "_delegated_children", delegated_page)
             if change != "same":
                 leaf = by_agent["leaf"]
                 approval = await _pending(app, leaf)

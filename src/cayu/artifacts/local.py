@@ -13,7 +13,7 @@ import shutil
 import stat
 import sys
 import unicodedata
-from collections.abc import Awaitable, Callable, Generator, Iterator
+from collections.abc import Awaitable, Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import copy_context
 from itertools import islice
@@ -68,6 +68,7 @@ from cayu.artifacts.base import (
     ArtifactStoreUnavailableError,
     InvalidArtifactIdError,
     _require_matching_artifact,
+    artifact_count_session_ids,
 )
 from cayu.artifacts.settlement import (
     ArtifactWriteSettlementFailureCode,
@@ -314,6 +315,25 @@ class LocalArtifactStore(ArtifactStore):
                 agent_name,
                 environment_name,
                 validated_limit,
+            )
+        except ArtifactStoreUnavailableError:
+            raise
+        except OSError as exc:
+            raise ArtifactStoreUnavailableError(
+                "Local artifact store could not list artifacts."
+            ) from exc
+
+    @runtime_artifact_operation("list")
+    async def count_session_artifacts(self, session_ids: Sequence[str]) -> dict[str, int]:
+        page = tuple(
+            require_unicode_scalar_text(session_id, "session_id")
+            for session_id in artifact_count_session_ids(session_ids)
+        )
+        if not page:
+            return {}
+        try:
+            return await asyncio.to_thread(
+                _count_session_artifacts, self.root, self._root_identity, page
             )
         except ArtifactStoreUnavailableError:
             raise
@@ -1401,6 +1421,17 @@ def _list_artifacts(
         if filters.matches(artifact):
             inventory.add(artifact)
     return inventory.result()
+
+
+def _count_session_artifacts(
+    root: Path, root_identity: tuple[int, int], session_ids: tuple[str, ...]
+) -> dict[str, int]:
+    # One inventory pass counts every session of the page.
+    counts = dict.fromkeys(session_ids, 0)
+    for artifact in _iter_artifacts(root, root_identity):
+        if artifact.scope == ArtifactScope.SESSION and artifact.session_id in counts:
+            counts[artifact.session_id] += 1
+    return counts
 
 
 def _iter_artifacts(

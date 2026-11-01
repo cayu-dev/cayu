@@ -382,8 +382,10 @@ def test_overview_browser_requires_private_checkpoint_authority():
 def test_overview_artifacts_deduplicate_registered_store_and_refuse_partial_counts(
     tmp_path, monkeypatch
 ):
+    from functools import partial
+
     from cayu.artifacts import LocalArtifactStore
-    from cayu.artifacts.base import ArtifactListResult
+    from cayu.artifacts.base import ArtifactListResult, ArtifactStore
     from cayu.environments import Environment, EnvironmentSpec
 
     app = _app()
@@ -403,9 +405,23 @@ def test_overview_artifacts_deduplicate_registered_store_and_refuse_partial_coun
         assert response.status_code == 200
         assert response.json()["overviews"][0]["uses"]["artifacts"] == "3"
 
+        async def missing_session(session_ids):
+            return {}
+
+        monkeypatch.setattr(artifacts, "count_session_artifacts", missing_session)
+        response = client.get("/api/sessions", params={"include": "overview"})
+        assert response.status_code == 503
+        assert "overviews" not in response.json()
+
+        # A store that keeps the per-session default refuses an incomplete listing.
         async def incomplete(**kwargs):
             return ArtifactListResult(artifacts=(), total_count=None, truncated=True)
 
+        monkeypatch.setattr(
+            artifacts,
+            "count_session_artifacts",
+            partial(ArtifactStore.count_session_artifacts, artifacts),
+        )
         monkeypatch.setattr(artifacts, "list", incomplete)
         response = client.get("/api/sessions", params={"include": "overview"})
         assert response.status_code == 503

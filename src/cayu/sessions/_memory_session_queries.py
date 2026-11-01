@@ -466,6 +466,7 @@ async def query_pending_actions(
     query: PendingActionQuery | None = None,
     *,
     checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
+    session_ids: tuple[str, ...] | None = None,
 ) -> PendingActionListResult:
     from cayu.sessions.pending_actions import (
         PENDING_ACTION_CHECKPOINT_KEYS,
@@ -493,6 +494,8 @@ async def query_pending_actions(
             candidate_ids = {query.session_id}
         else:
             candidate_ids = set()
+        if session_ids is not None:
+            candidate_ids = candidate_ids & set(session_ids)
         candidates = [
             session
             for session_id in candidate_ids

@@ -27,8 +27,9 @@ __all__ = ["conformance_postgres_dsn", "session_store_case"]
 
 @pytest.mark.store_semantics
 @pytest.mark.parametrize("mode", ["delete", "replace", "unrelated"])
+@pytest.mark.parametrize("read_kind", ["browser", "outcomes"])
 def test_browser_enrichment_reconciles_only_confirmed_identity_loss(
-    session_store_case, monkeypatch, mode
+    session_store_case, monkeypatch, mode, read_kind
 ):
     async def scenario():
         store = await _open_store(session_store_case)
@@ -36,19 +37,23 @@ def test_browser_enrichment_reconciles_only_confirmed_identity_loss(
             app = _app(store)
             await _start(app, "gone", "writer")
             await _start(app, "kept", "writer")
-            original = store.load_session_operation
+            method = "load_session_operations" if read_kind == "browser" else "summarize_outcomes"
+            original = getattr(store, method)
             reached = asyncio.Event()
             release = asyncio.Event()
 
-            async def paused_read(session_id, operation_id):
-                if session_id == "gone":
+            # The page reads every row's browser receipt at once.
+            async def paused_read(session_ids, *args, **kwargs):
+                if "gone" in session_ids:
                     reached.set()
                     await release.wait()
                     if mode == "unrelated":
                         raise KeyError("unrelated-store-failure")
-                return await original(session_id, operation_id)
+                    if read_kind == "outcomes":
+                        raise KeyError("Session not found: gone")
+                return await original(session_ids, *args, **kwargs)
 
-            monkeypatch.setattr(store, "load_session_operation", paused_read)
+            monkeypatch.setattr(store, method, paused_read)
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(
                     app=create_server(app, config=ServerConfig.local_development()),
@@ -90,14 +95,27 @@ def test_cloud_advances_past_pending_issues_while_control_plane_refuses_partial_
         store = app.session_store
         original = store.query_pending_actions
 
+        original_page = store.query_pending_actions_for_sessions
+        flagged = "leaf" if delegated else "writer"
+
+        async def issues(session_ids):
+            sessions = [await store.load(session_id) for session_id in session_ids]
+            return [
+                PendingActionIssue.source_invalid(PendingActionSession.from_session(session))
+                for session in sessions
+                if session is not None and session.agent_name == flagged
+            ]
+
         async def incomplete(query=None, **kwargs):
             page = await original(query, **kwargs)
-            session = await store.load(query.session_id)
-            if session is not None and session.agent_name == ("leaf" if delegated else "writer"):
-                issue = PendingActionIssue.source_invalid(
-                    PendingActionSession.from_session(session)
-                )
-                return page.model_copy(update={"issues": [issue]})
+            if flagged_issues := await issues([query.session_id]):
+                return page.model_copy(update={"issues": flagged_issues})
+            return page
+
+        async def incomplete_page(session_ids, query=None, **kwargs):
+            page = await original_page(session_ids, query, **kwargs)
+            if flagged_issues := await issues(session_ids):
+                return page.model_copy(update={"issues": [*page.issues, *flagged_issues]})
             return page
 
         async with httpx.AsyncClient(
@@ -111,6 +129,7 @@ def test_cloud_advances_past_pending_issues_while_control_plane_refuses_partial_
             normal = await client.get(path, headers=_bearer(TOKEN))
             assert normal.status_code == 200
             monkeypatch.setattr(store, "query_pending_actions", incomplete)
+            monkeypatch.setattr(store, "query_pending_actions_for_sessions", incomplete_page)
             response = await client.get(path, headers=_bearer(TOKEN))
             assert response.status_code == 200, response.text
             assert response.json() == normal.json()
@@ -195,5 +214,42 @@ def test_counts_stop_at_upper_creation_boundary_before_enrichment(monkeypatch):
             assert response.json()["running_now"] == "1"
             assert set(enriched) == {"older-running", "inside"}
             assert len(calls) == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.store_semantics
+def test_pending_pagination_rechecks_sessions_that_move_before_its_cursor(
+    session_store_case, monkeypatch
+):
+    from cayu.sessions.overview import SessionOverviewReader, SessionOverviewStatus
+
+    async def scenario():
+        store = await _open_store(session_store_case)
+        try:
+            app = _app(store)
+            await _start(app, "older", "approver")
+            await _start(app, "newer", "approver")
+            original = store.query_pending_actions_for_sessions
+            moved = False
+
+            async def move_after_first_page(session_ids, query, **kwargs):
+                nonlocal moved
+                page = await original(session_ids, query.model_copy(update={"limit": 1}), **kwargs)
+                if not moved and page.has_more:
+                    moved = True
+                    seen = {action.session.id for action in page.actions}
+                    remaining = next(sid for sid in session_ids if sid not in seen)
+                    await store.update_metadata(remaining, {"changed_during_page": True})
+                return page
+
+            monkeypatch.setattr(store, "query_pending_actions_for_sessions", move_after_first_page)
+            rows = await SessionOverviewReader(store).read(("older", "newer"))
+            assert moved
+            assert len(rows) == 2
+            assert all(row.status is SessionOverviewStatus.WAITING_APPROVAL for row in rows)
+            assert all(row.pending_complete for row in rows)
+        finally:
+            await _close_store(store)
 
     asyncio.run(scenario())

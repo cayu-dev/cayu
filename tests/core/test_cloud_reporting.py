@@ -426,13 +426,14 @@ def test_disappearance_during_summary_omits_only_that_incarnation(
             method = {
                 "usage": "read_usage_accounting",
                 "cost": "read_cost_accounting",
-                "outcome": "summarize_outcome",
+                # The page summarizes every session's outcome in one read.
+                "outcome": "summarize_outcomes",
             }[phase]
             original = getattr(store, method)
 
             async def while_reading(*args, **kwargs):
                 nonlocal changed
-                if not changed and (phase != "outcome" or args[0] == "removed"):
+                if not changed and (phase != "outcome" or "removed" in args[0]):
                     changed = True
                     await store.delete_session("removed")
                     if replace:
@@ -940,21 +941,30 @@ def test_legacy_ancestors_refresh_only_from_exact_retained_waits(
             app = _delegating_app(store)
             await _start(app, "root", "root")
             load = store.load
+            load_page = store.load_sessions
 
-            async def legacy_load(session_id):
-                session = await load(session_id)
+            def legacy(session):
                 if session is not None:
                     metadata = dict(session.metadata)
                     metadata.pop(RUN_LINEAGE_METADATA_KEY, None)
                     session = session.model_copy(update={"metadata": metadata})
                 return session
 
+            async def legacy_load(session_id):
+                return legacy(await load(session_id))
+
+            async def legacy_load_sessions(session_ids):
+                loaded = await load_page(session_ids)
+                return {session_id: legacy(session) for session_id, session in loaded.items()}
+
             monkeypatch.setattr(store, "load", legacy_load)
+            monkeypatch.setattr(store, "load_sessions", legacy_load_sessions)
             waiting = await read_cloud_activity(app)
             leaf = next(run.session_id for run in waiting.runs if run.agent_name == "leaf")
             # The adapter changes only the feed's legacy read view. Runtime
             # execution requires the store's concrete unmodified protocol.
             monkeypatch.delattr(store, "load")
+            monkeypatch.delattr(store, "load_sessions")
             approval = await _pending(app, leaf)
             await _drain(
                 app.resolve_tool_approval(
@@ -969,10 +979,11 @@ def test_legacy_ancestors_refresh_only_from_exact_retained_waits(
                 )
             )
             monkeypatch.setattr(store, "load", legacy_load)
+            monkeypatch.setattr(store, "load_sessions", legacy_load_sessions)
             checkpoint = store.load_checkpoint
+            checkpoints = store.load_checkpoints
 
-            async def retained_checkpoint(session_id):
-                value = await checkpoint(session_id)
+            def retained(session_id, value):
                 if session_id == "root" and wait_identity != "exact":
                     assert value is not None
                     wait = value["foreground_child_wait"]
@@ -982,7 +993,15 @@ def test_legacy_ancestors_refresh_only_from_exact_retained_waits(
                         wait["child_session_instance_id"] = "different-child-instance"
                 return value
 
+            async def retained_checkpoint(session_id):
+                return retained(session_id, await checkpoint(session_id))
+
+            async def retained_checkpoints(session_ids):
+                loaded = await checkpoints(session_ids)
+                return {key: retained(key, value) for key, value in loaded.items()}
+
             monkeypatch.setattr(store, "load_checkpoint", retained_checkpoint)
+            monkeypatch.setattr(store, "load_checkpoints", retained_checkpoints)
             asking = await read_cloud_activity(app, cursor=waiting.next_cursor)
             expected = (
                 {"root", "middle", "leaf"} if wait_identity == "exact" else {"middle", "leaf"}

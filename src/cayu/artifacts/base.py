@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -333,6 +333,27 @@ def _require_matching_artifact(
         )
 
 
+# One overview page holds at most this many sessions (the session list limit).
+MAX_ARTIFACT_COUNT_SESSIONS = 1000
+
+
+def artifact_count_session_ids(session_ids: Sequence[str]) -> tuple[str, ...]:
+    """Validate the session IDs of one count read and drop repeats, keeping order."""
+
+    if isinstance(session_ids, str | bytes) or not isinstance(session_ids, Iterable):
+        raise TypeError("session_ids must be a sequence of session IDs.")
+    page = tuple(
+        dict.fromkeys(
+            require_clean_nonblank(session_id, "session_id") for session_id in session_ids
+        )
+    )
+    if len(page) > MAX_ARTIFACT_COUNT_SESSIONS:
+        raise ValueError(
+            f"An artifact count read takes at most {MAX_ARTIFACT_COUNT_SESSIONS} sessions."
+        )
+    return page
+
+
 class ArtifactStore(ABC):
     """Durable uploaded/generated file storage for an environment."""
 
@@ -441,6 +462,35 @@ class ArtifactStore(ABC):
         Implementations should raise ``ArtifactStoreUnavailableError`` for
         operational backend failures.
         """
+
+    async def count_session_artifacts(self, session_ids: Sequence[str]) -> dict[str, int]:
+        """Count the session-scoped artifacts of several sessions in one read.
+
+        Every requested session maps to its count, zero included, the same
+        ``total_count`` that ``list(scope=SESSION, session_id=...)`` reports.
+        The default asks ``list`` once per session; a store that reads its
+        inventory as a whole should override it to read the inventory once.
+        Raises ``ArtifactStoreUnavailableError`` when a count is incomplete.
+        """
+
+        counts: dict[str, int] = {}
+        for session_id in artifact_count_session_ids(session_ids):
+            result = await self.list(scope=ArtifactScope.SESSION, session_id=session_id, limit=1)
+            if (
+                type(result) is not ArtifactListResult
+                or type(result.total_count) is not int
+                or result.total_count < len(result.artifacts)
+                or (not result.truncated and result.total_count != len(result.artifacts))
+                or any(
+                    artifact.scope != ArtifactScope.SESSION or artifact.session_id != session_id
+                    for artifact in result.artifacts
+                )
+            ):
+                raise ArtifactStoreUnavailableError(
+                    "Artifact store cannot provide a complete count."
+                )
+            counts[session_id] = result.total_count
+        return counts
 
     supports_metadata_scan: ClassVar[bool] = False
 

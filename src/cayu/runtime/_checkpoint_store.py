@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast, overload
@@ -328,6 +328,18 @@ class _RuntimeCheckpointSessionStore:
         except BaseException:
             checkpoint = None
             raise
+
+    async def load_checkpoints(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        checkpoints = await self._store.load_checkpoints(session_ids)
+        decoded: dict[str, dict[str, Any]] = {}
+        try:
+            for session_id, checkpoint in checkpoints.items():
+                value = decode_runtime_checkpoint(checkpoint, session_id=session_id)
+                if value is not None:
+                    decoded[session_id] = value
+            return decoded
+        finally:
+            checkpoints = {}
 
     async def _load_decoded_runtime_checkpoint(self, session_id: str) -> _DecodedRuntimeCheckpoint:
         load_checkpoint = self.load_checkpoint
@@ -805,6 +817,17 @@ class _RuntimeCheckpointSessionStore:
             checkpoint_root_guard=_ROOT_CHECKPOINT_GUARD,
         )
 
+    async def load_session_operations(
+        self,
+        session_ids: Sequence[str],
+        idempotency_key: str,
+    ) -> dict[str, dict[str, Any] | None]:
+        return await self._store.load_session_operations(
+            session_ids,
+            idempotency_key,
+            checkpoint_root_guard=_ROOT_CHECKPOINT_GUARD,
+        )
+
     async def replace_initial_transcript_messages(
         self,
         session_id: str,
@@ -903,6 +926,15 @@ class _RuntimeCheckpointSessionStore:
 
     async def query_pending_actions(self, query: Any = None) -> Any:
         return await self._store.query_pending_actions(
+            query,
+            checkpoint_root_guard=_ROOT_CHECKPOINT_GUARD,
+        )
+
+    async def query_pending_actions_for_sessions(
+        self, session_ids: Sequence[str], query: Any = None
+    ) -> Any:
+        return await self._store.query_pending_actions_for_sessions(
+            session_ids,
             query,
             checkpoint_root_guard=_ROOT_CHECKPOINT_GUARD,
         )

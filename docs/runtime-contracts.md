@@ -20876,6 +20876,31 @@ browser tool owner publishes that reserved receipt atomically with its durable
 operation. Generic operation publishers cannot create or replace it.
 Cloud's existing content-free summaries do not gain display metadata.
 
+An overview page reads its sessions a page at a time, so a page costs a fixed
+number of store reads however many sessions it holds. `SessionStore` page reads
+take up to 1000 session IDs: `load_sessions`, `load_checkpoints`,
+`summarize_outcomes`, `load_session_operations`, `query_latest_events`,
+`count_child_runs` and `query_pending_actions_for_sessions` (one cursor page of
+`query_pending_actions` restricted to those sessions). Each answers exactly what
+the matching single-session read answers; IDs with nothing to report are absent.
+`ArtifactStore.count_session_artifacts` returns the `list(scope=SESSION, ...)`
+total for each requested session, zero included. The base classes implement every
+page read by looping over the single-session methods, so custom stores keep
+working unchanged. The SQLite and PostgreSQL session stores and the local and S3
+artifact stores answer each in one read; the in-memory store reads pending actions
+for a page in one pass and keeps the defaults for the rest, which cost it no
+round trips. Where a single-session
+read checks scoped access bounds, its native page read falls back to the
+single-session reads while bounds apply. The delegated
+wait walk and fork-lineage walk read one level of the whole page per round, and
+the incarnation rechecks are one batched read each. If pending actions span
+multiple cursor pages, a final activity-time check detects sessions that could
+have moved before the cursor and reconciles those rows with single-session
+reads. Concurrent incarnation loss retries the outcome batch for surviving rows;
+unrelated store errors still propagate. Overview results, ordering,
+`SessionOverviewUnavailable` failures and identity-loss handling are unchanged;
+no store schema or HTTP contract changes.
+
 ## Inbox query contract (server contract 53)
 
 Contract 53 adds the read-only `inbox_queries` capability, server-side

@@ -15,12 +15,7 @@ from fastapi import APIRouter, HTTPException, Response
 from pydantic import ValidationError
 
 from cayu._time_buckets import BucketUnit, TimeSeriesSpec
-from cayu.artifacts.base import (
-    ArtifactListResult,
-    ArtifactScope,
-    ArtifactStore,
-    ArtifactStoreUnavailableError,
-)
+from cayu.artifacts.base import ArtifactStore, ArtifactStoreUnavailableError
 from cayu.budgets.pricing import PriceBook
 from cayu.messages import MessageRole, TextPart
 from cayu.server._session_overview_query import SessionOverviewSelection
@@ -42,7 +37,7 @@ from cayu.session_metadata import (
     validate_display_text,
 )
 from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
-from cayu.sessions._run_identity import is_eval_trial, session_run_id, session_run_lineage
+from cayu.sessions._run_identity import is_eval_trial, session_run_id
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.sessions.overview import (
     SessionOverviewFacts,
@@ -51,11 +46,11 @@ from cayu.sessions.overview import (
     SessionOverviewUnavailable,
     gather_in_order,
 )
-from cayu.sessions.queries import SessionAggregateFilter, SessionOrder, SessionQuery
+from cayu.sessions.queries import SessionAggregateFilter
 from cayu.sessions.records import Session
 from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_queries import TranscriptQuery
-from cayu.tools._browser_usage import has_retained_browser_usage
+from cayu.tools._browser_usage import retained_browser_usage
 from cayu.tools.browser_control import BrowserControlCheckpoint
 
 
@@ -99,101 +94,95 @@ class SessionOverviewService:
                 continue
             selected.append(fact)
 
-        async def enrich(fact: SessionOverviewFacts) -> SessionOverviewResponse | None:
-            session = fact.session
+        # Each read covers every selected session, so a page costs the same
+        # number of store reads however many sessions it holds.
+        while selected:
+            sessions = [fact.session for fact in selected]
             try:
-                uses = SessionOverviewUses(
-                    browser=await self._uses_browser(session),
-                    subagents=await self._subagent_count(session),
-                    artifacts=await self._artifact_count(session),
-                )
+                uses = await self._uses(sessions)
             except KeyError:
-                current = await self.store.load(session.id)
-                if current is None or current.instance_id != session.instance_id:
-                    return None
-                raise
-            current = await self.store.load(session.id)
-            if current is None or current.instance_id != session.instance_id:
-                return None
-            return self._project(fact, uses)
-
-        # Each session's reads stay in order; only different sessions overlap.
-        projected = await gather_in_order([lambda fact=fact: enrich(fact) for fact in selected])
-        kept: list[Session] = []
-        result: list[SessionOverviewResponse] = []
-        for fact, overview in zip(selected, projected, strict=True):
-            if overview is not None:
-                result.append(overview)
-                kept.append(fact.session)
-        return kept, result
-
-    async def _uses_browser(self, session: Session) -> bool:
-        with browser_control_checkpoint_read_scope(session.id):
-            checkpoint = await self.store.load_checkpoint(session.id)
-        raw = None if checkpoint is None else checkpoint.get(BROWSER_CONTROLS_CHECKPOINT_KEY)
-        if raw is None:
-            return await has_retained_browser_usage(self.store, session)
-        try:
-            controls = BrowserControlCheckpoint.model_validate(raw)
-        except ValidationError:
-            raise SessionOverviewUnavailable("Browser usage evidence is unavailable.") from None
-        if any(
-            record.identity.session_id == session.id
-            and record.identity.session_instance_id == session.instance_id
-            for record in controls.records
-        ):
-            return True
-        return await has_retained_browser_usage(self.store, session)
-
-    async def _subagent_count(self, session: Session) -> int:
-        run_id = session_run_id(session)
-        seen: set[str] = set()
-        cursors: set[str] = set()
-        cursor = None
-        while True:
-            page = await self.store.list_sessions(
-                SessionQuery(
-                    parent_session_id=session.id,
-                    limit=200,
-                    cursor=cursor,
-                    order_by=SessionOrder.CREATED_AT_ASC,
-                )
+                # Only a confirmed missing/replaced incarnation explains the
+                # error. Drop those rows and read the rest again; an unrelated
+                # store failure must propagate.
+                current = await self._current(sessions)
+                if len(current) == len(sessions):
+                    raise
+                selected = [fact for fact in selected if fact.session.id in current]
+                continue
+            current = await self._current(sessions)
+            kept = [fact for fact in selected if fact.session.id in current]
+            return (
+                [fact.session for fact in kept],
+                [self._project(fact, uses[fact.session.id]) for fact in kept],
             )
-            for child in page.sessions:
-                if (
-                    session_run_lineage(child)[1] == run_id
-                    and child.invocation.source.value != "fork"
-                ):
-                    seen.add(session_run_id(child))
-            if page.next_cursor is None:
-                return len(seen)
-            if page.next_cursor in cursors:
-                raise SessionOverviewUnavailable("Subagent paging did not advance.")
-            cursors.add(page.next_cursor)
-            cursor = page.next_cursor
+        return [], []
 
-    async def _artifact_count(self, session: Session) -> int:
+    async def _current(self, sessions: list[Session]) -> set[str]:
+        """The sessions whose selected incarnation is still current, from one read."""
+
+        current = await self.store.load_sessions(tuple(session.id for session in sessions))
+        return {
+            session.id
+            for session in sessions
+            if (row := current.get(session.id)) is not None
+            and row.instance_id == session.instance_id
+        }
+
+    async def _uses(self, sessions: list[Session]) -> dict[str, SessionOverviewUses]:
+        session_ids = tuple(session.id for session in sessions)
+        browser = await self._uses_browser(sessions)
+        subagents = await self.store.count_child_runs(sessions)
+        artifacts = await self._artifact_counts(session_ids)
+        return {
+            session.id: SessionOverviewUses(
+                browser=browser[session.id],
+                subagents=subagents[session.id],
+                artifacts=artifacts[session.id],
+            )
+            for session in sessions
+        }
+
+    async def _uses_browser(self, sessions: list[Session]) -> dict[str, bool]:
+        session_ids = tuple(session.id for session in sessions)
+        with browser_control_checkpoint_read_scope(*session_ids):
+            checkpoints = await self.store.load_checkpoints(session_ids)
+        uses: dict[str, bool] = {}
+        for session in sessions:
+            checkpoint = checkpoints.get(session.id)
+            raw = None if checkpoint is None else checkpoint.get(BROWSER_CONTROLS_CHECKPOINT_KEY)
+            if raw is None:
+                continue
+            try:
+                controls = BrowserControlCheckpoint.model_validate(raw)
+            except ValidationError:
+                raise SessionOverviewUnavailable("Browser usage evidence is unavailable.") from None
+            if any(
+                record.identity.session_id == session.id
+                and record.identity.session_instance_id == session.instance_id
+                for record in controls.records
+            ):
+                uses[session.id] = True
+        unsettled = [session for session in sessions if session.id not in uses]
+        uses.update(await retained_browser_usage(self.store, unsettled))
+        return uses
+
+    async def _artifact_counts(self, session_ids: tuple[str, ...]) -> dict[str, int]:
         # Registration owner deduplicates the same store shared by environments
         # and refuses distinct stores with conflicting IDs. IDs in different
         # stores denote different artifacts, exactly as in GET /artifacts.
-        total = 0
+        totals = dict.fromkeys(session_ids, 0)
         for store in self.artifact_stores().values():
-            result = await store.list(scope=ArtifactScope.SESSION, session_id=session.id, limit=1)
-            if type(result) is not ArtifactListResult:
-                raise SessionOverviewUnavailable("Artifact count evidence is unavailable.")
+            counts = await store.count_session_artifacts(session_ids)
             # Count evidence is scalar; do not serialize unrelated metadata.
             if (
-                type(result.total_count) is not int
-                or result.total_count < len(result.artifacts)
-                or (not result.truncated and result.total_count != len(result.artifacts))
-                or any(
-                    artifact.scope != ArtifactScope.SESSION or artifact.session_id != session.id
-                    for artifact in result.artifacts
-                )
+                type(counts) is not dict
+                or counts.keys() != totals.keys()
+                or any(type(count) is not int or count < 0 for count in counts.values())
             ):
                 raise SessionOverviewUnavailable("Artifact store cannot provide a complete count.")
-            total += result.total_count
-        return total
+            for session_id, count in counts.items():
+                totals[session_id] += count
+        return totals
 
     async def with_first_messages(
         self, sessions: Sequence[Session], overviews: Sequence[SessionOverviewResponse]

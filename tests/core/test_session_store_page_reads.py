@@ -1,0 +1,236 @@
+"""Page reads answer exactly what the single-session reads answer, on every store.
+
+Each native page read is compared with the base ``SessionStore`` default, which
+loops over the single-session methods, and with those methods themselves.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+from tests.core.session_store_conformance.support import (
+    _close_store,
+    _open_store,
+    conformance_postgres_dsn,
+    session_store_case,
+)
+from tests.core.test_cloud_reporting import _app, _drain, _start
+
+from cayu.artifacts import ArtifactScope, LocalArtifactStore
+from cayu.artifacts.base import ArtifactListResult, ArtifactStore, ArtifactStoreUnavailableError
+from cayu.messages import Message
+from cayu.sessions import ForkSessionRequest
+from cayu.sessions._browser_usage import BROWSER_USAGE_KEY
+from cayu.sessions._operation_records import SessionOperationPublication
+from cayu.sessions._page_reads import MAX_PAGE_READ_SESSIONS
+from cayu.sessions._supervision_projection import RELEASE_MARKER_EVENT_TYPES
+from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.pending_action_contracts import PendingActionQuery
+from cayu.sessions.requests import RunRequest
+from cayu.sessions.store import SessionStore
+
+__all__ = ["conformance_postgres_dsn", "session_store_case"]
+
+SESSIONS = ("written", "asked", "approval", "child", "fork")
+PAGE = (*SESSIONS, "missing", "written")
+
+
+async def _populate(app) -> None:
+    await _start(app, "written", "writer")
+    await _start(app, "asked", "asker")
+    await _start(app, "approval", "approver")
+    await _drain(
+        app.run(
+            RunRequest(
+                session_id="child",
+                parent_session_id="written",
+                agent_name="writer",
+                messages=[Message.text("user", "go")],
+            )
+        )
+    )
+    await _drain(
+        app.fork_session(ForkSessionRequest(source_session_id="written", session_id="fork"))
+    )
+
+    def record(_session, checkpoint, _persisted):
+        return SessionOperationPublication(
+            checkpoint={} if checkpoint is None else dict(checkpoint),
+            operation_records={"page-read-operation": {"status": "completed"}},
+        )
+
+    await app.session_store.publish_session_operation(
+        "asked", idempotency_key="page-read-operation", operation_transform=record, events=[]
+    )
+
+
+@pytest.mark.store_semantics
+def test_page_reads_match_single_session_reads(session_store_case):
+    async def scenario():
+        store = await _open_store(session_store_case)
+        try:
+            app = _app(store)
+            await _populate(app)
+
+            sessions = await store.load_sessions(PAGE)
+            assert list(sessions) == list(SESSIONS)
+            assert sessions == {sid: await store.load(sid) for sid in SESSIONS}
+            assert sessions == await SessionStore.load_sessions(store, PAGE)
+
+            checkpoints = await store.load_checkpoints(PAGE)
+            single = {sid: await store.load_checkpoint(sid) for sid in SESSIONS}
+            assert checkpoints == {sid: value for sid, value in single.items() if value}
+            assert checkpoints == await SessionStore.load_checkpoints(store, PAGE)
+
+            outcomes = await store.summarize_outcomes(PAGE)
+            assert outcomes == {sid: await store.summarize_outcome(sid) for sid in SESSIONS}
+            assert outcomes == await SessionStore.summarize_outcomes(store, PAGE)
+
+            markers = await store.query_latest_events(PAGE, RELEASE_MARKER_EVENT_TYPES)
+            expected = {}
+            for sid in SESSIONS:
+                latest = await store.query_events(
+                    EventQuery(
+                        session_id=sid,
+                        event_types=RELEASE_MARKER_EVENT_TYPES,
+                        order_by=EventOrder.SEQUENCE_DESC,
+                        limit=1,
+                    )
+                )
+                if latest:
+                    expected[sid] = latest[0]
+            assert expected and markers == expected
+            assert markers == await SessionStore.query_latest_events(
+                store, PAGE, RELEASE_MARKER_EVENT_TYPES
+            )
+
+            for key in ("page-read-operation", BROWSER_USAGE_KEY):
+                operations = await store.load_session_operations(PAGE, key)
+                assert operations == {
+                    sid: await store.load_session_operation(sid, key) for sid in SESSIONS
+                }
+                assert operations == await SessionStore.load_session_operations(store, PAGE, key)
+            assert (await store.load_session_operations(PAGE, "page-read-operation"))["asked"]
+
+            parents = [sessions[sid] for sid in SESSIONS]
+            children = await store.count_child_runs(parents)
+            # The fork's source is its parent too, but a fork is not a child run.
+            assert children == {"written": 1, "asked": 0, "approval": 0, "child": 0, "fork": 0}
+            assert children == await SessionStore.count_child_runs(store, parents)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(scenario())
+
+
+async def _all_pending(read) -> list:
+    actions, issues, cursor, cursors = [], [], None, set()
+    while True:
+        page = await read(cursor)
+        actions.extend(page.actions)
+        issues.extend(page.issues)
+        if not page.has_more:
+            return sorted((action.session.id, action.id) for action in actions) + issues
+        assert page.next_cursor is not None and page.next_cursor not in cursors
+        cursors.add(page.next_cursor)
+        cursor = page.next_cursor
+
+
+@pytest.mark.store_semantics
+def test_pending_actions_for_sessions_pages_through_exactly_those_sessions(session_store_case):
+    async def scenario():
+        store = await _open_store(session_store_case)
+        try:
+            app = _app(store)
+            await _populate(app)
+            await _start(app, "unrequested", "asker")
+            single = []
+            for sid in PAGE[:-1]:
+                single.extend(
+                    await _all_pending(
+                        lambda cursor, sid=sid: store.query_pending_actions(
+                            PendingActionQuery(session_id=sid, limit=1, cursor=cursor)
+                        )
+                    )
+                )
+            assert sorted(sid for sid, _ in single) == ["approval", "asked"]
+            for read in (store.query_pending_actions_for_sessions, _base_pending(store)):
+                paged = await _all_pending(
+                    lambda cursor, read=read: read(PAGE, PendingActionQuery(limit=1, cursor=cursor))
+                )
+                assert paged == sorted(single)
+            assert (await store.query_pending_actions_for_sessions(())).actions == []
+            with pytest.raises(ValueError, match="must not name one session"):
+                await store.query_pending_actions_for_sessions(
+                    PAGE, PendingActionQuery(session_id="asked")
+                )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(scenario())
+
+
+def _base_pending(store):
+    async def read(session_ids, query):
+        return await SessionStore.query_pending_actions_for_sessions(store, session_ids, query)
+
+    return read
+
+
+@pytest.mark.store_semantics
+def test_page_reads_validate_their_session_ids(session_store_case):
+    async def scenario():
+        store = await _open_store(session_store_case)
+        try:
+            assert await store.load_sessions(()) == {}
+            assert await store.load_checkpoints(()) == {}
+            assert await store.summarize_outcomes(()) == {}
+            assert await store.count_child_runs(()) == {}
+            with pytest.raises(TypeError):
+                await store.load_sessions("written")
+            with pytest.raises(ValueError):
+                await store.load_sessions([" padded "])
+            with pytest.raises(ValueError, match="at most"):
+                await store.load_sessions(
+                    [f"s{index}" for index in range(MAX_PAGE_READ_SESSIONS + 1)]
+                )
+            with pytest.raises(ValueError, match="event_types"):
+                await store.query_latest_events(["written"], ())
+        finally:
+            await _close_store(store)
+
+    asyncio.run(scenario())
+
+
+class _ListOnlyArtifacts(LocalArtifactStore):
+    """A store that keeps the base default, which asks ``list`` once per session."""
+
+    count_session_artifacts = ArtifactStore.count_session_artifacts
+
+
+def test_artifact_counts_match_listing_totals(tmp_path):
+    async def scenario():
+        native = LocalArtifactStore(tmp_path / "artifacts")
+        for index in range(3):
+            await native.put_bytes(b"x", filename=f"{index}.txt", session_id="owner")
+        await native.put_bytes(b"y", filename="other.txt", session_id="other")
+        page = ("owner", "other", "empty", "owner")
+        expected = {}
+        for sid in ("owner", "other", "empty"):
+            listed = await native.list(scope=ArtifactScope.SESSION, session_id=sid, limit=1)
+            expected[sid] = listed.total_count
+        assert expected == {"owner": 3, "other": 1, "empty": 0}
+        assert await native.count_session_artifacts(page) == expected
+        default = _ListOnlyArtifacts(tmp_path / "artifacts")
+        assert await default.count_session_artifacts(page) == expected
+        assert await native.count_session_artifacts(()) == {}
+
+        async def incomplete(**kwargs):
+            return ArtifactListResult(artifacts=(), total_count=None, truncated=True)
+
+        default.list = incomplete  # type: ignore[method-assign]
+        with pytest.raises(ArtifactStoreUnavailableError, match="complete count"):
+            await default.count_session_artifacts(page)
+
+    asyncio.run(scenario())

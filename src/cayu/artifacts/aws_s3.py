@@ -60,6 +60,7 @@ from cayu.artifacts.base import (
     ArtifactStoreUnavailableError,
     InvalidArtifactIdError,
     _require_matching_artifact,
+    artifact_count_session_ids,
 )
 from cayu.artifacts.settlement import (
     ArtifactWriteSettlementFailureCode,
@@ -780,6 +781,34 @@ class S3ArtifactStore(ArtifactStore):
                 "S3 artifact store could not list artifacts."
             ) from exc
         return inventory.result()
+
+    @runtime_artifact_operation("list")
+    async def count_session_artifacts(self, session_ids: Sequence[str]) -> dict[str, int]:
+        counts = dict.fromkeys(artifact_count_session_ids(session_ids), 0)
+        if not counts:
+            return {}
+        client = await self._get_client()
+        try:
+            # One inventory pass counts every session of the page.
+            async for artifact_id in self._iter_metadata_ids(client):
+                try:
+                    artifact = await self._read_metadata(client, artifact_id)
+                except FileNotFoundError:
+                    await self._require_no_surviving_content(client, artifact_id)
+                    continue
+                if artifact.scope != ArtifactScope.SESSION or artifact.session_id not in counts:
+                    continue
+                from cayu.artifacts.access import visible
+
+                if visible(artifact):
+                    counts[artifact.session_id] += 1
+        except ArtifactStoreUnavailableError:
+            raise
+        except Exception as exc:
+            raise ArtifactStoreUnavailableError(
+                "S3 artifact store could not list artifacts."
+            ) from exc
+        return counts
 
     supports_metadata_scan: ClassVar[bool] = True
 
