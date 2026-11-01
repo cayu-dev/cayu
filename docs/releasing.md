@@ -35,7 +35,8 @@ PRs since the previous release; do not rely on an accumulated `Unreleased` secti
    before tagging. It also rejects `## Unreleased` or any release section newer
    than `v0.11.4` that lacks the upgrade summary or the `### Breaking changes`
    heading; publication runs the same check on the tagged release.
-   Branch pushes do not start CI; use the PR or `workflow_dispatch`.
+   Pushes to `main` start CI; other branch pushes use the PR or
+   `workflow_dispatch`. Main pushes do not cancel full-store manual runs.
 4. Sync the approved commit to the public repo and push its matching `vX.Y.Z`
    tag. Verify the tag and commit before approving the `pypi` deployment.
 5. Confirm PyPI and GitHub publication, then install `cayu==X.Y.Z` in a clean

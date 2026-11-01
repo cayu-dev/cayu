@@ -97,10 +97,10 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
         assert "startsWith(github.ref, 'refs/tags/v')" not in _job_block(workflow, core_job)
     tests = _job_block(workflow, "python-tests")
     assert "uses: ./.github/workflows/python-tests.yml" in tests
-    assert "stores: ${{ github.event_name == 'pull_request' && 'sqlite' || 'all' }}" in tests
+    assert "&& 'sqlite' || 'all' }}" in tests
     scope = _job_block(workflow, "verification-scope")
     assert "python3 scripts/select_ci_jobs.py" in scope
-    assert 'if test "$EVENT_NAME" != "pull_request"' in scope
+    assert 'test "$EVENT_NAME" != "pull_request"' in scope
     for output in ("dashboard", "release_artifacts", "sqlite_cancellation"):
         assert f'echo "{output}=true"' in scope
         assert f"{output}: ${{{{ steps.scope.outputs.{output} }}}}" in scope
@@ -415,17 +415,35 @@ def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> No
     assert "publishing: true" not in package_manifest[sidecar_offset : sidecar_offset + 180]
 
 
-def test_ci_triggers_skip_main_pushes_and_cover_draft_transitions() -> None:
+def test_ci_triggers_cover_main_pushes_and_draft_transitions() -> None:
     workflow = _CI_WORKFLOW.read_text()
     triggers = workflow.split("on:\n", 1)[1].split("\npermissions:", 1)[0]
-    assert "branches:" not in triggers
+    assert "branches: [main]" in triggers
     assert 'tags: ["v*"]' in triggers
     assert "workflow_dispatch:" in triggers
     assert (
         "types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]" in triggers
     )
-    assert "group: ci-${{ github.ref }}" in workflow
+    # Main pushes must not cancel manual runs, which cover every store.
+    assert "group: ci-${{ github.event_name }}-${{ github.ref }}" in workflow
     assert "cancel-in-progress: true" in workflow
+
+
+def test_main_pushes_run_all_retained_gates() -> None:
+    workflow = _CI_WORKFLOW.read_text()
+    main_push = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    python_tests = _job_block(workflow, "python-tests")
+    assert f"(github.event_name == 'pull_request' || {main_push}) && 'sqlite' || 'all'" in (
+        python_tests
+    )
+    scope = _job_block(workflow, "verification-scope")
+    assert "if: github.event_name == 'pull_request'" in scope
+    assert "BASE_SHA: ${{ github.event.pull_request.base.sha }}" in scope
+    assert "HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}" in scope
+    # Main pushes never select a diff, so force pushes and cancelled earlier
+    # runs cannot omit a gate from the replacement run.
+    assert 'if test "$EVENT_NAME" != "pull_request"; then' in scope
+    assert "main_push=" not in scope
 
 
 def test_draft_prs_skip_every_independent_worker_before_allocation() -> None:

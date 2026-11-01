@@ -37,8 +37,12 @@ CI runs when a non-draft pull request opens, receives a push, reopens, or is
 marked ready for review. Draft PRs skip CI workers; converting a PR back to draft
 cancels its superseded run. New PR pushes also cancel older runs for that PR.
 
-Merging or pushing directly to `main` does not automatically run CI. Maintainers
-can run `ci.yml` manually against a selected branch or tag from the Actions UI or
+Each push to `main`, including a merge, runs CI on the merged result, because a PR
+need not be current with `main` before it merges. It runs the pull request gate's
+SQLite store set, and the path selector compares the commits the push added. A newer
+push to `main` cancels the older run, so a burst of merges is verified once, on its
+newest commit. Main shards use dedicated workers, never the shared PR workers.
+Maintainers can run `ci.yml` manually against a selected branch or tag from the Actions UI or
 with `gh workflow run ci.yml --ref <branch-or-tag>`. Manual runs validate without
 publishing. `v*` tag pushes retain release validation and gated publishing.
 `nightly.yml` runs the Python test jobs with every store each night and on
@@ -380,7 +384,8 @@ suite without coverage instrumentation. The PR gate targets approximately ten mi
 configured job timeouts are ceilings, not measured completion times. See
 `.github/workflows/ci.yml` for current limits. A small fail-open path selector additionally
 runs the retained SQLite cancellation, package/sidecar, and dashboard gates whenever their
-contracts can change. Release tags and manual CI dispatch run every retained gate.
+contracts can change. Pushes to `main`, release tags, and manual CI dispatch run every retained
+gate. Each main run covers changes from any earlier run it cancels.
 The Python test jobs live in `.github/workflows/python-tests.yml`, which `ci.yml` and
 `nightly.yml` call with a store mode. Pull requests run SQLite store variants across 43
 general shards, six Postgres shards, two host-journey shards and the browser-docker lane.

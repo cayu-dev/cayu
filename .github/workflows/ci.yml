@@ -1,7 +1,11 @@
 name: CI
 
 on:
+  # A push to main verifies the merged result: PRs need not be current with main
+  # before merging. The concurrency group cancels an older main run, so a burst of
+  # merges runs CI once on its newest commit.
   push:
+    branches: [main]
     tags: ["v*"]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
@@ -11,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -25,19 +29,22 @@ jobs:
       release_artifacts: ${{ steps.scope.outputs.release_artifacts }}
       sqlite_cancellation: ${{ steps.scope.outputs.sqlite_cancellation }}
     steps:
-      - name: Check out pull request history
+      - name: Check out the compared history
         if: github.event_name == 'pull_request'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Select retained high-value verification
         id: scope
         env:
+          # Only pull requests select gates from a diff.
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
+          # Every main push verifies all gates, including work whose earlier
+          # run was cancelled by this push. This also covers rewritten history.
           if test "$EVENT_NAME" != "pull_request"; then
             {
               echo "dashboard=true"
@@ -66,7 +73,8 @@ jobs:
     name: Python tests
     uses: ./.github/workflows/python-tests.yml
     with:
-      stores: ${{ github.event_name == 'pull_request' && 'sqlite' || 'all' }}
+      # Main pushes run the PR store set; nightly and release runs cover every store.
+      stores: ${{ (github.event_name == 'pull_request' || github.event_name == 'push' && github.ref == 'refs/heads/main') && 'sqlite' || 'all' }}
 
   sqlite-cancellation:
     name: SQLite cancellation (Python ${{ matrix.python-version }})
