@@ -463,7 +463,8 @@ async def _captured_scenario(page, base, provider, expected_aborts, expected_con
     import dashboard_behavior_live as fixture
 
     await page.goto(
-        f"{base}/cayu/sessions/{fixture.PROMOTION_SESSION_ID}", wait_until="networkidle"
+        f"{base}/cayu/sessions/{fixture.PROMOTION_SESSION_ID}?view=conversation",
+        wait_until="networkidle",
     )
     await page.get_by_role("tab", name="Trace", exact=True).click()
     await page.get_by_role("tab", name="Conversation", exact=True).click()

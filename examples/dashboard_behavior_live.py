@@ -1583,9 +1583,10 @@ async def _exercise_dashboard(
     await session_link.click()
 
     await expect(page).to_have_url(re.compile(rf"/cayu/sessions/{SESSION_ID}$"))
-    await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_have_attribute(
-        "aria-selected", "true"
-    )
+    # A finished session opens on Trace; the observation below reads its conversation.
+    conversation_tab = page.get_by_role("tab", name="Conversation", exact=True)
+    await conversation_tab.click()
+    await expect(conversation_tab).to_have_attribute("aria-selected", "true")
     await _exercise_session_observation(page, base_url, session_store)
     faults.session_settle_path = await _exercise_existing_session_mutations(
         page, base_url, provider
@@ -1645,7 +1646,10 @@ async def _open_eval_details(page: Page) -> None:
 
 async def _exercise_session_additions(page: Page, base_url: str) -> None:
     """The production destination workflow uses real immutable server publication."""
-    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+    await page.goto(
+        f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}?view=conversation",
+        wait_until="networkidle",
+    )
     await page.get_by_role("button", name="More actions", exact=True).click()
     await page.get_by_test_id("evaluate-session").click()
     sheet = page.get_by_test_id("eval-addition-sheet")
@@ -1705,7 +1709,10 @@ async def _exercise_session_additions(page: Page, base_url: str) -> None:
         destination != parent_selector, "membership append must publish a new immutable revision"
     )
 
-    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+    await page.goto(
+        f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}?view=conversation",
+        wait_until="networkidle",
+    )
     await page.get_by_role("button", name="More actions", exact=True).click()
     await page.get_by_test_id("evaluate-session").click()
     sheet = page.get_by_test_id("eval-addition-sheet")
@@ -1800,7 +1807,10 @@ async def _exercise_session_additions(page: Page, base_url: str) -> None:
     require_equal(catalog_response.status, 200, "captured corpus remains visible in the catalog")
     catalog = await catalog_response.json()
     corpus_parent = next(item["id"] for item in catalog["items"] if item["source"] == "corpus")
-    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+    await page.goto(
+        f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}?view=conversation",
+        wait_until="networkidle",
+    )
     await page.get_by_role("button", name="More actions", exact=True).click()
     await page.get_by_test_id("evaluate-session").click()
     sheet = page.get_by_test_id("eval-addition-sheet")
@@ -1820,7 +1830,10 @@ async def _exercise_session_additions(page: Page, base_url: str) -> None:
 
     # Closing a busy form does not cancel an already committed write or steal
     # later navigation. The acknowledgement is delivered through the real browser.
-    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+    await page.goto(
+        f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}?view=conversation",
+        wait_until="networkidle",
+    )
     await page.get_by_role("button", name="More actions", exact=True).click()
     await page.get_by_test_id("evaluate-session").click()
     sheet = page.get_by_test_id("eval-addition-sheet")
@@ -1873,7 +1886,10 @@ async def _exercise_eval_addition_ownership(page: Page, base_url: str) -> None:
     """A late acknowledgement cannot remove a newer dialog's exact recovery tuple."""
     catalog = await (await page.request.get(f"{base_url}/api/evals/suite-views")).json()
     destination = next(item["id"] for item in catalog["items"] if item["source"] == "authored")
-    await page.goto(f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}", wait_until="networkidle")
+    await page.goto(
+        f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}?view=conversation",
+        wait_until="networkidle",
+    )
 
     async def open_form(recover=False):
         await page.get_by_role("button", name="More actions", exact=True).click()
@@ -2457,13 +2473,13 @@ async def _exercise_captured_evaluation(
     finally:
         provider.block_next_promotion_run = previous_block
     await page.goto(
-        f"{base_url}/cayu/sessions/{WORKFLOW_ACTIVE_SESSION_ID}",
+        f"{base_url}/cayu/sessions/{WORKFLOW_ACTIVE_SESSION_ID}?view=conversation",
         wait_until="networkidle",
     )
     await expect(page.get_by_test_id("evaluate-session")).to_have_count(0)
 
     await page.goto(
-        f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}",
+        f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}?view=conversation",
         wait_until="networkidle",
     )
     await page.get_by_role("button", name="More actions", exact=True).click()
@@ -4759,7 +4775,9 @@ async def _exercise_optional_surface_capabilities(page: Page, base_url: str) -> 
         )
 
         observed_requests.clear()
-        await page.goto(f"{base_url}/cayu/sessions/{SESSION_ID}", wait_until="networkidle")
+        await page.goto(
+            f"{base_url}/cayu/sessions/{SESSION_ID}?view=conversation", wait_until="networkidle"
+        )
         await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_have_attribute(
             "aria-selected", "true"
         )
@@ -4861,7 +4879,8 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         )
 
         await page.goto(
-            f"{base_url}/cayu/sessions/{INTERRUPT_SESSION_ID}", wait_until="networkidle"
+            f"{base_url}/cayu/sessions/{INTERRUPT_SESSION_ID}?view=conversation",
+            wait_until="networkidle",
         )
         await expect(page.get_by_role("button", name="Stop", exact=True)).to_have_count(0)
         await expect(page.locator("#session-composer")).to_have_count(0)
@@ -4870,7 +4889,10 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         await expect(page.get_by_test_id("annotations-unavailable")).to_be_visible()
         await expect(page.get_by_role("link", name="New Run", exact=True)).to_have_count(0)
 
-        await page.goto(f"{base_url}/cayu/sessions/{APPROVAL_SESSION_ID}", wait_until="networkidle")
+        await page.goto(
+            f"{base_url}/cayu/sessions/{APPROVAL_SESSION_ID}?view=conversation",
+            wait_until="networkidle",
+        )
         await expect(page.get_by_role("button", name="Approve", exact=True)).to_be_disabled()
         await expect(page.get_by_role("button", name="Deny", exact=True)).to_be_disabled()
         await expect(
@@ -5482,9 +5504,7 @@ async def _exercise_mutation_recovery(page: Page, base_url: str) -> None:
             await expect(run_button).to_be_enabled()
             await run_button.click()
             await expect(page).to_have_url(re.compile(r"/cayu/sessions/[^/?]+$"), timeout=15_000)
-            await expect(
-                page.get_by_role("tab", name="Conversation", exact=True)
-            ).to_have_attribute("aria-selected", "true")
+            await expect(page.get_by_role("tablist", name="Session view")).to_be_visible()
             await expect(page.get_by_role("heading", level=1)).to_contain_text(prompt)
             session_urls.append(page.url)
     finally:
@@ -5503,7 +5523,9 @@ async def _exercise_mutation_recovery(page: Page, base_url: str) -> None:
 async def _exercise_existing_session_mutations(
     page: Page, base_url: str, provider: DashboardContractProvider
 ) -> str:
-    await page.goto(f"{base_url}/cayu/sessions/{SESSION_ID}", wait_until="domcontentloaded")
+    await page.goto(
+        f"{base_url}/cayu/sessions/{SESSION_ID}?view=conversation", wait_until="domcontentloaded"
+    )
     resume_input = page.locator("#session-composer")
     await expect(resume_input).to_be_visible()
     await resume_input.fill("Resume through the dashboard browser contract.")
@@ -5521,7 +5543,8 @@ async def _exercise_existing_session_mutations(
     ).to_be_visible()
 
     await page.goto(
-        f"{base_url}/cayu/sessions/{APPROVAL_SESSION_ID}", wait_until="domcontentloaded"
+        f"{base_url}/cayu/sessions/{APPROVAL_SESSION_ID}?view=conversation",
+        wait_until="domcontentloaded",
     )
     await expect(page.get_by_text("Needs your approval", exact=True).first).to_be_visible()
     deny_button = page.get_by_role("button", name="Deny", exact=True)
@@ -5545,7 +5568,8 @@ async def _exercise_existing_session_mutations(
     await expect(page.get_by_text("Needs your approval", exact=True)).to_have_count(0)
 
     await page.goto(
-        f"{base_url}/cayu/sessions/{INTERRUPT_SESSION_ID}", wait_until="domcontentloaded"
+        f"{base_url}/cayu/sessions/{INTERRUPT_SESSION_ID}?view=conversation",
+        wait_until="domcontentloaded",
     )
     await page.get_by_role("button", name="Stop", exact=True).click()
     interrupt_sheet = page.get_by_role("dialog")
@@ -5562,7 +5586,7 @@ async def _exercise_existing_session_mutations(
     ).to_be_visible()
 
     await page.goto(
-        f"{base_url}/cayu/sessions/{RESUME_INTERRUPT_SESSION_ID}",
+        f"{base_url}/cayu/sessions/{RESUME_INTERRUPT_SESSION_ID}?view=conversation",
         wait_until="domcontentloaded",
     )
     interrupted_resume_input = page.locator("#session-composer")
@@ -5606,7 +5630,7 @@ async def _exercise_existing_session_mutations(
     await page.route(failure_path, inject_runtime_failure)
     try:
         await page.goto(
-            f"{base_url}/cayu/sessions/{INTERRUPT_FAILURE_SESSION_ID}",
+            f"{base_url}/cayu/sessions/{INTERRUPT_FAILURE_SESSION_ID}?view=conversation",
             wait_until="domcontentloaded",
         )
         await page.get_by_role("button", name="Stop", exact=True).click()
@@ -5786,7 +5810,8 @@ async def _exercise_manual_mutation_reobservation(page: Page, base_url: str) -> 
     await page.route(events_path, expose_recovered_events)
     try:
         await page.goto(
-            f"{base_url}/cayu/sessions/{REOBSERVE_SESSION_ID}", wait_until="domcontentloaded"
+            f"{base_url}/cayu/sessions/{REOBSERVE_SESSION_ID}?view=conversation",
+            wait_until="domcontentloaded",
         )
         resume_input = page.locator("#session-composer")
         await resume_input.fill("Recover this dashboard observation without resubmitting.")
@@ -6097,7 +6122,10 @@ async def _exercise_session_progress_budget(
     state_path = f"/api/sessions/{session_id}/state"
     event_path = f"/api/sessions/{session_id}/events"
     async with _polling_budget_page(new_context) as (page, requests, _failures):
-        await page.goto(f"{base_url}/cayu/sessions/{session_id}", wait_until="domcontentloaded")
+        await page.goto(
+            f"{base_url}/cayu/sessions/{session_id}?view=conversation",
+            wait_until="domcontentloaded",
+        )
         await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
         await _pause_page_clock(page, requests)
         await _advance_page_clock(page, requests, 7_000, step_ms=1_000)

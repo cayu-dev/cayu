@@ -49,6 +49,7 @@ import {
 } from "@/lib/session-history"
 import { validateSessionHistorySearch } from "@/lib/session-history-search"
 import { prepareSessionTaskReplay, type TaskReplayAcceptance } from "@/lib/session-task-replay"
+import { readAsConversation, rememberConversation, sessionView } from "@/lib/session-view"
 import { cn } from "@/lib/utils"
 import {
   useInbox,
@@ -199,7 +200,21 @@ export function SessionPage({
   const endRef = useRef<HTMLDivElement>(null)
 
   const panel = PANEL_TABS.find((t) => t === search.panel) as PanelTab | undefined
-  const trace = search.view === "trace"
+  // How the session looked when the page opened decides its first view; answering a waiting
+  // session doesn't move the reader to Trace afterwards.
+  const [readBefore] = useState(() => readAsConversation(sessionId))
+  const [openedWaiting, setOpenedWaiting] = useState<boolean>()
+  if (openedWaiting === undefined && (overview.isSuccess || overview.isError))
+    setOpenedWaiting(isWaiting(overview.data?.state))
+  const view = sessionView(search, { readAsConversation: readBefore, waiting: openedWaiting })
+  // Reading it as a conversation is remembered; choosing Trace forgets it. A Trace view the
+  // page picked by default changes nothing, so a session that waits later opens Conversation.
+  useEffect(() => {
+    if (view === "conversation") rememberConversation(sessionId, true)
+    else if (view === "trace" && search.view === "trace") rememberConversation(sessionId, false)
+  }, [sessionId, view, search.view])
+  const trace = view === "trace"
+  const conversation = view === "conversation"
   const setSearch = (patch: Partial<SessionDetailSearch>) => {
     const next = { ...search, ...patch }
     for (const k of Object.keys(next))
@@ -422,20 +437,20 @@ export function SessionPage({
   }
 
   useEffect(() => {
-    if (!trace && transcriptPosition && transcript.data)
+    if (conversation && transcriptPosition && transcript.data)
       document
         .getElementById(
           `transcript-tool-${transcriptPosition.messageIndex}-${transcriptPosition.partIndex}`,
         )
         ?.scrollIntoView({ block: "center" })
-  }, [trace, transcriptPosition, transcript.data])
+  }, [conversation, transcriptPosition, transcript.data])
 
   const transcriptLoaded = !!transcript.data && !transcript.isFetching
   const transcriptOffset = transcript.data?.offset
   useEffect(() => {
     const element = conversationRef.current
     const content = conversationContentRef.current
-    if (!savedReading || !restoringReading.current || trace || !transcriptLoaded) return
+    if (!savedReading || !restoringReading.current || !conversation || !transcriptLoaded) return
     if (!element || !content) return
     // Pixel offsets only identify a position within the same bounded transcript window.
     if (savedReading.view !== filterKey || savedReading.transcriptOffset !== transcriptOffset) {
@@ -453,12 +468,12 @@ export function SessionPage({
       },
       { anchor: () => conversationAnchorRef.current },
     )
-  }, [savedReading, trace, transcriptLoaded, transcriptOffset, filterKey, readingKey])
+  }, [savedReading, conversation, transcriptLoaded, transcriptOffset, filterKey, readingKey])
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: follow new transcript and decision content only while pinned
+  // biome-ignore lint/correctness/useExhaustiveDependencies: follow new transcript and decision content only while pinned, and once Conversation shows
   useEffect(() => {
     if (pinned && navigation.current === null) endRef.current?.scrollIntoView({ block: "end" })
-  }, [pinned, navigation.current, transcript.data, inbox.data?.items.length])
+  }, [pinned, navigation.current, transcript.data, inbox.data?.items.length, conversation])
   // biome-ignore lint/correctness/useExhaustiveDependencies: close the menus when the session changes
   useEffect(() => {
     setMenuOpen(false)
@@ -567,8 +582,8 @@ export function SessionPage({
                     key={value}
                     type="button"
                     role="tab"
-                    aria-selected={(value === "trace") === trace}
-                    tabIndex={(value === "trace") === trace ? 0 : -1}
+                    aria-selected={value === view}
+                    tabIndex={value === view ? 0 : -1}
                     onClick={() =>
                       setSearch({
                         view: value,
@@ -576,7 +591,7 @@ export function SessionPage({
                     }
                     className={cn(
                       "rounded-md px-2.5 py-0.5 text-[13px]",
-                      (value === "trace") === trace
+                      value === view
                         ? "bg-muted font-medium"
                         : "text-muted-foreground hover:text-foreground",
                     )}
@@ -774,6 +789,10 @@ export function SessionPage({
               b.kind === "work" ? b.tools.map((t) => t.id) : [],
             )}
           />
+        ) : !conversation ? (
+          (!view || detail.isPending) && (
+            <p className="p-6 text-sm text-muted-foreground">Loading session…</p>
+          )
         ) : (
           <>
             <div

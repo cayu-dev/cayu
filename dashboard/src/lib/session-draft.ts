@@ -1,3 +1,5 @@
+import { tabStorage } from "./tab-storage.ts"
+
 /**
  * A session's unsent composer text, kept per session in this browser tab so leaving the
  * session or reloading the page doesn't lose it. The draft is cleared when it is sent.
@@ -6,14 +8,6 @@
 export const SESSION_DRAFT_PREFIX = "cayu-dashboard-draft:"
 
 type DraftStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">
-
-function tabStorage(): DraftStorage | null {
-  try {
-    return window.sessionStorage
-  } catch {
-    return null
-  }
-}
 
 export function readSessionDraft(
   sessionId: string,

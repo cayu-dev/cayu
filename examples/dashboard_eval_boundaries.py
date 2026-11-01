@@ -101,7 +101,7 @@ async def _exercise_eval_boundary(mode: str, selected: str) -> None:
             try:
                 if not durable:
                     await page.goto(
-                        f"{base}/cayu/sessions/{fixture.PROMOTION_SESSION_ID}",
+                        f"{base}/cayu/sessions/{fixture.PROMOTION_SESSION_ID}?view=conversation",
                         wait_until="networkidle",
                     )
                     await page.set_viewport_size({"width": 390, "height": 700})

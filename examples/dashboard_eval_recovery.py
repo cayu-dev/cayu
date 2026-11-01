@@ -127,7 +127,7 @@ async def exercise_captured_recovery(page, base, aborts, console):
     import dashboard_behavior_live as fixture
 
     session = fixture.PROMOTION_SESSION_ID
-    await page.goto(f"{base}/cayu/sessions/{session}", wait_until="networkidle")
+    await page.goto(f"{base}/cayu/sessions/{session}?view=conversation", wait_until="networkidle")
     await page.get_by_role("button", name="More actions", exact=True).click()
     await page.get_by_test_id("evaluate-session").click()
     addition = page.get_by_test_id("eval-addition-sheet")
@@ -242,7 +242,9 @@ async def exercise_captured_lifetime(page, base, sessions, aborts, console, expe
         await page.route("**/api/contract", direct_contract)
     await page.route(launch_url, launch)
     try:
-        await page.goto(f"{base}/cayu/sessions/{session}", wait_until="networkidle")
+        await page.goto(
+            f"{base}/cayu/sessions/{session}?view=conversation", wait_until="networkidle"
+        )
         if direct:
             await page.get_by_test_id("evaluate-session").click()
         else:

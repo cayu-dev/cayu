@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { sessionDisplayTitle } from "../src/next/app/session-model.ts"
+import { sessionDisplayTitle, shortSessionTitle } from "../src/next/app/session-model.ts"
 
 const user = (content) => ({ role: "user", content })
 
@@ -38,4 +38,21 @@ test("fallback uses only text from the first user message, never other roles or 
     ),
     "First message",
   )
+})
+
+test("a title from the first message is its first line, cut at a word", () => {
+  const record = { id: "session-1", labels: {} }
+  const prompt =
+    "Review 2026-09 close. Investigate the supplied records, reconcile every account and report."
+  const title = sessionDisplayTitle(record, null, user([{ type: "text", text: prompt }]))
+  assert.equal(title, "Review 2026-09 close. Investigate the supplied records…")
+  assert.ok(title.length <= 61)
+  assert.equal(
+    sessionDisplayTitle(record, null, user([{ type: "text", text: "Close September\n\nDetails" }])),
+    "Close September",
+  )
+  assert.equal(shortSessionTitle("x".repeat(80)), `${"x".repeat(60)}…`)
+  // A cut counts characters, so it never splits an emoji into half a surrogate pair.
+  assert.equal(shortSessionTitle(`a${"😀".repeat(80)}`), `a${"😀".repeat(59)}…`)
+  assert.equal(sessionDisplayTitle(record, "An authored title ".repeat(5), null).length, 90)
 })

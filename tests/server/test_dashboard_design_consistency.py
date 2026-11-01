@@ -64,7 +64,9 @@ def test_read_controls_share_rendered_style_and_remain_keyboard_operable(theme):
                 await route.fulfill(status=503, json={"detail": "Temporarily unavailable"})
 
             await page.route(re.compile(r"/api/inbox(?:\?|$)"), unavailable)
-            await page.goto(base + "/cayu/sessions/question", wait_until="networkidle")
+            await page.goto(
+                base + "/cayu/sessions/question?view=conversation", wait_until="networkidle"
+            )
             await check("Refresh actions")
             await page.route(re.compile(r"/api/tools/calls\?"), unavailable)
             await page.goto(base + "/cayu/tools", wait_until="networkidle")

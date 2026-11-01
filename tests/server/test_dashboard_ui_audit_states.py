@@ -23,7 +23,7 @@ def test_expanded_summary_stays_inside_conversation_scroll_owner(width):
             )
         ) as (page, base, *_):
             await page.set_viewport_size({"width": width, "height": 900})
-            await page.goto(base + "/cayu/sessions/visual-session")
+            await page.goto(base + "/cayu/sessions/visual-session?view=conversation")
             await page.get_by_text("Show full summary", exact=True).click()
             assert await page.evaluate("document.documentElement.scrollHeight <= innerHeight")
             scroll = page.locator("main .overflow-y-auto").first
@@ -104,7 +104,7 @@ def test_mobile_details_owns_keyboard_and_restores_opener():
     async def run():
         async with search_browser(runtime=await _runtime()) as (page, base, *_):
             await page.set_viewport_size({"width": 390, "height": 900})
-            await page.goto(base + "/cayu/sessions/visual-session")
+            await page.goto(base + "/cayu/sessions/visual-session?view=conversation")
             opener = page.get_by_role("button", name="Session details", exact=True)
             await opener.click()
             panel = page.get_by_role("dialog", name="Session details")
@@ -132,7 +132,7 @@ def test_mobile_details_owns_keyboard_and_restores_opener():
 def test_session_actions_escape_from_child_restores_trigger():
     async def run():
         async with search_browser(runtime=await _runtime()) as (page, base, *_):
-            await page.goto(base + "/cayu/sessions/visual-session")
+            await page.goto(base + "/cayu/sessions/visual-session?view=conversation")
             trigger = page.get_by_role("button", name="More actions", exact=True)
             await trigger.click()
             await page.keyboard.press("Tab")
@@ -220,7 +220,7 @@ def test_details_resize_preserves_draft_and_editor_escape_precedes_panel():
     async def run():
         async with search_browser(runtime=await _runtime()) as (page, base, *_):
             await page.set_viewport_size({"width": 390, "height": 900})
-            await page.goto(base + "/cayu/sessions/visual-session")
+            await page.goto(base + "/cayu/sessions/visual-session?view=conversation")
             opener = page.get_by_role("button", name="Session details", exact=True)
             await opener.click()
             panel = page.locator('aside[aria-label="Session details"]')
@@ -253,7 +253,7 @@ def test_details_resize_preserves_draft_and_editor_escape_precedes_panel():
 def test_session_view_tabs_support_arrow_navigation_without_losing_route():
     async def run():
         async with search_browser(runtime=await _runtime()) as (page, base, *_):
-            await page.goto(base + "/cayu/sessions/visual-session")
+            await page.goto(base + "/cayu/sessions/visual-session?view=conversation")
             conversation = page.get_by_role("tab", name="Conversation", exact=True)
             trace = page.get_by_role("tab", name="Trace", exact=True)
             await conversation.focus()
@@ -302,7 +302,7 @@ def test_desktop_details_does_not_own_escape_outside_panel(target):
     async def run():
         async with search_browser(runtime=await _runtime()) as (page, base, *_):
             await page.set_viewport_size({"width": 1440, "height": 900})
-            await page.goto(base + "/cayu/sessions/visual-session")
+            await page.goto(base + "/cayu/sessions/visual-session?view=conversation")
             await page.get_by_role("button", name="Session details", exact=True).click()
             panel = page.locator('aside[aria-label="Session details"]')
             await panel.get_by_role("button", name="Edit labels", exact=True).click()

@@ -330,7 +330,25 @@ export function constantColumns<T>(rows: T[], columns: Record<string, (row: T) =
   return { constant, varying }
 }
 
-/** Authored title first; callers fetch only the first user record when labels are absent. */
+const SHORT_TITLE_LENGTH = 60
+
+/**
+ * A prompt shortened to a name: its first line, cut at a word near the length limit. It counts
+ * characters, not UTF-16 units, so a cut never splits an emoji.
+ */
+export function shortSessionTitle(text: string): string {
+  const line = Array.from((text.trim().split("\n")[0] ?? "").replace(/\s+/g, " ").trim())
+  if (line.length <= SHORT_TITLE_LENGTH) return line.join("")
+  const cut = line.slice(0, SHORT_TITLE_LENGTH)
+  const space = cut.lastIndexOf(" ")
+  const words = (space >= SHORT_TITLE_LENGTH / 2 ? cut.slice(0, space) : cut).join("")
+  return `${words.replace(/[\s,;:.\-–—]+$/, "")}…`
+}
+
+/**
+ * Authored title first; callers fetch only the first user record when labels are absent. A
+ * title taken from the first message is shortened, since the conversation shows it in full.
+ */
 export function sessionDisplayTitle(
   session: { id: string; labels: Record<string, string> },
   title: string | null | undefined,
@@ -349,5 +367,5 @@ export function sessionDisplayTitle(
           .join("")
           .trim()
       : ""
-  return text || session.id
+  return text ? shortSessionTitle(text) : session.id
 }

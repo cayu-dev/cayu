@@ -272,7 +272,9 @@ def test_dot_environment_links_from_session_and_artifact_views(tmp_path):
             _,
             _,
         ):
-            await page.goto(f"{base}/cayu/sessions/first", wait_until="networkidle")
+            await page.goto(
+                f"{base}/cayu/sessions/first?view=conversation", wait_until="networkidle"
+            )
             header_link = page.get_by_role("link", name="..", exact=True).first
             await expect(header_link).to_be_visible()
             header_href = await header_link.get_attribute("href")

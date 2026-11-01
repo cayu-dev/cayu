@@ -7,6 +7,8 @@ import { PayloadViewer } from "./layout"
 export function TranscriptPart({ part }: { part: Record<string, unknown> }) {
   const [expanded, setExpanded] = useState(false)
   const type = typeof part.type === "string" ? part.type : "part"
+  // Provider continuation state is internal and never shown, wherever a part is rendered.
+  if (type === "provider_state") return null
   const text = typeof part.text === "string" ? part.text : null
   const toolName = typeof part.tool_name === "string" ? part.tool_name : ""
   const content = typeof part.content === "string" ? part.content : null

@@ -1,3 +1,5 @@
+import { tabStorage } from "./tab-storage.ts"
+
 /**
  * Where a person was reading in a scrolling view, remembered in this browser tab so
  * returning to the view puts them back there. `view` names what was on screen (a
@@ -18,14 +20,6 @@ export type ReadingPosition = {
 }
 type PositionStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">
 type ScrollMetrics = { scrollTop: number; scrollHeight: number; clientHeight: number }
-
-function tabStorage(): PositionStorage | null {
-  try {
-    return window.sessionStorage
-  } catch {
-    return null
-  }
-}
 
 export function readingPositionFromScroll(
   metrics: ScrollMetrics,

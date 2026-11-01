@@ -325,10 +325,14 @@ def test_dashboard_shell_member_keeps_decisions_without_full_access_widgets():
             requests,
             responses,
         ):
-            await page.goto(base + "/cayu/sessions/shell-approval", wait_until="networkidle")
+            await page.goto(
+                base + "/cayu/sessions/shell-approval?view=conversation", wait_until="networkidle"
+            )
             await expect(page.get_by_role("button", name="Approve", exact=True)).to_be_enabled()
             await expect(page.get_by_role("button", name="Deny", exact=True)).to_be_enabled()
-            await page.goto(base + "/cayu/sessions/shell-answer", wait_until="networkidle")
+            await page.goto(
+                base + "/cayu/sessions/shell-answer?view=conversation", wait_until="networkidle"
+            )
             await page.get_by_placeholder("Answer the paused session...").fill("Continue")
             await expect(
                 page.get_by_role("button", name="Submit Answer", exact=True)

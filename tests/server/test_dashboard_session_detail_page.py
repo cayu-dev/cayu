@@ -54,7 +54,7 @@ def test_detail_bounded_latest_history_and_role_filters():
                     reads.append(request.url) if "/transcript?" in request.url else None
                 ),
             )
-            await page.goto(f"{base}/cayu/sessions/long-conversation")
+            await page.goto(f"{base}/cayu/sessions/long-conversation?view=conversation")
             await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
             await expect(page.get_by_text("message-10001", exact=True)).to_be_visible()
             await expect(page.get_by_text("message-0", exact=True)).to_have_count(0)
@@ -103,7 +103,7 @@ def test_detail_rejected_followup_retains_draft_then_submits_once():
             return app
 
         async with search_browser(runtime=runtime, wrapper=reject_first) as (page, base, _, _, _):
-            await page.goto(f"{base}/cayu/sessions/followup")
+            await page.goto(f"{base}/cayu/sessions/followup?view=conversation")
             composer = page.locator("#session-composer")
             await composer.fill("keep this draft")
             await page.get_by_role("button", name="Send", exact=True).click()
@@ -177,7 +177,7 @@ def test_detail_unknown_followup_reobserves_without_resubmission():
                 )
 
             await page.route("**/api/resume", lose_observation)
-            await page.goto(f"{base}/cayu/sessions/uncertain")
+            await page.goto(f"{base}/cayu/sessions/uncertain?view=conversation")
             composer = page.locator("#session-composer")
             await composer.fill("accepted despite lost response")
             await page.get_by_role("button", name="Send", exact=True).click()
@@ -232,7 +232,7 @@ def test_detail_member_mobile_reads_without_execution_controls():
             )
         )
         async with search_browser(runtime=runtime, member=True) as (page, base, _, _, _):
-            await page.goto(f"{base}/cayu/sessions/member-read")
+            await page.goto(f"{base}/cayu/sessions/member-read?view=conversation")
             await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
             await expect(page.get_by_text("Member conversation", exact=True)).to_be_visible()
             await expect(page.locator("#session-composer")).to_have_count(0)
@@ -281,7 +281,7 @@ def test_detail_member_settles_inline_approval_with_reason():
                     else None
                 ),
             )
-            await page.goto(f"{base}/cayu/sessions/member-decide")
+            await page.goto(f"{base}/cayu/sessions/member-decide?view=conversation")
             await expect(page.get_by_role("button", name="Deny", exact=True)).to_be_visible()
             await expect(
                 page.get_by_text("Approve with changed arguments", exact=True)
@@ -357,7 +357,7 @@ def test_detail_evaluation_uses_existing_captured_evidence_flow(execution_enable
                     await route.fulfill(response=response, json=body)
 
                 await page.route("**/api/contract", disable_execution)
-            await page.goto(f"{base}/cayu/sessions/evaluate")
+            await page.goto(f"{base}/cayu/sessions/evaluate?view=conversation")
             await page.get_by_role("button", name="More actions", exact=True).click()
             await page.get_by_role("button", name="Add to evals", exact=True).click()
             await expect(page.get_by_text("Evaluate captured session", exact=True)).to_be_visible()
@@ -443,7 +443,7 @@ def test_detail_running_queue_respects_policy_and_withdraws_exact_record(allowed
                             else None
                         ),
                     )
-                    await page.goto(f"{base}/cayu/sessions/queue")
+                    await page.goto(f"{base}/cayu/sessions/queue?view=conversation")
                     composer = page.locator("#session-composer")
                     if not allowed:
                         await page.set_viewport_size({"width": 390, "height": 900})
@@ -630,7 +630,7 @@ def test_detail_recovery_uses_exact_public_authority(missing_authority):
                     await route.fulfill(response=response, json=body)
 
                 await page.route("**/api/pending-actions?**", omit_authority)
-            await page.goto(f"{base}/cayu/sessions/crashed")
+            await page.goto(f"{base}/cayu/sessions/crashed?view=conversation")
             await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
             if missing_authority:
                 await expect(
@@ -724,7 +724,7 @@ def test_detail_interrupt_confirms_reason_and_stops_live_runtime():
                             else None
                         ),
                     )
-                    await page.goto(f"{base}/cayu/sessions/interrupt")
+                    await page.goto(f"{base}/cayu/sessions/interrupt?view=conversation")
                     await page.get_by_role("button", name="Stop", exact=True).click()
                     await expect(
                         page.get_by_role("button", name="Keep running", exact=True)
@@ -803,7 +803,7 @@ def test_detail_tool_results_keep_exact_round_evidence():
             )
         await runtime.session_store.append_transcript_messages("tool-evidence", messages)
         async with search_browser(runtime=runtime) as (page, base, _, _, _):
-            await page.goto(f"{base}/cayu/sessions/tool-evidence")
+            await page.goto(f"{base}/cayu/sessions/tool-evidence?view=conversation")
             await page.get_by_role("button", name="Used read 2 times", exact=False).click()
             await page.get_by_role("button", name="read round-one", exact=False).click()
             await expect(page.get_by_text("first exact result", exact=True)).to_be_visible()
@@ -859,7 +859,7 @@ def test_detail_redacted_tool_identity_keeps_result_as_independent_evidence():
             assert response.ok
             payload = await response.json()
             assert payload["messages"][0]["content"][0]["tool_call_id"] == "[REDACTED_SECRET]"
-            await page.goto(f"{base}/cayu/sessions/hidden-tool")
+            await page.goto(f"{base}/cayu/sessions/hidden-tool?view=conversation")
             await expect(
                 page.get_by_text("result Independent redacted outcome", exact=True)
             ).to_be_visible()
@@ -891,7 +891,7 @@ def test_detail_structured_output_and_long_user_message_preserve_exact_content()
             ],
         )
         async with search_browser(runtime=runtime) as (page, base, _, _, _):
-            await page.goto(f"{base}/cayu/sessions/structured-conversation")
+            await page.goto(f"{base}/cayu/sessions/structured-conversation?view=conversation")
             await expect(page.get_by_text("exact ending", exact=False)).to_have_count(0)
             await page.get_by_role("button", name="Show all", exact=False).click()
             await expect(page.locator("p").filter(has_text=long_text)).to_be_visible()
@@ -947,7 +947,7 @@ def test_detail_suppressed_arguments_and_structured_tool_result_remain_readable(
             ],
         )
         async with search_browser(runtime=runtime) as (page, base, _, _, _):
-            await page.goto(f"{base}/cayu/sessions/suppressed-tool")
+            await page.goto(f"{base}/cayu/sessions/suppressed-tool?view=conversation")
             await page.get_by_role("button", name="Used read", exact=True).click()
             await page.get_by_role("button", name="read", exact=True).last.click()
             await expect(
@@ -981,7 +981,7 @@ def test_detail_direct_children_page_independently_of_unrelated_sessions():
                 identity=SessionIdentity(provider_name="fake", model="fake"),
             )
         async with search_browser(runtime=runtime) as (page, base, _, _, _):
-            await page.goto(f"{base}/cayu/sessions/relation-parent")
+            await page.goto(f"{base}/cayu/sessions/relation-parent?view=conversation")
             children = page.locator('a[href^="/cayu/sessions/child-"]')
             await expect(children).to_have_count(100)
             await expect(page.get_by_text("Unrelated 204", exact=True)).to_have_count(0)
@@ -993,6 +993,35 @@ def test_detail_direct_children_page_independently_of_unrelated_sessions():
             await page.locator('a[href="/cayu/sessions/child-000"]').click()
             await page.get_by_role("button", name="Session details", exact=True).click()
             await expect(page.locator('a[href="/cayu/sessions/relation-parent"]')).to_be_visible()
+
+    asyncio.run(run())
+
+
+def test_detail_opens_on_trace_and_returns_to_the_view_last_read():
+    from playwright.async_api import expect
+
+    async def run():
+        runtime = _app()
+        await runtime.session_store.create(
+            RunRequest(
+                session_id="opens-on-trace",
+                agent_name="writer",
+                title="Opens on Trace",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake"),
+        )
+        async with search_browser(runtime=runtime) as (page, base, _, _, _):
+            url = f"{base}/cayu/sessions/opens-on-trace"
+            trace = page.get_by_role("tab", name="Trace", exact=True)
+            conversation = page.get_by_role("tab", name="Conversation", exact=True)
+            await page.goto(url)
+            await expect(trace).to_have_attribute("aria-selected", "true")
+            await conversation.click()
+            await expect(conversation).to_have_attribute("aria-selected", "true")
+            # Coming back in the same tab opens the view it was last read in.
+            await page.goto(url)
+            await expect(conversation).to_have_attribute("aria-selected", "true")
 
     asyncio.run(run())
 
@@ -1014,7 +1043,7 @@ def test_detail_annotations_edit_user_fields_and_preserve_runtime_metadata():
             identity=SessionIdentity(provider_name="fake", model="fake"),
         )
         async with search_browser(runtime=runtime) as (page, base, _, _, _):
-            await page.goto(f"{base}/cayu/sessions/annotated")
+            await page.goto(f"{base}/cayu/sessions/annotated?view=conversation")
             await page.get_by_role("button", name="Session details", exact=True).click()
             await page.get_by_role("button", name="Edit labels", exact=True).click()
             await page.get_by_label("Session labels JSON", exact=True).fill('{"team":"new"}')
@@ -1089,7 +1118,7 @@ def test_detail_task_run_again_uses_exact_replay_and_receipt(lost_ack):
                     await route.fulfill(response=response)
 
             await page.route("**/api/tasks/source-task/replay", dispatch)
-            await page.goto(f"{base}/cayu/sessions/task-session")
+            await page.goto(f"{base}/cayu/sessions/task-session?view=conversation")
             await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
             await page.get_by_role("button", name="More actions", exact=True).click()
             await page.get_by_role("button", name="Run again", exact=True).click()
@@ -1167,7 +1196,7 @@ def test_detail_provider_resolution_keeps_exact_stage_and_audit_reason(resolutio
                     else None
                 ),
             )
-            await page.goto(f"{base}/cayu/sessions/provider-resolution")
+            await page.goto(f"{base}/cayu/sessions/provider-resolution?view=conversation")
             await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
             button = page.get_by_role(
                 "button",
@@ -1220,7 +1249,7 @@ def test_detail_direct_run_again_creates_one_new_session_from_original_prompt():
                     else None
                 ),
             )
-            await page.goto(f"{base}/cayu/sessions/direct-source")
+            await page.goto(f"{base}/cayu/sessions/direct-source?view=conversation")
             await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
             await page.get_by_role("button", name="More actions", exact=True).click()
             await page.get_by_role("button", name="Run again", exact=True).click()
@@ -1260,7 +1289,7 @@ def test_detail_member_protected_review_uses_exact_reference_and_reason():
                     else None
                 ),
             )
-            await page.goto(base + "/cayu/sessions/approval")
+            await page.goto(base + "/cayu/sessions/approval?view=conversation")
             await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
             await expect(page.get_by_text("Protected human review", exact=True)).to_be_visible()
             await expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)
@@ -1320,7 +1349,7 @@ def test_detail_interrupt_owns_separate_transport_while_followup_is_observed():
                     "request",
                     lambda request: posts.append(request) if request.method == "POST" else None,
                 )
-                await page.goto(f"{base}/cayu/sessions/overlap")
+                await page.goto(f"{base}/cayu/sessions/overlap?view=conversation")
                 await expect(
                     page.get_by_role("tab", name="Conversation", exact=True)
                 ).to_be_visible()
@@ -1375,7 +1404,7 @@ def test_detail_annotation_example_preserves_reserved_metadata(monkeypatch):
         runtime, provider, _store, _tasks, directory = await _seed_app()
         try:
             async with search_browser(runtime=runtime) as (page, base, _, _, _):
-                await page.goto(f"{base}/cayu/sessions/{SESSION_ID}")
+                await page.goto(f"{base}/cayu/sessions/{SESSION_ID}?view=conversation")
                 await _exercise_session_annotations(page)
         finally:
             provider.release_direct()
@@ -1502,7 +1531,7 @@ def test_detail_observation_example_preserves_event_and_transcript_links(monkeyp
 
                 if event_page == "delayed":
                     await page.route(f"**/api/sessions/{SESSION_ID}/events?*", delay_initial)
-                await page.goto(f"{base}/cayu/sessions/{SESSION_ID}")
+                await page.goto(f"{base}/cayu/sessions/{SESSION_ID}?view=conversation")
                 exercise = asyncio.create_task(_exercise_session_observation(page, base, store))
                 try:
                     if event_page == "delayed":
@@ -1588,7 +1617,7 @@ def test_detail_incomplete_or_noncausal_tool_results_remain_independent(identity
                 await route.fulfill(response=response, json=body)
 
             await page.route("**/api/sessions/unpaired/transcript?**", project_optional_fields)
-            await page.goto(f"{base}/cayu/sessions/unpaired")
+            await page.goto(f"{base}/cayu/sessions/unpaired?view=conversation")
             if identity == "window":
                 await page.get_by_role("button", name="Older messages", exact=True).click()
             await expect(
@@ -1642,7 +1671,7 @@ def test_detail_user_file_parts_survive_paging_and_role_filter(role):
         messages += [Message.text("user", f"padding {i}") for i in range(100)]
         await runtime.session_store.append_transcript_messages("files", messages)
         async with search_browser(runtime=runtime) as (page, base, _, _, _):
-            await page.goto(f"{base}/cayu/sessions/files")
+            await page.goto(f"{base}/cayu/sessions/files?view=conversation")
             if role == "user":
                 await page.get_by_label("Message role", exact=True).select_option("user")
             await page.get_by_role("button", name="Older messages", exact=True).click()
@@ -1718,7 +1747,7 @@ def test_detail_recovery_observation_loss_never_claims_decided(accepted):
                 )
 
             await page.route("**/api/user-input/recover", lose_recovery)
-            await page.goto(f"{base}/cayu/sessions/crashed")
+            await page.goto(f"{base}/cayu/sessions/crashed?view=conversation")
             await page.get_by_label("The person's answer", exact=True).fill("staging")
             await page.get_by_label("Verified result or failure reason", exact=True).fill(
                 "Verified externally"
@@ -1782,7 +1811,7 @@ def test_detail_definite_recovery_rejection_retains_form_for_corrected_attempt()
                     await route.continue_()
 
             await page.route("**/api/user-input/recover", reject_first)
-            await page.goto(f"{base}/cayu/sessions/crashed")
+            await page.goto(f"{base}/cayu/sessions/crashed?view=conversation")
             await page.get_by_label("The person's answer", exact=True).fill("staging")
             result = page.get_by_label("Verified result or failure reason", exact=True)
             await result.fill("Initial evidence")
@@ -2032,7 +2061,7 @@ def test_detail_returning_to_bottom_reconciles_deferred_terminal_answer():
             running = asyncio.create_task(execute())
             try:
                 await asyncio.wait_for(entered.wait(), 10)
-                await page.goto(f"{base}/cayu/sessions/deferred-tail")
+                await page.goto(f"{base}/cayu/sessions/deferred-tail?view=conversation")
                 await expect(page.get_by_text("history-34", exact=False)).to_be_visible()
                 scroller = page.locator("div.overflow-y-auto").filter(
                     has=page.get_by_label("Message role", exact=True)
@@ -2141,7 +2170,7 @@ def test_failed_session_shows_redacted_error_without_overflow(width):
         await runtime.session_store.update_status("failed-display", SessionStatus.FAILED)
         async with search_browser(runtime=runtime) as (page, base, _, _, _):
             await page.set_viewport_size({"width": width, "height": 900})
-            await page.goto(f"{base}/cayu/sessions/failed-display")
+            await page.goto(f"{base}/cayu/sessions/failed-display?view=conversation")
             banner = page.get_by_text("Provider returned 503: [REDACTED_SECRET]", exact=False).first
             await expect(banner).to_be_visible()
             assert "provider-secret-canary" not in await page.locator("body").inner_text()

@@ -103,7 +103,9 @@ def test_environment_old_search_and_both_session_links(tmp_path):
             await expect(
                 page.get_by_role("link", name="Other environment", exact=True)
             ).to_have_count(0)
-            await page.goto(f"{base}/cayu/sessions/review-session", wait_until="networkidle")
+            await page.goto(
+                f"{base}/cayu/sessions/review-session?view=conversation", wait_until="networkidle"
+            )
 
             async def exact_links():
                 links = page.get_by_role("link", name=name, exact=True)

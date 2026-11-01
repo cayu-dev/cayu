@@ -17,6 +17,7 @@ import type {
   MutationTransportSnapshot,
 } from "@/lib/mutation-transport"
 import { reconcileRunAgentSelection } from "@/lib/run-agent-selection"
+import { rememberConversation } from "@/lib/session-view"
 import { cn } from "@/lib/utils"
 import type { Api, TaskType } from "../api/types"
 import { useSpecialists, useTaskTypes } from "../app/queries"
@@ -35,6 +36,12 @@ function useStartUnavailableReason(mode?: "task" | "specialist"): string | null 
   if (mode === "task")
     return taskCreationEnabled === true ? null : "Task creation is unavailable for this deployment."
   return executionEnabled === true ? null : "Starting sessions is unavailable for this deployment."
+}
+
+/** A session the person just started opens on its conversation, where its reply is. */
+function startedSession(sessionId: string) {
+  rememberConversation(sessionId, true)
+  return sessionRoute(sessionId)
 }
 
 /** The button that opens the form, for a page's top bar. */
@@ -191,7 +198,7 @@ function StartSessionForm({ onClose, initialMode, onPendingChange }: StartSessio
         if (result.snapshot && !["terminal", "runtime_failed"].includes(result.snapshot.phase))
           return null
         if (!result.session_id) throw new Error("The runtime did not return a session identity.")
-        return sessionRoute(result.session_id)
+        return startedSession(result.session_id)
       }
       const input = fields
         ? inputFrom(fields, values)
@@ -496,7 +503,7 @@ function StartSessionForm({ onClose, initialMode, onPendingChange }: StartSessio
                     if (!mounted.current || router.state.location.pathname !== origin) return
                     setSnapshot(next)
                     if (["terminal", "runtime_failed"].includes(next.phase) && next.sessionId)
-                      done(sessionRoute(next.sessionId))
+                      done(startedSession(next.sessionId))
                   })
                   .catch(setObservationError)
                   .finally(() => setRetrying(false))

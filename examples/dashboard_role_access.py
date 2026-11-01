@@ -446,7 +446,8 @@ async def _exercise_developer(
 
     # Full access may approve with changed arguments; the tool runs with them.
     await page.goto(
-        f"{base_url}/cayu/sessions/{DEVELOPER_APPROVAL_SESSION}", wait_until="networkidle"
+        f"{base_url}/cayu/sessions/{DEVELOPER_APPROVAL_SESSION}?view=conversation",
+        wait_until="networkidle",
     )
     card = page.locator("[data-inbox-item]").first
     await card.get_by_text("Decision options", exact=True).click()
@@ -582,7 +583,10 @@ async def _exercise_member(
     await expect(page.get_by_role("heading", name="Evals", exact=True)).to_be_visible()
 
     # A session offers decisions but no composer, Run again or changed arguments.
-    await page.goto(f"{base_url}/cayu/sessions/{MEMBER_APPROVAL_SESSION}", wait_until="networkidle")
+    await page.goto(
+        f"{base_url}/cayu/sessions/{MEMBER_APPROVAL_SESSION}?view=conversation",
+        wait_until="networkidle",
+    )
     card = page.locator("[data-inbox-item]").first
     await expect(card.get_by_role("button", name="Approve", exact=True)).to_be_visible()
     await expect(page.locator("#session-composer")).to_have_count(0)
@@ -646,7 +650,8 @@ async def _exercise_member(
             )
 
             await page.goto(
-                f"{base_url}/cayu/sessions/{MEMBER_APPROVAL_SESSION}", wait_until="networkidle"
+                f"{base_url}/cayu/sessions/{MEMBER_APPROVAL_SESSION}?view=conversation",
+                wait_until="networkidle",
             )
             card = page.locator("[data-inbox-item]").first
             await card.get_by_text("Decision options", exact=True).click()

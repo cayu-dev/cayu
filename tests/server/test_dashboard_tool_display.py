@@ -160,7 +160,7 @@ def test_session_labels_use_only_unambiguous_enabled_declarations(mode):
                     await route.continue_()
 
                 await page.route("**/api/agents", delayed)
-            await page.goto(f"{base}/cayu/sessions/label-session")
+            await page.goto(f"{base}/cayu/sessions/label-session?view=conversation")
             if mode == "inventory-delayed":
                 try:
                     await expect(
@@ -304,7 +304,7 @@ def test_native_labels_keep_priority_and_fit_conversation_and_trace(verb, target
         async with search_browser(runtime=runtime) as (page, base, _, _, _):
             for width in [390, 800, 1440]:
                 await page.set_viewport_size({"width": width, "height": 900})
-                await page.goto(f"{base}/cayu/sessions/presentation")
+                await page.goto(f"{base}/cayu/sessions/presentation?view=conversation")
                 await expect(page.get_by_text("Finished", exact=True)).to_be_visible()
                 await page.get_by_role("button", name=verb, exact=False).click()
                 row = page.locator('[id^="transcript-tool-"]').first

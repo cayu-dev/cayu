@@ -97,7 +97,7 @@ def test_task_replay_guards_departure_and_recovers_exact_receipt(detail_failure)
                     await route.fulfill(response=response)
 
             await page.route("**/api/tasks/source-task/replay", dispatch)
-            await page.goto(f"{base}/cayu/sessions/task-session")
+            await page.goto(f"{base}/cayu/sessions/task-session?view=conversation")
             await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
             await page.get_by_role("button", name="More actions", exact=True).click()
             await page.get_by_role("button", name="Run again", exact=True).click()
@@ -226,7 +226,7 @@ def test_followup_trace_recovery_clears_only_submitted_draft():
                 )
 
             await page.route("**/api/resume", lose_observation)
-            await page.goto(f"{base}/cayu/sessions/uncertain")
+            await page.goto(f"{base}/cayu/sessions/uncertain?view=conversation")
             composer = page.locator("#session-composer")
             await composer.fill("accepted despite lost response")
             await page.get_by_role("button", name="Send", exact=True).click()
@@ -340,7 +340,7 @@ def test_queue_acceptance_guards_departure_and_recovers_delivered_receipt():
                     await route.fulfill(status=200, content_type="text/event-stream", body="")
 
                 await page.route("**/api/sessions/queue/messages", lose_enqueue)
-                await page.goto(f"{base}/cayu/sessions/queue")
+                await page.goto(f"{base}/cayu/sessions/queue?view=conversation")
                 composer = page.locator("#session-composer")
                 await expect(composer).to_be_enabled()
                 await composer.fill("Please verify the new entry")
@@ -436,7 +436,7 @@ def test_run_observation_guard_preserves_exact_destination(entrance):
                 )
 
             await page.route("**/api/run", lost_observer)
-            await page.goto(f"{base}/cayu/sessions/direct-source")
+            await page.goto(f"{base}/cayu/sessions/direct-source?view=conversation")
             if entrance == "rerun":
                 await page.get_by_role("button", name="More actions", exact=True).click()
                 await page.get_by_role("button", name="Run again", exact=True).click()

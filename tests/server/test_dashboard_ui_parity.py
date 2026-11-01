@@ -114,7 +114,7 @@ def test_session_details_use_single_column_annotation_owner():
             base,
             *_,
         ):
-            await page.goto(f"{base}/cayu/sessions/visual-session?panel=overview")
+            await page.goto(f"{base}/cayu/sessions/visual-session?panel=overview&view=conversation")
             panel = page.get_by_role("complementary", name="Session details")
             await expect(panel).to_be_visible()
             summary = panel.get_by_text("Detailed release summary. " * 100, exact=True)

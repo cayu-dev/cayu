@@ -58,7 +58,7 @@ def test_prototype_terminal_session_keeps_mock_evaluation_dialog(prototype_url, 
             page = browser.new_page()
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
-            page.goto(f"{prototype_url}#/sessions/{session_id}")
+            page.goto(f"{prototype_url}#/sessions/{session_id}?view=conversation")
             playwright.expect(
                 page.get_by_role("tab", name="Conversation", exact=True)
             ).to_be_visible()
