@@ -154,6 +154,7 @@ export function buildBlocks(
     if (m.role === "user") {
       work = null
       m.content.forEach((part, index) => {
+        if (part.type === "provider_state") return
         if (part.type === "thinking" && !includeThinking) return
         const partKey = `${key}.${index}`
         if (part.type === "text") {
@@ -165,6 +166,8 @@ export function buildBlocks(
       continue
     }
     m.content.forEach((p, i) => {
+      // Provider continuation state is not conversation content or a work boundary.
+      if (p.type === "provider_state") return
       if (p.type === "thinking" && !includeThinking) return
       const pkey = `${key}.${i}`
       if (p.type === "structured_output" && structuredOutputEnabled) {

@@ -63,6 +63,48 @@ test("buildBlocks groups tool calls and thinking between messages into one work 
   assert.equal(work.tools[1].error, true)
 })
 
+test("provider state does not split tool work or change native part positions", () => {
+  const state = { type: "provider_state", provider: "openai" }
+  const messages = [
+    msg(0, "assistant", [
+      state,
+      { type: "tool_call", ...correlation, tool_call_id: "a", tool_name: "read" },
+      state,
+    ]),
+    msg(1, "tool", [{ type: "tool_result", ...correlation, tool_call_id: "a", content: "found" }]),
+    msg(2, "assistant", [state]),
+    msg(3, "assistant", [
+      { type: "tool_call", ...correlation, tool_call_id: "b", tool_name: "inspect" },
+      state,
+    ]),
+  ]
+  const original = structuredClone(messages)
+  const blocks = buildBlocks(messages)
+  assert.deepEqual(
+    blocks.map((block) => block.kind),
+    ["work"],
+  )
+  assert.deepEqual(
+    blocks[0].tools.map((tool) => [tool.name, tool.messageIndex, tool.partIndex, tool.result]),
+    [
+      ["read", 0, 1, "found"],
+      ["inspect", 3, 0, null],
+    ],
+  )
+  assert.equal(workSummary(blocks[0].tools), "Used read, used inspect")
+  assert.deepEqual(messages, original)
+})
+
+test("provider state is omitted from assistant and user text messages", () => {
+  for (const role of ["assistant", "user"]) {
+    const state = { type: "provider_state", provider: "openai" }
+    assert.deepEqual(buildBlocks([msg(0, role, [state])]), [])
+    assert.deepEqual(buildBlocks([msg(0, role, [{ type: "text", text: "Done." }, state])]), [
+      { kind: role === "user" ? "user" : "text", key: "m0.0", text: "Done." },
+    ])
+  }
+})
+
 test("buildBlocks renders public structured-output parts from assistant and tool messages", () => {
   for (const role of ["assistant", "tool"]) {
     for (const output of [{ findings: [] }, [1, 2], "ready", false, 0, null]) {
