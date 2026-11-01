@@ -140,26 +140,36 @@ def test_request_header_count_accepts_exact_boundary_and_rejects_next_header(
 
 
 def test_request_head_uses_absolute_deadline_against_slowloris() -> None:
+    # Every byte arrives far inside the 0.5s budget, and the head never completes
+    # before the client gives up about four seconds in. Only a deadline across the
+    # whole head ends this read with a timeout; a per-read timeout would consume
+    # every byte and fail as malformed when the client closes. The outcome, not
+    # wall time, shows which, so a slow runner cannot flip it.
     reader, writer = socket.socketpair()
+    finished = threading.Event()
 
     def trickle() -> None:
         with writer:
-            for byte in b"GET / HTTP/1.1\r\n\r\n":
-                with contextlib.suppress(OSError):
+            for byte in b"GET / HTTP/1.1\r\nX-Slow: " + b"a" * 200:
+                if finished.is_set():
+                    return
+                try:
                     writer.send(bytes((byte,)))
+                except OSError:
+                    return
                 time.sleep(0.02)
 
     sender = threading.Thread(target=trickle)
     sender.start()
-    started = time.monotonic()
     try:
         with pytest.raises(_ProxyProtocolError) as caught:
-            _read_head(reader, timeout_s=0.05)
+            _read_head(reader, timeout_s=0.5)
         assert caught.value.error_code == "request_head_timeout"
-        assert time.monotonic() - started < 0.25
     finally:
+        finished.set()
         reader.close()
-        sender.join(timeout=1.0)
+        sender.join(timeout=5.0)
+    assert not sender.is_alive()
 
 
 def test_live_proxy_slowloris_deadline_releases_worker_capacity(
