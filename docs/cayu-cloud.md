@@ -28,8 +28,9 @@ cayu cloud service status --application my-agent
 - `deployment list|logs|status|timeline|wait|promote|discard|retry` and `rollback` for
   immutable releases, including [candidate releases](#candidate-releases);
 - `runtimes list|status` for retained runtime artifacts;
-- `service credentials|destroy|logs|pause|restart|resume|sleep|status|wake` for Agent
-  infrastructure, and `schedule run` to run a schedule now;
+- `service check|credentials|destroy|logs|pause|restart|resume|sleep|status|wake` for Agent
+  infrastructure and [its own post-deploy check](#operator-check), and `schedule run` to run a
+  schedule now;
 - `env list|set|unset` for Agent-owned configuration, and `settings list|set|unset`
   for the Agent's [managed settings](#agent-settings);
 - `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
@@ -1965,6 +1966,79 @@ Cloud reads it from the deployment root's uploaded `cayu-cloud.toml`. A custom
 `--manifest` deploy whose root `cayu-cloud.toml` declares it. A Cayu Cloud that doesn't
 keep webhooks yet ignores the table. `cayu cloud init` writes no `[webhooks]`, because it
 cannot know which paths receive them.
+
+## Operator check
+
+`cayu cloud service status` says whether the Agent's processes are up, not whether the Agent
+works. An Agent can declare one route that checks that itself (its AI gateway answers, one live
+workflow completes), and `cayu cloud service check` has Cayu Cloud call it after a deploy, with
+the Agent's operator login, whatever the Agent's own sign-in:
+
+```toml
+[operator_check]
+path = "/operator-check"   # required
+method = "POST"            # optional: "POST" (the default) or "GET"
+timeout_seconds = 30       # optional: 1 to 45
+```
+
+- `path` follows the same rules as `home` (see [Sign-in and home page](#sign-in-and-home-page)),
+  and can't be under `/.cayu/`, which Cayu Cloud's Agent router serves itself, or under one of
+  the `[webhooks] paths`, whose requests Cloud keeps while the Agent sleeps. Other keys are
+  rejected like those in `[web]`. It requires `schema_version = 2`, and `cayu cloud deploy`
+  checks it before uploading and fails with `manifest_invalid`.
+- Like `[webhooks]`, it is not sent in the deployment request: Cayu Cloud reads it from the
+  deployment root's uploaded `cayu-cloud.toml`, so a custom `--manifest` path that declares it,
+  or a custom `--manifest` deploy whose root file declares it, is rejected.
+
+Cayu Cloud calls exactly the declared route of the serving release and nothing else, through the
+Agent router, with HTTP Basic `CAYU_OPERATOR_USERNAME` and `CAYU_OPERATOR_PASSWORD` (the login it
+injects into every Agent process). The router passes that request on unchanged with either
+`[sign_in]` mode. The app serves the route with `cayu.server.operator_check`:
+
+```python
+from cayu.server.operator_check import CheckFailed, OperatorCheck
+
+check = OperatorCheck()
+
+
+@check.step("ai_gateway")
+async def ai_gateway() -> str:
+    reply = await gateway.test_connection()
+    if not reply.ok:
+        raise CheckFailed(f"The gateway answered {reply.status}.")
+    return f"Answered in {reply.elapsed_ms} ms"
+
+
+app.include_router(check.router())  # POST /operator-check, operator login only
+```
+
+Steps run in order, plain or `async`, and a failed step doesn't stop the next. A step fails when
+it raises: `CheckFailed` shows its message, any other exception only its type (the traceback
+goes to the app's log). The route answers `200` with `{"ok": true, "summary", "checks": [{"name",
+"ok", "detail", "duration_ms"}]}` when every step passes and `503` with `"ok": false` otherwise.
+`router()` reads the operator login when it is called and raises `AuthConfigurationError` without
+it; pass `path=`, `method=` and `auth=` (any server auth dependency) to serve it elsewhere or
+protect it another way, and call `await check.run()` for the same report without a route. An app
+that serves the route itself checks the same Basic login and answers the same JSON.
+
+```bash
+cayu cloud service check --application my-agent
+cayu cloud service check --application my-agent --json
+```
+
+The command prints the verdict, the HTTP status, how long the check took, the summary and each
+step, and a hint when the answer shows the route isn't set up for Cloud (for example `401`: the
+route refused the operator login). `--json` prints the JSON envelope with `result.outcome`
+(`passed` or `failed`), `http_status`, `duration_ms`, `deployment_id` and a bounded `body`. A
+failed check exits `2` with `operator_check_failed` and the same result in the error. Cloud's
+refusals exit `2` with their `code`: `operator_check_not_declared`, `service_not_running`,
+`no_web_service`, `operator_check_timeout` (the check may still be running: read `service logs`
+before running it again) or `agent_unreachable`.
+
+A sleeping Agent wakes for the check. While Cloud reports `agent_starting` (the check wasn't
+sent), the command asks again after Cloud's `Retry-After`, for up to `--wait-seconds` (300 by
+default). It never sends a check twice otherwise, because a check can run a live workflow. Cloud
+records who ran each check, on which Agent and release, when, and the result.
 
 ## Application database migration
 

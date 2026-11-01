@@ -294,6 +294,86 @@ class CloudWebhooks:
     paths: tuple[str, ...]
 
 
+# `[operator_check]`: the one route of the Agent Cayu Cloud calls with its operator login.
+OPERATOR_CHECK_METHODS = ("POST", "GET")
+OPERATOR_CHECK_DEFAULT_METHOD = "POST"
+OPERATOR_CHECK_DEFAULT_TIMEOUT_SECONDS = 30
+OPERATOR_CHECK_MAX_TIMEOUT_SECONDS = 45
+_OPERATOR_CHECK_ROUTER_PATH_ERROR = (
+    "[operator_check] path can't be under \"/.cayu/\", which Cayu Cloud's Agent router serves "
+    "itself."
+)
+_OPERATOR_CHECK_WEBHOOK_ERROR = (
+    "[operator_check] path can't be under one of the [webhooks] paths, whose requests Cayu Cloud "
+    "keeps while the Agent sleeps and delivers later."
+)
+_OPERATOR_CHECK_METHOD_ERROR = '[operator_check] method must be "POST" or "GET".'
+_OPERATOR_CHECK_TIMEOUT_ERROR = (
+    "[operator_check] timeout_seconds must be a whole number of seconds from 1 to "
+    f"{OPERATOR_CHECK_MAX_TIMEOUT_SECONDS}."
+)
+
+
+@dataclass(frozen=True)
+class CloudOperatorCheck:
+    """`[operator_check]`: the Agent's own post-deploy check, which `cayu cloud service check`
+    has Cayu Cloud call with the Agent's operator login."""
+
+    path: str
+    method: str = OPERATOR_CHECK_DEFAULT_METHOD
+    timeout_seconds: int = OPERATOR_CHECK_DEFAULT_TIMEOUT_SECONDS
+
+
+def _checked_operator_check(path: object, method: object, timeout_seconds: object) -> None:
+    decoded = unquote(_same_host_path(path, label="[operator_check] path"))
+    if decoded == "/.cayu" or decoded.startswith("/.cayu/"):
+        raise CloudApiError("manifest_invalid", _OPERATOR_CHECK_ROUTER_PATH_ERROR)
+    if method not in OPERATOR_CHECK_METHODS:
+        raise CloudApiError("manifest_invalid", _OPERATOR_CHECK_METHOD_ERROR)
+    if (
+        type(timeout_seconds) is not int
+        or not 1 <= timeout_seconds <= OPERATOR_CHECK_MAX_TIMEOUT_SECONDS
+    ):
+        raise CloudApiError("manifest_invalid", _OPERATOR_CHECK_TIMEOUT_ERROR)
+
+
+def _as_requested(path: str) -> str:
+    # A path as it reaches Cayu Cloud's Agent router: percent-decoded, without the `.` segments
+    # a client removes before it sends a path. Cloud matches webhook prefixes in this form.
+    segments = unquote(path).split("/")
+    kept = [segment for segment in segments[:-1] if segment != "."]
+    return "/".join([*kept, "" if segments[-1] == "." else segments[-1]])
+
+
+def _under_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
+    """Whether Cloud's router would match ``path`` to one of ``prefixes``, as it matches
+    `[webhooks] paths`: one ending in `/` covers everything under it, any other that path and
+    everything below it."""
+
+    requested = _as_requested(path)
+    for prefix in map(_as_requested, prefixes):
+        if prefix.endswith("/"):
+            if requested.startswith(prefix):
+                return True
+        elif requested == prefix or requested.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def _operator_check(table: dict[str, object] | None) -> CloudOperatorCheck | None:
+    if table is None:
+        return None
+    path = table.get("path")
+    method = table.get("method", OPERATOR_CHECK_DEFAULT_METHOD)
+    timeout_seconds = table.get("timeout_seconds", OPERATOR_CHECK_DEFAULT_TIMEOUT_SECONDS)
+    _checked_operator_check(path, method, timeout_seconds)
+    return CloudOperatorCheck(
+        path=cast("str", path),
+        method=cast("str", method),
+        timeout_seconds=cast("int", timeout_seconds),
+    )
+
+
 # The command `cayu new --with app-database` projects migrate their own tables with.
 APP_DATABASE_MIGRATE = "alembic upgrade head"
 _DATABASE_MIGRATE_ERROR = (
@@ -413,6 +493,7 @@ class CloudProjectManifest:
     sign_in: CloudSignIn = CloudSignIn()
     database: CloudDatabase | None = None
     webhooks: CloudWebhooks | None = None
+    operator_check: CloudOperatorCheck | None = None
 
     @classmethod
     def load(cls, path: Path) -> CloudProjectManifest:
@@ -453,6 +534,7 @@ class CloudProjectManifest:
             "sign_in",
             "database",
             "webhooks",
+            "operator_check",
         }
         schema_version = payload.get("schema_version")
         if set(payload) - allowed or schema_version not in {1, 2}:
@@ -482,6 +564,11 @@ class CloudProjectManifest:
                 "manifest_invalid",
                 "[webhooks] requires cayu-cloud.toml schema_version 2.",
             )
+        if schema_version == 1 and "operator_check" in payload:
+            raise CloudApiError(
+                "manifest_invalid",
+                "[operator_check] requires cayu-cloud.toml schema_version 2.",
+            )
         application = payload.get("application")
         if type(application) is not str:
             raise CloudApiError(
@@ -502,6 +589,9 @@ class CloudProjectManifest:
             webhooks = payload.get("webhooks")
             if webhooks is not None and not isinstance(webhooks, dict):
                 raise TypeError("webhooks must be a table")
+            operator_check = payload.get("operator_check")
+            if operator_check is not None and not isinstance(operator_check, dict):
+                raise TypeError("operator_check must be a table")
             if web is not None and not isinstance(web, dict):
                 raise TypeError("web must be a table")
             if worker is not None and not isinstance(worker, dict):
@@ -522,6 +612,7 @@ class CloudProjectManifest:
                 ("sign_in", sign_in, CloudSignIn),
                 ("database", database, CloudDatabase),
                 ("webhooks", webhooks, CloudWebhooks),
+                ("operator_check", operator_check, CloudOperatorCheck),
                 *(
                     (
                         f'schedule "{item["name"]}"'
@@ -603,6 +694,7 @@ class CloudProjectManifest:
                 sign_in=_sign_in(sign_in),
                 database=_database(database),
                 webhooks=_webhooks(webhooks),
+                operator_check=_operator_check(operator_check),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CloudApiError(
@@ -717,6 +809,16 @@ class CloudProjectManifest:
             _migrate_command(self.database.migrate)
         if self.webhooks is not None:
             _webhook_paths(self.webhooks.paths)
+        if self.operator_check is not None:
+            _checked_operator_check(
+                self.operator_check.path,
+                self.operator_check.method,
+                self.operator_check.timeout_seconds,
+            )
+            if self.webhooks is not None and _under_prefix(
+                self.operator_check.path, self.webhooks.paths
+            ):
+                raise CloudApiError("manifest_invalid", _OPERATOR_CHECK_WEBHOOK_ERROR)
 
     def deployment_payload(self, *, repository: str, revision: str) -> dict[str, object]:
         return {
@@ -1257,8 +1359,8 @@ def resolve_project(
 
 
 def _validate_source_manifest_path(manifest: CloudProjectManifest, path: Path) -> None:
-    # Cloud reads storage acknowledgements, sign-in, home and webhooks only from the root
-    # file, not from the selected CLI manifest path.
+    # Cloud reads storage acknowledgements, sign-in, home, webhooks and the operator check
+    # only from the root file, not from the selected CLI manifest path.
     if path == _ROOT_MANIFEST:
         return
     if manifest.home is not None or manifest.sign_in != CloudSignIn():
@@ -1274,6 +1376,13 @@ def _validate_source_manifest_path(manifest: CloudProjectManifest, path: Path) -
             "[webhooks] requires cayu-cloud.toml at the deployment root. Move the manifest "
             "there as a regular file and deploy without --manifest; Cloud reads webhook paths "
             "only from that file.",
+        )
+    if manifest.operator_check is not None:
+        raise CloudApiError(
+            "manifest_invalid",
+            "[operator_check] requires cayu-cloud.toml at the deployment root. Move the "
+            "manifest there as a regular file and deploy without --manifest; Cloud reads the "
+            "operator check only from that file.",
         )
     if manifest.local_files:
         raise CloudApiError(
@@ -1293,7 +1402,8 @@ _ROOT_MANIFEST_UNREADABLE = (
 
 
 def _validate_root_settings(root_manifest: str | None, path: Path) -> None:
-    # A custom manifest deploys with the root file's sign-in, home and webhooks, because
+    # A custom manifest deploys with the root file's sign-in, home, webhooks and operator
+    # check, because
     # Cloud reads them only from there. Refuse when that file declares anything but the
     # default.
     if root_manifest is None:
@@ -1308,6 +1418,13 @@ def _validate_root_settings(root_manifest: str | None, path: Path) -> None:
             "The deployment root's cayu-cloud.toml declares [webhooks], and Cloud reads "
             f"webhook paths only from that file, not from {path.as_posix()}. Deploy without "
             "--manifest, or remove [webhooks] from the root cayu-cloud.toml.",
+        )
+    if payload.get("operator_check") is not None:
+        raise CloudApiError(
+            "manifest_invalid",
+            "The deployment root's cayu-cloud.toml declares [operator_check], and Cloud reads "
+            f"the operator check only from that file, not from {path.as_posix()}. Deploy "
+            "without --manifest, or remove [operator_check] from the root cayu-cloud.toml.",
         )
     if payload.get("home") is None and payload.get("sign_in", {"mode": "own"}) == {"mode": "own"}:
         return

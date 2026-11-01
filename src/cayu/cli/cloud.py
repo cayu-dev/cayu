@@ -58,6 +58,11 @@ from cayu.cli._cloud_releases import (
     render_releases,
     show_application,
 )
+from cayu.cli._cloud_service_check import (
+    OperatorCheckFailedError,
+    add_service_check_arguments,
+    service_check,
+)
 from cayu.cli._cloud_service_logs import add_service_logs_arguments, service_logs
 from cayu.cli._cloud_service_switch import ServiceStillSwitchingError, send_when_not_switching
 from cayu.cli._cloud_settings import CloudSettingsError, add_settings_parser, settings_command
@@ -804,6 +809,7 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
             CompassWriteError,
             CloudSettingsError,
             CloudEvalError,
+            OperatorCheckFailedError,
             ServiceStillSwitchingError,
         ),
     ):
@@ -1134,6 +1140,11 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     service_commands = service.add_subparsers(dest="service_command", required=True)
     service_descriptions = {
+        "check": (
+            "Run the Agent's own post-deploy check: Cayu Cloud calls the route its "
+            "cayu-cloud.toml declares in [operator_check] with the Agent's operator login, and "
+            "this prints the Agent's answer. A failed check exits 2."
+        ),
         "credentials": (
             "Show the Agent's own Developer dashboard (/cayu/) username and password. The "
             "output is a credential: keep it out of logs and shared terminals."
@@ -1158,6 +1169,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         operation.add_argument("--application", required=True)
         if action == "logs":
             add_service_logs_arguments(operation)
+        if action == "check":
+            add_service_check_arguments(operation)
         if action in _SWITCH_REFUSED_SERVICE_ACTIONS:
             _add_switch_wait_argument(operation)
         if action == "destroy":
@@ -3684,6 +3697,14 @@ def _service(
         )
     elif action == "logs":
         return service_logs(arguments, client=client, application_id=application_id, sleep=sleep)
+    elif action == "check":
+        return service_check(
+            arguments,
+            client=client,
+            application_id=application_id,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
     elif action == "credentials":
         result = _operator_credentials(client, application_id=application_id)
     else:
