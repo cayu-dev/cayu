@@ -17,6 +17,11 @@ from time import monotonic
 from typing import Any
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError, require_clean_nonblank
+from cayu.environments.bindings import (
+    DeterministicWorkspaceBinding,
+    NativeBinding,
+    NoWorkspaceBinding,
+)
 from cayu.events import Event, EventType
 from cayu.failure_evidence import exception_evidence
 from cayu.runners.base import ExecCommand, ExecResult, Runner
@@ -44,6 +49,10 @@ _MAX_COMPLETED_PAYLOAD_BYTES = MAX_TOOL_TERMINAL_PAYLOAD_BYTES
 # each stream always keeps at least a quarter of the payload.
 _MAX_COMPLETED_METADATA_BYTES = _MAX_COMPLETED_PAYLOAD_BYTES // 2
 _REPLACEMENT_CHARACTER = "\ufffd"
+# Bindings whose bind() and finalize() only pass the configured workspace and
+# runner through, so the runner already sees the workspace without a session.
+# Exact types: a subclass may add setup to bind().
+_SETUP_FREE_BINDINGS = frozenset({NativeBinding, DeterministicWorkspaceBinding, NoWorkspaceBinding})
 _UNSAFE_TEXT = re.compile("[\x00\ud800-\udfff]")
 
 
@@ -129,6 +138,37 @@ async def command(
         if replayed is not None:
             return replayed
 
+    # Admitted application work, like an agent step's run: shutdown waits for
+    # it, and a sealed application refuses a new one.
+    return await ctx.app._run_admitted_workflow_command(
+        lambda: _execute_command(
+            ctx,
+            step_id=step_id,
+            exec_command=exec_command,
+            owned_argv=owned_argv,
+            environment_name=environment_name,
+            cwd=cwd,
+            owned_env=owned_env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+    )
+
+
+async def _execute_command(
+    ctx: WorkflowContext,
+    *,
+    step_id: str,
+    exec_command: ExecCommand,
+    owned_argv: tuple[str, ...],
+    environment_name: str | None,
+    cwd: str | None,
+    owned_env: dict[str, str] | None,
+    timeout_s: int | None,
+    stdin: str | None,
+    output_limit_bytes: int,
+) -> CommandResult:
     (await ctx.execution_deadline()).require_admission("workflow_command")
     anchor = await ctx._workflow_anchor()
     parent_session_id, causal_budget_id = _workflow_lineage_from_anchor(ctx, anchor)
@@ -253,6 +293,17 @@ def _resolve_command_runner(
             f"command step {request.step_id!r}: environment {name!r} is factory-backed "
             "and is provisioned per session; command() currently runs only on an "
             "environment registered with register_environment()."
+        )
+    binding = registered.environment.binding
+    if binding is not None and type(binding) not in _SETUP_FREE_BINDINGS:
+        # The runtime binds and finalizes a workspace binding (checkout, copy-in,
+        # copy-back) only around an agent session. Running here would execute
+        # against a workspace the binding never prepared.
+        raise ValueError(
+            f"command step {request.step_id!r}: environment {name!r} uses "
+            f"{type(binding).__name__}, which prepares the workspace per session; "
+            "command() runs only on environments whose runner already sees the "
+            "workspace (no binding, NativeBinding or NoWorkspaceBinding)."
         )
     runner = registered.environment.runner
     if runner is None:

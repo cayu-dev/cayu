@@ -7,9 +7,9 @@ ordinary session run, and watchers are delivered by ``dispatch_event_watchers``.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import aclosing
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from cayu.observability.watchers import EventWatcher, EventWatcherRunResult
 from cayu.runtime._event_watcher_delivery import dispatch_event_watchers
@@ -18,6 +18,9 @@ from cayu.runtime.application_lifecycle import _admitted_entrance
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.approvals.proposals import ToolCallProposalOutcome
+
+
+_T = TypeVar("_T")
 
 
 class WorkflowEntrances:
@@ -47,6 +50,17 @@ class WorkflowEntrances:
     def event_watchers(self) -> tuple[EventWatcher, ...]:
         """Watchers declared with ``register_event_watcher``, in registration order."""
         return self._event_watchers
+
+    @_admitted_entrance
+    async def _run_admitted_workflow_command(
+        self: CayuApp, operation: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        """Run one workflow ``command`` step as admitted application work.
+
+        Shutdown waits for it like an agent step's run, and a sealed application
+        refuses a new one unless admitted work started it.
+        """
+        return await operation()
 
     @_admitted_entrance
     async def run_event_watchers(

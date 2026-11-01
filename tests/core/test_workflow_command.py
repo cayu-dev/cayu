@@ -354,3 +354,82 @@ def test_oversized_argv_is_refused_before_running(tmp_path: Path) -> None:
         assert await _step_events(app, "run-huge-argv", EventType.WORKFLOW_STEP_STARTED) == []
 
     asyncio.run(scenario())
+
+
+def test_sealed_application_refuses_a_new_command(tmp_path: Path) -> None:
+    from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
+
+    async def scenario() -> None:
+        app = _app(tmp_path)
+        ctx = _CommandWorkflow(app, "pass").context("run-sealed")
+        await ctx.start()
+        app.seal_admissions()
+        with pytest.raises(ApplicationAdmissionsSealed):
+            await command(ctx, step_id="sealed", argv=[PY, "-c", "open('ran.txt', 'w').write('x')"])
+        assert not (tmp_path / "ran.txt").exists()
+        assert await _step_events(app, "run-sealed", EventType.WORKFLOW_STEP_STARTED) == []
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_waits_for_a_running_command(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = _app(tmp_path)
+        ctx = _CommandWorkflow(app, "pass").context("run-shutdown")
+        await ctx.start()
+        running = asyncio.create_task(
+            command(
+                ctx,
+                step_id="slow",
+                argv=[PY, "-c", "import time; time.sleep(1.5); print('done')"],
+                timeout_s=30,
+            )
+        )
+        while app._admission.in_flight == 0:
+            assert not running.done()
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)
+        outcome = await app.aclose(timeout_s=20)
+        assert running.done()
+        result = running.result()
+        assert result.passed and result.stdout.strip() == "done"
+        assert outcome.open_operations == 0
+
+    asyncio.run(scenario())
+
+
+def test_command_refuses_a_binding_that_prepares_the_workspace(tmp_path: Path) -> None:
+    from cayu.environments import NativeBinding
+    from cayu.workspaces import LocalWorkspace
+
+    class CheckoutBinding(NativeBinding):
+        """Stands in for a binding whose bind() checks out or copies files."""
+
+    async def scenario() -> None:
+        app = CayuApp(enable_logging=False)
+        workspace = LocalWorkspace(tmp_path, workspace_id="w")
+        for name, binding in (("native", NativeBinding()), ("checkout", CheckoutBinding())):
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(name=name),
+                    workspace=workspace,
+                    runner=LocalRunner(tmp_path),
+                    binding=binding,
+                )
+            )
+        ctx = _CommandWorkflow(app, "pass").context("run-binding")
+        await ctx.start()
+        ok = await command(
+            ctx, step_id="native", argv=[PY, "-c", "pass"], environment_name="native"
+        )
+        assert ok.passed
+        with pytest.raises(ValueError, match="CheckoutBinding"):
+            await command(
+                ctx,
+                step_id="checkout",
+                argv=[PY, "-c", "open('ran.txt', 'w').write('x')"],
+                environment_name="checkout",
+            )
+        assert not (tmp_path / "ran.txt").exists()
+
+    asyncio.run(scenario())

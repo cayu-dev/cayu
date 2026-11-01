@@ -13732,6 +13732,17 @@ The command runs through the runner of a registered environment, so the same
 workflow runs on a local, Docker or Lambda MicroVM runner by registering a different
 environment. The environment must be registered with `register_environment`. A
 factory-backed environment is provisioned per agent session and is refused for now.
+The runtime binds and finalizes a workspace binding only around an agent session, so
+`command` also refuses an environment whose binding prepares the workspace (for example
+`GitRepositoryBinding` or `SyncBinding`) instead of running against a workspace that
+binding never checked out or copied in. No binding, `NativeBinding`,
+`DeterministicWorkspaceBinding` and `NoWorkspaceBinding` are accepted, by exact type.
+
+Each command runs as admitted application work, like an agent step's run.
+`seal_admissions()` and `aclose()` refuse a new command unless admitted work started
+it, and `aclose()` counts a running command as an open operation and waits for it,
+including the journaling of its completion. A replayed result is a journal read and
+is not refused.
 
 `command` journals `workflow.step.started` (`kind="command"`, argv and environment
 name) and `workflow.step.completed` with `exit_code`, `timed_out`, `cancelled`,
