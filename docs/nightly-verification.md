@@ -119,7 +119,6 @@ or in CI.
 | Controlled fault injection | loopback TCP, durable SQLite/filesystems, and POSIX process groups | $0 | `provider-stream-abort`, `sqlite-write-failure`, `runner-cleanup-failure`, `workspace-sync-failure` |
 | Postgres integration | Docker/testcontainers or `CAYU_TEST_POSTGRES_DSN` | $0 | `postgres-required` |
 | Docker runner live | Docker daemon; `docker-live-generated-coding-image` also needs `CAYU_DOCKER_GENERATED_CODING_WHEEL` and network to snapshot.debian.org and PyPI | $0 | `docker-runner`, `docker-live-*` |
-| microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for network-default, virtual-egress, and guest-agent-liveness checks | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
 | AWS Lambda MicroVM live | `cayu[aws]`, plus `cayu[egress]` for the metadata-isolation check, AWS credentials/region, an operator-selected protocol-compatible image for the generic runner task; canonical image-build and deployed integrated-stack prerequisites for their dedicated tasks | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-recoverable-allocation-live`, `aws-lambda-microvm-replacement-live`, `aws-lambda-microvm-coding-live`, `aws-lambda-microvm-browser-live`, `aws-lambda-microvm-browser-control-live`, `aws-lambda-microvm-tool-admission-live`, `aws-lambda-microvm-image-build-live`, `aws-lambda-microvm-metadata-isolation-live` |
 | Chat Completions live | `GEMINI_API_KEY`; or `OPENROUTER_API_KEY` plus explicit `CAYU_OPENROUTER_MODEL` | provider-dependent | `gemini-eval`, `chat-completions-contract`, `openrouter-contract` |
@@ -179,9 +178,7 @@ high level:
 | real project discovery, IPython startup, top-level await, loop reuse, namespace aliases, and EOF exit | hermetic | `console-pty` |
 | Postgres stores, migrations, pgvector, real dispatch claim path | verified when Postgres is available | `postgres-required` |
 | real explicitly selected Docker container exec, timeout cleanup, bounded workspace search, sync binding, admitted Python/non-Python toolchain profiles, and virtual-egress enforcement (not sandbox isolation) | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync`, `docker-live-toolchain-profiles`, `docker-live-virtual-egress` |
-| real microsandbox runner, portable workspace round-trip/path safety, runtime, sync binding, deny-by-default networking with explicit-open compatibility, and opt-in guest-agent liveness | verified when microsandbox is available | `microsandbox-live-*` |
 | real E2B runner, irreversible hardened guest handoff, portable workspace round-trip/path safety, and sync binding | verified when E2B is available and security-sensitive checks are explicitly enabled | `e2b-live-*` |
-| real Microsandbox virtual-egress enforcement and secret non-possession | verified when the runtime and explicit opt-in are available | `microsandbox-live-virtual-egress` |
 | real E2B virtual-egress enforcement and secret non-possession | verified when the key, tunnel configuration, and explicit opt-in are available | `e2b-live-virtual-egress` |
 | real AWS Lambda MicroVM runner/workspace/cleanup/suspend-resume | verified when AWS and an operator-selected image passes the authenticated protocol handshake | `lambda-microvm-live` |
 | fresh-process Lambda MicroVM allocation recovery after a lost acknowledgement, concurrent client-token adoption, changed-parameter rejection, suspended reconnect by durable identity with a verified unprivileged agent boundary, disposal proof, in-window and never-submitted reaping, and a zero-unaccounted census | verified when AWS, a protocol-compatible image ARN, an egress network connector, at least 3 GiB of free ARM64 MicroVM memory quota, and the explicit opt-in are available; guest egress enforcement is covered by the metadata-isolation check | `aws-lambda-microvm-recoverable-allocation-live` |
@@ -221,12 +218,11 @@ trial per scenario. Real GitHub promotion for the repository tournament remains
 an explicit manual check because it creates a branch and pull request in the
 configured disposable repository.
 
-There are 40 live example files across `examples/` and its provider subdirectories:
+There are 36 live example files across `examples/` and its provider subdirectories:
 
 | prerequisite | examples |
 | --- | --- |
 | Docker | `docker_interrupt_live.py`, `docker_sync_binding_live.py` |
-| microsandbox | `microsandbox_runner_live.py`, `microsandbox_runtime_live.py`, `microsandbox_workspace_live.py`, `microsandbox_sync_binding_live.py`, `microsandbox_guest_agent_liveness_live.py`, `microsandbox_network_default_live.py` |
 | E2B key | `e2b_runner_live.py`, `e2b_hardened_coding_agent_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
 | AWS credentials, region, and Lambda MicroVM image | `aws/lambda_microvm_runner_live.py`, `aws/lambda_microvm_tool_admission_live.py`, `aws/lambda_microvm_coding_live.py`, `aws/lambda_microvm_recoverable_allocation_live.py` and `aws/lambda_microvm_replacement_live.py` (also need an egress network connector) |
 | AWS credentials, region, and Bedrock model | `aws/bedrock_provider_live.py` |
@@ -237,7 +233,7 @@ There are 40 live example files across `examples/` and its provider subdirectori
 
 The deterministic runner examples use `_live_checks.py` and raise on wrong
 outputs, missing cleanup artifacts, missing files, or missing model/tool rounds.
-The E2B and Microsandbox workspace examples also reuse
+The E2B workspace example also reuses
 `_workspace_conformance.py` to verify the same portable round-trip and path
 validation scenarios used by the credential-free workspace conformance suite.
 Those live checks prove provider integration and a real sandbox boundary; the
@@ -417,50 +413,6 @@ ANTHROPIC_API_KEY=... CAYU_PROVIDER=anthropic \
   --check structured-output-live \
   --strict
 ```
-
-Run local Microsandbox live contracts only when starting a real microVM is
-intended. Use an isolated `MSB_HOME` when verification must not migrate or
-otherwise mutate the default shared Microsandbox state. The guest-agent check
-kills a memory-constrained microVM through Microsandbox's public lifecycle API
-while a command is active, verifies the bounded ping classification, and
-removes its unique sandbox in `finally`:
-
-```bash
-MSB_HOME=/tmp/cayu-microsandbox-agent-liveness \
-CAYU_RUN_MICROSANDBOX_GUEST_AGENT_LIVE=1 \
-uv run --extra microsandbox python scripts/nightly_verification.py \
-  --check microsandbox-live-guest-agent-liveness \
-  --strict
-```
-
-The check requires a typed unavailable result followed by a fail-fast call. It
-does not infer OOM from the incomplete command outcome.
-
-```bash
-MSB_HOME=/tmp/cayu-microsandbox-network-verification \
-CAYU_RUN_MICROSANDBOX_NETWORK_LIVE=1 \
-uv run --group nightly --extra microsandbox python scripts/nightly_verification.py \
-  --check microsandbox-live-network-default \
-  --strict
-
-MSB_HOME=/tmp/cayu-microsandbox-removal-verification \
-CAYU_MICROSANDBOX_REMOVE_STRESS_ITERATIONS=10 \
-uv run python scripts/nightly_verification.py \
-  --check microsandbox-live-runner \
-  --strict
-
-MSB_HOME=/tmp/cayu-microsandbox-verification \
-CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1 \
-uv run python scripts/nightly_verification.py \
-  --check microsandbox-live-virtual-egress \
-  --strict
-```
-
-The network-default check reports the installed SDK and CLI versions, proves
-that an omitted policy blocks direct IPv4 and hostname/DNS access, and then
-creates a separate sandbox with `Network.allow_all()` to prove explicit opt-in
-still works. It performs real public-network access and remains opt-in even
-though it needs no provider credentials.
 
 `chat-completions-contract` uses `CAYU_CHAT_COMPLETIONS_CONTRACT_MODEL`
 defaulting to `gemini-3.1-flash-lite`. Keep it separate from `CAYU_GEMINI_MODEL` so

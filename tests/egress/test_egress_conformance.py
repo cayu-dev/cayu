@@ -35,7 +35,6 @@ from cayu.egress import (
 )
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.egress.e2b_adapter import E2BEgressAdapter
-from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 from cayu.runners import ExecCommand, ExecResult, Runner
 from cayu.vaults import SecretRef, StaticVault
 
@@ -88,12 +87,10 @@ def test_registration_covers_every_enforcing_builtin_adapter() -> None:
     assert {registration.adapter_type for registration in EGRESS_CONFORMANCE_REGISTRATIONS} == {
         DockerEgressAdapter,
         E2BEgressAdapter,
-        MicrosandboxEgressAdapter,
     }
     assert {registration.runner_kind for registration in EGRESS_CONFORMANCE_REGISTRATIONS} == {
         "docker",
         "e2b",
-        "microsandbox",
     }
 
 
@@ -286,9 +283,6 @@ def test_live_prerequisites_keep_paid_lanes_explicit() -> None:
         registrations["e2b"].live_prerequisites.required_env_values
     )
     assert "E2B_API_KEY" in registrations["e2b"].live_prerequisites.required_env
-    assert ("CAYU_RUN_MICROSANDBOX_EGRESS_E2E", "1") in (
-        registrations["microsandbox"].live_prerequisites.required_env_values
-    )
     for name, registration in registrations.items():
         assert Path(registration.live_proof_source).is_file()
         assert registration.teardown_timeout_s <= 30

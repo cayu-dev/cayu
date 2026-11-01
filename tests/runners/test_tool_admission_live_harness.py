@@ -1,4 +1,4 @@
-"""Local driver checks; these are not Docker or Microsandbox qualification."""
+"""Local driver checks; these are not Docker qualification."""
 
 from __future__ import annotations
 
@@ -58,13 +58,11 @@ def test_live_qualification_driver_exercises_real_local_search(tmp_path, monkeyp
     asyncio.run(_qualify(LocalRunner(workspace, inherit_env=False), proof=proof))
 
 
-@pytest.mark.parametrize("backend", ["docker", "microsandbox"])
-def test_opted_in_qualification_requires_explicit_target(monkeypatch, backend):
+def test_opted_in_qualification_requires_explicit_target(monkeypatch):
     monkeypatch.setenv("CAYU_RUN_TOOL_ADMISSION_LIVE", "1")
-    suffix = "IMAGE_ID" if backend == "docker" else "SANDBOX"
-    monkeypatch.delenv(f"CAYU_860_{backend.upper()}_PRESENT_{suffix}", raising=False)
+    monkeypatch.delenv("CAYU_860_DOCKER_PRESENT_IMAGE_ID", raising=False)
     with pytest.raises(pytest.fail.Exception, match="no target is prepared automatically"):
-        _configured(backend, "present")
+        _configured("docker", "present")
 
 
 def test_live_docker_driver_forbids_implicit_pull_without_replacing_dispatch(monkeypatch):

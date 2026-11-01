@@ -310,7 +310,7 @@ class _UncertainTimeoutRunner(Runner):
 
 
 class _OpaqueFailureRunner(Runner):
-    isolation = "microsandbox"
+    isolation = "lambda-microvm"
 
     async def exec(
         self,
@@ -322,7 +322,7 @@ class _OpaqueFailureRunner(Runner):
 
 
 class _InjectedFailureRunner(Runner):
-    isolation = "microsandbox"
+    isolation = "lambda-microvm"
 
     def __init__(self, error: BaseException) -> None:
         self.error = error
@@ -355,7 +355,7 @@ class _HostileInstanceAdapterRunner(Runner):
 
 
 class _SynchronousFailureRunner(Runner):
-    isolation = "microsandbox"
+    isolation = "lambda-microvm"
 
     async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
         del command, kwargs
@@ -380,7 +380,7 @@ class _DiagnosticCancelledRunner(Runner):
             artifacts=[
                 {
                     "type": "cayu.runner_cleanup.v1",
-                    "adapter": "microsandbox",
+                    "adapter": "lambda-microvm",
                     "action": "kill_command",
                     "status": "completed",
                     "timeout_s": 5.0,
@@ -430,7 +430,7 @@ class _CleanupFailureRunner(_BlockingRunner):
                 [
                     {
                         "type": "cayu.runner_cleanup.v1",
-                        "adapter": "microsandbox",
+                        "adapter": "lambda-microvm",
                         "action": "kill_command",
                         "status": "failed",
                         "timeout_s": 5.0,
@@ -443,7 +443,7 @@ class _CleanupFailureRunner(_BlockingRunner):
 
 
 class _CleanupReplacingCancellationRunner(_BlockingRunner):
-    isolation = "microsandbox"
+    isolation = "lambda-microvm"
 
     async def exec(
         self,
@@ -587,7 +587,7 @@ class _GroupedCleanupFailureRunner(_BlockingRunner):
                 [
                     {
                         "type": "cayu.runner_cleanup.v1",
-                        "adapter": "microsandbox",
+                        "adapter": "lambda-microvm",
                         "action": "kill_command",
                         "status": "failed",
                         "timeout_s": 5.0,
@@ -628,7 +628,7 @@ class _DelayedGroupedCleanupFailureRunner(_BlockingRunner):
 
 
 class _FatalCleanupGroupRunner(_BlockingRunner):
-    isolation = "microsandbox"
+    isolation = "lambda-microvm"
 
     async def exec(
         self,
@@ -1760,7 +1760,7 @@ def test_runner_cleanup_failure_cannot_replace_real_task_cancellation() -> None:
         "errno": None,
         "errno_code": None,
         "execution_phase": "unknown",
-        "adapter": "microsandbox",
+        "adapter": "lambda-microvm",
         "status": "failed",
         "error_type": "RuntimeError",
         "timed_out": False,
@@ -2089,7 +2089,7 @@ def test_runner_cleanup_failure_cancellation_stops_the_runtime_turn(
         assert cancellation.artifacts == [
             {
                 "type": "cayu.runner_cleanup.v1",
-                "adapter": "microsandbox",
+                "adapter": "lambda-microvm",
                 "action": "kill_command",
                 "status": "failed",
                 "timeout_s": 5.0,
@@ -2178,7 +2178,7 @@ def test_parallel_runner_cleanup_failures_cross_task_group_cancellation() -> Non
     secret = "parallel-runner-cleanup-secret-canary-ABCDEFGHIJKLMNOP"
 
     class ParallelGroupedCleanupRunner(Runner):
-        isolation = "microsandbox"
+        isolation = "lambda-microvm"
 
         def __init__(self) -> None:
             self.arrivals = 0
@@ -2850,7 +2850,7 @@ def test_invocation_runner_handle_preserves_mixed_cancellation_cleanup_group() -
     assert cancellation.artifacts == [
         {
             "type": "cayu.runner_cleanup.v1",
-            "adapter": "microsandbox",
+            "adapter": "lambda-microvm",
             "action": "kill_command",
             "status": "failed",
             "timeout_s": 5.0,
@@ -5012,7 +5012,7 @@ def test_invocation_runner_handle_rejects_secret_authored_exception_type() -> No
     ("adapter", "error_type"),
     [
         ("e2b", "SandboxException"),
-        ("microsandbox", "ExecFailedError"),
+        ("lambda-microvm", "LambdaMicroVMProtocolError"),
     ],
 )
 def test_invocation_runner_handle_preserves_supported_sdk_error_classification(
@@ -5077,7 +5077,7 @@ def test_invocation_runner_handle_rejects_secret_authored_unavailable_types() ->
     source_error = RunnerUnavailableError(
         "opaque runner failure",
         diagnostic={
-            "adapter": "microsandbox",
+            "adapter": "lambda-microvm",
             "last_command": {
                 "exit_code": None,
                 "timed_out": False,
@@ -5458,7 +5458,7 @@ def test_invocation_runner_handle_sanitizes_cleanup_without_replacing_cancellati
     assert cancellation.artifacts == [
         {
             "type": "cayu.runner_cleanup.v1",
-            "adapter": "microsandbox",
+            "adapter": "lambda-microvm",
             "action": "kill_command",
             "status": "failed",
             "timeout_s": 5.0,

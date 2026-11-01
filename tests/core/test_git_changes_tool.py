@@ -19,7 +19,6 @@ from cayu.vaults import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces import (
     E2BWorkspace,
     LocalWorkspace,
-    MicrosandboxWorkspace,
     RunnerWorkspace,
 )
 
@@ -300,12 +299,11 @@ def test_git_changes_invocation_handle_rejects_mismatched_workspace(tmp_path: Pa
     ("workspace_type", "root"),
     [
         (E2BWorkspace, "/home/user/workspace"),
-        (MicrosandboxWorkspace, "/workspace"),
     ],
 )
 def test_git_changes_invocation_handle_authenticates_remote_workspace_binding(
     tmp_path: Path,
-    workspace_type: type[E2BWorkspace] | type[MicrosandboxWorkspace],
+    workspace_type: type[E2BWorkspace],
     root: str,
 ) -> None:
     runner = LocalRunner(tmp_path)

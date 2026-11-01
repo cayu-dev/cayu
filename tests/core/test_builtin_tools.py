@@ -5072,7 +5072,7 @@ def test_exec_command_tool_reports_timeout_and_cancellation():
 def test_exec_command_tool_preserves_runner_unavailable_diagnostic() -> None:
     diagnostic = {
         "type": "cayu.runner_unavailable.v1",
-        "adapter": "microsandbox",
+        "adapter": "lambda-microvm",
         "sandbox_name": "dead-agent",
         "status": "unavailable",
     }
@@ -5080,7 +5080,7 @@ def test_exec_command_tool_preserves_runner_unavailable_diagnostic() -> None:
     class UnavailableRunner(RecordingRunner):
         async def exec(self, *args, **kwargs) -> ExecResult:
             raise RunnerUnavailableError(
-                "Microsandbox guest agent is unavailable.",
+                "Sandbox guest agent is unavailable.",
                 diagnostic=diagnostic,
             )
 
@@ -5092,7 +5092,7 @@ def test_exec_command_tool_preserves_runner_unavailable_diagnostic() -> None:
     )
 
     assert result.is_error is True
-    assert result.content == "Microsandbox guest agent is unavailable."
+    assert result.content == "Sandbox guest agent is unavailable."
     assert result.structured == {
         "error": "runner_unavailable",
         "diagnostic": diagnostic,
@@ -5103,7 +5103,7 @@ def test_exec_command_tool_preserves_runner_unavailable_diagnostic() -> None:
 def test_exec_command_tool_preserves_runner_unavailable_diagnostic_from_policy_preflight() -> None:
     diagnostic = {
         "type": "cayu.runner_unavailable.v1",
-        "adapter": "microsandbox",
+        "adapter": "lambda-microvm",
         "status": "unavailable",
     }
 
@@ -5111,7 +5111,7 @@ def test_exec_command_tool_preserves_runner_unavailable_diagnostic_from_policy_p
         def preflight_exec(self, *args, **kwargs) -> None:
             del args, kwargs
             raise RunnerUnavailableError(
-                "Microsandbox guest agent is unavailable.",
+                "Sandbox guest agent is unavailable.",
                 diagnostic=diagnostic,
             )
 
@@ -5126,7 +5126,7 @@ def test_exec_command_tool_preserves_runner_unavailable_diagnostic_from_policy_p
     )
 
     assert result.is_error is True
-    assert result.content == "Microsandbox guest agent is unavailable."
+    assert result.content == "Sandbox guest agent is unavailable."
     assert result.structured == {
         "error": "runner_unavailable",
         "diagnostic": diagnostic,
@@ -5139,7 +5139,7 @@ def test_exec_command_tool_preserves_runner_unavailable_diagnostic_from_policy_p
 def test_runner_unavailable_diagnostic_reaches_durable_tool_event() -> None:
     diagnostic = {
         "type": "cayu.runner_unavailable.v1",
-        "adapter": "microsandbox",
+        "adapter": "lambda-microvm",
         "sandbox_name": "dead-agent",
         "status": "unavailable",
     }
@@ -5147,7 +5147,7 @@ def test_runner_unavailable_diagnostic_reaches_durable_tool_event() -> None:
     class UnavailableRunner(RecordingRunner):
         async def exec(self, *args, **kwargs) -> ExecResult:
             raise RunnerUnavailableError(
-                "Microsandbox guest agent is unavailable.",
+                "Sandbox guest agent is unavailable.",
                 diagnostic=diagnostic,
             )
 
@@ -5637,17 +5637,17 @@ def test_exec_command_tool_rejects_non_none_async_preflight_result() -> None:
 def test_exec_command_tool_runtime_preflight_preserves_runner_unavailable() -> None:
     diagnostic = {
         "type": "cayu.runner_unavailable.v1",
-        "adapter": "microsandbox",
+        "adapter": "lambda-microvm",
         "status": "unavailable",
     }
 
     class UnavailablePreflightRunner(RecordingRunner):
-        isolation = "microsandbox"
+        isolation = "lambda-microvm"
 
         def preflight_exec(self, *args, **kwargs) -> None:
             del args, kwargs
             raise RunnerUnavailableError(
-                "Microsandbox guest agent is unavailable.",
+                "Sandbox guest agent is unavailable.",
                 diagnostic=diagnostic,
             )
 
@@ -5673,7 +5673,7 @@ def test_exec_command_tool_runtime_preflight_preserves_runner_unavailable() -> N
 
     safe_diagnostic = {
         "type": "cayu.runner_unavailable.v1",
-        "adapter": "microsandbox",
+        "adapter": "lambda-microvm",
         "status": "unavailable",
         "error_type": "RunnerUnavailableError",
     }

@@ -932,7 +932,7 @@ def test_recording_capability_names_the_lambda_relay() -> None:
     assert capability.supported is True
     assert capability.reason == "lambda_microvm_control_relay"
     assert browser_recording_capability("docker").reason == "docker_sampled_active_page"
-    assert browser_recording_capability("microsandbox").supported is False
+    assert browser_recording_capability("unknown-backend").supported is False
 
 
 def _handle(runner: Runner) -> InvocationRunnerHandle:

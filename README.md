@@ -548,7 +548,6 @@ deployment:
 | `cayu[aws]` | Amazon Bedrock and Lambda MicroVM support |
 | `cayu[vertex]` | Anthropic models through Google Cloud Vertex AI |
 | `cayu[e2b]` | E2B runner and workspace |
-| `cayu[microsandbox]` | Local microVM-backed untrusted-code runner |
 | `cayu[egress]` | Virtual egress and credential-broker primitives |
 | `cayu[files]` | Image and PDF inspection |
 | `cayu[console]` | Interactive application console |
@@ -609,7 +608,7 @@ See [OpenAI subscription authentication](https://github.com/cayu-dev/cayu/blob/m
 support boundary, credential storage, and fallback options.
 
 The same agent can run in a local workspace, trusted Docker container, E2B,
-Microsandbox, Lambda MicroVM, or an application-owned runner without changing
+Lambda MicroVM, or an application-owned runner without changing
 its identity or transcript contract.
 
 ## Open and replaceable Developer dashboard

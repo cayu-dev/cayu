@@ -2686,7 +2686,7 @@ def test_runtime_runner_failure_omits_opaque_diagnostic_at_every_publication(
     session_id = f"sess_runner_failure_{len(failure_message)}"
 
     class OpaqueFailureRunner(Runner):
-        isolation = "microsandbox"
+        isolation = "lambda-microvm"
 
         async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
             del command, kwargs
@@ -2789,7 +2789,7 @@ def test_operator_interrupt_runner_cleanup_omits_opaque_diagnostic(
     caller_cleanup_artifacts: list[dict] = []
 
     class CleanupFailureRunner(Runner):
-        isolation = "microsandbox"
+        isolation = "lambda-microvm"
 
         def __init__(self) -> None:
             self.started: asyncio.Event | None = None
@@ -2806,7 +2806,7 @@ def test_operator_interrupt_runner_cleanup_omits_opaque_diagnostic(
                     [
                         {
                             "type": "cayu.runner_cleanup.v1",
-                            "adapter": "microsandbox",
+                            "adapter": "lambda-microvm",
                             "action": "kill_command",
                             "status": "failed",
                             "timeout_s": 5.0,
@@ -2912,7 +2912,7 @@ def test_operator_interrupt_runner_cleanup_omits_opaque_diagnostic(
     assert caller_cleanup_artifacts == [
         {
             "type": "cayu.runner_cleanup.v1",
-            "adapter": "microsandbox",
+            "adapter": "lambda-microvm",
             "action": "kill_command",
             "status": "failed",
             "timeout_s": 5.0,
@@ -4330,7 +4330,7 @@ def test_runtime_sanitizes_grouped_runner_failure_from_real_caller_cancellation(
                     [
                         {
                             "type": "cayu.runner_cleanup.v1",
-                            "adapter": "microsandbox",
+                            "adapter": "lambda-microvm",
                             "action": "kill_command",
                             "status": "failed",
                             "timeout_s": 5.0,
@@ -4424,7 +4424,7 @@ def test_runtime_sanitizes_grouped_runner_failure_from_real_caller_cancellation(
     assert failure.artifacts == [
         {
             "type": "cayu.runner_cleanup.v1",
-            "adapter": "microsandbox",
+            "adapter": "lambda-microvm",
             "action": "kill_command",
             "status": "failed",
             "timeout_s": 5.0,

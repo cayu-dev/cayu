@@ -128,13 +128,6 @@ from cayu.workspaces.e2b import (
 )
 from cayu.workspaces.e2b import E2BWorkspace as E2BWorkspace
 from cayu.workspaces.local import LocalWorkspace as LocalWorkspace
-from cayu.workspaces.microsandbox import (
-    DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT as DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT,
-)
-from cayu.workspaces.microsandbox import (
-    DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES as DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES,
-)
-from cayu.workspaces.microsandbox import MicrosandboxWorkspace as MicrosandboxWorkspace
 from cayu.workspaces.references import WorkspaceReferenceBinding as WorkspaceReferenceBinding
 from cayu.workspaces.references import (
     WorkspaceReferenceBindingError as WorkspaceReferenceBindingError,

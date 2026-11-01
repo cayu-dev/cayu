@@ -1407,8 +1407,7 @@ Environment-scoped `workspace_instructions` are optional operating guidance for 
 Runner and workspace implementations should share the same execution boundary.
 For a sandbox-backed environment, `exec_command` and file tools must both talk to
 the sandbox, not split command execution into the sandbox and file access into
-the trusted host. `MicrosandboxRunner` pairs with `MicrosandboxWorkspace`.
-`E2BRunner` pairs with `E2BWorkspace`. E2B's Python SDK command API executes
+the trusted host. `E2BRunner` pairs with `E2BWorkspace`. E2B's Python SDK command API executes
 strings through Bash, so Cayu maps process-form commands with shell quoting
 before sending them to E2B; this keeps Cayu's public command contract stable
 while making the E2B-specific execution semantics explicit.
@@ -1928,7 +1927,7 @@ Rollback persists `rollback_intent` and then `rolled_back` or `expired` before p
 
 `Workspace.branch_capabilities()` returns one typed, bounded declaration covering isolated views, deterministic net changes, cooperative atomic publication, recovery, retention, and lifecycle inspection. Every third-party and built-in adapter inherits explicit `unsupported` values. Cayu never upgrades that declaration from filesystem access, a workspace snapshot, a sync or copy binding, runner reconnectability, Git availability, or a provider claim. Application manifests (`cayu inspect`) and the server `/api/environments` control-plane response expose the same content-free declaration plus `workspace_branch_lifecycle`, a bounded snapshot of the actual states for branch handles attached to that workspace instance. The snapshot carries no branch IDs or paths, reports whether observation was truncated, and updates as attached handles move through active, publication, rollback, terminal, or fenced states. Durable lifecycle remains recoverable only by an authorized branch ID; this control-plane snapshot is not durable branch enumeration.
 
-Production remote implementations are `RunnerWorkspace(runner, enable_workspace_branches=True, ...)` over an exact `E2BRunner`, `LambdaMicroVMRunner`, or `DockerRunner` that owns an exact container ID. Each opts in through the nominal `RemoteWorkspaceBranchCapability`, whose allocation fingerprint is a SHA-256 over the provider name and sandbox, MicroVM, or container ID. The guest keeps branch state in a private sibling directory of the workspace root, so that root's parent must be writable by the command user: on the first-party Lambda image use a subdirectory such as `cwd="project"` under the agent-owned `/workspace`. Lambda branch state survives Cayu process loss and suspend/resume for the MicroVM's lifetime; it is lost when the MicroVM ends and is not part of workspace checkpoints, so allocation replacement cannot recover an open branch. A Docker runner identified only by a reusable name, subclasses of these runners, `E2BWorkspace`, Microsandbox, local runners, arbitrary `Runner` extensions, and a `RunnerWorkspace` without the explicit flag remain unsupported. Durable use additionally requires a `branch_authority_resolver` implementing `RemoteWorkspaceBranchAuthorityProvider` whose typed `claim_scope` is `durable`, plus the same complete `WorkspaceBranchAuthority`, publication, rollback, and recovery identities as durable local branches. Before every guest operation that provider atomically claims the complete current session/run and binding authority; a binding-only claim cannot upgrade remote recovery to durable because one environment generation may survive multiple run epochs. The provider must keep those complete claims authoritative across every worker process. The built-in `WorkspaceBranchBindingAuthorityRegistry` implements the operation-authority shape for local coordination but truthfully declares `process_local`, so it cannot upgrade a remote adapter to durable by itself. This selection is about the exact Cayu guest protocol on a retained allocation filesystem, not a general claim that reconnectable sandboxes provide transactions.
+Production remote implementations are `RunnerWorkspace(runner, enable_workspace_branches=True, ...)` over an exact `E2BRunner`, `LambdaMicroVMRunner`, or `DockerRunner` that owns an exact container ID. Each opts in through the nominal `RemoteWorkspaceBranchCapability`, whose allocation fingerprint is a SHA-256 over the provider name and sandbox, MicroVM, or container ID. The guest keeps branch state in a private sibling directory of the workspace root, so that root's parent must be writable by the command user: on the first-party Lambda image use a subdirectory such as `cwd="project"` under the agent-owned `/workspace`. Lambda branch state survives Cayu process loss and suspend/resume for the MicroVM's lifetime; it is lost when the MicroVM ends and is not part of workspace checkpoints, so allocation replacement cannot recover an open branch. A Docker runner identified only by a reusable name, subclasses of these runners, `E2BWorkspace`, local runners, arbitrary `Runner` extensions, and a `RunnerWorkspace` without the explicit flag remain unsupported. Durable use additionally requires a `branch_authority_resolver` implementing `RemoteWorkspaceBranchAuthorityProvider` whose typed `claim_scope` is `durable`, plus the same complete `WorkspaceBranchAuthority`, publication, rollback, and recovery identities as durable local branches. Before every guest operation that provider atomically claims the complete current session/run and binding authority; a binding-only claim cannot upgrade remote recovery to durable because one environment generation may survive multiple run epochs. The provider must keep those complete claims authoritative across every worker process. The built-in `WorkspaceBranchBindingAuthorityRegistry` implements the operation-authority shape for local coordination but truthfully declares `process_local`, so it cannot upgrade a remote adapter to durable by itself. This selection is about the exact Cayu guest protocol on a retained allocation filesystem, not a general claim that reconnectable sandboxes provide transactions.
 
 The remote implementation stores a digest-protected bounded journal, immutable baseline, overlay, and tombstones in one mode-`0700` sibling directory on the allocation filesystem. Its internal `.stage` suffix is retained for the branch's complete lifecycle: Cayu never renames or removes this top-level creation directory because portable POSIX filesystems provide no pathname rename or removal conditional on an already-open directory inode. Creation first writes an immutable no-replace request-claim sidecar, creates and opens the directory, then writes a separate immutable no-replace claim that binds the request to that directory's exact device/inode before copying private bytes. Claim publication retains a hard-linked pending anchor instead of deleting a pathname after validation; a complete interrupted publication is recoverable, while an incomplete pending claim remains one capacity-bearing object for operator cleanup. Every later operation opens and locks that same inode and resolves records, blobs, temporary files, and cleanup relative to the pinned descriptor, so replacing the canonical pathname after it is pinned cannot redirect work or cause the replacement to be removed. An exact recordless or `creating` retry revalidates the source and rebuilds the same bound inode; expiry removes baseline and overlay content and writes the terminal `expired` record in that inode. The claim sidecars remain as small immutable evidence. A correlated terminal canonical record releases the capacity slot, while missing, replaced, malformed, or unbound canonical material remains capacity-bearing and untouched. POSIX has no portable atomic mkdir-and-return-directory-descriptor primitive, so interference or process loss between directory creation and its first durable inode binding cannot be distinguished safely: Cayu never adopts or removes a directory retained in that window, even when it is empty. This is a bounded fail-closed liveness leak within the direct-host-access boundary described below, not an ownership claim over hostile co-resident same-UID filesystem mutation. Overlay writes and deletes likewise record bounded before/after intent before touching private bytes; recovery settles a matching destination or owned temporary file, rolls back a provably untouched intent, and fences unindexed or contradictory private material. Limits are checked against the projected record before either mutation. Ordinary `RunnerWorkspace` operations take the shared side of a guest source lock; capture and publication take the exclusive side. Each guest operation has the bounded `branch_operation_timeout_s` configured on `RunnerWorkspace` (300 seconds by default). Publication records intent before mutation, preflights every affected path and ancestor, applies deterministic per-path atomic replacements, records progress, verifies the after identities, and only then records `committed`. A timeout, cancellation, or worker loss after durable intent never authorizes blind replay. A new Cayu process reconnecting to the same allocation compares every source path with its recorded before and after identities: it completes a provable before/after mixture, returns an existing terminal receipt, or records `ambiguous` without guessing. The record keeps its original creation authority immutable and separately advances a complete operation authority only to a strictly newer run epoch; that handoff is persisted before recovery mutates private or source state, so retry by the replacement converges while equal-epoch conflicts and older owners remain fenced. Complete invocation-authority claims fence stale run epochs and binding generations before guest work. Raw contents remain in the allocation and provider stderr, environment data, credentials, allocation IDs, and unrestricted command output are never copied into public branch evidence.
 
@@ -3351,12 +3350,6 @@ continues through caller cancellation until sockets, workers, upstream
 operations, permits, and the final certificate-authority owner are released.
 All rejection codes are fixed and non-echoing.
 
-New `CREATE` operations through the built-in Microsandbox virtual-egress
-adapter currently fail with `EnvironmentAllocationUnsupportedError` before
-adapter preparation or provider creation. Its provider API does not yet expose
-every primitive required for exact create-or-lookup recovery and race-safe
-cleanup.
-
 Lambda MicroVM binds each allocation intent to an AWS `RunMicrovm` client token
 derived from the adapter generation and allocation id; the token itself is
 never persisted. Before dispatch the adapter pins, in the intent's `adapter`
@@ -3499,9 +3492,9 @@ provider cleanup, retires the now-unusable generation, and continues to report
 the original sync failure; ordinary partial-copy failures retain the readable
 generation for convergence instead.
 
-Virtual-egress finalization fences new managed command dispatch before its first await, revokes authority, drains commands admitted before the fence, and then syncs or unmounts the workspace while its runner-backed target remains readable. Only the exact retained binding owner may use the managed runner during that synchronization. Provider runner/resource cleanup starts after a successful authoritative sync. A partial copy or deletion failure leaves the provider runner open, the target readable, and the exact binding generation held so retry resumes from the same baseline and converges the durable source. Independently detached guest processes are outside managed command-dispatch accounting; applications must not use them for filesystem effects that must be captured by sync-back. A single phase failure is propagated unchanged. When the workspace and managed-resource phases both fail, Cayu follows its cleanup aggregation convention: the workspace exception is first and the managed-resource exception is second in an `ExceptionGroup`; a cancellation in either position produces a `BaseExceptionGroup` so cancellation remains observable without dropping the other failure. The durable `failures` array uses the same order, except that cancellation deferred while authority revocation completes precedes those phases as `cancellation`. Cancellation received during post-finalization revocation diagnostics is appended after the phase failures, and cancellation received while `environment.binding.finalize_failed` is being written is deferred until the original phase evidence is durable. If cleanup itself fails after caller cancellation, both signals are retained in a cancellation-containing aggregate. Cancellation-containing aggregates are then re-raised rather than converted into an ordinary terminal result. Managed cleanup is complete only after runner teardown, adapter/proxy/network release, and ownership-claim release succeed. A failed managed-cleanup attempt retains its coordinator, and a later finalization or runner-close attempt resumes it without re-reading a runner-backed target whose authoritative sync already succeeded. Successful retry does not repeat completed logical teardown or grant-revocation evidence. Each adapter returns explicit runner-finalization evidence rather than treating `Runner.is_closed` as proof that remote mutations stopped. A copied workspace arms its mutation-quiescence requirement before the bound environment is exposed and remains fenced until the provider confirms that the sandbox is stopped, suspended, removed, or otherwise mutation-quiescent. A detach-only result is insufficient. Reconnectable Microsandbox sessions use a stopped, allocation-preserving boundary; non-reconnectable adapters use their terminal boundary. The exact workspace owner remains fenced until positive quiescence, so an old workload cannot overlap a replacement owner.
+Virtual-egress finalization fences new managed command dispatch before its first await, revokes authority, drains commands admitted before the fence, and then syncs or unmounts the workspace while its runner-backed target remains readable. Only the exact retained binding owner may use the managed runner during that synchronization. Provider runner/resource cleanup starts after a successful authoritative sync. A partial copy or deletion failure leaves the provider runner open, the target readable, and the exact binding generation held so retry resumes from the same baseline and converges the durable source. Independently detached guest processes are outside managed command-dispatch accounting; applications must not use them for filesystem effects that must be captured by sync-back. A single phase failure is propagated unchanged. When the workspace and managed-resource phases both fail, Cayu follows its cleanup aggregation convention: the workspace exception is first and the managed-resource exception is second in an `ExceptionGroup`; a cancellation in either position produces a `BaseExceptionGroup` so cancellation remains observable without dropping the other failure. The durable `failures` array uses the same order, except that cancellation deferred while authority revocation completes precedes those phases as `cancellation`. Cancellation received during post-finalization revocation diagnostics is appended after the phase failures, and cancellation received while `environment.binding.finalize_failed` is being written is deferred until the original phase evidence is durable. If cleanup itself fails after caller cancellation, both signals are retained in a cancellation-containing aggregate. Cancellation-containing aggregates are then re-raised rather than converted into an ordinary terminal result. Managed cleanup is complete only after runner teardown, adapter/proxy/network release, and ownership-claim release succeed. A failed managed-cleanup attempt retains its coordinator, and a later finalization or runner-close attempt resumes it without re-reading a runner-backed target whose authoritative sync already succeeded. Successful retry does not repeat completed logical teardown or grant-revocation evidence. Each adapter returns explicit runner-finalization evidence rather than treating `Runner.is_closed` as proof that remote mutations stopped. A copied workspace arms its mutation-quiescence requirement before the bound environment is exposed and remains fenced until the provider confirms that the sandbox is stopped, suspended, removed, or otherwise mutation-quiescent. A detach-only result is insufficient. Non-reconnectable adapters use their terminal boundary. The exact workspace owner remains fenced until positive quiescence, so an old workload cannot overlap a replacement owner.
 
-`SyncBinding` is the built-in copy binding. It copies files from the durable source workspace into a target workspace during `bind(...)`, exposes the target workspace to tools, and can copy creates/updates/deletes back to the source during `finalize(...)`. The target workspace is usually a session-scoped sandbox workspace such as `E2BWorkspace`, `MicrosandboxWorkspace`, or `RunnerWorkspace`; it can also be a local scratch workspace for tests and local development. A `target_workspace_plan_factory` receives `SyncBindingContext` with source workspace, runner, session id, agent name, environment name, and request metadata and returns `SyncTargetWorkspacePlan` with a stable, quiescent per-session target identity; Cayu invokes the plan provision callback only after reserving both resource identities. The legacy `target_workspace_factory` entrance is rejected before callback invocation because its former create-or-attach contract could mutate an unidentified, unreserved target. External target allocation and cleanup remain owned by the surrounding `EnvironmentFactoryResult` lifecycle. During a runtime-managed failed bind, the exact source-target reservation transfers to that cleanup owner and remains held until direct or deferred factory cleanup positively reaches quiescence. Source and target must be different workspaces. By default, `SyncBinding` cleans the target workspace before copying in, syncs back for every terminal outcome, propagates deletions, caps each copy-in or copy-back transfer at 100,000 files and 4 GiB of logical file data, and caps the complete raw tar at 8 GiB. Apps can configure `pattern`, `max_files`, `max_file_bytes`, `max_total_bytes`, `max_archive_bytes`, `clean_target`, `sync_back`, and `delete_missing` to match their lifecycle policy. The target workspace should be dedicated to that binding/session when `clean_target="always"` is used. Every active generation atomically reserves both the resolved source and target by their stable `Workspace.resource_key` values through one opaque process-local owner generation before the first mutating workspace operation. A factory-backed bind first reserves its source provisionally under that exact generation before invoking the identity resolver, then atomically promotes the claim to the complete pair before target provisioning or releases it on failure. When opposite factory binds each resolve the other's provisional source as their target, the first promotion contender atomically yields its source so the other generation can complete instead of both failing. Fixed targets, resolved targets, separate wrappers, and separate `SyncBinding` instances all compose through that registry; an owned resource cannot participate in another binding in either role. Elapsed time never releases a live reservation: only successful finalization or `abandon()` of that exact bound generation can make both resources reusable. A workspace mutation that has already been dispatched remains fenced to that generation until the mutation definitively returns; caller cancellation is then propagated without allowing an old worker to overlap a retry. For direct `SyncBinding` callers, failed or cancelled finalization retains both reservations and baseline state for retry, and concurrent finalization and abandonment fail closed. Direct callers that will not finalize again must call `abandon()` explicitly.
+`SyncBinding` is the built-in copy binding. It copies files from the durable source workspace into a target workspace during `bind(...)`, exposes the target workspace to tools, and can copy creates/updates/deletes back to the source during `finalize(...)`. The target workspace is usually a session-scoped sandbox workspace such as `E2BWorkspace` or `RunnerWorkspace`; it can also be a local scratch workspace for tests and local development. A `target_workspace_plan_factory` receives `SyncBindingContext` with source workspace, runner, session id, agent name, environment name, and request metadata and returns `SyncTargetWorkspacePlan` with a stable, quiescent per-session target identity; Cayu invokes the plan provision callback only after reserving both resource identities. The legacy `target_workspace_factory` entrance is rejected before callback invocation because its former create-or-attach contract could mutate an unidentified, unreserved target. External target allocation and cleanup remain owned by the surrounding `EnvironmentFactoryResult` lifecycle. During a runtime-managed failed bind, the exact source-target reservation transfers to that cleanup owner and remains held until direct or deferred factory cleanup positively reaches quiescence. Source and target must be different workspaces. By default, `SyncBinding` cleans the target workspace before copying in, syncs back for every terminal outcome, propagates deletions, caps each copy-in or copy-back transfer at 100,000 files and 4 GiB of logical file data, and caps the complete raw tar at 8 GiB. Apps can configure `pattern`, `max_files`, `max_file_bytes`, `max_total_bytes`, `max_archive_bytes`, `clean_target`, `sync_back`, and `delete_missing` to match their lifecycle policy. The target workspace should be dedicated to that binding/session when `clean_target="always"` is used. Every active generation atomically reserves both the resolved source and target by their stable `Workspace.resource_key` values through one opaque process-local owner generation before the first mutating workspace operation. A factory-backed bind first reserves its source provisionally under that exact generation before invoking the identity resolver, then atomically promotes the claim to the complete pair before target provisioning or releases it on failure. When opposite factory binds each resolve the other's provisional source as their target, the first promotion contender atomically yields its source so the other generation can complete instead of both failing. Fixed targets, resolved targets, separate wrappers, and separate `SyncBinding` instances all compose through that registry; an owned resource cannot participate in another binding in either role. Elapsed time never releases a live reservation: only successful finalization or `abandon()` of that exact bound generation can make both resources reusable. A workspace mutation that has already been dispatched remains fenced to that generation until the mutation definitively returns; caller cancellation is then propagated without allowing an old worker to overlap a retry. For direct `SyncBinding` callers, failed or cancelled finalization retains both reservations and baseline state for retry, and concurrent finalization and abandonment fail closed. Direct callers that will not finalize again must call `abandon()` explicitly.
 
 Runtime-managed sessions invoke finalization through the environment lifecycle. When a completed outcome requires sync-back, the runtime first persists a private bounded finalization marker containing the exact binding generation, source path baseline and any required revision baseline, target identity, binding policy, and frozen execution-profile fingerprint. Task completion and the public `session.completed` event follow successful finalization. A failure instead fails the linked task and session with `phase="workspace_finalize"` and `workspace_output_committed=false`, or `workspace_output_committed=true` when the binding reports that its output (copy-back) had committed before a later phase, such as closing its runner, failed; diagnostics identify only the failing path, error type, and count of already applied operations, never file contents. The target remains owned and readable rather than destroying the only copy of mutations. `CayuApp.recover_incomplete_session(...)` claims that marker durably, reconnects the registered environment, reconstructs the exact `SyncBinding` owner without repeating copy-in, and retries only finalization—never provider or tool effects. With `source_conflict_policy="require_revision"`, partial publication updates the marker's revision baseline. A repeated conditional create, replace, or delete is accepted only when the durable source already has the exact intended content and mode; any different concurrent source change remains a `SyncBindingSourceConflictError`. The marker clears only after successful sync-back. Current binding policy, source/target IDs, and the reconnected target must match the marker, so restart recovery requires a static registration or environment factory that resolves the same retained target. Composite managed-egress bindings propagate this completion and recovery capability through their runner fence.
 
@@ -3531,9 +3524,9 @@ may suppress the raw private snapshot without suppressing this evidence.
 
 Every `Workspace` implements `bounded_read_limit(max_bytes)`, returning a positive limit no larger than the caller's hard ceiling or the backend's own default policy. This separate composition hook prevents a safety caller from accidentally increasing a custom backend's ordinary read allowance. Bulk tar export and import are independent nominal contracts. A `BoundedTarReader` implementation must reject logical or conservative raw-archive overflow before allocating or materializing the archive; a `TarWriter` imports caller-validated uncompressed tar bytes. `BoundedTarStreamReader` and `TarStreamWriter` provide the corresponding caller-owned binary-stream path without exposing a host pathname. Merely exposing methods with matching names is not sufficient. `RunnerWorkspace` implements the byte contracts and advertises the streaming contracts when `runner.binary_stream_capability()` returns a `RunnerBinaryStreamCapability`; it preflights guest file sizes and raw archive bounds before emitting bytes. A `WorkspaceLineLocator`, returned by `line_locator()`, finds a line range's byte span (`WorkspaceLineSpan`) without returning file content; `RunnerWorkspace` scans the file inside the guest, and workspaces without one are paged through `read_bytes`. A runner whose transport caps command output declares the cap as `max_exec_output_bytes`, and wrappers forward it; guarded runner workspace reads lower their request and their `bounded_read_limit(...)` to what fits once base64-encoded, so a large read returns a shorter page instead of cut-off output. Capability discovery never provisions a runner or executes commands. A deferred runner returns no streaming capability until its target's support is known, preserving text-based tar transfers for unknown or unsupported targets. A returned capability still executes through its owning runner's lifecycle and execution fences.
 
-`GitRepositoryBinding` is the built-in Git checkout binding. It requires a `LocalWorkspace` or a `RunnerWorkspace` because cloning and fetching require running the `git` executable. For E2B, Microsandbox, and Docker command runners, wrap the runner with `RunnerWorkspace` when the repo should be cloned inside the selected runner environment. On bind, Cayu clones into an empty workspace or fetches an existing Git work tree, verifies the configured remote URL by default, refuses dirty existing repositories by default, checks out the requested ref, fast-forwards to the fetched remote branch when possible, and records repo/ref/branch/commit/dirty metadata in `bound.metadata["git_repository"]` and the bound snapshot. An existing repository without an initial commit is represented with `commit=null` and a snapshot whose `version` is `None`; binding, finalization, and revision observation do not manufacture a commit. It does not merge, rebase, or rewrite divergent clean branches; Git failures in those cases are surfaced so the app or agent can decide how to proceed. On finalize, Cayu records the final commit and dirty state in a final Git `WorkspaceSnapshot`. The binding never commits, pushes, creates branches, or creates pull requests; those are explicit agent/tool or trusted app workflows. Because `repo_url` is durable metadata, HTTP(S) URLs with embedded credentials are rejected; private repository access should use trusted app setup, SSH agent configuration, or a credential helper outside the persisted URL. For untrusted sandbox runners, do not expose long-lived Git credentials through generic shell access; use public repositories, trusted host-side credentials, or a dedicated brokered Git tool. App-provided binding metadata must not use the reserved `git_repository` key.
+`GitRepositoryBinding` is the built-in Git checkout binding. It requires a `LocalWorkspace` or a `RunnerWorkspace` because cloning and fetching require running the `git` executable. For E2B and Docker command runners, wrap the runner with `RunnerWorkspace` when the repo should be cloned inside the selected runner environment. On bind, Cayu clones into an empty workspace or fetches an existing Git work tree, verifies the configured remote URL by default, refuses dirty existing repositories by default, checks out the requested ref, fast-forwards to the fetched remote branch when possible, and records repo/ref/branch/commit/dirty metadata in `bound.metadata["git_repository"]` and the bound snapshot. An existing repository without an initial commit is represented with `commit=null` and a snapshot whose `version` is `None`; binding, finalization, and revision observation do not manufacture a commit. It does not merge, rebase, or rewrite divergent clean branches; Git failures in those cases are surfaced so the app or agent can decide how to proceed. On finalize, Cayu records the final commit and dirty state in a final Git `WorkspaceSnapshot`. The binding never commits, pushes, creates branches, or creates pull requests; those are explicit agent/tool or trusted app workflows. Because `repo_url` is durable metadata, HTTP(S) URLs with embedded credentials are rejected; private repository access should use trusted app setup, SSH agent configuration, or a credential helper outside the persisted URL. For untrusted sandbox runners, do not expose long-lived Git credentials through generic shell access; use public repositories, trusted host-side credentials, or a dedicated brokered Git tool. App-provided binding metadata must not use the reserved `git_repository` key.
 
-`Workspace.delete(path)` is part of the workspace contract. It deletes a file if it exists and is used by bindings to propagate removed files. Built-in local, runner-backed, E2B, and Microsandbox workspaces implement it. Workspaces should keep delete path validation as strict as read/write path validation: relative paths only, no root escape, and no deleting directories through the file delete API.
+`Workspace.delete(path)` is part of the workspace contract. It deletes a file if it exists and is used by bindings to propagate removed files. Built-in local, runner-backed, and E2B workspaces implement it. Workspaces should keep delete path validation as strict as read/write path validation: relative paths only, no root escape, and no deleting directories through the file delete API.
 
 `BoundWorkspace.snapshot` and a `WorkspaceBinding.finalize(...)` return value can carry `WorkspaceSnapshot` records. A snapshot is non-secret durable identity for a concrete workspace version: for example a git commit, S3 object generation, EFS snapshot id, sandbox filesystem generation, or app-owned sync token. `environment.binding.completed` includes `bound_snapshot` when the binding knows the version made visible to the runner. `environment.binding.finalize_completed` includes `final_snapshot` when finalization syncs or persists a new version after the session. Snapshots do not implement storage, copying, mounting, or cleanup by themselves; those behaviors remain in the binding/workspace/runner implementation. Apps should treat snapshot metadata as observability and replay/debug context, not as a place for secrets.
 
@@ -4958,7 +4951,7 @@ The provider/model identity, projection cursor, incremented run epoch, transform
 
 When a `TaskStore` is configured, ordinary resume also queries for the one `running` task already attached to the session and carries that task through the resumed loop, so post-crash completion or failure terminalizes the original task instead of leaving it stuck `running`; multiple running tasks attached to one session are rejected as ambiguous. A session can be resumed only from `completed`, `failed`, or `interrupted`. `pending`, `running`, and `interrupting` sessions are rejected so concurrent workers do not continue the same session at the same time. Interrupted sessions with a pending tool approval must be continued through `resolve_tool_approval(...)`, not `resume(...)`. Sessions with a `pending_interruption_cascade` must retry and resolve that descendant interruption before resume or fork; the guard is part of the atomic status/checkpoint boundary, so continuation cannot race marker creation. Model target adoption does not permit parallel resumes of one session and does not change same-step retry policy.
 
-`InterruptSessionRequest` moves a `pending` or `running` session to `interrupting`, signals registered active work for that session in the current `CayuApp` process, and only then finalizes the session as `interrupted` with a durable `session.interrupted` event. `interrupting` is not resumable; it means provider/tool/runner work is still being stopped or the final transcript repair has not completed. `interrupted` is resumable. If the current process does not own the active run, or the active run is still stopping and repairing its transcript, the interrupt request reports that interruption is still finalizing and leaves the session `interrupting`; callers should retry, poll the session/event store, or subscribe until `session.interrupted` appears. Runtime loops check session status before model requests, after provider responses, before tool-policy planning, and between tool calls. The durable session status remains the cross-worker source of truth. Every `session.interrupted` event includes a normalized `interruption_type`: `operator_requested` for explicit operator/API interruption, `tool_approval_required` for approval pauses, and `runtime_interrupted` for runtime/status-driven interruption repair. Durable explicit and recovery-driven interruption attempts also carry an opaque `interruption_request_id`; terminal-event reconciliation requires that ID to match the pending checkpoint, so an event from before a resume cannot satisfy a later interruption. Explicit operator interruptions also carry optional typed `requested_by` provenance. Direct SDK callers may supply that actor; authenticated HTTP requests derive it from the verified `AuthContext`, reject a body-supplied actor, exclude authorization claims from the durable event, and propagate the same actor to background and durable child interruptions. `CayuApp.recover_incomplete_session(...)` and `CayuApp.recover_incomplete_sessions(...)` are worker-startup recovery helpers, not model continuation APIs. They do not call the model and do not execute tools. They repair pending ordinary tool rounds from durable terminal tool events when possible, preserve pending tool approvals for `resolve_tool_approval(...)`, finalize stale `interrupting` sessions, and mark explicitly selected abandoned `pending`/`running` sessions as `interrupted` so a user or app can resume deliberately later. Terminal `completed`, `failed`, and `interrupted` sessions are also repairable when the status commit survived but its matching terminal event did not. Recovery examines at most the two newest lifecycle/terminal records, fences the stale publisher and concurrent repair workers, scopes evidence to the latest `session.started`/`session.resumed` boundary, and publishes one status-consistent event with a deterministic identity. A terminal fork's `session.forked` event is a complete branch baseline, not evidence that the child ran, so recovery and continuation do not fabricate a terminal event until that fork is actually resumed. Resumed and continuation runs record a durable operation identity in the same atomic checkpoint/status transition that claims their running epoch. Their terminal events carry that identity as `session_run_operation_id`; the marker is removed only after terminal evidence is durable, and stores reject deletion while the marker remains. Normal terminal publication reconciles that preassigned event identity after an ambiguous acknowledgement or side-effect delivery failure before classifying the run as failed, so an already-durable terminal event cannot produce a second terminal outcome. If the reconciliation read also fails, Cayu raises a typed publication-uncertainty error while preserving the terminal status and run-operation marker for later recovery; it does not manufacture a contradictory failure outcome. When recovery fences an abandoned resumed or continuation run, it atomically transfers the same operation identity to the recovery epoch before publishing terminal evidence, so the crashed owner remains fenced without breaking the logical run boundary. Recovery can therefore distinguish an earlier run's terminal event when the newer run failed before publishing `session.resumed`, without weakening contradiction checks. A later resume or continuation performs the same bounded inspection even for an initial run without an operation marker, reconciles missing terminal evidence, and only then claims the next run. A matching event is reused without duplication; multiple matching terminal events or operation-bound status conflicts fail closed. Without an operation marker, a newer durable status may legitimately follow an older terminal event through a recovery API, so only the newest consecutive event matching that status is current evidence. A pending interruption marker must carry the same stable request identity as an existing event and is cleared only after that event is known durable. Missing approval, user-input, and interrupted tool-round terminal events are reconstructed from their durable pending checkpoints before recovery reports or repairs those actions. Repaired completion and marker-backed interruption events preserve the available durable outcome; a repaired failure explicitly reports that its original error details were unavailable. Recovery does not invent those details or replay terminal runtime hooks. Batch recovery requires explicit `statuses`; every `SessionStatus` value is supported. Healthy terminal inspection candidates do not consume the recovery result limit. Terminal candidate discovery advances through a resumable chain of keyset pages, each bounded by `inspection_limit`, with no more than ten store pages per call and no more than 1,000 sessions per store page, until the requested number of recoverable rows is found or the selected statuses are exhausted. Healthy recent history therefore cannot permanently hide older incomplete evidence across the opaque cursor chain, while each call, store read, and in-memory page remains bounded. Batch recovery is fault-isolated per session: recovery that needs the session's registered runtime configuration reports `skipped_unregistered_agent` and leaves the session untouched when that agent is absent, while terminal-evidence-only repair is intentionally attempted before the registration lookup and can succeed without that historical agent. An unexpected per-session error is reported with a `failed` action carrying the error message, and neither kind of per-session result aborts the sweep — only session listing failures and cancellation raise. Apps should include `running` or `pending` only when an external deployment/worker boundary proves those sessions are abandoned. Runner adapters are responsible for cleaning up underlying subprocesses or remote execution when their `exec(...)` coroutine is cancelled. `E2BRunner` and `MicrosandboxRunner` default to `cancellation_cleanup="command"` for user/runtime interruption and `timeout_cleanup="command"` for command timeout, so interactive coding sandboxes keep their workspace after an operator interrupt or ordinary command timeout. Cleanup waits are bounded by `cancel_timeout_s`. If E2B has not yet returned a command handle when interruption or timeout arrives, Cayu first tries to stop the start attempt and resolve the handle within the cleanup window. With `"command"` cleanup, Cayu reports deferred cleanup and keeps waiting in the background for a bounded adapter-owned window. If that delayed command start never resolves, Cayu preserves the sandbox but closes that runner's exec path so later commands do not overlap with an unknown command state. With `"sandbox"` cleanup, Cayu kills the sandbox immediately because the sandbox is the configured cleanup boundary. Cayu preserves `cayu.runner_cleanup.v1` diagnostics on synthetic interrupted tool results or timed-out `ExecResult.artifacts`. Apps that prefer a stronger cleanup boundary can set `cancellation_cleanup="sandbox"` or `timeout_cleanup="sandbox"` explicitly. Interrupting a session does not automatically cancel a linked task; task state remains application/workflow owned. The optional server exposes this as `POST /api/sessions/{session_id}/interrupt`.
+`InterruptSessionRequest` moves a `pending` or `running` session to `interrupting`, signals registered active work for that session in the current `CayuApp` process, and only then finalizes the session as `interrupted` with a durable `session.interrupted` event. `interrupting` is not resumable; it means provider/tool/runner work is still being stopped or the final transcript repair has not completed. `interrupted` is resumable. If the current process does not own the active run, or the active run is still stopping and repairing its transcript, the interrupt request reports that interruption is still finalizing and leaves the session `interrupting`; callers should retry, poll the session/event store, or subscribe until `session.interrupted` appears. Runtime loops check session status before model requests, after provider responses, before tool-policy planning, and between tool calls. The durable session status remains the cross-worker source of truth. Every `session.interrupted` event includes a normalized `interruption_type`: `operator_requested` for explicit operator/API interruption, `tool_approval_required` for approval pauses, and `runtime_interrupted` for runtime/status-driven interruption repair. Durable explicit and recovery-driven interruption attempts also carry an opaque `interruption_request_id`; terminal-event reconciliation requires that ID to match the pending checkpoint, so an event from before a resume cannot satisfy a later interruption. Explicit operator interruptions also carry optional typed `requested_by` provenance. Direct SDK callers may supply that actor; authenticated HTTP requests derive it from the verified `AuthContext`, reject a body-supplied actor, exclude authorization claims from the durable event, and propagate the same actor to background and durable child interruptions. `CayuApp.recover_incomplete_session(...)` and `CayuApp.recover_incomplete_sessions(...)` are worker-startup recovery helpers, not model continuation APIs. They do not call the model and do not execute tools. They repair pending ordinary tool rounds from durable terminal tool events when possible, preserve pending tool approvals for `resolve_tool_approval(...)`, finalize stale `interrupting` sessions, and mark explicitly selected abandoned `pending`/`running` sessions as `interrupted` so a user or app can resume deliberately later. Terminal `completed`, `failed`, and `interrupted` sessions are also repairable when the status commit survived but its matching terminal event did not. Recovery examines at most the two newest lifecycle/terminal records, fences the stale publisher and concurrent repair workers, scopes evidence to the latest `session.started`/`session.resumed` boundary, and publishes one status-consistent event with a deterministic identity. A terminal fork's `session.forked` event is a complete branch baseline, not evidence that the child ran, so recovery and continuation do not fabricate a terminal event until that fork is actually resumed. Resumed and continuation runs record a durable operation identity in the same atomic checkpoint/status transition that claims their running epoch. Their terminal events carry that identity as `session_run_operation_id`; the marker is removed only after terminal evidence is durable, and stores reject deletion while the marker remains. Normal terminal publication reconciles that preassigned event identity after an ambiguous acknowledgement or side-effect delivery failure before classifying the run as failed, so an already-durable terminal event cannot produce a second terminal outcome. If the reconciliation read also fails, Cayu raises a typed publication-uncertainty error while preserving the terminal status and run-operation marker for later recovery; it does not manufacture a contradictory failure outcome. When recovery fences an abandoned resumed or continuation run, it atomically transfers the same operation identity to the recovery epoch before publishing terminal evidence, so the crashed owner remains fenced without breaking the logical run boundary. Recovery can therefore distinguish an earlier run's terminal event when the newer run failed before publishing `session.resumed`, without weakening contradiction checks. A later resume or continuation performs the same bounded inspection even for an initial run without an operation marker, reconciles missing terminal evidence, and only then claims the next run. A matching event is reused without duplication; multiple matching terminal events or operation-bound status conflicts fail closed. Without an operation marker, a newer durable status may legitimately follow an older terminal event through a recovery API, so only the newest consecutive event matching that status is current evidence. A pending interruption marker must carry the same stable request identity as an existing event and is cleared only after that event is known durable. Missing approval, user-input, and interrupted tool-round terminal events are reconstructed from their durable pending checkpoints before recovery reports or repairs those actions. Repaired completion and marker-backed interruption events preserve the available durable outcome; a repaired failure explicitly reports that its original error details were unavailable. Recovery does not invent those details or replay terminal runtime hooks. Batch recovery requires explicit `statuses`; every `SessionStatus` value is supported. Healthy terminal inspection candidates do not consume the recovery result limit. Terminal candidate discovery advances through a resumable chain of keyset pages, each bounded by `inspection_limit`, with no more than ten store pages per call and no more than 1,000 sessions per store page, until the requested number of recoverable rows is found or the selected statuses are exhausted. Healthy recent history therefore cannot permanently hide older incomplete evidence across the opaque cursor chain, while each call, store read, and in-memory page remains bounded. Batch recovery is fault-isolated per session: recovery that needs the session's registered runtime configuration reports `skipped_unregistered_agent` and leaves the session untouched when that agent is absent, while terminal-evidence-only repair is intentionally attempted before the registration lookup and can succeed without that historical agent. An unexpected per-session error is reported with a `failed` action carrying the error message, and neither kind of per-session result aborts the sweep — only session listing failures and cancellation raise. Apps should include `running` or `pending` only when an external deployment/worker boundary proves those sessions are abandoned. Runner adapters are responsible for cleaning up underlying subprocesses or remote execution when their `exec(...)` coroutine is cancelled. `E2BRunner` defaults to `cancellation_cleanup="command"` for user/runtime interruption and `timeout_cleanup="command"` for command timeout, so interactive coding sandboxes keep their workspace after an operator interrupt or ordinary command timeout. Cleanup waits are bounded by `cancel_timeout_s`. If E2B has not yet returned a command handle when interruption or timeout arrives, Cayu first tries to stop the start attempt and resolve the handle within the cleanup window. With `"command"` cleanup, Cayu reports deferred cleanup and keeps waiting in the background for a bounded adapter-owned window. If that delayed command start never resolves, Cayu preserves the sandbox but closes that runner's exec path so later commands do not overlap with an unknown command state. With `"sandbox"` cleanup, Cayu kills the sandbox immediately because the sandbox is the configured cleanup boundary. Cayu preserves `cayu.runner_cleanup.v1` diagnostics on synthetic interrupted tool results or timed-out `ExecResult.artifacts`. Apps that prefer a stronger cleanup boundary can set `cancellation_cleanup="sandbox"` or `timeout_cleanup="sandbox"` explicitly. Interrupting a session does not automatically cancel a linked task; task state remains application/workflow owned. The optional server exposes this as `POST /api/sessions/{session_id}/interrupt`.
 
 A successful operator interruption ends the active `run(...)` stream normally after
 its durable `session.interrupted` event. The interrupt request does not leave a
@@ -12603,7 +12596,7 @@ execution; it is never a fallback for an unavailable microVM runner.
 with its lifecycle-managed runner and attaches the returned `Workspace` to the
 session environment. With no explicit `inner_binding`, Cayu uses
 `NativeBinding`; the workspace and runner therefore name the same underlying
-sandbox resource. First-party `MicrosandboxWorkspace` and `E2BWorkspace`
+sandbox resource. First-party `E2BWorkspace`
 instances acquire provider-native filesystem behavior through typed
 `RunnerWorkspaceCapability` objects. Those objects expose stable identity and
 native file operations but no runner lifecycle method. Consumers finalize the
@@ -12636,7 +12629,7 @@ reconstruction for the same durable request are application responsibilities;
 restart-stable deployments should capture the resolver's behavior and version
 in the application-provided execution-profile identity.
 
-The built-in E2B and Microsandbox adapters are not yet valid for new
+The built-in E2B adapter is not yet valid for new
 `VirtualEgressEnvironmentFactory` allocations: Cayu rejects those creates
 before provider mutation as described in the environment-factory contract.
 Provider-specific examples that call an adapter or runner directly are trusted
@@ -13898,8 +13891,8 @@ continues to require unknown-outcome reconciliation under the existing contract.
 
 The `adapter` field of runner execution, unavailable-runner, and
 `cayu.runner_cleanup.v1` diagnostics publishes only a registered runner adapter
-identity: the built-in `docker`, `e2b`, `lambda-microvm`, `local`, and
-`microsandbox`, plus any name an application registers explicitly with the
+identity: the built-in `docker`, `e2b`, `lambda-microvm`, and `local`,
+plus any name an application registers explicitly with the
 experimental `cayu.extensions.runners.register_runner_adapter_identity`. Any
 other value is published as `"unknown"`. `error_type` likewise publishes only
 the runtime's fixed class-name baseline or a class name registered as trusted by
@@ -14174,13 +14167,6 @@ executed remain `unverified`; a secret-owned executable search path also cannot
 be proved from the controller's environment. Local snapshots do not retain or
 overwrite another session's requirement plan.
 
-`MicrosandboxRunner` collects request-scoped executable evidence in the guest,
-binding it to the provider allocation's name, incarnation, configuration, root,
-and environment. A probe requires one well-typed guest exit event; ambiguous
-completion transfers settlement ownership and fences reuse until guest stop
-and the dispatched SDK operation both settle. The collector discards guest
-output and bounds observation time and stream-event count.
-
 Virtual-egress adapters may declare planned executable checks through
 `execution_admission_evidence_for(requirements)`. These declarations do not
 prove availability. The managed runner combines its adapter-owned security
@@ -14191,8 +14177,7 @@ because a tool requests it.
 
 `LambdaMicroVMRunner` collects request-scoped executable evidence through the
 guest's ordinary agent execution lane, never the trusted system lane, using the
-same availability script and process-form probe arguments as Docker and
-Microsandbox. The evidence is bound to one exact MicroVM: its identifier and
+same availability script and process-form probe arguments as Docker. The evidence is bound to one exact MicroVM: its identifier and
 endpoint, the control-plane image ARN and version, the guest root, the runner
 environment overlay, the sidecar protocol version confirmed by a live health
 read, and the guest kernel boot id. The runner reads that identity before and
@@ -14680,13 +14665,13 @@ arguments, lifecycle state, cancellation behavior, and `exec_system()`
 dispatch. Trusted execution is not exposed through agent tools or
 `RunnerWorkspace`.
 
-Remote runner command cleanup is bounded. `DockerRunner`, `E2BRunner`, and `MicrosandboxRunner` expose `cancel_timeout_s`, defaulting to 5 seconds, `cancellation_cleanup`, defaulting to `"command"`, and `timeout_cleanup`, defaulting to `"command"`. Built-in runners re-raise the original `asyncio.CancelledError` with cleanup diagnostics attached so asyncio's cancellation bookkeeping is preserved. E2B delayed-start cleanup may continue briefly in the background after the foreground interruption or timeout cleanup wait; if it cannot resolve the command start, the runner exec path is closed while the sandbox is preserved. Command timeouts return `ExecResult(timed_out=True)`.
+Remote runner command cleanup is bounded. `DockerRunner` and `E2BRunner` expose `cancel_timeout_s`, defaulting to 5 seconds, `cancellation_cleanup`, defaulting to `"command"`, and `timeout_cleanup`, defaulting to `"command"`. Built-in runners re-raise the original `asyncio.CancelledError` with cleanup diagnostics attached so asyncio's cancellation bookkeeping is preserved. E2B delayed-start cleanup may continue briefly in the background after the foreground interruption or timeout cleanup wait; if it cannot resolve the command start, the runner exec path is closed while the sandbox is preserved. Command timeouts return `ExecResult(timed_out=True)`.
 
 Both cleanup fields accept the same modes. `DockerRunner` also accepts `"command_or_sandbox"`; other built-in runners refuse it.
 
 - `"sandbox"`: call the sandbox provider's kill/terminate operation and close the runner. This is the strongest generic cleanup boundary for shells, child processes, and background work.
 - `"command_or_sandbox"`: call the command handle's `kill()` first. A runner accepts this mode only when its handle reports success after confirming that the command's whole process tree has exited; the runner then stays reusable and the result carries one completed `kill_command` artifact. If that kill fails, times out, or is unsupported, Cayu records its artifact and then runs `"sandbox"` cleanup, so the result carries both artifacts. Each phase is bounded by `cancel_timeout_s`, so observation is bounded by twice that value. A completed `kill_sandbox` settles workspace mutation as `runner_quiescent` even after an unconfirmed `kill_command`.
-- `"command"`: call the provider command handle's `kill()` method. Positively completed cleanup leaves the runner reusable. Failed, timed-out, or unsupported cleanup permanently poisons execution on that runner instance, including Docker, E2B, Microsandbox, and Lambda MicroVM. `reopen_exec()` cannot override that uncertainty. E2B may retain a delayed-start cleanup while its execution fence stays closed; only positive completion of its owned cleanup permits reuse. Cayu records cleanup diagnostics without treating cancellation of a local SDK await as proof that a remote command stopped.
+- `"command"`: call the provider command handle's `kill()` method. Positively completed cleanup leaves the runner reusable. Failed, timed-out, or unsupported cleanup permanently poisons execution on that runner instance, including Docker, E2B, and Lambda MicroVM. `reopen_exec()` cannot override that uncertainty. E2B may retain a delayed-start cleanup while its execution fence stays closed; only positive completion of its owned cleanup permits reuse. Cayu records cleanup diagnostics without treating cancellation of a local SDK await as proof that a remote command stopped.
 - `"none"`: do not try to stop the command or sandbox. Cayu records a skipped cleanup diagnostic and leaves the runner reusable for ordinary cancellations where command state is already known. If command submission may have succeeded but start acknowledgement never arrived, the runner exec path remains closed because Cayu cannot prove that no late command is still running. This is for callers that own cleanup outside Cayu.
 
 If cleanup fails or times out, Cayu includes a structured `cayu.runner_cleanup.v1` artifact with adapter, action, status, timeout, and error details when available.
@@ -14701,17 +14686,7 @@ details do not collapse into one replay. Repeated publication reuses the first
 committed timestamp only when all other event material matches. This diagnostic
 does not settle an effect, close the pending round, or authorize another dispatch.
 
-Microsandbox sandbox cleanup preserves its remote kill artifact when owned transport
-finalization also fails. A following `close_transports` failure artifact reports
-that separate phase; it is not proof of command termination. Caller cancellation
-also retains the ordered transport exceptions.
-If transport finalization exceeds the observation deadline, the completed kill
-artifact is retained and the timeout is attributed to `close_transports`.
-Workspace settlement treats transport closure separately: an acknowledged sandbox
-kill still proves guest quiescence when transport closure fails, but transport
-closure alone never proves that a command stopped.
-
-E2B and Microsandbox ordinary post-dispatch transport failures use the same owned
+E2B ordinary post-dispatch transport failures use the same owned
 cleanup boundary as interruption. Without positive command settlement, execution
 is poisoned, including when cleanup is configured as `none`. The sanitized
 execution failure remains available alongside cleanup evidence.
@@ -14823,10 +14798,9 @@ those tools called with a bare `ToolContext`, `ExecCommandTool`, and direct
 commands; `confirmed_cancellation` also reports `receipt_command_tree_cleanup`,
 which is always false.
 
-After Docker, E2B or Microsandbox allocation is acknowledged, failed or cancelled initial
+After Docker or E2B allocation is acknowledged, failed or cancelled initial
 workspace setup rolls back under a retained owner. Docker and E2B bound observation by
-`cancel_timeout_s`; Microsandbox uses `cancel_timeout_s + remove_timeout_s` for
-stop and removal together. A second caller cancellation does not cancel rollback.
+`cancel_timeout_s`. A second caller cancellation does not cancel rollback.
 The caller's cancellation remains authoritative, with rollback failures or timeout
 attached. Ordinary setup and rollback failures retain their ordered exceptions.
 E2B terminal cleanup accepts both deletion (`True`) and provider-confirmed absence
@@ -14837,9 +14811,8 @@ Docker rollback targets only the acknowledged immutable container ID, never a
 reusable container name. Strict reconnect and execution through an exact-ID handle
 reject that allocation while rollback remains pending or failed; a late deletion
 cannot race a successful coding-factory recovery of the same allocation.
-Applications can call `await DockerRunner.drain_failed_creations(timeout_s=5)`,
-`await E2BRunner.drain_failed_creations(timeout_s=5)` or
-`await MicrosandboxRunner.drain_failed_creations(timeout_s=5)` after interruption
+Applications can call `await DockerRunner.drain_failed_creations(timeout_s=5)` or
+`await E2BRunner.drain_failed_creations(timeout_s=5)` after interruption
 and again after repairing a provider failure. Each method joins pending cleanup,
 retries each settled failure once, and returns the number still unsettled for that
 adapter in this process. Concurrent drains do not dispatch duplicate cleanup.
@@ -14862,38 +14835,6 @@ from the cleanup drain.
 Retained E2B deletions use the configured SDK request timeout (or SDK default),
 not discovery's diminishing time allowance. A drain bounds observation without
 restarting pending deletion; a settled failure retries with a fresh SDK request.
-Microsandbox reserves a same-name acquisition lease before provider dispatch and
-holds it through setup or attachment. Competing creation or attachment in this
-process is rejected, including `replace=True`; distinct names remain independent.
-Failed setup transfers that lease to rollback without an admission gap. Deferred
-attachment restoration retains it until successful settlement. Confirmed removal
-retires rollback ownership even when an earlier stop failure must still be
-reported. The existing authenticated environment-cleanup retry can reclaim a
-failed restoration's lease; ordinary create/attach calls cannot bypass it.
-Direct runner callers can use
-`await MicrosandboxRunner.drain_failed_attachments(timeout_s=5)` to join pending
-attachment restoration or retry each settled failure once after repairing the
-provider. It returns the number of attachment restorations still unsettled in
-this process. This retries the retained stop operation, not allocation or resume;
-it joins any pending original mutation before retrying. Concurrent drains share
-the same owner, and cancelling a drain does not release the same-name fence.
-Creation rollback and attachment restoration have separate drain methods.
-Adapter restoration retries retain the runner's terminal settlement until its
-provider stop finishes; an internal close observation deadline cannot release
-the acquisition fence or permit another restoration stop. Public `close()` and
-factory drain observations remain bounded.
-Microsandbox removal deadlines bound retry admission, not an already-dispatched
-provider removal. Constructor rollback and terminal close retain that removal
-until its await settles; observation timeout does not cancel it or authorize
-another removal. Constructor drains keep the same-name acquisition fence until
-successful reclamation.
-A later drain must not remove a replacement allocation. This fence does
-not coordinate external SDK clients or different processes.
-
-Microsandbox public `close()` retains already-observed transport failures if a
-subsequent transport or provider teardown stalls. Its bounded observer reports
-those original failures alongside timeout, including when caller cancellation is
-the authoritative outcome.
 
 ### Ambiguous command execution
 
@@ -15155,150 +15096,6 @@ or make caller-supplied bootstrap callbacks untrusted. See
 [`examples/e2b_hardened_coding_agent_live.py`](../examples/e2b_hardened_coding_agent_live.py)
 for an end-to-end coding-agent flow with protected independent verification and
 no virtual credentials.
-
-`MicrosandboxRunner` is Cayu's primary local runner for untrusted code and is
-available as an optional microVM-backed runner:
-
-```bash
-pip install "cayu[microsandbox]"
-```
-
-Cayu's prerelease Microsandbox integration is pinned to version `0.6.6`. The
-runner uses that release's public Python API and bundled `msb` runtime directly;
-it does not carry compatibility paths for Microsandbox 0.5.x. The Python SDK
-uses its bundled runtime unless `MSB_PATH` overrides it.
-
-Microsandbox SDKs and separately invoked `msb` binaries use the same state
-directory and SQLite database by default. Running different versions against
-that shared state can apply migrations another version cannot read. Keep any
-separately installed CLI aligned with 0.6.6, or set `MSB_HOME` to a dedicated
-directory for isolated development/live verification. Cayu never deletes,
-downgrades, or rewrites that database as remediation.
-
-```python
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.runners import MicrosandboxRunner
-
-async with await MicrosandboxRunner.create(
-    "agent-session-123",
-    image="python:3.13",
-    replace=True,
-) as runner:
-    environment = Environment(
-        EnvironmentSpec(name="sandboxed"),
-        runner=runner,
-    )
-```
-
-When `network` is omitted, `MicrosandboxRunner.create(...)` supplies
-`microsandbox.Network.none()` before sandbox creation or guest setup. Direct
-IPv4 and hostname/DNS egress are therefore unavailable by default. If Cayu
-cannot construct the supported SDK's deny-all policy, creation fails before
-`microsandbox.Sandbox.create(...)`; it never retries without a policy.
-
-Applications that intentionally need unrestricted guest networking must make
-that choice visible:
-
-```python
-from cayu.runners import MicrosandboxRunner
-from microsandbox import Network
-
-runner = await MicrosandboxRunner.create(
-    "trusted-network-client",
-    network=Network.allow_all(),
-)
-```
-
-Do not use the explicit-open form for untrusted model-authored code unless a
-separate enforced egress boundary is in place. A caller-supplied `network`
-value, including a deny policy or Cayu's virtual-egress policy, is forwarded as
-the exact object supplied; Cayu does not replace, merge, or reinterpret it.
-
-`MicrosandboxRunner.create(...)` passes other extra keyword arguments through to
-`microsandbox.Sandbox.create(...)`, so applications can configure images,
-volumes, network policies, resource limits, labels, patches, and Microsandbox
-secret placeholders without Cayu inventing a lossy abstraction over those
-backend-specific controls. Network policy objects, proxy credentials,
-environment values, and destination configuration are neither copied into
-ordinary runner logs nor persisted as runner diagnostics.
-
-Lifecycle is explicit:
-
-- `close_action="remove"`: stop and remove a sandbox created for a session or test.
-- `close_action="stop"`: stop the sandbox but leave the persisted record.
-- `close_action="detach"`: detach and let the sandbox outlive the Python process.
-- `close_action="none"`: attach/use only; no lifecycle action on close.
-
-Microsandbox can briefly continue reporting a stopped sandbox as running after
-its stop waiter completes. Removal therefore attempts immediately, then retries
-only the SDK's typed `SandboxStillRunningError` with bounded exponential
-backoff. `remove_timeout_s` defaults to
-`DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS` (5 seconds); reaching that
-deadline raises `MicrosandboxCleanupError` instead of retrying indefinitely.
-Authentication, transport, permission, and unrelated SDK errors are never
-retried. `SandboxNotFoundError` during removal, including the preceding stop,
-is treated as idempotent success because the requested terminal state has
-already been reached.
-
-After a close attempt, `last_cleanup_diagnostic` provides a copied, JSON-safe
-`cayu.microsandbox_cleanup.v1` record with the sandbox name, lifecycle action,
-terminal status, deadline, removal attempts, refreshed statuses, and safe error
-metadata when available. Deferred removal attempts are recorded separately
-from final `removed`, `timed_out`, or `failed` status. Cancellation during
-removal, status refresh, or retry backoff is re-raised unchanged after recording
-the cancelled operation. Setup cleanup retains the original setup or
-cancellation error alongside every terminal cleanup error in a flat, ordered
-`BaseExceptionGroup`: the original error first, followed by a stop error and
-then a removal error when present. Cleanup still attempts removal after stop
-fails. Non-timeout cleanup errors retain their structured record on the cleanup
-exception's `diagnostic` attribute. A failed close does not mark the runner
-closed so an operator may retry it. Once stopping succeeds, a removal retry
-resumes directly at removal instead of trying to stop the already-stopped
-sandbox again.
-
-An isolated command exit of `-9` is not enough to classify the sandbox as dead.
-The same is true of Microsandbox 0.6.6's opaque base `MicrosandboxError` when an
-exec session ends without an exit event. After either outcome, the runner gives
-Microsandbox's `Sandbox.ping()` up to `liveness_timeout_s` (one second by
-default) to prove the guest agent is reachable. Other exact-base SDK errors are
-re-raised unchanged without a liveness probe because Microsandbox maps unrelated
-runtime, protocol, HTTP, and agent-client variants to that same Python base
-class. A successful ping returns the original `ExecResult` or re-raises the
-no-exit-event SDK error unchanged. A failed or timed-out ping raises
-`MicrosandboxUnavailableError`, records registry status when available, and
-latches that runner's exec path so later calls fail fast without launching
-another guest command. Explicit SDK subclasses such as a stopped-sandbox error
-are not reclassified. Microsandbox command execution is serialized so another
-command cannot launch while that proof and latch transition is in flight.
-Applications recover by creating a new runner through `from_existing(...)` or
-replacing the sandbox; `reopen_exec()` does not clear confirmed guest-agent
-unavailability.
-
-The `cayu.runner_unavailable.v1` diagnostic includes the sandbox identity,
-last command outcome, bounded ping evidence, registry evidence, and safe
-remediation. `ExecCommandTool` preserves it in structured output and artifacts,
-so runtime tool events retain the same evidence. After confirmed unavailability,
-captured output text from the failed exchange is discarded as unreliable; the
-diagnostic retains observed stdout/stderr byte counts. Cancellation and command
-timeout paths keep their existing cleanup contracts and are not reclassified.
-Cayu reports confirmed guest-agent unavailability; it does not report OOM unless
-Microsandbox provides explicit OOM evidence.
-
-Use `MicrosandboxRunner.from_existing(...)` when a separate control plane owns
-creation and lifecycle. The creator also owns that sandbox's creation-time
-network policy: attaching does not inspect, replace, or strengthen it.
-
-The runner executes all commands under an absolute guest root, `/workspace` by
-default. Per-command `cwd` values may be relative to that root or the already
-canonical absolute root/child path produced by `resolve_cwd()`; other absolute
-paths and escaping relative traversal are rejected. `env` values are explicit
-overlays only; host process environment variables are not inherited.
-Vault integrations should resolve only the specific secrets needed at the
-execution boundary and pass them through the runner or Microsandbox's own secret
-placeholder mechanism. A microVM boundary prevents ordinary workspace escape.
-Network denial only removes ambient egress; applications must still constrain
-host mounts, environment inheritance, secret injection, artifact promotion,
-and command/tool authorization.
 
 `LambdaMicroVMRunner` is the AWS-native Firecracker adapter behind the optional `cayu[aws]`
 extra. `create(...)` calls the distinct `lambda-microvms` control API, waits for the authenticated
@@ -15811,28 +15608,6 @@ summary metadata distinguishes text, binary, unknown, and untracked counts.
 Diff pages independently reject binary/control content even when repository
 attributes force Git to label binary bytes as text.
 
-`MicrosandboxWorkspace` exposes a Microsandbox filesystem root through the same
-workspace contract:
-
-```python
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.runners import MicrosandboxRunner
-from cayu.workspaces import MicrosandboxWorkspace
-
-runner = await MicrosandboxRunner.create("session-123")
-environment = Environment(
-    EnvironmentSpec(name="sandbox"),
-    runner=runner,
-    workspace=MicrosandboxWorkspace(runner, workspace_id="sandbox-workspace"),
-)
-```
-
-Use `MicrosandboxWorkspace` when file tools must operate inside the same
-Microsandbox boundary as `exec_command`. Read, write, and delete use Cayu's
-guest-side guard and require `python3` in the sandbox; listing uses
-Microsandbox's native filesystem API. Its `root` defaults to `/workspace`,
-matching `MicrosandboxRunner`.
-
 `RunnerWorkspace` is the generic fallback for runners that do not have a native
 filesystem adapter. It uses a Python guard executed through the runner for
 read, write, delete, list, and bulk-tar operations. The guard pins the trusted,
@@ -15907,9 +15682,9 @@ result shapes, glob semantics, deterministic listing limits, resource identity, 
 declared adapter extensions. Registrations also declare whether they provide
 descriptor-relative containment against symlink replacement by a hostile
 co-resident process; supported claims require an adversarial scenario probe.
-Its E2B and Microsandbox fixtures bridge
+Its E2B fixture bridges
 the real guest guard and native filesystem seams to one host-backed directory,
-but they do not claim a real sandbox boundary. The opt-in E2B and Microsandbox
+but it does not claim a real sandbox boundary. The opt-in E2B
 workspace checks in `scripts/nightly_verification.py` reuse the portable
 round-trip and path-safety scenarios against live sandboxes.
 When exporting a new built-in workspace adapter, add its deterministic factory

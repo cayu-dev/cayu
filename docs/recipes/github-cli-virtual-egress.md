@@ -73,7 +73,7 @@ factory = VirtualEgressEnvironmentFactory(
 That explicit Docker selection is suitable for trusted development and CI; its
 network policy is enforced, but an ordinary container is not a security
 boundary for hostile code. For untrusted agent-authored code, supply a
-registered enforcing Microsandbox, E2B, or other sandbox adapter with the same
+registered enforcing E2B or other sandbox adapter with the same
 credential and policy declarations.
 
 `opaque_token` is provider-neutral. It means an opaque secret carried with the

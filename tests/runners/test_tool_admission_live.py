@@ -22,7 +22,6 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runners.base import ExecCommand
 from cayu.runners.docker import DockerRunner
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
-from cayu.runners.microsandbox import MicrosandboxRunner
 from cayu.sessions.requests import RunRequest
 from cayu.tools.base import ToolExecutableRequirement
 from cayu.tools.search import SearchTextTool
@@ -47,8 +46,7 @@ def _disable_docker_pulls(monkeypatch):
 def _configured(backend: str, proof: str) -> str:
     if os.environ.get("CAYU_RUN_TOOL_ADMISSION_LIVE") != "1":
         pytest.skip("Set CAYU_RUN_TOOL_ADMISSION_LIVE=1 with prepared disposable targets.")
-    suffix = "IMAGE_ID" if backend == "docker" else "SANDBOX"
-    key = f"CAYU_860_{backend.upper()}_{proof.upper()}_{suffix}"
+    key = f"CAYU_860_{backend.upper()}_{proof.upper()}_IMAGE_ID"
     value = os.environ.get(key)
     if not value:
         pytest.fail(f"Live qualification requires {key}; no target is prepared automatically.")
@@ -158,29 +156,6 @@ def test_public_search_text_admission_in_live_docker(monkeypatch, proof):
             credential_mode="trusted_tool",
             allow_raw_secret_env=False,
             docker_path=docker,
-        ) as runner:
-            await _qualify(runner, proof=proof)
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("proof", ["present", "missing"])
-def test_public_search_text_admission_in_live_microsandbox(proof):
-    name = _configured("microsandbox", proof)
-    assert re.fullmatch(r"cayu-860-live-[a-z0-9-]+", name), (
-        "Supply an explicitly disposable running sandbox named cayu-860-live-*."
-    )
-    # Import failure is a failed qualification after opt-in, not a silent skip.
-    import microsandbox
-
-    async def run():
-        handle = await microsandbox.Sandbox.get(name)
-        assert type(handle.created_at) in {int, float} and handle.created_at > 0
-        async with await MicrosandboxRunner.from_existing(
-            name,
-            expected_created_at=handle.created_at,
-            close_action="remove",
-            default_cwd="/workspace",
         ) as runner:
             await _qualify(runner, proof=proof)
 

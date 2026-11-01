@@ -11,20 +11,12 @@ from tests.runners.test_e2b import (
 from tests.runners.test_e2b import (
     FakeSandbox as E2BSandbox,
 )
-from tests.runners.test_microsandbox import (
-    FakeMicrosandboxModule,
-    FakeSandboxApi,
-    reset_fake_module,
-)
-from tests.runners.test_microsandbox import (
-    FakeSandbox as MicroSandbox,
-)
 
-from cayu.runners import DockerRunner, E2BRunner, ExecResult, MicrosandboxRunner
+from cayu.runners import DockerRunner, E2BRunner, ExecResult
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("adapter", ["docker", "e2b", "microsandbox"])
+@pytest.mark.parametrize("adapter", ["docker", "e2b"])
 @pytest.mark.parametrize("cleanup_state", ["success", "failed", "pending"])
 @pytest.mark.parametrize("grouped", [False, True])
 async def test_constructor_fatal_setup_survives_rollback_cancellation(
@@ -77,7 +69,7 @@ async def test_constructor_fatal_setup_survives_rollback_cancellation(
             cancel_timeout_s=rollback_timeout_s,
         )
         runner_type = DockerRunner
-    elif adapter == "e2b":
+    else:
         reset_fake_e2b()
         sandbox = E2BSandbox()
         FakeAsyncSandbox.next_sandbox = sandbox
@@ -85,18 +77,6 @@ async def test_constructor_fatal_setup_survives_rollback_cancellation(
         sandbox.kill = cleanup
         creation = E2BRunner.create(e2b_module=FakeE2BModule, cancel_timeout_s=rollback_timeout_s)
         runner_type = E2BRunner
-    else:
-        reset_fake_module()
-        monkeypatch.setattr(MicroSandbox, "exec", setup)
-        monkeypatch.setattr(FakeSandboxApi, "remove", classmethod(cleanup))
-        creation = MicrosandboxRunner.create(
-            "fatal-setup",
-            replace=False,
-            sandbox_module=FakeMicrosandboxModule,
-            cancel_timeout_s=rollback_timeout_s,
-            remove_timeout_s=rollback_timeout_s,
-        )
-        runner_type = MicrosandboxRunner
 
     task = asyncio.create_task(creation)
     try:
@@ -118,11 +98,6 @@ async def test_constructor_fatal_setup_survives_rollback_cancellation(
             assert isinstance(errors[1], TimeoutError)
             assert await runner_type.drain_failed_creations(timeout_s=0.01) == 1
             assert len(cleanup_calls) == 1
-            if adapter == "microsandbox":
-                with pytest.raises(RuntimeError, match="pending"):
-                    await MicrosandboxRunner.create(
-                        "fatal-setup", sandbox_module=FakeMicrosandboxModule
-                    )
         elif cleanup_state == "failed":
             assert isinstance(errors[1], Exception)
             assert await runner_type.drain_failed_creations(timeout_s=1) == 1

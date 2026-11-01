@@ -18,7 +18,6 @@ EXTRA_ONLY = (
     "google",
     "httpx2",
     "mcp",
-    "microsandbox",
     "opentelemetry",
     "playwright",
     "psycopg",

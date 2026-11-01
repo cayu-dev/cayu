@@ -581,10 +581,18 @@ class _ConcurrentWindowMutationTool(Tool):
         workspace_mutation=True,
     )
 
-    def __init__(self, *, path: str, started: list[int], both_started: asyncio.Event) -> None:
+    def __init__(
+        self,
+        *,
+        path: str,
+        started: list[int],
+        both_started: asyncio.Event,
+        writes_finished: asyncio.Barrier,
+    ) -> None:
         self.path = path
         self.started = started
         self.both_started = both_started
+        self.writes_finished = writes_finished
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         del args
@@ -594,6 +602,9 @@ class _ConcurrentWindowMutationTool(Tool):
             self.both_started.set()
         await asyncio.wait_for(self.both_started.wait(), timeout=10)
         await ctx.workspace.create_bytes(self.path, self.path.encode())
+        # Both tools must finish writing before either after-observation starts.
+        # A snapshot racing the other write is correctly marked incomplete.
+        await asyncio.wait_for(self.writes_finished.wait(), timeout=10)
         return ToolResult(content="created")
 
 
@@ -2153,6 +2164,7 @@ def test_overlapping_sessions_never_claim_per_tool_workspace_causality(tmp_path)
         workspace = LocalWorkspace(tmp_path, workspace_id="concurrent-workspace")
         started = [0]
         both_started = asyncio.Event()
+        writes_finished = asyncio.Barrier(2)
         results = []
 
         for index in range(2):
@@ -2180,6 +2192,7 @@ def test_overlapping_sessions_never_claim_per_tool_workspace_causality(tmp_path)
                         path=f"concurrent-{index}.txt",
                         started=started,
                         both_started=both_started,
+                        writes_finished=writes_finished,
                     )
                 ],
             )

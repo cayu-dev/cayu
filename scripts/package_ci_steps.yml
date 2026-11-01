@@ -139,13 +139,9 @@ steps:
       .release-all-venv/bin/python - <<'PY'
       import awscrt.auth
       import boto3
-      import microsandbox
-      from cayu.runners.microsandbox import MicrosandboxRunner
 
       assert boto3 is not None
       assert awscrt.auth is not None
-      assert microsandbox is not None
-      assert MicrosandboxRunner is not None
       PY
   - name: Verify all lazy exports from the built wheel with runtime extras
     groups: core

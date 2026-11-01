@@ -8,7 +8,7 @@ built against [Modal](https://modal.com) Sandboxes, but the contract is the same
 for any backend.
 
 The built-in runners (`LocalRunner`, `DockerRunner`, `E2BRunner`,
-`MicrosandboxRunner`, `LambdaMicroVMRunner`) all implement this same contract;
+`LambdaMicroVMRunner`) all implement this same contract;
 read their source in `src/cayu/runners/` alongside this guide.
 
 If you only want an existing runner's commands to go through your own wrapper
@@ -191,7 +191,7 @@ class ExecCommand(BaseModel):
 `process` is argv (no shell parsing). `shell` is a script string where quoting and
 expansion are intentional. Translate both to your platform:
 
-- If your SDK takes argv natively (Modal, Microsandbox), pass `command.argv`
+- If your SDK takes argv natively (Modal), pass `command.argv`
   through and run a `shell` script as `["bash", "-c", command.shell]`.
 - If your SDK only takes a command *string* (E2B runs through Bash), quote argv
   with `shlex.join(command.argv)` and pass `command.shell` verbatim. See
@@ -275,7 +275,7 @@ Follow [`examples/modal_runner.py`](../examples/modal_runner.py).
            raise RuntimeError("ModalRunner requires the optional modal package. ...") from exc
    ```
 
-   This mirrors `_e2b_module()` / `_microsandbox_module()` in the built-in runners.
+   This mirrors `_e2b_module()` in `src/cayu/runners/e2b.py`.
 
 2. **Subclass and translate.** Set `isolation = "modal"`, validate
    `type(command) is ExecCommand`, resolve relative or already-canonical `cwd`
@@ -299,8 +299,8 @@ Follow [`examples/modal_runner.py`](../examples/modal_runner.py).
    expects `output_limit_bytes` to bound capture *inside* the runner** so a command
    can't exhaust memory before the result is built. The example reads *all* output
    and truncates the final string — simple, but **not memory-safe for unbounded
-   output**. A production runner streams into a bounded buffer (`_LimitedBytes` in
-   `microsandbox.py`), which also lets partial output **survive a timeout** and —
+   output**. A production runner streams into a bounded buffer (`RedactedOutputCapture`,
+   used by `e2b.py`), which also lets partial output **survive a timeout** and —
    for OS-pipe backends — lets you read stdout/stderr **concurrently**
    (`asyncio.gather`) to avoid a full-pipe deadlock. (Modal's streams are
    network-buffered, so the example reads them sequentially — and because it reads
@@ -390,7 +390,7 @@ credential brokering that keeps secrets off the sandbox entirely, see:
 Mock the platform SDK — never hit the real service in unit tests. Construct the
 runner with a **fake sandbox** and drive `exec()`; the SDK module is only needed
 by `create()`, which takes a `modal_module=` injection hook (mirroring
-`sandbox_module=` on `MicrosandboxRunner`), so you never monkeypatch `importlib`:
+`e2b_module=` on `E2BRunner.create`), so you never monkeypatch `importlib`:
 
 ```python
 # FakeSandbox.exec records its call and returns stdout="abcdef".
@@ -409,8 +409,7 @@ assert result.stdout == "abc" and result.stdout_truncated is True
 Assert: command translation (argv/workdir/env recorded by the fake), output
 truncation, the no-host-env-leak rule (a host env var you set is absent from the
 forwarded env), timeout → `timed_out=True`, and cancellation → the original `asyncio.CancelledError`.
-The built-in tests are full worked examples: `tests/runners/test_microsandbox.py`,
-`tests/runners/test_e2b.py`.
+`tests/runners/test_e2b.py` is a full worked example.
 
 For a credential-boundary regression, use
 `cayu.testing.base.verify_provider_credential_isolation(...)`. Install unique host
@@ -481,7 +480,7 @@ register_runner_adapter_identity(
 - Registration is process-wide and permanent. Repeating an identical
   registration returns the existing `RunnerAdapterIdentity`; registering the
   same name with a different error-type set raises `ValueError`. Built-in
-  identities (`docker`, `e2b`, `lambda-microvm`, `local`, `microsandbox`) are
+  identities (`docker`, `e2b`, `lambda-microvm`, `local`) are
   pre-registered and cannot be widened.
 - `registered_runner_adapter_identities()` returns a read-only snapshot.
 - Cayu never discovers adapters automatically (no entry points). An adapter

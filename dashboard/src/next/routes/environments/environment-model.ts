@@ -19,7 +19,6 @@ const RUNNERS: Record<string, string> = {
   LocalRunner: "This machine",
   DockerRunner: "Docker container",
   LambdaMicroVMRunner: "AWS Lambda microVM",
-  MicrosandboxRunner: "Microsandbox VM",
   E2BRunner: "E2B sandbox",
   BrokeredSandboxRunner: "Brokered sandbox",
   DeferredRunner: "Chosen when a session starts",

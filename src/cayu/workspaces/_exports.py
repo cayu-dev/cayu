@@ -9,14 +9,6 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.workspaces.e2b",
         "DEFAULT_E2B_WORKSPACE_READ_LIMIT_BYTES",
     ),
-    "DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT": (
-        "cayu.workspaces.microsandbox",
-        "DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT",
-    ),
-    "DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES": (
-        "cayu.workspaces.microsandbox",
-        "DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES",
-    ),
     "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT": (
         "cayu.workspaces.runner",
         "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT",
@@ -43,7 +35,6 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "GitRemoteWorkspaceSource": ("cayu.workspaces.sources", "GitRemoteWorkspaceSource"),
     "GitWorkspaceSource": ("cayu.workspaces.sources", "GitWorkspaceSource"),
     "LocalWorkspace": ("cayu.workspaces.local", "LocalWorkspace"),
-    "MicrosandboxWorkspace": ("cayu.workspaces.microsandbox", "MicrosandboxWorkspace"),
     "RemoteWorkspaceBranchAuthorityProvider": (
         "cayu.workspaces.branches",
         "RemoteWorkspaceBranchAuthorityProvider",
@@ -235,8 +226,6 @@ PUBLIC_NAMES = [
     "DEFAULT_E2B_WORKSPACE_LIST_DEPTH",
     "DEFAULT_E2B_WORKSPACE_LIST_LIMIT",
     "DEFAULT_E2B_WORKSPACE_READ_LIMIT_BYTES",
-    "DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT",
-    "DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES",
     "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT",
     "DEFAULT_GIT_REMOTE_FETCH_TIMEOUT_SECONDS",
     "DEFAULT_GIT_REMOTE_MAX_FETCH_BYTES",
@@ -248,7 +237,6 @@ PUBLIC_NAMES = [
     "GitWorkspaceSource",
     "LocalWorkspace",
     "MAX_GIT_REMOTE_FETCH_FILES",
-    "MicrosandboxWorkspace",
     "RemoteWorkspaceBranchAuthorityProvider",
     "RunnerBoundWorkspace",
     "RunnerWorkspace",

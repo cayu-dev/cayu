@@ -34,11 +34,10 @@ from tests.workspaces.conformance import (
 import cayu.workspaces as workspaces_module
 import cayu.workspaces._local_guard as local_guard_module
 import cayu.workspaces.runner as runner_workspace_module
-from cayu.runners import E2BRunner, LocalRunner, MicrosandboxRunner
+from cayu.runners import E2BRunner, LocalRunner
 from cayu.workspaces import (
     E2BWorkspace,
     LocalWorkspace,
-    MicrosandboxWorkspace,
     RunnerWorkspace,
     Workspace,
     WorkspaceListResult,
@@ -86,55 +85,6 @@ class _E2BSandbox:
 
     def __init__(self) -> None:
         self.files = _HostE2BFilesystem()
-
-
-@dataclass(frozen=True)
-class _MicrosandboxEntry:
-    path: str
-    kind: str
-
-
-class _HostMicrosandboxFilesystem:
-    async def list(self, path: str) -> list[_MicrosandboxEntry]:
-        entries = [
-            _MicrosandboxEntry(
-                path=str(target),
-                kind="dir" if target.is_dir() else "file",
-            )
-            for target in Path(path).iterdir()
-        ]
-        return list(reversed(entries))
-
-
-class _MicrosandboxSftp:
-    async def real_path(self, path: str) -> str:
-        if not os.path.lexists(path):
-            raise FileNotFoundError(path)
-        return os.path.realpath(path)
-
-    async def close(self) -> None:
-        return None
-
-
-class _MicrosandboxSshClient:
-    async def sftp(self) -> _MicrosandboxSftp:
-        return _MicrosandboxSftp()
-
-    async def close(self) -> None:
-        return None
-
-
-class _MicrosandboxSsh:
-    async def open_client(self, **_kwargs: object) -> _MicrosandboxSshClient:
-        return _MicrosandboxSshClient()
-
-
-class _MicrosandboxSandbox:
-    def __init__(self) -> None:
-        self.fs = _HostMicrosandboxFilesystem()
-
-    def ssh(self) -> _MicrosandboxSsh:
-        return _MicrosandboxSsh()
 
 
 async def _local_factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> WorkspaceHarness:
@@ -325,24 +275,6 @@ async def _e2b_factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> Workspac
     )
 
 
-async def _microsandbox_factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> WorkspaceHarness:
-    runner = MicrosandboxRunner(
-        _MicrosandboxSandbox(),
-        name="workspace-conformance-microsandbox",
-        sandbox_module=SimpleNamespace(),
-    )
-    cast("Any", runner).exec = make_local_guard_exec()
-    return WorkspaceHarness(
-        MicrosandboxWorkspace(
-            runner,
-            root=str(root),
-            workspace_id="conformance-microsandbox",
-        ),
-        root,
-        runner.close,
-    )
-
-
 async def _runner_bulk_transfer_probe(harness: WorkspaceHarness) -> None:
     workspace = cast("RunnerWorkspace", harness.workspace)
     await workspace.write_bytes("bulk/a.txt", b"alpha")
@@ -443,12 +375,6 @@ REGISTRATIONS = (
         "e2b",
         E2BWorkspace,
         _e2b_factory,
-        WorkspaceCapabilities("stable", NOT_ON_WORKSPACE, NATIVE_LISTING_IS_ADVISORY),
-    ),
-    WorkspaceConformanceRegistration(
-        "microsandbox",
-        MicrosandboxWorkspace,
-        _microsandbox_factory,
         WorkspaceCapabilities("stable", NOT_ON_WORKSPACE, NATIVE_LISTING_IS_ADVISORY),
     ),
 )

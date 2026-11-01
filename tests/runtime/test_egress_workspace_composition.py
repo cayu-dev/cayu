@@ -25,14 +25,11 @@ from cayu.runners import (
     E2BWorkspaceCapability,
     ExecCommand,
     LocalRunner,
-    MicrosandboxRunner,
-    MicrosandboxWorkspaceCapability,
     Runner,
 )
 from cayu.vaults import SecretRef, StaticVault
 from cayu.workspaces import (
     E2BWorkspace,
-    MicrosandboxWorkspace,
     RunnerWorkspace,
     Workspace,
     WorkspaceListResult,
@@ -41,53 +38,6 @@ from cayu.workspaces import (
 )
 
 pytest.importorskip("cryptography")
-
-
-@dataclass(frozen=True)
-class _MicrosandboxEntry:
-    path: str
-    kind: str
-
-
-class _LocalMicrosandboxFilesystem:
-    async def list(self, path: str) -> Sequence[_MicrosandboxEntry]:
-        root = Path(path)
-        return tuple(
-            _MicrosandboxEntry(
-                path=str(child),
-                kind="dir" if child.is_dir() else "file",
-            )
-            for child in root.iterdir()
-        )
-
-
-class _LocalSftp:
-    async def real_path(self, path: str) -> str:
-        return str(Path(path).resolve())
-
-    async def close(self) -> None:
-        return None
-
-
-class _LocalSshClient:
-    async def sftp(self) -> _LocalSftp:
-        return _LocalSftp()
-
-    async def close(self) -> None:
-        return None
-
-
-class _LocalSsh:
-    async def open_client(self, **_kwargs: Any) -> _LocalSshClient:
-        return _LocalSshClient()
-
-
-class _LocalMicrosandbox:
-    def __init__(self) -> None:
-        self.fs = _LocalMicrosandboxFilesystem()
-
-    def ssh(self) -> _LocalSsh:
-        return _LocalSsh()
 
 
 @dataclass(frozen=True)
@@ -273,35 +223,21 @@ def _local_exec(root: Path) -> Any:
     return exec_command
 
 
-@pytest.mark.parametrize("provider", ["microsandbox", "e2b"])
 @pytest.mark.parametrize("observation_mode", ["default", "deterministic"])
 def test_factory_composes_provider_workspace_without_unwrapping(
     tmp_path: Path,
-    provider: str,
     observation_mode: str,
 ) -> None:
     order: list[str] = []
-    if provider == "microsandbox":
-        inner = MicrosandboxRunner(
-            _LocalMicrosandbox(),
-            name="workspace-composition",
-            default_cwd=str(tmp_path),
-            close_action="none",
-            sandbox_module=object(),
-        )
-        workspace_type = MicrosandboxWorkspace
-        capability_type = MicrosandboxWorkspaceCapability
-        private_identity_attribute = "name"
-    else:
-        inner = E2BRunner(
-            _LocalE2BSandbox(),
-            default_cwd=str(tmp_path),
-            close_action="none",
-            e2b_module=object(),
-        )
-        workspace_type = E2BWorkspace
-        capability_type = E2BWorkspaceCapability
-        private_identity_attribute = "sandbox_id"
+    provider = "e2b"
+    inner = E2BRunner(
+        _LocalE2BSandbox(),
+        default_cwd=str(tmp_path),
+        close_action="none",
+        e2b_module=object(),
+    )
+    workspace_type = E2BWorkspace
+    capability_type = E2BWorkspaceCapability
     inner.exec = _local_exec(tmp_path)  # type: ignore[method-assign]
     adapter = _WorkspaceAdapter(provider, inner, order)
 
@@ -330,10 +266,7 @@ def test_factory_composes_provider_workspace_without_unwrapping(
         assert isinstance(capability, capability_type)
         assert not hasattr(capability, "close")
         assert not hasattr(capability, "filesystem")
-        if private_identity_attribute == "name":
-            assert managed.name == inner.name
-        else:
-            assert not hasattr(managed, private_identity_attribute)
+        assert not hasattr(managed, "sandbox_id")
 
         with pytest.raises(ValueError, match="escapes the workspace root"):
             await workspace.read_bytes("../escape.txt")
@@ -665,7 +598,5 @@ def test_workspace_factory_cancellation_cleans_up_managed_egress() -> None:
 def test_provider_workspaces_reject_runners_without_typed_capability(tmp_path: Path) -> None:
     runner = LocalRunner(tmp_path)
 
-    with pytest.raises(TypeError, match="MicrosandboxWorkspaceCapability"):
-        MicrosandboxWorkspace(runner, root=str(tmp_path))
     with pytest.raises(TypeError, match="E2BWorkspaceCapability"):
         E2BWorkspace(runner, root=str(tmp_path))

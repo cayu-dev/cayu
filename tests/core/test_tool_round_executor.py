@@ -965,7 +965,7 @@ def test_grouped_cancellation_remains_authoritative_when_interrupt_closure_fails
                     [
                         {
                             "type": "cayu.runner_cleanup.v1",
-                            "adapter": "microsandbox",
+                            "adapter": "lambda-microvm",
                             "action": "kill_command",
                             "status": "failed",
                             "timeout_s": 5.0,

@@ -404,8 +404,8 @@ Notes:
   provider-native workspaces. It receives the public lifecycle-managed runner;
   when supplied without `inner_binding`, the virtual-egress factory attaches
   the workspace with `NativeBinding`. For example,
-  `workspace_factory=MicrosandboxWorkspace` produces a first-party workspace
-  in the enforced microVM without exposing the raw `MicrosandboxRunner`.
+  `workspace_factory=E2BWorkspace` produces a first-party workspace
+  in the enforced sandbox without exposing the raw `E2BRunner`.
 
 ### Coding in a cloud sandbox
 
@@ -1307,7 +1307,7 @@ Every custom `SandboxEgressAdapter` must explicitly set
 `CREATE` before adapter preparation. This is intentional: Cayu cannot safely
 infer whether third-party runner creation mutates a process-external provider.
 
-The bundled Microsandbox, E2B, and Lambda MicroVM virtual-egress adapters do
+The bundled E2B and Lambda MicroVM virtual-egress adapters do
 not currently satisfy every exact-recovery and conditional-cleanup requirement,
 so new creates through them fail before adapter setup or provider mutation.
 Docker remains available because its allocation is process-local. See
@@ -1717,8 +1717,8 @@ owner.
 ### Live tool-requirement qualification
 
 `tests/runners/test_tool_admission_live.py` qualifies `SearchTextTool` through
-`CayuApp.run`, using a scripted provider rather than a paid model. Each backend
-has a present-`rg` case that must return an actual guest file match, and a
+`CayuApp.run`, using a scripted provider rather than a paid model. It runs
+against Docker and has a present-`rg` case that must return an actual guest file match, and a
 missing-`rg` case that must refuse before any provider request or successful
 session. The test driver creates a small uniquely named fixture in the guest.
 Local driver tests and evidence fixtures are not live backend qualification.
@@ -1735,17 +1735,11 @@ not install packages, build images, or request image pulls.
   Its test-only transport guard adds `--pull=never` to real Docker creation, so
   a concurrent image prune cannot trigger an implicit download. Guest dispatch
   and admission evidence still use the production Docker implementation.
-- Microsandbox: set `CAYU_860_MICROSANDBOX_PRESENT_SANDBOX` and
-  `CAYU_860_MICROSANDBOX_MISSING_SANDBOX` to pre-created disposable running
-  sandboxes named `cayu-860-live-*`. The test attaches to the exact provider
-  incarnation and **removes the supplied sandbox afterward**, including on test
-  failure. Re-create these targets before rerunning the qualification.
 
-After exporting the relevant target variables, run one backend at a time:
+After exporting the target variables, run:
 
 ```sh
 CAYU_RUN_TOOL_ADMISSION_LIVE=1 PYTHONPATH=src pytest -q tests/runners/test_tool_admission_live.py -k docker
-CAYU_RUN_TOOL_ADMISSION_LIVE=1 PYTHONPATH=src pytest -q tests/runners/test_tool_admission_live.py -k microsandbox
 ```
 
 Without opt-in, these tests skip. Once opted in, missing configuration or
@@ -1998,8 +1992,7 @@ repository already ships worked, live ones:
 - Copy-in/copy-out with `SyncBinding`:
   [`examples/sync_binding_local.py`](../examples/sync_binding_local.py) (local, no runner),
   [`examples/docker_sync_binding_live.py`](../examples/docker_sync_binding_live.py),
-  [`examples/e2b_sync_binding_live.py`](../examples/e2b_sync_binding_live.py),
-  [`examples/microsandbox_sync_binding_live.py`](../examples/microsandbox_sync_binding_live.py).
+  [`examples/e2b_sync_binding_live.py`](../examples/e2b_sync_binding_live.py).
 - A custom runner backend (Modal Sandboxes):
   [`examples/modal_runner.py`](../examples/modal_runner.py) and the companion
   [Build a Runner](./build-a-runner.md) guide.

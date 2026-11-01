@@ -66,7 +66,7 @@ class _KillRaises:
 
 def test_builtin_identities_are_seeded_without_extra_error_types() -> None:
     identities = extension_runners.registered_runner_adapter_identities()
-    assert set(identities) == {"docker", "e2b", "lambda-microvm", "local", "microsandbox"}
+    assert set(identities) == {"docker", "e2b", "lambda-microvm", "local"}
     for name, identity in identities.items():
         assert identity == extension_runners.RunnerAdapterIdentity(name=name)
     with pytest.raises(TypeError):
@@ -220,7 +220,7 @@ def test_trusted_error_type_is_retained_only_after_registration() -> None:
 
 
 def test_builtin_diagnostics_are_unchanged() -> None:
-    for adapter in ("docker", "e2b", "lambda-microvm", "local", "microsandbox"):
+    for adapter in ("docker", "e2b", "lambda-microvm", "local"):
         assert runner_execution_error(TimeoutError(), adapter=adapter).diagnostic == {
             "type": "cayu.runner_execution_error.v1",
             "adapter": adapter,
@@ -346,14 +346,3 @@ def test_public_capability_evidence_builder_matches_the_adapter_builder() -> Non
         extension_egress.virtual_egress_execution_capability_evidence(
             **{**arguments, "preflight_observed_at": "2026-01-01T00:00:00Z"}
         )
-
-
-def test_microsandbox_proxy_exposure_keeps_its_former_import_path() -> None:
-    from cayu.egress import microsandbox_adapter, proxy_exposure
-
-    assert proxy_exposure.MICROSANDBOX_HOST == microsandbox_adapter.MICROSANDBOX_HOST
-    assert proxy_exposure.MicrosandboxHostProxyExposure is (
-        microsandbox_adapter.MicrosandboxHostProxyExposure
-    )
-    with pytest.raises(AttributeError):
-        _ = proxy_exposure.NotAProxyExposure

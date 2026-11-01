@@ -119,11 +119,6 @@ e2b = [
 egress = [
   "cryptography>=42",
 ]
-microsandbox = [
-  # Prerelease policy: accept only the exact SDK/runtime baseline Cayu verifies.
-  # Upstream patch fixes require a Cayu bump and a fresh live-verification pass.
-  "microsandbox==0.6.6",
-]
 otel = [
   "opentelemetry-api>=1.45.1",
   "opentelemetry-sdk>=1.45.1",
@@ -165,7 +160,6 @@ all = [
   "fastapi>=0.115,<0.137",
   "google-auth[requests]>=2,<3",
   "ipython>=9,<10",
-  "microsandbox==0.6.6",
   "opentelemetry-api>=1.45.1",
   "opentelemetry-sdk>=1.45.1",
   "pillow>=13.0.0",
@@ -188,7 +182,6 @@ all-runtime-extras = [
   "e2b",
   "egress",
   "files",
-  "microsandbox",
   "oidc",
   "otel",
   "postgres",

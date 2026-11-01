@@ -45,8 +45,6 @@ corresponding credentials or service.
 - [`docker_interrupt_live.py`](docker_interrupt_live.py) — Docker interruption behavior.
 - [`e2b_runner_live.py`](e2b_runner_live.py) and
   [`e2b_workspace_live.py`](e2b_workspace_live.py) — E2B execution and workspaces.
-- [`microsandbox_runner_live.py`](microsandbox_runner_live.py) and
-  [`microsandbox_workspace_live.py`](microsandbox_workspace_live.py) — local microVM execution.
 - [`modal_runner.py`](modal_runner.py) — an application-owned remote runner.
 - [`artifact_file_live.py`](artifact_file_live.py) and
   [`artifact_workspace_bridge.py`](artifact_workspace_bridge.py) — durable files and mutable workspaces.

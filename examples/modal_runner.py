@@ -148,8 +148,8 @@ class ModalRunner(Runner):
             # SIMPLIFICATION: this reads ALL of stdout/stderr and truncates after the
             # fact, so it is NOT memory-safe for unbounded output. The Runner contract
             # expects `output_limit_bytes` to bound capture INSIDE the runner; a
-            # production runner streams into a bounded buffer (see `_LimitedBytes` in
-            # src/cayu/runners/microsandbox.py) so large output can't exhaust memory.
+            # production runner streams into a bounded buffer (see `RedactedOutputCapture`
+            # in src/cayu/runners/_redacted_output.py) so large output can't exhaust memory.
             process = await self._sandbox.exec.aio(
                 *prepared.argv,
                 workdir=prepared.workdir,

@@ -12,7 +12,6 @@ from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.egress.e2b_adapter import E2BEgressAdapter
 from cayu.egress.grants import VirtualCredentialRegistry
-from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 from cayu.egress.proxy_exposure import ExposedProxy
 
 VerificationStatus = Literal["verified", "smoke", "skipped", "failed", "unclaimed"]
@@ -59,10 +58,6 @@ def _docker_adapter_factory(**options: Any) -> SandboxEgressAdapter:
 def _e2b_adapter_factory(**options: Any) -> SandboxEgressAdapter:
     options.setdefault("exposure", _UnconfiguredE2BExposure())
     return E2BEgressAdapter(**options)
-
-
-def _microsandbox_adapter_factory(**options: Any) -> SandboxEgressAdapter:
-    return MicrosandboxEgressAdapter(**options)
 
 
 @dataclass
@@ -151,7 +146,7 @@ def _deterministic_docker_fixture() -> DeterministicEgressFixture:
 
 
 def _deterministic_remote_fixture(
-    adapter_type: type[E2BEgressAdapter] | type[MicrosandboxEgressAdapter],
+    adapter_type: type[E2BEgressAdapter],
 ) -> DeterministicEgressFixture:
     release_probe = ResourceReleaseProbe()
 
@@ -171,10 +166,6 @@ def _deterministic_remote_fixture(
 
 def _deterministic_e2b_fixture() -> DeterministicEgressFixture:
     return _deterministic_remote_fixture(E2BEgressAdapter)
-
-
-def _deterministic_microsandbox_fixture() -> DeterministicEgressFixture:
-    return _deterministic_remote_fixture(MicrosandboxEgressAdapter)
 
 
 @dataclass(frozen=True)
@@ -393,27 +384,6 @@ EGRESS_CONFORMANCE_REGISTRATIONS = (
         ),
         teardown_timeout_s=15,
         live_proof_source="tests/egress/test_e2b_egress_e2e.py",
-    ),
-    EgressConformanceRegistration(
-        name="microsandbox",
-        runner_kind="microsandbox",
-        adapter_type=MicrosandboxEgressAdapter,
-        adapter_factory=_microsandbox_adapter_factory,
-        deterministic_fixture_factory=_deterministic_microsandbox_fixture,
-        live_prerequisites=LivePrerequisites(
-            required_modules=("cryptography", "microsandbox"),
-            required_env_values=(("CAYU_RUN_MICROSANDBOX_EGRESS_E2E", "1"),),
-            notes=("Requires an intentionally available local Microsandbox runtime.",),
-        ),
-        capabilities=_LIVE_SECURITY,
-        bounded_destinations=(
-            "api.stripe.com:443",
-            "1.1.1.1:443",
-            "8.8.8.8:443",
-            "169.254.169.254:80",
-        ),
-        teardown_timeout_s=15,
-        live_proof_source="tests/egress/test_microsandbox_egress_e2e.py",
     ),
 )
 

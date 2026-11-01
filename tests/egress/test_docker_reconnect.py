@@ -89,7 +89,7 @@ def setup(tmp_path):
     [
         ("version", True),
         ("version", 2),
-        ("backend", "microsandbox"),
+        ("backend", "lambda-microvm"),
         ("container_id", "fixture"),
         ("allocation_id", "../other"),
         ("unexpected", "secret"),

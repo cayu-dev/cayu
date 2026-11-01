@@ -202,7 +202,7 @@ def test_available_evidence_rejects_runtime_observations() -> None:
 
 def test_admission_reports_every_unmet_requirement_without_trusting_candidate_name() -> None:
     evidence = ExecutionCapabilityEvidence(
-        subject="microsandbox",
+        subject="example-sandbox",
         claims=(
             ExecutionCapabilityClaim(
                 capability="untrusted_code_isolation",
@@ -236,7 +236,7 @@ def test_admission_reports_every_unmet_requirement_without_trusting_candidate_na
     )
 
     decision = evaluate_execution_admission(
-        candidate="microsandbox",
+        candidate="example-sandbox",
         requirements=ExecutionRequirements.untrusted(),
         evidence=evidence,
     )

@@ -4348,8 +4348,8 @@ Docker is the P1 bounded path for code the operator already trusts. It is
 not hostile-repository isolation. Runtime networking is disabled, the root
 filesystem is read-only, the guest is non-root, all capabilities are dropped,
 resources and writable tmpfs mounts are bounded, no host paths are mounted, and
-no raw workload credentials or ambient host environment enter the guest. Use
-the separate P3 Microsandbox follow-up #1191 for untrusted-code execution.
+no raw workload credentials or ambient host environment enter the guest.
+Untrusted-code execution belongs on Lambda MicroVM and is tracked in #1878.
 
 Image build authority and runtime execution authority are separate. First run
 `uv lock` and review `uv.lock`. Then pin the image inputs in
@@ -4535,7 +4535,7 @@ verification, non-root/read-only/capability/resource controls, protected source
 paths, ephemeral guest Git, revision-checked bounded copy-back, and tool-free
 reviewer. Never add shell, arbitrary executable authority, runtime installation, publication,
 or network tools to the primary agent. Do not describe this Docker profile as
-untrusted isolation; that work belongs to #1191.
+untrusted isolation; that work belongs to #1878.
 
 Advance the check, command-policy, environment, binding, and primary-agent
 identities with their documented behavior, rebuild the pinned image, and run

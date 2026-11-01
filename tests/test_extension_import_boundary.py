@@ -1,8 +1,8 @@
-"""Readiness gate for extracting E2B and Microsandbox into optional packages (#1879).
+"""Readiness gate for extracting E2B into an optional package (#1879).
 
 An independently installed adapter package cannot import private Cayu modules
-or names. This test parses the in-tree E2B and Microsandbox implementations and
-fails if they import any private Cayu module or name outside ``_ALLOWED``.
+or names. This test parses the in-tree E2B implementation and fails if it
+imports any private Cayu module or name outside ``_ALLOWED``.
 
 ``_ALLOWED`` is the remaining extraction debt. It must only shrink: when an
 import moves to a public seam (for example ``cayu.extensions.runners`` or
@@ -41,78 +41,16 @@ _ALLOWED: dict[str, frozenset[str]] = {
             "cayu.runners.base._contains_runner_fatal_signal",
         }
     ),
-    "src/cayu/runners/microsandbox.py": frozenset(
-        {
-            "cayu._exception_groups.exception_group_children",
-            "cayu._exception_state.exception_state",
-            "cayu._exception_state.set_exception_state",
-            "cayu._task_wait.await_shielded_task_outcome",
-            "cayu._task_wait.capture_awaitable_outcome",
-            "cayu._task_wait.restore_task_cancellation_requests",
-            "cayu._task_wait.unexpected_child_cancellation_error",
-            "cayu._validation.canonical_durable_json_bytes",
-            "cayu._validation.copy_json_value",
-            "cayu._validation.require_clean_nonblank",
-            "cayu._validation.require_durable_clean_nonblank",
-            "cayu.runners._admission_probes.EXECUTABLE_AVAILABILITY_SCRIPT",
-            "cayu.runners._cleanup.RunnerCleanupProgress",
-            "cayu.runners._cleanup.RunnerFailureProgress",
-            "cayu.runners._cleanup._cleanup_artifact",
-            "cayu.runners._cleanup.attach_runner_cancellation_failure",
-            "cayu.runners._cleanup.runner_cancellation_failure",
-            "cayu.runners._creation_cleanup.CreationCleanupProgress",
-            "cayu.runners._creation_cleanup.CreationLease",
-            "cayu.runners._creation_cleanup.acquire_creation_lease",
-            "cayu.runners._creation_cleanup.drain_acquisition_restorations",
-            "cayu.runners._creation_cleanup.drain_creation_cleanups",
-            "cayu.runners._creation_cleanup.register_acquisition_restoration_retry",
-            "cayu.runners._creation_cleanup.require_creation_cleanup_settled",
-            "cayu.runners._creation_cleanup.retry_acquisition_settlement",
-            "cayu.runners._creation_cleanup.settle_creation_cleanup",
-            "cayu.runners.base._clean_runner_preflight",
-            "cayu.runners.base._clear_preflight_traceback_frames",
-            "cayu.runners.base._contains_runner_fatal_signal",
-        }
-    ),
     "src/cayu/egress/e2b_adapter.py": frozenset(
         {
             "cayu._exception_groups.iter_exception_tree",
             "cayu.egress.authority._build_adapter_verified_egress_authority_cutover_receipt",
         }
     ),
-    "src/cayu/egress/microsandbox_adapter.py": frozenset(
-        {
-            "cayu._exception_groups.add_exception_note_safely",
-            "cayu._exception_groups.exception_cause",
-            "cayu.egress.adapter._await_bounded_cleanup_task",
-            "cayu.egress.adapter._consume_accounted_task_cancellation",
-            "cayu.egress.adapter._raise_primary_with_cleanup_cancellation",
-            "cayu.runners._creation_cleanup.retry_acquisition_settlement",
-        }
-    ),
     "src/cayu/workspaces/e2b.py": frozenset(
         {
             "cayu._validation.require_clean_nonblank",
             "cayu._validation.require_positive_finite_seconds",
-            "cayu.workspaces._guest_guard.guard_create",
-            "cayu.workspaces._guest_guard.guard_delete",
-            "cayu.workspaces._guest_guard.guard_delete_if_revision",
-            "cayu.workspaces._guest_guard.guard_move_if_revision",
-            "cayu.workspaces._guest_guard.guard_read",
-            "cayu.workspaces._guest_guard.guard_replace",
-            "cayu.workspaces._guest_guard.guard_require_absent",
-            "cayu.workspaces._guest_guard.guard_write",
-            "cayu.workspaces.base._WorkspaceListCollector",
-            "cayu.workspaces.base._validate_absolute_guest_root",
-            "cayu.workspaces.base._validate_workspace_offset",
-            "cayu.workspaces.base._validate_workspace_positive_limit",
-            "cayu.workspaces.base._validate_workspace_relative_path",
-            "cayu.workspaces.base._validate_workspace_revision",
-        }
-    ),
-    "src/cayu/workspaces/microsandbox.py": frozenset(
-        {
-            "cayu._validation.require_clean_nonblank",
             "cayu.workspaces._guest_guard.guard_create",
             "cayu.workspaces._guest_guard.guard_delete",
             "cayu.workspaces._guest_guard.guard_delete_if_revision",

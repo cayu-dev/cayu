@@ -126,9 +126,8 @@ workload credentials separately and explicitly when an agent integration needs
 authority of its own.
 
 For untrusted model-authored commands, use an isolated remote runner with
-explicit guest environment and mount inputs, such as a hardened E2B or
-Microsandbox deployment that has passed Cayu's provider-credential isolation
-probe. Do not copy `~/.cayu/auth.json`, `CAYU_HOME`, your host home, or provider
+explicit guest environment and mount inputs, such as a hardened E2B
+deployment that has passed Cayu's provider-credential isolation probe. Do not copy `~/.cayu/auth.json`, `CAYU_HOME`, your host home, or provider
 key variables into the sandbox or image.
 
 `LocalRunner` is for trusted local execution. Its default minimized child

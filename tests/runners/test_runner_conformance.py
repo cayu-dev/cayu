@@ -46,7 +46,6 @@ from cayu.runners.docker import DockerRunner
 from cayu.runners.e2b import E2BRunner
 from cayu.runners.launched import LaunchedRunner
 from cayu.runners.local import LocalRunner
-from cayu.runners.microsandbox import MicrosandboxRunner
 
 ORPHAN_WRITE_DELAY_SECONDS = 0.5
 ORPHAN_OBSERVATION_DELAY_SECONDS = 0.6
@@ -321,105 +320,6 @@ async def _e2b_cleanup_factory(
     )
 
 
-class _LocalMicrosandboxHandle:
-    def __init__(
-        self,
-        command: SubprocessCommand,
-        *,
-        cwd: str,
-        env: dict[str, str],
-        stdin: bytes | None,
-    ) -> None:
-        self.command = command
-        self.cwd = cwd
-        self.env = env
-        self.stdin = stdin
-        self._process: asyncio.subprocess.Process | None = None
-        self._producer: asyncio.Task[None] | None = None
-        self._events: asyncio.Queue[Any | None] = asyncio.Queue()
-        self._stdout = bytearray()
-        self._stderr = bytearray()
-        self._exit_code: int | None = None
-
-    def __aiter__(self) -> _LocalMicrosandboxHandle:
-        return self
-
-    async def __anext__(self) -> Any:
-        if self._producer is None:
-            self._producer = asyncio.create_task(self._produce())
-        event = await self._events.get()
-        if event is None:
-            raise StopAsyncIteration
-        return event
-
-    async def _produce(self) -> None:
-        environment = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            **self.env,
-        }
-        if self.command.argv is not None:
-            self._process = await asyncio.create_subprocess_exec(
-                *self.command.argv,
-                cwd=self.cwd,
-                env=environment,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-        else:
-            assert self.command.shell is not None
-            self._process = await asyncio.create_subprocess_shell(
-                self.command.shell,
-                cwd=self.cwd,
-                env=environment,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-        if self._process.stdin is not None:
-            if self.stdin is not None:
-                self._process.stdin.write(self.stdin)
-                await self._process.stdin.drain()
-            self._process.stdin.close()
-
-        async def pump(
-            stream: asyncio.StreamReader | None,
-            event_type: str,
-            content: bytearray,
-        ) -> None:
-            if stream is None:
-                return
-            while chunk := await stream.read(8192):
-                content.extend(chunk)
-                await self._events.put(SimpleNamespace(event_type=event_type, data=chunk))
-
-        stdout_task = asyncio.create_task(pump(self._process.stdout, "stdout", self._stdout))
-        stderr_task = asyncio.create_task(pump(self._process.stderr, "stderr", self._stderr))
-        self._exit_code = await self._process.wait()
-        await asyncio.gather(stdout_task, stderr_task)
-        await self._events.put(SimpleNamespace(event_type="exited", code=self._exit_code))
-        await self._events.put(None)
-
-    async def collect(self) -> Any:
-        if self._producer is not None:
-            await self._producer
-        return SimpleNamespace(
-            exit_code=self._exit_code if self._exit_code is not None else -9,
-            stdout_bytes=bytes(self._stdout),
-            stderr_bytes=bytes(self._stderr),
-        )
-
-    async def kill(self) -> None:
-        if self._process is not None and self._process.returncode is None:
-            _kill_local_process(self._process)
-            await self._process.wait()
-        if self._producer is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._producer
-
-
 def _kill_local_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
@@ -428,75 +328,6 @@ def _kill_local_process(process: asyncio.subprocess.Process) -> None:
             os.killpg(process.pid, signal.SIGKILL)
             return
     process.kill()
-
-
-class _LocalMicrosandbox:
-    def __init__(self) -> None:
-        self.name = "conformance-microsandbox"
-        self.handles: list[_LocalMicrosandboxHandle] = []
-
-    async def exec_stream(self, cmd: str, args: list[str], **options: Any) -> Any:
-        handle = _LocalMicrosandboxHandle(
-            SubprocessCommand(argv=[cmd, *args]),
-            cwd=options["cwd"],
-            env=options["env"],
-            stdin=options.get("stdin"),
-        )
-        self.handles.append(handle)
-        return handle
-
-    async def shell_stream(self, script: str, **options: Any) -> Any:
-        handle = _LocalMicrosandboxHandle(
-            SubprocessCommand(shell=script),
-            cwd=options["cwd"],
-            env=options["env"],
-            stdin=options.get("stdin"),
-        )
-        self.handles.append(handle)
-        return handle
-
-    async def stop(self) -> None:
-        return None
-
-    async def stop_and_wait(self) -> None:
-        return None
-
-    async def kill(self) -> None:
-        await asyncio.gather(*(handle.kill() for handle in self.handles))
-
-    async def detach(self) -> None:
-        return None
-
-    async def finalize(self) -> None:
-        await self.kill()
-
-
-async def _microsandbox_factory(
-    root: Path,
-    _monkeypatch: pytest.MonkeyPatch,
-) -> RunnerHarness:
-    return await _microsandbox_cleanup_factory(root, _monkeypatch, "command")
-
-
-async def _microsandbox_cleanup_factory(
-    root: Path,
-    _monkeypatch: pytest.MonkeyPatch,
-    cleanup_policy: RunnerCleanupPolicy,
-) -> RunnerHarness:
-    sandbox = _LocalMicrosandbox()
-    return RunnerHarness(
-        MicrosandboxRunner(
-            sandbox,
-            name="conformance-microsandbox",
-            default_cwd=str(root),
-            close_action="none",
-            sandbox_module=SimpleNamespace(),
-            cancellation_cleanup=cleanup_policy,
-            timeout_cleanup=cleanup_policy,
-        ),
-        root,
-        finalize=sandbox.finalize,
-    )
 
 
 async def _lambda_microvm_factory(
@@ -615,45 +446,6 @@ async def _probe_e2b_ambiguous_start(
     await asyncio.sleep(0.25)
     result = await runner.exec(ExecCommand.process(sys.executable, "-c", "print('safe')"))
     assert result.stdout == "safe\n"
-    await runner.close()
-
-
-class _DelayedMicrosandbox(_LocalMicrosandbox):
-    def __init__(self) -> None:
-        super().__init__()
-        self.start_received = asyncio.Event()
-        self._delay_next_start = True
-
-    async def exec_stream(self, cmd: str, args: list[str], **options: Any) -> Any:
-        if self._delay_next_start:
-            self._delay_next_start = False
-            self.start_received.set()
-            await asyncio.sleep(30)
-        return await super().exec_stream(cmd, args, **options)
-
-
-async def _probe_microsandbox_ambiguous_start(
-    root: Path,
-    _monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sandbox = _DelayedMicrosandbox()
-    runner = MicrosandboxRunner(
-        sandbox,
-        name="conformance-microsandbox-ambiguous",
-        default_cwd=str(root),
-        close_action="none",
-        sandbox_module=SimpleNamespace(),
-    )
-    task = asyncio.create_task(
-        runner.exec(ExecCommand.process(sys.executable, "-c", "print('uncertain')"))
-    )
-    await sandbox.start_received.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError) as exc_info:
-        await task
-    assert getattr(exc_info.value, "artifacts", [])[0]["status"] == "unsupported"
-    with pytest.raises(RuntimeError, match="command state is unknown"):
-        await runner.exec(ExecCommand.process(sys.executable, "-c", "print('unsafe')"))
     await runner.close()
 
 
@@ -988,16 +780,6 @@ E2B = RunnerConformanceRegistration(
     ambiguous_start_probe=_probe_e2b_ambiguous_start,
 )
 
-MICROSANDBOX = RunnerConformanceRegistration(
-    name="microsandbox",
-    runner_type=MicrosandboxRunner,
-    factory=_microsandbox_factory,
-    system_execution_mode="shared",
-    capabilities=REMOTE_SANDBOX_CAPABILITIES,
-    cleanup_factory=_microsandbox_cleanup_factory,
-    ambiguous_start_probe=_probe_microsandbox_ambiguous_start,
-)
-
 LAMBDA_MICROVM = RunnerConformanceRegistration(
     name="lambda-microvm",
     runner_type=LambdaMicroVMRunner,
@@ -1017,8 +799,8 @@ LAMBDA_MICROVM = RunnerConformanceRegistration(
     suspend_resume_probe=_probe_lambda_microvm_lifecycle,
 )
 
-REGISTRATIONS = (LOCAL, LAUNCHED_LOCAL, DOCKER, E2B, LAMBDA_MICROVM, MICROSANDBOX)
-OVERLAY_REGISTRATIONS = (DOCKER, E2B, LAMBDA_MICROVM, MICROSANDBOX)
+REGISTRATIONS = (LOCAL, LAUNCHED_LOCAL, DOCKER, E2B, LAMBDA_MICROVM)
+OVERLAY_REGISTRATIONS = (DOCKER, E2B, LAMBDA_MICROVM)
 CLEANUP_CASES = tuple(
     (registration, policy)
     for registration in REGISTRATIONS
@@ -1717,7 +1499,6 @@ async def test_remote_runner_conformance_close_binds_action_before_scheduling(
     runner.close_action = {
         "docker": "remove",
         "e2b": "kill",
-        "microsandbox": "remove",
         "lambda-microvm": "terminate",
     }[registration.name]
     try:
@@ -1748,12 +1529,6 @@ async def test_remote_runner_conformance_rejects_configuration_before_allocation
         elif registration is E2B:
             await E2BRunner.create(
                 e2b_module=SimpleNamespace(AsyncSandbox=SimpleNamespace(create=allocate)),
-                cancel_timeout_s=invalid_timeout,
-            )
-        elif registration is MICROSANDBOX:
-            await MicrosandboxRunner.create(
-                "conformance-invalid",
-                sandbox_module=SimpleNamespace(Sandbox=SimpleNamespace(create=allocate)),
                 cancel_timeout_s=invalid_timeout,
             )
         else:
@@ -1801,9 +1576,6 @@ async def test_remote_runner_conformance_teardown_failure_never_grants_reuse(
     elif registration is E2B:
         runner.close_action = "kill"
         monkeypatch.setattr(runner._sandbox, "kill", mutate)
-    elif registration is MICROSANDBOX:
-        runner.close_action = "detach"
-        monkeypatch.setattr(runner._sandbox, "detach", mutate, raising=False)
     else:
         assert registration is LAMBDA_MICROVM
         runner.close_action = "terminate"

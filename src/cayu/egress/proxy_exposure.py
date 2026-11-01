@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import importlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from ipaddress import IPv4Address, ip_address
-from typing import Any, Protocol
+from typing import Protocol
 from urllib.parse import urlsplit
 
 from cayu.egress.errors import UnsupportedEgressError
@@ -110,18 +109,3 @@ def _is_rfc1918(address: IPv4Address) -> bool:
         or int(IPv4Address("172.16.0.0")) <= value <= int(IPv4Address("172.31.255.255"))
         or int(IPv4Address("192.168.0.0")) <= value <= int(IPv4Address("192.168.255.255"))
     )
-
-
-# Microsandbox's exposure is provider-specific and lives with its adapter. These
-# names remain importable from here during the optional-package transition.
-_RELOCATED_NAMES = {
-    "MICROSANDBOX_HOST": "cayu.egress.microsandbox_adapter",
-    "MicrosandboxHostProxyExposure": "cayu.egress.microsandbox_adapter",
-}
-
-
-def __getattr__(name: str) -> Any:
-    module_name = _RELOCATED_NAMES.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return getattr(importlib.import_module(module_name), name)

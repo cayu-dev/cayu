@@ -520,13 +520,6 @@ def test_bedrock_live_check_requires_explicit_enabled_value() -> None:
     ("check_id", "lane", "test_path", "opt_in_env", "required_env"),
     [
         (
-            "microsandbox-live-virtual-egress",
-            "microsandbox",
-            "tests/egress/test_microsandbox_egress_e2e.py",
-            "CAYU_RUN_MICROSANDBOX_EGRESS_E2E",
-            (),
-        ),
-        (
             "e2b-live-virtual-egress",
             "e2b",
             "tests/egress/test_e2b_egress_e2e.py",
@@ -663,42 +656,6 @@ def test_nightly_workflow_builds_the_generated_coding_image_from_a_commit_wheel(
     assert '"x64"' in workflow or "ubuntu-latest" in workflow
 
 
-def test_microsandbox_guest_agent_liveness_is_registered_and_explicitly_gated() -> None:
-    check = next(
-        check for check in nightly.CHECKS if check.id == "microsandbox-live-guest-agent-liveness"
-    )
-
-    assert check.lane == "microsandbox"
-    assert check.command == (
-        "uv",
-        "run",
-        "python",
-        "examples/microsandbox_guest_agent_liveness_live.py",
-    )
-    assert check.required_modules == ("microsandbox",)
-    assert check.required_env_values == {"CAYU_RUN_MICROSANDBOX_GUEST_AGENT_LIVE": "1"}
-
-
-def test_microsandbox_network_default_is_registered_and_explicitly_gated() -> None:
-    check = next(
-        check for check in nightly.CHECKS if check.id == "microsandbox-live-network-default"
-    )
-
-    assert check.lane == "microsandbox"
-    assert check.command == (
-        "uv",
-        "run",
-        "--group",
-        "nightly",
-        "--extra",
-        "microsandbox",
-        "python",
-        "examples/microsandbox_network_default_live.py",
-    )
-    assert check.required_modules == ("microsandbox",)
-    assert check.required_env_values == {"CAYU_RUN_MICROSANDBOX_NETWORK_LIVE": "1"}
-
-
 def test_e2b_hardened_handoff_is_registered_and_explicitly_gated() -> None:
     check = next(check for check in nightly.CHECKS if check.id == "e2b-live-hardened-handoff")
 
@@ -751,12 +708,10 @@ def test_virtual_egress_opt_in_flag_must_equal_one(
     assert result.reason == "CAYU_RUN_E2B_EGRESS_E2E must equal '1'"
 
 
-def test_microsandbox_virtual_egress_runs_when_module_is_present(
+def test_e2b_virtual_egress_runs_when_module_is_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    check = next(
-        check for check in nightly.CHECKS if check.id == "microsandbox-live-virtual-egress"
-    )
+    check = next(check for check in nightly.CHECKS if check.id == "e2b-live-virtual-egress")
     called = False
     monkeypatch.setattr(nightly, "_module_missing", lambda name: False)
 
@@ -767,7 +722,7 @@ def test_microsandbox_virtual_egress_runs_when_module_is_present(
             returncode=0,
             stdout=(
                 'CAYU_NIGHTLY_EVIDENCE={"schema":"cayu.egress_conformance.v1",'
-                '"records":[{"adapter":"microsandbox","scenario":"guest-network-'
+                '"records":[{"adapter":"e2b","scenario":"guest-network-'
                 'bypass-denial","status":"verified","proof_source":"live",'
                 '"observations":["public-ip-denied","metadata-service-denied"],'
                 '"cleanup_outcome":"complete","duration_ms":1,'
@@ -777,7 +732,12 @@ def test_microsandbox_virtual_egress_runs_when_module_is_present(
 
     result = nightly.run_checks(
         [check],
-        environ={"CAYU_RUN_MICROSANDBOX_EGRESS_E2E": "1"},
+        environ={
+            "CAYU_RUN_E2B_EGRESS_E2E": "1",
+            "E2B_API_KEY": "set",
+            "CAYU_E2B_PROXY_EXPOSURE_COMMAND": "tunnel {host} {port}",
+            "CAYU_E2B_PROXY_URL": "http://proxy.example:8443",
+        },
         runner=runner,
     )[0]
 
@@ -789,15 +749,13 @@ def test_microsandbox_virtual_egress_runs_when_module_is_present(
 def test_virtual_egress_failed_subprocess_preserves_emitted_failure_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    check = next(
-        check for check in nightly.CHECKS if check.id == "microsandbox-live-virtual-egress"
-    )
+    check = next(check for check in nightly.CHECKS if check.id == "e2b-live-virtual-egress")
     monkeypatch.setattr(nightly, "_module_missing", lambda name: False)
     emitted = {
         "schema": "cayu.egress_conformance.v1",
         "records": [
             {
-                "adapter": "microsandbox",
+                "adapter": "e2b",
                 "scenario": "live-security-conformance",
                 "status": "failed",
                 "proof_source": "live",
@@ -811,14 +769,19 @@ def test_virtual_egress_failed_subprocess_preserves_emitted_failure_evidence(
     stdout = (
         "CAYU_NIGHTLY_EVIDENCE="
         '{"schema":"cayu.egress_conformance.v1","records":[{"adapter":'
-        '"microsandbox","scenario":"live-security-conformance","status":"failed",'
+        '"e2b","scenario":"live-security-conformance","status":"failed",'
         '"proof_source":"live","observations":[],"cleanup_outcome":"unknown",'
         '"duration_ms":1,"reason":"check-failed"}]}\n'
     )
 
     result = nightly.run_checks(
         [check],
-        environ={"CAYU_RUN_MICROSANDBOX_EGRESS_E2E": "1"},
+        environ={
+            "CAYU_RUN_E2B_EGRESS_E2E": "1",
+            "E2B_API_KEY": "set",
+            "CAYU_E2B_PROXY_EXPOSURE_COMMAND": "tunnel {host} {port}",
+            "CAYU_E2B_PROXY_URL": "http://proxy.example:8443",
+        },
         runner=lambda command, env: nightly.CommandOutcome(returncode=1, stdout=stdout),
     )[0]
 
@@ -829,21 +792,24 @@ def test_virtual_egress_failed_subprocess_preserves_emitted_failure_evidence(
 def test_virtual_egress_failed_subprocess_without_emission_uses_nightly_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    check = next(
-        check for check in nightly.CHECKS if check.id == "microsandbox-live-virtual-egress"
-    )
+    check = next(check for check in nightly.CHECKS if check.id == "e2b-live-virtual-egress")
     monkeypatch.setattr(nightly, "_module_missing", lambda name: False)
 
     result = nightly.run_checks(
         [check],
-        environ={"CAYU_RUN_MICROSANDBOX_EGRESS_E2E": "1"},
+        environ={
+            "CAYU_RUN_E2B_EGRESS_E2E": "1",
+            "E2B_API_KEY": "set",
+            "CAYU_E2B_PROXY_EXPOSURE_COMMAND": "tunnel {host} {port}",
+            "CAYU_E2B_PROXY_URL": "http://proxy.example:8443",
+        },
         runner=lambda command, env: nightly.CommandOutcome(returncode=1),
     )[0]
 
     assert result.status == nightly.STATUS_FAILED
     assert result.evidence["harness"]["records"] == [
         {
-            "adapter": "microsandbox",
+            "adapter": "e2b",
             "scenario": "live-security-conformance",
             "status": "failed",
             "proof_source": "nightly",

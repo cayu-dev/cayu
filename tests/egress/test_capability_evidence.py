@@ -15,7 +15,6 @@ from cayu.egress import (
 from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.egress.e2b_adapter import E2BEgressAdapter
-from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 from cayu.egress.proxy_exposure import ProxyExposure
 from cayu.runners import LocalRunner
 
@@ -23,7 +22,6 @@ from cayu.runners import LocalRunner
 def test_builtin_adapters_classify_process_external_allocation() -> None:
     assert DockerEgressAdapter.process_external_allocation is False
     assert E2BEgressAdapter.process_external_allocation is True
-    assert MicrosandboxEgressAdapter.process_external_allocation is True
     assert LambdaMicroVMEgressAdapter.process_external_allocation is True
 
 
@@ -303,7 +301,6 @@ def test_unsupported_capability_is_distinct_and_actionable() -> None:
     [
         (DockerEgressAdapter(), "docker"),
         (E2BEgressAdapter(exposure=cast("ProxyExposure", object())), "e2b"),
-        (MicrosandboxEgressAdapter(), "microsandbox"),
     ],
 )
 def test_builtin_adapters_without_runtime_claims_publish_explicit_unclaimed_evidence(

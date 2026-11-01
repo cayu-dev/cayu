@@ -85,7 +85,6 @@ from cayu.runners.base import ExecCommand, ExecResult, Runner, RunnerExecutionEr
 from cayu.runners.docker import DockerRunner
 from cayu.runners.e2b import E2BRunner
 from cayu.runners.local import LocalRunner
-from cayu.runners.microsandbox import MicrosandboxRunner
 from cayu.runtime._environment_lifecycle import (
     _persist_binding_finalize_failure_event,
     _reconcile_binding_finalize_failure_event,
@@ -1637,10 +1636,10 @@ def test_factory_does_not_fallback_to_docker_for_an_unavailable_microvm() -> Non
     registry = EgressAdapterRegistry()
     registry.register(docker_adapter)
 
-    with pytest.raises(UnsupportedEgressError, match="microsandbox"):
+    with pytest.raises(UnsupportedEgressError, match="lambda-microvm"):
         _virtual_factory(
             adapter_registry=registry,
-            runner_kind="microsandbox",
+            runner_kind="lambda-microvm",
         )
 
     assert docker_adapter.prepare_calls == []
@@ -1701,22 +1700,18 @@ def test_factory_does_not_accept_caller_assertions_in_place_of_adapter_evidence(
         )
 
 
-@pytest.mark.parametrize("backend", ["microsandbox", "lambda_microvm"])
 @pytest.mark.parametrize("executable_present", [True, False])
 def test_virtual_egress_combines_adapter_security_with_actual_guest_tool_probes(
-    executable_present, backend, tmp_path
+    executable_present, tmp_path
 ):
     from tests.runners.lambda_microvm_harness import (
         ClientTokenLambdaModel,
         SupervisorTransport,
         is_boot_id_read,
     )
-    from tests.runners.test_microsandbox_admission import Guest, sdk
 
     from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
-    from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
     from cayu.runners.aws_lambda_microvm import LambdaMicroVMRunner
-    from cayu.runners.microsandbox import MicrosandboxRunner
     from cayu.tools.search import SearchTextTool
 
     guest_bin = tmp_path / "guest-bin"
@@ -1727,52 +1722,39 @@ def test_virtual_egress_combines_adapter_security_with_actual_guest_tool_probes(
     transport = SupervisorTransport(tmp_path / "workspace")
 
     async def create_runner(request):
-        if backend == "lambda_microvm":
-            model = ClientTokenLambdaModel()
-            allocation = model.run_microvm(imageIdentifier=model.image_arn)
-            return LambdaMicroVMRunner(
-                model,
-                microvm_id=allocation["microvmId"],
-                endpoint=allocation["endpoint"],
-                default_cwd=str(transport.supervisor.root),
-                endpoint_transport=transport,
-                poll_interval_s=0,
-                env_overlay={**request.env_overlay, "PATH": str(guest_bin)},
-            )
-        guest = Guest(0 if executable_present else 1)
-        guest.registry_name = request.name
-        guest.running_name = request.name
-        return MicrosandboxRunner(guest, name=request.name, sandbox_module=sdk(guest))
-
-    declaring_adapter = (
-        LambdaMicroVMEgressAdapter if backend == "lambda_microvm" else MicrosandboxEgressAdapter
-    )
+        model = ClientTokenLambdaModel()
+        allocation = model.run_microvm(imageIdentifier=model.image_arn)
+        return LambdaMicroVMRunner(
+            model,
+            microvm_id=allocation["microvmId"],
+            endpoint=allocation["endpoint"],
+            default_cwd=str(transport.supervisor.root),
+            endpoint_transport=transport,
+            poll_interval_s=0,
+            env_overlay={**request.env_overlay, "PATH": str(guest_bin)},
+        )
 
     class ProbeAdapter(_RecordingAdapter):
-        execution_admission_evidence_for = declaring_adapter.execution_admission_evidence_for
+        execution_admission_evidence_for = (
+            LambdaMicroVMEgressAdapter.execution_admission_evidence_for
+        )
 
         def execution_capability_evidence(self, runner=None):
             return _available_untrusted_execution_evidence(self.runner_kind)
 
-    adapter = ProbeAdapter(
-        "lambda-microvm" if backend == "lambda_microvm" else "microsandbox",
-        runner_factory=create_runner,
-    )
+    adapter = ProbeAdapter("lambda-microvm", runner_factory=create_runner)
     events, provider, _ = asyncio.run(
         _run_virtual_factory_lifecycle(
             _virtual_factory(adapter=adapter),
-            session_id=f"egress_probe_{backend}_{executable_present}",
+            session_id=f"egress_probe_lambda_microvm_{executable_present}",
             requirements=ExecutionRequirements.untrusted(),
             tools=[SearchTextTool()],
         )
     )
     assert len(provider.requests) == (1 if executable_present else 0)
-    if backend == "lambda_microvm":
-        probes = [payload for payload in transport.payloads if not is_boot_id_read(payload)]
-        assert [payload["argv"][-1] for payload in probes] == ["rg"]
-        assert {payload["execution_profile"] for payload in transport.payloads} == {"agent"}
-    else:
-        assert adapter.captured["inner_runner"]._sandbox.calls
+    probes = [payload for payload in transport.payloads if not is_boot_id_read(payload)]
+    assert [payload["argv"][-1] for payload in probes] == ["rg"]
+    assert {payload["execution_profile"] for payload in transport.payloads} == {"agent"}
     if not executable_present:
         failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
         assert any(
@@ -1984,21 +1966,21 @@ def test_factory_publishes_admitted_requirements_and_execution_evidence() -> Non
 
 
 def test_factory_rejects_an_unsupported_explicit_runner_without_a_registry() -> None:
-    with pytest.raises(UnsupportedEgressError, match="microsandbox"):
-        _virtual_factory(runner_kind="microsandbox")
+    with pytest.raises(UnsupportedEgressError, match="lambda-microvm"):
+        _virtual_factory(runner_kind="lambda-microvm")
 
 
 def test_factory_rejects_conflicting_adapter_and_runner_selection() -> None:
     with pytest.raises(ValueError, match="does not match"):
         _virtual_factory(
             adapter=_RecordingAdapter("docker"),
-            runner_kind="microsandbox",
+            runner_kind="lambda-microvm",
         )
 
 
 def test_factory_rejects_an_explicit_unsupported_adapter() -> None:
-    with pytest.raises(UnsupportedEgressError, match="microsandbox"):
-        _virtual_factory(adapter=UnsupportedEgressAdapter("microsandbox"))
+    with pytest.raises(UnsupportedEgressError, match="lambda-microvm"):
+        _virtual_factory(adapter=UnsupportedEgressAdapter("lambda-microvm"))
 
 
 def test_factory_rejects_duplicate_credential_env_names() -> None:
@@ -2563,7 +2545,7 @@ def test_factory_create_operation_refuses_same_session_reconnect_metadata() -> N
     ("field", "value", "message"),
     [
         ("version", 2, "version"),
-        ("runner_kind", "microsandbox", "runner kind"),
+        ("runner_kind", "docker", "runner kind"),
         ("session_id", "other-session", "different session"),
         ("environment_name", "other-environment", "different environment"),
         ("capability", "mystery", "capability"),
@@ -6422,7 +6404,7 @@ def test_managed_docker_preflight_rejects_transport_key_before_secret_state_or_a
     assert adapter.torn_down == 1
 
 
-@pytest.mark.parametrize("runner_kind", ("lambda-microvm", "e2b", "microsandbox"))
+@pytest.mark.parametrize("runner_kind", ("lambda-microvm", "e2b"))
 def test_managed_remote_preflight_rejects_invalid_overlay_before_secret_state_or_admission(
     runner_kind: str,
 ) -> None:
@@ -6436,15 +6418,9 @@ def test_managed_remote_preflight_rejects_invalid_overlay_before_secret_state_or
                 endpoint_transport=object(),  # type: ignore[arg-type]
                 env_overlay=env_overlay,
             )
-        if runner_kind == "e2b":
-            return E2BRunner(
-                object(),
-                sandbox_id="e2b-preflight",
-                env_overlay=env_overlay,
-            )
-        return MicrosandboxRunner(
+        return E2BRunner(
             object(),
-            name="microsandbox-preflight",
+            sandbox_id="e2b-preflight",
             env_overlay=env_overlay,
         )
 

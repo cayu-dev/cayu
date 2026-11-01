@@ -127,7 +127,6 @@ _OPTIONAL_DISTRIBUTIONS = (
     "fastapi",
     "google-auth",
     "ipython",
-    "microsandbox",
     "openai-codex",
     "opentelemetry-api",
     "opentelemetry-sdk",

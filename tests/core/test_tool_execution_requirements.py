@@ -159,7 +159,7 @@ def test_duplicate_alternatives_and_requirement_names_are_rejected() -> None:
 
 @pytest.mark.parametrize(
     "entrance",
-    ["agent", "factory_request", "manifest", "microsandbox_declaration", "lambda_declaration"],
+    ["agent", "factory_request", "manifest", "docker_declaration", "lambda_declaration"],
 )
 @pytest.mark.parametrize(
     "field",
@@ -224,10 +224,10 @@ def test_agent_requirement_revalidation_does_not_publish_rejected_values(
                     environment_name="environment",
                     execution_requirements=requirements,
                 )
-            elif entrance == "microsandbox_declaration":
-                from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
+            elif entrance == "docker_declaration":
+                from cayu.egress.docker_adapter import DockerEgressAdapter
 
-                MicrosandboxEgressAdapter().execution_admission_evidence_for(requirements)
+                DockerEgressAdapter().execution_admission_evidence_for(requirements)
             elif entrance == "lambda_declaration":
                 from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
                 from cayu.egress.proxy_exposure import VpcTaskProxyExposure

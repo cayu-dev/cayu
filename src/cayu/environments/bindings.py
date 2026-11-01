@@ -5200,7 +5200,7 @@ def _git_executor_for_workspace(
         )
     raise TypeError(
         "GitRepositoryBinding requires a LocalWorkspace or RunnerWorkspace. "
-        "For E2B, Microsandbox, or Docker runners, wrap the runner with RunnerWorkspace."
+        "For E2B, Lambda MicroVM, or Docker runners, wrap the runner with RunnerWorkspace."
     )
 
 

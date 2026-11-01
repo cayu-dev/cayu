@@ -229,7 +229,7 @@ identity, and again after workspace binding immediately before exposing the
 live environment.
 Docker's adapter explicitly reports secure isolation as unsupported, so
 `ExecutionRequirements.untrusted()` cannot be used to relabel Docker virtual
-egress as a sandbox. Microsandbox, E2B, Lambda microVM, and third-party
+egress as a sandbox. E2B, Lambda microVM, and third-party
 integrations must each publish their own capability evidence rather than being
 trusted because of their provider name.
 
@@ -669,7 +669,7 @@ adapter. Omitted and unsupported selections fail before grants, proxies,
 runners, or workspaces are created. `runner_kind="docker"` selects ordinary
 Docker container execution and is intended for trusted development, CI,
 conformance, and packaging. It is never an implicit fallback for untrusted code.
-E2B and Microsandbox integrations use registered `SandboxEgressAdapter`
+E2B integrations use registered `SandboxEgressAdapter`
 implementations that both prepare the proxy and create the matching network-restricted runner. Remote/raw
 proxy exposures have an additional credentialless requirement described below.
 
@@ -721,91 +721,6 @@ binding (the normal `CayuApp` lifecycle); direct runner close waits only for
 that binding-owned synchronization and cannot replace it. Applications must
 not retain or close a raw provider runner.
 
-### Microsandbox
-
-Microsandbox runs locally and exposes the host as
-`host.microsandbox.internal`. Its adapter creates a deny-by-default network
-policy that allows only DNS to the host gateway and TCP to the per-session Cayu
-proxy port. The session CA is copied into the root filesystem before boot.
-
-Microsandbox publishes both IPv4 and IPv6 gateway addresses for that hostname
-and rewrites them to the matching host loopback address. Cayu therefore binds
-the same ephemeral proxy port on both `127.0.0.1` and `::1`; guest clients work
-regardless of which address family they select. Both listeners share one broker
-and session CA, and both are closed during teardown. Setup fails closed if
-either listener cannot be established.
-
-The default is deliberately loopback-only. It does not expose the proxy port on
-the host's LAN interfaces. The adapter exposes no bind-host override; paired
-loopback listeners are part of its fixed Microsandbox exposure contract.
-
-The built-in host exposure is shared host infrastructure rather than a
-session-exclusive transport. It therefore supports virtual-credential routes
-but fails closed for credentialless destinations. A custom Microsandbox
-`ProxyExposure` may support them only when its returned `ExposedProxy` truthfully
-sets `credentialless_isolated=True` and the endpoint is unreachable from other
-sandboxes and untrusted peers.
-
-> **Allocation status:** the stock Microsandbox SDK does not expose a
-> conditional delete for an immutable sandbox incarnation. Cayu therefore
-> rejects new Microsandbox virtual-egress allocations before adapter setup or
-> provider mutation. The configuration below illustrates the intended adapter
-> composition, but attempts to use it for a new `CayuApp` session currently
-> fail with `EnvironmentAllocationUnsupportedError`. Existing durable
-> Microsandbox identities can still use the reconnect contract below.
-
-```python
-from cayu import CayuApp
-from cayu.environments import EnvironmentSpec
-from cayu.egress import HttpEgressPolicy, VirtualCredentialSpec, VirtualEgressEnvironmentFactory
-from cayu.workspaces import MicrosandboxWorkspace
-from cayu.vaults import SecretRef, StaticVault
-from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
-
-app = CayuApp()
-vault = StaticVault({"provider_key": "sk_test_..."})
-policies = {
-    "provider": HttpEgressPolicy(
-        name="provider",
-        allowed_hosts=["api.example.com"],
-        allowed_endpoints=[("GET", "/v1/data")],
-    )
-}
-credentials = [
-    VirtualCredentialSpec(
-        env_name="PROVIDER_KEY",
-        secret=SecretRef(name="provider_key"),
-        destination="api.example.com",
-        policy_name="provider",
-        credential_kind="opaque_bearer",
-    )
-]
-
-factory = VirtualEgressEnvironmentFactory(
-    resolver=vault,
-    policies=policies,
-    credentials=credentials,
-    adapter=MicrosandboxEgressAdapter(),
-    image="python:3.13",  # Microsandbox OCI image
-    workspace_factory=MicrosandboxWorkspace,
-)
-
-app.register_environment_factory(
-    EnvironmentSpec(name="microsandbox-egress"),
-    factory,
-    default=True,
-)
-```
-
-For every session on `microsandbox-egress`, file tools receive a
-`MicrosandboxWorkspace` whose read, write, list, delete, and canonical-path
-operations use the same microVM as command tools. The application never
-constructs `_EgressManagedRunner`, accesses `_runner`, casts to
-`MicrosandboxRunner`, or owns a second cleanup handle.
-
-Install both optional dependencies with
-`pip install 'cayu[egress,microsandbox]'`.
-
 ### Governed authority changes between invocations
 
 An egress policy is now a versioned execution-profile component, not just a
@@ -856,7 +771,6 @@ Each adapter declares one strategy:
 | --- | --- |
 | Docker | `fresh_authority_path`: terminate detached guest work, pause the exact container, stage a fresh internal network/broker/sidecar, revoke and drain the old broker, disconnect and close the old path (including established sockets), update the runtime-owned exec overlay, verify positive and negative enforcement, and unpause the same container. |
 | E2B | `fresh_authority_path`: deny all network access, terminate guest-owned processes, stage a fresh Cayu exposure/broker, revoke and close the old path, apply the new proxy-only `update_network` policy, and verify the same sandbox. Cayu requires E2B 2.45.1 or newer stable 2.x. |
-| Microsandbox | `allocation_replacement`: its reconnect evidence remains useful, but it is not a hot-cutover tracer for this contract. |
 | Missing/custom declaration | `unsupported`: refuse before changing the active generation. |
 
 Neither Docker nor E2B claims that the provider invalidates established
@@ -963,63 +877,6 @@ that envelope to the session checkpoint and passes it back to a newly
 constructed factory on resume or recovery; applications should not persist a
 live runner, broker, or adapter object themselves.
 
-For Microsandbox, the durable identity is the sandbox name plus immutable
-numeric provider creation timestamp, the original host listener port, the
-guest-visible proxy endpoint port, a non-secret ownership id, and the attested
-owner session and environment:
-
-```json
-{
-  "version": 1,
-  "runner_kind": "microsandbox",
-  "session_id": "sess_...",
-  "environment_name": "billing",
-  "capability": "supported",
-  "identity": {
-    "sandbox_name": "cayu-egress-sandbox-...",
-    "sandbox_created_at": 1752582896.789,
-    "proxy_listener_port": 43127,
-    "proxy_endpoint_port": 43127,
-    "ownership_id": "9f2d9a6f7a2c4e32a624b37d104ca4f1",
-    "owner_session_id": "sess_...",
-    "owner_environment_name": "billing"
-  }
-}
-```
-
-The guest endpoint port is part of the sandbox's immutable deny-by-default
-network policy, while the listener port identifies the host socket that must be
-reclaimed. Recording both permits a session-isolated exposure to map one to the
-other without confusing the two during reconnect. A host-local, mode-`0600`
-attestation and process-independent lock bind every identity field to the
-sandbox name, so concurrent callers cannot evade the single-owner rule by
-presenting a different port. The provider creation timestamp prevents a
-removed-and-recreated same-name sandbox from being accepted as the original
-incarnation. Attested session and environment ownership prevents a valid inner
-identity from being rewrapped in an envelope for another runtime scope. The
-default attestation
-directory is stable across Cayu process restarts; deployments may set
-`reconnect_state_dir` to a private host-local runtime directory. Reconnect must
-validate the attestation, reclaim that exact listener, and reproduce the
-recorded guest endpoint before attaching. A custom exposure whose mapping is
-not stable across calls fails closed before the sandbox is attached. It
-then creates a fresh credential registry, broker, grants, proxy, and session
-CA; attaches the recorded sandbox; replaces the guest CA; and reruns the
-positive proxy/TLS and negative direct-egress preflight before any agent
-command can run. The old
-virtual credential is unknown to the fresh registry and cannot authorize a
-request through the new broker. A second concurrent owner receives
-`EgressReconnectConflictError` before a proxy is opened or the sandbox is
-mutated.
-
-An interrupted Microsandbox session without a copied workspace detaches rather
-than removes its sandbox. When a copied workspace requires a positive mutation
-boundary, Cayu stops the sandbox instead: the durable identity and attestation
-remain resumable, and reconnect restarts that same stopped incarnation.
-Completed, failed, cancelled, or explicitly closed sessions remove it.
-Reconnected teardown keeps the normal ordering: revoke and drain grants,
-release the runner, then close the proxy boundary.
-
 The envelope never contains real or virtual credential values, proxy bearer
 authority, or CA private material. The factory validates version, runner kind,
 session, environment, exact adapter-owned identity allowlists, and common
@@ -1035,14 +892,11 @@ Reconnect support is explicit by adapter:
 
 | Adapter | Virtual-egress reconnect |
 | --- | --- |
-| Microsandbox | Supported; attested single-owner sandbox plus host-listener and guest-endpoint ports, fresh grants/broker/CA, full preflight. |
 | Lambda MicroVM | Supported for the same MicroVM: allowlisted non-secret identity, resume when suspended, never replaces an ended MicroVM, fresh grants/broker/CA, full preflight plus an agent privilege probe. A sidecar owner claim (protocol 3 and later) fences stale owners across processes: their commands are cancelled and rejected, and a lifecycle lease stops them from suspending or terminating the successor's MicroVM; an unconfirmable owner mutates nothing. |
 | Docker | Opt-in local POSIX ownership directory, exact container/network identity, fresh proxy/CA, repeated preflight; see below. Default configuration remains unsupported. |
 | E2B | Generic reconnect is unsupported; crash-safe creation/recovery instead uses the durable exact-sandbox handoff described below. |
 
-Reconnect capability is distinct from crash-safe creation. New remote
-virtual-egress allocation remains unsupported for Microsandbox; it fails with
-`EnvironmentAllocationUnsupportedError` before provider mutation. Lambda
+Reconnect capability is distinct from crash-safe creation. Lambda
 MicroVM binds each allocation intent to an idempotent `RunMicrovm` client token
 and recovers or reaps only that token's MicroVM inside a pinned replay window
 (see `docs/runtime-contracts.md`). E2B implements durable exact-sandbox create-or-lookup, while Docker
@@ -1473,7 +1327,6 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | Runner | Status |
 | --- | --- |
 | `docker` | Egress enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; opt-in local reconnect. Container isolation is not a secure sandbox boundary. |
-| `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure; reconnect supported. |
 | `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`; durable exact-sandbox create/recovery and process-local parked resume are supported. |
 | `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. In `metadata_isolation="required"` mode that relay authenticates each connection with a per-session transport token, which admits credentialless routes (including the browser); crash-safe client-token creation, recovery, and reaping; same-MicroVM factory reconnect with fresh authority. |
 | `local` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
@@ -1578,7 +1431,7 @@ a private Fargate receiver, and an exact host/method/path egress policy.
 `tests/egress/` proves non-possession rather than redaction:
 
 - Shared deterministic conformance: one registration contract describes the
-  Docker, E2B, and Microsandbox adapter factories, runner kinds, bounded
+  Docker and E2B adapter factories, runner kinds, bounded
   destinations, live prerequisites, capability proof classes, teardown bounds,
   and proof sources. It proves fail-closed resolution, runner/binding pairing,
   grant scoping, cancellation-safe retryable cleanup, revocation-before-release,
@@ -1599,9 +1452,6 @@ a private Fargate receiver, and an exact host/method/path egress policy.
   proves same-container/workspace generation rotation, old grant/destination
   denial, target permission, and termination of a TLS connection opened before
   the cutover.
-- Microsandbox E2E (manual/nightly): set
-  `CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1`, then run
-  `uv run python scripts/nightly_verification.py --check microsandbox-live-virtual-egress --strict`.
 - E2B E2E (manual/nightly): set `E2B_API_KEY`,
   `CAYU_E2B_PROXY_EXPOSURE_COMMAND` (a raw TCP tunnel command template using
   `{host}` and `{port}`), `CAYU_E2B_PROXY_URL`, and
@@ -1630,9 +1480,9 @@ The deterministic adapter, runner, preflight-failure, and teardown tests run in
 normal CI. Live results emit typed bounded evidence with adapter, scenario,
 status, proof source, safe reason/observation tokens, bounded duration, and
 cleanup outcome; the records never contain secrets, headers, provider response
-bodies, or command output. E2B and
-Microsandbox E2Es are intentionally opt-in because they need
-cloud credentials, virtualization, or external tunnel infrastructure. The
+bodies, or command output. E2B
+E2Es are intentionally opt-in because they need
+cloud credentials or external tunnel infrastructure. The
 nightly registry reports them as `skipped` when an opt-in flag, runtime, API key,
 or E2B tunnel input is absent; a successful real-runtime run reports `verified`.
 

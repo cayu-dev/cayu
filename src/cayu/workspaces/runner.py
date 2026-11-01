@@ -1173,7 +1173,7 @@ class RunnerWorkspace(
         if runner_key is None:
             return None
         # Key by the runner's resolved absolute working directory so this RunnerWorkspace and the native
-        # wrapper (E2BWorkspace / MicrosandboxWorkspace) over the same sandbox directory produce equal keys.
+        # wrapper (for example E2BWorkspace) over the same sandbox directory produce equal keys.
         return ("runner", runner_key, runner.resolve_cwd(self.cwd))
 
     def is_bound_to_runner(self, runner: Runner) -> bool:

@@ -9,13 +9,45 @@ import os
 import sys
 from pathlib import Path
 
-from tests.egress.microsandbox_reconnect_worker import _factory
 from tests.egress_e2e_support import RecordingProviderUpstream, connect_probe_script
 
-from cayu.egress import CapturedRequest
+from cayu.egress import CapturedRequest, HttpEgressPolicy
 from cayu.egress.docker_adapter import DockerEgressAdapter
+from cayu.egress.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.environments import EnvironmentFactoryOperation, EnvironmentFactoryRequest
 from cayu.runners import ExecCommand
+from cayu.vaults import SecretRef, StaticVault
+
+REAL_SECRET = "sk_test_51DockerReconnectRealSecretNeverInGuest"
+
+
+def _factory(
+    *,
+    adapter: DockerEgressAdapter,
+    upstream: RecordingProviderUpstream,
+    image: str,
+) -> VirtualEgressEnvironmentFactory:
+    return VirtualEgressEnvironmentFactory(
+        resolver=StaticVault({"stripe": REAL_SECRET}),
+        policies={
+            "stripe": HttpEgressPolicy(
+                name="stripe",
+                allowed_hosts=["api.stripe.com"],
+                allowed_endpoints=[("POST", "/v1/customers")],
+            )
+        },
+        credentials=[
+            VirtualCredentialSpec(
+                env_name="STRIPE_SECRET_KEY",
+                secret=SecretRef(name="stripe"),
+                destination="api.stripe.com",
+                policy_name="stripe",
+            )
+        ],
+        image=image,
+        adapter=adapter,
+        upstream=upstream,
+    )
 
 
 class CapturingDocker(DockerEgressAdapter):

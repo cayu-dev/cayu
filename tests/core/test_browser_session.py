@@ -116,7 +116,7 @@ class _UnavailableAfterDispatchRunner(_WireRunner):
         self.dispatched = True
         raise RunnerUnavailableError(
             "Runner became unavailable after dispatch.",
-            diagnostic={"adapter": "microsandbox", "kind": "liveness"},
+            diagnostic={"adapter": "lambda-microvm", "kind": "liveness"},
         )
 
 
@@ -128,7 +128,7 @@ class _UnavailableDuringPreflightRunner(_WireRunner):
         del command, kwargs
         raise RunnerUnavailableError(
             "Runner is unavailable before dispatch.",
-            diagnostic={"adapter": "microsandbox", "kind": "liveness"},
+            diagnostic={"adapter": "lambda-microvm", "kind": "liveness"},
         )
 
     async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
