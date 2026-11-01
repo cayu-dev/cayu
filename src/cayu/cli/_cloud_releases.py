@@ -1,18 +1,19 @@
 """`cayu cloud applications show` and `cayu cloud deployment list`: what an Agent runs now, and
 its Releases.
 
-`applications show NAME` reads the Agent, its selected Release and its newest Releases, and
-prints the selected Release (when it was selected, its source revision and the Cayu runtime
-its image is built with) and any candidate or in-flight Release. `deployment list
---application NAME` lists the Agent's Releases, newest first.
+`applications show --application NAME` (or `applications show NAME`) reads the Agent, its
+selected Release and its newest Releases, and prints when the Agent last served a request,
+the selected Release (when it was selected, its source revision and the Cayu runtime its
+image is built with) and any candidate or in-flight Release. `deployment list --application
+NAME` lists the Agent's Releases, newest first.
 
 Both read routes every Cloud has. Older Clouds omit `selected_at` and `cayu_runtime`; the table
 says "not recorded" for those missing fields. A Release Cloud refused to publish is marked "not
 published", with Cloud's reason and its hint for getting past it.
 
 `release_application_id` finds the Agent of a Release from its id alone (`GET
-/v1/deployments/{id}`), so `deployment status|logs|timeline|wait` take a `dep_...` id without
-`--application`. A Cloud without that route still finds the Release an Agent currently selects;
+/v1/deployments/{id}`), so `deployment status|logs|timeline|wait|source` take a `dep_...` id
+without `--application`. A Cloud without that route still finds the Release an Agent currently selects;
 for any other Release it asks for `--application`.
 
 These commands print a table by default; `--json` prints the JSON envelope the other `cayu
@@ -101,14 +102,34 @@ def show_application(client: CloudApiClient, application_id: str) -> dict[str, A
     return {
         "schema_version": SCHEMA_VERSION,
         "application": {
-            key: application.get(key)
-            for key in ("id", "name", "lifecycle", "revision", "archived_at", "home")
+            **{
+                key: application.get(key)
+                for key in ("id", "name", "lifecycle", "revision", "archived_at", "home")
+            },
+            "last_request_at": last_request_at(application),
         },
         "selected_release": None if selected is None else release_summary(selected),
         "pending_releases": [
             {**release_summary(release), "pending": _pending_kind(release)} for release in pending
         ],
     }
+
+
+def last_request_at(answer: Mapping[str, Any]) -> str | None:
+    """When Cloud last saw the Agent's web service answer a request, or None if never.
+
+    Cloud records it to within about five minutes and doesn't count its own reads. An older
+    Cloud leaves the field out, which means the same as none recorded.
+    """
+
+    value = answer.get("last_request_at")
+    return value if isinstance(value, str) and value else None
+
+
+def with_last_request_at(answer: Mapping[str, Any]) -> dict[str, Any]:
+    """``answer`` with `last_request_at` always present, None when Cloud recorded none."""
+
+    return {**answer, "last_request_at": last_request_at(answer)}
 
 
 def list_releases(client: CloudApiClient, application_id: str, *, limit: int) -> dict[str, Any]:
@@ -234,6 +255,7 @@ def render_application(result: Mapping[str, Any]) -> str:
     lines = [
         f"Agent: {_cell(application.get('name'))} ({_cell(application.get('id'))})",
         f"Lifecycle: {_cell(application.get('lifecycle'))}",
+        f"Last request: {_when(application.get('last_request_at'), missing='never recorded')}",
     ]
     selected = shown["selected_release"]
     if selected is None:

@@ -9,7 +9,7 @@ commands from an Agent repository.
 cayu cloud login
 cayu cloud whoami
 cayu cloud deploy .
-cayu cloud applications show my-agent
+cayu cloud applications show --application my-agent
 cayu cloud deployment list --application my-agent
 cayu cloud deployment status DEPLOYMENT_ID
 cayu cloud deployment timeline DEPLOYMENT_ID
@@ -25,8 +25,9 @@ cayu cloud service status --application my-agent
 - `applications list|show|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
 - `init` and `deploy` for local project setup and publication;
-- `deployment list|logs|status|timeline|wait|promote|discard|retry` and `rollback` for
-  immutable releases, including [candidate releases](#candidate-releases);
+- `deployment list|logs|status|timeline|wait|source|promote|discard|retry` and `rollback`
+  for immutable releases, including [candidate releases](#candidate-releases) and
+  [downloading a release's source](#downloading-a-releases-source);
 - `runtimes list|status` for retained runtime artifacts;
 - `service check|credentials|destroy|logs|pause|restart|resume|sleep|status|wake` for Agent
   infrastructure and [its own post-deploy check](#operator-check), and `schedule run` to run a
@@ -82,9 +83,11 @@ retained Cloud operation as failed.
 
 ## What an Agent runs
 
-`applications show NAME` shows what an Agent runs now: its selected release, when it was
-selected (promoted, or rolled back to), its source repository and revision, and the Cayu
-runtime its image is built with, then any candidate or in-flight release.
+`applications show --application NAME` shows what an Agent runs now: when it last served a
+request, its selected release, when it was selected (promoted, or rolled back to), its source
+repository and revision, and the Cayu runtime its image is built with, then any candidate or
+in-flight release. It also takes the Agent positionally (`applications show NAME`), as it
+always has; naming it both ways with different values is refused.
 `deployment list --application NAME [--limit N]` lists the Agent's releases newest first
 (20 by default) with their status, when each was created and selected, the source revision
 and the Cayu runtime. Both print a table; `--json` prints the usual envelope, whose
@@ -99,9 +102,10 @@ for getting past it under the release; `--json` keeps `publication_error` as Clo
 it. `service status` names the release the service runs as `deployment_id`.
 
 ```console
-$ cayu cloud applications show my-agent
+$ cayu cloud applications show --application my-agent
 Agent: My Agent (my-agent)
 Lifecycle: active
+Last request: 2026-10-30 17:02Z
 Selected release: dep_8k2m (version 1.4.0, promoted)
   Selected at: 2026-10-28 21:03Z
   Created at: 2026-10-28 20:51Z
@@ -117,11 +121,84 @@ that lock pins is the one the release runs. `deployment status` returns it as
 `cayu_runtime` (`version`, `source` and `lock_digest`). Releases admitted before Cloud
 recorded it, or whose lock pins no single `cayu` version, show "not recorded".
 
-`deployment status|logs|timeline|wait` take a release id (`dep_...`) on its own: the CLI
-asks Cloud which Agent the release belongs to, so `--application` is optional for them. A
+`deployment status|logs|timeline|wait|source` take a release id (`dep_...`) on its own: the
+CLI asks Cloud which Agent the release belongs to, so `--application` is optional for them. A
 Cloud from before that lookup still finds a release an Agent currently selects, and asks
 for `--application` for any other release. `promote`, `discard`, `retry` and `rollback`
 still require `--application`.
+
+## When an Agent last served a request
+
+`service status`, `applications list` and `applications show` say when the Agent's web
+service last answered a request through Cayu Cloud's Agent router, as `last_request_at` (an
+ISO 8601 time in UTC, or `null`). Use it to tell which Agents are still used before you
+[archive](#archive-an-agent) one. Cloud records it to within about five minutes and
+doesn't count its own reads (the inbox, session and activity reads, the home page probe).
+`null` means none recorded: an Agent without a web process, one that has served nothing
+since Cloud began recording, or a Cloud from before it did, which leaves the field out; the
+CLI then gives `null` too. `applications show` prints it as `Last request: 2026-10-30
+17:02Z`, or `Last request: never recorded`.
+
+```bash
+cayu cloud applications list | jq -r '.result.items[] | "\(.id) \(.last_request_at)"'
+```
+
+## Downloading a release's source
+
+`deployment source RELEASE --output DIR` downloads the source bundle `cayu cloud deploy`
+uploaded for that release and extracts it into DIR, which it creates when it is missing and
+otherwise must be empty. The project's files land directly in DIR (the bundle keeps them
+under `source/`). `--archive` writes the `.tar.gz` itself as the file `--output` names
+instead, and never replaces an existing file. Like `deployment status`, it takes a `dep_...`
+id without `--application`.
+
+```console
+$ cayu cloud deployment source dep_8k2m --output ./dep_8k2m
+Extracted 214 files and 1 link (3184211 bytes) from release dep_8k2m into /work/dep_8k2m.
+Verified digest sha256:9f3c...
+$ cayu cloud deployment source dep_8k2m --output dep_8k2m.tar.gz --archive
+```
+
+Cloud sends the bundle's SHA-256 with it, and the CLI refuses a download that doesn't
+match, writing nothing (`source_digest_mismatch`). Extraction checks every member before it
+writes anything and refuses the whole bundle (`source_bundle_unsafe`) for an absolute path,
+a `..` segment, a name listed twice, a member written through a link, a device or fifo, or
+a link that leads outside DIR, also through a chain of the bundle's own links. Names are
+compared the way macOS and Windows compare them, ignoring case, so two names that differ only
+in case are refused as a duplicate and `UP` follows a link named `up`. A bundle that unpacks
+to more than 100,000 members or 512 MiB of files is refused (`source_bundle_too_large`) as its
+headers are read; tar metadata (a long name, PAX records) over 64 KiB is refused too. Python's
+`data` extraction filter adds its own checks; a Python without it (3.11 before 3.11.4) refuses
+to extract (`source_extraction_unsupported`) and only `--archive` works there. The download
+and the extracted files are staged in hidden `.cayu-source-` entries inside DIR (so DIR may be
+a mount point or sit under a read-only directory) and published only when all of them are
+there. Publication works relative to open directory descriptors and never follows a link
+below DIR, so a directory another user swaps for a link meanwhile is never written through;
+Windows, which lacks these calls, only keeps the archive (`source_extraction_unsupported`).
+Every file, directory and link is created under a name that must not exist yet, so nothing
+another process puts in DIR meanwhile is replaced: the command refuses (`output_exists`) and
+keeps already-published files for inspection. A failed publication may leave a partial tree;
+the error says to inspect DIR and retry with a new or empty directory. Automatic rollback
+cannot safely distinguish a published file from a concurrent replacement at the same name.
+An archive refused before publication leaves no extracted files. An existing empty DIR keeps
+its permissions, and `--output .` extracts into the current directory when empty. `--archive`
+keeps the bundle as it is for
+inspection. `--json` prints the usual envelope, whose `result` has `output`, `format`
+(`directory` or `archive`), `digest`, `bytes` (the archive's size), `files`, `links` and
+`file_bytes`.
+
+Cloud refuses with an error `code`:
+
+- `source_not_uploaded` when the release was built from a connected repository: there is
+  no uploaded bundle, and the error names the `repository` and `revision` to fetch from it;
+- `source_bundle_expired` when Cloud no longer keeps that release's bundle;
+- `release_not_found` for a release the Agent doesn't have;
+- `developer_required`, `agent_not_yours` or `key_scope_required` when the login or API key
+  may not read the Agent's source; and
+- `source_bundles_unavailable` when Cloud can't read bundles right now; run it again later.
+
+A Cayu Cloud from before this download answers with category
+`source_download_unsupported`.
 
 ## Initialize an Agent project
 

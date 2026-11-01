@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -9,7 +10,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -95,14 +96,16 @@ CANDIDATE_REFUSAL_CODES = frozenset({"candidate_baseline_changed", "candidate_ex
 # Cloud's documented refusals whose code and own message the CLI reports, filtered like a
 # conflict's reason, since the message says what to fix: Compass's (`cayu cloud compass`),
 # a schedule run's (`cayu cloud schedule run`), a settings change's (`cayu cloud
-# settings`), an environment change's (`cayu cloud env set|unset` with several names) and
-# an inbox decision's (`cayu inbox`), whose structured fields (such as a
-# refused settle's `item`) that command reads from `CloudApiError.body`.
+# settings`), an environment change's (`cayu cloud env set|unset` with several names), a
+# source download's (`cayu cloud deployment source`) and an inbox decision's (`cayu inbox`),
+# whose structured fields (such as a refused settle's `item`) that command reads from
+# `CloudApiError.body`.
 _REPORTED_API_REFUSALS = frozenset(
     {
         *_INBOX_REFUSALS,
         (403, "compass_disabled"),
         (403, "developer_required"),
+        (403, "key_scope_required"),
         (404, "agent_not_watched"),
         (404, "not_enrolled"),
         (404, "release_not_found"),
@@ -127,6 +130,8 @@ _REPORTED_API_REFUSALS = frozenset(
         (503, "operator_credentials_unavailable"),
         (504, "operator_check_timeout"),
         (409, "settings_revision_conflict"),
+        (409, "source_not_uploaded"),
+        (410, "source_bundle_expired"),
         (422, "environment_change_invalid"),
         (422, "invalid_setting"),
         (422, "invalid_settings"),
@@ -136,9 +141,24 @@ _REPORTED_API_REFUSALS = frozenset(
         (503, "agent_domain_unknown"),
         (503, "compass_unavailable"),
         (503, "release_source_unavailable"),
+        (503, "source_bundles_unavailable"),
         (504, "compass_outcome_unknown"),
     }
 )
+
+# A binary download is written in parts of this size; a refusal is read up to the limit.
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+_ERROR_BODY_LIMIT = 64 * 1024
+
+
+@dataclass(frozen=True)
+class DownloadedFile:
+    """What `CloudApiClient.download` wrote: the answer's headers, size and SHA-256."""
+
+    headers: dict[str, str]
+    size: int
+    sha256: str
+
 
 # Cloud's stable rejection codes are short lowercase identifiers.
 _CLOUD_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -203,6 +223,19 @@ _TRANSPORT_ERRORS: tuple[tuple[type[httpx.RequestError], str], ...] = (
     (httpx.ReadError, "read_failed"),
     (httpx.WriteError, "write_failed"),
 )
+
+
+def _unavailable(exc: httpx.RequestError, request: str) -> CloudApiError:
+    """Cloud couldn't be reached for ``request``. The exception's own text can carry the full
+    URL, so only its kind is kept."""
+
+    transport_error = _transport_error(exc)
+    return CloudApiError(
+        "api_unavailable",
+        f"Cayu Cloud API is unavailable ({transport_error.replace('_', ' ')} on {request}).",
+        transport_error=transport_error,
+        request=request,
+    )
 
 
 def _transport_error(exc: httpx.RequestError) -> str:
@@ -304,24 +337,7 @@ class CloudApiClient:
                     query=query,
                 )
         if not 200 <= response.status_code < 300:
-            structured = _structured_api_error(response)
-            detail = _safe_api_error_detail(response.status_code, structured)
-            if detail is None and structured is None:
-                detail = _safe_conflict_detail(response)
-            suffix = f": {detail}" if detail is not None else "."
-            code = _safe_api_error_code(response.status_code, structured)
-            raise CloudApiError(
-                "api_request_rejected",
-                f"Cayu Cloud API returned HTTP {response.status_code}{suffix}",
-                status_code=response.status_code,
-                # A documented candidate refusal's own message is its plain-text reason.
-                detail=detail
-                if code in CANDIDATE_REFUSAL_CODES
-                else _plain_api_error_detail(response),
-                code=code,
-                rejected_fields=_rejected_fields(response),
-                body=None if code is None or structured is None else structured[1],
-            ) from None
+            raise _rejection(response) from None
         if response.status_code == 204:
             return {}
         try:
@@ -337,6 +353,69 @@ class CloudApiClient:
                 "Cayu Cloud API returned an unsupported response.",
             )
         return result
+
+    def download(
+        self,
+        path: str,
+        destination: BinaryIO,
+        *,
+        max_bytes: int,
+        accept: str = "application/gzip",
+    ) -> DownloadedFile:
+        """Stream a binary answer of at most ``max_bytes`` into ``destination``.
+
+        Cloud's refusals are JSON and raise the same `CloudApiError` as `request`. The body
+        is written as it arrives, so a large answer is never held in memory, and its SHA-256
+        digest is computed on the way.
+        """
+
+        api_key = self._current_api_key()
+        request = f"GET {path}"
+        try:
+            with httpx.Client(follow_redirects=False, timeout=self.timeout_seconds) as client:
+                for attempt in range(2):
+                    with client.stream(
+                        "GET",
+                        self.api_url.rstrip("/") + path,
+                        headers={
+                            "Accept": f"{accept}, application/json",
+                            "Authorization": f"Bearer {api_key}",
+                        },
+                    ) as response:
+                        if (
+                            response.status_code == 401
+                            and attempt == 0
+                            and self.rejected_api_key_provider is not None
+                        ):
+                            replacement = self._validated_api_key(
+                                self.rejected_api_key_provider(api_key)
+                            )
+                            if replacement != api_key:
+                                api_key = replacement
+                                continue
+                        if not 200 <= response.status_code < 300:
+                            raise _rejection(_bounded_error_response(response)) from None
+                        digest = hashlib.sha256()
+                        written = 0
+                        for chunk in response.iter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise CloudApiError(
+                                    "api_response_too_large",
+                                    f"Cayu Cloud answered {request} with more than "
+                                    f"{max_bytes} bytes.",
+                                )
+                            digest.update(chunk)
+                            destination.write(chunk)
+                        return DownloadedFile(
+                            # httpx already gives the names in lowercase.
+                            headers=dict(response.headers.items()),
+                            size=written,
+                            sha256=digest.hexdigest(),
+                        )
+        except httpx.RequestError as exc:
+            raise _unavailable(exc, request) from None
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _send(
         self,
@@ -370,16 +449,7 @@ class CloudApiClient:
                     headers=headers,
                 )
         except httpx.RequestError as exc:
-            # The exception's own text can carry the full URL, so only its kind is kept.
-            transport_error = _transport_error(exc)
-            request = f"{method} {path}"
-            raise CloudApiError(
-                "api_unavailable",
-                f"Cayu Cloud API is unavailable ({transport_error.replace('_', ' ')} on "
-                f"{request}).",
-                transport_error=transport_error,
-                request=request,
-            ) from None
+            raise _unavailable(exc, f"{method} {path}") from None
 
     def _current_api_key(self) -> str:
         return self._validated_api_key(
@@ -443,6 +513,44 @@ class CloudApiClient:
                 f"Local source bundle upload returned HTTP {response.status_code}{suffix}.",
                 status_code=response.status_code,
             )
+
+
+def _rejection(response: httpx.Response) -> CloudApiError:
+    """The `CloudApiError` for Cloud's non-2xx answer, keeping only its documented parts."""
+
+    structured = _structured_api_error(response)
+    detail = _safe_api_error_detail(response.status_code, structured)
+    if detail is None and structured is None:
+        detail = _safe_conflict_detail(response)
+    suffix = f": {detail}" if detail is not None else "."
+    code = _safe_api_error_code(response.status_code, structured)
+    return CloudApiError(
+        "api_request_rejected",
+        f"Cayu Cloud API returned HTTP {response.status_code}{suffix}",
+        status_code=response.status_code,
+        # A documented candidate refusal's own message is its plain-text reason.
+        detail=detail if code in CANDIDATE_REFUSAL_CODES else _plain_api_error_detail(response),
+        code=code,
+        rejected_fields=_rejected_fields(response),
+        body=None if code is None or structured is None else structured[1],
+    )
+
+
+def _bounded_error_response(response: httpx.Response) -> httpx.Response:
+    """A streamed refusal's first bytes as a complete response the error helpers can read."""
+
+    content = bytearray()
+    for chunk in response.iter_bytes():
+        content.extend(chunk)
+        if len(content) >= _ERROR_BODY_LIMIT:
+            del content[_ERROR_BODY_LIMIT:]
+            break
+    content_type = response.headers.get("content-type")
+    return httpx.Response(
+        response.status_code,
+        headers={} if content_type is None else {"content-type": content_type},
+        content=bytes(content),
+    )
 
 
 def _object_store_error(content: bytes) -> str | None:

@@ -1,5 +1,5 @@
-"""`cayu cloud applications show`, `cayu cloud deployment list`, and the release reads that find
-a release's Agent from its id alone."""
+"""`cayu cloud applications show|list`, `cayu cloud deployment list`, the release reads that find
+a release's Agent from its id alone, and when an Agent last served a request."""
 
 from __future__ import annotations
 
@@ -125,6 +125,108 @@ def test_show_prints_the_selected_release_and_what_is_pending(
     # Neither the selected release nor an earlier promoted one is pending.
     assert "dep_live" not in pending and "dep_old" not in pending
     assert "not recorded" in pending
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [["--application", "my-agent"], ["my-agent", "--application", "my-agent"], ["my-agent"]],
+)
+def test_show_takes_the_agent_as_application_or_positionally(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str], arguments: list[str]
+) -> None:
+    cloud(_show_routes(_LIVE))
+
+    assert main(["cloud", "applications", "show", *arguments, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["application"]["id"] == "my-agent"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["my-agent", "--application", "other-agent"], "differ"),
+        ([], "--application"),
+    ],
+)
+def test_show_needs_the_agent_named_once(
+    cloud: Callable[..., _Cloud],
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+    message: str,
+) -> None:
+    fake = cloud(_show_routes(_LIVE))
+
+    assert main(["cloud", "applications", "show", *arguments, "--json"]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["category"] == "invalid_input"
+    assert message in error["message"]
+    assert fake.requests == []
+
+
+def test_show_says_when_the_agent_last_served_a_request(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    routes = _show_routes(_LIVE)
+    routes[("GET", "/v1/applications/my-agent")] = httpx.Response(
+        200, json={**_AGENT, "lifecycle": "active", "last_request_at": "2026-10-30T17:02:11Z"}
+    )
+    cloud(routes)
+
+    assert main(["cloud", "applications", "show", "--application", "my-agent"]) == 0
+    assert "Last request: 2026-10-30 17:02Z" in capsys.readouterr().out
+    assert main(["cloud", "applications", "show", "--application", "my-agent", "--json"]) == 0
+    application = json.loads(capsys.readouterr().out)["result"]["application"]
+    assert application["last_request_at"] == "2026-10-30T17:02:11Z"
+
+
+@pytest.mark.parametrize("answer", [{"last_request_at": None}, {}])
+def test_show_says_when_no_request_was_recorded(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str], answer: dict[str, None]
+) -> None:
+    # An older Cloud leaves the field out, which means the same as none recorded.
+    routes = _show_routes(_LIVE)
+    routes[("GET", "/v1/applications/my-agent")] = httpx.Response(
+        200, json={**_AGENT, "lifecycle": "active", **answer}
+    )
+    cloud(routes)
+
+    assert main(["cloud", "applications", "show", "my-agent"]) == 0
+    assert "Last request: never recorded" in capsys.readouterr().out
+    assert main(["cloud", "applications", "show", "my-agent", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["application"]["last_request_at"] is None
+
+
+def test_applications_list_carries_when_each_agent_last_served(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    served = {**_AGENT, "last_request_at": "2026-10-30T17:02:11+00:00"}
+    older = {"id": "old-agent", "name": "Old Agent"}
+    cloud({("GET", "/v1/applications"): httpx.Response(200, json={"items": [served, older]})})
+
+    assert main(["cloud", "applications", "list"]) == 0
+    items = json.loads(capsys.readouterr().out)["result"]["items"]
+    assert [item["last_request_at"] for item in items] == ["2026-10-30T17:02:11+00:00", None]
+    assert items[1] == {**older, "last_request_at": None}
+
+
+def test_service_status_carries_when_the_agent_last_served(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    service = {"application_id": "my-agent", "status": "running"}
+    fake = cloud(
+        {
+            ("GET", "/v1/applications/my-agent/service"): httpx.Response(
+                200, json={**service, "last_request_at": "2026-10-30T17:02:11Z"}
+            )
+        }
+    )
+
+    assert main(["cloud", "service", "status", "--application", "my-agent"]) == 0
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert result["last_request_at"] == "2026-10-30T17:02:11Z"
+
+    fake.routes[("GET", "/v1/applications/my-agent/service")] = httpx.Response(200, json=service)
+    assert main(["cloud", "service", "status", "--application", "my-agent"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["last_request_at"] is None
 
 
 def test_show_leaves_out_a_release_another_selection_superseded(

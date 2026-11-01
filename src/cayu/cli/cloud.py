@@ -48,6 +48,11 @@ from cayu.cli._cloud_project import (
     resolve_project,
     schedule_input_json,
 )
+from cayu.cli._cloud_release_source import (
+    SourceDownloadError,
+    download_release_source,
+    render_source,
+)
 from cayu.cli._cloud_releases import DEFAULT_LIMIT as _DEFAULT_RELEASE_LIMIT
 from cayu.cli._cloud_releases import add_output_argument as _add_release_output_argument
 from cayu.cli._cloud_releases import (
@@ -57,6 +62,7 @@ from cayu.cli._cloud_releases import (
     render_application,
     render_releases,
     show_application,
+    with_last_request_at,
 )
 from cayu.cli._cloud_service_check import (
     OperatorCheckFailedError,
@@ -81,7 +87,7 @@ _DEPLOYMENT_IN_PROGRESS = {
 _DEPLOYMENT_READY = {"smoke_tested", "promoted"}
 _DEPLOYMENT_STATUSES = _DEPLOYMENT_FAILURES | _DEPLOYMENT_IN_PROGRESS | _DEPLOYMENT_READY
 # `deployment` reads that find the release's Agent from a `dep_...` id without --application.
-_RELEASE_ID_ACTIONS = frozenset({"logs", "status", "timeline", "wait"})
+_RELEASE_ID_ACTIONS = frozenset({"logs", "source", "status", "timeline", "wait"})
 _SERVICE_FAILURES = {"degraded", "failed", "stopped"}
 _SERVICE_IN_PROGRESS = {"deleting", "deploying", "sleeping", "starting", "stopping"}
 _SERVICE_READY = {"running"}
@@ -811,6 +817,7 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
             CloudEvalError,
             OperatorCheckFailedError,
             ServiceStillSwitchingError,
+            SourceDownloadError,
         ),
     ):
         error.update(exc.details)
@@ -922,10 +929,17 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "show",
         description=(
             "Show an Agent's selected release (when it was selected, its source revision and "
-            "the Cayu runtime its image is built with) and any candidate or in-flight release."
+            "the Cayu runtime its image is built with), when it last served a request, and any "
+            "candidate or in-flight release."
         ),
     )
-    application_show.add_argument("application", help="The Agent's slug or name.")
+    application_show.add_argument(
+        "application_positional",
+        nargs="?",
+        metavar="APPLICATION",
+        help="The Agent's slug or name; the same as --application.",
+    )
+    application_show.add_argument("--application", help="The Agent's slug or name.")
     _add_release_output_argument(application_show, render_application)
 
     context = commands.add_parser(
@@ -1064,6 +1078,11 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         ),
         "discard": "Discard a candidate release so it is never published.",
         "retry": "Create a new immutable release attempt from retained source.",
+        "source": (
+            "Download the source bundle `cayu cloud deploy` uploaded for one release, verify "
+            "its digest, and extract it into a new or empty directory, or with --archive keep "
+            "the .tar.gz itself."
+        ),
     }
     for action, description in deployment_descriptions.items():
         operation = deployment_commands.add_parser(action, description=description)
@@ -1080,6 +1099,22 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             _add_acknowledge_breaking_argument(operation)
             _add_session_choice_arguments(operation)
             operation.set_defaults(_cloud_preflight=_preflight_acknowledgements)
+        if action == "source":
+            operation.add_argument(
+                "--output",
+                type=Path,
+                required=True,
+                help=(
+                    "The directory to extract into (created if missing; it must be empty), or "
+                    "with --archive the new .tar.gz file."
+                ),
+            )
+            operation.add_argument(
+                "--archive",
+                action="store_true",
+                help="Write the verified .tar.gz to --output instead of extracting it.",
+            )
+            _add_release_output_argument(operation, render_source)
         if action == "logs":
             operation.add_argument("--diagnostic-offset", type=_diagnostic_offset, default=None)
             operation.add_argument("--diagnostic-limit", type=_diagnostic_limit, default=None)
@@ -3453,6 +3488,17 @@ def _deployment(
             "invalid_input",
             f"{arguments.deployment_id} is not a release id (dep_...); pass --application.",
         )
+    if arguments.deployment_command == "source":
+        return {
+            "operation": "deployment.source",
+            "result": download_release_source(
+                client,
+                application_id=application_id,
+                deployment_id=arguments.deployment_id,
+                output=arguments.output,
+                archive=arguments.archive,
+            ),
+        }
     base = f"/v1/applications/{application_id}/deployments/{arguments.deployment_id}"
     if arguments.deployment_command == "status":
         result = client.request("GET", base)
@@ -3675,7 +3721,7 @@ def _service(
         from cayu.cli._cloud_worker_handoff import drain_warnings, worker_exits_report
 
         result = {
-            **result,
+            **with_last_request_at(result),
             "worker_exits": worker_exits_report(
                 lambda: client.request("GET", f"/v1/applications/{application_id}/worker-exits")
             ),
@@ -3856,21 +3902,27 @@ def _applications(
 ) -> dict[str, Any]:
     action = arguments.application_command
     if action == "list":
-        return {
-            "operation": "applications.list",
+        listed = client.request(
+            "GET",
+            "/v1/applications",
             # The server lists active Agents by default; send only a different filter.
-            "result": client.request(
-                "GET",
-                "/v1/applications",
-                query=None
-                if arguments.lifecycle == "active"
-                else {"lifecycle": arguments.lifecycle},
-            ),
-        }
+            query=None if arguments.lifecycle == "active" else {"lifecycle": arguments.lifecycle},
+        )
+        items = listed.get("items")
+        if isinstance(items, list):
+            listed = {
+                **listed,
+                "items": [
+                    with_last_request_at(item) if isinstance(item, dict) else item for item in items
+                ],
+            }
+        return {"operation": "applications.list", "result": listed}
     if action == "show":
         return {
             "operation": "applications.show",
-            "result": show_application(client, _application_id(client, arguments.application)),
+            "result": show_application(
+                client, _application_id(client, _shown_application(arguments))
+            ),
         }
     application_id = arguments.application
     path = f"/v1/applications/{application_id}"
@@ -3917,6 +3969,22 @@ def _applications(
                     raise
                 transient_failures += 1
     return {"operation": "applications.archive", "result": operation}
+
+
+def _shown_application(arguments: argparse.Namespace) -> str:
+    """`applications show` takes the Agent as --application, or positionally as it always has."""
+
+    positional, option = arguments.application_positional, arguments.application
+    if positional is not None and option is not None and positional != option:
+        raise CloudCommandError(
+            "invalid_input",
+            f"Name the Agent once: the argument {positional!r} and --application {option!r} "
+            "differ.",
+        )
+    reference = option if option is not None else positional
+    if reference is None:
+        raise CloudCommandError("invalid_input", "Name the Agent with --application.")
+    return reference
 
 
 def _archive_status(operation: dict[str, Any]) -> str:

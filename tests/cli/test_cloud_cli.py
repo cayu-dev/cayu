@@ -1093,6 +1093,8 @@ def test_service_status_preserves_structured_health_issues(
         "result": {
             "application_id": "outbound-agent",
             "issues": [issue],
+            # An older Cloud sends no last_request_at: none recorded.
+            "last_request_at": None,
             "status": "degraded",
             "worker_exits": {
                 "message": (
