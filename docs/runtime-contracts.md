@@ -8830,6 +8830,17 @@ loaded as step output, or recovered, so a concurrent foreign identity winner
 remains untouched. Session stores must preserve runtime-owned session metadata
 on create and user-metadata replacement for this readback boundary.
 
+Public event views (`GET /api/sessions/{id}/events`, the event stream and event sinks)
+show two journal keys of `workflow.*` events that other events keep private.
+`step_id` is the application's own step name and passes through the secret redactor
+like other public text. `child_session_id` appears the way the session API shows session
+ids (`CayuApp.project_session_id_for_exposure`): the id itself, or its keyed `session_id`
+alias when redaction would change it. The alias resolves at the session endpoints, and
+without an alias keyring such an id stays `[PRIVATE_EVENT_AUTHORITY]`. A caller that can
+read the run's events can already list the same child under it through
+`GET /api/sessions?parent_session_id=...`. Every other key ending in `_id` stays private
+authority, including the journal's `attempt_id` and the same keys on non-workflow events.
+
 A replayed step's `StepResult` is rebuilt from the completed child session's
 durable events, not from the journal record, so `text`, `output`,
 `finish_reason`, `raw_finish_reason` and `usage` match what the original

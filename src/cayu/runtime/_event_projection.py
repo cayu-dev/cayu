@@ -996,6 +996,28 @@ def _require_public_authority_alias_codec(
     return codec
 
 
+def _public_session_reference(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+    codec: PublicAuthorityAliasCodec | None,
+) -> str:
+    """A session id as the public session API shows it (`project_session_id_for_exposure`).
+
+    The id itself unless redaction would change it, else its keyed `session_id` alias, which
+    the store registers for every session so the session endpoints resolve it. Without a
+    keyring such an id stays private.
+    """
+
+    if type(value) is not str or not value.strip():
+        return PRIVATE_EVENT_AUTHORITY
+    if redactor.redact_text(value) == value:
+        return value
+    if not isinstance(codec, PublicAuthorityAliasCodec):
+        return PRIVATE_EVENT_AUTHORITY
+    return public_event_envelope_alias(value, field_name="session_id", codec=codec)
+
+
 def _resolvable_alias_fields(
     event: Event,
     *,
@@ -1681,6 +1703,13 @@ def _project_runtime_event(
                 # workload-secret substring collisions in this content-free
                 # digest, just as it does during first-write preparation.
                 redacted_payload[key] = event.payload[key]
+            continue
+        if key in policy.session_aliased_authority_keys:
+            redacted_payload[key] = _public_session_reference(
+                event.payload[key],
+                redactor=redactor,
+                codec=public_authority_alias_codec,
+            )
             continue
         redacted_payload[key] = (
             public_event_linkage_id(sequence, key)

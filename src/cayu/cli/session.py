@@ -1299,8 +1299,9 @@ def _render_workflow(output: str, payload: dict[str, Any]) -> None:
     )
     if safe["step_ids_withheld"]:
         print(
-            "The event view withholds step and child session ids, as an Agent's public API "
-            "does, so the run's child sessions are listed instead of its steps."
+            "Some workflow identifiers are withheld or redacted; available child sessions "
+            "are listed where steps cannot be identified. Redeploy older Agents to expose "
+            "step names; secret-redacted names remain unavailable."
         )
     if not safe["complete"]:
         print(

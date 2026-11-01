@@ -36,6 +36,7 @@ from cayu.sessions._call_inspection import InspectionWindow, currency_totals_tex
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord
+from cayu.vaults.redaction import REDACTED_SECRET
 
 _EVENT_PAGE = 200
 _CHILD_PAGE = 200
@@ -127,7 +128,7 @@ class WorkflowRun:
     started_at: datetime | None
     completed_at: datetime | None
     steps: list[WorkflowStep]
-    # The reader's event view withheld journal step and child ids (an Agent's public API).
+    # The event view withheld or redacted journal identifiers.
     step_ids_withheld: bool
     custom_events: list[EventRecord]
     nodes: dict[str, SessionNode]
@@ -308,17 +309,23 @@ def _steps_from_journal(journal: list[EventRecord]) -> _Journal:
             else:
                 parsed.completed_at = event.timestamp
             continue
-        step_id = _text(payload.get("step_id"))
+        step_id = _identity_text(payload.get("step_id"))
         child_id = _text(payload.get("child_session_id"))
-        if _withheld(payload.get("step_id")) or _withheld(payload.get("child_session_id")):
+        if (
+            _withheld(payload.get("step_id"))
+            or _withheld(payload.get("child_session_id"))
+            or (isinstance(payload.get("step_id"), str) and step_id is None)
+        ):
             parsed.ids_withheld = True
         agent = _text(payload.get("agent")) or event.agent_name
         if payload.get("kind") == "gated_loop":
-            loop_name = _text(payload.get("loop_name"))
-            item_key = _text(payload.get("item_key"))
+            loop_name = _identity_text(payload.get("loop_name"))
+            item_key = _identity_text(payload.get("item_key"))
             # Withheld step ids still pair by the loop's name and item key.
-            item = step_id or (loop_name, item_key)
-            step = open_loop_items.get(item)
+            item = step_id or (
+                (loop_name, item_key) if loop_name is not None and item_key is not None else None
+            )
+            step = None if item is None else open_loop_items.get(item)
             if step is None:
                 step = WorkflowStep(
                     step_id=step_id,
@@ -331,7 +338,8 @@ def _steps_from_journal(journal: list[EventRecord]) -> _Journal:
                 steps[(f"gated_loop:{record.sequence}", None)] = step
             if event.type == EventType.WORKFLOW_STEP_STARTED:
                 step.started_at = event.timestamp
-                open_loop_items[item] = step
+                if item is not None:
+                    open_loop_items[item] = step
             else:
                 open_loop_items.pop(item, None)
                 step.child_session_id = child_id
@@ -534,6 +542,13 @@ def _text(value: object) -> str | None:
     if not isinstance(value, str) or not value or _withheld(value):
         return None
     return value
+
+
+def _identity_text(value: object) -> str | None:
+    """Redacted labels can collide and must never identify a workflow step."""
+
+    text = _text(value)
+    return None if text is not None and REDACTED_SECRET in text else text
 
 
 def _withheld(value: object) -> bool:

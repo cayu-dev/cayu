@@ -95,6 +95,8 @@ class EventPayloadPolicy:
     nested_authority_paths: frozenset[tuple[str, ...]] = frozenset()
     aliased_nested_authority_paths: frozenset[tuple[str, ...]] = frozenset()
     envelope_aliased_nested_authority_paths: frozenset[tuple[str, ...]] = frozenset()
+    # Top-level keys naming a session, shown as the public session API shows session ids.
+    session_aliased_authority_keys: frozenset[str] = frozenset()
     untrusted_container_keys: frozenset[str] = frozenset()
     untrusted_container_paths: frozenset[tuple[str, ...]] = frozenset()
 
@@ -119,6 +121,14 @@ class EventPayloadPolicy:
             raise ValueError("Aliased event authority keys must also be authority keys.")
         if self.public_authority_keys & self.aliased_authority_keys:
             raise ValueError("Event authority cannot be both public and aliased.")
+        if not self.session_aliased_authority_keys <= self.authority_keys:
+            raise ValueError("Session-aliased event authority keys must also be authority keys.")
+        if self.session_aliased_authority_keys & (
+            self.public_authority_keys | self.aliased_authority_keys | self.internal_authority_keys
+        ):
+            raise ValueError(
+                "Session-aliased event authority cannot be public, aliased or internal."
+            )
         if not self.aliased_nested_authority_paths <= self.nested_authority_paths:
             raise ValueError("Aliased nested event authority must also be nested authority.")
         if not self.envelope_aliased_nested_authority_paths <= self.nested_authority_paths:
@@ -241,6 +251,7 @@ def _policy(
     nested_authority_paths: Collection[tuple[str, ...]] = (),
     aliased_nested_authority_paths: Collection[tuple[str, ...]] = (),
     envelope_aliased_nested_authority_paths: Collection[tuple[str, ...]] = (),
+    session_aliased_authority_keys: Collection[str] = (),
     untrusted_container_keys: Collection[str] = (),
     untrusted_container_paths: Collection[tuple[str, ...]] = (),
 ) -> EventPayloadPolicy:
@@ -264,6 +275,7 @@ def _policy(
         nested_authority_paths=nested_authority,
         aliased_nested_authority_paths=frozenset(aliased_nested_authority_paths),
         envelope_aliased_nested_authority_paths=frozenset(envelope_aliased_nested_authority_paths),
+        session_aliased_authority_keys=frozenset(session_aliased_authority_keys),
         untrusted_container_keys=untrusted,
         untrusted_container_paths=nested_untrusted,
     )
@@ -284,6 +296,7 @@ def _observed_policy(
     nested_authority_paths: Collection[tuple[str, ...]] = (),
     aliased_nested_authority_paths: Collection[tuple[str, ...]] = (),
     envelope_aliased_nested_authority_paths: Collection[tuple[str, ...]] = (),
+    session_aliased_authority_keys: Collection[str] = (),
     untrusted_container_keys: Collection[str] = (),
     untrusted_container_paths: Collection[tuple[str, ...]] = (),
 ) -> EventPayloadPolicy:
@@ -311,6 +324,7 @@ def _observed_policy(
         nested_authority_paths=nested_authority_paths,
         aliased_nested_authority_paths=aliased_nested_authority_paths,
         envelope_aliased_nested_authority_paths=envelope_aliased_nested_authority_paths,
+        session_aliased_authority_keys=session_aliased_authority_keys,
         untrusted_container_keys=untrusted_container_keys,
         untrusted_container_paths=untrusted_container_paths,
     )
@@ -3316,6 +3330,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "passed step_id total workflow "
         "argv cancelled duration_ms environment_name exit_code stderr stderr_truncated "
         "stdout stdout_truncated timed_out",
+        # The app's own step name, and the child session the step ran in, which the session
+        # API already lists under the run. `attempt_id` stays private.
+        public_authority_keys={"step_id"},
+        session_aliased_authority_keys={"child_session_id"},
         untrusted_container_keys={"argv", "detail"},
     )
     for event_type in (

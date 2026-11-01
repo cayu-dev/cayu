@@ -624,10 +624,13 @@ Usage comes from the same per-session aggregate as `cayu session usage`, priced 
 them stopped it. `--jsonl` prints a `step` record per row, a `custom_event` record per
 event, and a closing `summary` record.
 
-An Agent's public event API withholds the step and child session ids in `workflow.*`
-events, so with `--application` the output has `step_ids_withheld: true` and lists the
-run's child sessions (`kind` `child`) in place of named steps; gated-loop outcomes, custom
-events and the totals are the same as from the Agent's store.
+With `--application` the Agent's public event API names each step and its child session
+(see [Workflow journal replay](runtime-contracts.md#workflow-journal-replay)), so the
+output matches the Agent's store. A child session id that redaction would change comes
+back as its public session alias, which the other `cayu session` commands accept. An
+Agent on a Cayu that predates this withholds both ids; the output then has
+`step_ids_withheld: true` and lists the run's child sessions (`kind` `child`) in place of
+named steps, with the same gated-loop outcomes, custom events and totals.
 
 ### Rollups across many sessions
 

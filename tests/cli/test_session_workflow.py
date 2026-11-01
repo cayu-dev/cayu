@@ -254,20 +254,41 @@ def test_cloud_agent_workflow_and_scoped_rollup_match_the_local_store(agent, cap
 
     local = _json(capsys, "workflow", _RUN_ID, "--sqlite", str(path))
     remote = _json(capsys, "workflow", _RUN_ID, "--application", "bug-hunter-agent")
-    assert local["step_ids_withheld"] is False
-    # An Agent's public event view withholds journal step and child ids, so its run lists
-    # the child sessions; the totals, gate outcomes and custom events are the same.
-    assert remote["step_ids_withheld"] is True
-    assert [(row["kind"], row["child_session_id"]) for row in remote["steps"]] == [
-        ("gated_loop", None),
-        ("child", ids["plan"]),
-        ("child", ids["worker"]),
+    # The Agent's public event view names each step and its child session, so the run
+    # reads the same as from its store.
+    assert remote == local
+    assert remote["step_ids_withheld"] is False
+    assert [row["step_id"] for row in remote["steps"] if row["kind"] == "step"] == [
+        "plan",
+        "worker-w1",
     ]
-    assert remote["steps"][0]["outcome"] == "pass"
-    plan = next(row for row in remote["steps"] if row["child_session_id"] == ids["plan"])
-    assert (plan["agent"], plan["sessions"], plan["model_calls"]) == ("planner", 2, 2)
-    for key in ("workflow", "totals", "custom_events", "complete"):
-        assert remote[key] == local[key], key
+    plan = next(row for row in remote["steps"] if row["step_id"] == "plan")
+    assert (plan["child_session_id"], plan["sessions"], plan["model_calls"]) == (ids["plan"], 2, 2)
+
+
+def test_journal_from_an_agent_that_withholds_step_ids_lists_children_instead() -> None:
+    from cayu.cli._workflow_run import _steps_from_journal
+    from cayu.events import Event, EventType
+    from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
+    from cayu.sessions.records import EventRecord
+
+    def record(sequence: int, event_type: EventType, **payload) -> EventRecord:
+        return EventRecord(
+            sequence=sequence,
+            event=Event(type=event_type, session_id=_RUN_ID, agent_name="planner", payload=payload),
+        )
+
+    hidden = {"step_id": PRIVATE_EVENT_AUTHORITY, "child_session_id": PRIVATE_EVENT_AUTHORITY}
+    parsed = _steps_from_journal(
+        [
+            record(1, EventType.WORKFLOW_STEP_STARTED, agent="planner", **hidden),
+            record(2, EventType.WORKFLOW_STEP_COMPLETED, has_output=False, **hidden),
+        ]
+    )
+
+    # An older Agent's public view withholds both ids; the step can't be named.
+    assert parsed.ids_withheld is True
+    assert parsed.steps == []
 
 
 def test_agent_reader_leaves_unset_scope_out_and_names_an_agent_that_refuses_it() -> None:
@@ -534,3 +555,30 @@ def test_a_command_completion_pairs_with_its_step_ids_latest_start() -> None:
         ("completed", "check", {"argv": ["pytest"], "exit_code": 0, "passed": True}),
     )
     assert _rows(journal) == [(0, None, None), (1, 2, 0)]
+
+
+def test_redacted_command_names_never_swap_completions() -> None:
+    from cayu.runtime._event_projection import project_persisted_runtime_event
+    from cayu.vaults.redaction import SecretRedactor
+
+    redactor = SecretRedactor(["alpha-token", "beta-token"])
+    a, b = {"argv": ["pytest"]}, {"argv": ["ruff", "check"]}
+    records = _command_records(
+        ("started", "check-alpha-token", a),
+        ("started", "check-beta-token", b),
+        ("completed", "check-alpha-token", {**a, "exit_code": 0, "passed": True}),
+        ("completed", "check-beta-token", {**b, "exit_code": 3, "passed": False}),
+    )
+    projected = [
+        EventRecord(
+            sequence=record.sequence,
+            event=project_persisted_runtime_event(
+                record.event, sequence=record.sequence, redactor=redactor
+            ),
+        )
+        for record in records
+    ]
+    assert {record.event.payload["step_id"] for record in projected} == {"check-[REDACTED_SECRET]"}
+    assert _rows(projected) == [(0, 2, 0), (1, 3, 3)]
+    assert _steps_from_journal(projected).ids_withheld
+    assert [step.outcome for step in _steps_from_journal(projected).steps] == ["passed", "failed"]
