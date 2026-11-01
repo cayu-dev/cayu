@@ -553,9 +553,12 @@ JSON carries:
 
 - `workflow`: the run's name (from `workflow.started`), agent, causal budget, when the
   journal says it started and completed, and `status`, read from the journal: `completed`
-  once it recorded `workflow.completed`, `running` while it hasn't and a session in the run
+  once it recorded `workflow.completed` for its latest attempt (a run started again under
+  the same session id counts from its new `workflow.started`), `running` while it hasn't and a session in the run
   is still live, and `stopped` when it hasn't and none is (a step raised, the run was cut
-  off, or its process is between steps). `session_status` is the status of the run's own
+  off, or its process is between steps or running a `command()` check, which has no
+  session; that command's row has `journal` `started` until it ends, and the journal can't
+  tell a command still running from a process that died running it). `session_status` is the status of the run's own
   session, which the shipped journal marks completed before the run starts, so it doesn't
   say whether the run finished. A session without a workflow journal reports its own
   status in both.
@@ -566,8 +569,11 @@ JSON carries:
   tokens included) and estimated cost. A step's numbers cover its child session and every
   session under it, which `sessions` counts. A `gated_loop` item row names its loop, item
   key and `outcome` (`pass` or `fail`) and the child of the step it ran; that step's own row
-  carries the usage, unless no step names that child, in which case the item row does. Direct children of the run that no step names are listed with `kind`
-  `child`.
+  carries the usage, unless no step names that child, in which case the item row does. A
+  `command` step row (a `command()` check, which runs in no child session) has no child or
+  usage and carries its `exit_code` and `outcome` (`passed`, `failed`, `timed_out` or
+  `cancelled`); each run of it, a rerun included, is its own row. Direct children of the
+  run that no step names are listed with `kind` `child`.
 - `custom_events`: the `custom.*` events the workflow emitted, in sequence order, with a
   payload preview bounded by `--payload-bytes` (default 2048). Cayu's own `custom.cayu.*`
   markers are left out.

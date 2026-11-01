@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.cli import main
+from cayu.cli._workflow_run import _steps_from_journal
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.evals import ScriptedModelProvider
+from cayu.events import Event, EventType
 from cayu.providers import ModelStreamEvent
+from cayu.runners import LocalRunner
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.sessions.queries import SessionQuery
+from cayu.sessions.records import EventRecord
 from cayu.storage import SQLiteSessionStore
-from cayu.workflows import WorkflowBase, WorkflowSpec, gated_loop, step
+from cayu.workflows import WorkflowBase, WorkflowSpec, command, gated_loop, step
 
 _USAGE = {
     "input_tokens": 10,
@@ -367,3 +375,162 @@ def test_workflow_status_comes_from_the_journal_and_tables_escape_journal_text(
     assert "\x1b" not in table and "\x07" not in table
     assert "items/\\x1b]52;c;YXR0YWNrZXI=\\x07 [pass]" in table
     assert "(stopped)" in table
+
+
+class CheckWorkflow(WorkflowBase):
+    """A command-only workflow that completes only when its check passes."""
+
+    spec = WorkflowSpec(name="check")
+
+    def __init__(self, app: CayuApp, *, code: int) -> None:
+        super().__init__(app)
+        self.code = code
+
+    async def run(self, session_id):
+        ctx = self.context(session_id)
+        yield await ctx.start()
+        result = await command(
+            ctx,
+            step_id="check",
+            argv=[sys.executable, "-c", f"import sys; sys.exit({self.code})"],
+            # Run it every time, as a check of current state does, rather than replaying.
+            rerun=True,
+        )
+        if not result.passed:
+            raise RuntimeError("the check failed")
+        yield await ctx.completed({"passed": True})
+
+
+def _run_checks(path: Path, root: Path, *codes: int) -> None:
+    """Run the check workflow under one session id once per exit code."""
+
+    async def seed() -> None:
+        store = SQLiteSessionStore(path)
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_environment(
+                Environment(EnvironmentSpec(name="local"), runner=LocalRunner(root)),
+                default=True,
+            )
+            for code in codes:
+                workflow = CheckWorkflow(app, code=code)
+                if code == 0:
+                    async for _ in workflow.run("check-run"):
+                        pass
+                else:
+                    with pytest.raises(RuntimeError, match="check failed"):
+                        async for _ in workflow.run("check-run"):
+                            pass
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+
+def test_a_command_step_is_listed_with_its_outcome(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "cayu.db"
+    _run_checks(path, tmp_path, 3)
+
+    payload = _json(capsys, "workflow", "check-run", "--sqlite", str(path))
+
+    (check,) = payload["steps"]
+    assert (check["kind"], check["step_id"], check["child_session_id"]) == (
+        "command",
+        "check",
+        None,
+    )
+    assert (check["journal"], check["outcome"], check["exit_code"]) == ("completed", "failed", 3)
+    assert check["started_at"] is not None and check["ended_at"] is not None
+    assert check["model_calls"] is None
+    assert payload["workflow"]["status"] == "stopped"
+
+    assert main(["session", "workflow", "check-run", "--sqlite", str(path), "--table"]) == 0
+    assert "check [failed]" in capsys.readouterr().out
+
+
+def test_a_rerun_of_a_completed_run_counts_from_its_own_start(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "cayu.db"
+    _run_checks(path, tmp_path, 0, 7)
+
+    payload = _json(capsys, "workflow", "check-run", "--sqlite", str(path))
+
+    # The first attempt completed; the rerun under the same session id failed its check.
+    workflow = payload["workflow"]
+    assert (workflow["status"], workflow["completed_at"]) == ("stopped", None)
+    assert [(row["outcome"], row["exit_code"]) for row in payload["steps"]] == [
+        ("passed", 0),
+        ("failed", 7),
+    ]
+    # Its start is the rerun's, after the first attempt's check ended.
+    assert payload["steps"][0]["ended_at"] <= workflow["started_at"]
+    assert workflow["started_at"] <= payload["steps"][1]["started_at"]
+
+    # Completing it again reads as completed.
+    _run_checks(path, tmp_path, 0)
+    payload = _json(capsys, "workflow", "check-run", "--sqlite", str(path))
+    assert payload["workflow"]["status"] == "completed"
+
+
+def _command_records(*events: tuple[str, str, dict]) -> list[EventRecord]:
+    """Journal records of command steps: (started|completed, step id, extra payload)."""
+
+    start = datetime(2026, 11, 1, 9, tzinfo=UTC)
+    types = {
+        "started": EventType.WORKFLOW_STEP_STARTED,
+        "completed": EventType.WORKFLOW_STEP_COMPLETED,
+    }
+    return [
+        EventRecord(
+            sequence=index + 1,
+            event=Event(
+                type=types[kind],
+                session_id="run",
+                timestamp=start + timedelta(seconds=index),
+                payload={"step_id": step_id, "kind": "command", **extra},
+            ),
+        )
+        for index, (kind, step_id, extra) in enumerate(events)
+    ]
+
+
+def _rows(journal: list[EventRecord]) -> list[tuple[int | None, int | None, int | None]]:
+    """Each command row as (started second, completed second, exit code)."""
+
+    def second(moment: datetime | None) -> int | None:
+        return None if moment is None else moment.second
+
+    return [
+        (second(step.started_at), second(step.completed_at), step.exit_code)
+        for step in _steps_from_journal(journal).steps
+    ]
+
+
+def test_withheld_command_ids_pair_only_when_the_argv_tells_them_apart() -> None:
+    hidden = PRIVATE_EVENT_AUTHORITY
+    a, b = {"argv": ["pytest"]}, {"argv": ["ruff", "check"]}
+    # Two concurrent commands: each completion finds its own start by argv.
+    distinct = _command_records(
+        ("started", hidden, a),
+        ("started", hidden, b),
+        ("completed", hidden, {**a, "exit_code": 0, "passed": True}),
+        ("completed", hidden, {**b, "exit_code": 3, "passed": False}),
+    )
+    assert _rows(distinct) == [(0, 2, 0), (1, 3, 3)]
+    assert _steps_from_journal(distinct).ids_withheld
+    # The same argv twice can't be told apart, so no completion is given another's start.
+    same = _command_records(
+        ("started", hidden, a),
+        ("started", hidden, a),
+        ("completed", hidden, {**a, "exit_code": 0}),
+    )
+    assert _rows(same) == [(0, None, None), (1, None, None), (None, 2, 0)]
+
+
+def test_a_command_completion_pairs_with_its_step_ids_latest_start() -> None:
+    # An earlier attempt died mid-command; the rerun's completion is the rerun's.
+    journal = _command_records(
+        ("started", "check", {"argv": ["pytest"]}),
+        ("started", "check", {"argv": ["pytest"]}),
+        ("completed", "check", {"argv": ["pytest"], "exit_code": 0, "passed": True}),
+    )
+    assert _rows(journal) == [(0, None, None), (1, 2, 0)]
