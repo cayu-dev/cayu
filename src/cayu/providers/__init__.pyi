@@ -162,6 +162,7 @@ from cayu.providers.operations import (
     copy_provider_operation_snapshot as copy_provider_operation_snapshot,
 )
 from cayu.providers.operations import copy_provider_operation_state as copy_provider_operation_state
+from cayu.providers.request_controls import ModelRequestControls as ModelRequestControls
 from cayu.providers.response import ModelResponse as ModelResponse
 from cayu.providers.retry_policy import RetryPolicy as RetryPolicy
 from cayu.providers.retry_policy import copy_retry_policy as copy_retry_policy

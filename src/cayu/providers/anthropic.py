@@ -112,6 +112,7 @@ from cayu.providers.deadlines import (
     _resolve_provider_stream_deadlines,
     observe_provider_semantic_progress,
 )
+from cayu.providers.request_controls import ModelRequestControls, request_controls_from_values
 from cayu.proxies import CredentialProxy
 from cayu.vaults import SecretRef, copy_secret_ref
 
@@ -466,6 +467,9 @@ class AnthropicProvider(ModelProvider):
                 default_max_tokens=self.max_tokens,
             )
         }
+
+    def request_controls(self, request: ModelRequest) -> ModelRequestControls:
+        return anthropic_request_controls(request, default_max_tokens=self.max_tokens)
 
     def __init__(
         self,
@@ -1669,6 +1673,38 @@ def _anthropic_options(options: Mapping[str, Any]) -> dict[str, Any]:
         if key in _RESERVED_ANTHROPIC_OPTIONS:
             raise ValueError(f"Anthropic option is reserved: {key}")
     return copied
+
+
+def anthropic_request_controls(
+    request: ModelRequest,
+    *,
+    default_max_tokens: int,
+) -> ModelRequestControls:
+    """The generation controls an Anthropic Messages payload for ``request`` carries."""
+
+    if type(request) is not ModelRequest:
+        raise TypeError("request must be a ModelRequest.")
+    effective = _effective_anthropic_request_options(
+        request.options,
+        model=request.model,
+        default_max_tokens=default_max_tokens,
+    )
+    thinking = effective.get("thinking")
+    output_config = effective.get("output_config")
+    return request_controls_from_values(
+        reasoning_effort=(
+            output_config.get("effort") if isinstance(output_config, Mapping) else None
+        ),
+        thinking_budget_tokens=(
+            thinking.get("budget_tokens")
+            if isinstance(thinking, Mapping) and thinking.get("type") == "enabled"
+            else None
+        ),
+        temperature=effective.get("temperature"),
+        top_p=effective.get("top_p"),
+        top_k=effective.get("top_k"),
+        max_output_tokens=effective.get("max_tokens"),
+    )
 
 
 def _effective_anthropic_request_options(

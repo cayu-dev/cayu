@@ -1675,3 +1675,40 @@ async def test_provider_conformance_leading_only_system_prompt_serializes_unchan
     assert with_system.pop(field) == expected
     assert field not in without_system
     assert with_system == without_system
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+async def test_provider_conformance_reports_the_request_controls_it_sends(
+    registration: ProviderConformanceRegistration,
+) -> None:
+    """Built-in adapters report their effective controls, matching the wire payload."""
+
+    harness = await registration.factory("text")
+    try:
+        cap_path = harness.provider.output_token_option_path()
+        assert cap_path is not None
+        namespace, *native_cap_path = cap_path
+        native_options: dict[str, Any] = {}
+        target = native_options
+        for key in native_cap_path[:-1]:
+            target = target.setdefault(key, {})
+        target[native_cap_path[-1]] = 321
+        target["temperature"] = 0.25
+        options = {namespace: native_options}
+        messages = [Message.text("user", "Say hello.")]
+        controls = harness.provider.request_controls(
+            ModelRequest(model=harness.model, messages=messages, options=copy.deepcopy(options))
+        )
+    finally:
+        await harness.aclose()
+    sent = await _sent_payload(registration, messages, options=options)
+
+    assert controls is not None, f"{registration.name} does not report its request controls"
+    assert controls.max_output_tokens == 321
+    assert controls.temperature == 0.25
+    wire = sent
+    for key in native_cap_path[:-1]:
+        wire = wire[key]
+    assert wire[native_cap_path[-1]] == controls.max_output_tokens
+    assert wire["temperature"] == controls.temperature

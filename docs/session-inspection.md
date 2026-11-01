@@ -548,6 +548,33 @@ are `null` for a call recorded without completion details. A Cloud Agent whose C
 predates these fields doesn't send them, so its JSON and JSONL rows have no
 `finish_reason` or `raw_finish_reason` keys and the table shows `-`.
 
+### Request controls
+
+`session usage` also shows the generation controls each model call sent and, where the
+provider's API echoes them back, what the provider reported. Each call in JSON and JSONL
+carries:
+
+| Field | Meaning |
+| --- | --- |
+| `request_controls` | The `reasoning_effort`, `thinking_budget_tokens`, `temperature`, `top_p`, `top_k` and `max_output_tokens` the call sent, after Cayu's mapping of `ThinkingConfig` and provider options and the adapter's defaults. A control that is absent wasn't sent; `{}` means none was. Null when the provider adapter doesn't report its controls, and for calls recorded before Cayu did. |
+| `echoed_request_controls` | The controls the provider echoed on its response, with `null` where it echoed a control as null. Null when the response echoed nothing; OpenAI Responses echoes effort, cap, temperature and top_p, the other built-in APIs don't. |
+| `request_controls_mismatch` | Controls that were sent and echoed with a different value, such as an output cap a proxy echoed as `null`. An empty list means the echo matched; null means there was nothing to compare: no echo, or no sent controls (an adapter that doesn't report them, or a `model.started` outside the selected window). Compaction calls are included. |
+
+The table output adds a `Request controls` section, one row per call that has either
+record:
+
+```console
+Request controls
+sequence  sent                                                      echoed                                                                mismatch
+14        reasoning_effort=high temperature=0.5 max_output_tokens=128000  reasoning_effort=high temperature=0.5 top_p=0.98 max_output_tokens=null  max_output_tokens
+```
+
+The sent controls come from the call's `model.started` event and the echo and mismatch
+from its `model.completed` event (see [Request controls](runtime-contracts.md#request-controls)).
+`cayu session events --type model.started --include-payload 2048` shows the same record
+for every attempt, retries included. A Cloud Agent whose Cayu predates these fields returns
+its calls without them.
+
 ### Workflow runs
 
 `cayu session workflow SESSION_ID` shows one workflow run as a whole. `SESSION_ID` is the

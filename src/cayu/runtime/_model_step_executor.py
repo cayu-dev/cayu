@@ -183,6 +183,7 @@ from cayu.providers.operations import (
     ProviderOperationSnapshot,
     ProviderOperationStartIdempotencySupport,
 )
+from cayu.providers.request_controls import REQUEST_CONTROLS_PAYLOAD_KEY
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.releases import release_event_fields
 from cayu.runtime import _context_events
@@ -276,6 +277,7 @@ from cayu.runtime._provider_operation_start_owner import (
 from cayu.runtime._provider_stream import (
     _close_async_iterator,
 )
+from cayu.runtime._request_controls import model_request_controls_payload
 from cayu.runtime._run_limits import (
     _TRUSTED_BINDING_PROVENANCE,
     UNKNOWN_POST_DISPATCH_BUDGET_REASON,
@@ -1909,6 +1911,10 @@ class ModelStepExecutor:
                 )
                 if context_count_event is not None:
                     yield context_count_event, None
+                request_controls = model_request_controls_payload(
+                    provider,
+                    attempt_model_request,
+                )
                 model_started = _event_with_model_identity_authority(
                     Event(
                         type=EventType.MODEL_STARTED,
@@ -1920,6 +1926,11 @@ class ModelStepExecutor:
                             "step": step,
                             "attempt": attempt,
                             "max_attempts": retry_policy.max_attempts,
+                            **(
+                                {REQUEST_CONTROLS_PAYLOAD_KEY: request_controls}
+                                if request_controls is not None
+                                else {}
+                            ),
                             **(
                                 {
                                     MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY: (
@@ -1986,6 +1997,7 @@ class ModelStepExecutor:
                     memory_evidence_reference=memory_evidence_reference,
                     child_session_notification_binding=child_session_notification_binding,
                     prepared_model_completion_dispatch=pre_count_completion_dispatch,
+                    request_controls=request_controls,
                 )
                 result: AssistantStepResult | None = None
                 async for event, step_result in attempt_events:

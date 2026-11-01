@@ -10,6 +10,12 @@ from cayu.artifacts.settlement import ArtifactWriteSettlementEvidence
 from cayu.egress.authority import EgressAuthorityTransitionState
 from cayu.events import SESSION_EXPORT_EVENT_FIELDS, SESSION_EXPORT_EVENT_TYPES, Event, EventType
 from cayu.providers._retry_decision import RetryDecision
+from cayu.providers.request_controls import (
+    ECHOED_REQUEST_CONTROLS_KEY,
+    REQUEST_CONTROL_FIELDS,
+    REQUEST_CONTROLS_MISMATCH_KEY,
+    REQUEST_CONTROLS_PAYLOAD_KEY,
+)
 from cayu.releases import RELEASE_EVENT_PAYLOAD_KEY, ReleaseIdentity
 from cayu.tools._argument_publication import ARGUMENTS_IDENTITY_FIELD
 from cayu.tools._shared_artifact_result_schema import (
@@ -60,6 +66,10 @@ _MODEL_POLICY_PATHS = frozenset(
         for key in ("snapshot_id", "effective_revision", "config_sha256")
     ]
 )
+
+
+def _request_control_paths(key: str) -> frozenset[tuple[str, ...]]:
+    return frozenset((key, field_name) for field_name in REQUEST_CONTROL_FIELDS)
 
 
 _MANAGED_SETTINGS_PATHS = frozenset(("managed_settings", key) for key in ("revision", "values"))
@@ -1278,8 +1288,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     model_started = _observed_policy(
         "actor attempt attempt_id compactor execution_profile_fingerprint instruction_digest instruction_present max_attempts "
         "file_attachment_attestations mode model model_attempt_id model_step_id operation_id provider purpose reason request_id "
+        f"{REQUEST_CONTROLS_PAYLOAD_KEY} "
         f"source_run_epoch source_transcript_cursor step {RELEASE_EVENT_PAYLOAD_KEY}",
-        owned_nested_paths=_resolution_actor_nested_paths("actor") | _RELEASE_PATHS,
+        owned_nested_paths=(
+            _resolution_actor_nested_paths("actor")
+            | _RELEASE_PATHS
+            | _request_control_paths(REQUEST_CONTROLS_PAYLOAD_KEY)
+        ),
         authority_keys=(_MODEL_EXECUTION_AUTHORITY_KEYS | {"file_attachment_attestations"}),
         internal_authority_keys={"file_attachment_attestations"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
@@ -1438,6 +1453,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "context_overflow",
         "context_pressure",
         "details",
+        ECHOED_REQUEST_CONTROLS_KEY,
         "end_turn",
         "error",
         "error_type",
@@ -1461,6 +1477,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "reason",
         "rejected_usage_evidence",
         "request_id",
+        REQUEST_CONTROLS_MISMATCH_KEY,
         "requested_model",
         "source_run_epoch",
         "source_transcript_cursor",
@@ -1484,6 +1501,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             | _MODEL_BUDGET_SETTLEMENT_NESTED_PATHS
             | _MODEL_CONTEXT_PRESSURE_NESTED_PATHS
             | _resolution_actor_nested_paths("actor")
+            | _request_control_paths(ECHOED_REQUEST_CONTROLS_KEY)
             | {
                 ("step_classification", "type"),
                 ("step_classification", "reason"),

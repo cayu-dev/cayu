@@ -383,6 +383,7 @@ class LiveModelAttempt:
         child_session_notification_binding: ChildSessionNotificationStageBinding | None,
         prepared_model_completion_dispatch: ModelCompletionDispatch | None,
         retry_elapsed_s: Callable[[], float] | None = None,
+        request_controls: dict[str, Any] | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         input_coverage = context_input_coverage(
             model_request.messages, transcript_cursor=transcript_cursor_before_request
@@ -1246,6 +1247,7 @@ class LiveModelAttempt:
                         execution_profile_fingerprint=(
                             None if execution_profile is None else execution_profile.fingerprint
                         ),
+                        request_controls=request_controls,
                     )
                     if provider_operation_state is not None and terminal_progress_verified:
                         if completion_dispatch is None:  # pragma: no cover - checked at start

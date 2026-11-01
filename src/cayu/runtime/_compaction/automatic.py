@@ -119,6 +119,7 @@ from cayu.runtime._model_execution_selection import (
     ModelFailoverTransition,
 )
 from cayu.runtime._model_stage_abandonment import abandon_pre_dispatch_model_stage
+from cayu.runtime._request_controls import request_controls_field
 from cayu.runtime._run_limits import (
     BudgetedOperationFailed,
     BudgetedOperationRejected,
@@ -2482,6 +2483,7 @@ class AutomaticCompactionRun:
                                     "attempt": attempt,
                                     "max_attempts": max_attempts,
                                     "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
+                                    **request_controls_field(provider, detached_request),
                                     **model_attempt_identity.payload(),
                                     **release_event_fields(
                                         self._owner._event_writer.release_identity

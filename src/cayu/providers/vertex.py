@@ -47,6 +47,7 @@ from cayu.providers.anthropic import (
     _anthropic_tool,
     _effective_anthropic_request_options,
     _validate_anthropic_tool_name,
+    anthropic_request_controls,
     anthropic_response_events,
     anthropic_stream_events,
     build_anthropic_payload,
@@ -72,6 +73,7 @@ from cayu.providers.deadlines import (
     ProviderStreamDeadlines,
     _resolve_provider_stream_deadlines,
 )
+from cayu.providers.request_controls import ModelRequestControls
 
 DEFAULT_VERTEX_REGION = "global"
 DEFAULT_VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
@@ -358,6 +360,9 @@ class VertexProvider(ModelProvider):
                 default_max_tokens=self.max_tokens,
             )
         }
+
+    def request_controls(self, request: ModelRequest) -> ModelRequestControls:
+        return anthropic_request_controls(request, default_max_tokens=self.max_tokens)
 
     @property
     def anthropic_version(self) -> str:

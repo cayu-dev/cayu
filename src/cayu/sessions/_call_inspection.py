@@ -42,6 +42,15 @@ from cayu.budgets.usage import (
 )
 from cayu.events import Event, EventType
 from cayu.execution_units import ToolRoundIdentity
+from cayu.providers.request_controls import (
+    ECHOED_REQUEST_CONTROLS_KEY,
+    REQUEST_CONTROL_FIELDS,
+    REQUEST_CONTROLS_MISMATCH_KEY,
+    REQUEST_CONTROLS_PAYLOAD_KEY,
+    copy_echoed_request_controls,
+    copy_request_controls_payload,
+    request_controls_mismatch,
+)
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import EventRecord
 from cayu.tools.policy import ToolPolicyDecision
@@ -210,6 +219,8 @@ _TOOL_INSPECTION_IDENTITY_CONFLICT_KEY = "_cayu_tool_identity_conflict"
 
 
 USAGE_INSPECTION_EVENT_TYPES = (
+    # Read for the request controls each call sent; joined to its completion by attempt.
+    EventType.MODEL_STARTED,
     EventType.MODEL_COMPLETED,
     # Read for cost only: they add to a priced view's estimated cost, not to its rows.
     EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
@@ -228,8 +239,17 @@ def model_call_usage(
     unmatched_ledger: list[dict[str, Any]] = []
     reservations: dict[str, dict[str, Any]] = {}
     settled_reservation_ids: set[str] = set()
+    sent_controls: dict[str, dict[str, Any]] = {}
     for record in records:
         event = record.event
+        if event.type == EventType.MODEL_STARTED:
+            attempt_id = event.payload.get("model_attempt_id")
+            controls = copy_request_controls_payload(
+                event.payload.get(REQUEST_CONTROLS_PAYLOAD_KEY)
+            )
+            if type(attempt_id) is str and controls is not None:
+                sent_controls[attempt_id] = controls
+            continue
         if event.type == EventType.BUDGET_RESERVED:
             reservation_id = event.payload.get("reservation_id")
             if type(reservation_id) is not str:
@@ -269,6 +289,7 @@ def model_call_usage(
                 "pricing_state": "unknown",
                 "ledger": [],
                 **_call_cost(event.payload.get(_COST_KEY)),
+                **_call_request_controls(event.payload, sent_controls),
             }
             calls.append(call)
             continue
@@ -307,6 +328,37 @@ def model_call_usage(
             continue
         unmatched_ledger.append({**ledger, "outcome": "open"})
     return calls, unmatched_ledger
+
+
+def _call_request_controls(
+    payload: dict[str, Any],
+    sent_controls: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """The controls a call sent, those its provider echoed, and which of them differ.
+
+    The sent controls come from the call's ``model.started`` event. The mismatch is
+    the one recorded on the completion; a completion without one (a compaction call,
+    or one recovered after a restart) is compared here instead. Without sent controls
+    to compare against, the mismatch is None (not compared), never an empty match.
+    """
+
+    attempt_id = payload.get("model_attempt_id")
+    sent = sent_controls.get(attempt_id) if type(attempt_id) is str else None
+    echoed = copy_echoed_request_controls(payload.get(ECHOED_REQUEST_CONTROLS_KEY))
+    mismatch: list[str] | None = None
+    if echoed is not None:
+        recorded = payload.get(REQUEST_CONTROLS_MISMATCH_KEY)
+        if type(recorded) is list and all(
+            type(field) is str and field in REQUEST_CONTROL_FIELDS for field in recorded
+        ):
+            mismatch = list(cast("list[str]", recorded))
+        elif sent is not None:
+            mismatch = request_controls_mismatch(sent, echoed)
+    return {
+        "request_controls": sent,
+        "echoed_request_controls": echoed,
+        "request_controls_mismatch": mismatch,
+    }
 
 
 TOOL_INSPECTION_EVENT_TYPES = (
@@ -1159,10 +1211,21 @@ def usage_inspection_record(record: EventRecord, pricer: CallPricer | None = Non
             "cost_currency": cost.currency,
             "cost_state": "priced" if cost.priced else "unpriced",
         }
+    if event.type == EventType.MODEL_STARTED:
+        for key in ("model_attempt_id", REQUEST_CONTROLS_PAYLOAD_KEY):
+            if key in event.payload:
+                payload[key] = event.payload[key]
     if event.type == EventType.MODEL_COMPLETED:
         transcript_cursor = event.payload.get("transcript_cursor")
         if transcript_cursor is not None:
             payload["transcript_cursor"] = transcript_cursor
+        for key in (
+            "model_attempt_id",
+            ECHOED_REQUEST_CONTROLS_KEY,
+            REQUEST_CONTROLS_MISMATCH_KEY,
+        ):
+            if key in event.payload:
+                payload[key] = event.payload[key]
         completion = event.payload.get("completion")
         if type(completion) is dict:
             payload["completion"] = {

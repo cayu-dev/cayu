@@ -102,6 +102,7 @@ from cayu.providers.deadlines import (
     _resolve_provider_stream_deadlines,
     observe_provider_semantic_progress,
 )
+from cayu.providers.request_controls import ModelRequestControls, request_controls_from_values
 
 if TYPE_CHECKING:
     import httpx
@@ -621,6 +622,9 @@ class ChatCompletionsProvider(ModelProvider):
             options_key=self.name,
         )
         return {self.name: effective} if effective else {}
+
+    def request_controls(self, request: ModelRequest) -> ModelRequestControls:
+        return chat_completions_request_controls(request, options_key=self.name)
 
     async def aclose(self) -> None:
         """Close the transport's shared HTTP client, if it owns one."""
@@ -2187,6 +2191,45 @@ def _chat_completions_options(options: Mapping[str, Any], options_key: str) -> d
         if key in _RESERVED_CHAT_COMPLETIONS_OPTIONS:
             raise ValueError(f"Chat Completions option is reserved: {key}")
     return copied
+
+
+def chat_completions_request_controls(
+    request: ModelRequest,
+    *,
+    options_key: str,
+) -> ModelRequestControls:
+    """The generation controls a Chat Completions payload for ``request`` carries.
+
+    The cap is ``max_completion_tokens``, else the older ``max_tokens``. Effort is
+    ``reasoning_effort``, else a compatible endpoint's ``reasoning.effort``.
+    """
+
+    if type(request) is not ModelRequest:
+        raise TypeError("request must be a ModelRequest.")
+    effective = _effective_chat_completions_request_options(
+        request.options,
+        model=request.model,
+        options_key=options_key,
+    )
+    reasoning = effective.get("reasoning")
+    thinking = effective.get("thinking")
+    reasoning_effort = effective.get("reasoning_effort")
+    if reasoning_effort is None and isinstance(reasoning, Mapping):
+        reasoning_effort = reasoning.get("effort")
+    budget = thinking.get("budget_tokens") if isinstance(thinking, Mapping) else None
+    if budget is None and isinstance(reasoning, Mapping):
+        budget = reasoning.get("max_tokens")
+    max_output_tokens = effective.get("max_completion_tokens")
+    if max_output_tokens is None:
+        max_output_tokens = effective.get("max_tokens")
+    return request_controls_from_values(
+        reasoning_effort=reasoning_effort,
+        thinking_budget_tokens=budget,
+        temperature=effective.get("temperature"),
+        top_p=effective.get("top_p"),
+        top_k=effective.get("top_k"),
+        max_output_tokens=max_output_tokens,
+    )
 
 
 def _effective_chat_completions_request_options(

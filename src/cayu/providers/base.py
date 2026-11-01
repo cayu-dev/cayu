@@ -62,6 +62,7 @@ from cayu.providers.operations import (
     ProviderOperationRecoveryMetadata,
     ProviderOperationStatus,
 )
+from cayu.providers.request_controls import ModelRequestControls
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 _REQUEST_FOOTPRINT_SAFE_PROVIDER_OPTION_KEYS = frozenset(
@@ -1608,6 +1609,23 @@ class ModelProvider(ABC):
             for key, value in request.options.items()
             if key not in _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS and value is not None
         }
+
+    def request_controls(self, request: ModelRequest) -> ModelRequestControls | None:
+        """Report the generation controls this adapter will send for ``request``.
+
+        Return the effective reasoning effort, thinking budget, temperature,
+        top_p, top_k and output-token cap after the adapter's own mapping of
+        ``ThinkingConfig`` and raw options and its defaults, as they will appear
+        on the wire. A field left ``None`` is not sent, so the provider's default
+        applies. The runtime records the result on ``model.started``; it never
+        changes what is sent. ``None``, the default, means the adapter does not
+        report its controls, so custom providers stay source-compatible.
+        Transparent wrappers delegate this hook. Implementations must be
+        deterministic, side-effect free, and perform no I/O.
+        """
+
+        del request
+        return None
 
     def preflight_model_target(self, *, model: str) -> None:
         """Reject an unavailable provider/model target before runtime mutation.

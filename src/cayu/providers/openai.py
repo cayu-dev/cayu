@@ -175,6 +175,12 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
     copy_provider_operation_state,
 )
+from cayu.providers.request_controls import (
+    ECHOED_REQUEST_CONTROLS_KEY,
+    ModelRequestControls,
+    openai_responses_echoed_request_controls,
+    request_controls_from_values,
+)
 from cayu.vaults.redaction import REDACTED_SECRET
 
 if TYPE_CHECKING:
@@ -1396,6 +1402,9 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         if not self.streaming:
             effective["stream"] = False
         return {"openai": effective} if effective else {}
+
+    def request_controls(self, request: ModelRequest) -> ModelRequestControls:
+        return openai_request_controls(request)
 
     def __init__(
         self,
@@ -4846,6 +4855,9 @@ def _completed_event_from_response(
         and item.get("type") == "web_search_call"
         and item.get("status") == "outcome_unknown"
     )
+    echoed_controls = openai_responses_echoed_request_controls(response)
+    if echoed_controls is not None:
+        payload[ECHOED_REQUEST_CONTROLS_KEY] = echoed_controls
     if web_search_calls or web_search_outcome_unknown:
         payload["hosted_tool_usage"] = {
             "web_search_calls": web_search_calls,
@@ -6047,6 +6059,22 @@ def _effective_openai_request_options(
     effective = _openai_options(options)
     _apply_thinking_options(effective, options.get("thinking"))
     return effective
+
+
+def openai_request_controls(request: ModelRequest) -> ModelRequestControls:
+    """The generation controls an OpenAI Responses payload for ``request`` carries."""
+
+    if type(request) is not ModelRequest:
+        raise TypeError("request must be a ModelRequest.")
+    effective = _effective_openai_request_options(request.options, model=request.model)
+    reasoning = effective.get("reasoning")
+    return request_controls_from_values(
+        reasoning_effort=reasoning.get("effort") if isinstance(reasoning, Mapping) else None,
+        temperature=effective.get("temperature"),
+        top_p=effective.get("top_p"),
+        top_k=effective.get("top_k"),
+        max_output_tokens=effective.get("max_output_tokens"),
+    )
 
 
 def _effective_openai_request_options_for_request(

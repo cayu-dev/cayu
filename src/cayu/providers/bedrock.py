@@ -103,6 +103,7 @@ from cayu.providers.deadlines import (
     current_provider_deadline_controller,
     observe_provider_semantic_progress,
 )
+from cayu.providers.request_controls import ModelRequestControls, request_controls_from_values
 
 DEFAULT_BEDROCK_MAX_TOKENS = 4096
 DEFAULT_BEDROCK_STREAM_CLOSE_TIMEOUT_SECONDS = 5.0
@@ -435,6 +436,9 @@ class BedrockProvider(ModelProvider):
             default_max_tokens=self.max_tokens,
         )
         return {"bedrock": {"inferenceConfig": inference, **options}}
+
+    def request_controls(self, request: ModelRequest) -> ModelRequestControls:
+        return bedrock_request_controls(request, default_max_tokens=self.max_tokens)
 
     def _resolved_cache_policy(
         self,
@@ -1019,6 +1023,46 @@ def bedrock_model_supports_default_prompt_caching(model: str) -> bool:
     if separator and head in _BEDROCK_CROSS_REGION_PREFIXES:
         base = rest
     return base.startswith(_BEDROCK_PROMPT_CACHE_MODEL_PREFIXES)
+
+
+def bedrock_request_controls(
+    request: ModelRequest,
+    *,
+    default_max_tokens: int,
+) -> ModelRequestControls:
+    """The generation controls a Bedrock Converse payload for ``request`` carries.
+
+    ``inferenceConfig`` carries the cap, temperature and top_p. Model-specific
+    ``additionalModelRequestFields`` may carry ``top_k`` and Anthropic-style
+    ``thinking.budget_tokens`` and ``output_config.effort``; other model-specific
+    fields are not interpreted.
+    """
+
+    if type(request) is not ModelRequest:
+        raise TypeError("request must be a ModelRequest.")
+    inference, options = _bedrock_request_options(
+        request.options,
+        default_max_tokens=default_max_tokens,
+    )
+    additional = options.get("additionalModelRequestFields")
+    if not isinstance(additional, Mapping):
+        additional = {}
+    thinking = additional.get("thinking")
+    output_config = additional.get("output_config")
+    return request_controls_from_values(
+        reasoning_effort=(
+            output_config.get("effort") if isinstance(output_config, Mapping) else None
+        ),
+        thinking_budget_tokens=(
+            thinking.get("budget_tokens")
+            if isinstance(thinking, Mapping) and thinking.get("type") == "enabled"
+            else None
+        ),
+        temperature=inference.get("temperature"),
+        top_p=inference.get("topP"),
+        top_k=additional.get("top_k"),
+        max_output_tokens=inference.get("maxTokens"),
+    )
 
 
 def _bedrock_request_options(

@@ -3114,6 +3114,28 @@ class ApiSessionModelCall(ApiBaseModel):
     cost_state: Literal["priced", "unpriced"] | None = Field(
         default=None, description="Null unless the request carried a price book."
     )
+    request_controls: dict[str, StrictStr | StrictInt | StrictFloat] | None = Field(
+        default=None,
+        description=(
+            "The reasoning effort, thinking budget, sampling settings and output-token cap the "
+            "call sent, from its `model.started` event. A control that is absent wasn't sent. "
+            "Null when the provider adapter doesn't report its controls."
+        ),
+    )
+    echoed_request_controls: dict[str, StrictStr | StrictInt | StrictFloat | None] | None = Field(
+        default=None,
+        description=(
+            "The controls the provider echoed back on its response, where its API returns them. "
+            "A null value means the provider echoed the control as null."
+        ),
+    )
+    request_controls_mismatch: list[StrictStr] | None = Field(
+        default=None,
+        description=(
+            "Controls the call sent whose echoed value differs, such as an output cap echoed "
+            "as null. Null when the provider echoed nothing."
+        ),
+    )
 
 
 class ApiSessionModelCallAggregate(ApiBaseModel):

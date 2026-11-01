@@ -93,6 +93,11 @@ from cayu.providers.base import (
     copy_model_completion,
     copy_usage_dialect,
 )
+from cayu.providers.request_controls import (
+    ECHOED_REQUEST_CONTROLS_KEY,
+    apply_echoed_request_controls,
+    copy_echoed_request_controls,
+)
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._model_errors import (
@@ -1418,6 +1423,11 @@ def sanitize_context_compaction_telemetry(
                 payload[key] = value
         if normalization_failed or invalid_usage:
             payload["usage_unavailable_reason"] = "invalid compaction usage telemetry"
+        # Only the validated echo is public; the mismatch flag is runtime-owned and
+        # readers compare the echo with the call's model.started record.
+        echoed_controls = copy_echoed_request_controls(source.get(ECHOED_REQUEST_CONTROLS_KEY))
+        if echoed_controls is not None:
+            payload[ECHOED_REQUEST_CONTROLS_KEY] = echoed_controls
         context_overflow = _compaction_event_bool(source.get("context_overflow"))
         if context_overflow is not None:
             payload["context_overflow"] = context_overflow
@@ -7560,6 +7570,9 @@ def _compaction_model_completed_payload(
     """
 
     payload = copy_json_value(completed_payload, "completed")
+    # The compaction call's sent controls are on its own model.started record;
+    # readers compare the validated echo against them.
+    apply_echoed_request_controls(payload, request_controls=None)
     resolved_model = payload.get("model")
     if type(resolved_model) is not str or not resolved_model.strip():
         resolved_model = fallback_model

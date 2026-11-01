@@ -1740,6 +1740,14 @@ export type ApiSessionModelCall = {
      */
     cost_state?: 'priced' | 'unpriced' | null;
     /**
+     * Echoed Request Controls
+     *
+     * The controls the provider echoed back on its response, where its API returns them. A null value means the provider echoed the control as null.
+     */
+    echoed_request_controls?: {
+        [key: string]: string | number | number | null;
+    } | null;
+    /**
      * Finish Reason
      *
      * Why the call ended, normalized: stop, tool_calls, length, content_filter, error or unknown.
@@ -1775,6 +1783,20 @@ export type ApiSessionModelCall = {
      * Reasoning Tokens
      */
     reasoning_tokens: number | null;
+    /**
+     * Request Controls
+     *
+     * The reasoning effort, thinking budget, sampling settings and output-token cap the call sent, from its `model.started` event. A control that is absent wasn't sent. Null when the provider adapter doesn't report its controls.
+     */
+    request_controls?: {
+        [key: string]: string | number | number;
+    } | null;
+    /**
+     * Request Controls Mismatch
+     *
+     * Controls the call sent whose echoed value differs, such as an output cap echoed as null. Null when the provider echoed nothing.
+     */
+    request_controls_mismatch?: Array<string> | null;
     /**
      * Requested Model
      */

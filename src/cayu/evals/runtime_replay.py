@@ -558,6 +558,9 @@ class _RecordedProvider(ModelProvider):
     def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
         return self._source.request_fingerprint_options(request)
 
+    def request_controls(self, request: ModelRequest):
+        return self._source.request_controls(request)
+
     def preflight_model_target(self, *, model: str) -> None:
         self._source.preflight_model_target(model=model)
 

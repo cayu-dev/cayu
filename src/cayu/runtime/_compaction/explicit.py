@@ -133,6 +133,7 @@ from cayu.runtime._recovery_ownership import (
     RecoveryOwnership,
     _checkpoint_without_active_incomplete_recovery_claim,
 )
+from cayu.runtime._request_controls import request_controls_field
 from cayu.runtime._run_limits import (
     BudgetReservationIdentityGuard,
     BudgetReservationLeaseLost,
@@ -2112,6 +2113,7 @@ class SessionCompaction:
                                     "attempt": dispatch_attempt,
                                     "max_attempts": max_dispatch_attempts,
                                     "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
+                                    **request_controls_field(provider, detached_request),
                                     **model_attempt_identity.payload(),
                                     **release_event_fields(self._event_writer.release_identity),
                                 },

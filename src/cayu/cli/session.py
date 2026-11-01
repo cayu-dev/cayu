@@ -1567,6 +1567,8 @@ def _render_usage(
     )
     if safe_calls:
         print()
+    if _print_request_controls(safe_calls):
+        print()
     print("Aggregate usage")
     safe_aggregate = cast("dict[str, Any]", safe_payload["aggregate"])
     _print_table(
@@ -1602,6 +1604,45 @@ def _render_usage(
             ),
             safe_ledger,
         )
+
+
+def _print_request_controls(calls: list[dict[str, Any]]) -> bool:
+    """Print the controls each call sent and its provider echoed, when any call has them."""
+
+    rows = [
+        {
+            "sequence": call.get("sequence"),
+            "sent": _request_controls_text(call.get("request_controls"), unset="provider defaults"),
+            "echoed": _request_controls_text(call.get("echoed_request_controls"), unset=None),
+            "mismatch": ", ".join(call.get("request_controls_mismatch") or ()) or None,
+        }
+        for call in calls
+        if call.get("request_controls") is not None
+        or call.get("echoed_request_controls") is not None
+    ]
+    if not rows:
+        return False
+    print("Request controls")
+    _print_table(("sequence", "sent", "echoed", "mismatch"), rows)
+    return True
+
+
+def _request_controls_text(controls: object, *, unset: str | None) -> str | None:
+    if not isinstance(controls, dict):
+        return None
+    if not controls:
+        return unset
+    return " ".join(
+        f"{field}={'null' if value is None else _printable_control(value)}"
+        for field, value in controls.items()
+    )
+
+
+def _printable_control(value: object) -> str:
+    """Escape anything a terminal would interpret; echoed values come from the provider."""
+
+    text = str(value)
+    return text if text.isprintable() else text.encode("unicode_escape").decode("ascii")
 
 
 async def _session_tools(args: argparse.Namespace, reader: SessionReader) -> int:

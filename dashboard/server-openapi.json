@@ -3501,6 +3501,34 @@
             "description": "Null unless the request carried a price book.",
             "title": "Cost State"
           },
+          "echoed_request_controls": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The controls the provider echoed back on its response, where its API returns them. A null value means the provider echoed the control as null.",
+            "title": "Echoed Request Controls"
+          },
           "finish_reason": {
             "anyOf": [
               {
@@ -3579,6 +3607,46 @@
               }
             ],
             "title": "Reasoning Tokens"
+          },
+          "request_controls": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The reasoning effort, thinking budget, sampling settings and output-token cap the call sent, from its `model.started` event. A control that is absent wasn't sent. Null when the provider adapter doesn't report its controls.",
+            "title": "Request Controls"
+          },
+          "request_controls_mismatch": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Controls the call sent whose echoed value differs, such as an output cap echoed as null. Null when the provider echoed nothing.",
+            "title": "Request Controls Mismatch"
           },
           "requested_model": {
             "anyOf": [

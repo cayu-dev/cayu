@@ -11532,6 +11532,50 @@ sanitizing secrets.
 
 Model providers translate model-specific APIs into Cayu runtime contracts.
 
+### Request controls
+
+Every model attempt records the generation controls it sent. Before
+`model.started`, the runtime asks the adapter for
+`ModelProvider.request_controls(request)`, which returns a
+`ModelRequestControls` (`cayu.providers`) with the effective values after the
+adapter's own mapping of `ThinkingConfig` and raw provider options and its
+defaults: `reasoning_effort`, `thinking_budget_tokens`, `temperature`, `top_p`,
+`top_k` and `max_output_tokens` (whichever wire field carries the cap:
+`max_output_tokens`, `max_tokens`, `max_completion_tokens` or Bedrock
+`maxTokens`). `model.started.payload.request_controls` holds the controls that
+were sent; a control that is absent wasn't sent, so the provider's default
+applied, and `{}` means the adapter sent none of them. Effort values are the
+provider's native vocabulary, unchanged. The record never contains prompts,
+messages, tool definitions or other raw options.
+
+Every built-in adapter implements the hook, and the provider conformance suite
+checks that the reported cap and temperature match the wire payload. The base
+implementation returns `None`, so a custom provider keeps working and its
+`model.started` simply has no `request_controls`; transparent wrappers should
+delegate. The hook must be deterministic, side-effect free and perform no I/O.
+If it raises or returns another type, the attempt still runs and the record is
+left out.
+
+When the provider's response echoes the effective settings, the adapter puts them
+in its completion payload under `echoed_request_controls` (same field names). The
+OpenAI Responses adapters read `reasoning.effort`, `max_output_tokens`,
+`temperature` and `top_p` from the response; a field the response carries as
+`null` is recorded as `null`, and a field it omits is left out. Chat Completions,
+Anthropic, Vertex and Bedrock responses don't echo these settings. The runtime
+validates the echo, drops fields it doesn't recognize, and compares it with what
+was sent: `model.completed.payload.request_controls_mismatch` lists the controls
+that were sent and echoed with a different value, such as an output cap echoed as
+`null` by a proxy that dropped it. An echoed value for a control Cayu didn't send
+is the provider's default and isn't a mismatch. The mismatch flag is runtime-owned;
+a provider payload can't set it. Context-compaction model calls record
+`request_controls` on their own `model.started` and the validated echo on their
+`model.completed`, but no flag. They are compared by `cayu session usage` against the
+call's `model.started` record, as is a completion recovered after a restart. When no
+sent controls are known (an adapter that doesn't report them, or a `model.started`
+outside the inspected window), the mismatch is reported as `null`, not as a match.
+Echoed effort values with control characters are dropped. Events written before this
+change have none of these fields and read as before.
+
 OpenAI Responses protocol failures emitted by `OpenAIProvider.stream()` retain
 credential-safe diagnostics in the error payload and persisted/public
 `model.error` events:

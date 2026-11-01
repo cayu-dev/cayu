@@ -57,6 +57,7 @@ from cayu.providers.base import (
     normalize_model_completion,
 )
 from cayu.providers.operations import ProviderOperationRecoveryMetadata
+from cayu.providers.request_controls import apply_echoed_request_controls
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._completion_projection import portable_model_completion_projection
@@ -416,6 +417,7 @@ def _model_stream_event_to_runtime_event(
     completion_diagnostics: dict[str, Any] | None = None,
     execution_profile_fingerprint: str | None = None,
     retry_decision: RetryDecision | None = None,
+    request_controls: dict[str, Any] | None = None,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
         raise TypeError("Model stream events must be ModelStreamEvent instances.")
@@ -543,6 +545,7 @@ def _model_stream_event_to_runtime_event(
         payload.pop("input_coverage", None)
         if input_coverage is not None:
             payload["input_coverage"] = input_coverage.model_dump(mode="json")
+        apply_echoed_request_controls(payload, request_controls=request_controls)
         if completion_diagnostics:
             payload.update(
                 copy_durable_json_object(

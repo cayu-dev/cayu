@@ -89,9 +89,11 @@ from cayu.providers.openai import (
     _validate_openai_tool_name,
     build_openai_payload,
     is_openai_hosted_tool_rejection,
+    openai_request_controls,
     openai_stream_events,
     preflight_openai_native_structured_output_schema,
 )
+from cayu.providers.request_controls import ModelRequestControls
 from cayu.vaults.redaction import SecretRedactor
 
 _AUTH_STORE_VERSION = 1
@@ -723,6 +725,9 @@ class OpenAISubscriptionProvider(ModelProvider):
     def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
         effective = _effective_openai_request_options_for_request(request)
         return {"openai": effective} if effective else {}
+
+    def request_controls(self, request: ModelRequest) -> ModelRequestControls:
+        return openai_request_controls(request)
 
     async def billing_identity_for_request(self, request: ModelRequest) -> BillingIdentity:
         return BillingIdentity(

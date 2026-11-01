@@ -90,6 +90,13 @@ transports. Confirm support at the selected backend with a bounded live probe
 that checks the emitted request and successful response. A successful response
 does not prove internal reasoning allocation.
 
+To see what a session actually sent, run `cayu session usage SESSION_ID`. Each
+model call lists the effort, thinking budget, sampling settings and output cap it
+sent (from `model.started`) and, for OpenAI Responses, the values the response
+echoed back, flagging any that differ. A compatible proxy that echoes
+`max_output_tokens: null` after a cap was sent shows up there as a
+`max_output_tokens` mismatch.
+
 Audit sources: OpenAI [Chat Completions schema](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
 [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning),
 [GPT-5](https://developers.openai.com/api/docs/models/gpt-5),
