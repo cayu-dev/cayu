@@ -21002,7 +21002,9 @@ two fields and every built-in store applies them in its native query.
 `max_sessions` (at most 500) sessions created in the `since`/`until` window, oldest first,
 the per-group sums of sessions, statuses, model and tool calls, tool failures by error kind,
 aggregate usage and time by phase. `group_by` is `agent`, `day`, `release` or `label:KEY`;
-`agent_name`, `environment_name`, `status` and `labels` filter sessions. With a `pricing`
+`agent_name`, `environment_name`, `status`, `labels`, `causal_budget_id` and
+`root_session_id` filter sessions (the last two accept public session aliases, resolved as
+`GET /api/sessions` resolves `causal_budget_id`). With a `pricing`
 price book each group also sums its model calls' estimated cost per currency (`cost`) and
 counts `unpriced_model_calls`. Groups merge by
 adding, so a client reads `next_cursor` pages and merges groups with the same key. Each

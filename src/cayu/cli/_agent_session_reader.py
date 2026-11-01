@@ -61,6 +61,8 @@ class AgentSessionReader:
             "provider_name": query.provider_name,
             "model": query.model,
             "environment_name": query.environment_name,
+            "parent_session_id": query.parent_session_id,
+            "causal_budget_id": query.causal_budget_id,
             "label": [f"{key}={value}" for key, value in query.labels.items()],
             "order_by": query.order_by.value,
             "created_since": _instant(query.created_since),
@@ -259,6 +261,17 @@ class AgentSessionReader:
                     "/sessions/rollup", _rollup_body(query), resource="session rollups"
                 )
             except CayuApiError as exc:
+                if exc.status_code in {400, 422} and (
+                    query.causal_budget_id is not None or query.root_session_id is not None
+                ):
+                    raise CayuApiError(
+                        "request_rejected",
+                        f"{exc} The Agent's Cayu may predate rollups scoped by --causal-budget "
+                        "or --root; redeploy it with a newer cayu release, or run `cayu session "
+                        "rollup --sqlite PATH` on a copy of its session store.",
+                        status_code=exc.status_code,
+                        detail=exc.detail,
+                    ) from None
                 # An Agent whose Cayu predates priced rollups rejects the `pricing` field;
                 # its pages come back without cost.
                 if query.pricing is None or exc.status_code not in {400, 422}:
@@ -486,13 +499,18 @@ def _mapping(value: object) -> dict[str, Any]:
     return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
 
 
+# Rollup fields a later Cayu added; an older Agent rejects them whatever their value.
+_OPTIONAL_ROLLUP_FIELDS = ("pricing", "causal_budget_id", "root_session_id")
+
+
 def _rollup_body(query: SessionRollupQuery) -> dict[str, Any]:
-    """A rollup page request; without pricing the key is left out, since an older Agent
-    rejects the field whatever its value."""
+    """A rollup page request; unset later fields are left out, since an older Agent
+    rejects them whatever their value."""
 
     body = query.model_dump(mode="json")
-    if query.pricing is None:
-        body.pop("pricing", None)
+    for name in _OPTIONAL_ROLLUP_FIELDS:
+        if getattr(query, name) is None:
+            body.pop(name, None)
     return body
 
 

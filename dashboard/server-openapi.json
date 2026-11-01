@@ -41644,7 +41644,7 @@
       },
       "SessionRollupQuery": {
         "additionalProperties": false,
-        "description": "Which sessions a rollup reads and how it groups them.\n\n``since``/``until`` select sessions by creation time, half-open. ``group_by`` is\n``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)\nor ``label:KEY``. ``cursor`` continues after the previous page's last session.",
+        "description": "Which sessions a rollup reads and how it groups them.\n\n``since``/``until`` select sessions by creation time, half-open. ``group_by`` is\n``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)\nor ``label:KEY``. ``causal_budget_id`` keeps the sessions charged to one causal budget (a\nrun and the child sessions it spawned) and ``root_session_id`` the sessions one root\ninvocation started, root included. ``cursor`` continues after the previous page's last\nsession.",
         "properties": {
           "agent_name": {
             "anyOf": [
@@ -41656,6 +41656,17 @@
               }
             ],
             "title": "Agent Name"
+          },
+          "causal_budget_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Causal Budget Id"
           },
           "cursor": {
             "anyOf": [
@@ -41707,6 +41718,17 @@
                 "type": "null"
               }
             ]
+          },
+          "root_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Root Session Id"
           },
           "since": {
             "anyOf": [
@@ -56305,7 +56327,7 @@
     },
     "/api/sessions/rollup": {
       "post": {
-        "description": "One page of `cayu session rollup`: usage, cost, time by phase and tool failures by error kind for up to `max_sessions` sessions created in the window, grouped by agent, UTC day, Release or `label:KEY`. Groups merge by adding; pass `next_cursor` back as `cursor` for the next page.",
+        "description": "One page of `cayu session rollup`: usage, cost, time by phase and tool failures by error kind for up to `max_sessions` sessions created in the window, grouped by agent, UTC day, Release or `label:KEY`. `causal_budget_id` and `root_session_id` keep one run's sessions. Groups merge by adding; pass `next_cursor` back as `cursor` for the next page.",
         "operationId": "post_session_rollup_api_sessions_rollup_post",
         "requestBody": {
           "content": {

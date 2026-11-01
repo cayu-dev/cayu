@@ -466,6 +466,9 @@ cayu session list --since 2026-10-27 --until 2026-10-28T12:00:00-07:00
 # pending-action counts.
 cayu session show SESSION_ID
 
+# A workflow run as a whole: steps, child sessions, usage and custom events.
+cayu session workflow SESSION_ID --table
+
 # Submit one explicit disposition through the authenticated server. The full
 # Authorization value is read from CAYU_API_AUTHORIZATION by default.
 export CAYU_API_AUTHORIZATION='Bearer ...'
@@ -535,6 +538,54 @@ as free.
 For a Cloud Agent the CLI sends the price book with the request, so the Agent prices with
 the same book; an Agent whose Cayu predates priced usage returns its calls without cost.
 
+### Workflow runs
+
+`cayu session workflow SESSION_ID` shows one workflow run as a whole. `SESSION_ID` is the
+run's own session (the id passed to the workflow's `run`), whose `workflow.*` journal names
+the child session each `step()` ran in:
+
+```console
+cayu session workflow team-solve-d489aeb3b57f --sqlite runs/team.db --table
+cayu session workflow team-solve-d489aeb3b57f --application team-solver --json
+```
+
+JSON carries:
+
+- `workflow`: the run's name (from `workflow.started`), agent, causal budget, when the
+  journal says it started and completed, and `status`, read from the journal: `completed`
+  once it recorded `workflow.completed`, `running` while it hasn't and a session in the run
+  is still live, and `stopped` when it hasn't and none is (a step raised, the run was cut
+  off, or its process is between steps). `session_status` is the status of the run's own
+  session, which the shipped journal marks completed before the run starts, so it doesn't
+  say whether the run finished. A session without a workflow journal reports its own
+  status in both.
+- `steps`: one row per journaled step and its child session, in journal order, with the
+  step id, agent, child session id and its status, `journal` (`started` or `completed`),
+  `started_at` and `ended_at` (the journal's times, or the child session's creation and,
+  once it finished, last activity), and model calls, tool calls, token usage (reasoning
+  tokens included) and estimated cost. A step's numbers cover its child session and every
+  session under it, which `sessions` counts. A `gated_loop` item row names its loop, item
+  key and `outcome` (`pass` or `fail`) and the child of the step it ran; that step's own row
+  carries the usage, unless no step names that child, in which case the item row does. Direct children of the run that no step names are listed with `kind`
+  `child`.
+- `custom_events`: the `custom.*` events the workflow emitted, in sequence order, with a
+  payload preview bounded by `--payload-bytes` (default 2048). Cayu's own `custom.cayu.*`
+  markers are left out.
+- `totals`: the run's sessions by status, model calls, tool calls, usage and estimated cost
+  across the workflow session and every session under it, children of children included.
+
+Usage comes from the same per-session aggregate as `cayu session usage`, priced as
+[Cost](#cost) describes (`--price-book PATH`). Child sessions are found through their
+`parent_session_id`, breadth first; `--max-sessions` (default 1000) and `--max-events`
+(default 100,000, the run's own events) bound the read, and `complete: false` says one of
+them stopped it. `--jsonl` prints a `step` record per row, a `custom_event` record per
+event, and a closing `summary` record.
+
+An Agent's public event API withholds the step and child session ids in `workflow.*`
+events, so with `--application` the output has `step_ids_withheld: true` and lists the
+run's child sessions (`kind` `child`) in place of named steps; gated-loop outcomes, custom
+events and the totals are the same as from the Agent's store.
+
 ### Rollups across many sessions
 
 `cayu session rollup` sums usage, time by phase and tool failures across the sessions
@@ -545,7 +596,15 @@ label:
 cayu session rollup --since 2026-10-01 --by day --table
 cayu session rollup --since 2026-10-01 --by label:repository --agent hunter --json
 cayu session rollup --by release --application bug-hunter --table
+cayu session rollup --causal-budget CAUSAL_BUDGET_ID --by agent --table
+cayu session rollup --root RUN_SESSION_ID --json
 ```
+
+`--causal-budget ID` keeps the sessions charged to one causal budget, which a run shares
+with the child sessions it spawns (`cayu session show` prints it as `causal_budget_id`; by
+default it is the root session's id, or its task's). `--root SESSION_ID`
+keeps a root session and every session its invocation started. Either one sums a single
+workflow run; combined with `--label` or `--by label:KEY` they compare runs.
 
 Each group reports its sessions and their statuses, model calls (with usage evidence and
 errors), tool calls and tool failures, aggregate token usage (auxiliary inference and
@@ -590,8 +649,8 @@ predates it answers that it doesn't serve rollups yet.
 
 ### Sessions of a Cloud Agent
 
-Add `--application NAME` to `list`, `rollup`, `show`, `interactions`, `usage`, `tools`,
-`events`, `transcript` or `output` to read a Cayu Cloud Agent's sessions instead of a local
+Add `--application NAME` to `list`, `rollup`, `show`, `workflow`, `interactions`, `usage`,
+`tools`, `events`, `transcript` or `output` to read a Cayu Cloud Agent's sessions instead of a local
 store. `NAME` is the Agent's id, name or slug, as in `cayu cloud` commands. The CLI signs
 in the same way: `CAYU_CLOUD_API_KEY` or an API-key file, the selected private context
 (`--context PATH`, `CAYU_CLOUD_CONTEXT`, or `cayu cloud context use`), or `cayu cloud login`.

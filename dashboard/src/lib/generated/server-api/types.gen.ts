@@ -20640,13 +20640,20 @@ export type SessionQueuedMessage = {
  *
  * ``since``/``until`` select sessions by creation time, half-open. ``group_by`` is
  * ``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)
- * or ``label:KEY``. ``cursor`` continues after the previous page's last session.
+ * or ``label:KEY``. ``causal_budget_id`` keeps the sessions charged to one causal budget (a
+ * run and the child sessions it spawned) and ``root_session_id`` the sessions one root
+ * invocation started, root included. ``cursor`` continues after the previous page's last
+ * session.
  */
 export type SessionRollupQuery = {
     /**
      * Agent Name
      */
     agent_name?: string | null;
+    /**
+     * Causal Budget Id
+     */
+    causal_budget_id?: string | null;
     /**
      * Cursor
      */
@@ -20670,6 +20677,10 @@ export type SessionRollupQuery = {
      */
     max_sessions?: number;
     pricing?: PriceBook | null;
+    /**
+     * Root Session Id
+     */
+    root_session_id?: string | null;
     /**
      * Since
      */

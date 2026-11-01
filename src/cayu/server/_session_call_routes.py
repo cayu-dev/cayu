@@ -242,8 +242,12 @@ def register_session_rollup_route(
     redact: Callable[[Any], Any],
     serialize_cursor: Callable[[str | None], str | None],
     pricing_route: type[APIRoute] = APIRoute,
+    resolve_scope: Callable[[SessionRollupQuery], Awaitable[SessionRollupQuery]] | None = None,
 ) -> None:
     async def post_session_rollup(query: SessionRollupQuery, response: Response):
+        if resolve_scope is not None:
+            # Public session aliases in the causal-budget and root filters name private ids.
+            query = await resolve_scope(query)
         try:
             page = await rollup_page(store, query)
         except ValueError as exc:
@@ -276,7 +280,8 @@ def register_session_rollup_route(
         description=(
             "One page of `cayu session rollup`: usage, cost, time by phase and tool failures "
             "by error kind for up to `max_sessions` sessions created in the window, grouped "
-            "by agent, UTC day, Release or `label:KEY`. Groups merge by adding; pass "
+            "by agent, UTC day, Release or `label:KEY`. `causal_budget_id` and "
+            "`root_session_id` keep one run's sessions. Groups merge by adding; pass "
             "`next_cursor` back as `cursor` for the next page."
         ),
     )

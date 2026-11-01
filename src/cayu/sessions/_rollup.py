@@ -120,7 +120,10 @@ class SessionRollupQuery(BaseModel):
 
     ``since``/``until`` select sessions by creation time, half-open. ``group_by`` is
     ``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)
-    or ``label:KEY``. ``cursor`` continues after the previous page's last session.
+    or ``label:KEY``. ``causal_budget_id`` keeps the sessions charged to one causal budget (a
+    run and the child sessions it spawned) and ``root_session_id`` the sessions one root
+    invocation started, root included. ``cursor`` continues after the previous page's last
+    session.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
@@ -132,6 +135,8 @@ class SessionRollupQuery(BaseModel):
     environment_name: str | None = None
     status: SessionStatus | None = None
     labels: dict[str, str] = Field(default_factory=dict)
+    causal_budget_id: str | None = None
+    root_session_id: str | None = None
     cursor: str | None = None
     max_sessions: StrictInt = Field(default=100, ge=1, le=ROLLUP_MAX_SESSIONS_PER_PAGE)
     # Prices every model call on its own date; without it groups report no cost.
@@ -164,6 +169,8 @@ class SessionRollupQuery(BaseModel):
             environment_name=self.environment_name,
             status=self.status,
             labels=self.labels,
+            causal_budget_id=self.causal_budget_id,
+            root_session_id=self.root_session_id,
             created_since=self.since,
             created_before=self.until,
             cursor=self.cursor,

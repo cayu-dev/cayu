@@ -27,6 +27,8 @@ from cayu.cli._session_reader import (
     TranscriptEntry,
     aggregate_usage_cli_payload,
 )
+from cayu.cli._workflow_run import SessionUsage as WorkflowSessionUsage
+from cayu.cli._workflow_run import read_workflow_run, run_status, session_ended_at, step_times
 from cayu.cli.storage import _sanitize
 from cayu.cli.store_targets import (
     SessionStoreBackend,
@@ -156,6 +158,19 @@ def add_session_parser(subparsers: Any) -> None:
         help="Only sessions with this exact label; repeat for multiple labels.",
     )
     rollup_parser.add_argument(
+        "--causal-budget",
+        metavar="ID",
+        help=(
+            "Only sessions charged to this causal budget: a run and the child sessions it "
+            "spawned share its id."
+        ),
+    )
+    rollup_parser.add_argument(
+        "--root",
+        metavar="SESSION_ID",
+        help="Only this root session and the sessions its invocation started.",
+    )
+    rollup_parser.add_argument(
         "--max-sessions",
         type=_positive_int,
         default=10_000,
@@ -188,6 +203,44 @@ def add_session_parser(subparsers: Any) -> None:
     show_parser.add_argument("session_id")
     _add_target_options(show_parser)
     add_output_options(show_parser, formats=FORMAT_CHOICES)
+
+    workflow_parser = commands.add_parser(
+        "workflow",
+        help="Show a workflow run: its steps, their child sessions, usage and custom events.",
+        description=(
+            "Show one workflow run as a whole: each journaled step with its child session, "
+            "agent, status, start and end, model calls and tokens (the child session and "
+            "everything under it), totals for the run including children of children, and "
+            "the custom.* events the workflow emitted, in order. Works on any session; one "
+            "without a workflow journal lists its child sessions."
+        ),
+    )
+    workflow_parser.add_argument("session_id", help="The workflow run's own session id.")
+    _add_target_options(workflow_parser)
+    _add_price_book_option(workflow_parser)
+    workflow_parser.add_argument(
+        "--max-sessions",
+        type=_positive_int,
+        default=1000,
+        help=(
+            "Stop walking child sessions after this many sessions (default 1000); the "
+            "output then says the run is incomplete."
+        ),
+    )
+    workflow_parser.add_argument(
+        "--max-events",
+        type=_positive_int,
+        default=100_000,
+        help="Read at most this many of the run's own events (default 100000).",
+    )
+    workflow_parser.add_argument(
+        "--payload-bytes",
+        type=_payload_limit,
+        default=2048,
+        metavar="BYTES",
+        help="Bound each custom event's payload preview (default 2048 bytes).",
+    )
+    add_output_options(workflow_parser, formats=FORMAT_CHOICES)
 
     snapshot_parser = commands.add_parser(
         "snapshots",
@@ -609,6 +662,8 @@ async def _run_session_command(
             return await _show_session(args, reader)
         if args.session_command == "rollup":
             return await _session_rollup(args, reader)
+        if args.session_command == "workflow":
+            return await _session_workflow(args, reader)
         if args.session_command == "snapshots":
             from cayu.environments.snapshot_lifecycle import inspect_execution_snapshots
 
@@ -726,6 +781,8 @@ async def _session_rollup(args: argparse.Namespace, reader: SessionReader) -> in
         environment_name=args.environment,
         status=None if args.status is None else SessionStatus(args.status),
         labels=_parse_labels(args.label),
+        causal_budget_id=args.causal_budget,
+        root_session_id=args.root,
         cursor=args.cursor,
         max_sessions=min(page_size, args.max_sessions),
         pricing=pricing,
@@ -882,6 +939,231 @@ async def _show_session(args: argparse.Namespace, reader: SessionReader) -> int:
     }
     _render_detail(args.output_format, payload)
     return 0
+
+
+async def _session_workflow(args: argparse.Namespace, reader: SessionReader) -> int:
+    pricing = _price_book(args)
+    run = await read_workflow_run(
+        reader,
+        args.session_id,
+        pricing=pricing,
+        max_sessions=args.max_sessions,
+        max_events=args.max_events,
+    )
+    priced = run.totals.unpriced_calls is not None
+    # A gated-loop item usually names the child of a step it ran, whose row has the usage;
+    # an item whose `do` ran a child without a journaled step carries that child's usage.
+    step_children = {step.child_session_id for step in run.steps if step.kind == "step"}
+    steps: list[dict[str, Any]] = []
+    for step in run.steps:
+        node = None if step.child_session_id is None else run.nodes.get(step.child_session_id)
+        started_at, ended_at = step_times(step, node)
+        usage = (
+            run.subtree_usage.get(step.child_session_id)
+            if step.child_session_id is not None
+            and (step.kind == "step" or step.child_session_id not in step_children)
+            else None
+        )
+        steps.append(
+            {
+                "step_id": step.step_id,
+                "kind": step.kind,
+                "agent": step.agent or (None if node is None else node.agent),
+                "child_session_id": step.child_session_id,
+                "status": None if node is None else node.status,
+                "journal": "completed" if step.completed_at is not None else "started",
+                "loop_name": step.loop_name,
+                "item_key": step.item_key,
+                "outcome": step.outcome,
+                "has_output": step.has_output,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                **_workflow_usage_fields(usage, priced=priced),
+            }
+        )
+    for child_id in run.unlinked_children:
+        node = run.nodes[child_id]
+        steps.append(
+            {
+                "step_id": None,
+                "kind": "child",
+                "agent": node.agent,
+                "child_session_id": child_id,
+                "status": node.status,
+                "journal": None,
+                "loop_name": None,
+                "item_key": None,
+                "outcome": None,
+                "has_output": None,
+                "started_at": node.created_at,
+                "ended_at": session_ended_at(node),
+                **_workflow_usage_fields(run.subtree_usage.get(child_id), priced=priced),
+            }
+        )
+    custom_events = [
+        _event_row(record, payload_limit=args.payload_bytes) for record in run.custom_events
+    ]
+    session = run.session
+    complete = run.sessions_complete and run.events_complete
+    payload = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "workflow": {
+            "session_id": args.session_id,
+            "name": run.name,
+            "agent": session.get("agent"),
+            "status": run_status(run),
+            # The journal's anchor session; the shipped journal marks it completed up front.
+            "session_status": session.get("status"),
+            "parent_session_id": session.get("parent_session_id"),
+            "causal_budget_id": session.get("causal_budget_id"),
+            "started_at": None if run.started_at is None else run.started_at.isoformat(),
+            "completed_at": None if run.completed_at is None else run.completed_at.isoformat(),
+        },
+        "steps": steps,
+        "custom_events": custom_events,
+        "totals": {
+            "statuses": dict(sorted(run.totals.statuses.items())),
+            **_workflow_usage_fields(run.totals, priced=priced),
+        },
+        "step_ids_withheld": run.step_ids_withheld,
+        "complete": complete,
+        "sessions_complete": run.sessions_complete,
+        "events_complete": run.events_complete,
+        "price_book": _price_book_source(
+            args, {"version": pricing.price_book_version, "generated_at": pricing.generated_at}
+        )
+        if priced
+        else None,
+    }
+    _render_workflow(args.output_format, payload)
+    return 0
+
+
+def _workflow_usage_fields(usage: WorkflowSessionUsage | None, *, priced: bool) -> dict[str, Any]:
+    if usage is None:
+        # A gated-loop item whose child a step row covers, or a child that wasn't found.
+        return dict.fromkeys(
+            (
+                "sessions",
+                "model_calls",
+                "model_calls_with_usage",
+                "tool_calls",
+                "usage",
+                "estimated_cost",
+                "unpriced_model_calls",
+            )
+        )
+    return {
+        "sessions": usage.sessions,
+        "model_calls": usage.model_calls,
+        "model_calls_with_usage": usage.model_calls_with_usage,
+        "tool_calls": usage.tool_calls,
+        "usage": aggregate_usage_cli_payload(usage.usage),
+        "estimated_cost": usage.estimated_cost(priced=priced),
+        "unpriced_model_calls": usage.unpriced_calls if priced else None,
+    }
+
+
+def _render_workflow(output: str, payload: dict[str, Any]) -> None:
+    safe = cast("dict[str, Any]", _redact_sensitive(payload))
+    if output == "json":
+        print(json.dumps(safe, ensure_ascii=False, sort_keys=True))
+        return
+    if output == "jsonl":
+        for row in safe["steps"]:
+            record = {"record_type": "step", **row, "schema_version": CLI_SCHEMA_VERSION}
+            print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        for row in safe["custom_events"]:
+            record = {"record_type": "custom_event", **row, "schema_version": CLI_SCHEMA_VERSION}
+            print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        summary = {"record_type": "summary"} | {
+            key: value for key, value in safe.items() if key not in {"steps", "custom_events"}
+        }
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+        return
+    workflow = safe["workflow"]
+    window = " to ".join(
+        value for value in (workflow["started_at"], workflow["completed_at"]) if value
+    )
+    print(
+        terminal_safe(
+            f"Workflow {workflow['name'] or '-'}, session {workflow['session_id']} "
+            f"({workflow['status']})" + (f", {window}" if window else "")
+        )
+    )
+    if safe["steps"]:
+        print()
+        _print_table(
+            (
+                "step",
+                "agent",
+                "child_session",
+                "status",
+                "started_at",
+                "ended_at",
+                "sessions",
+                "model_calls",
+                "input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cost",
+            ),
+            [_workflow_table_row(row) for row in safe["steps"]],
+        )
+    if safe["custom_events"]:
+        print()
+        print("Custom events")
+        _print_table(
+            ("sequence", "timestamp", "type", "agent", "payload_preview"),
+            safe["custom_events"],
+        )
+    totals = safe["totals"]
+    usage = totals["usage"]
+    statuses = ", ".join(f"{status} {count}" for status, count in totals["statuses"].items())
+    print()
+    print(
+        terminal_safe(
+            f"Totals: {totals['sessions']} sessions ({statuses or 'none'}), "
+            f"{totals['model_calls']} model calls, {usage['input_tokens']} input, "
+            f"{usage['output_tokens']} output and {usage['reasoning_tokens']} reasoning tokens, "
+            f"cost {_cost_total_text(totals['estimated_cost'], totals['unpriced_model_calls'])}."
+        )
+    )
+    if safe["step_ids_withheld"]:
+        print(
+            "The event view withholds step and child session ids, as an Agent's public API "
+            "does, so the run's child sessions are listed instead of its steps."
+        )
+    if not safe["complete"]:
+        print(
+            "Incomplete: the run has more sessions or events than were read; raise "
+            "--max-sessions or --max-events."
+        )
+
+
+def _workflow_table_row(row: dict[str, Any]) -> dict[str, Any]:
+    usage = row["usage"] or {}
+    step = row["step_id"] if row["step_id"] is not None else "(child)"
+    if row["loop_name"] is not None and row["item_key"] is not None:
+        step = f"{row['loop_name']}/{row['item_key']}"
+    if row["outcome"]:
+        step = f"{step} [{row['outcome']}]"
+    return {
+        "step": step,
+        "agent": row["agent"],
+        "child_session": row["child_session_id"],
+        "status": row["status"] if row["status"] is not None else row["journal"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+        "sessions": row["sessions"],
+        "model_calls": row["model_calls"],
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "reasoning_tokens": usage.get("reasoning_tokens"),
+        "cost": None
+        if row["usage"] is None
+        else _cost_total_text(row["estimated_cost"], row["unpriced_model_calls"]),
+    }
 
 
 async def _session_interactions(args: argparse.Namespace, reader: SessionReader) -> int:
@@ -1645,7 +1927,9 @@ def _print_table(headers: tuple[str, ...], rows: list[dict[str, Any]]) -> None:
 def _cell(value: object) -> str:
     if value is None:
         return "-"
-    return str(value)
+    # Cells can hold journaled text, such as a gated-loop item key, so terminal controls
+    # are escaped rather than sent to the operator's terminal.
+    return terminal_safe(str(value))
 
 
 def _positive_limit(value: str) -> int:

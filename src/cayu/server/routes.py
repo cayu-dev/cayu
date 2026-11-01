@@ -354,6 +354,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._foreground_child_checkpoint import MAX_FOREGROUND_CHAIN_DEPTH
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
+from cayu.sessions._rollup import SessionRollupQuery
 from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY
 from cayu.sessions._supervision_projection import supervision_page_with_anchors
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
@@ -4997,6 +4998,22 @@ def create_router(
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         return private_parent_session_id, private_causal_budget_id
 
+    async def _resolve_rollup_scope(query: SessionRollupQuery) -> SessionRollupQuery:
+        """Resolve a rollup's public causal-budget and root filters to private authority."""
+
+        if query.causal_budget_id is None and query.root_session_id is None:
+            return query
+        _, causal_budget_id = await _resolve_session_query_authority_filters(
+            parent_session_id=None,
+            causal_budget_id=query.causal_budget_id,
+        )
+        root_session_id = query.root_session_id
+        if root_session_id is not None:
+            root_session_id = await _resolve_public_session_id(root_session_id)
+        return query.model_copy(
+            update={"causal_budget_id": causal_budget_id, "root_session_id": root_session_id}
+        )
+
     async def _resolve_public_interaction_id(
         *,
         session_id: str,
@@ -8834,6 +8851,7 @@ def create_router(
         redact=cayu_app.redact_json,
         serialize_cursor=partial(_serialize_session_cursor, cayu_app),
         pricing_route=_BoundedSessionPricingRoute,
+        resolve_scope=_resolve_rollup_scope,
     )
     register_session_rollup_route(
         router,
@@ -8841,6 +8859,7 @@ def create_router(
         store=session_store,
         redact=cayu_app.redact_json,
         serialize_cursor=partial(_serialize_session_cursor, cayu_app),
+        resolve_scope=_resolve_rollup_scope,
     )
     register_session_trace(
         router,
