@@ -383,3 +383,101 @@ def test_close_accepts_the_public_id_the_pending_action_api_shows() -> None:
         closed = _close(client, "public", "priya", reason="Stale.", waiting_on=action["input_id"])
         assert closed.status_code == 200, closed.text
         assert closed.json()["session"]["status"] == "failed"
+
+
+def test_repeating_a_close_with_the_public_pause_id_replays_it() -> None:
+    app = _app()
+    with _client(app) as client:
+        _pause(client, app, "replayed", "asker")
+        actions = client.get("/api/pending-actions", headers=_as("priya"))
+        [action] = [row for row in actions.json()["actions"] if row["session"]["id"] == "replayed"]
+        assert action["input_id"].startswith("cayu_event_")
+        for _attempt in range(2):
+            closed = _close(
+                client, "replayed", "priya", reason="Stale.", waiting_on=action["input_id"]
+            )
+            assert closed.status_code == 200, closed.text
+            assert closed.json()["session"]["status"] == "failed"
+        events = _portal(client).call(app.session_store.load_events, "replayed")
+        assert [event.type for event in events].count(EventType.SESSION_FAILED) == 1
+
+
+def test_close_reads_every_page_of_child_sessions(monkeypatch) -> None:
+    import asyncio
+
+    from cayu.sessions.queries import SessionQuery
+    from cayu.sessions.records import SessionIdentity
+
+    async def scenario() -> None:
+        app = _app()
+        store = app._runtime_session_store
+        original = store.list_sessions
+
+        async def one_per_page(query: SessionQuery):
+            if query.parent_session_id is not None:
+                query = query.model_copy(update={"limit": 1})
+            return await original(query)
+
+        monkeypatch.setattr(store, "list_sessions", one_per_page)
+        try:
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="asker", session_id="paged", messages=[Message.text("user", "go")]
+                )
+            ):
+                pass
+            for child_id in ("paged-ended", "paged-running"):
+                await app.session_store.create(
+                    RunRequest(
+                        agent_name="asker",
+                        session_id=child_id,
+                        parent_session_id="paged",
+                        messages=[Message.text("user", "child")],
+                    ),
+                    identity=SessionIdentity(provider_name="scripted", model="ask"),
+                )
+            await app.session_store.update_status("paged-running", SessionStatus.RUNNING)
+            await app.session_store.update_status("paged-ended", SessionStatus.COMPLETED)
+            # Created first and changed last, the ended child fills the first page
+            # whether children are listed by creation or by latest change.
+            with pytest.raises(SessionStatusConflict, match="still running"):
+                await app.close_session("paged", reason="Nobody will answer.")
+            assert (await app.session_store.load("paged")).status is SessionStatus.INTERRUPTED
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_repeating_a_close_with_the_recorded_private_id_replays_without_resolving_it(
+    monkeypatch,
+) -> None:
+    import asyncio
+
+    async def scenario() -> None:
+        app = _app()
+        try:
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="asker", session_id="private", messages=[Message.text("user", "go")]
+                )
+            ):
+                pass
+            [pending] = (await app.session_store.query_pending_actions(_query("private"))).actions
+            first = await app.close_session("private", reason="Stale.", waiting_on=pending.input_id)
+            assert first.status is SessionStatus.FAILED
+
+            async def unresolvable(**_kwargs):
+                # As for a legacy private ID shaped like a public alias, once its
+                # pending action is gone.
+                raise ValueError("Public input_id alias is malformed or field-mismatched.")
+
+            monkeypatch.setattr(app._session_abandonment, "_resolve_action_linkage", unresolvable)
+            again = await app.close_session("private", reason="Stale.", waiting_on=pending.input_id)
+            assert again.status is SessionStatus.FAILED
+            with pytest.raises(SessionStatusConflict, match="ended without that"):
+                await app.close_session("private", reason="Stale.", waiting_on="another-input")
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())

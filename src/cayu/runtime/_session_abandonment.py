@@ -416,19 +416,22 @@ class SessionAbandonment:
         checkpoint = await self._session_store.load_checkpoint(session_id)
         record = abandoned_session_from_checkpoint(checkpoint)
         if session.status is SessionStatus.FAILED and record is not None:
-            if waiting_on is not None and waiting_on not in (record.get("closed") or {}).values():
+            # A repeated close replays. The ID may be the private one the close
+            # recorded, including a legacy private ID that looks like an alias, or the
+            # public alias the pending-action API showed for it.
+            closed_ids = set((record.get("closed") or {}).values())
+            if (
+                waiting_on is not None
+                and waiting_on not in closed_ids
+                and await self._private_waiting_on(session_id, waiting_on) not in closed_ids
+            ):
                 raise SessionStatusConflict("Session ended without that approval or question.")
             return await self._finish(session, metadata=metadata, passes=[])
+        if waiting_on is not None:
+            waiting_on = await self._private_waiting_on(session_id, waiting_on)
         if session.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
             raise SessionStatusConflict(
                 f"Session already {session.status.value}; there is nothing to close."
-            )
-        if waiting_on is not None and waiting_on.startswith(PUBLIC_EVENT_ID_PREFIX):
-            # The pending-action API shows these as public aliases.
-            waiting_on = await self._resolve_action_linkage(
-                session_id=session_id,
-                value=waiting_on,
-                field_name="approval_id" if waiting_on.endswith(":approval_id") else "input_id",
             )
         # Every refusal, the children's included, comes before anything is closed.
         await self._require_closable(
@@ -483,15 +486,45 @@ class SessionAbandonment:
             )
         return await self._finish(session, metadata=metadata, passes=passes)
 
-    async def _open_children(self, session_id: str) -> list[Session]:
-        page = await self._session_store.list_sessions(
-            SessionQuery(parent_session_id=session_id, limit=1000)
+    async def _private_waiting_on(self, session_id: str, waiting_on: str) -> str:
+        """The private approval or input ID for ``waiting_on``, which may be a public alias.
+
+        The pending-action API shows these as ``cayu_event_…`` aliases; the resolver
+        reads the alias's own event, so it still works after the pause is gone.
+        """
+
+        if not waiting_on.startswith(PUBLIC_EVENT_ID_PREFIX):
+            return waiting_on
+        return await self._resolve_action_linkage(
+            session_id=session_id,
+            value=waiting_on,
+            field_name="approval_id" if waiting_on.endswith(":approval_id") else "input_id",
         )
-        return [
-            child
-            for child in page.sessions
-            if child.status not in {SessionStatus.COMPLETED, SessionStatus.FAILED}
-        ]
+
+    async def _open_children(self, session_id: str) -> list[Session]:
+        """Every child of the session that hasn't ended, across all listing pages."""
+
+        children: list[Session] = []
+        cursor: str | None = None
+        while True:
+            page = await self._session_store.list_sessions(
+                SessionQuery(
+                    parent_session_id=session_id,
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                    limit=1000,
+                    cursor=cursor,
+                )
+            )
+            children.extend(
+                child
+                for child in page.sessions
+                if child.status not in {SessionStatus.COMPLETED, SessionStatus.FAILED}
+            )
+            if page.next_cursor is None:
+                return children
+            if page.next_cursor == cursor:
+                raise RuntimeError("Child session listing returned a repeated cursor.")
+            cursor = page.next_cursor
 
     async def _require_closable(
         self,
