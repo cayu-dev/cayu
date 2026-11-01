@@ -285,6 +285,14 @@ async def test_host_recovers_planner_input_before_first_producer_attachment(
                     runner = asyncio.create_task(host.run())
                     await entered.wait()
                     await asyncio.sleep(0)
+                    # The idle poll waits through asyncio.wait_for, whose own
+                    # timeout requests cancellation of this task when it expires
+                    # and withdraws it once the task resumes. Let any such
+                    # internal request settle so the count below is ours alone.
+                    for _ in range(10):
+                        if not runner.cancelling():
+                            break
+                        await asyncio.sleep(0)
                     runner.cancel()
                     assert runner.cancelling() == 1
                     with pytest.raises(asyncio.CancelledError):
