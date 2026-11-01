@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -61,6 +62,7 @@ _REQUIRE_POSTGRES_ENV_VAR = "CAYU_REQUIRE_POSTGRES_TESTS"
 _RUNTIME_REQUIRE_POSTGRES_ENV_VAR = "CAYU_REQUIRE_POSTGRES"
 _REQUIRE_CURRENT_TEST_DURATIONS_ENV_VAR = "CAYU_REQUIRE_CURRENT_TEST_DURATIONS"
 _POSTGRES_CONTAINER_IMAGE = "pgvector/pgvector:pg16"
+_IMAGE_PULL_ATTEMPTS = 3
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _MAX_UNKNOWN_DURATION_FRACTION = 0.05
 _CI_FAILURE_LOGGING = False
@@ -238,6 +240,30 @@ def _docker_available() -> bool:
         return False
 
 
+def _pull_image(image: str) -> None:
+    """Pull an image unless Docker has it, retrying a failed registry request.
+
+    A single failed pull from Docker Hub would otherwise fail every Postgres test
+    in the shard.
+    """
+    import docker
+
+    client = docker.from_env()
+    try:
+        client.images.get(image)
+        return
+    except docker.errors.ImageNotFound:
+        pass
+    for attempt in range(1, _IMAGE_PULL_ATTEMPTS + 1):
+        try:
+            client.images.pull(image)
+            return
+        except docker.errors.APIError:
+            if attempt == _IMAGE_PULL_ATTEMPTS:
+                raise
+            time.sleep(5 * attempt)
+
+
 def _postgres_required() -> bool:
     return os.environ.get(_REQUIRE_POSTGRES_ENV_VAR, "").strip().lower() in _TRUTHY_ENV_VALUES
 
@@ -389,6 +415,7 @@ def _postgres_server_dsn() -> str:
     except Exception as exc:  # pragma: no cover - dependency guard
         _skip_or_fail_postgres_unavailable(f"testcontainers unavailable: {exc}")
 
+    _pull_image(_POSTGRES_CONTAINER_IMAGE)
     container = PostgresContainer(_POSTGRES_CONTAINER_IMAGE)
     container.start()
     try:

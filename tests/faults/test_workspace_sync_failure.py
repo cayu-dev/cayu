@@ -1112,13 +1112,15 @@ def test_restarted_completion_finalization_settles_attached_task(
         )
 
     async def exercise_contract() -> None:
+        # A claimed task's lease runs on this clock, so it expires only when the
+        # test says the original owner is gone, however long the run takes.
         ownership_now = [datetime.now(UTC)]
         session_store = SQLiteSessionStore(session_path)
         task_store = (
             SQLiteTaskStore(
                 task_path, clock=lambda: ownership_now[0], ownership_clock=lambda: ownership_now[0]
             )
-            if governed
+            if claimed_task
             else SQLiteTaskStore(task_path)
         )
         binding = BlockingCompletionBinding()
@@ -1210,7 +1212,7 @@ def test_restarted_completion_finalization_settles_attached_task(
             SQLiteTaskStore(
                 task_path, clock=lambda: ownership_now[0], ownership_clock=lambda: ownership_now[0]
             )
-            if governed
+            if claimed_task
             else SQLiteTaskStore(task_path)
         )
         recovery_provider = ScriptedModelProvider(
@@ -1247,7 +1249,7 @@ def test_restarted_completion_finalization_settles_attached_task(
                 assert provider.requests
                 assert "initial_transcript_pending" not in pending_checkpoint
             if claimed_task and not governed:
-                await asyncio.sleep(1.05)
+                ownership_now[0] = task_lease_expires_at + timedelta(seconds=1)
             if governed:
                 ownership_now[0] = admission.claim.lease_expires_at + timedelta(seconds=1)
                 recovery_request = WorkAttemptRecoveryRequest(

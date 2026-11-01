@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import json
 import os
 import stat
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
@@ -443,40 +443,54 @@ def test_rejected_object_descriptors_are_always_closed(tmp_path, monkeypatch, me
         os.mkfifo(target)
     else:
         target.write_bytes(CONTENT)
-    actual_open, actual_fstat, actual_fdopen = os.open, os.fstat, os.fdopen
+    actual_open, actual_close = os.open, os.close
+    actual_fstat, actual_fdopen = os.fstat, os.fdopen
     opened = []
-    operation_descriptors = []
+    descriptor_calls = []
     current = None
+    operation_thread = None
 
+    # Record calls per thread: the store works in a worker thread, and other
+    # threads in the process may open, close or reuse descriptor numbers.
     def track_open(path, *args, **kwargs):
-        nonlocal current
+        nonlocal current, operation_thread
         descriptor = actual_open(path, *args, **kwargs)
-        operation_descriptors.append(descriptor)
+        descriptor_calls.append((threading.get_ident(), "open", descriptor))
         # Unrelated cleanup must not invalidate the operation's leak checks.
         unrelated.close()
         if path == target.name:
             current = descriptor
+            operation_thread = threading.get_ident()
             opened.append(descriptor)
         return descriptor
 
+    def track_close(descriptor):
+        actual_close(descriptor)
+        descriptor_calls.append((threading.get_ident(), "close", descriptor))
+
+    def injected(descriptor):
+        return descriptor == current and threading.get_ident() == operation_thread
+
     def fail_fstat(descriptor):
-        if descriptor == current and entry == "fstat_error":
+        if injected(descriptor) and entry == "fstat_error":
             raise OSError("injected object fstat failure")
         return actual_fstat(descriptor)
 
     def fail_fdopen(descriptor, *args, **kwargs):
-        if descriptor == current and entry == "fdopen_error":
+        if injected(descriptor) and entry == "fdopen_error":
             raise OSError("injected object wrapper failure")
         return actual_fdopen(descriptor, *args, **kwargs)
 
     with source.open("rb") as unrelated, monkeypatch.context() as patch:
         patch.setattr(os, "open", track_open)
+        patch.setattr(os, "close", track_close)
         patch.setattr(os, "fstat", fail_fstat)
         patch.setattr(os, "fdopen", fail_fdopen)
         patch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) | {track_open})
         for _ in range(20):
             current = None
-            operation_descriptors.clear()
+            operation_thread = None
+            descriptor_calls.clear()
             if entry in {"directory", "fifo"}:
                 with pytest.raises(AgentBundleError, match="object_path_not_regular"):
                     put(store, source, method)
@@ -484,10 +498,18 @@ def test_rejected_object_descriptors_are_always_closed(tmp_path, monkeypatch, me
                 with pytest.raises(OSError, match="injected object"):
                     put(store, source, method)
             assert current is not None
-            # Check the object and its parent directories before a later call
-            # can reuse their descriptor numbers.
-            for descriptor in operation_descriptors:
-                with pytest.raises(OSError) as closed:
-                    actual_fstat(descriptor)
-                assert closed.value.errno == errno.EBADF
+            # Replay the operation thread's own calls: the object and each
+            # parent directory it opened must have been closed again.
+            operation_calls = [
+                (action, descriptor)
+                for thread, action, descriptor in descriptor_calls
+                if thread == operation_thread
+            ]
+            still_open = set()
+            for action, descriptor in operation_calls:
+                if action == "open":
+                    still_open.add(descriptor)
+                else:
+                    still_open.discard(descriptor)
+            assert still_open == set()
     assert len(opened) == 20

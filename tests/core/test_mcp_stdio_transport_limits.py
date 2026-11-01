@@ -50,6 +50,9 @@ def StdioMcpClient(*args: Any, **kwargs: Any) -> _StdioMcpClient:
         and not stdio_mcp_parent_death_containment_platform_candidate()
     ):
         kwargs["process_lifetime"] = StdioMcpProcessLifetime.GRACEFUL_CLEANUP
+    # Supervisor startup is not a transport limit under test here. Give it room
+    # on a contended host so readiness never decides a transport-limit test.
+    kwargs.setdefault("containment_startup_timeout_s", 30.0)
     return _StdioMcpClient(*args, **kwargs)
 
 
@@ -125,9 +128,16 @@ def test_stdio_rejects_conflicting_legacy_and_limits_configuration() -> None:
 
 def test_stdio_legacy_timeout_mutation_updates_idle_and_total_limits() -> None:
     async def run() -> tuple[dict[str, Any] | None, dict[str, Any] | None, tuple[float, float]]:
-        session = await StdioMcpClient(request_timeout_s=0.2).connect(_server_spec())
+        # Connect under a generous limit so spawn and initialize never race the
+        # short limit, then apply the short limit the mutation must replace.
+        session = await StdioMcpClient(request_timeout_s=60.0).connect(_server_spec())
         assert isinstance(session, StdioMcpSession)
-        session.request_timeout_s = 0.75
+        session.request_timeout_s = 0.2
+        assert (
+            session.transport_limits.idle_timeout_s,
+            session.transport_limits.total_call_timeout_s,
+        ) == (0.2, 0.2)
+        session.request_timeout_s = 30.0
         deferred_call: asyncio.Task[Any] | None = None
         try:
             deferred_call = asyncio.create_task(session.call_tool("echo", {"defer_response": True}))
@@ -152,12 +162,14 @@ def test_stdio_legacy_timeout_mutation_updates_idle_and_total_limits() -> None:
 
     assert deferred == {"echoed": ""}
     assert trigger == {"echoed": "release"}
-    assert timeouts == (0.75, 0.75)
+    assert timeouts == (30.0, 30.0)
 
 
 def test_stdio_active_call_keeps_its_legacy_timeout_snapshot() -> None:
     async def run() -> tuple[dict[str, Any] | None, float, tuple[float, float]]:
-        session = await StdioMcpClient(request_timeout_s=0.75).connect(_server_spec())
+        # Every call snapshots this generous limit, so spawn, initialize, and the
+        # release round trip never race the short limit applied below.
+        session = await StdioMcpClient(request_timeout_s=30.0).connect(_server_spec())
         assert isinstance(session, StdioMcpSession)
         request_written = asyncio.Event()
         original_write = session._write_with_timeout
@@ -169,14 +181,23 @@ def test_stdio_active_call_keeps_its_legacy_timeout_snapshot() -> None:
             timeout_message: str,
             call_deadline: float | None = None,
         ) -> None:
+            arguments = (
+                payload.get("params", {}).get("arguments", {})
+                if payload.get("method") == "tools/call"
+                else {}
+            )
+            defer_response = bool(arguments.get("defer_response"))
+            if arguments.get("text") == "release":
+                # The release call has already taken its snapshot. Shorten the
+                # live limit before either response can be read, after the
+                # deferred call has been silent for longer than that limit.
+                session.request_timeout_s = 0.2
             await original_write(
                 payload,
                 timeout_message=timeout_message,
                 call_deadline=call_deadline,
             )
-            if payload.get("method") == "tools/call" and payload.get("params", {}).get(
-                "arguments", {}
-            ).get("defer_response"):
+            if defer_response:
                 request_written.set()
 
         try:
@@ -184,7 +205,6 @@ def test_stdio_active_call_keeps_its_legacy_timeout_snapshot() -> None:
             started_at = asyncio.get_running_loop().time()
             deferred_call = asyncio.create_task(session.call_tool("echo", {"defer_response": True}))
             await request_written.wait()
-            session.request_timeout_s = 0.2
             await asyncio.sleep(0.25)
             await session.call_tool("echo", {"text": "release"})
             deferred_result = await deferred_call

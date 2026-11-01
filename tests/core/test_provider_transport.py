@@ -1284,7 +1284,7 @@ async def test_real_sse_absolute_deadline_counts_from_the_last_output(
         'data: {"type":"response.created","response":{"id":"resp-absolute"}}',
         "",
     ]
-    for output_index in range(12):
+    for output_index in range(24):
         lines.extend(
             [
                 (
@@ -1298,13 +1298,16 @@ async def test_real_sse_absolute_deadline_counts_from_the_last_output(
     lines.extend([": keep-alive"] * 25)
     response = _StreamingResponse(lines, heartbeat_sleep_s=0.04)
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
+    # The absolute deadline also covers the wait for the first output, so it
+    # leaves room for a slow event loop there; the output still runs for more
+    # than three times as long.
     provider = OpenAIProvider(
         api_key="test-key",
         stream_deadlines=ProviderStreamDeadlines(
-            transport_idle_timeout_s=0.15,
-            semantic_progress_timeout_s=2.0,
-            protocol_idle_timeout_s=2.0,
-            absolute_stream_timeout_s=0.25,
+            transport_idle_timeout_s=0.5,
+            semantic_progress_timeout_s=5.0,
+            protocol_idle_timeout_s=5.0,
+            absolute_stream_timeout_s=0.6,
         ),
     )
 
@@ -1316,12 +1319,12 @@ async def test_real_sse_absolute_deadline_counts_from_the_last_output(
 
     evidence = captured.value.deadline_evidence
     assert evidence.deadline_kind is ProviderDeadlineKind.ABSOLUTE
-    # About a second of output did not trip the 0.25 s deadline; the
+    # About two seconds of output did not trip the 0.6 s deadline; the
     # keep-alives that followed did.
     assert evidence.last_progress_kind is not None
     assert evidence.last_progress_elapsed_s is not None
-    assert evidence.last_progress_elapsed_s >= 0.9
-    assert evidence.elapsed_s >= evidence.last_progress_elapsed_s + 0.25
+    assert evidence.last_progress_elapsed_s >= 1.8
+    assert evidence.elapsed_s >= evidence.last_progress_elapsed_s + 0.6
     assert response.byte_stream.closed is True
 
 
@@ -1606,19 +1609,22 @@ async def test_http_sse_bounds_active_never_ending_identity_error_body() -> None
             url="https://provider.example/v1/stream",
             headers={},
             payload={},
-            timeout_s=0.02,
-            transport_idle_timeout_s=0.01,
-            protocol_idle_timeout_s=0.01,
-            semantic_progress_timeout_s=0.01,
-            absolute_stream_timeout_s=0.01,
+            # The request timeout caps how long an active error body may be
+            # read. The stream clocks also bound waiting for the response
+            # headers, so they stay wide: a busy event loop must not let them
+            # expire before the body bound is reached.
+            timeout_s=0.2,
+            transport_idle_timeout_s=5.0,
+            protocol_idle_timeout_s=5.0,
+            semantic_progress_timeout_s=5.0,
+            absolute_stream_timeout_s=5.0,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
             protocol_error=OpenAIProtocolError,
             error_response_text=lambda response: response.text,
         )
-        # The provider's millisecond deadlines enforce the body bound. This
-        # watchdog only detects a hang; it must allow scheduling and cleanup.
+        # This watchdog only detects a hang; it must allow scheduling and cleanup.
         with pytest.raises(OpenAIAPIError) as captured:
             await asyncio.wait_for(events.__anext__(), timeout=10)
 
@@ -1648,19 +1654,22 @@ async def test_http_sse_bounds_stalled_identity_error_body_by_idle_timeout() -> 
             url="https://provider.example/v1/stream",
             headers={},
             payload={},
-            timeout_s=1.0,
-            transport_idle_timeout_s=0.01,
-            protocol_idle_timeout_s=0.01,
-            semantic_progress_timeout_s=0.01,
-            absolute_stream_timeout_s=0.01,
+            # The transport idle timeout is also the error-body idle bound
+            # under test. It bounds waiting for the response headers too, so
+            # it leaves a busy event loop wide room to deliver them. The other
+            # stream clocks and the request timeout stay well above it.
+            timeout_s=5.0,
+            transport_idle_timeout_s=0.5,
+            protocol_idle_timeout_s=5.0,
+            semantic_progress_timeout_s=5.0,
+            absolute_stream_timeout_s=5.0,
             request_label="OpenAI API",
             response_label="OpenAI",
             api_error=OpenAIAPIError,
             protocol_error=OpenAIProtocolError,
             error_response_text=lambda response: response.text,
         )
-        # The provider's millisecond deadlines enforce the body bound. This
-        # watchdog only detects a hang; it must allow scheduling and cleanup.
+        # This watchdog only detects a hang; it must allow scheduling and cleanup.
         with pytest.raises(OpenAIAPIError) as captured:
             await asyncio.wait_for(events.__anext__(), timeout=10)
 

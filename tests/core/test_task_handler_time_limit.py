@@ -389,11 +389,17 @@ def test_operator_cancellation_wins_over_the_time_limit():
         task = await store.create_task(TaskCreate(type="job"))
         give_up = asyncio.Event()
         handler, _sessions = _retry_forever(give_up, explicit_deadline=True)
+        entered = asyncio.Event()
+
+        async def entering(app, task, worker_id):
+            entered.set()
+            return await handler(app, task, worker_id)
+
         worker = asyncio.create_task(
             run_task_worker(
                 app,
                 store,
-                handler,
+                entering,
                 worker_id="w",
                 max_tasks=1,
                 poll_interval_s=0.02,
@@ -401,8 +407,9 @@ def test_operator_cancellation_wins_over_the_time_limit():
                 execution_grace_s=GRACE_S,
             )
         )
-        while (await store.load_task(task.id)).status is TaskStatus.PENDING:
-            await asyncio.sleep(0.02)
+        # A claimed task is not yet running its handler. Cancel the running
+        # handler, which is what the time limit would otherwise end.
+        await asyncio.wait_for(entered.wait(), GIVE_UP_S)
         await store.cancel_task(task.id, {"code": "operator"})
         final = await _wait_for_status(store, task.id, {TaskStatus.CANCELLED}, give_up)
         await asyncio.wait_for(worker, 5)
@@ -419,19 +426,26 @@ def test_cancelling_the_worker_drains_within_the_time_limit():
         task = await store.create_task(TaskCreate(type="job"))
         give_up = asyncio.Event()
         handler, _sessions = _retry_forever(give_up, explicit_deadline=True)
+        entered = asyncio.Event()
+
+        async def entering(app, task, worker_id):
+            entered.set()
+            return await handler(app, task, worker_id)
+
         worker = asyncio.create_task(
             run_task_worker(
                 app,
                 store,
-                handler,
+                entering,
                 worker_id="w",
                 poll_interval_s=0.02,
                 execution_timeout_s=TIMEOUT_S,
                 execution_grace_s=GRACE_S,
             )
         )
-        while (await store.load_task(task.id)).status is TaskStatus.PENDING:
-            await asyncio.sleep(0.02)
+        # Cancelling before dispatch leaves the claim to lease reclamation;
+        # only a running handler is drained.
+        await asyncio.wait_for(entered.wait(), GIVE_UP_S)
         worker.cancel()
         # The drain waits for the handler; the time limit still ends it.
         final = await _wait_for_status(store, task.id, {TaskStatus.CANCELLED}, give_up)

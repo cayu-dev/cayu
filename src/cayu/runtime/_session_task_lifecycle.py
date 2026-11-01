@@ -800,6 +800,20 @@ class SessionTaskLifecycle:
                 raise SessionRuntimePublicationConflict(
                     "Runtime task failure has duplicate terminal session evidence."
                 )
+            # The event read can observe a concurrent failure publication after
+            # the initial session load. Validate against its completed session,
+            # while retaining the invocation identity checked above.
+            if session.status is not SessionStatus.FAILED:
+                current_session = await self.session_store.load(session.id)
+                if (
+                    current_session is None
+                    or current_session.instance_id != session.instance_id
+                    or current_session.run_epoch != session.run_epoch
+                ):
+                    raise SessionRuntimePublicationConflict(
+                        "Runtime task failure terminal evidence changed its session identity."
+                    )
+                session = current_session
             terminal_event = terminal_records[0].event
             if (
                 not terminal_event_matches(terminal_event)
@@ -935,6 +949,27 @@ class SessionTaskLifecycle:
             interaction_id = await self._session_finalization.activate_latest_open_interaction(
                 session.id
             )
+            if interaction_id is None:
+                # A concurrent exact replay can atomically publish this failure
+                # after this caller loaded the session. Converge through the
+                # durable terminal path, which validates the winner's evidence.
+                concurrent_session = await self.session_store.load(session.id)
+                concurrent_records = await self.session_store.query_events(
+                    EventQuery(session_id=session.id, event_id=terminal_event_id, limit=2)
+                )
+                if (
+                    concurrent_session is not None
+                    and concurrent_session.status is SessionStatus.FAILED
+                    and len(concurrent_records) == 1
+                ):
+                    replayed, terminal_events = await self.replay_runtime_task_failure_if_needed(
+                        session_id=session_id,
+                        task_id=task_id,
+                        task_worker_id=task_worker_id,
+                        task_lease_expires_at=task_lease_expires_at,
+                        task_handoff_id=task_handoff_id,
+                    )
+                    return replayed, (*replay_events, *terminal_events)
             if interaction_id != identity.interaction_id:
                 raise SessionRuntimePublicationConflict(
                     "Runtime task failure lost its open durable interaction."

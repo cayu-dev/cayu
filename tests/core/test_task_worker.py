@@ -6730,11 +6730,13 @@ def test_elected_worker_completes_task_through_user_input_continuation() -> None
     "loss_point",
     ["before_interaction", "before_session_event", "after_session_event"],
 )
+@pytest.mark.parametrize("replay_point", ["before_terminal_read", "before_interaction"])
 def test_generic_continuation_failure_replays_after_task_terminalization_loss(
     task_store_kind: str,
     session_store_kind: str,
     task_authority: str,
     loss_point: str,
+    replay_point: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6977,10 +6979,71 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
             tools=[UserInputTool()],
         )
 
+        # Pause the resume replay after loading the session, either before its
+        # terminal-event read or before its open-interaction check. Let the
+        # user-input replay publish the failure before resuming that operation.
+        user_input_replayed = asyncio.Event()
+        terminal_read_reached = asyncio.Event()
+        replaying_tasks: set[asyncio.Task[object]] = set()
+        late_replay_tasks: set[asyncio.Task[object]] = set()
+        original_replay = recovered_app._session_tasks.replay_runtime_task_failure_if_needed
+        original_activate = recovered_app._session_finalization.activate_latest_open_interaction
+
+        async def tracked_replay(**kwargs):
+            current = asyncio.current_task()
+            assert current is not None
+            replaying_tasks.add(current)
+            try:
+                return await original_replay(**kwargs)
+            finally:
+                replaying_tasks.discard(current)
+
+        async def activate_after_peer_replay(session_id: str) -> str | None:
+            current = asyncio.current_task()
+            if current in replaying_tasks and current in late_replay_tasks:
+                await asyncio.wait_for(user_input_replayed.wait(), 10)
+            return await original_activate(session_id)
+
+        monkeypatch.setattr(
+            recovered_app._session_tasks,
+            "replay_runtime_task_failure_if_needed",
+            tracked_replay,
+        )
+        monkeypatch.setattr(
+            recovered_app._session_finalization,
+            "activate_latest_open_interaction",
+            activate_after_peer_replay,
+        )
+
+        original_query = recovered_app.session_store.query_events
+
+        async def query_after_peer_replay(query: EventQuery) -> list[EventRecord]:
+            current = asyncio.current_task()
+            if (
+                replay_point == "before_terminal_read"
+                and current in replaying_tasks
+                and current in late_replay_tasks
+                and query.event_id is not None
+                and query.event_id.endswith(":session_failed")
+            ):
+                terminal_read_reached.set()
+                await asyncio.wait_for(user_input_replayed.wait(), 10)
+            return await original_query(query)
+
+        monkeypatch.setattr(recovered_app.session_store, "query_events", query_after_peer_replay)
+
         async def replay_user_input() -> list[Event]:
-            return [event async for event in recovered_app.resolve_user_input(response)]
+            if replay_point == "before_terminal_read":
+                await asyncio.wait_for(terminal_read_reached.wait(), 10)
+            try:
+                return [event async for event in recovered_app.resolve_user_input(response)]
+            finally:
+                user_input_replayed.set()
 
         async def replay_ordinary_resume() -> list[Event]:
+            current = asyncio.current_task()
+            assert current is not None
+            late_replay_tasks.add(current)
             return [
                 event
                 async for event in recovered_app.resume(

@@ -1606,14 +1606,40 @@ def test_foreground_resolver_renews_publication_ownership(
             return _result("1")
 
     async def scenario() -> None:
-        app, session_store, _task_store, decision_id = await _prepared_app()
+        store_now = datetime.now(UTC)
+        session_store = InMemorySessionStore(ownership_clock=lambda: store_now)
+        renewed = asyncio.Event()
+        renewed_after: datetime | None = None
+        original_renew = resolver_coordinator_module._PublicationLeaseHeartbeat.renew
+
+        async def observe_renewal(heartbeat):
+            # The store reads its clock inside the renewal, so only a renewal
+            # that starts after the advance is known to extend past it.
+            started_at = store_now
+            result = await original_renew(heartbeat)
+            if renewed_after is not None and started_at >= renewed_after:
+                renewed.set()
+            return result
+
+        monkeypatch.setattr(
+            resolver_coordinator_module._PublicationLeaseHeartbeat, "renew", observe_renewal
+        )
+        app, session_store, _task_store, decision_id = await _prepared_app_with_stores(
+            session_store=session_store,
+        )
         resolver = BlockingResolver()
         app.register_completion_result_resolver(_contract().result_resolver, resolver)
         operation = asyncio.create_task(
             app.resolve_completion_result(_resolution_request(decision_id))
         )
-        await resolver.started.wait()
-        await asyncio.sleep(0.12)
+        await wait_for_fake_step(resolver.started, operation)
+        # Advance through the original lease using store time, and wait for a
+        # real heartbeat renewal between the two steps. Scheduler latency does
+        # not need to fit inside a short wall-clock lease to prove renewal.
+        store_now += timedelta(seconds=40)
+        renewed_after = store_now
+        await wait_for_fake_step(renewed, operation)
+        store_now += timedelta(seconds=40)
 
         with pytest.raises(
             ValueError,
@@ -1627,7 +1653,7 @@ def test_foreground_resolver_renews_publication_ownership(
     monkeypatch.setattr(
         resolver_coordinator_module,
         "_PUBLICATION_OWNER_LEASE_SECONDS",
-        0.05,
+        60,
     )
     monkeypatch.setattr(
         resolver_coordinator_module,

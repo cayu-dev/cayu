@@ -434,11 +434,31 @@ def test_a_worker_whose_target_differs_leaves_the_trials_to_the_owner(
             return await prepare(run_record, registration)
 
         monkeypatch.setattr(helper, "_preflight_run", counted_preflight)
+        found = 0
+        claim_trial = helper_store.claim_run_trial
+
+        async def counted_claim_trial(*args, **kwargs):
+            nonlocal found
+            lease = await claim_trial(*args, **kwargs)
+            if lease is not None:
+                found += 1
+            return lease
+
+        monkeypatch.setattr(helper_store, "claim_run_trial", counted_claim_trial)
         try:
             owner.start()
+            # A worker that can't run the admitted target fails a queued run it
+            # claims itself, so the owner claims the run first.
+            async with asyncio.timeout(30):
+                while (
+                    await owner_store.load_run("different-target-run")
+                ).status is not EvalRunStatus.RUNNING:
+                    await asyncio.sleep(0.01)
             helper.start()
             # The helper keeps finding the open trials while the owner is held.
-            await asyncio.sleep(0.5)
+            async with asyncio.timeout(30):
+                while found < 3:
+                    await asyncio.sleep(0.01)
             held.set()
             record = await owner_store.wait_for_run_terminal(
                 "different-target-run", timeout_seconds=60

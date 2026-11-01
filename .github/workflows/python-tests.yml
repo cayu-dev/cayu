@@ -73,6 +73,9 @@ jobs:
       CAYU_REQUIRE_POSTGRES_TESTS: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
+      # Workers are single-use VMs, so testcontainers' Ryuk reaper has nothing to
+      # clean up, and pulling its image from Docker Hub can fail the shard.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
       CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -115,6 +118,9 @@ jobs:
       CAYU_REQUIRE_POSTGRES_TESTS: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
+      # Workers are single-use VMs, so testcontainers' Ryuk reaper has nothing to
+      # clean up, and pulling its image from Docker Hub can fail the shard.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
       CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT: "1"
       CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
     steps:

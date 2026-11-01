@@ -154,6 +154,17 @@ class _CancelledTool(Tool):
         raise asyncio.CancelledError
 
 
+class _ManualClockLoop(asyncio.SelectorEventLoop):
+    """Event loop whose clock a test can move forward without waiting."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.offset_s = 0.0
+
+    def time(self) -> float:
+        return super().time() + self.offset_s
+
+
 class _SlowTool(Tool):
     spec = _spec("slow")
 
@@ -165,6 +176,11 @@ class _SlowTool(Tool):
         assert ctx.workspace is not None
         workspace = cast("LocalWorkspace", ctx.workspace)
         self.workspace_root = workspace.root
+        loop = asyncio.get_running_loop()
+        assert isinstance(loop, _ManualClockLoop)
+        # Expire the verifier's deadline only once the tool is running, so a
+        # slow workspace setup cannot consume it first.
+        loop.offset_s += 3600
         await asyncio.sleep(60)
         return ToolResult(content="late")
 
@@ -785,14 +801,14 @@ def test_caller_cancellation_survives_child_tool_uncancel() -> None:
 
 def test_overall_deadline_raises_without_returning_incomplete_evidence() -> None:
     tool = _SlowTool()
-    with pytest.raises(TimeoutError):
-        asyncio.run(
+    with asyncio.Runner(loop_factory=_ManualClockLoop) as runner, pytest.raises(TimeoutError):
+        runner.run(
             verify_tool_effect(
                 _app(tool),
                 agent_name="worker",
                 tool_name="slow",
                 arguments={},
-                timeout_seconds=0.01,
+                timeout_seconds=60.0,
             )
         )
 
