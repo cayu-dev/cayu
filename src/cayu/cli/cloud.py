@@ -25,6 +25,7 @@ from cayu.cli._cloud_api import (
     CloudApiError,
     archived_agent_error,
 )
+from cayu.cli._cloud_api_keys import add_api_keys_parser, api_keys_command
 from cayu.cli._cloud_auth import (
     CloudAuthCredentials,
     CloudAuthError,
@@ -1229,6 +1230,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_data_parser(commands)
 
+    add_api_keys_parser(commands)
+
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
 
     add_eval_parser(commands, seconds=_positive_finite_seconds)
@@ -2038,6 +2041,8 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             client=client,
             application_id=_application_id(client, arguments.application),
         )
+    if arguments.command == "api-keys":
+        return api_keys_command(arguments, client=client)
     if arguments.command == "settings":
         return settings_command(
             arguments,

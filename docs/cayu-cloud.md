@@ -36,7 +36,9 @@ cayu cloud service status --application my-agent
 - `compass agents|show|enroll|disable|verify|pass|job|missions|findings` for
   [Compass](#compass);
 - `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
-  read its eval runs; and
+  read its eval runs;
+- `api-keys create|list|revoke` for the Organization's
+  [API keys](#organization-api-keys), as a signed-in admin; and
 - `evidence list|show|verify` for local content-free command records.
 
 `deployment timeline` shows the release pipeline milestones and whether a failed
@@ -1553,6 +1555,33 @@ If submission loses its response, the CLI reports `deployment_id` and
 `retry_idempotency_key` for `cayu cloud deployment retry DEPLOYMENT_ID
 --idempotency-key KEY`. Agent process health failures, on either smoke provider, and
 other nonretryable failures require repairing the source.
+
+## Organization API keys
+
+CI, Compass and other automated callers reach Cayu Cloud with an Organization API key instead
+of a person's login. A signed-in Organization admin creates, lists and revokes them; Cloud
+refuses an API key, whatever its scopes, so sign in with `cayu cloud login` first:
+
+```console
+cayu cloud api-keys create --name github-actions --purpose ci --key-file ~/.config/cayu/ci-key
+cayu cloud api-keys list
+cayu cloud api-keys revoke key_0123456789abcdef
+```
+
+`create` generates the key locally and writes it to `--key-file`, a new file only you can
+read; it refuses a path that already exists. Cloud receives only the key's SHA-256 digest, and
+neither the key nor the digest is printed. `--purpose` gives the key the narrowest scopes for
+its use: `verifier` (read and report, for Compass and evaluation runners), `ci` (read and
+deploy candidates), `release` (also promote, roll back and operate the service) or `developer`
+(a developer's whole access). `--scope read|report|deploy|operate|developer`, repeatable, names
+the scopes instead. If Cloud answers that it refused the key, the file is removed. If the
+answer is lost, unreadable or a server error, Cloud may have kept the key, so the file stays:
+run the same command with `--retry`, which sends the key in `--key-file` again and gets the key
+Cloud kept (or keeps it now), or check with `cayu cloud api-keys list`.
+
+To rotate a key, create its replacement, move its holder to the new key file, then revoke the
+old key. A revoked key stops working at once and stays listed as inactive. The results report
+each key's `id`, `name`, `scopes`, `active` and `created_at`, never the key.
 
 ## Agent settings
 
