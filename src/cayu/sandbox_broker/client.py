@@ -37,6 +37,8 @@ from pydantic import (
     model_validator,
 )
 
+from cayu.releases import RELEASE_ID_ENV
+
 __all__ = [
     "BROKER_API_URL_ENV",
     "BROKER_APPLICATION_ID_ENV",
@@ -51,6 +53,7 @@ __all__ = [
     "MAX_EGRESS_HOSTS",
     "MAX_GIT_REPOSITORIES",
     "MAX_LEASE_SECONDS",
+    "MAX_PROVENANCE_ID_CHARS",
     "MAX_QUEUE_SECONDS",
     "MAX_STDIO_CHUNK_BYTES",
     "MAX_WAIT_SECONDS",
@@ -81,6 +84,7 @@ __all__ = [
     "SandboxNotFoundError",
     "SandboxNotReadyError",
     "SandboxOrganizationCapacity",
+    "SandboxProvenance",
     "SandboxQueueCapacity",
     "SandboxQueuedRequest",
     "SandboxQuotaExceededError",
@@ -345,6 +349,44 @@ class SandboxEgress(BaseModel):
         return None
 
 
+#: Cloud's bound on each id a sandbox's ``provenance`` names.
+MAX_PROVENANCE_ID_CHARS = 256
+
+
+def _provenance_id(value: Any) -> str | None:
+    """An id Cloud accepts in ``provenance`` (1 to 256 printable characters), else None."""
+
+    if type(value) is not str or not 1 <= len(value) <= MAX_PROVENANCE_ID_CHARS:
+        return None
+    return value if value.isprintable() else None
+
+
+class SandboxProvenance(BaseModel):
+    """What a sandbox is created for: the Release its creator's process runs, and the session
+    and task it works on, so a sandbox left behind can be traced to where it came from.
+
+    Cayu Cloud records the ids as the create states them (the contract's ``provenance``) and
+    returns them on the record. Provenance never fails a create: an id Cloud wouldn't take
+    (empty, longer than ``MAX_PROVENANCE_ID_CHARS``, not printable) is left out.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    release_id: str | None = None
+    session_id: str | None = None
+    task_id: str | None = None
+
+    @field_validator("release_id", "session_id", "task_id", mode="before")
+    @classmethod
+    def _id(cls, value: Any) -> Any:
+        return _provenance_id(value)
+
+    def wire(self) -> dict[str, str] | None:
+        """The ids as a create sends them, or None when there are none."""
+
+        return self.model_dump(exclude_none=True) or None
+
+
 class SandboxGit(BaseModel):
     """The repositories a sandbox fetches with the Agent's brokered git credentials, as its
     record reports them (``host/path``, the host lowercased, the path exactly as named)."""
@@ -448,11 +490,19 @@ class SandboxRecord(BaseModel):
     #: The repositories the sandbox fetches with brokered git credentials; ``None`` without
     #: them, and from a broker that predates them.
     git: SandboxGit | None = None
+    #: The Release, session and task its create named; ``None`` when it named none, and from
+    #: a broker that predates them.
+    provenance: SandboxProvenance | None = None
 
     @field_validator("owner_epoch", mode="before")
     @classmethod
     def _owner_epoch_or_none(cls, value: Any) -> Any:
         return value if type(value) is int and value >= 0 else None
+
+    @field_validator("provenance", mode="before")
+    @classmethod
+    def _provenance_or_none(cls, value: Any) -> Any:
+        return value if isinstance(value, Mapping | SandboxProvenance) else None
 
     @field_validator("git", mode="before")
     @classmethod
@@ -743,12 +793,18 @@ class SandboxBrokerSettings:
     Agent process) and the optional ``CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS``
     (default ``DEFAULT_REQUEST_TIMEOUT_SECONDS``, 45).
     The API URL must be HTTPS; plain HTTP is accepted only for a loopback host.
+
+    ``release_id`` is the Release this process runs, which a create that names its
+    provenance includes unless it names a Release itself; ``from_env`` reads
+    ``CAYU_RELEASE_ID``, which Cloud states in every Agent process, and leaves it out when
+    it isn't one Cloud would take.
     """
 
     api_url: str
     application_id: str
     token: str = field(repr=False)
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    release_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("api_url", "application_id", "token"):
@@ -769,6 +825,11 @@ class SandboxBrokerSettings:
         timeout = self.request_timeout_s
         if type(timeout) not in {int, float} or not isfinite(timeout) or timeout <= 0:
             raise ValueError("Sandbox broker request_timeout_s must be a positive number.")
+        if self.release_id is not None and _provenance_id(self.release_id) is None:
+            raise ValueError(
+                "Sandbox broker release_id must be 1 to "
+                f"{MAX_PROVENANCE_ID_CHARS} printable characters."
+            )
         object.__setattr__(self, "api_url", self.api_url.rstrip("/"))
         object.__setattr__(self, "request_timeout_s", float(timeout))
 
@@ -792,6 +853,7 @@ class SandboxBrokerSettings:
             application_id=env[BROKER_APPLICATION_ID_ENV].strip(),
             token=env[BROKER_TOKEN_ENV].strip(),
             request_timeout_s=timeout,
+            release_id=_provenance_id(env.get(RELEASE_ID_ENV, "").strip()),
         )
 
 
@@ -1033,6 +1095,9 @@ class SandboxBrokerClient:
         self.settings = settings
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
+        # Set once the broker refuses ``provenance`` as an unknown field (a Cloud that
+        # predates it): later creates leave it out.
+        self._provenance_unsupported = False
         self._base = (
             f"{settings.api_url}/v1/applications/{quote(settings.application_id, safe='')}"
             "/sandboxes"
@@ -1079,6 +1144,7 @@ class SandboxBrokerClient:
         egress_hosts: Sequence[str] | None = None,
         queue_seconds: int = 0,
         git_repositories: Sequence[str] | None = None,
+        provenance: SandboxProvenance | None = None,
     ) -> SandboxRecord:
         """Create a sandbox; ``egress_hosts`` names an ``allowlist`` egress's hosts.
 
@@ -1098,6 +1164,17 @@ class SandboxBrokerClient:
         must be covered by one of the Agent's bindings, or the broker refuses the
         create with ``git_repositories_unbound``; an install that doesn't broker
         git credentials refuses it with ``git_credentials_unsupported``.
+
+        ``provenance`` names the session and task the sandbox is for; its Release is
+        the settings' ``release_id`` unless it names one, so ``SandboxProvenance()``
+        names only the Release. Cloud records them on the sandbox, so one left behind
+        can be traced. They are part of the request: replaying a create under the
+        same key needs the same provenance, so a caller whose key outlives one
+        Release (a key derived from a task that may be retried after a redeploy)
+        should leave the Release out or pass none. Without ``provenance`` the body is
+        the one older Runtimes sent. A Cloud that predates provenance refuses it as
+        an unknown field; the create is then sent again without it, and this client
+        sends it no more.
         """
 
         if (
@@ -1128,8 +1205,29 @@ class SandboxBrokerClient:
             repositories = validate_git_repositories(git_repositories)
             validate_git_egress(repositories, mode, hosts)
             payload["git"] = {"repositories": list(repositories)}
-        body, _ = await self._json("POST", self._base, payload=payload)
+        if provenance is not None and type(provenance) is not SandboxProvenance:
+            raise TypeError("Sandbox provenance must be a SandboxProvenance.")
+        # Only when asked for, so a create without it sends the body older Runtimes did and
+        # a replay of one under a durable key still matches after a redeploy.
+        ids = None if provenance is None else self._provenance(provenance)
+        if ids is not None and not self._provenance_unsupported:
+            payload["provenance"] = ids
+        try:
+            body, _ = await self._json("POST", self._base, payload=payload)
+        except SandboxBrokerRefusedError as error:
+            if "provenance" not in payload or not _refuses_provenance(error):
+                raise
+            # Nothing was created: the broker refused the body before looking at the key.
+            self._provenance_unsupported = True
+            del payload["provenance"]
+            body, _ = await self._json("POST", self._base, payload=payload)
         return self._model(SandboxRecord, body)
+
+    def _provenance(self, given: SandboxProvenance) -> dict[str, str] | None:
+        release_id = self.settings.release_id
+        if given.release_id is None and release_id is not None:
+            given = given.model_copy(update={"release_id": release_id})
+        return given.wire()
 
     async def get(self, sandbox_id: str) -> SandboxRecord:
         body, _ = await self._json("GET", self._sandbox_url(sandbox_id))
@@ -2006,6 +2104,16 @@ def _retry_after_seconds(headers: httpx.Headers) -> float:
     if seconds != seconds:  # NaN
         seconds = _HANDOVER_RETRY_SECONDS
     return min(max(seconds, low), high)
+
+
+def _refuses_provenance(error: SandboxBrokerRefusedError) -> bool:
+    """Whether the broker refused a create's ``provenance`` as a field it doesn't know."""
+
+    return (
+        error.status == 422
+        and error.code == "sandbox_invalid"
+        and str(error).endswith("Unknown field: provenance.")
+    )
 
 
 def _broker_error(status: int, body: bytes, headers: httpx.Headers) -> SandboxBrokerError:

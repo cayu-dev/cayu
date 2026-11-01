@@ -64,6 +64,7 @@ from cayu.cli._cloud_releases import (
     show_application,
     with_last_request_at,
 )
+from cayu.cli._cloud_sandboxes import add_sandboxes_parser, sandboxes_command
 from cayu.cli._cloud_service_check import (
     OperatorCheckFailedError,
     add_service_check_arguments,
@@ -1288,6 +1289,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     _add_switch_wait_seconds_arguments(schedule_run)
 
     add_settings_parser(commands)
+    add_sandboxes_parser(commands)
 
     add_data_parser(commands)
 
@@ -2106,6 +2108,12 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         return api_keys_command(arguments, client=client)
     if arguments.command == "settings":
         return settings_command(
+            arguments,
+            client=client,
+            application_id=_application_id(client, arguments.application),
+        )
+    if arguments.command == "sandboxes":
+        return sandboxes_command(
             arguments,
             client=client,
             application_id=_application_id(client, arguments.application),

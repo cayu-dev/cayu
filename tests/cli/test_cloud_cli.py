@@ -85,6 +85,7 @@ def test_cloud_help_exposes_first_party_customer_commands(
         "logout",
         "rollback",
         "runtimes",
+        "sandboxes",
         "service",
         "settings",
         "whoami",

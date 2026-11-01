@@ -81,6 +81,16 @@ def bind_task_lease_authority(authority: TaskLeaseAuthority) -> Iterator[None]:
         _ACTIVE_TASK_LEASE_AUTHORITY.reset(token)
 
 
+def current_task_id() -> str | None:
+    """The managed task whose handler this code runs in, or None outside one.
+
+    Only attribution reads it (a brokered sandbox's provenance); it grants nothing.
+    """
+
+    authority = _ACTIVE_TASK_LEASE_AUTHORITY.get()
+    return None if authority is None else authority.task_id
+
+
 def active_task_lease_authority(
     *,
     task_id: str,

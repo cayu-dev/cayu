@@ -73,11 +73,13 @@ from cayu.environments.lifecycle import (
 )
 from cayu.runners import ExecCommand
 from cayu.runners.base import Runner
+from cayu.runtime._task_lease_authority import current_task_id
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sandbox_broker.client import (
     SandboxBrokerClient,
     SandboxBrokerError,
     SandboxEgressMode,
+    SandboxProvenance,
     SandboxRecord,
     validate_egress,
     validate_git_egress,
@@ -919,6 +921,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             lease_seconds=self.lease_seconds,
             labels=labels,
             queue_seconds=self.queue_seconds,
+            # What Cloud records the sandbox was for; the client adds the process's Release.
+            provenance=SandboxProvenance(session_id=request.session_id, task_id=current_task_id()),
         )
         # The runtime runs a follow-up turn's create under the reconnect phase.
         phase = (

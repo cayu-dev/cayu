@@ -157,6 +157,12 @@ class FakeSandbox:
             "interactive_commands": self.interactive_commands,
             "guarantees": {"version": self.guarantees_version, "items": list(self.guarantees)},
             "git": self.body.get("git"),
+            "provenance": None
+            if self.body.get("provenance") is None
+            else {
+                name: self.body["provenance"].get(name)
+                for name in ("release_id", "session_id", "task_id")
+            },
             **({} if self.image_identity is None else {"image_identity": self.image_identity}),
         }
 
@@ -202,6 +208,8 @@ class FakeBroker:
         self.fail_copy_ins = 0
         # Whether new sandboxes run interactive commands; Cloud before them refuses the field.
         self.interactive_commands = True
+        # Whether creates may name their provenance; Cloud before it refuses the field.
+        self.provenance = True
         # Staged objects by key, and every request the storage received.
         self.objects: dict[str, bytes] = {}
         self.storage_requests: list[httpx.Request] = []
@@ -494,6 +502,8 @@ class FakeBroker:
             status, code = self.refuse_create
             detail = {"scope": "agent", "limit": 8} if code == "sandbox_quota_exceeded" else {}
             return _error(status, code, detail)
+        if "provenance" in body and not self.provenance:
+            return _error(422, "sandbox_invalid", message="Unknown field: provenance.")
         if body["image"] not in self.catalog:
             return _error(422, "image_unknown")
         egress = body.get("egress")

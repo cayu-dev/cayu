@@ -35,6 +35,7 @@ cayu cloud service status --application my-agent
 - `env list|set|unset` for Agent-owned configuration, and `settings list|set|unset`
   for the Agent's [managed settings](#agent-settings);
 - `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
+- `sandboxes list|show` to [read an Agent's brokered sandboxes](#reading-an-agents-sandboxes);
 - `compass agents|show|enroll|disable|verify|pass|job|missions|findings` for
   [Compass](#compass);
 - `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
@@ -1767,6 +1768,35 @@ with `queue_seconds` waits in Cloud's queue instead of being refused, and
 takes `queue_seconds` as well and reports a waiting session's queue position in
 its lifecycle progress events
 ([limits and capacity](environment-factories.md#coding-in-a-sandbox-brokered-by-cayu-cloud)).
+
+### Reading an Agent's sandboxes
+
+`cayu cloud sandboxes` reads the sandboxes Cloud brokers for an Agent, with
+the `cayu cloud login` (anyone who may see the Agent) or a context's API key
+with the `read` scope. It changes nothing; only the Agent creates, renews and
+destroys its sandboxes.
+
+```sh
+cayu cloud sandboxes list --application my-agent                 # newest first
+cayu cloud sandboxes list --application my-agent --status ready --limit 200
+cayu cloud sandboxes show --application my-agent sbx_7f2c...      # with its events
+```
+
+`list` starts with the Agent's capacity now (how many places are held under
+its limit, and whether a create would wait or be refused) and shows each
+sandbox's status, when its lease ends, why and when it ended, and the Release,
+session and task it was created for. A sandbox that still holds a place for a
+Release the Agent no longer selects is marked `*`: a redeploy's leftover keeps
+its place until its lease runs out. `show` adds its audit events: who asked,
+each command's program and outcome, renewals, egress hosts and its end. Both
+print a table, or the JSON envelope with `--json`. A sandbox created by an
+older Runtime, or without provenance, shows `-` for its Release, session and
+task. The commands need a Cayu Cloud with cayu-tech/cayu-cloud#679; an older
+one refuses the login on these routes.
+
+Cloud also logs every create it refuses for a full limit, with the limit, how
+many held a place and when the soonest lease runs out (`sandbox_quota_refused`
+in its API log).
 
 ## Fixed process resources
 

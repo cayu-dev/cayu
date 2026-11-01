@@ -581,6 +581,22 @@ factory = BrokeredSandboxCodingEnvironmentFactory.from_env(
 | `CAYU_CLOUD_SANDBOX_LEASE_SECONDS` | Lease length, 60 to 3600, default 900. |
 | `CAYU_CLOUD_SANDBOX_REQUEST_TIMEOUT_SECONDS` | Timeout for one broker request, default 45. A read that waits (`wait_seconds`) gets its wait on top. |
 
+Each sandbox the factory creates names its provenance, which Cloud records on
+the sandbox (`provenance` on its record and its `requested` event): the
+session it was created for, the managed task whose handler created it when
+there is one, and the Release the process runs (`CAYU_RELEASE_ID`, which Cloud
+sets and `SandboxBrokerSettings.from_env` reads as `release_id`). That is how
+`cayu cloud sandboxes list` traces a sandbox left behind, for example by a
+redeploy, to the Release, session and task it came from. A direct
+`SandboxBrokerClient.create` names it when asked:
+`provenance=SandboxProvenance(session_id=..., task_id=...)` adds the Release
+too, and `SandboxProvenance()` names only the Release. Provenance is part of
+the request, so a caller whose idempotency key outlives one Release (a key
+derived from a task that may be retried after a redeploy) should pass none, or
+the replay won't match. Without it the client sends the body older Runtimes
+did. An id Cloud wouldn't take is left out rather than failing the create, and
+a Cloud that predates provenance gets the create without it.
+
 Every install's catalog has `coding-python` (Python with `uv`, `git` and
 ripgrep); an install may also offer `coding-agents`, which adds the Claude Code
 and Codex CLIs. Catalog images don't contain your project's dependencies.
