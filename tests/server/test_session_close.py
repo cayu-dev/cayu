@@ -296,8 +296,8 @@ def test_a_sleeping_session_is_interrupted_before_it_is_closed() -> None:
     asyncio.run(scenario())
 
 
-def test_a_waiting_subagent_is_closed_with_its_parent() -> None:
-    import asyncio
+async def _parent_waiting_on_subagent():
+    """An app whose session ``parent`` waits on a foreground subagent paused on an approval."""
 
     from tests.core.test_foreground_subagent_recovery import _identity, _Provider
     from tests.core.test_tool_round_execution_identities import _RecordingTool
@@ -308,48 +308,53 @@ def test_a_waiting_subagent_is_closed_with_its_parent() -> None:
     from cayu.tools import AlwaysRequireApprovalToolPolicy
     from cayu.tools.subagents import SubagentSpec, SubagentTool
 
-    async def scenario() -> None:
-        provider = _Provider(
+    provider = _Provider(
+        [
             [
-                [
-                    ModelStreamEvent.tool_call(
-                        id="spawn", name="subagent", arguments={"agent": "child", "task": "work"}
-                    ),
-                    ModelStreamEvent.completed(),
-                ],
-                [
-                    ModelStreamEvent.tool_call(id="act", name="record", arguments={"value": 7}),
-                    ModelStreamEvent.completed(),
-                ],
-            ]
-        )
-        app = CayuApp(enable_logging=False)
-        app.register_provider(provider, default=True)
-        app.register_agent(
-            AgentSpec(name="parent", model="test"),
-            tools=[
-                SubagentTool(
-                    app,
-                    agents={"child": SubagentSpec(agent_name="child")},
-                    execution_profile_identity=_identity("closed-subagent"),
-                )
+                ModelStreamEvent.tool_call(
+                    id="spawn", name="subagent", arguments={"agent": "child", "task": "work"}
+                ),
+                ModelStreamEvent.completed(),
             ],
-        )
-        app.register_agent(
-            AgentSpec(name="child", model="test"),
-            tools=[_RecordingTool()],
-            tool_policy=AlwaysRequireApprovalToolPolicy(tools=["record"]),
-        )
+            [
+                ModelStreamEvent.tool_call(id="act", name="record", arguments={"value": 7}),
+                ModelStreamEvent.completed(),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="parent", model="test"),
+        tools=[
+            SubagentTool(
+                app,
+                agents={"child": SubagentSpec(agent_name="child")},
+                execution_profile_identity=_identity("closed-subagent"),
+            )
+        ],
+    )
+    app.register_agent(
+        AgentSpec(name="child", model="test"),
+        tools=[_RecordingTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(tools=["record"]),
+    )
+    async for _event in app.run(
+        RunRequest(session_id="parent", agent_name="parent", messages=[Message.text("user", "go")])
+    ):
+        pass
+    [child] = (
+        await app.session_store.list_sessions(SessionQuery(parent_session_id="parent"))
+    ).sessions
+    return app, child
+
+
+def test_a_waiting_subagent_is_closed_with_its_parent() -> None:
+    import asyncio
+
+    async def scenario() -> None:
+        app, child = await _parent_waiting_on_subagent()
         try:
-            async for _event in app.run(
-                RunRequest(
-                    session_id="parent", agent_name="parent", messages=[Message.text("user", "go")]
-                )
-            ):
-                pass
-            [child] = (
-                await app.session_store.list_sessions(SessionQuery(parent_session_id="parent"))
-            ).sessions
             with pytest.raises(SessionStatusConflict, match="parent session waits on it"):
                 await app.close_session(child.id, reason="Nobody will approve it.")
             # A refused parent close leaves its children as they were.
@@ -477,6 +482,113 @@ def test_repeating_a_close_with_the_recorded_private_id_replays_without_resolvin
             assert again.status is SessionStatus.FAILED
             with pytest.raises(SessionStatusConflict, match="ended without that"):
                 await app.close_session("private", reason="Stale.", waiting_on="another-input")
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_repeating_a_parent_close_that_stopped_closes_the_remaining_children(
+    monkeypatch,
+) -> None:
+    import asyncio
+
+    async def scenario() -> None:
+        app, child = await _parent_waiting_on_subagent()
+        recovery = app._incomplete_recovery
+        original = recovery.close_waiting_session
+        stopped = False
+
+        async def stop_once(session_id, **options):
+            nonlocal stopped
+            if session_id == child.id and not options.get("check_only") and not stopped:
+                stopped = True
+                raise RuntimeError("Process lost while closing the children.")
+            return await original(session_id, **options)
+
+        monkeypatch.setattr(recovery, "close_waiting_session", stop_once)
+        try:
+            with pytest.raises(RuntimeError, match="Process lost"):
+                await app.close_session("parent", reason="Nobody will approve it.")
+            assert (await app.session_store.load("parent")).status is SessionStatus.FAILED
+            assert (await app.session_store.load(child.id)).status is SessionStatus.INTERRUPTED
+            # The retry finishes the cascade, with the original close's reason.
+            closed = await app.close_session("parent", reason="Retrying.")
+            assert closed.status is SessionStatus.FAILED
+            assert (await app.session_store.load(child.id)).status is SessionStatus.FAILED
+            assert not (await app.session_store.query_pending_actions(_query(child.id))).actions
+            events = await app.session_store.load_events(child.id)
+            [failed] = [event for event in events if event.type is EventType.SESSION_FAILED]
+            assert failed.payload["metadata"]["reason"] == "Nobody will approve it."
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_retry_preflights_all_children_before_mutating_any(monkeypatch) -> None:
+    import asyncio
+
+    from cayu.sessions.records import SessionIdentity
+
+    async def scenario():
+        app, child = await _parent_waiting_on_subagent()
+        original = app._incomplete_recovery.close_waiting_session
+
+        async def stop_child(session_id, **options):
+            if session_id == child.id and not options.get("check_only"):
+                raise RuntimeError("stopped cascade")
+            return await original(session_id, **options)
+
+        try:
+            monkeypatch.setattr(app._incomplete_recovery, "close_waiting_session", stop_child)
+            with pytest.raises(RuntimeError, match="stopped cascade"):
+                await app.close_session("parent", reason="Stop.")
+            monkeypatch.setattr(app._incomplete_recovery, "close_waiting_session", original)
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="missing",
+                    session_id="later",
+                    parent_session_id="parent",
+                    messages=[Message.text("user", "child")],
+                ),
+                identity=SessionIdentity(provider_name="test", model="test"),
+            )
+            with pytest.raises(SessionStatusConflict, match="isn't registered"):
+                await app.close_session("parent", reason="Retry.")
+            assert (await app.session_store.load(child.id)).status is SessionStatus.INTERRUPTED
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status", [SessionStatus.INTERRUPTED, SessionStatus.RUNNING])
+def test_repeated_close_leaves_new_forks_alone(status) -> None:
+    import asyncio
+
+    from cayu.sessions.requests import ForkSessionRequest
+
+    async def scenario():
+        app = _app()
+        try:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="approver",
+                    session_id="source",
+                    messages=[Message.text("user", "go")],
+                )
+            ):
+                pass
+            await app.close_session("source", reason="Done.")
+            async for _ in app.fork_session(
+                ForkSessionRequest(source_session_id="source", session_id="fork")
+            ):
+                pass
+            await app.session_store.update_status("fork", status)
+            closed = await app.close_session("source", reason="Retry.")
+            assert closed.status is SessionStatus.FAILED
+            assert (await app.session_store.load("fork")).status is status
         finally:
             await app.aclose()
 

@@ -32,6 +32,7 @@ from cayu.sessions._foreground_child_checkpoint import FOREGROUND_CHILD_WAIT_KEY
 from cayu.sessions._pending_approval_reader import pending_approval_from_checkpoint
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (
@@ -426,6 +427,10 @@ class SessionAbandonment:
                 and await self._private_waiting_on(session_id, waiting_on) not in closed_ids
             ):
                 raise SessionStatusConflict("Session ended without that approval or question.")
+            if "closed" in record:
+                # A close fails the parent before its children, so one that stopped in
+                # between left children open; repeating it closes the rest.
+                await self._close_remaining_children(session_id, record)
             return await self._finish(session, metadata=metadata, passes=[])
         if waiting_on is not None:
             waiting_on = await self._private_waiting_on(session_id, waiting_on)
@@ -485,6 +490,40 @@ class SessionAbandonment:
                 )
             )
         return await self._finish(session, metadata=metadata, passes=passes)
+
+    async def _close_remaining_children(self, session_id: str, record: dict[str, Any]) -> None:
+        """Close the open children a closed session left, as its own close would have.
+
+        They are closed with the reason and person the parent's close recorded. A child
+        that runs again is refused before any other child is closed.
+        """
+
+        # Forks are independent runs, including forks created after this close.
+        # Replaying the source close must neither end nor refuse because of them.
+        children = [
+            child
+            for child in await self._open_children(session_id)
+            if child.invocation.source is not SessionExecutionSource.FORK
+        ]
+        if any(child.status in _CLOSE_BLOCKING_STATUSES for child in children):
+            raise SessionStatusConflict(
+                "The session is closed, but a child session is still running; interrupt "
+                "it, then repeat the close to close the rest."
+            )
+        for child in children:
+            await self._require_closable(
+                child, await self._session_store.load_checkpoint(child.id), from_parent=True
+            )
+        metadata = record["metadata"]
+        reason = metadata.get("reason")
+        actor = metadata.get("resolved_by")
+        for child in children:
+            await self.close(
+                child.id,
+                reason=reason if type(reason) is str and reason.strip() else "Parent closed.",
+                closed_by=ResolutionActor.model_validate(actor) if type(actor) is dict else None,
+                _from_parent=True,
+            )
 
     async def _private_waiting_on(self, session_id: str, waiting_on: str) -> str:
         """The private approval or input ID for ``waiting_on``, which may be a public alias.

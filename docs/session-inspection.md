@@ -710,7 +710,9 @@ or interrupted child sessions are closed with it; a subagent whose parent waits 
 it is refused, so close the parent. A session that is running or interrupting,
 already completed or failed, asleep (interrupt it first, which cancels its wake), or
 has a task or a child session still running is refused. Repeating a close returns
-the closed session.
+the closed session, and closes any child sessions a close that stopped part way
+left open, after checking every remaining child can close. Independent forks of a
+closed session are left alone by a repeated close.
 
 With `--application NAME` it goes through the Agent's own Cayu API as you, like the
 reads below, which needs a developer or admin. Without it, it opens the project's
