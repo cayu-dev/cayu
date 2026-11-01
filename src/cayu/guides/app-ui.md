@@ -224,7 +224,10 @@ reason="...", closed_by=actor)`; pass `waiting_on=` the approval or input ID to
 close it only while it still waits on that pause. It fails the session with the reason and actor
 recorded, removes its pending approval or question from the inbox, keeps its
 transcript and events, and releases its environment. `cayu session close` and
-`POST /api/sessions/{id}/close` do the same.
+`POST /api/sessions/{id}/close` do the same. If a close stops after the session
+failed but before its child sessions closed, repeating it or the next
+`recover_abandoned_sessions()` sweep closes the rest after the root meets its
+inactivity window. Retained cleanup stays retryable after all children close.
 
 Transient renewal errors do not release the row, and the heartbeat keeps retrying
 for as long as the run is active, even after a store outage outlasts the lease.

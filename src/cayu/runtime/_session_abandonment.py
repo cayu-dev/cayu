@@ -31,6 +31,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions._foreground_child_checkpoint import FOREGROUND_CHILD_WAIT_KEY
 from cayu.sessions._pending_approval_reader import pending_approval_from_checkpoint
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.queries import SessionOrder, SessionQuery
@@ -167,6 +168,18 @@ _DENIED_APPROVAL_STRING_FIELDS = (
 _CLOSED_FIELDS = frozenset({"tool_round_id", "approval_id", "input_id"})
 
 
+def _unresumed_close(
+    session_id: str, action: IncompleteSessionRecoveryAction, message: str
+) -> IncompleteSessionRecoveryResult:
+    return IncompleteSessionRecoveryResult(
+        session_id=session_id,
+        previous_status=SessionStatus.FAILED,
+        status=SessionStatus.FAILED,
+        actions=(action,),
+        message=message,
+    )
+
+
 def _valid_closed(closed: Any) -> bool:
     return (
         type(closed) is dict
@@ -266,6 +279,32 @@ def _abandonable_tool_round(
 logger = logging.getLogger(__name__)
 # A child in one of these statuses still runs, so its parent can't be closed.
 _CLOSE_BLOCKING_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
+_OPEN_STATUSES = (SessionStatus.PENDING, SessionStatus.INTERRUPTED)
+
+
+class _ClosedSessionChildRunning(SessionStatusConflict):
+    """A closed session's remaining child runs again, so none of them is closed yet."""
+
+
+def _close_record(checkpoint: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The abandonment record of a session ``close`` ended, if it has one."""
+
+    record = abandoned_session_from_checkpoint(checkpoint)
+    if record is None or record["reason"] != SESSION_CLOSED_REASON or "closed" not in record:
+        return None
+    return record
+
+
+def _recorded_close(record: dict[str, Any]) -> tuple[str, ResolutionActor | None]:
+    """The reason and person a close recorded, to close its children with."""
+
+    metadata = record["metadata"]
+    reason = metadata.get("reason")
+    actor = metadata.get("resolved_by")
+    return (
+        reason if type(reason) is str and reason.strip() else "Parent closed.",
+        ResolutionActor.model_validate(actor) if type(actor) is dict else None,
+    )
 
 
 def _merged_recovery_results(
@@ -401,7 +440,8 @@ class SessionAbandonment:
         ``IncompleteSessionRecovery.close_waiting_session``, after its pending or
         interrupted child sessions are closed the same way. A second, ordinary
         recovery pass then publishes the terminal evidence and releases the
-        environment binding. Repeating the call after a close finishes that cleanup.
+        environment binding. Repeating the call after a close finishes that cleanup,
+        and so does ``resume_stopped_closes``, which the abandonment sweep runs.
         """
 
         if type(reason) is not str or not reason.strip():
@@ -473,9 +513,31 @@ class SessionAbandonment:
             if current.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
                 # Recovery found the session had already ended.
                 return _merged_recovery_results(passes)
-            closed = await self._incomplete_recovery.close_waiting_session(
-                session_id, reason=SESSION_CLOSED_REASON, metadata=metadata, waiting_on=waiting_on
-            )
+            try:
+                closed = await self._incomplete_recovery.close_waiting_session(
+                    session_id,
+                    reason=SESSION_CLOSED_REASON,
+                    metadata=metadata,
+                    waiting_on=waiting_on,
+                )
+            except SessionStatusConflict:
+                # Another close got there first, such as the sweep finishing a stopped
+                # close while a person repeats it. Its close stands; replay it.
+                current = await self._session_store.load(session_id)
+                if (
+                    current is None
+                    or current.instance_id != session.instance_id
+                    or current.status is not SessionStatus.FAILED
+                    or _close_record(await self._session_store.load_checkpoint(session_id)) is None
+                ):
+                    raise
+                return await self.close(
+                    session_id,
+                    reason=reason,
+                    closed_by=closed_by,
+                    waiting_on=waiting_on,
+                    _from_parent=_from_parent,
+                )
             # The parent closes first, so a refused parent never closes its children;
             # each child was checked above and is closable now that its parent ended.
             for child in await self._open_children(session_id):
@@ -500,7 +562,7 @@ class SessionAbandonment:
 
         remaining = await self._remaining_close_descendants(session_id, record)
         if any(child.status in _CLOSE_BLOCKING_STATUSES for child, _ in remaining):
-            raise SessionStatusConflict(
+            raise _ClosedSessionChildRunning(
                 "The session is closed, but a child session is still running; interrupt "
                 "it, then repeat the close to close the rest."
             )
@@ -515,15 +577,8 @@ class SessionAbandonment:
             # children so each descendant and finalization is executed once.
             if child.parent_session_id != session_id:
                 continue
-            metadata = close_record["metadata"]
-            reason = metadata.get("reason")
-            actor = metadata.get("resolved_by")
-            await self.close(
-                child.id,
-                reason=reason if type(reason) is str and reason.strip() else "Parent closed.",
-                closed_by=ResolutionActor.model_validate(actor) if type(actor) is dict else None,
-                _from_parent=True,
-            )
+            reason, closed_by = _recorded_close(close_record)
+            await self.close(child.id, reason=reason, closed_by=closed_by, _from_parent=True)
 
     async def _remaining_close_descendants(
         self, session_id: str, record: dict[str, Any]
@@ -729,10 +784,160 @@ class SessionAbandonment:
                     results.extend(
                         await self.abandon_retained(inactive_for_seconds=inactive_for_seconds)
                     )
+                results.extend(
+                    await self.resume_stopped_closes(inactive_for_seconds=inactive_for_seconds)
+                )
                 return results
             if page.next_cursor == cursor:
                 raise RuntimeError("Abandoned-session recovery returned a repeated cursor.")
             cursor = page.next_cursor
+
+    async def resume_stopped_closes(
+        self, *, inactive_for_seconds: int
+    ) -> list[IncompleteSessionRecoveryResult]:
+        """Finish closes that failed a session but stopped before closing its children.
+
+        Open children discover interrupted cascades. Failed sessions also retain
+        discoverable cleanup work after the last child changes status. Completed
+        closes are skipped, and the root must satisfy the sweep's inactivity window.
+        """
+
+        results: list[IncompleteSessionRecoveryResult] = []
+        visited: set[str] = set()
+        for status in (*_OPEN_STATUSES, SessionStatus.FAILED):
+            cursor: str | None = None
+            while True:
+                page = await self._session_store.list_sessions(
+                    SessionQuery(
+                        status=status,
+                        order_by=SessionOrder.CREATED_AT_ASC,
+                        limit=1000,
+                        cursor=cursor,
+                    )
+                )
+                for candidate in page.sessions:
+                    if candidate.status is not SessionStatus.FAILED and (
+                        candidate.parent_session_id is None
+                        or candidate.parent_session_id in visited
+                        or candidate.invocation.source is SessionExecutionSource.FORK
+                    ):
+                        continue
+                    if candidate.status is SessionStatus.FAILED and candidate.id in visited:
+                        continue
+                    result = await self._resume_stopped_close(
+                        candidate, visited, inactive_for_seconds=inactive_for_seconds
+                    )
+                    if result is not None:
+                        results.append(result)
+                if page.next_cursor is None or page.next_cursor == cursor:
+                    break
+                cursor = page.next_cursor
+        return results
+
+    async def _resume_stopped_close(
+        self, child: Session, visited: set[str], *, inactive_for_seconds: int
+    ) -> IncompleteSessionRecoveryResult | None:
+        """Finish the close of ``child``'s closed parent; a failure is reported, not raised.
+
+        ``visited`` collects the sessions this pass already looked at.
+        """
+
+        failed_candidate = child.status is SessionStatus.FAILED
+        session_id = child.id if failed_candidate else child.parent_session_id
+        assert session_id is not None
+        try:
+            if failed_candidate and (
+                _close_record(await self._session_store.load_checkpoint(child.id)) is None
+                or not await self._retained(child)
+            ):
+                return None
+            root = await self._closed_ancestor(session_id)
+            if root is None:
+                # The parent wasn't closed, so its other children needn't look again.
+                visited.add(session_id)
+                return None
+            current = await self._session_store.load(child.id)
+            if (
+                current is None
+                or current.instance_id != child.instance_id
+                or (
+                    current.status is not SessionStatus.FAILED
+                    if failed_candidate
+                    else current.status not in _OPEN_STATUSES
+                )
+            ):
+                # Closed (or resumed) since it was listed; a sibling may still be open.
+                return None
+            visited.add(session_id)
+            if root[0] in visited and root[0] != session_id:
+                return None
+            session_id, record = root
+            visited.add(session_id)
+            owner = await self._session_store.load(session_id)
+            if (
+                owner is None
+                or owner.status is not SessionStatus.FAILED
+                or not self._incomplete_recovery.session_is_inactive(
+                    owner, inactive_for_seconds=inactive_for_seconds
+                )
+            ):
+                return None
+            reason, closed_by = _recorded_close(record)
+            result = await self.close(session_id, reason=reason, closed_by=closed_by)
+        except _ClosedSessionChildRunning as exc:
+            logger.info("Session close not resumed for session %s: a child is running", session_id)
+            return _unresumed_close(
+                session_id, IncompleteSessionRecoveryAction.SKIPPED_ACTIVE, str(exc)
+            )
+        except SessionRunFenced:
+            # Another process, such as a person repeating the close, holds the
+            # session's recovery claim and finishes the close itself.
+            logger.info("Session close not resumed for session %s: another owner", session_id)
+            return _unresumed_close(
+                session_id,
+                IncompleteSessionRecoveryAction.SKIPPED_EXECUTION_OWNER,
+                "Another process is finishing the session's close.",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Resuming the close of session %s failed: error_type=%s",
+                session_id,
+                type(exc).__name__,
+            )
+            return _unresumed_close(
+                session_id,
+                IncompleteSessionRecoveryAction.FAILED,
+                f"Resuming the session's close failed: {type(exc).__name__}.",
+            )
+        return result.model_copy(
+            update={
+                "actions": (IncompleteSessionRecoveryAction.CLOSED, *result.actions),
+                "message": "Finished the session's close: closed the child sessions it left open.",
+            }
+        )
+
+    async def _closed_ancestor(self, session_id: str) -> tuple[str, dict[str, Any]] | None:
+        """The topmost closed session in the closed chain from ``session_id`` up.
+
+        Resuming there also finishes the closed ancestors a nested close left.
+        """
+
+        found: tuple[str, dict[str, Any]] | None = None
+        seen: set[str] = set()
+        current: str | None = session_id
+        while current is not None and current not in seen:
+            seen.add(current)
+            session = await self._session_store.load(current)
+            if session is None or session.status is not SessionStatus.FAILED:
+                return found
+            record = _close_record(await self._session_store.load_checkpoint(current))
+            if record is None:
+                return found
+            found = (current, record)
+            if session.invocation.source is SessionExecutionSource.FORK:
+                return found
+            current = session.parent_session_id
+        return found
 
     async def abandon_swept(
         self, result: IncompleteSessionRecoveryResult

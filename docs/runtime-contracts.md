@@ -1824,7 +1824,18 @@ Pending or interrupted child sessions are closed too: every refusal, each open
 descendant's included, is checked before anything changes, then the parent closes
 and its children after it. A close that stopped after the parent closed is
 finished by repeating it: the retry closes the children still open, with the
-reason and person the parent's close recorded, before it reports the close. A subagent whose foreground parent waits on it is
+reason and person the parent's close recorded, before it reports the close.
+`recover_abandoned_sessions` finishes it the same way once the closed root meets
+the sweep's `inactive_for_seconds` window. It reads pending and interrupted
+sessions, plus failed sessions to find retained terminal publication or cleanup
+work even after the last child closes. Completed close records are skipped. It
+repeats the close from the topmost closed ancestor, reporting `closed` among the
+result's actions. An explicit zero window permits an immediate retry. While a remaining child runs again, neither the retry nor the
+sweep closes any of them; the sweep reports `skipped_active` with the reason, and
+reports `skipped_execution_owner` when another process holds the closed session's
+recovery claim. Closers that race (two sweeps, or a sweep and a person repeating the
+close) settle through the same fenced transition, and one that finds the child
+already closed replays that close, so each child gets one `session.failed`. A subagent whose foreground parent waits on it is
 refused, so close the parent instead. Running or interrupting sessions or children, finished sessions,
 sleeping sessions (interrupt one first, which cancels its wake), sessions with an
 unfinished task, and sessions whose agent isn't registered are refused with

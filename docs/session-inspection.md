@@ -717,7 +717,14 @@ the closed session, and closes any child sessions a close that stopped part way
 left open, after checking every remaining child can close. Independent forks of a
 closed session are left alone by a repeated close. A retry also traverses children
 that already recorded their close, so an interruption deeper in the cascade does
-not strand their descendants.
+not strand their descendants. You don't have to repeat it yourself: every
+`recover_abandoned_sessions` sweep finishes a close that stopped part way once its
+root meets `inactive_for_seconds`, with the reason and person the close recorded.
+It also retries retained cleanup after every child is failed; an explicit zero
+window permits immediate recovery. While one of the remaining children is
+running again, the sweep closes none of them and reports `skipped_active` for the
+closed session; interrupt that child and the next sweep, or a repeated close,
+closes the rest.
 
 With `--application NAME` it goes through the Agent's own Cayu API as you, like the
 reads below, which needs a developer or admin. Without it, it opens the project's

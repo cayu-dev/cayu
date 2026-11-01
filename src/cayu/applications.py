@@ -7775,7 +7775,8 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         as by :meth:`abandon_session` when it has at least one task and every
         one of its tasks is terminal, which requires a ``task_store``. The
         sweep then also revisits interrupted sessions whose tasks finished
-        later, and abandoned sessions whose cleanup did not finish.
+        later, and abandoned sessions whose cleanup did not finish. Every sweep
+        finishes a ``close_session`` that stopped before closing the children.
         """
 
         return tuple(

@@ -648,3 +648,311 @@ def test_parent_close_retry_crosses_an_already_closed_child(monkeypatch) -> None
             await app.aclose()
 
     asyncio.run(scenario())
+
+
+async def _stopped_parent_close(app, child, monkeypatch, *, stopped_session_id=None):
+    """Close ``parent`` and stop the cascade once it reaches ``stopped_session_id``."""
+
+    original = app._incomplete_recovery.close_waiting_session
+    stopped_session_id = stopped_session_id or child.id
+
+    async def stop(session_id, **options):
+        if session_id == stopped_session_id and not options.get("check_only"):
+            raise RuntimeError("Process lost while closing the children.")
+        return await original(session_id, **options)
+
+    monkeypatch.setattr(app._incomplete_recovery, "close_waiting_session", stop)
+    with pytest.raises(RuntimeError, match="Process lost"):
+        await app.close_session("parent", reason="Nobody will approve it.")
+    monkeypatch.setattr(app._incomplete_recovery, "close_waiting_session", original)
+    assert (await app.session_store.load("parent")).status is SessionStatus.FAILED
+    return original
+
+
+def _failures(events):
+    return [event for event in events if event.type is EventType.SESSION_FAILED]
+
+
+def test_the_sweep_finishes_a_parent_close_that_stopped(monkeypatch) -> None:
+    import asyncio
+
+    from cayu.sessions import IncompleteSessionRecoveryAction
+
+    async def scenario() -> None:
+        app, child = await _parent_waiting_on_subagent()
+        try:
+            await _stopped_parent_close(app, child, monkeypatch)
+            assert (await app.session_store.load(child.id)).status is SessionStatus.INTERRUPTED
+            # The normal sweep waits out its grace window before resuming.
+            assert await app.recover_abandoned_sessions() == ()
+            from datetime import timedelta
+
+            clock = app._incomplete_recovery._clock
+            monkeypatch.setattr(
+                app._incomplete_recovery, "_clock", lambda: clock() + timedelta(hours=1)
+            )
+            [result] = await app.recover_abandoned_sessions()
+            assert result.session_id == "parent"
+            assert IncompleteSessionRecoveryAction.CLOSED in result.actions
+            assert IncompleteSessionRecoveryAction.FAILED not in result.actions
+            assert (await app.session_store.load(child.id)).status is SessionStatus.FAILED
+            assert not (await app.session_store.query_pending_actions(_query(child.id))).actions
+            [failed] = _failures(await app.session_store.load_events(child.id))
+            assert failed.payload["metadata"]["reason"] == "Nobody will approve it."
+            assert len(_failures(await app.session_store.load_events("parent"))) == 1
+            # Nothing is left for later sweeps.
+            assert await app.recover_abandoned_sessions(inactive_for_seconds=0) == ()
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_the_sweep_finishes_a_nested_close_from_its_closed_root(monkeypatch) -> None:
+    import asyncio
+
+    from cayu.sessions.records import SessionIdentity
+
+    async def scenario() -> None:
+        app, child = await _parent_waiting_on_subagent()
+        try:
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="child",
+                    session_id="grandchild",
+                    parent_session_id=child.id,
+                    messages=[Message.text("user", "work")],
+                ),
+                identity=SessionIdentity(provider_name="test", model="test"),
+            )
+            await _stopped_parent_close(app, child, monkeypatch, stopped_session_id="grandchild")
+            assert (await app.session_store.load(child.id)).status is SessionStatus.FAILED
+            assert (await app.session_store.load("grandchild")).status is SessionStatus.PENDING
+            finished = []
+            finish = app._session_abandonment._finish
+
+            async def count_finish(session, **options):
+                finished.append(session.id)
+                return await finish(session, **options)
+
+            monkeypatch.setattr(app._session_abandonment, "_finish", count_finish)
+            [result] = await app.recover_abandoned_sessions(inactive_for_seconds=0)
+            # Resumed from the closed root, so the parent's own cleanup finishes too.
+            assert result.session_id == "parent"
+            assert sorted(finished) == sorted(["parent", child.id, "grandchild"])
+            [failed] = _failures(await app.session_store.load_events("grandchild"))
+            assert failed.payload["metadata"]["reason"] == "Nobody will approve it."
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_a_running_child_stops_the_sweep_from_finishing_a_close(monkeypatch) -> None:
+    import asyncio
+
+    from cayu.sessions import IncompleteSessionRecoveryAction
+    from cayu.sessions.records import SessionIdentity
+
+    async def scenario() -> None:
+        app, child = await _parent_waiting_on_subagent()
+        try:
+            await _stopped_parent_close(app, child, monkeypatch)
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="child",
+                    session_id="running",
+                    parent_session_id="parent",
+                    messages=[Message.text("user", "work")],
+                ),
+                identity=SessionIdentity(provider_name="test", model="test"),
+            )
+            await app.session_store.update_status("running", SessionStatus.RUNNING)
+            [skipped] = await app._session_abandonment.resume_stopped_closes(inactive_for_seconds=0)
+            assert skipped.session_id == "parent"
+            assert skipped.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+            assert "still running" in skipped.message
+            # None of the remaining children is closed while one runs.
+            assert (await app.session_store.load(child.id)).status is SessionStatus.INTERRUPTED
+            assert (await app.session_store.load("running")).status is SessionStatus.RUNNING
+            assert _failures(await app.session_store.load_events(child.id)) == []
+            # Once it is interrupted, the next sweep closes them all.
+            await app.session_store.update_status("running", SessionStatus.INTERRUPTED)
+            [result] = await app._session_abandonment.resume_stopped_closes(inactive_for_seconds=0)
+            assert IncompleteSessionRecoveryAction.CLOSED in result.actions
+            for session_id in (child.id, "running"):
+                assert (await app.session_store.load(session_id)).status is SessionStatus.FAILED
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("other", ["repeated_close", "second_sweep"])
+def test_a_sweep_racing_another_closer_fails_each_child_once(monkeypatch, other) -> None:
+    import asyncio
+
+    from cayu.sessions import IncompleteSessionRecoveryAction
+    from cayu.sessions.authority import SessionRunFenced
+
+    def finished(outcome) -> bool:
+        """Whether one closer finished the close, rather than yielding to the other."""
+
+        if isinstance(outcome, SessionRunFenced):
+            # A person's close fenced off the parent's last cleanup can be repeated.
+            return False
+        assert not isinstance(outcome, BaseException), outcome
+        if type(outcome) is tuple:
+            [outcome] = outcome
+            if outcome.actions == (IncompleteSessionRecoveryAction.SKIPPED_EXECUTION_OWNER,):
+                return False
+            assert IncompleteSessionRecoveryAction.CLOSED in outcome.actions
+            assert IncompleteSessionRecoveryAction.FAILED not in outcome.actions
+        assert outcome.status is SessionStatus.FAILED
+        return True
+
+    async def scenario() -> None:
+        app, child = await _parent_waiting_on_subagent()
+        try:
+            original = await _stopped_parent_close(app, child, monkeypatch)
+            arrived = 0
+            both = asyncio.Event()
+
+            async def meet(session_id, **options):
+                # Both closers read the child as open before either closes it.
+                nonlocal arrived
+                if session_id == child.id and not options.get("check_only"):
+                    arrived += 1
+                    if arrived == 2:
+                        both.set()
+                    await asyncio.wait_for(both.wait(), 10)
+                return await original(session_id, **options)
+
+            monkeypatch.setattr(app._incomplete_recovery, "close_waiting_session", meet)
+            outcomes = await asyncio.gather(
+                app.recover_abandoned_sessions(inactive_for_seconds=0),
+                app.close_session("parent", reason="Retrying.")
+                if other == "repeated_close"
+                else app.recover_abandoned_sessions(inactive_for_seconds=0),
+                return_exceptions=True,
+            )
+            assert arrived == 2
+            # Whichever closes the child first, the other replays that close; the
+            # parent's last cleanup is claimed by one of them.
+            assert any([finished(outcome) for outcome in outcomes])
+            assert (await app.session_store.load(child.id)).status is SessionStatus.FAILED
+            assert await app.recover_abandoned_sessions(inactive_for_seconds=0) == ()
+            again = await app.close_session("parent", reason="Retrying.")
+            assert again.status is SessionStatus.FAILED
+            for session_id in ("parent", child.id):
+                events = await app.session_store.load_events(session_id)
+                assert len(_failures(events)) == 1
+            [failed] = _failures(await app.session_store.load_events(child.id))
+            assert failed.payload["metadata"]["reason"] == "Nobody will approve it."
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_sweep_retries_cleanup_after_every_session_is_failed(monkeypatch):
+    import asyncio
+
+    from cayu.sessions import IncompleteSessionRecoveryAction
+
+    async def scenario():
+        app, child = await _parent_waiting_on_subagent()
+        try:
+            await _stopped_parent_close(app, child, monkeypatch)
+            finish = app._session_abandonment._finish
+            failed_once = False
+
+            async def fail_once(session, **options):
+                nonlocal failed_once
+                if session.id == child.id and not failed_once:
+                    failed_once = True
+                    raise RuntimeError("temporary cleanup failure")
+                return await finish(session, **options)
+
+            monkeypatch.setattr(app._session_abandonment, "_finish", fail_once)
+            [failed] = await app.recover_abandoned_sessions(inactive_for_seconds=0)
+            assert IncompleteSessionRecoveryAction.FAILED in failed.actions
+            for sid in ("parent", child.id):
+                assert (await app.session_store.load(sid)).status is SessionStatus.FAILED
+            [recovered] = await app.recover_abandoned_sessions(inactive_for_seconds=0)
+            assert IncompleteSessionRecoveryAction.CLOSED in recovered.actions
+            for sid in ("parent", child.id):
+                assert len(_failures(await app.session_store.load_events(sid))) == 1
+            assert await app.recover_abandoned_sessions(inactive_for_seconds=0) == ()
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_default_sweep_leaves_an_inflight_first_close_alone(monkeypatch):
+    import asyncio
+
+    async def scenario():
+        app, child = await _parent_waiting_on_subagent()
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = app._incomplete_recovery.close_waiting_session
+
+        async def held(session_id, **options):
+            if session_id == child.id and not options.get("check_only"):
+                entered.set()
+                await release.wait()
+            return await original(session_id, **options)
+
+        monkeypatch.setattr(app._incomplete_recovery, "close_waiting_session", held)
+        close = asyncio.create_task(app.close_session("parent", reason="Finish now."))
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            assert await app.recover_abandoned_sessions() == ()
+            assert not close.done()
+            release.set()
+            result = await asyncio.wait_for(close, 10)
+            assert result.status is SessionStatus.FAILED
+            for sid in ("parent", child.id):
+                assert len(_failures(await app.session_store.load_events(sid))) == 1
+        finally:
+            release.set()
+            await asyncio.gather(close, return_exceptions=True)
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_finished_parent_is_found_through_an_interrupted_child_with_pending_children(monkeypatch):
+    import asyncio
+
+    from cayu.sessions.records import SessionIdentity
+
+    async def scenario():
+        app, child = await _parent_waiting_on_subagent()
+        try:
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="child",
+                    session_id="grandchild",
+                    parent_session_id=child.id,
+                    messages=[Message.text("user", "work")],
+                ),
+                identity=SessionIdentity(provider_name="test", model="test"),
+            )
+            await _stopped_parent_close(app, child, monkeypatch)
+            parent = await app.session_store.load("parent")
+            await app._session_abandonment._finish(parent, metadata={}, passes=[])
+            assert not await app._session_abandonment._retained(parent)
+            [result] = await app._session_abandonment.resume_stopped_closes(inactive_for_seconds=0)
+            assert result.session_id == "parent"
+            for sid in ("parent", child.id, "grandchild"):
+                assert (await app.session_store.load(sid)).status is SessionStatus.FAILED
+                assert len(_failures(await app.session_store.load_events(sid))) == 1
+            assert (
+                await app._session_abandonment.resume_stopped_closes(inactive_for_seconds=0) == []
+            )
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())

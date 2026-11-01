@@ -576,6 +576,10 @@ class IncompleteSessionRecovery:
         self._workspace_observation_recovery = workspace_observation_recovery
         self.terminal_finalization = terminal_finalization
 
+    def session_is_inactive(self, session: Session, *, inactive_for_seconds: int) -> bool:
+        """Apply the recovery grace window using the configured runtime clock."""
+        return (self._clock() - session.updated_at).total_seconds() >= inactive_for_seconds
+
     async def _automatic_provider_disposition_task_context(
         self,
         pending: ProviderOperationPendingDisposition,
