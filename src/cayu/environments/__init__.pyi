@@ -43,6 +43,12 @@ from cayu.environments.admission import evaluate_execution_admission as evaluate
 from cayu.environments.aws_filesystems import EFSAccessPointBinding as EFSAccessPointBinding
 from cayu.environments.aws_filesystems import S3FilesAccessPointBinding as S3FilesAccessPointBinding
 from cayu.environments.aws_filesystems import WorkspaceMountError as WorkspaceMountError
+from cayu.environments.aws_lambda_microvm import (
+    LambdaMicroVMEnvironmentFactory as LambdaMicroVMEnvironmentFactory,
+)
+from cayu.environments.aws_lambda_microvm import (
+    LambdaMicroVMLifecycleBinding as LambdaMicroVMLifecycleBinding,
+)
 from cayu.environments.base import (
     DEFAULT_WORKSPACE_INSTRUCTION_PATHS as DEFAULT_WORKSPACE_INSTRUCTION_PATHS,
 )

@@ -29,6 +29,7 @@ from tests.runners.lambda_microvm_harness import (
 )
 
 import cayu.egress.aws_lambda_microvm_adapter as adapter_module
+import cayu.runners._lambda_microvm_allocation as allocation_module
 import cayu.runners.aws_lambda_microvm as runner_module
 from cayu.egress import (
     HttpEgressPolicy,
@@ -340,7 +341,7 @@ def test_reap_between_replay_window_and_lifetime_bound_stays_pending(
 def test_reap_retries_after_unconfirmed_termination(
     clock: _Clock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(adapter_module, "_REAP_TERMINATION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(allocation_module, "REAP_TERMINATION_TIMEOUT_SECONDS", 0.05)
 
     async def run() -> None:
         store = InMemorySessionStore()

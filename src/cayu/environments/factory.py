@@ -592,6 +592,13 @@ class EnvironmentFactoryRequest:
     #: once :func:`cayu.environments.process_local_owner_exited` reports the
     #: owner gone. See ``cayu.environments.process_ownership``.
     process_local_owner: str | None = None
+    #: Monotonic epoch of the caller's claim on the allocation this request
+    #: names, when the runtime tracks one: whoever takes the allocation over
+    #: later gets a larger epoch. A factory whose provider can fence attaches
+    #: by epoch should pass it, so an owner that lost the allocation can't
+    #: displace its successor with a late attach. ``None`` when the runtime
+    #: tracks no epoch for the allocation (ordinary per-session requests today).
+    ownership_epoch: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.operation, EnvironmentFactoryOperation):
@@ -656,6 +663,10 @@ class EnvironmentFactoryRequest:
             self.process_local_owner
         ):
             raise ValueError("process_local_owner must be a process-local owner token.")
+        if self.ownership_epoch is not None and (
+            type(self.ownership_epoch) is not int or self.ownership_epoch < 0
+        ):
+            raise ValueError("ownership_epoch must be a nonnegative integer or None.")
         if self.replacement_predecessor and (
             self.operation is not EnvironmentFactoryOperation.CREATE or self.reconnect_metadata
         ):
@@ -1006,6 +1017,7 @@ def copy_environment_factory_request(
         interaction_id=request.interaction_id,
         replacement_predecessor=request.replacement_predecessor,
         process_local_owner=request.process_local_owner,
+        ownership_epoch=request.ownership_epoch,
     )
 
 

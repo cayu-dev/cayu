@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import email.utils
 import ipaddress
 import secrets
 import time
@@ -46,15 +45,36 @@ from cayu.runners import (
     LambdaMicroVMRunner,
     Runner,
 )
+
+# The allocation protocol is shared with the plain Lambda MicroVM environment
+# factory; names other modules and tests read from here stay importable.
+from cayu.runners._lambda_microvm_allocation import (
+    DEFAULT_CLIENT_TOKEN_REPLAY_WINDOW_SECONDS,
+    LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS,
+    LambdaMicroVMAllocationRecoveryError,
+    pin_allocation_metadata,
+    reap_token_owned_microvm,
+    require_replay_window,
+    require_replay_window_open,
+    resolve_exact_image,
+)
+from cayu.runners._lambda_microvm_allocation import (
+    LIFETIME_EXPIRY_MARGIN_SECONDS as _LIFETIME_EXPIRY_MARGIN_SECONDS,  # noqa: F401
+)
+from cayu.runners._lambda_microvm_allocation import AllocationMetadata as _AllocationMetadata
+from cayu.runners._lambda_microvm_allocation import client_token as _client_token
+from cayu.runners._lambda_microvm_allocation import (
+    lifetime_deadline as _lifetime_deadline,  # noqa: F401
+)
+from cayu.runners._lambda_microvm_allocation import replay_deadline as _replay_deadline
+from cayu.runners._lambda_microvm_allocation import (
+    validated_allocation_metadata as _validated_allocation_metadata,
+)
 from cayu.runners.aws_lambda_microvm import (
-    LAMBDA_SIGV4_REQUEST_VALIDITY_SECONDS,
     LambdaMicroVMEndpointTransport,
-    LambdaMicroVMError,
     _control_client,
     lambda_microvm_run_options,
     read_microvm_state,
-    run_microvm_with_client_token,
-    terminate_microvm_confirmed,
 )
 from cayu.runners.base import RunnerWorkloadAuthority
 from cayu.runners.workloads import (
@@ -69,28 +89,6 @@ from cayu.workspaces.revisions import (
 )
 
 DEFAULT_PREFLIGHT_TIMEOUT_SECONDS = 30
-#: Longest time after intent preparation that Cayu submits or replays one
-#: allocation's RunMicrovm client token. It must stay below AWS's token
-#: retention, which is undocumented; a replay after retention could create a
-#: second MicroVM. Live replays still returned the original MicroVM after more
-#: than one hour, the configurable maximum.
-DEFAULT_CLIENT_TOKEN_REPLAY_WINDOW_SECONDS = 900
-#: AWS's maximum MicroVM lifetime; recoverable allocations always pin a bound.
-LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS = 28_800
-#: Allowance for AWS's maximum-duration enforcement to finish terminating.
-_LIFETIME_EXPIRY_MARGIN_SECONDS = 300
-_REAP_TERMINATION_TIMEOUT_SECONDS = 8.0
-_ALLOCATION_METADATA_VERSION = 1
-_ALLOCATION_METADATA_KEYS = frozenset(
-    {
-        "version",
-        "image_arn",
-        "image_version",
-        "maximum_duration_s",
-        "prepared_at_s",
-        "replay_window_s",
-    }
-)
 _RECONNECT_IDENTITY_KEYS = frozenset(
     {
         "microvm_id",
@@ -106,23 +104,6 @@ _METADATA_ISOLATION_UNVERIFIED_REASON = "guest_process_boundary_unverified"
 _wall_clock: Callable[[], float] = time.time
 
 LambdaMicroVMMetadataIsolationMode = Literal["required", "unverified"]
-
-
-class LambdaMicroVMAllocationRecoveryError(LambdaMicroVMError):
-    """A recoverable allocation cannot be adopted or disposed without guessing.
-
-    The durable intent remains owned and retryable. Cayu never answers this
-    error by allocating a replacement MicroVM.
-    """
-
-
-class _AllocationMetadata(TypedDict):
-    version: int
-    image_arn: str
-    image_version: str
-    maximum_duration_s: int
-    prepared_at_s: int
-    replay_window_s: int
 
 
 class _ReconnectIdentity(TypedDict):
@@ -250,13 +231,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         ready_timeout_s: float | None = None,
         lifecycle_timeout_s: float | None = None,
     ) -> None:
-        if (
-            type(client_token_replay_window_s) is not int
-            or not 0 < client_token_replay_window_s <= 3_600
-        ):
-            raise ValueError(
-                "client_token_replay_window_s must be an integer between 1 and 3600 seconds."
-            )
+        require_replay_window(client_token_replay_window_s)
         if not region_name.strip():
             raise ValueError("region_name must be nonblank.")
         if not egress_network_connector_arn.strip():
@@ -481,26 +456,15 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                     "Lambda MicroVM replacement region differs from its predecessor's region."
                 )
             image_version = predecessor["image_version"]
-        maximum_duration = self.runner_options.get(
-            "maximum_duration_in_seconds", LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS
+        metadata = pin_allocation_metadata(
+            image_arn=image_arn,
+            image_version=image_version,
+            maximum_duration_s=self.runner_options.get(
+                "maximum_duration_in_seconds", LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS
+            ),
+            replay_window_s=self.client_token_replay_window_s,
+            now=_wall_clock(),
         )
-        if (
-            type(maximum_duration) is not int
-            or not 0 < maximum_duration <= LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS
-        ):
-            raise ValueError(
-                "Recoverable Lambda MicroVM allocation requires maximum_duration_in_seconds "
-                f"between 1 and {LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS}."
-            )
-        metadata: _AllocationMetadata = {
-            "version": _ALLOCATION_METADATA_VERSION,
-            "image_arn": image_arn,
-            "image_version": image_version,
-            "maximum_duration_s": maximum_duration,
-            # Floor so every elapsed-time decision errs toward "later".
-            "prepared_at_s": int(_wall_clock()),
-            "replay_window_s": self.client_token_replay_window_s,
-        }
         return dict(metadata)
 
     async def create_or_recover_runner(
@@ -571,7 +535,6 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             raise TypeError("Lambda MicroVM cleanup requires VirtualEgressAllocationReap.")
         metadata = _validated_allocation_metadata(request.allocation_metadata)
         identity = request.acknowledged_identity or {}
-        microvm_id = identity.get("microvm_id")
         now = _wall_clock()
         control_client, owns_client = _control_client(
             client=self.client,
@@ -580,40 +543,13 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             endpoint_url=self.endpoint_url,
         )
         try:
-            if microvm_id is None:
-                if now <= _replay_deadline(metadata):
-                    response = await run_microvm_with_client_token(
-                        control_client,
-                        self._run_options(metadata),
-                        client_token=_client_token(
-                            self.allocation_adapter_generation, request.allocation_id
-                        ),
-                        submit_not_after=_replay_deadline(metadata),
-                    )
-                    microvm_id = response.get("microvmId")
-                    if type(microvm_id) is not str or not microvm_id.strip():
-                        raise LambdaMicroVMProtocolError("run_microvm response omitted microvmId.")
-                else:
-                    # The local clock only decides whether asking is worthwhile;
-                    # AWS's clock is the proof.
-                    server_now = (
-                        await _aws_server_time(control_client, metadata["image_arn"])
-                        if now >= _lifetime_deadline(metadata)
-                        else None
-                    )
-                    if server_now is not None and server_now >= _lifetime_deadline(metadata):
-                        return
-                    raise LambdaMicroVMAllocationRecoveryError(
-                        "Lambda MicroVM client-token replay window has elapsed and AWS has not "
-                        "confirmed that the allocation's maximum lifetime has; cleanup remains "
-                        f"pending until {_lifetime_deadline(metadata)} (epoch seconds, AWS time)."
-                    )
-            if type(microvm_id) is not str:
-                raise LambdaMicroVMProtocolError("Acknowledged Lambda MicroVM id is invalid.")
-            await terminate_microvm_confirmed(
+            await reap_token_owned_microvm(
                 control_client,
-                microvm_id,
-                timeout_s=_REAP_TERMINATION_TIMEOUT_SECONDS,
+                run_options=self._run_options(metadata),
+                token=_client_token(self.allocation_adapter_generation, request.allocation_id),
+                metadata=metadata,
+                acknowledged_microvm_id=identity.get("microvm_id"),
+                now=now,
             )
         finally:
             if owns_client:
@@ -623,12 +559,8 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
 
     async def _resolve_exact_image(self, image: str) -> tuple[str, str]:
         configured_version = self.runner_options.get("image_version")
-        if configured_version is not None and (
-            type(configured_version) is not str or not configured_version.strip()
-        ):
-            raise ValueError("Lambda MicroVM image_version must be a nonblank string.")
         if image.startswith("arn:") and configured_version is not None:
-            return image, configured_version
+            return await resolve_exact_image(None, image, configured_version=configured_version)
         control_client, owns_client = _control_client(
             client=self.client,
             region_name=self.region_name,
@@ -636,25 +568,17 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             endpoint_url=self.endpoint_url,
         )
         try:
-            response = await asyncio.to_thread(
-                control_client.get_microvm_image, imageIdentifier=image
+            return await resolve_exact_image(
+                control_client,
+                image,
+                configured_version=configured_version,
+                unavailable_error=UnsupportedEgressError,
             )
         finally:
             if owns_client:
                 close = getattr(control_client, "close", None)
                 if callable(close):
                     await asyncio.to_thread(close)
-        if not isinstance(response, Mapping):
-            raise LambdaMicroVMProtocolError("get_microvm_image response must be an object.")
-        image_arn = response.get("imageArn")
-        version = configured_version or response.get("latestActiveImageVersion")
-        if type(image_arn) is not str or not image_arn.startswith("arn:"):
-            raise LambdaMicroVMProtocolError("get_microvm_image omitted a valid imageArn.")
-        if type(version) is not str or not version.strip():
-            raise UnsupportedEgressError(
-                "Lambda MicroVM image has no active version to pin for recoverable allocation."
-            )
-        return image_arn, version
 
     def _run_options(self, metadata: _AllocationMetadata) -> dict[str, Any]:
         options = self.runner_options
@@ -670,11 +594,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         )
 
     def _require_replay_window_open(self, metadata: _AllocationMetadata, *, action: str) -> None:
-        if _wall_clock() > _replay_deadline(metadata):
-            raise LambdaMicroVMAllocationRecoveryError(
-                f"Cannot {action} Lambda MicroVM allocation: its client-token replay window "
-                "has elapsed, so another submission could create a duplicate MicroVM."
-            )
+        require_replay_window_open(metadata, action=action, now=_wall_clock())
 
     def _common_runner_options(self, request: VirtualEgressRunnerRequest) -> dict[str, Any]:
         if request.runner_kind != self.runner_kind:
@@ -1036,95 +956,6 @@ async def _verify_agent_privilege_boundary(runner: Runner, *, timeout_s: int) ->
 
 def _lambda_environment_fingerprint(microvm_id: str) -> str:
     return sha256(f"lambda-microvm\0{microvm_id}".encode()).hexdigest()
-
-
-def _client_token(adapter_generation: str, allocation_id: str) -> str:
-    # Derived rather than stored: the durable intent never carries submission
-    # authority, and every recovery worker reconstructs the identical token.
-    digest = sha256(
-        f"cayu.lambda-microvm.run\0{adapter_generation}\0{allocation_id}".encode()
-    ).hexdigest()
-    return f"cayu-{digest}"
-
-
-def _validated_allocation_metadata(metadata: Mapping[str, Any]) -> _AllocationMetadata:
-    if not isinstance(metadata, Mapping) or set(metadata) != _ALLOCATION_METADATA_KEYS:
-        raise LambdaMicroVMAllocationRecoveryError(
-            "Lambda MicroVM allocation intent is missing its pinned provider inputs."
-        )
-    if metadata["version"] != _ALLOCATION_METADATA_VERSION:
-        raise LambdaMicroVMAllocationRecoveryError(
-            "Lambda MicroVM allocation intent has an unsupported metadata version."
-        )
-    for key in ("image_arn", "image_version"):
-        value = metadata[key]
-        if type(value) is not str or not value.strip():
-            raise LambdaMicroVMAllocationRecoveryError(
-                f"Lambda MicroVM allocation intent has an invalid {key}."
-            )
-    if not metadata["image_arn"].startswith("arn:"):
-        raise LambdaMicroVMAllocationRecoveryError(
-            "Lambda MicroVM allocation intent must pin an image ARN."
-        )
-    for key, upper in (
-        ("maximum_duration_s", LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS),
-        ("replay_window_s", 3_600),
-        ("prepared_at_s", None),
-    ):
-        value = metadata[key]
-        if type(value) is not int or value <= 0 or (upper is not None and value > upper):
-            raise LambdaMicroVMAllocationRecoveryError(
-                f"Lambda MicroVM allocation intent has an invalid {key}."
-            )
-    return {
-        "version": metadata["version"],
-        "image_arn": metadata["image_arn"],
-        "image_version": metadata["image_version"],
-        "maximum_duration_s": metadata["maximum_duration_s"],
-        "prepared_at_s": metadata["prepared_at_s"],
-        "replay_window_s": metadata["replay_window_s"],
-    }
-
-
-def _replay_deadline(metadata: _AllocationMetadata) -> int:
-    return metadata["prepared_at_s"] + metadata["replay_window_s"]
-
-
-def _lifetime_deadline(metadata: _AllocationMetadata) -> int:
-    # No request for the token is signed after the replay deadline, and AWS
-    # accepts a SigV4 request for at most 15 minutes after signing, so any
-    # token-owned MicroVM started by then; maximum-duration enforcement has
-    # terminated it after this instant in AWS's time.
-    return (
-        _replay_deadline(metadata)
-        + LAMBDA_SIGV4_REQUEST_VALIDITY_SECONDS
-        + metadata["maximum_duration_s"]
-        + _LIFETIME_EXPIRY_MARGIN_SECONDS
-    )
-
-
-async def _aws_server_time(client: Any, image_arn: str) -> float | None:
-    """Return AWS's clock from a read response's ``Date`` header, or ``None``.
-
-    An error response from AWS carries the same authoritative header.
-    """
-
-    try:
-        response: Any = await asyncio.to_thread(client.get_microvm_image, imageIdentifier=image_arn)
-    except Exception as exc:
-        response = getattr(exc, "response", None)
-    metadata = response.get("ResponseMetadata") if isinstance(response, Mapping) else None
-    headers = metadata.get("HTTPHeaders") if isinstance(metadata, Mapping) else None
-    value = headers.get("date") if isinstance(headers, Mapping) else None
-    if type(value) is not str:
-        return None
-    try:
-        parsed = email.utils.parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.timestamp()
 
 
 def _all_ingress_connector_arn(region_name: str) -> str:

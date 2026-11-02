@@ -1327,7 +1327,19 @@ Limits of this version:
   them in sequence, or give them `allocation_scope="session"`.
 - Forked sessions, deferred-materialization factories and factories that
   declare an egress authority don't share; the last two fail with an error
-  when asked to. A fork keeps its source's causal budget, but its own
+  when asked to.
+- Factories that allocate a process-external resource, and so declare an
+  `allocation_scope`, don't share yet. Both Lambda MicroVM factories are in
+  this group. The shared path creates a scope's allocation with plain
+  `create()`, and these factories may only be created through
+  `create_recoverable` under a durable intent, so the step fails before any
+  provider call (`LambdaMicroVMEnvironmentFactory` refuses a plain CREATE).
+  To lift this, the shared path has to keep the allocation intent in the
+  workflow run's shared allocation record, call `create_recoverable` with a
+  context over that record, reap an unacknowledged intent from
+  `recover_incomplete_sessions`, and pass the record's claim generation as
+  `ownership_epoch`. The virtual-egress Lambda factory is also refused for its
+  egress authority until that refusal is lifted. A fork keeps its source's causal budget, but its own
   subagents' `causal_budget` scope stops at the fork, so they never join the
   source's allocation.
 - `unregister_environment` refuses an environment while a shared allocation
@@ -1626,12 +1638,91 @@ Every custom `SandboxEgressAdapter` must explicitly set
 `CREATE` before adapter preparation. This is intentional: Cayu cannot safely
 infer whether third-party runner creation mutates a process-external provider.
 
-The bundled E2B and Lambda MicroVM virtual-egress adapters do
-not currently satisfy every exact-recovery and conditional-cleanup requirement,
-so new creates through them fail before adapter setup or provider mutation.
-Docker remains available because its allocation is process-local. See
-[Runtime contracts](runtime-contracts.md) for the complete state and atomic
-publication contract.
+The bundled Lambda MicroVM virtual-egress adapter and
+`LambdaMicroVMEnvironmentFactory` (below) implement this protocol through
+`RunMicrovm` client-token replay. Docker needs none of it because its
+allocation is process-local. See [Runtime contracts](runtime-contracts.md) for
+the complete state and atomic publication contract.
+
+#### Lambda MicroVM without mediated egress
+
+`cayu.environments.LambdaMicroVMEnvironmentFactory` gives each allocation one
+AWS Lambda MicroVM whose disk is the workspace. It composes
+`LambdaMicroVMRunner`, `RunnerWorkspace` and `LambdaMicroVMLifecycleBinding`,
+and each of those stays usable on its own. Use it when the workload needs no
+network, or only the network its connectors give it. For proxied, audited
+egress with virtual credentials, use `SandboxCodingEnvironmentFactory` with
+`LambdaMicroVMEgressAdapter` (see "Coding in a cloud sandbox"). Both share the
+same allocation protocol in `cayu.runners._lambda_microvm_allocation`.
+
+```python
+from cayu.environments import EnvironmentSpec, LambdaMicroVMEnvironmentFactory
+
+factory = LambdaMicroVMEnvironmentFactory(
+    image_identifier=microvm_image_arn,
+    region_name="us-east-1",
+    create_options={"maximum_duration_in_seconds": 3600},
+    runner_options={"default_cwd": "/workspace"},
+)
+app.register_environment_factory(EnvironmentSpec(name="sandbox"), factory, default=True)
+```
+
+[`examples/aws/environments/lambda_microvm.py`](../examples/aws/environments/lambda_microvm.py)
+wraps this in a small registration helper.
+
+How it recovers and fences:
+
+- The factory declares an allocation scope for CREATE, so Cayu always calls
+  `create_recoverable`, and `create()` refuses a CREATE outright. Before any
+  provider call the intent pins the exact image version (`image_version`, or
+  the image's latest active version), the lifetime bound
+  (`maximum_duration_in_seconds`, AWS's 8-hour maximum by default) and a
+  client-token replay window (`client_token_replay_window_s`, 15 minutes by
+  default, at most an hour).
+- `RunMicrovm` runs under a client token derived from the intent's allocation
+  id. A create whose acknowledgement was lost, or one two recovery workers
+  repeat, resolves to the one MicroVM AWS created for that token. The token is
+  never stored, and the durable reconnect metadata is only the MicroVM's
+  identity (id, endpoint, region, image, version) and the owning session and
+  environment. No endpoint token or AWS credential is ever written down.
+- If the factory fails after dispatch, it lets go of its handle without
+  terminating anything: the intent owns the MicroVM, a retry adopts it by
+  replaying the token, and `recover_incomplete_sessions` reaps it. Reaping
+  replays the token within the window and terminates with positive readback;
+  after the window it waits for AWS's own clock to pass the pinned lifetime
+  bound. It never creates a replacement.
+- RECONNECT attaches to the same MicroVM with a freshly minted endpoint token
+  and claims the sidecar's owner fence. That rejects every later command and
+  suspend or terminate call from the runner that owned it before. When the
+  request carries `EnvironmentFactoryRequest.ownership_epoch`, the claim is
+  epoch-fenced too, so an owner that lost the allocation can't take it back
+  with a late attach. Ordinary per-session requests carry no epoch today and
+  rely on the owner fence alone. Set `fence_owner_epochs=False` only for an
+  image whose sidecar doesn't advertise `owner_epoch`.
+- The binding suspends the MicroVM when a session is interrupted and
+  terminates it for any other outcome, returning only after the control plane
+  reports `SUSPENDED` or `TERMINATED`. `is_allocation_disposed` is True only
+  for `TERMINATED` or an identifier AWS no longer knows.
+- Termination is durable. The binding uses the runtime's durable finalization
+  path, so a completed session's obligation to terminate is recorded before
+  finalize runs, and the binding records the exact MicroVM to terminate before
+  the terminate call. If the worker dies anywhere in teardown,
+  `recover_incomplete_sessions` finishes it through
+  `recover_finalization_disposal`, which only terminates that MicroVM with
+  readback (a no-op if AWS already terminated it) and never reattaches.
+  The factory builds its binding with `durable_disposal=True`; a
+  `LambdaMicroVMLifecycleBinding` in an environment registered directly,
+  with no factory to recover through, keeps the default and terminates in
+  finalize only.
+- A replacement (`WorkspaceCheckpointPolicy(allocation_replacement="restore")`
+  after the old MicroVM was proven disposed) keeps its predecessor's exact
+  image version, even if a newer version has become active since, and is
+  refused before dispatch if the predecessor names another image or region.
+
+Live verification against AWS is
+`examples/aws/lambda_microvm_recoverable_allocation_live.py` (client-token
+adoption, concurrent recovery, stale-owner fencing, reaping) and
+`examples/aws/lambda_microvm_runner_live.py`.
 
 ## Deferred materialization
 

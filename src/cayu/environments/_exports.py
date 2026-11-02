@@ -202,6 +202,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.environments.docker_coding",
         "DockerCodingEnvironmentFactory",
     ),
+    "LambdaMicroVMEnvironmentFactory": (
+        "cayu.environments.aws_lambda_microvm",
+        "LambdaMicroVMEnvironmentFactory",
+    ),
+    "LambdaMicroVMLifecycleBinding": (
+        "cayu.environments.aws_lambda_microvm",
+        "LambdaMicroVMLifecycleBinding",
+    ),
     "DockerCodingFixedEnvironmentVariable": (
         "cayu.environments.docker_toolchains",
         "DockerCodingFixedEnvironmentVariable",
@@ -520,6 +528,8 @@ PUBLIC_NAMES = [
     "DockerCodingCommandAuthority",
     "DockerCodingDependencyInput",
     "DockerCodingEnvironmentFactory",
+    "LambdaMicroVMEnvironmentFactory",
+    "LambdaMicroVMLifecycleBinding",
     "DockerCodingFixedEnvironmentVariable",
     "DockerCodingToolchainError",
     "DockerCodingToolchainProfile",
