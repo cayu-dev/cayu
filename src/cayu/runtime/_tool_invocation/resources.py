@@ -224,6 +224,7 @@ class ToolInvocationResources:
                 self._image_decode_policy.as_dict() if self._image_decode_policy else None
             ),
             session_id=session.id,
+            session_labels=session.labels,
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
             causal_budget_id=session.causal_budget_id,

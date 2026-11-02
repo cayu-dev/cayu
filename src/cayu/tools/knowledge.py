@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -258,6 +260,11 @@ class RememberKnowledgePolicy(BaseModel):
     default_kind: str = "fact"
     default_created_by: str = "model"
     require_labels: dict[str, str] = Field(default_factory=dict)
+    #: Labels each note copies from the calling session (``ToolContext.session_labels``),
+    #: such as ``("module", "repository")``. The runtime sets them and the model can't; a
+    #: label the session doesn't carry is left off. Notes that differ only in these labels
+    #: are separate entries.
+    copy_session_labels: tuple[str, ...] = ()
 
     @field_validator("default_namespace", "default_kind")
     @classmethod
@@ -302,6 +309,22 @@ class RememberKnowledgePolicy(BaseModel):
     def copy_required_labels(cls, value) -> dict[str, str]:
         return copy_label_map(value, "require_labels")
 
+    @field_validator("copy_session_labels", mode="before")
+    @classmethod
+    def validate_copied_label_keys(cls, value) -> tuple[str, ...]:
+        if isinstance(value, str | bytes):
+            raise ValueError("copy_session_labels must be an iterable of label keys.")
+        try:
+            items = list(value)
+        except TypeError as exc:
+            raise ValueError("copy_session_labels must be an iterable of label keys.") from exc
+        keys: list[str] = []
+        for index, item in enumerate(items):
+            if type(item) is not str:
+                raise ValueError(f"`copy_session_labels[{index}]` must be a string.")
+            keys.append(require_clean_nonblank(item, f"copy_session_labels[{index}]"))
+        return tuple(dict.fromkeys(keys))
+
     @field_validator("governance", mode="before")
     @classmethod
     def copy_governance(cls, value: object) -> object:
@@ -315,7 +338,36 @@ class RememberKnowledgePolicy(BaseModel):
             raise ValueError("Model attribution cannot also be activation policy authority.")
         if self.allowed_kinds is not None and self.default_kind not in self.allowed_kinds:
             raise ValueError("default_kind must be included in allowed_kinds.")
+        fixed = sorted(set(self.copy_session_labels) & set(self.require_labels))
+        if fixed:
+            raise ValueError(
+                f"Labels {fixed} are both required and copied from the session; choose one."
+            )
         return self
+
+    def labels_for(
+        self, session_labels: Mapping[str, str]
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """A note's labels for a session: all of them, and those copied from the session."""
+
+        copied = {
+            key: session_labels[key] for key in self.copy_session_labels if key in session_labels
+        }
+        return {**copied, **self.require_labels}, copied
+
+
+def _remember_entry_id(content_entry_id: str, copied_labels: Mapping[str, str]) -> str:
+    """The entry a note is remembered as: its content's id, scoped to its session labels.
+
+    A policy that copies no labels keeps the content-derived id, so the same text is one
+    entry. With copied labels, the same note from sessions labelled differently (another
+    module, say) is a separate entry instead of a conflict with the first one's labels.
+    """
+
+    if not copied_labels:
+        return content_entry_id
+    basis = json.dumps([content_entry_id, sorted(copied_labels.items())], ensure_ascii=False)
+    return f"knowledge_{sha256(basis.encode('utf-8')).hexdigest()[:32]}"
 
 
 def _copy_remember_knowledge_policy(
@@ -335,6 +387,7 @@ def _copy_remember_knowledge_policy(
             # malformed forged instances retain the public ValidationError
             # contract instead of leaking a helper-level ValueError.
             require_labels=policy.require_labels,
+            copy_session_labels=policy.copy_session_labels,
         )
     if type(policy) is not dict:
         raise TypeError("policy must be a RememberKnowledgePolicy or dictionary.")
@@ -844,6 +897,7 @@ class RememberKnowledgeTool(Tool):
             aspects = _optional_string_list(args, "aspects") or []
             title = _optional_arg_string(args, "title")
             metadata = _remember_metadata(ctx)
+            labels, copied_labels = policy.labels_for(ctx.session_labels)
         source_hash = knowledge_source_hash(text)
         with tool_argument_validation():
             operation_id = _knowledge_publication_operation_id(
@@ -852,7 +906,7 @@ class RememberKnowledgeTool(Tool):
             intent_sha256 = _remember_request_intent_sha256(
                 text=text,
                 namespace=policy.default_namespace,
-                labels=policy.require_labels,
+                labels=labels,
                 kind=kind,
                 visibility=policy.default_visibility,
                 governance=policy.governance,
@@ -919,10 +973,13 @@ class RememberKnowledgeTool(Tool):
         entry_id = (
             prior_receipt.entry_id
             if prior_receipt is not None
-            else content_knowledge_entry_id(
-                namespace=policy.default_namespace,
-                kind=kind,
-                source_hash=source_hash,
+            else _remember_entry_id(
+                content_knowledge_entry_id(
+                    namespace=policy.default_namespace,
+                    kind=kind,
+                    source_hash=source_hash,
+                ),
+                copied_labels,
             )
         )
         revision_parent: KnowledgeEntry | None = None
@@ -944,7 +1001,7 @@ class RememberKnowledgeTool(Tool):
                     namespace=policy.default_namespace,
                     kind=kind,
                     visibility=policy.default_visibility,
-                    required_labels=policy.require_labels,
+                    required_labels=labels,
                 ):
                     if _remember_existing_entry_is_live(existing_entry):
                         return _remember_knowledge_already_known_result(existing_entry)
@@ -968,7 +1025,7 @@ class RememberKnowledgeTool(Tool):
                 text=text,
                 entry_id=entry_id,
                 namespace=policy.default_namespace,
-                labels=policy.require_labels,
+                labels=labels,
                 kind=kind,
                 visibility=policy.default_visibility,
                 status=KnowledgeStatus.PENDING,
@@ -1063,7 +1120,7 @@ class RememberKnowledgeTool(Tool):
             namespace=policy.default_namespace,
             kind=kind,
             visibility=policy.default_visibility,
-            required_labels=policy.require_labels,
+            required_labels=labels,
             governance=policy.governance,
             activation_policy=self._activation_policy,
             access_scope=store.bound_access_scope(),

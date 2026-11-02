@@ -31,6 +31,7 @@ from cayu._validation import (
     copy_durable_json_object,
     copy_durable_json_value,
     copy_durable_metadata,
+    copy_label_map,
     freeze_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -1193,6 +1194,9 @@ class ToolContext(BaseModel):
         default=None, exclude_if=lambda value: value is None
     )
     session_id: str
+    #: The calling session's labels, as the runtime read them when it started the call.
+    #: Tools and policies can label what they write with them; the model can't set them.
+    session_labels: dict[str, str] = Field(default_factory=dict)
     agent_name: str | None = None
     environment_name: str | None = None
     causal_budget_id: str | None = None
@@ -1217,6 +1221,12 @@ class ToolContext(BaseModel):
     knowledge_access_scope: Any = Field(default=None, exclude=True)
     mcp_servers: tuple[Any, ...] = Field(default_factory=tuple, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("session_labels", mode="before")
+    @classmethod
+    def copy_session_labels(cls, value: object) -> dict[str, str]:
+        return copy_label_map(value, "session_labels")
+
     _policy_denials: list[_PolicyDenialSignal] = PrivateAttr(default_factory=list)
     _runtime_workspace_authority: Any = PrivateAttr(default=None)
     _runtime_artifact_store_authority: Any = PrivateAttr(default=None)

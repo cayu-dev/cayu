@@ -17782,6 +17782,16 @@ runtime. Model-facing inputs are deliberately limited to `text`, optional
 status, visibility, impact targets, importance, and confidence are app-owned for
 this tool.
 
+`copy_session_labels` names labels each note copies from the calling session, for
+example `RememberKnowledgePolicy(require_labels={"kind": "module-note"},
+copy_session_labels=("module", "repository"))`. The runtime reads them from
+`ToolContext.session_labels` (the session's own labels, set by the runtime and never
+by the model); a label the session doesn't carry is left off, and a key can't be both
+required and copied. With copied labels, the entry id covers them too, so the same
+text remembered from sessions labelled differently becomes separate entries; a policy
+that copies none keeps the content-derived id. Any tool can read
+`ToolContext.session_labels` the same way.
+
 `KnowledgeGovernanceMode` is the application configuration for how generated
 knowledge may advance. The default `reviewed` mode never invokes an automatic
 policy and routes accepted model/curator candidates to `pending`.

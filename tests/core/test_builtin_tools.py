@@ -555,6 +555,7 @@ def test_tool_context_carries_services_without_serializing_them(tmp_path):
     assert ctx.mcp_servers
     assert dumped == {
         "session_id": "sess_1",
+        "session_labels": {},
         "agent_name": "assistant",
         "environment_name": "local-dev",
         "causal_budget_id": None,

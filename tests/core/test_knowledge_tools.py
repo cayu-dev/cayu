@@ -698,6 +698,70 @@ def test_remember_knowledge_policy_owns_namespace_and_labels() -> None:
     assert entry.confidence is None
 
 
+def test_remember_knowledge_copies_chosen_labels_from_the_calling_session() -> None:
+    """A note carries the session's module and repository labels (#3195)."""
+
+    policy = RememberKnowledgePolicy(
+        require_labels={"kind": "module-note"}, copy_session_labels=("module", "repository")
+    )
+    text = "The worker's lease loop re-reads the task before renewing."
+
+    async def remember(session_labels: dict[str, str]):
+        store_entry = await RememberKnowledgeTool(policy=policy).run(
+            ToolContext(
+                session_id="hunter-1",
+                session_labels=session_labels,
+                knowledge_store=store,
+                idempotency_key=f"remember-{len(session_labels)}-{sorted(session_labels.items())}",
+            ),
+            # The model's own labels are ignored, as before.
+            {"text": text, "labels": {"module": "attacker"}},
+        )
+        assert store_entry.structured is not None, store_entry
+        return await store.get_entry(store_entry.structured["entry"]["entry_id"])
+
+    store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+
+    async def run():
+        worker = await remember(
+            {"module": "src/cayu/tasks/worker.py", "repository": "cayu", "team": "x"}
+        )
+        # The same note from another module is its own entry, not a label conflict.
+        other = await remember({"module": "src/cayu/runtime/loop.py", "repository": "cayu"})
+        # A session without one of the labels leaves it off.
+        unlabelled = await remember({"repository": "cayu"})
+        return worker, other, unlabelled
+
+    worker, other, unlabelled = asyncio.run(run())
+    assert worker is not None and other is not None and unlabelled is not None
+    assert worker.labels == {
+        "kind": "module-note",
+        "module": "src/cayu/tasks/worker.py",
+        "repository": "cayu",
+    }
+    assert other.labels["module"] == "src/cayu/runtime/loop.py"
+    assert unlabelled.labels == {"kind": "module-note", "repository": "cayu"}
+    assert len({worker.id, other.id, unlabelled.id}) == 3
+
+
+def test_remember_knowledge_policy_validates_copied_session_labels() -> None:
+    assert RememberKnowledgePolicy(copy_session_labels=["a", "b", "a"]).copy_session_labels == (
+        "a",
+        "b",
+    )
+    with pytest.raises(ValidationError, match="both required and copied"):
+        RememberKnowledgePolicy(require_labels={"a": "x"}, copy_session_labels=("a",))
+    with pytest.raises(ValidationError):
+        RememberKnowledgePolicy(copy_session_labels="module")
+    with pytest.raises(ValidationError):
+        RememberKnowledgePolicy(copy_session_labels=(" ",))
+    # The copied keys survive the tool's defensive copy of its policy.
+    tool = RememberKnowledgeTool(policy=RememberKnowledgePolicy(copy_session_labels=("m",)))
+    assert knowledge_module._copy_remember_knowledge_policy(tool._policy).copy_session_labels == (
+        "m",
+    )
+
+
 def test_remember_knowledge_policy_restricts_kinds() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
@@ -4425,3 +4489,58 @@ def test_remember_knowledge_distinct_kinds_are_not_deduped() -> None:
     assert second.structured["already_known"] is False
     assert second.structured["written"] is True
     assert second.structured["entry"]["entry_id"] != first.structured["entry"]["entry_id"]
+
+
+def test_the_runtime_gives_a_tool_its_sessions_labels() -> None:
+    """``ToolContext.session_labels`` are the calling session's own (#3195)."""
+
+    from cayu import AgentSpec, CayuApp, Message
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions.memory import InMemorySessionStore
+    from cayu.sessions.requests import RunRequest
+
+    seen: list[ToolContext] = []
+
+    class Labelled(Tool):
+        spec = ToolSpec(
+            name="read_labels",
+            description="Read the session's labels.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            seen.append(ctx)
+            return ToolResult(content="ok")
+
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_1", name="read_labels", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="hunter", model="fake-model"), tools=[Labelled()])
+
+    async def run() -> None:
+        async for _event in app.run(
+            RunRequest(
+                agent_name="hunter",
+                session_id="hunter-1",
+                labels={"module": "src/cayu/tasks/worker.py", "repository": "cayu"},
+                messages=[Message.text("user", "go")],
+            )
+        ):
+            pass
+        await app.aclose()
+
+    asyncio.run(run())
+    [ctx] = seen
+    assert ctx.session_labels == {"module": "src/cayu/tasks/worker.py", "repository": "cayu"}
