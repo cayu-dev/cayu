@@ -126,6 +126,12 @@ class CayuApi:
         self._sleep = sleep
         self._monotonic = monotonic
 
+    @property
+    def origin(self) -> str:
+        """The server this API is on (scheme and host), as resolved for a Cloud Agent."""
+
+        return self._origin
+
     def get(
         self,
         path: str,

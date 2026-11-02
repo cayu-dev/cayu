@@ -798,6 +798,8 @@ cancelled. Live worker work instead retains its worker/lease and a durable
 cancellation request until the owner drains and commits terminal cancellation;
 a 200 response does not promise that dispatched effects have already stopped.
 The returned task distinguishes these outcomes. Lifecycle conflicts return 409.
+An optional body `{"reason": "..."}` (at most 4,096 characters) is recorded as the
+task's error, `{"code": "task_cancelled", "message": reason}`.
 Managed schedules retain their revision fence: use the existing
 `POST /api/tasks/schedule/cancel` with `operation_id` and `expected_revision`;
 the general endpoint refuses them. Holds and resume retain their existing rules.
@@ -817,6 +819,9 @@ The CLI can create and control tasks on a running server:
 cayu task create report --input-file report.json --operation-id report-2026-10-29 --json
 cayu task hold TASK_ID --reason "Waiting for review"
 cayu task block TASK_ID --reason "Missing source data"
+cayu task resume TASK_ID
+cayu task cancel TASK_ID --reason "Wrong input"
+cayu task replay TASK_ID --operation-id report-2026-10-29-again --json
 cayu task list --server-url http://127.0.0.1:8000 --json
 cayu task wait TASK_ID --server-url http://127.0.0.1:8000 --json
 ```
@@ -825,7 +830,20 @@ cayu task wait TASK_ID --server-url http://127.0.0.1:8000 --json
 ([exit codes](project-workers.md#inspect-tasks)). `hold` uses the task pause
 transition; it does not interrupt work already owned by a worker. The server
 applies the same lifecycle and full-access checks as the dashboard.
-`--payload-file` accepts a JSON object of hold details. The input defaults to
+`--payload-file` accepts a JSON object of hold details. `resume` returns a held,
+blocked or attention-needed task to the queue (`POST /api/tasks/{task_id}/resume`).
+`cancel` uses `POST /api/tasks/{task_id}/cancel`, so a task a worker is running shows
+`cancellation_requested` until its worker stops. `replay` queues a new task of the same
+declared type and input, as the dashboard's replay does: it reads
+`GET /api/tasks/{task_id}/replay` and refuses with its `unavailable_reason` (such as
+`task_type_not_declared`) when the agent can't replay the task. Keep `--operation-id`
+for an exact retry: the CLI keeps each replay request it sends (under
+`$XDG_STATE_HOME/cayu/task-replays`, by default `~/.local/state`) and a retry with the same
+operation ID sends it again unchanged, so a replay whose answer was lost returns the task it
+created even after the source task's proof has changed. The kept request is dropped only when
+the route refuses it (HTTP 400, 409, 413 or 422); after any other failure it stays for the
+retry. `resume` accepts a task that goes back
+to wait for its prerequisites or group (`waiting_dependencies`, `waiting_group`). With `--application NAME` each command reaches a Cayu Cloud Agent. The input defaults to
 `{}` when `--input-file` is omitted.
 
 `cayu task graph-create graph.json --operation-id daily-report --json` admits

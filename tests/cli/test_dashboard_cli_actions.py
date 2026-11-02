@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -10,7 +11,7 @@ from fastapi.testclient import TestClient
 from cayu import CayuApp
 from cayu.cli import main
 from cayu.server import ServerConfig, create_server
-from cayu.tasks import InMemoryTaskStore, TaskTypeSpec
+from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskTypeSpec
 
 
 def test_graph_http_admits_once_and_rejects_changed_content():
@@ -38,6 +39,8 @@ def test_graph_http_admits_once_and_rejects_changed_content():
         ["task", "create", "report", "--operation-id", "one"],
         ["task", "block", "one"],
         ["task", "hold", "one"],
+        ["task", "resume", "one"],
+        ["task", "cancel", "one", "--reason", "No longer needed"],
         ["knowledge", "keep", "one", "--operation-id", "review"],
         ["knowledge", "drop", "one"],
     ],
@@ -49,7 +52,8 @@ def test_actions_use_server_api(command, monkeypatch, capsys):
     if command[1] == "create":
         receipt = {"task_id": "one"}
     elif command[0] == "task":
-        receipt = {"id": "one", "status": "paused" if command[1] == "hold" else "blocked"}
+        status = {"hold": "paused", "block": "blocked", "resume": "pending"}
+        receipt = {"id": "one", "status": status.get(command[1], "cancelled")}
     else:
         receipt = {
             "entry_id": "one",
@@ -147,6 +151,107 @@ def test_cli_real_routes_create_hold_block_graph_and_list(tmp_path, monkeypatch,
             "graph_id"
         ]
         assert len(run("list", "--server-url", "http://localhost")["tasks"]) == 2
+
+
+def test_cli_cancels_resumes_and_replays_tasks_through_the_real_routes(
+    monkeypatch, capsys, tmp_path
+):
+    """`cayu task cancel|resume|replay` reach the API's task controls."""
+
+    from cayu.cli import _control_plane_actions
+    from cayu.cli._cloud_agent_api import CayuApi
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    store = InMemoryTaskStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+    app.register_task_type(TaskTypeSpec(name="report", input_schema={"type": "object"}))
+    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+        monkeypatch.setattr(
+            _control_plane_actions,
+            "open_action_api",
+            lambda args: CayuApi("http://testserver", http=client),
+        )
+
+        def run(*args, code=0):
+            assert main(["task", *args, "--json"]) == code
+            return json.loads(capsys.readouterr().out)
+
+        held = run("create", "report", "--operation-id", "held")["result"]["task_id"]
+        run("hold", held, "--reason", "Review")
+        # `hold` pauses "until resumed", and `resume` does.
+        assert run("resume", held)["result"]["status"] == "pending"
+
+        cancelled = run("cancel", held, "--reason", "Wrong input")["result"]
+        assert cancelled["status"] == "cancelled"
+        assert cancelled["error"] == {"code": "task_cancelled", "message": "Wrong input"}
+        # Cancelling again is refused by the task's lifecycle, without echoing the server.
+        assert "error" in run("cancel", held, code=1)
+
+        replayed = run("replay", held, "--operation-id", "again")["result"]
+        assert replayed["replayed_task_id"] == held and replayed["task_id"] != held
+        # A retry sends the request it kept, not a fresh offer whose proof may have changed.
+        offered = _control_plane_actions._offered_replay
+        monkeypatch.setattr(
+            _control_plane_actions,
+            "_offered_replay",
+            lambda *_args: pytest.fail("a retry must reuse the kept replay request"),
+        )
+        assert run("replay", held, "--operation-id", "again")["result"] == replayed
+        monkeypatch.setattr(_control_plane_actions, "_offered_replay", offered)
+
+        # A retry that can't reach the Agent keeps the request for the next retry.
+        unreachable = _control_plane_actions._replay_record("http://127.0.0.1:9", held, "again")
+        unreachable.parent.mkdir(parents=True, exist_ok=True)
+        unreachable.write_text(
+            json.dumps({"operation_id": "again", "type": "report", "source": {"task_id": held}})
+        )
+        monkeypatch.setattr(
+            _control_plane_actions,
+            "open_action_api",
+            lambda args: CayuApi(
+                "http://127.0.0.1:9", timeout_seconds=0.5, sleep=lambda _seconds: None
+            ),
+        )
+        run("replay", held, "--operation-id", "again", code=1)
+        assert unreachable.exists()
+        monkeypatch.setattr(
+            _control_plane_actions,
+            "open_action_api",
+            lambda args: CayuApi("http://testserver", http=client),
+        )
+
+        # A replay the server refuses outright isn't kept: the next try asks for a fresh offer.
+        stale = run("create", "report", "--operation-id", "stale")["result"]["task_id"]
+        record = _control_plane_actions._replay_record("http://testserver", stale, "stale-1")
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(
+            json.dumps({"operation_id": "stale-1", "type": "report", "source": {"task_id": stale}})
+        )
+        run("replay", stale, "--operation-id", "stale-1", code=1)
+        assert not record.exists()
+        assert (
+            run("replay", stale, "--operation-id", "stale-1")["result"]["replayed_task_id"] == stale
+        )
+        task = client.get(f"/api/tasks/{replayed['task_id']}").json()
+        assert (task["type"], task["status"]) == ("report", "pending")
+
+        # A task whose type the agent no longer declares can't be replayed, and says why.
+        asyncio.run(store.create_task(TaskCreate(task_id="old", type="retired")))
+        refused = run("replay", "old", "--operation-id", "old-again", code=1)
+        assert "task_type_not_declared" in refused["error"]["message"]
+
+        # Resuming a task whose prerequisite hasn't finished puts it back to wait for it.
+        graph = {
+            "operation_id": "chain",
+            "nodes": [
+                {"key": "first", "type": "report", "input": {}},
+                {"key": "second", "type": "report", "input": {}, "prerequisite_keys": ["first"]},
+            ],
+        }
+        second = client.post("/api/task-graphs", json=graph).json()["task_ids"]["second"]
+        run("hold", second)
+        assert run("resume", second)["result"]["status"] == "waiting_dependencies"
 
 
 def test_cli_real_knowledge_review_and_existing_pending_listing(monkeypatch, capsys):

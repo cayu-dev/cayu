@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,7 @@ from urllib.parse import quote
 
 from cayu._validation import require_durable_clean_nonblank
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, open_cloud_agent_api
+from cayu.cli._cloud_private_state import write_private_json
 from cayu.cli._json_inputs import json_object_file
 from cayu.cli._output import add_output_options, output_destination, terminal_safe
 from cayu.cli._read_targets import _positive_seconds
@@ -106,10 +109,14 @@ def _mutation_result(args: argparse.Namespace, body: dict[str, Any], result: Any
                 raise invalid
             # These keys are caller-selected node identities, not secret field names.
             return {"graph_id": result["graph_id"], "task_ids": dict(task_ids)}
+        if args.task_command == "replay":
+            if not _receipt_identity(result.get("task_id")):
+                raise invalid
+            return {"task_id": result["task_id"], "replayed_task_id": args.task_id}
         if (
             not _receipt_identity(result.get("id"))
             or result["id"] != args.task_id
-            or result.get("status") != ("paused" if args.task_command == "hold" else "blocked")
+            or not _task_action_settled(args.task_command, result)
         ):
             raise invalid
     elif (
@@ -121,6 +128,72 @@ def _mutation_result(args: argparse.Namespace, body: dict[str, Any], result: Any
     ):
         raise invalid
     return _redact_sensitive(result)
+
+
+def _task_action_settled(command: str, task: dict[str, Any]) -> bool:
+    """Whether the task the server returned is in the state the action leaves it in."""
+
+    status = task.get("status")
+    if command == "cancel":
+        # A running task stays running, marked, until its worker stops.
+        return status == "cancelled" or task.get("status_reason") in {
+            "cancellation_requested",
+            "retry_cancellation_requested",
+        }
+    if command == "resume":
+        # Back in the queue, or waiting there for its prerequisites or its group.
+        return status in {"pending", "waiting_dependencies", "waiting_group"}
+    return status == {"hold": "paused", "block": "blocked"}[command]
+
+
+def _replay_request(
+    api: CayuApi, task_id: str, operation: str | None, *, record: Path
+) -> dict[str, Any]:
+    """The replay of ``task_id`` to send: the one sent before under this operation ID, or
+    the one the agent offers now (its declared type and incarnation proof).
+
+    The task store binds a replay's operation ID to its exact request, proof included, and the
+    proof changes once the source task is attached to a session or deleted. So the first
+    request is kept (``_replay_record``), and a retry sends it again unchanged: a replay
+    whose answer was lost then returns the task it created instead of a conflict. A request
+    the server refused outright is dropped, so the next try asks for a fresh offer.
+    """
+
+    try:
+        kept = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        kept = None
+    if isinstance(kept, dict) and kept.get("operation_id") == operation:
+        return kept
+    request = _offered_replay(api, task_id, operation)
+    write_private_json(record, request)
+    return request
+
+
+def _replay_record(target: str, task_id: str, operation: str | None) -> Path:
+    """Where the replay sent under ``operation`` is kept, per target and task."""
+
+    root = os.environ.get("XDG_STATE_HOME")
+    base = Path(root).expanduser() if root else Path.home() / ".local" / "state"
+    digest = hashlib.sha256(
+        json.dumps([target, task_id, operation], separators=(",", ":")).encode()
+    ).hexdigest()
+    return base / "cayu" / "task-replays" / f"{digest}.json"
+
+
+def _offered_replay(api: CayuApi, task_id: str, operation: str | None) -> dict[str, Any]:
+    quoted = quote(task_id, safe="")
+    offer = api.get(f"/tasks/{quoted}/replay", resource="task")
+    if not isinstance(offer, dict) or offer.get("available") is not True:
+        reason = offer.get("unavailable_reason") if isinstance(offer, dict) else None
+        raise ValueError(
+            f"Task {task_id} can't be replayed ({reason or 'unavailable'}). "
+            "`cayu task show` has the task."
+        )
+    task = api.get(f"/tasks/{quoted}", resource="task")
+    if not isinstance(task, dict) or not isinstance(task.get("type"), str):
+        raise CayuApiError("not_cayu", "The agent returned a task without its type.")
+    return {"operation_id": operation, "type": task["type"], "source": offer.get("source")}
 
 
 def _output_aliases_input(args: argparse.Namespace) -> bool:
@@ -165,6 +238,10 @@ def run_action(args: argparse.Namespace) -> int:
                     elif command == "graph-create":
                         path, body = "/task-graphs", json_object_file(args.file)
                         body["operation_id"] = operation
+                    elif command in {"cancel", "resume", "replay"}:
+                        path = f"/tasks/{quote(args.task_id, safe='')}/{command}"
+                        reason = getattr(args, "reason", None)
+                        body = {} if reason is None else {"reason": reason}
                     else:
                         action = "pause" if command == "hold" else command
                         path = f"/tasks/{quote(args.task_id, safe='')}/{action}"
@@ -176,12 +253,27 @@ def run_action(args: argparse.Namespace) -> int:
                     action = "approve" if args.knowledge_command == "keep" else "reject"
                     path, body = f"/knowledge/{quote(args.entry_id, safe='')}/{action}", {}
                 api = open_action_api(args)
-                result = api.mutate(
-                    path,
-                    body,
-                    resource="task" if args.command == "task" else "knowledge",
-                    operation_id=operation,
-                )
+                replay_record: Path | None = None
+                if args.command == "task" and args.task_command == "replay":
+                    # The Agent the API resolved to, not the name: two contexts may each have
+                    # an Agent of that name.
+                    replay_record = _replay_record(api.origin, args.task_id, operation)
+                    body = _replay_request(api, args.task_id, operation, record=replay_record)
+                try:
+                    result = api.mutate(
+                        path,
+                        body,
+                        resource="task" if args.command == "task" else "knowledge",
+                        operation_id=operation,
+                    )
+                except CayuApiError as exc:
+                    if replay_record is not None and exc.category == "request_rejected":
+                        # The route refused this exact request, so it wasn't admitted: a retry
+                        # asks for a fresh offer. Any other failure (unreachable, waking,
+                        # credentials, an unknown outcome) may follow an admitted attempt, so
+                        # the kept request stays for the retry.
+                        replay_record.unlink(missing_ok=True)
+                    raise
                 payload = {"schema_version": "1", "result": _mutation_result(args, body, result)}
                 if operation is not None:
                     payload["operation_id"] = operation

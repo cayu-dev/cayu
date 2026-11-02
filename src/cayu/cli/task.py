@@ -94,6 +94,8 @@ _TERMINAL_EXIT_CODES = {
 _TIMED_OUT = "timed_out"
 DEFAULT_WAIT_SECONDS = 6 * 60 * 60.0
 DEFAULT_POLL_SECONDS = 5.0
+# Commands that change a task through the agent's API (`_control_plane_actions`).
+_ACTIONS = frozenset({"create", "graph-create", "block", "hold", "cancel", "resume", "replay"})
 
 
 def add_task_parser(subparsers: Any) -> None:
@@ -156,6 +158,43 @@ def add_task_parser(subparsers: Any) -> None:
             "--payload-file", type=Path, help="Optional JSON object with hold details."
         )
         add_action_target_options(action)
+
+    cancel = commands.add_parser(
+        "cancel",
+        help="Cancel a task.",
+        description=(
+            "Cancel a task. Idle work is cancelled at once; a task a worker is running is "
+            "asked to stop and is cancelled once its worker has stopped (its reason shows "
+            "cancellation_requested until then). Tasks that depend on it are then skipped. "
+            "Inspect the result with `cayu task show TASK_ID`."
+        ),
+    )
+    cancel.add_argument("task_id")
+    cancel.add_argument("--reason", help="Why, recorded as the task's cancellation message.")
+    add_action_target_options(cancel)
+    resume = commands.add_parser(
+        "resume",
+        help="Resume a held, blocked or attention-needed task.",
+        description=(
+            "Return a task that `cayu task hold` paused, `cayu task block` blocked or that "
+            "needs attention to the pending queue, where a worker picks it up again."
+        ),
+    )
+    resume.add_argument("task_id")
+    add_action_target_options(resume)
+    replay = commands.add_parser(
+        "replay",
+        help="Queue a declared task again with the same input.",
+        description=(
+            "Queue a new task of the same declared type with the same input as TASK_ID, "
+            "as the dashboard's replay does. The agent must still declare the type and "
+            "accept the input. Retain the operation ID for exact retry; the new task's ID "
+            "is printed."
+        ),
+    )
+    replay.add_argument("task_id")
+    replay.add_argument("--operation-id", required=True, help="Retain this ID for exact retry.")
+    add_action_target_options(replay)
 
     list_parser = commands.add_parser(
         "list",
@@ -231,7 +270,7 @@ def add_task_parser(subparsers: Any) -> None:
 
 
 def run_task(args: argparse.Namespace) -> int:
-    if args.task_command in {"create", "graph-create", "block", "hold"}:
+    if args.task_command in _ACTIONS:
         from cayu.cli._control_plane_actions import run_action
 
         return run_action(args)

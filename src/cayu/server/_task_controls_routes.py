@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from fastapi import HTTPException, Query
-from pydantic import StringConstraints
+from pydantic import BaseModel, ConfigDict, StringConstraints
 
 from cayu.server._inbox_cursor import InboxCursorSeal
 from cayu.server._task_index import read_task_index
@@ -24,6 +24,26 @@ if TYPE_CHECKING:
 
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+#: The longest cancellation reason the task records as its error message.
+TASK_CANCEL_REASON_MAX_CHARS = 4096
+#: The error code of a task cancelled through the API with a reason.
+TASK_CANCELLED_ERROR_CODE = "task_cancelled"
+
+
+class TaskCancelBody(BaseModel):
+    """Why the task is cancelled; recorded as its error (``task_cancelled``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: (
+        Annotated[
+            str,
+            StringConstraints(
+                strip_whitespace=True, min_length=1, max_length=TASK_CANCEL_REASON_MAX_CHARS
+            ),
+        ]
+        | None
+    ) = None
 
 
 def register_task_controls_routes(
@@ -39,12 +59,18 @@ def register_task_controls_routes(
     auth_default = cast("AuthContext | None", optional_auth_context)
 
     @router.post("/tasks/{task_id}/cancel", response_model=ApiTaskDetail, dependencies=protected)
-    async def cancel_task(task_id: NonBlankString):
+    async def cancel_task(task_id: NonBlankString, body: TaskCancelBody | None = None):
         store = cayu_app.task_store
         if store is None:
             raise HTTPException(404, "Task store is not configured.")
+        reason = None if body is None else body.reason
+        error = (
+            None
+            if reason is None
+            else {"code": TASK_CANCELLED_ERROR_CODE, "message": cayu_app.redact_json(reason)}
+        )
         try:
-            task = await store.cancel_task(task_id)
+            task = await store.cancel_task(task_id, error)
         except KeyError:
             raise HTTPException(404, "Task was not found.") from None
         except TaskScheduleConflict:

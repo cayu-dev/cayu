@@ -22139,6 +22139,18 @@ export type TaskAggregateFilter = {
 };
 
 /**
+ * TaskCancelBody
+ *
+ * Why the task is cancelled; recorded as its error (``task_cancelled``).
+ */
+export type TaskCancelBody = {
+    /**
+     * Reason
+     */
+    reason?: string | null;
+};
+
+/**
  * TaskCreationResponse
  */
 export type TaskCreationResponse = {
@@ -31344,7 +31356,10 @@ export type BlockTaskApiTasksTaskIdBlockPostResponses = {
 export type BlockTaskApiTasksTaskIdBlockPostResponse = BlockTaskApiTasksTaskIdBlockPostResponses[keyof BlockTaskApiTasksTaskIdBlockPostResponses];
 
 export type CancelTaskApiTasksTaskIdCancelPostData = {
-    body?: never;
+    /**
+     * Body
+     */
+    body?: TaskCancelBody | null;
     path: {
         /**
          * Task Id

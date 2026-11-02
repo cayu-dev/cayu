@@ -44366,6 +44366,27 @@
         "title": "TaskAggregateFilter",
         "type": "object"
       },
+      "TaskCancelBody": {
+        "additionalProperties": false,
+        "description": "Why the task is cancelled; recorded as its error (``task_cancelled``).",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "title": "TaskCancelBody",
+        "type": "object"
+      },
       "TaskCreationResponse": {
         "properties": {
           "task_id": {
@@ -61255,6 +61276,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/TaskCancelBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
