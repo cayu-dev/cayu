@@ -422,22 +422,14 @@ def test_application_evidence_that_only_looks_like_cayus_is_read_without_its_num
     assert loss["restart_limit"] is None and loss["session_run_epoch"] is None
 
 
-def test_list_and_show_say_whether_worker_loss_or_a_request_fenced_a_cancelled_task(
-    tmp_path: Path, monkeypatch: Any, capsys: Any
-) -> None:
-    """While a fenced task waits to stop, its list row has the fence's code and says which.
-
-    Once it's settled the code is only in the task's error, which list rows leave out, so the
-    row says nothing rather than guess; ``show`` still says.
-    """
+def _fence_four_tasks(database: Path) -> None:
+    """Two tasks fenced by worker loss and two by a request; one of each settled."""
 
     from tests.core.test_task_restart_after_worker_loss import SETTLE
     from tests.core.test_task_restart_after_worker_loss import _Clock as _StoreClock
 
     from cayu.tasks import reconcile_abandoned_tasks
     from cayu.tasks.queries import TaskQuery
-
-    database = tmp_path / "tasks.sqlite"
 
     async def fence(store: SQLiteTaskStore, clock: _StoreClock, task_id: str, asked: bool) -> None:
         await store.create_task(TaskCreate(task_id=task_id, type=task_id))
@@ -468,12 +460,35 @@ def test_list_and_show_say_whether_worker_loss_or_a_request_fenced_a_cancelled_t
             await store.close()
 
     asyncio.run(build())
-    expected = {
-        "lost-waiting": ("worker_loss", "worker_loss"),
-        "asked-waiting": ("request", "request"),
-        "lost-settled": (None, "worker_loss"),
-        "asked-settled": (None, "request"),
+
+
+_FENCED_BY = {
+    "lost-waiting": "worker_loss",
+    "asked-waiting": "request",
+    "lost-settled": "worker_loss",
+    "asked-settled": "request",
+}
+
+
+def _table_rows(capsys: Any, *target: str) -> dict[str, str]:
+    return {
+        line.split()[0]: line
+        for line in _task(capsys, "list", *target).splitlines()[1:]
+        if line.strip()
     }
+
+
+def test_list_and_show_say_whether_worker_loss_or_a_request_fenced_a_cancelled_task(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """A list row says what fenced a task both while it waits to stop and once it's settled.
+
+    While it waits, the fence's error is in its status payload. Once it's settled the error
+    is only the task's own, which list rows leave out except for its code.
+    """
+
+    database = tmp_path / "tasks.sqlite"
+    _fence_four_tasks(database)
     targets = {
         "local": ("--sqlite", str(database)),
         "server": ("--server-url", "http://127.0.0.1"),
@@ -481,22 +496,59 @@ def test_list_and_show_say_whether_worker_loss_or_a_request_fenced_a_cancelled_t
     }
     with _served(database, monkeypatch):
         for name, target in targets.items():
-            rows = json.loads(_task(capsys, "list", *target, "--json"))["tasks"]
-            listed = {row["id"]: row["cancellation"]["fenced_by"] for row in rows}
+            rows = {
+                row["id"]: row
+                for row in json.loads(_task(capsys, "list", *target, "--json"))["tasks"]
+            }
             shown = {
-                task_id: json.loads(_task(capsys, "show", task_id, *target, "--json"))[
-                    "cancellation"
-                ]["fenced_by"]
-                for task_id in expected
+                task_id: json.loads(_task(capsys, "show", task_id, *target, "--json"))
+                for task_id in _FENCED_BY
             }
-            assert listed == {task_id: pair[0] for task_id, pair in expected.items()}, name
-            assert shown == {task_id: pair[1] for task_id, pair in expected.items()}, name
-            table = {
-                line.split()[0]: line
-                for line in _task(capsys, "list", *target).splitlines()[1:]
-                if line.strip()
-            }
+            listed = {task_id: row["cancellation"]["fenced_by"] for task_id, row in rows.items()}
+            assert listed == _FENCED_BY, name
+            assert {
+                task_id: shown[task_id]["cancellation"]["fenced_by"] for task_id in shown
+            } == _FENCED_BY, name
+            for task_id in ("lost-settled", "asked-settled"):
+                row, code = rows[task_id], shown[task_id]["task"]["error"]["code"]
+                assert "error" not in row and row["error_code"] == code, name
+            for task_id in ("lost-waiting", "asked-waiting"):
+                assert rows[task_id]["error_code"] is None, name
+            table = _table_rows(capsys, *target)
             assert "(worker lost)" in table["lost-waiting"], name
             assert "(requested)" in table["asked-waiting"], name
-            for task_id in ("lost-settled", "asked-settled"):
-                assert "(quiescent)" in table[task_id], name
+            assert "(quiescent, worker lost)" in table["lost-settled"], name
+            assert "(quiescent, requested)" in table["asked-settled"], name
+
+
+def test_a_server_without_error_codes_in_its_rows_still_lists_settled_cancellations(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """A server older than ``error_code`` lists cleanly; settled rows don't guess the cause."""
+
+    from cayu.cli._task_readers import ApiTaskReader
+
+    database = tmp_path / "tasks.sqlite"
+    _fence_four_tasks(database)
+    list_tasks = ApiTaskReader.list_tasks
+
+    async def older_server_rows(self: ApiTaskReader, request: Any) -> list[dict[str, Any]]:
+        rows = await list_tasks(self, request)
+        for row in rows:
+            del row["error_code"]
+        return rows
+
+    monkeypatch.setattr(ApiTaskReader, "list_tasks", older_server_rows)
+    target = ("--server-url", "http://127.0.0.1")
+    with _served(database, monkeypatch):
+        rows = json.loads(_task(capsys, "list", *target, "--json"))["tasks"]
+        table = _table_rows(capsys, *target)
+
+    assert {row["id"]: row["cancellation"]["fenced_by"] for row in rows} == {
+        **_FENCED_BY,
+        "lost-settled": None,
+        "asked-settled": None,
+    }
+    assert all("error_code" not in row for row in rows)
+    for task_id in ("lost-settled", "asked-settled"):
+        assert "(quiescent)" in table[task_id]

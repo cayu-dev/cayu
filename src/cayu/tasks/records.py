@@ -673,6 +673,25 @@ def copy_task(task: Task) -> Task:
     )
 
 
+#: The longest error code a task list row carries. A longer code is left out rather
+#: than cut short, since a truncated code would name a different error.
+TASK_ERROR_CODE_MAX_CHARS = 128
+
+
+def task_error_code(task: Task) -> str | None:
+    """The ``code`` of ``task``'s error, for list rows that leave the error itself out.
+
+    Only the code is read, never the error's message or details. ``None`` when the task has
+    no error, or its code is missing, not a string, blank, or longer than
+    ``TASK_ERROR_CODE_MAX_CHARS``.
+    """
+
+    code = task.error.get("code") if type(task.error) is dict else None
+    if type(code) is not str or not code.strip() or len(code) > TASK_ERROR_CODE_MAX_CHARS:
+        return None
+    return code
+
+
 def _copy_task_retry_policy(policy: TaskRetryPolicy) -> TaskRetryPolicy:
     if type(policy) is not TaskRetryPolicy:
         raise TypeError("Task retry policy must be a TaskRetryPolicy instance.")

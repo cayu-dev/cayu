@@ -4622,6 +4622,19 @@
           ],
           "title": "Error"
         },
+        "error_code": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Error Code"
+        },
         "graph_id": {
           "anyOf": [
             {
@@ -4969,6 +4982,19 @@
             }
           ],
           "title": "Description"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Error Code"
         },
         "graph_id": {
           "anyOf": [

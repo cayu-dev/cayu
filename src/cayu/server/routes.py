@@ -449,7 +449,7 @@ from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.queries import TaskOrder, TaskQuery
-from cayu.tasks.records import Task, TaskStatus
+from cayu.tasks.records import TASK_ERROR_CODE_MAX_CHARS, Task, TaskStatus, task_error_code
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -4009,6 +4009,8 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
             "status": task.status.value,
             "status_reason": task.status_reason,
             "status_payload": task.status_payload,
+            # Only the error's code; its message and details stay in the task's detail.
+            "error_code": task_error_code(task),
             "session_id": task.session_id,
             "parent_task_id": task.parent_task_id,
             "assigned_agent_name": task.assigned_agent_name,
@@ -4032,6 +4034,10 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
         },
         untrusted_container_fields={"status_payload"},
     )
+    error_code = projected.get("error_code")
+    if type(error_code) is str and len(error_code) > TASK_ERROR_CODE_MAX_CHARS:
+        # Redaction can lengthen a code that held a secret; leave it out instead.
+        projected["error_code"] = None
     projected_status_payload = projected.get("status_payload")
     if (
         task.retry_series is not None

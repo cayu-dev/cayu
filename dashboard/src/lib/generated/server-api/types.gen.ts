@@ -2364,6 +2364,10 @@ export type ApiTaskDetail = {
         [key: string]: unknown;
     } | null;
     /**
+     * Error Code
+     */
+    error_code?: string | null;
+    /**
      * Graph Id
      */
     graph_id: string | null;
@@ -2515,6 +2519,10 @@ export type ApiTaskListItem = {
      * Description
      */
     description: string | null;
+    /**
+     * Error Code
+     */
+    error_code?: string | null;
     /**
      * Graph Id
      */

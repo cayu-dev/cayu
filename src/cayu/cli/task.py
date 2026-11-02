@@ -478,7 +478,8 @@ def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:
     was lost: ``worker_loss`` when the worker or expired-claim reclamation fenced it,
     ``request`` when someone asked to cancel it. Both settle the same way, so only the fence's
     error code tells them apart. Once a task is settled that code is only in its ``error``,
-    which list rows leave out, so a settled task's list row has ``fenced_by`` ``None``.
+    which list rows carry as ``error_code``. A row from a server that predates
+    ``error_code`` has ``fenced_by`` ``None`` once its task is settled.
     """
 
     status = task.get("status")
@@ -492,7 +493,8 @@ def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:
     request_event = _object(payload.get("event"))
     error = _object(task.get("error")) or _object(payload.get("error"))
     actor = _object(reconciliation.get("reconciled_by"))
-    code = _text(error.get("code"))
+    # A list row has no error, only its code, and not from a server older than that field.
+    code = _text(task.get("error_code")) or _text(error.get("code"))
     fenced_by = None
     if (requested or reconciliation) and code is not None:
         fenced_by = "worker_loss" if code in WORKER_LOSS_FENCE_CODES else "request"

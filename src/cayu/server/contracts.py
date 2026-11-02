@@ -239,6 +239,7 @@ from cayu.sessions.topology import (
 )
 from cayu.sessions.usage import MAX_USAGE_ROLLUP_WINDOW
 from cayu.tasks.queries import TaskAggregateFilter, TaskOperationalSnapshot, TaskStatusCounts
+from cayu.tasks.records import TASK_ERROR_CODE_MAX_CHARS
 from cayu.tasks.scheduling import TaskScheduleEventType
 from cayu.tasks.topology import (
     TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
@@ -3411,6 +3412,8 @@ class ApiTaskListItem(ApiBaseModel):
     status: str
     status_reason: str | None
     status_payload: dict[str, Any] | None
+    # The ``code`` of the task's error only; the error itself is in the task's detail.
+    error_code: str | None = Field(default=None, min_length=1, max_length=TASK_ERROR_CODE_MAX_CHARS)
     session_id: str | None
     parent_task_id: str | None
     assigned_agent_name: str | None

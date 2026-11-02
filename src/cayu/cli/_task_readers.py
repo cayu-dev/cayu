@@ -17,7 +17,7 @@ from urllib.parse import quote
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, CayuApiNotFound
 from cayu.cli.store_targets import SessionStoreBackend, SessionStoreTarget
 from cayu.tasks.queries import TaskOrder, TaskQuery
-from cayu.tasks.records import Task, TaskStatus
+from cayu.tasks.records import Task, TaskStatus, task_error_code
 from cayu.tasks.store import TaskStore
 
 # The server's task list takes at most this many rows per page (`TaskQuery.limit`).
@@ -43,7 +43,8 @@ class TaskReader(Protocol):
     source: dict[str, Any]
 
     async def list_tasks(self, request: TaskListRequest) -> list[dict[str, Any]]:
-        """One page of list rows (no ``input``, ``result``, ``error`` or ``metadata``)."""
+        """One page of list rows: no ``input``, ``result``, ``error`` or ``metadata``, but
+        the error's ``error_code`` (missing from servers that predate it)."""
         ...
 
     async def load_task(self, task_id: str) -> dict[str, Any] | None:
@@ -168,6 +169,7 @@ def task_projection(task: Task, *, detail: bool = False) -> dict[str, Any]:
         "status": task.status.value,
         "status_reason": task.status_reason,
         "status_payload": task.status_payload,
+        "error_code": task_error_code(task),
         "session_id": task.session_id,
         "parent_task_id": task.parent_task_id,
         "assigned_agent_name": task.assigned_agent_name,

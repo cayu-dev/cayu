@@ -612,3 +612,57 @@ def test_server_task_lifecycle_endpoints_validate_request_body() -> None:
     response = client.post("/api/tasks/task_1/block", json={"reason": "   "})
 
     assert response.status_code == 422
+
+
+def test_server_task_list_rows_carry_the_error_code_but_never_the_error() -> None:
+    task_store = InMemoryTaskStore()
+    errors = {
+        "operator": {
+            "code": "operator_stop",
+            "message": "private-error-message",
+            "details": {"note": "private-error-details"},
+        },
+        "too_long": {"code": "c" * 129, "message": "private-error-message"},
+        "not_text": {"code": 42, "message": "private-error-message"},
+        "blank": {"code": " ", "message": "private-error-message"},
+        "redacted": {"code": "stop-private-code-canary", "message": "private-error-message"},
+        "no_code": {"message": "private-error-message"},
+    }
+
+    async def setup_tasks() -> None:
+        await task_store.create_task(TaskCreate(task_id="pending", type="review"))
+        for task_id, error in errors.items():
+            await task_store.create_task(TaskCreate(task_id=task_id, type="review"))
+            await task_store.cancel_task(task_id, error)
+
+    asyncio.run(setup_tasks())
+    client = TestClient(
+        create_server(
+            CayuApp(
+                task_store=task_store,
+                secret_redactor=SecretRedactor("private-code-canary"),
+            ),
+            config=_LOCAL_SERVER_CONFIG,
+        )
+    )
+
+    listed = client.get("/api/tasks")
+    index = client.get("/api/tasks", params={"include": "counts"})
+
+    assert listed.status_code == 200 and index.status_code == 200
+    for rows in (listed.json(), index.json()["items"]):
+        codes = {row["id"]: row["error_code"] for row in rows}
+        assert codes["operator"] == "operator_stop"
+        assert codes["redacted"] is not None and "private-code-canary" not in codes["redacted"]
+        assert {task_id: codes[task_id] for task_id in ("too_long", "not_text", "blank")} == {
+            "too_long": None,
+            "not_text": None,
+            "blank": None,
+        }
+        assert codes["no_code"] is None and codes["pending"] is None
+        assert all("error" not in row for row in rows)
+    for response in (listed, index):
+        assert "private-error" not in response.text
+    detail = client.get("/api/tasks/operator").json()
+    assert detail["error_code"] == "operator_stop"
+    assert detail["error"]["message"] == "private-error-message"
