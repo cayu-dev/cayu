@@ -60,6 +60,26 @@ def add_usage_parser(subparsers: Any) -> None:
         )
         for option in ("agent", "environment", "provider", "model"):
             command.add_argument(f"--{option}", help=f"Exact current session {option} filter.")
+        command.add_argument(
+            "--parent-session", metavar="SESSION_ID", help="Only direct children of this session."
+        )
+        command.add_argument(
+            "--causal-budget",
+            metavar="ID",
+            help="Only sessions charged to this causal budget (a run and the sessions it spawned).",
+        )
+        command.add_argument(
+            "--label",
+            action="append",
+            metavar="KEY=VALUE",
+            help="Exact current label filter; repeat for several labels.",
+        )
+        command.add_argument(
+            "--label-selector",
+            action="append",
+            metavar="EXPR",
+            help="Label selector such as 'team in (a,b)', 'team notin (a)', 'team' or '!team'; repeat to require each.",
+        )
         if name == "rollup":
             command.add_argument(
                 "--price-book",
@@ -123,6 +143,7 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
     from cayu._time_buckets import TimeSeriesSpec, time_buckets
     from cayu.cli._cloud_agent_api import CayuApi, open_cloud_agent_api
     from cayu.cli.diagnostics import read_authorization
+    from cayu.sessions._label_filter_syntax import parse_label_filters, parse_label_selectors
 
     cost_order = args.usage_command == "rollup" and args.session_order == "cost"
     if cost_order and args.top_sessions is None:
@@ -134,6 +155,18 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
     )
     if series is not None:
         time_buckets(args.since, args.until, series)
+    # Parsed with the server's own rules, so bad input fails before any request.
+    labels = parse_label_filters(args.label)
+    label_selectors = parse_label_selectors(args.label_selector)
+    relations = {
+        key: value
+        for key, value in (
+            ("parent_session_id", args.parent_session),
+            ("causal_budget_id", args.causal_budget),
+        )
+        if value is not None
+    }
+    related = bool(relations or labels or label_selectors)
     if target.server_url is not None:
         api = CayuApi(
             target.server_url,
@@ -161,6 +194,9 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
             surfaces.append(
                 "usage_series" if args.usage_command == "rollup" else "session_overview_series"
             )
+        if args.usage_command == "counts" and related:
+            # An older server ignores unknown count filters rather than rejecting them.
+            surfaces.append("session_overview_count_filters")
         if cost_order:
             surfaces.append("usage_cost_details")
         if surfaces:
@@ -174,10 +210,17 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
                         f"The server does not advertise {surface} support for the requested options."
                     )
         if args.usage_command == "rollup":
+            session_filter: dict[str, Any] = {**filters, **relations}
+            if labels:
+                session_filter["labels"] = labels
+            if label_selectors:
+                session_filter["label_selectors"] = [
+                    selector.model_dump(mode="json") for selector in label_selectors
+                ]
             body: dict[str, Any] = {
                 "start_at": args.since.isoformat(),
                 "end_at": args.until.isoformat(),
-                "session_filter": filters,
+                "session_filter": session_filter,
             }
             if series is not None:
                 body["series"] = series.model_dump()
@@ -193,13 +236,19 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
                 body["pricing"] = json.loads(raw)
             result = api.post("/usage/rollup", body, resource="usage rollup")
         else:
-            query = {
+            query: dict[str, str | list[str]] = {
                 "since": args.since.isoformat(),
                 "until": args.until.isoformat(),
                 **filters,
+                **relations,
                 "include_eval": str(args.include_eval).lower(),
                 "include_forks": str(args.include_forks).lower(),
             }
+            # The server parses the same text, so it is sent unchanged.
+            if args.label:
+                query["label"] = list(args.label)
+            if args.label_selector:
+                query["label_selector"] = list(args.label_selector)
             if series is not None:
                 query.update(bucket_unit=series.unit, timezone=series.timezone)
             result = api.get(

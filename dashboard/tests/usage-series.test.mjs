@@ -15,37 +15,89 @@ const body = {
 }
 
 test("one histogram request preserves exact bounds, all supported filters, resolution and zone", () => {
-  assert.deepEqual(histogramRequest(body, "hour", "America/New_York"), {
-    since: body.start_at,
-    until: body.end_at,
-    ...body.session_filter,
-    bucket_unit: "hour",
-    timezone: "America/New_York",
-  })
+  for (const countFilters of [false, true])
+    assert.deepEqual(histogramRequest(body, {}, "hour", "America/New_York", countFilters), {
+      since: body.start_at,
+      until: body.end_at,
+      ...body.session_filter,
+      bucket_unit: "hour",
+      timezone: "America/New_York",
+    })
 })
 
-test("unsupported scopes never silently become an unfiltered chart", () => {
-  for (const extra of [
-    { labels: { team: "qa" } },
-    { label_selectors: [{ key: "team", operator: "exists" }] },
-    { parent_session_id: "parent" },
-    { causal_budget_id: "budget" },
-  ])
+const related = [
+  [{ labels: { team: "qa" } }, { label: ["team=qa"] }],
+  [{ label_selectors: [{ key: "team", operator: "exists" }] }, { label_selector: ["team"] }],
+  [{ parent_session_id: "parent" }, {}],
+  [{ causal_budget_id: "budget" }, {}],
+]
+
+test("without the count-filters capability these scopes never become an unfiltered chart", () => {
+  for (const [extra, search] of related)
     assert.equal(
       histogramRequest(
         { ...body, session_filter: { ...body.session_filter, ...extra } },
+        search,
         "day",
         "UTC",
+        false,
       ),
       null,
     )
   assert.ok(
     histogramRequest(
       { ...body, session_filter: { labels: {}, label_selectors: [], parent_session_id: null } },
+      {},
       "day",
       "UTC",
+      false,
     ),
   )
+})
+
+test("with the count-filters capability the chart carries the headline's exact filters", () => {
+  assert.deepEqual(
+    histogramRequest(
+      {
+        ...body,
+        session_filter: {
+          ...body.session_filter,
+          parent_session_id: "parent",
+          causal_budget_id: "budget",
+          labels: { team: "qa", tier: "a=b" },
+          label_selectors: [
+            { key: "env", operator: "in", values: ["dev", "prod"] },
+            { key: "pii", operator: "not_exists", values: [] },
+          ],
+        },
+      },
+      { label: ["team=qa", "tier=a=b"], label_selector: ["env in (dev,prod),!pii"] },
+      "day",
+      "Asia/Bishkek",
+      true,
+    ),
+    {
+      since: body.start_at,
+      until: body.end_at,
+      ...body.session_filter,
+      parent_session_id: "parent",
+      causal_budget_id: "budget",
+      label: ["team=qa", "tier=a=b"],
+      label_selector: ["env in (dev,prod),!pii"],
+      bucket_unit: "day",
+      timezone: "Asia/Bishkek",
+    },
+  )
+  for (const [extra, search] of related)
+    assert.ok(
+      histogramRequest(
+        { ...body, session_filter: { ...body.session_filter, ...extra } },
+        search,
+        "day",
+        "UTC",
+        true,
+      ),
+    )
 })
 
 test("native boundaries, start counts and activity tokens retain distinct populations", () => {

@@ -26,7 +26,12 @@ cayu usage counts --application accounting-agent \
 ```
 
 Both commands accept `--agent`, `--environment`, `--provider` and `--model` as
-exact current-session filters. `--server-url` supports mounted APIs; authenticated
+exact current-session filters, plus `--parent-session ID`, `--causal-budget ID`,
+repeated `--label KEY=VALUE` and repeated `--label-selector EXPR` (for example
+`'team in (a,b)'` or `'!team'`). They select the same sessions in both commands,
+so `counts --bucket` matches the dashboard chart for any headline filter. `counts`
+with the last four needs a server that advertises
+`session_overview_count_filters`. `--server-url` supports mounted APIs; authenticated
 servers read the complete Authorization header from `CAYU_API_AUTHORIZATION`
 or the variable named by `--authorization-env`. Cloud uses the existing login
 and optional `--context` file. These commands do not open database files directly.

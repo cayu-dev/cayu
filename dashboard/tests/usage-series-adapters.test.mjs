@@ -70,6 +70,74 @@ test("batched histogram adapter carries exact filters and real AbortSignal", asy
   }
 })
 
+test("histogram adapter repeats label filters and sends relation filters", async () => {
+  const original = globalThis.fetch
+  let request
+  globalThis.fetch = async (url, init) => {
+    request = { url, init }
+    return new Response(JSON.stringify({ total_count: "0" }), {
+      headers: { "content-type": "application/json" },
+    })
+  }
+  try {
+    await realApi.overviewCounts({
+      since: "2026-01-01T00:00:00Z",
+      until: "2026-01-02T00:00:00Z",
+      parent_session_id: "parent",
+      causal_budget_id: "budget",
+      label: ["team=qa", "tier=a=b"],
+      label_selector: ["env in (dev,prod)", "!pii"],
+    })
+    const url = new URL(request.url, "https://example.test")
+    assert.deepEqual(url.searchParams.getAll("label"), ["team=qa", "tier=a=b"])
+    assert.deepEqual(url.searchParams.getAll("label_selector"), ["env in (dev,prod)", "!pii"])
+    assert.equal(url.searchParams.get("parent_session_id"), "parent")
+    assert.equal(url.searchParams.get("causal_budget_id"), "budget")
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("prototype start histogram applies the headline's label, parent and budget filters", async () => {
+  const api = createMockApi()
+  const end = api.now() + 1000
+  const query = {
+    since: new Date(end - 365 * 86400000).toISOString(),
+    until: new Date(end).toISOString(),
+    bucket_unit: "week",
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  }
+  const rows = api.records().sessions
+  const labelled = rows.find((row) => Object.keys(row.session.labels).length > 0)
+  assert.ok(labelled)
+  const [key, value] = Object.entries(labelled.session.labels)[0]
+  const rollup = coreRoutes.find((route) => route.path === "/usage/rollup")
+  for (const [search, sessionFilter] of [
+    [{ label: [`${key}=${value}`] }, { labels: { [key]: value } }],
+    [{ label_selector: [`!${key}`] }, { label_selectors: [{ key, operator: "not_exists" }] }],
+    [
+      { causal_budget_id: labelled.session.causal_budget_id },
+      { causal_budget_id: labelled.session.causal_budget_id },
+    ],
+    [{ parent_session_id: "no-such-parent" }, { parent_session_id: "no-such-parent" }],
+  ]) {
+    const counts = await api.overviewCounts({ ...query, ...search })
+    const data = rollup.handle(
+      { body: { start_at: query.since, end_at: query.until, session_filter: sessionFilter } },
+      { records: api.records, now: api.now },
+    )
+    const all = await api.overviewCounts(query)
+    assert.ok(BigInt(counts.total_count) <= BigInt(all.total_count))
+    assert.ok(BigInt(counts.total_count) <= BigInt(data.matching_session_count))
+    assert.equal(
+      counts.series.buckets.reduce((total, b) => total + BigInt(b.total_count), 0n),
+      BigInt(counts.total_count),
+    )
+    if (search.parent_session_id) assert.equal(counts.total_count, "0")
+    if (search.label) assert.ok(BigInt(counts.total_count) >= 1n)
+  }
+})
+
 test("prototype rollup and filtered start histogram have matching buckets and additive activity", async () => {
   const api = createMockApi()
   const end = api.now() + 1000

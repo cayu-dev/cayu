@@ -354,6 +354,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     session_execution_profiles,
 )
 from cayu.sessions._foreground_child_checkpoint import MAX_FOREGROUND_CHAIN_DEPTH
+from cayu.sessions._label_filter_syntax import parse_label_filters, parse_label_selectors
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions._rollup import SessionRollupQuery
 from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY
@@ -398,7 +399,6 @@ from cayu.sessions.pending_action_contracts import (
     _PendingActionSourceLinkage,
 )
 from cayu.sessions.queries import (
-    LabelSelectorOperator,
     LabelSelectorRequirement,
     SessionDebugState,
     SessionListResult,
@@ -3860,129 +3860,19 @@ def _usage_breakdown(rows) -> list[dict[str, Any]]:
 
 
 def _parse_session_label_filters(values: list[str] | None) -> dict[str, str]:
-    if values is None:
-        return {}
-    labels: dict[str, str] = {}
-    for raw in values:
-        if type(raw) is not str or "=" not in raw:
-            raise HTTPException(
-                status_code=422,
-                detail="Session label filters must use `key=value`.",
-            )
-        key, value = raw.split("=", 1)
-        try:
-            parsed = copy_label_map({key: value}, "label")
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        parsed_key, parsed_value = next(iter(parsed.items()))
-        if parsed_key in labels:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Duplicate session label filter: {parsed_key}",
-            )
-        labels[parsed_key] = parsed_value
-    return labels
+    try:
+        return parse_label_filters(values)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _parse_session_label_selectors(
     values: list[str] | None,
 ) -> tuple[LabelSelectorRequirement, ...]:
-    if values is None:
-        return ()
-    selectors: list[LabelSelectorRequirement] = []
-    for raw in values:
-        if type(raw) is not str:
-            raise HTTPException(status_code=422, detail="Label selector must be a string.")
-        for expression in _split_label_selector(raw):
-            selectors.append(_parse_label_selector_expression(expression))
-    return tuple(selectors)
-
-
-def _split_label_selector(value: str) -> list[str]:
-    parts: list[str] = []
-    start = 0
-    depth = 0
-    for index, char in enumerate(value):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth < 0:
-                raise HTTPException(status_code=422, detail="Invalid label selector.")
-        elif char == "," and depth == 0:
-            part = value[start:index].strip()
-            if not part:
-                raise HTTPException(status_code=422, detail="Invalid label selector.")
-            parts.append(part)
-            start = index + 1
-    if depth != 0:
-        raise HTTPException(status_code=422, detail="Invalid label selector.")
-    part = value[start:].strip()
-    if not part:
-        raise HTTPException(status_code=422, detail="Invalid label selector.")
-    parts.append(part)
-    return parts
-
-
-def _parse_label_selector_expression(expression: str) -> LabelSelectorRequirement:
     try:
-        if expression.startswith("!"):
-            key = expression[1:].strip()
-            return LabelSelectorRequirement(
-                key=key,
-                operator=LabelSelectorOperator.NOT_EXISTS,
-            )
-        if " notin " in expression:
-            key, raw_values = expression.split(" notin ", 1)
-            return LabelSelectorRequirement(
-                key=key.strip(),
-                operator=LabelSelectorOperator.NOT_IN,
-                values=_parse_label_selector_values(raw_values),
-            )
-        if " in " in expression:
-            key, raw_values = expression.split(" in ", 1)
-            return LabelSelectorRequirement(
-                key=key.strip(),
-                operator=LabelSelectorOperator.IN,
-                values=_parse_label_selector_values(raw_values),
-            )
-        if "!=" in expression:
-            key, value = expression.split("!=", 1)
-            return LabelSelectorRequirement(
-                key=key.strip(),
-                operator=LabelSelectorOperator.NOT_IN,
-                values=(value.strip(),),
-            )
-        if "==" in expression:
-            key, value = expression.split("==", 1)
-            return LabelSelectorRequirement(
-                key=key.strip(),
-                operator=LabelSelectorOperator.IN,
-                values=(value.strip(),),
-            )
-        if "=" in expression:
-            key, value = expression.split("=", 1)
-            return LabelSelectorRequirement(
-                key=key.strip(),
-                operator=LabelSelectorOperator.IN,
-                values=(value.strip(),),
-            )
-        return LabelSelectorRequirement(
-            key=expression.strip(),
-            operator=LabelSelectorOperator.EXISTS,
-        )
+        return parse_label_selectors(values)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-def _parse_label_selector_values(raw_values: str) -> tuple[str, ...]:
-    raw_values = raw_values.strip()
-    if not raw_values.startswith("(") or not raw_values.endswith(")"):
-        raise HTTPException(status_code=422, detail="Label selector values must use `(a,b)`.")
-    values = tuple(value.strip() for value in raw_values[1:-1].split(","))
-    if any(not value for value in values):
-        raise HTTPException(status_code=422, detail="Label selector values cannot be blank.")
-    return values
 
 
 def _clean_optional_query_value(value: str | None, field_name: str) -> str | None:

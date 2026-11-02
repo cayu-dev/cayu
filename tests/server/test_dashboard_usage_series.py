@@ -102,12 +102,48 @@ def test_usage_native_series_share_window_filters_and_distinct_populations(role)
             await expect(table).to_contain_text("14 activity tokens")
             assert await table.locator("tbody tr").count() >= 24
             assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-            # Existing unsupported bookmark filters remain on the headline but never broaden bars.
+            # Label, parent and budget filters narrow the bars exactly like the headline.
             reads.clear()
             await page.goto(
                 f"{base}/cayu/usage?{urlencode({**search, 'label': 'team=qa'})}",
                 wait_until="networkidle",
             )
+            await expect(page.get_by_text("0 started", exact=True)).to_be_visible()
+            (chart,) = [r for r in reads if "bucket_unit=" in r.url]
+            assert parse_qs(urlsplit(chart.url).query)["label"] == ["team=qa"]
+
+    asyncio.run(exercise())
+
+
+def test_relation_filters_keep_the_chart_unavailable_without_the_count_filter_capability():
+    async def exercise():
+        runtime, now = await _usage_runtime()
+        async with _home_browser(role="member", seeded_runtime=runtime) as (
+            page,
+            base,
+            _,
+            _responses,
+        ):
+            reads = []
+
+            async def contract(route):
+                response = await route.fetch()
+                body = await response.json()
+                body["capabilities"]["surfaces"].pop("session_overview_count_filters", None)
+                await route.fulfill(response=response, json=body)
+
+            await page.route("**/api/contract", contract)
+            page.on("request", lambda request: reads.append(request))
+            search = {
+                "range": "custom",
+                "start_at": (now - timedelta(days=1)).isoformat(),
+                "end_at": (now + timedelta(seconds=1)).isoformat(),
+                "label": "team=qa",
+            }
+            await page.goto(f"{base}/cayu/usage?{urlencode(search)}", wait_until="networkidle")
+            # The headline keeps the filter; an older server would ignore it on the chart.
+            body = next(r.post_data_json for r in reads if r.url.endswith("/api/usage/rollup"))
+            assert body["session_filter"]["labels"] == {"team": "qa"}
             await expect(
                 page.get_by_text(
                     "Session counts are unavailable for label, parent or budget filters.",

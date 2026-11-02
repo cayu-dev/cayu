@@ -23,6 +23,8 @@ type Services = {
   usageCostDetailsEnabled?: boolean
   usageSeriesEnabled?: boolean
   sessionOverviewSeriesEnabled?: boolean
+  /** Label, parent-session and causal-budget filters on start counts and their series. */
+  sessionOverviewCountFiltersEnabled?: boolean
   artifactsEnabled?: boolean
   artifactSearchEnabled?: boolean
   taskIndexEnabled?: boolean

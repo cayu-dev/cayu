@@ -649,9 +649,20 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
       return wait({ counts, total_count: items.length, complete: true, unavailable_reason: null })
     },
     async overviewCounts(query) {
+      // The same parsing the Usage headline uses, so the two always select the same rows.
+      const filter = buildSessionAggregateFilter({
+        agent_name: query.agent_name,
+        environment_name: query.environment_name,
+        provider_name: query.provider_name,
+        model: query.model,
+        parent_session_id: query.parent_session_id,
+        causal_budget_id: query.causal_budget_id,
+        label: query.label,
+        label_selector: query.label_selector,
+      })
       const rows = data.sessions.filter(
         (row) =>
-          !isEvalTrialMetadata(row.metadata) && !row.overview.forked && sessionMatches(row, query),
+          !isEvalTrialMetadata(row.metadata) && !row.overview.forked && sessionMatches(row, filter),
       )
       const day = rows.filter((row) =>
         inMockTimeWindow(row.session.created_at, query.since, query.until),

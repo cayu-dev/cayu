@@ -372,11 +372,12 @@ def build_session_query_sql(
             clauses.append(_label_exists_clause(dialect, negated=True))
             params.append(selector.key)
         else:
-            exists_sql = _label_in_clause(dialect, value_count=len(selector.values))
             if selector.operator == LabelSelectorOperator.IN:
-                clauses.append(exists_sql)
+                clauses.append(_label_in_clause(dialect, value_count=len(selector.values)))
             elif selector.operator == LabelSelectorOperator.NOT_IN:
-                clauses.append(f"NOT {exists_sql}")
+                clauses.append(
+                    _label_in_clause(dialect, value_count=len(selector.values), negated=True)
+                )
             else:
                 raise ValueError(f"Unsupported label selector operator: {selector.operator}")
             params.extend([selector.key, *selector.values])
@@ -519,37 +520,55 @@ def _append_session_field_filter(
 
 
 def _label_exact_clause(dialect: SessionStoreSqlDialect) -> str:
-    return f"""
-        EXISTS (
-            SELECT 1
-            FROM cayu_session_labels
-            WHERE cayu_session_labels.session_id = cayu_sessions.id
-              AND cayu_session_labels.key = {dialect.placeholder}
-              AND cayu_session_labels.value = {dialect.placeholder}
-        )
-        """
+    return _label_membership_clause(
+        dialect,
+        f"cayu_session_labels.value = {dialect.placeholder}",
+        negated=False,
+    )
 
 
 def _label_exists_clause(dialect: SessionStoreSqlDialect, *, negated: bool) -> str:
-    prefix = "NOT " if negated else ""
-    return f"""
-        {prefix}EXISTS (
+    return _label_membership_clause(dialect, None, negated=negated)
+
+
+def _label_in_clause(
+    dialect: SessionStoreSqlDialect, *, value_count: int, negated: bool = False
+) -> str:
+    return _label_membership_clause(
+        dialect,
+        f"cayu_session_labels.value IN ({dialect.placeholders(value_count)})",
+        negated=negated,
+    )
+
+
+def _label_membership_clause(
+    dialect: SessionStoreSqlDialect, value_sql: str | None, *, negated: bool
+) -> str:
+    """Match sessions by a label key and optional value predicate.
+
+    A positive match is an uncorrelated ``IN`` so both stores can drive the read
+    from the ``(key, value, session_id)`` label index; SQLite otherwise scans
+    every session and probes its labels row by row. A negated match keeps
+    ``NOT EXISTS``, which PostgreSQL plans as an anti-join (``NOT IN`` is not).
+    The label primary key is ``(session_id, key)``, so both forms select the
+    same sessions.
+    """
+
+    value_clause = "" if value_sql is None else f" AND {value_sql}"
+    if negated:
+        return f"""
+        NOT EXISTS (
             SELECT 1
             FROM cayu_session_labels
             WHERE cayu_session_labels.session_id = cayu_sessions.id
-              AND cayu_session_labels.key = {dialect.placeholder}
+              AND cayu_session_labels.key = {dialect.placeholder}{value_clause}
         )
         """
-
-
-def _label_in_clause(dialect: SessionStoreSqlDialect, *, value_count: int) -> str:
     return f"""
-        EXISTS (
-            SELECT 1
+        cayu_sessions.id IN (
+            SELECT cayu_session_labels.session_id
             FROM cayu_session_labels
-            WHERE cayu_session_labels.session_id = cayu_sessions.id
-              AND cayu_session_labels.key = {dialect.placeholder}
-              AND cayu_session_labels.value IN ({dialect.placeholders(value_count)})
+            WHERE cayu_session_labels.key = {dialect.placeholder}{value_clause}
         )
         """
 

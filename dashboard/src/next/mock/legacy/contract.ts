@@ -235,6 +235,11 @@ export const CONTRACT: ServerContract = {
         read: { enabled: true, unavailable_reason: null },
         mutate: { enabled: false, unavailable_reason: "unsupported" },
       },
+      session_overview_count_filters: {
+        configured: true,
+        read: { enabled: true, unavailable_reason: null },
+        mutate: { enabled: false, unavailable_reason: "unsupported" },
+      },
       session_overview_first_message: {
         configured: true,
         read: { enabled: true, unavailable_reason: null },

@@ -43,9 +43,12 @@ async function needsEvalReads(): Promise<never> {
   throw new Error("The prototype's Evals calls only run on the fake API.")
 }
 
-const query = (params: Record<string, string | number | null | undefined>) => {
+const query = (params: Record<string, string | number | string[] | null | undefined>) => {
   const search = new URLSearchParams()
-  for (const [k, v] of Object.entries(params)) if (v != null && v !== "") search.set(k, String(v))
+  for (const [k, v] of Object.entries(params)) {
+    if (Array.isArray(v)) for (const item of v) search.append(k, item)
+    else if (v != null && v !== "") search.set(k, String(v))
+  }
   const text = search.toString()
   return text ? `?${text}` : ""
 }

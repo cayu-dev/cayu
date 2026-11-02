@@ -1,22 +1,28 @@
 import type { UsageRollupBody } from "@/lib/api"
 import type { SessionStartSeries, UsageTimeSeries } from "@/lib/generated/server-api"
+import type { UsageRollupSearch } from "@/lib/usage-rollup-search"
 import type { OverviewCountsQuery } from "../../api/types"
 import type { BucketUnit } from "./usage-window"
 
-/** The start-time API supports these four current-session attributes only. */
+/**
+ * The start-time request for the headline's filters. Label, parent-session and
+ * causal-budget filters need `session_overview_count_filters`: an older server ignores
+ * them, so without it the chart is unavailable rather than silently unfiltered.
+ */
 export function histogramRequest(
   body: UsageRollupBody,
+  search: Pick<UsageRollupSearch, "label" | "label_selector">,
   unit: BucketUnit,
   timezone: string,
+  countFilters: boolean,
 ): OverviewCountsQuery | null {
   const filter = body.session_filter
-  if (
-    filter?.parent_session_id ||
-    filter?.causal_budget_id ||
-    Object.keys(filter?.labels ?? {}).length ||
-    filter?.label_selectors?.length
-  )
-    return null
+  const related =
+    !!filter?.parent_session_id ||
+    !!filter?.causal_budget_id ||
+    Object.keys(filter?.labels ?? {}).length > 0 ||
+    (filter?.label_selectors?.length ?? 0) > 0
+  if (related && !countFilters) return null
   return {
     since: body.start_at,
     until: body.end_at,
@@ -24,6 +30,16 @@ export function histogramRequest(
     environment_name: filter?.environment_name ?? undefined,
     provider_name: filter?.provider_name ?? undefined,
     model: filter?.model ?? undefined,
+    ...(related
+      ? {
+          parent_session_id: filter?.parent_session_id ?? undefined,
+          causal_budget_id: filter?.causal_budget_id ?? undefined,
+          // The same text the headline's filter was parsed from; the server parses it
+          // with the rules GET /api/sessions uses, which the headline parser mirrors.
+          label: search.label,
+          label_selector: search.label_selector,
+        }
+      : {}),
     bucket_unit: unit,
     timezone,
   }

@@ -4871,6 +4871,7 @@ export type ControlPlaneSurfaceCapabilities = {
     session_follow?: OptionalSurfaceCapability | null;
     session_followups?: OptionalSurfaceCapability | null;
     session_overview?: OptionalSurfaceCapability | null;
+    session_overview_count_filters?: OptionalSurfaceCapability | null;
     session_overview_first_message?: OptionalSurfaceCapability | null;
     session_overview_queries?: OptionalSurfaceCapability | null;
     session_overview_series?: OptionalSurfaceCapability | null;
@@ -29172,6 +29173,22 @@ export type GetSessionOverviewCountsApiSessionsOverviewCountsGetData = {
          * Model
          */
         model?: string | null;
+        /**
+         * Parent Session Id
+         */
+        parent_session_id?: string | null;
+        /**
+         * Causal Budget Id
+         */
+        causal_budget_id?: string | null;
+        /**
+         * Label
+         */
+        label?: Array<string> | null;
+        /**
+         * Label Selector
+         */
+        label_selector?: Array<string> | null;
         /**
          * Bucket Unit
          */

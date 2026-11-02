@@ -10110,6 +10110,16 @@
               }
             ]
           },
+          "session_overview_count_filters": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "session_overview_first_message": {
             "anyOf": [
               {
@@ -40202,7 +40212,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "87",
+            "default": "88",
             "title": "Contract Version",
             "type": "string"
           },
@@ -48442,7 +48452,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "87",
+            "default": "88",
             "title": "Contract Version",
             "type": "string"
           }
@@ -56462,6 +56472,76 @@
                 }
               ],
               "title": "Model"
+            }
+          },
+          {
+            "in": "query",
+            "name": "parent_session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Parent Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "causal_budget_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Causal Budget Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label_selector",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label Selector"
             }
           },
           {

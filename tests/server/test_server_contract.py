@@ -264,6 +264,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "read": {"enabled": True, "unavailable_reason": None},
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
+        "session_overview_count_filters": {
+            "configured": True,
+            "read": {"enabled": True, "unavailable_reason": None},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
         "tool_display": {
             "configured": True,
             "read": {"enabled": True, "unavailable_reason": None},

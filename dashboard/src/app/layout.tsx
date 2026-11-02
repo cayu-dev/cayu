@@ -159,6 +159,9 @@ function IdentityGate() {
             serverContract.capabilities.surfaces.usage_series?.read.enabled === true,
           sessionOverviewSeriesEnabled:
             serverContract.capabilities.surfaces.session_overview_series?.read.enabled === true,
+          sessionOverviewCountFiltersEnabled:
+            serverContract.capabilities.surfaces.session_overview_count_filters?.read.enabled ===
+            true,
           artifactSearchEnabled:
             serverContract.capabilities.surfaces.artifact_search?.read.enabled === true,
           artifactsEnabled: serverContract.capabilities.surfaces.artifacts?.read.enabled === true,

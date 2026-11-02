@@ -77,6 +77,7 @@ export function UsagePage() {
     usageCostDetailsEnabled = false,
     usageSeriesEnabled = false,
     sessionOverviewSeriesEnabled = false,
+    sessionOverviewCountFiltersEnabled = false,
   } = useServices()
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
   const go = useGo()
@@ -151,7 +152,15 @@ export function UsagePage() {
   const shownWindow = rollup.data?.value?.window ?? window
   const shownBody = rollup.data?.value?.body ?? body
   const countsRequest =
-    shownBody && shownWindow ? histogramRequest(shownBody, shownWindow.unit, timezone) : null
+    shownBody && shownWindow
+      ? histogramRequest(
+          shownBody,
+          search,
+          shownWindow.unit,
+          timezone,
+          sessionOverviewCountFiltersEnabled,
+        )
+      : null
   const countsQueryKey = ["usage", "counts", countsRequest, sessionOverviewSeriesEnabled]
   const counts = useQuery({
     queryKey: countsQueryKey,
@@ -172,6 +181,7 @@ export function UsagePage() {
     timezone,
     usageSeriesEnabled,
     sessionOverviewSeriesEnabled,
+    sessionOverviewCountFiltersEnabled,
   ])
   const countsKey = hashKey([countsRequest])
   const [previousHistogram, setPreviousHistogram] = useState<{

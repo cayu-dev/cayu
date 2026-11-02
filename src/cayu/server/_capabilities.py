@@ -140,6 +140,9 @@ class ControlPlaneCapabilitySnapshot:
                 session_overview_series=_optional_surface(
                     True, read_supported=self.session_overview_supported, mutation_supported=False
                 ),
+                session_overview_count_filters=_optional_surface(
+                    True, read_supported=self.session_overview_supported, mutation_supported=False
+                ),
                 session_overview_queries=_optional_surface(
                     True, read_supported=self.session_overview_supported, mutation_supported=False
                 ),

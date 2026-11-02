@@ -623,6 +623,19 @@ corresponding next real instant. Fully skipped calendar days have no bucket.
 attributes. Optional `bucket_unit` and `timezone` request a batched `series` of
 `total_count` and `failed` per creation-time bucket. Check
 `capabilities.surfaces.session_overview_series.read.enabled` for these options.
+
+The same endpoint accepts `parent_session_id`, `causal_budget_id`, repeated
+`label=key=value` exact labels and repeated `label_selector` expressions (`key`,
+`!key`, `key in (a,b)`, `key notin (a,b)`, `key=v`, `key!=v`, comma-separated to
+require several). Labels and selectors use the `GET /api/sessions` syntax and
+bounds. They build the same current-session filter that `POST /api/usage/rollup`
+takes as `session_filter`, and every store applies it with the same query, so the
+start counts and the rollup select the same sessions. Parent and budget IDs are
+matched exactly, as the rollup matches them. Invalid filters return 422 without
+echoing the input. Check
+`capabilities.surfaces.session_overview_count_filters.read.enabled` before sending
+these; an older server ignores unknown parameters and would return unfiltered
+counts.
 Failures describe the current state of those session starts, not failure events
 occurring in the bucket. Existing eval/fork exclusions and older `running_now`
 sessions remain unchanged. This live overview observation is separate from the
@@ -630,18 +643,25 @@ store snapshot used by the event-usage rollup.
 
 The Developer dashboard uses one batched start-count request for its Sessions
 chart and requests event activity in the headline rollup. Both use the same exact
-window, the viewer's IANA time zone, and the specialist, environment, provider and
-model filters. Bars show session starts and their current failed state; hover and
+window, the viewer's IANA time zone, and the specialist, environment, provider,
+model, label, label-selector, parent-session and causal-budget filters. Bars show
+session starts and their current failed state; hover and
 accessible table details show **activity tokens**, including older sessions active
 in that period. These populations intentionally differ. There is no per-bucket
 cost estimate. Unsupported series capabilities leave the headline usable with an
-explicit chart/detail unavailable state. Label, parent-session and causal-budget
-filters still apply to the headline; the start chart is unavailable for those
-filters because its API cannot apply them. A failed refresh keeps the last
-successful numbers with a visible warning.
+explicit chart/detail unavailable state. Against a server without
+`session_overview_count_filters`, label, parent-session and causal-budget filters
+still apply to the headline and the start chart says it is unavailable for them,
+rather than drawing unfiltered bars. A failed refresh keeps the last successful
+numbers with a visible warning.
 
 `cayu usage rollup` and `cayu usage counts` expose the same data through a running
-local server (`--server-url`) or Cloud Agent (`--application`). See
+local server (`--server-url`) or Cloud Agent (`--application`). Both take
+`--agent`, `--environment`, `--provider`, `--model`, `--parent-session`,
+`--causal-budget`, repeated `--label KEY=VALUE` and repeated `--label-selector EXPR`,
+parsed with the server's rules before any request. `counts` with the last four
+requires `session_overview_count_filters` and fails against an older server
+instead of printing unfiltered counts. See
 [Session inspection](session-inspection.md#event-window-usage-and-start-counts).
 
 ### Home and Inbox

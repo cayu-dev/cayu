@@ -9,9 +9,9 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import ValidationError
 
 from cayu._time_buckets import BucketUnit, TimeSeriesSpec
@@ -37,6 +37,7 @@ from cayu.session_metadata import (
     validate_display_text,
 )
 from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
+from cayu.sessions._label_filter_syntax import parse_label_filters, parse_label_selectors
 from cayu.sessions._run_identity import is_eval_trial, session_run_id
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.sessions.overview import (
@@ -339,21 +340,32 @@ def register_session_overview_counts(
         environment_name: str | None = None,
         provider_name: str | None = None,
         model: str | None = None,
+        parent_session_id: str | None = None,
+        causal_budget_id: str | None = None,
+        label: Annotated[list[str] | None, Query()] = None,
+        label_selector: Annotated[list[str] | None, Query()] = None,
         bucket_unit: BucketUnit | None = None,
         timezone: str = "UTC",
     ) -> SessionOverviewCountsResponse:
         try:
+            # The same current-session filter the Usage rollup takes as session_filter,
+            # with labels and selectors in the GET /api/sessions text syntax.
+            filters = SessionAggregateFilter(
+                agent_name=agent_name,
+                environment_name=environment_name,
+                provider_name=provider_name,
+                model=model,
+                parent_session_id=parent_session_id,
+                causal_budget_id=causal_budget_id,
+                labels=parse_label_filters(label),
+                label_selectors=parse_label_selectors(label_selector),
+            )
             counts = await SessionOverviewReader(service.store, pricing=service.pricing).counts(
                 since=since,
                 until=until,
                 include_eval=include_eval,
                 include_forks=include_forks,
-                filters=SessionAggregateFilter(
-                    agent_name=agent_name,
-                    environment_name=environment_name,
-                    provider_name=provider_name,
-                    model=model,
-                ),
+                filters=filters,
                 series=None
                 if bucket_unit is None
                 else TimeSeriesSpec(unit=bucket_unit, timezone=timezone),

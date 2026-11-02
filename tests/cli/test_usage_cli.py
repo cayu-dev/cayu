@@ -305,3 +305,123 @@ def test_plain_counts_does_not_require_series_capability(monkeypatch, capsys):
         )
     assert calls == ["/api/sessions/overview/counts"]
     assert json.loads(capsys.readouterr().out)["total_count"] == "2"
+
+
+def test_usage_cli_relation_filters_match_the_http_headline_and_chart(monkeypatch, capsys):
+    from tests.core.test_cloud_reporting import _drain
+
+    from cayu.messages import Message
+    from cayu.sessions.requests import RunRequest
+
+    app = _app()
+
+    async def seed():
+        for session_id, labels, parent in (
+            ("root", {"team": "red"}, None),
+            ("child", {"team": "blue"}, "root"),
+            ("other", {"team": "red", "tier": "gold"}, None),
+        ):
+            await _drain(
+                app.run(
+                    RunRequest(
+                        agent_name="writer",
+                        session_id=session_id,
+                        messages=[Message.text("user", "go")],
+                        labels=labels,
+                        parent_session_id=parent,
+                        causal_budget_id=parent,
+                    )
+                )
+            )
+
+    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+        client.portal.call(seed)
+        monkeypatch.setattr(
+            "cayu.cli._cloud_agent_api.CayuApi",
+            lambda url, **kwargs: CayuApi(url, http=client, **kwargs),
+        )
+        now = datetime.now(UTC) + timedelta(seconds=1)
+        window = ["--since", (now - timedelta(days=1)).isoformat(), "--until", now.isoformat()]
+        for options, session_filter, expected in (
+            (["--label", "team=red"], {"labels": {"team": "red"}}, "2"),
+            (
+                ["--label-selector", "team in (red,blue)", "--label-selector", "!tier"],
+                {
+                    "label_selectors": [
+                        {"key": "team", "operator": "in", "values": ["red", "blue"]},
+                        {"key": "tier", "operator": "not_exists", "values": []},
+                    ]
+                },
+                "2",
+            ),
+            (["--parent-session", "root"], {"parent_session_id": "root"}, "1"),
+            (
+                ["--causal-budget", "root", "--label", "team=blue"],
+                {"causal_budget_id": "root", "labels": {"team": "blue"}},
+                "1",
+            ),
+        ):
+            arguments = [
+                "--server-url",
+                "http://127.0.0.1",
+                *window,
+                "--bucket",
+                "hour",
+                "--timezone",
+                "America/Los_Angeles",
+                *options,
+                "--json",
+            ]
+            assert main(["usage", "counts", *arguments]) == 0
+            counts = json.loads(capsys.readouterr().out)
+            assert counts["total_count"] == expected, options
+            assert sum(int(b["total_count"]) for b in counts["series"]["buckets"]) == int(expected)
+            assert main(["usage", "rollup", *arguments]) == 0
+            rollup = json.loads(capsys.readouterr().out)
+            direct = client.post(
+                "/api/usage/rollup",
+                json={"start_at": window[1], "end_at": window[3], "session_filter": session_filter},
+            ).json()
+            assert rollup["matching_session_count"] == direct["matching_session_count"] == expected
+            assert rollup["totals"] == direct["totals"]
+
+
+def test_usage_counts_relation_filters_require_capability_and_valid_syntax(monkeypatch, capsys):
+    import httpx
+
+    calls = []
+
+    def respond(request):
+        calls.append(request.url.path)
+        if request.url.path == "/api/contract":
+            enabled = {"read": {"enabled": True}}
+            return httpx.Response(
+                200, json={"capabilities": {"surfaces": {"session_overview_series": enabled}}}
+            )
+        return httpx.Response(200, json={"total_count": "99", "series": None})
+
+    window = ["--since", "2026-01-01T00:00:00Z", "--until", "2026-01-02T00:00:00Z"]
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+        monkeypatch.setattr(
+            "cayu.cli._cloud_agent_api.CayuApi",
+            lambda url, **kwargs: CayuApi(url, http=http, **kwargs),
+        )
+        for options in (
+            ["--label", "team=red"],
+            ["--label-selector", "team"],
+            ["--parent-session", "root"],
+            ["--causal-budget", "root"],
+        ):
+            calls.clear()
+            command = ["usage", "counts", "--server-url", "http://127.0.0.1", *window]
+            assert main([*command, *options, "--json"]) == 1
+            assert calls == ["/api/contract"]
+            output = json.loads(capsys.readouterr().out)
+            assert "session_overview_count_filters" in output["error"]["message"]
+        for options in (["--label", "no-separator"], ["--label-selector", "team in red"]):
+            for name in ("counts", "rollup"):
+                calls.clear()
+                command = ["usage", name, "--server-url", "http://127.0.0.1", *window]
+                assert main([*command, *options, "--json"]) == 1
+                assert calls == []
+                assert "error" in json.loads(capsys.readouterr().out)

@@ -108,11 +108,14 @@ Deployment kind is declared at startup and exposed by System and
 `cayu diagnostics system`; neither infers hosting from names or sign-in. See
 [deployment declarations](https://github.com/cayu-tech/cayu/blob/main/docs/server-configuration.md#deployment-kind).
 
-## Current page limitations
+## Current page behavior
 
-The production and prototype pages retain the following explicit limitations.
-Usage now reads one filtered, batched start/failure histogram and event-activity
-token details in the same window and viewer time zone. With pricing, provider and
+Usage reads one filtered, batched start/failure histogram and event-activity
+token details in the same window and viewer time zone. The chart applies every
+headline filter: specialist, environment, provider and model, plus labels, label
+selectors, parent session and causal budget when the server advertises
+`session_overview_count_filters`. Against an older server those last four leave
+the chart explicitly unavailable while the headline still applies them. With pricing, provider and
 model rows show estimates with separate currencies and explicit partial coverage.
 A supporting agent ranks sessions globally by cost and returns their titles and
 specialists in the same snapshot. If costs cannot be compared completely, the
@@ -121,12 +124,8 @@ locally. Environments show declared MCP names and file storage kind, plus native
 retained-session counts and activity observations without per-row session reads.
 Artifacts search and sort the selected stores before paging, with producing-session
 titles returned on each row. System shows the explicitly configured deployment
-kind. The remaining histogram filter limitation is listed below; the UI does not
-infer missing values or claim an exact result from a partial read.
-
-| Page | Remaining work | Current behavior |
-| --- | --- | --- |
-| Usage | Start counts for labels, parent sessions and causal budgets | Headline keeps these filters; chart explicitly unavailable because the histogram API cannot apply them |
+kind. The UI does not infer missing values or claim an exact result from a
+partial read.
 
 ## Production ownership and navigation
 

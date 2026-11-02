@@ -259,6 +259,7 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     session_overview: OptionalSurfaceCapability | None = None
     session_overview_first_message: OptionalSurfaceCapability | None = None
     session_overview_series: OptionalSurfaceCapability | None = None
+    session_overview_count_filters: OptionalSurfaceCapability | None = None
     usage_series: OptionalSurfaceCapability | None = None
     usage_cost_details: OptionalSurfaceCapability | None = None
     session_overview_queries: OptionalSurfaceCapability | None = None

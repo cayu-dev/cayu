@@ -219,6 +219,13 @@ export type OverviewCountsQuery = {
   environment_name?: string
   provider_name?: string
   model?: string
+  /** These four need `session_overview_count_filters`; older servers ignore them. */
+  parent_session_id?: string
+  causal_budget_id?: string
+  /** Exact `key=value` labels, in the `GET /api/sessions` syntax. */
+  label?: string[]
+  /** Label selector expressions, in the `GET /api/sessions` syntax. */
+  label_selector?: string[]
   bucket_unit?: "hour" | "day" | "week"
   timezone?: string
 }
