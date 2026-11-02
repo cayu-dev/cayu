@@ -28,7 +28,16 @@ PRs since the previous release; do not rely on an accumulated `Unreleased` secti
    uv run python scripts/build_dashboard_source_bundle.py
    ```
 
-3. Pass CI, `qualification.yml`, and
+3. Open a non-draft PR from a same-repository `release/*` branch to `main` in
+   the private mirror. These release PRs force every CI gate, run the all-store
+   Python matrix on exclusive workers, run full qualification, and verify
+   immutable release notes, version reuse, model-catalog freshness, and extraction
+   of the current version's GitHub release notes.
+   Ordinary PRs retain the smaller validation scope. Publication and remote tag
+   provenance checks still require the actual release tag; PR validation never
+   publishes to PyPI or creates a GitHub release.
+
+   Pass CI, `qualification.yml`, and
    `uv run python -m maintenance.model_catalog.check` on the release commit.
    Check note integrity with
    `uv run python scripts/verify_release_state.py --notes docs/release-notes.md`

@@ -1,6 +1,6 @@
 {
   "artifact_version": 1,
-  "cayu_version": "0.16.3",
+  "cayu_version": "0.17.0",
   "content_digest": "sha256:591502bfacc38286053eeeab6366c0879c3e44b22f405244f995ad90a481046b",
   "files": [
     {

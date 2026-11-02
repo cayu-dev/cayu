@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import textwrap
 from pathlib import Path
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
@@ -346,7 +348,7 @@ def test_release_artifact_job_enforces_tagged_note_immutability() -> None:
     setup = package.index("uses: astral-sh/setup-uv@")
     # Tag publishing verifies immutable release state from full history.
     assert (
-        "fetch-depth: ${{ startsWith(github.ref, 'refs/tags/v') && '0' || '1' }}"
+        "fetch-depth: ${{ (startsWith(github.ref, 'refs/tags/v') || env.PRIVATE_RELEASE_PR == 'true') && '0' || '1' }}"
         in package[checkout:setup]
     )
     assert "python3 scripts/run_ci.py --lane package" in package
@@ -442,7 +444,10 @@ def test_main_pushes_run_all_retained_gates() -> None:
     assert "HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}" in scope
     # Main pushes never select a diff, so force pushes and cancelled earlier
     # runs cannot omit a gate from the replacement run.
-    assert 'if test "$EVENT_NAME" != "pull_request"; then' in scope
+    assert (
+        'if test "$EVENT_NAME" != "pull_request" || test "$PRIVATE_RELEASE_PR" = "true"; then'
+        in scope
+    )
     assert "main_push=" not in scope
 
 
@@ -470,8 +475,74 @@ def test_manual_tag_validation_cannot_publish() -> None:
 def test_shared_test_workers_cannot_host_release_or_nightly_jobs() -> None:
     shards = _job_block(_PYTHON_TESTS_WORKFLOW.read_text(), "test_shards")
     assert (
-        "fromJSON(github.event_name == 'pull_request' && vars.CI_RUNNER_SHARED "
+        "fromJSON(inputs.stores == 'sqlite' && github.event_name == 'pull_request' && vars.CI_RUNNER_SHARED "
         "|| vars.CI_RUNNER_GENERAL || '[\"ubuntu-latest\"]')"
     ) in shards
     specialists = _job_block(_PYTHON_TESTS_WORKFLOW.read_text(), "test_specialists")
     assert "CI_RUNNER_SHARED" not in specialists
+
+
+def test_private_release_prs_force_validation_without_enabling_publication(tmp_path: Path) -> None:
+    workflow = _CI_WORKFLOW.read_text()
+    policy = next(
+        line for line in workflow.splitlines() if line.startswith("  PRIVATE_RELEASE_PR:")
+    )
+    for guard in (
+        "github.event_name == 'pull_request'",
+        "github.event.repository.private",
+        "github.event.pull_request.head.repo.full_name == github.repository",
+        "github.base_ref == 'main'",
+        "startsWith(github.head_ref, 'release/')",
+    ):
+        assert guard in policy
+    scope = _job_block(workflow, "verification-scope")
+    script = textwrap.dedent(scope.split("        run: |\n", 1)[1])
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "select_ci_jobs.py").write_text(
+        'print("dashboard=false\\nrelease_artifacts=false\\nsqlite_cancellation=false")\n'
+    )
+    for event, candidate, forced in (
+        ("pull_request", "true", True),
+        ("pull_request", "false", False),
+        ("push", "false", True),
+    ):
+        output = tmp_path / f"{event}-{candidate}"
+        subprocess.run(
+            ["bash", "-eo", "pipefail", "-c", script],
+            cwd=tmp_path,
+            env=os.environ
+            | {
+                "EVENT_NAME": event,
+                "PRIVATE_RELEASE_PR": candidate,
+                "GITHUB_OUTPUT": str(output),
+                "BASE_SHA": "base",
+                "HEAD_SHA": "head",
+            },
+            check=True,
+        )
+        selected = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        assert selected == {
+            "release_candidate": candidate,
+            "dashboard": str(forced).lower(),
+            "release_artifacts": str(forced).lower(),
+            "sqlite_cancellation": str(forced).lower(),
+        }
+    tests = _job_block(workflow, "python-tests")
+    assert "needs: verification-scope" in tests
+    assert "release_candidate == 'true' && 'all'" in tests
+    qualification = _job_block(workflow, "release-qualification")
+    assert "needs: verification-scope" in qualification
+    assert "release_candidate == 'true'" in qualification
+    package = _job_block(workflow, "package-build")
+    assert "if: env.PRIVATE_RELEASE_PR == 'true'" in package
+    assert "scripts/verify_release_state.py --notes docs/release-notes.md" in package
+    assert "uv run python -m maintenance.model_catalog.check" in package
+    assert "scripts/extract_release_notes.py" in package
+    assert '--version "v$release_version"' in package
+    for name in ("publish", "github-release"):
+        condition = _job_block(workflow, name).split("needs:", 1)[0]
+        assert "github.event_name == 'push'" in condition
+        assert "startsWith(github.ref, 'refs/tags/v')" in condition
+        assert "release_candidate" not in condition
+        assert "PRIVATE_RELEASE_PR" not in condition

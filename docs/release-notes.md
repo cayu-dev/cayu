@@ -1,5 +1,95 @@
 # Release notes
 
+## v0.17.0
+
+Upgrade: Stop older workers and servers, back up the database, and run
+`cayu storage migrate --acknowledge-breaking 139` before starting the new runtime.
+Storage revision and compatibility floor advance from 137 to 139; older binaries
+must not reopen migrated stores. Server contract advances from 79 to 89; upgrade
+servers, generated HTTP clients, and custom dashboards together. Manifest schema
+remains 17. Replace Microsandbox configurations with Docker or another supported
+runner before upgrading.
+
+### Breaking changes
+
+- Storage revision 139 is a breaking writer boundary requiring
+  `--acknowledge-breaking 139` and matching runtime binaries. Rollback requires
+  restoring the pre-upgrade backup. PostgreSQL migrations also require backup
+  evidence or an explicit backup waiver; see the storage migration guide.
+- Server contract 89 requires matching clients and dashboards.
+- Microsandbox runners, workspaces, egress adapters, and the `microsandbox` extra
+  are removed. Use a supported backend such as Docker, E2B, or Lambda MicroVM.
+
+### Changes
+
+- Run journaled command steps in workflows and inspect individual workflow runs,
+  step finish reasons, and token usage from the CLI. Public workflow events name
+  steps and expose resolvable child-session references while retaining secret
+  redaction; redacted names never correlate different command results.
+- Share Docker, brokered sandbox, or Lambda MicroVM allocations across workflow steps through
+  application-selected scopes, with fork isolation and retryable cleanup.
+  Supported deferred and virtual-egress factories can share allocations while
+  attaching separate stores, knowledge scopes, and MCP servers per session.
+  Workflow commands can join the same scoped allocation as agent steps.
+  Opt into per-step copy-back and serialized writers; failed publication keeps
+  unpublished work available for recovery.
+  Durable workflow and agent-session records reconnect supported allocations
+  after restart and preserve cleanup retries. Recover interrupted creation
+  through durable allocation intents, and retain interrupted owners' suspended
+  allocations for resume. Factories without reconnect support start fresh
+  allocations, losing work that existed only in the old sandbox.
+- Author, run, calibrate, import, and inspect evaluation suites and corpora from
+  the CLI, including production scenarios and captured sessions.
+- Read Cloud application data, download verified release source bundles, update
+  environment variables together, manage organization API keys, and run operator
+  checks from the CLI. Source extraction preserves partial files on publication
+  failure so concurrent replacements cannot be deleted by cleanup.
+- Inspect Cloud system agents and identify service settings that require a
+  restart, preserving the selected connection context in restart guidance.
+- List and release retained shared sandbox allocations through the application
+  API, server, and CLI, with leased cleanup and active-run checks. Recovery
+  and operator cleanup share exclusive disposal leases. Lost or expired leases
+  stop cleanup while preserving unpublished work and retry records; recovery
+  continues with the remaining allocations. Interrupted Docker commands require
+  verified termination before their runners can be reused.
+- Allocate Lambda MicroVMs through the library environment factory with
+  recoverable creation, pinned image replacements, and durable disposal.
+- List and filter application sandboxes with allocation provenance and identify
+  their owning release without changing replay-safe creation requests.
+- Return bounded, redacted first-message previews with session overview rows.
+  Read previews and overview counts in batches and expose session overviews
+  through `cayu session list --overview`.
+  A failed preview leaves only that row's title unavailable and preserves the list.
+- Apply label, parent-session, and causal-budget filters to usage charts and
+  overview counts, matching the selected session population.
+- Open dashboard sessions on Trace by default, retain conversations for human
+  input, and give untitled sessions concise names from their first user message.
+- Close sessions waiting for human input without deleting their history, and
+  inspect model request controls alongside provider-reported values.
+- Spread durable evaluation trials across workers and restore trial workspaces
+  from recorded commits and case fixtures.
+
+### Fixes
+
+- Preserve user scrolling while dashboard transcripts load and keep the end
+  of a followed conversation visible when its layout shrinks.
+- Explain worker-loss task settlement in CLI inspection output, including the
+  lost worker, lease expiry, settlement time, and reconciliation evidence.
+- Fence lost task owners, settle interrupted work, and preserve sandbox runners
+  across broker handovers.
+- Bound in-flight work by elapsed run limits and warn before implicit retry
+  budgets expire.
+- Replay session closure aliases consistently, inspect every child page before
+  closing a parent, and resume interrupted nested closure exactly once per session
+  while preserving original attribution and independent forks. The abandonment
+  sweep finishes stopped closures and retries retained cleanup once the closed
+  root passes its inactivity window.
+- Converge identical concurrent workspace publications and release local capacity
+  after competing publications finish.
+- Batch overview and artifact-store reads across each page, preserving pending
+  actions and rechecking session incarnations during concurrent changes. Keep
+  shared reads bounded and drain abandoned work when callers cancel.
+
 ## v0.16.3
 
 Upgrade: Storage revision and compatibility floor remain 137; no database migration

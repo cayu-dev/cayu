@@ -14,6 +14,11 @@ on:
 permissions:
   contents: read
 
+# Only same-repository release branches in the private mirror get release gates.
+# Forks, ordinary PRs and public PRs retain the normal PR validation scope.
+env:
+  PRIVATE_RELEASE_PR: ${{ github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && startsWith(github.head_ref, 'release/') }}
+
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -25,6 +30,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
     timeout-minutes: 2
     outputs:
+      release_candidate: ${{ steps.scope.outputs.release_candidate }}
       dashboard: ${{ steps.scope.outputs.dashboard }}
       release_artifacts: ${{ steps.scope.outputs.release_artifacts }}
       sqlite_cancellation: ${{ steps.scope.outputs.sqlite_cancellation }}
@@ -45,7 +51,8 @@ jobs:
         run: |
           # Every main push verifies all gates, including work whose earlier
           # run was cancelled by this push. This also covers rewritten history.
-          if test "$EVENT_NAME" != "pull_request"; then
+          echo "release_candidate=$PRIVATE_RELEASE_PR" >> "$GITHUB_OUTPUT"
+          if test "$EVENT_NAME" != "pull_request" || test "$PRIVATE_RELEASE_PR" = "true"; then
             {
               echo "dashboard=true"
               echo "release_artifacts=true"
@@ -69,12 +76,13 @@ jobs:
       - run: python3 scripts/run_ci.py --lane static
 
   python-tests:
+    needs: verification-scope
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Python tests
     uses: ./.github/workflows/python-tests.yml
     with:
-      # Main pushes run the PR store set; nightly and release runs cover every store.
-      stores: ${{ (github.event_name == 'pull_request' || github.event_name == 'push' && github.ref == 'refs/heads/main') && 'sqlite' || 'all' }}
+      # Private release PRs, nightly and tag runs cover every store.
+      stores: ${{ needs.verification-scope.outputs.release_candidate == 'true' && 'all' || (github.event_name == 'pull_request' || github.event_name == 'push' && github.ref == 'refs/heads/main') && 'sqlite' || 'all' }}
 
   sqlite-cancellation:
     name: SQLite cancellation (Python ${{ matrix.python-version }})
@@ -107,8 +115,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          # Only tag publishing verifies immutable release state from history.
-          fetch-depth: ${{ startsWith(github.ref, 'refs/tags/v') && '0' || '1' }}
+          # Release candidates also verify immutable notes against previous tags.
+          fetch-depth: ${{ (startsWith(github.ref, 'refs/tags/v') || env.PRIVATE_RELEASE_PR == 'true') && '0' || '1' }}
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -129,6 +137,16 @@ jobs:
             publishing=(--publishing)
           fi
           python3 scripts/run_ci.py --lane package --package-group build "${publishing[@]}"
+      - name: Validate private release candidate
+        if: env.PRIVATE_RELEASE_PR == 'true'
+        run: |
+          uv run --no-project --offline --no-python-downloads --python 3.11 \
+            python scripts/verify_release_state.py --notes docs/release-notes.md
+          uv run python -m maintenance.model_catalog.check
+          release_version="$(uv run python -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])')"
+          uv run python scripts/extract_release_notes.py \
+            --notes docs/release-notes.md --version "v$release_version" \
+            --output "$RUNNER_TEMP/candidate-release-notes.md"
       # Every verification group and publishing consume these same archive bytes.
       - name: Upload release distribution
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -204,7 +222,8 @@ jobs:
 
   release-qualification:
     name: Release qualification
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verification-scope
+    if: startsWith(github.ref, 'refs/tags/v') || needs.verification-scope.outputs.release_candidate == 'true'
     uses: ./.github/workflows/qualification.yml
 
   # Publishes to PyPI via Trusted Publishing (OIDC). Runs ONLY on v* tag pushes
