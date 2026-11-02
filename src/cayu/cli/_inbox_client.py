@@ -23,7 +23,7 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import quote
 
 if TYPE_CHECKING:
@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 #: The most items one listing reads, however many pages that takes; it lists the oldest.
 MAX_LISTED_ITEMS = 10_000
 _PAGE_LIMIT = 100
+#: How many items an older Cloud left out the CLI reads at once, by id.
+_LEFT_OUT_READS = 8
 #: How often the local client checks whether a continued session is still running.
 _CONTINUATION_POLL_SECONDS = 0.2
 _RUNNING = frozenset({"pending", "running", "interrupting"})
@@ -212,15 +214,7 @@ class LocalInbox:
     async def list_items(
         self, *, kind: str | None, session_id: str | None, agent_name: str | None
     ) -> InboxListing:
-        filters = {
-            name: value
-            for name, value in (
-                ("kind", kind),
-                ("session_id", session_id),
-                ("agent_name", agent_name),
-            )
-            if value is not None
-        }
+        filters = _filters(kind, session_id, agent_name)
         items: list[dict[str, Any]] = []
         notes: list[str] = []
         cursor: str | None = None
@@ -236,9 +230,7 @@ class LocalInbox:
                 notes.append(f"Only the oldest {MAX_LISTED_ITEMS} of the items read are listed.")
             if cursor is None or len(items) >= MAX_LISTED_ITEMS:
                 # The inbox pages by session activity; list oldest first, as Cloud does.
-                items.sort(
-                    key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or ""))
-                )
+                items.sort(key=_oldest_first)
                 return InboxListing(items[:MAX_LISTED_ITEMS], complete=not notes, notes=notes)
 
     async def item(self, item_id: str) -> dict[str, Any]:
@@ -317,24 +309,82 @@ class CloudInbox:
     async def list_items(
         self, *, kind: str | None, session_id: str | None, agent_name: str | None
     ) -> InboxListing:
-        answer = await asyncio.to_thread(self._request, "GET", "")
-        items = [
-            row
-            for row in answer.get("items", [])
-            if isinstance(row, dict)
-            and (kind is None or row.get("kind") == kind)
-            and (session_id is None or row.get("session_id") == session_id)
-            and (agent_name is None or row.get("agent_name") == agent_name)
-        ]
+        """Every item Cloud reads from the Agent, including those asked before its Release.
+
+        The filters go to Cloud too, so a Cloud that reads one session's items directly
+        does; an older one answers with every item and the CLI filters them here. Items
+        asked before the Agent's serving Release carry ``asked_before_release: true``. An
+        older Cloud leaves them out of ``items`` and names only their ids
+        (``agents[].earlier_release_items``), so each is read by its id.
+        """
+
+        query = _filters(kind, session_id, agent_name)
+        answer = await asyncio.to_thread(self._request, "GET", "", query=query or None)
+
+        def wanted(row: object) -> bool:
+            if not isinstance(row, dict):
+                return False
+            row = cast("dict[str, Any]", row)
+            return (
+                (kind is None or row.get("kind") == kind)
+                and (session_id is None or row.get("session_id") == session_id)
+                and (agent_name is None or row.get("agent_name") == agent_name)
+            )
+
+        items = [row for row in answer.get("items", []) if wanted(row)]
+        agents = [agent for agent in answer.get("agents", []) if isinstance(agent, dict)]
         notes = [
             str(agent.get("detail") or agent.get("reason") or agent.get("state"))
-            for agent in answer.get("agents", [])
-            if isinstance(agent, dict) and agent.get("state") != "read"
+            for agent in agents
+            if agent.get("state") != "read"
         ]
-        for agent in answer.get("agents", []):
-            if isinstance(agent, dict):
-                notes.extend(_issue_note(issue) for issue in agent.get("issues", []))
-        return InboxListing(items, complete=answer.get("complete") is True, notes=notes)
+        for agent in agents:
+            notes.extend(_issue_note(issue) for issue in agent.get("issues", []))
+        listed = {row.get("id") for row in items}
+        left_out = [
+            item_id
+            for agent in agents
+            for item_id in agent.get("earlier_release_items") or ()
+            if isinstance(item_id, str) and item_id not in listed
+        ]
+        earlier, unread = await self._read_left_out(left_out)
+        items.extend(item for item in earlier if wanted(item))
+        if unread:
+            notes.append(
+                f"{unread} item(s) asked before the Agent's current Release couldn't be read; "
+                "list the inbox again."
+            )
+        items.sort(key=_oldest_first)
+        return InboxListing(
+            items, complete=answer.get("complete") is True and not unread, notes=notes
+        )
+
+    async def _read_left_out(self, item_ids: list[str]) -> tuple[list[dict[str, Any]], int]:
+        """The pending items among ids an older Cloud left out, and how many weren't read."""
+
+        limit = asyncio.Semaphore(_LEFT_OUT_READS)
+
+        async def read(item_id: str) -> dict[str, Any] | None:
+            async with limit:
+                state = await self.item(item_id)
+            item = state.get("item")
+            if state.get("status") == "unavailable":
+                # Not proof it was settled: its current state can't be read.
+                raise InboxClientError(
+                    "unavailable", "This earlier-release item's current state can't be read."
+                )
+            if state.get("status") != "pending" or not isinstance(item, dict):
+                return None
+            return {**item, "asked_before_release": True}
+
+        answers = await asyncio.gather(
+            *(read(item_id) for item_id in dict.fromkeys(item_ids)), return_exceptions=True
+        )
+        unread = sum(1 for answer in answers if isinstance(answer, InboxClientError))
+        for answer in answers:
+            if isinstance(answer, BaseException) and not isinstance(answer, InboxClientError):
+                raise answer
+        return [answer for answer in answers if isinstance(answer, dict)], unread
 
     async def item(self, item_id: str) -> dict[str, Any]:
         return await asyncio.to_thread(self._request, "GET", f"/{quote(item_id, safe='')}")
@@ -384,6 +434,12 @@ class CloudInbox:
         except InboxClientError as exc:
             if exc.code == "review_reference_unsupported":
                 raise _review_unsupported() from None
+            if exc.code == "profile_adoption_unsupported":
+                raise InboxClientError(
+                    "profile_adoption_unsupported",
+                    "This Cayu Cloud can't settle an approval with a changed execution profile "
+                    "adopted yet. Settle it in the Agent's Developer dashboard instead.",
+                ) from None
             raise
         return {"replayed": answer.get("replayed") is True, "item": answer.get("item")}
 
@@ -399,6 +455,10 @@ def _cloud_refusal(exc: CloudApiError) -> InboxClientError:
         path == "body.review_reference" for path, _ in exc.rejected_fields
     ):
         code = "review_reference_unsupported"
+    elif exc.status_code == 422 and any(
+        path == "body.profile_adoption" for path, _ in exc.rejected_fields
+    ):
+        code = "profile_adoption_unsupported"
     elif exc.code is not None:
         code = exc.code
     elif exc.status_code is not None:
@@ -419,6 +479,20 @@ def _review_unsupported() -> InboxClientError:
         "This Cayu Cloud can't show or decide with an Agent's protected review yet, so it "
         "shows no arguments. Approve or deny in the Agent's Developer dashboard instead.",
     )
+
+
+def _filters(kind: str | None, session_id: str | None, agent_name: str | None) -> dict[str, str]:
+    """The listing filters sent upstream, those given."""
+
+    return {
+        name: value
+        for name, value in (("kind", kind), ("session_id", session_id), ("agent_name", agent_name))
+        if value is not None
+    }
+
+
+def _oldest_first(item: dict[str, Any]) -> tuple[str, str]:
+    return str(item.get("created_at") or ""), str(item.get("id") or "")
 
 
 def _issue_note(issue: Any) -> str:

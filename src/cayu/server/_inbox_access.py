@@ -20,6 +20,7 @@ from fastapi import HTTPException
 
 from cayu.events import EventType
 from cayu.server.inbox import InboxItemKind, InboxItemScope, InboxKnowledgeEntry
+from cayu.sessions._inbox_item_ids import PENDING_INBOX_KINDS
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import (
@@ -38,11 +39,7 @@ if TYPE_CHECKING:
     from cayu.sessions.pending_action_contracts import PendingActionRecord
     from cayu.sessions.store import SessionStore
 
-PENDING_KINDS: dict[PendingActionKind, InboxItemKind] = {
-    PendingActionKind.TOOL_APPROVAL: "approval",
-    PendingActionKind.USER_INPUT: "question",
-    PendingActionKind.MANUAL_RECOVERY: "recovery",
-}
+PENDING_KINDS: dict[PendingActionKind, InboxItemKind] = dict(PENDING_INBOX_KINDS)
 _ATTENTION_KINDS: dict[InboxItemKind, PendingActionKind] = {
     kind: pending for pending, kind in PENDING_KINDS.items()
 }

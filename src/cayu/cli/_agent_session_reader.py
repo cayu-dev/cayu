@@ -22,6 +22,7 @@ from cayu.budgets.pricing import PriceBook
 from cayu.budgets.usage import AggregateUsageMetrics
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, CayuApiNotFound
 from cayu.cli._session_reader import (
+    MAX_SHOWN_INBOX_ITEMS,
     InteractionPage,
     SessionListPage,
     TranscriptEntry,
@@ -197,6 +198,7 @@ class AgentSessionReader:
                 "count": len(actions),
                 "kinds": sorted({str(item["kind"]) for item in actions if "kind" in item}),
                 "issue_count": len(issues),
+                "inbox_items": self._inbox_items(session_id) if actions else [],
             },
             "queue": {"queued": None, "delivered": None, "outstanding": None},
             "operation": {"accepted_event_count": None, "state": None},
@@ -436,6 +438,27 @@ class AgentSessionReader:
             if _SESSION_NOT_FOUND in str(exc):
                 raise ValueError(f"Session not found: {session_id}") from None
             raise _unsupported(path) from None
+
+    def _inbox_items(self, session_id: str) -> list[dict[str, str]] | None:
+        """The session's inbox items, read from the Agent's inbox for this one session;
+        ``None`` when the Agent serves no inbox."""
+
+        try:
+            body = self._get_supported(
+                "/inbox", {"session_id": session_id, "limit": MAX_SHOWN_INBOX_ITEMS}
+            )
+        except CayuApiError as exc:
+            if exc.category == "unsupported":
+                return None
+            raise
+        return [
+            {"id": str(item["id"]), "kind": str(item.get("kind"))}
+            for item in body.get("items", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and item.get("session_id") == session_id
+            and item.get("kind") != "knowledge"
+        ][:MAX_SHOWN_INBOX_ITEMS]
 
     def _get_supported(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         try:

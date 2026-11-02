@@ -72,6 +72,7 @@ _INBOX_REFUSALS = frozenset(
         (409, "expired"),
         (409, "identity_refused"),
         (409, "not_settleable"),
+        (409, "profile_changed"),
         (409, "operator_login_missing"),
         (409, "not_reviewable"),
         (409, "review_not_served"),

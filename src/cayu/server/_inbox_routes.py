@@ -89,6 +89,13 @@ from cayu.server.inbox import (
     InboxSettleResponse,
     inbox_decisions,
 )
+from cayu.sessions._inbox_item_ids import (
+    INBOX_ITEM_ID_PREFIX,
+    INBOX_ITEM_ID_VERSION,
+    INBOX_ITEM_KIND_CODES,
+    encode_inbox_id,
+    inbox_session_item_id,
+)
 from cayu.sessions._pending_approval_reader import approval_resolution_intent_from_checkpoint
 from cayu.sessions._terminal_evidence import _INTERRUPTION_TYPE_USER_INPUT_REQUIRED
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
@@ -112,17 +119,12 @@ if TYPE_CHECKING:
     from cayu.sessions.store import SessionStore
     from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 
-_ITEM_ID_PREFIX = "inbox_"
+_ITEM_ID_PREFIX = INBOX_ITEM_ID_PREFIX
 _CURSOR_PREFIX = "inboxcursor_"
-_LOCATOR_VERSION = 1
+_LOCATOR_VERSION = INBOX_ITEM_ID_VERSION
 _SEALED = "sealed"
 _ITEM_ID_PATTERN = r"^inbox_[A-Za-z0-9_-]{1,8192}$"
-_KIND_CODES: dict[InboxItemKind, str] = {
-    "approval": "a",
-    "question": "q",
-    "recovery": "r",
-    "knowledge": "k",
-}
+_KIND_CODES = cast("dict[InboxItemKind, str]", INBOX_ITEM_KIND_CODES)
 _KINDS_BY_CODE = {code: kind for kind, code in _KIND_CODES.items()}
 _ATTENTION_KINDS: dict[InboxItemKind, AttentionKind] = {
     "approval": "tool_approval",
@@ -178,9 +180,7 @@ class _SessionItem:
     pending: PendingActionRecord | None
 
 
-def _encode(prefix: str, document: list[Any]) -> str:
-    raw = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return prefix + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+_encode = encode_inbox_id
 
 
 def _decode(prefix: str, value: str) -> list[Any] | None:
@@ -198,15 +198,8 @@ def _decode(prefix: str, value: str) -> list[Any] | None:
 
 
 def _session_item_id(locator: _SessionLocator) -> str:
-    return _encode(
-        _ITEM_ID_PREFIX,
-        [
-            _LOCATOR_VERSION,
-            _KIND_CODES[locator.kind],
-            locator.public_session_id,
-            locator.sequence,
-            locator.attention_id,
-        ],
+    return inbox_session_item_id(
+        locator.kind, locator.public_session_id, locator.sequence, locator.attention_id
     )
 
 

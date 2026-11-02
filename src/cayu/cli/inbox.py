@@ -13,6 +13,7 @@ import asyncio
 import getpass
 import html
 import json
+import secrets
 import sys
 import unicodedata
 from collections.abc import AsyncIterator
@@ -42,6 +43,7 @@ _KINDS = ("approval", "question", "recovery", "knowledge")
 _DEFAULT_PURPOSE = "approvals"
 _REASON_MAX_CHARS = 4096
 _CELL_MAX_CHARS = 60
+_DISMISSABLE = frozenset({"recovery", "approval", "question"})
 
 
 def add_inbox_parser(subparsers: Any) -> None:
@@ -64,7 +66,12 @@ def add_inbox_parser(subparsers: Any) -> None:
     listing = commands.add_parser(
         "list",
         help="List what is waiting, oldest first.",
-        description="List what is waiting, oldest first. Use an item's id with `cayu inbox show`.",
+        description=(
+            "List what is waiting, oldest first. Use an item's id with `cayu inbox show`. "
+            "With --session it reads that session's pending actions directly. On a Cloud "
+            "Agent, items asked before the Agent's current Release are listed in their own "
+            "section (asked_before_release in --json): they can still be read and settled."
+        ),
     )
     listing.add_argument("--kind", choices=_KINDS, help="Only items of this kind.")
     listing.add_argument("--agent", help="Only this agent's items (exact name).")
@@ -81,7 +88,7 @@ def add_inbox_parser(subparsers: Any) -> None:
             "withholds; without a policy the inbox shows no arguments."
         ),
     )
-    show.add_argument("item_id", metavar="ITEM_ID")
+    _add_item_options(show)
     show.add_argument(
         "--full",
         action="store_true",
@@ -105,10 +112,20 @@ def add_inbox_parser(subparsers: Any) -> None:
                 "continues in this process until it pauses or ends."
             ),
         )
-        command.add_argument("item_id", metavar="ITEM_ID")
+        _add_item_options(command)
         command.add_argument(
             "--reason",
             help=f"Why, recorded with the decision (at most {_REASON_MAX_CHARS} characters).",
+        )
+        command.add_argument(
+            "--adopt-profile",
+            action="store_true",
+            help=(
+                "The Agent's execution profile changed while the approval waited (the "
+                "settle was refused with profile_changed): settle it with the current "
+                "profile adopted, if the application's ExecutionProfilePolicy allows it. "
+                "Needs --reason, recorded with the adoption."
+            ),
         )
         command.add_argument(
             "--wait-seconds",
@@ -145,13 +162,30 @@ def add_inbox_parser(subparsers: Any) -> None:
             "child sessions are running, or that waits on something else is refused."
         ),
     )
-    dismiss.add_argument("item_id", metavar="ITEM_ID")
+    _add_item_options(dismiss)
     dismiss.add_argument(
         "--reason",
         required=True,
         help=f"Why, recorded with the abandonment (at most {_REASON_MAX_CHARS} characters).",
     )
     _add_target_options(dismiss)
+
+
+def _add_item_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "item_id",
+        metavar="ITEM_ID",
+        nargs="?",
+        help="The item's id, from `cayu inbox list`. Or name its session with --session.",
+    )
+    parser.add_argument(
+        "--session",
+        metavar="SESSION_ID",
+        help=(
+            "Instead of ITEM_ID: the session waiting (public session id), read directly. "
+            "Refused when the session waits on more than one item; name the item then."
+        ),
+    )
 
 
 def _add_review_options(parser: argparse.ArgumentParser) -> None:
@@ -219,6 +253,10 @@ async def _run(args: argparse.Namespace) -> int:
             _check_reason(reason)
         if args.application is not None and args.reviewer is not None:
             raise ValueError("--reviewer applies to the local inbox; a Cloud Agent records you.")
+        if args.inbox_command != "list" and (args.item_id is None) == (args.session is None):
+            raise ValueError("Name the item with ITEM_ID or its session with --session.")
+        if getattr(args, "adopt_profile", False) and reason is None:
+            raise ValueError("--adopt-profile needs --reason, recorded with the adoption.")
         async with _inbox(args) as inbox:
             if args.inbox_command == "list":
                 return await _list(args, inbox)
@@ -226,7 +264,13 @@ async def _run(args: argparse.Namespace) -> int:
                 return await _show(args, inbox)
             return await _decide(args, inbox)
     except InboxClientError as exc:
-        _render_error(args, exc.code, str(exc), item=exc.item)
+        message = str(exc)
+        if exc.code == "profile_changed":
+            message += (
+                " Settle it again with --adopt-profile --reason TEXT to adopt the Agent's "
+                "current execution profile."
+            )
+        _render_error(args, exc.code, message, item=exc.item)
     except (CloudApiError, CloudAuthError, CloudCommandError) as exc:
         _render_error(args, exc.category, str(exc))
     except ProjectError as exc:
@@ -302,21 +346,20 @@ async def _list(args: argparse.Namespace, inbox: InboxClient) -> int:
             }
         )
         return 0
+    current = [item for item in listing.items if item.get("asked_before_release") is not True]
+    earlier = [item for item in listing.items if item.get("asked_before_release") is True]
     if not listing.items:
         print("Nothing is waiting.")
-    else:
-        rows = [
-            {
-                "kind": item.get("kind"),
-                "agent": item.get("agent_name"),
-                "session": item.get("session_id"),
-                "what": _summary(item),
-                "created": item.get("created_at"),
-                "id": item.get("id"),
-            }
-            for item in listing.items
-        ]
-        _print_table(("kind", "agent", "session", "what", "created", "id"), rows)
+    elif current:
+        _print_items(current)
+    if earlier:
+        if current:
+            print()
+        print(
+            f"Asked before the Agent's current Release ({len(earlier)}). They may still "
+            "resume: show and settle them by id, or dismiss the ones that won't."
+        )
+        _print_items(earlier)
     for note in listing.notes:
         print(f"note: {_plain(note)}", file=sys.stderr)
     if not listing.complete:
@@ -324,8 +367,61 @@ async def _list(args: argparse.Namespace, inbox: InboxClient) -> int:
     return 0
 
 
+def _print_items(items: list[dict[str, Any]]) -> None:
+    rows = [
+        {
+            "kind": item.get("kind"),
+            "agent": item.get("agent_name"),
+            "session": item.get("session_id"),
+            "what": _summary(item),
+            "created": item.get("created_at"),
+            "id": item.get("id"),
+        }
+        for item in items
+    ]
+    _print_table(("kind", "agent", "session", "what", "created", "id"), rows)
+
+
+async def _resolve_item_id(
+    args: argparse.Namespace, inbox: InboxClient, kinds: frozenset[str] | None = None
+) -> str:
+    """ITEM_ID, or the one item of ``--session`` (of ``kinds``) waiting, read directly."""
+
+    if args.item_id is not None:
+        return str(args.item_id)
+    listing = await inbox.list_items(kind=None, session_id=args.session, agent_name=None)
+    items = [
+        item
+        for item in listing.items
+        if item.get("session_id") == args.session and (kinds is None or item.get("kind") in kinds)
+    ]
+    if len(items) == 1 and listing.complete:
+        args.item_id = str(items[0]["id"])
+        return args.item_id
+    if len(items) == 1:
+        # Another item of the session may be among those that couldn't be read.
+        raise InboxClientError(
+            "listing_incomplete",
+            f"Session {_plain(args.session)}'s items couldn't all be read, so "
+            f"{_plain(items[0].get('id'))} may not be its only one; name the item. "
+            + " ".join(_plain(note) for note in listing.notes),
+        )
+    what = "item" if kinds is None else " or ".join(sorted(kinds)) + " item"
+    if not items:
+        unread = "" if listing.complete else " " + " ".join(listing.notes)
+        raise InboxClientError(
+            "no_pending_item",
+            f"Session {_plain(args.session)} isn't waiting on an {what} in the inbox.{unread}",
+        )
+    ids = ", ".join(f"{_plain(item.get('id'))} ({_plain(item.get('kind'))})" for item in items)
+    raise InboxClientError(
+        "several_pending_items",
+        f"Session {_plain(args.session)} waits on {len(items)} items; name one: {ids}",
+    )
+
+
 async def _show(args: argparse.Namespace, inbox: InboxClient) -> int:
-    state = await inbox.item(args.item_id)
+    state = await inbox.item(await _resolve_item_id(args, inbox))
     item = state.get("item") if state.get("status") == "pending" else None
     review: dict[str, Any] | None = None
     review_error: InboxClientError | None = None
@@ -377,7 +473,8 @@ async def _show(args: argparse.Namespace, inbox: InboxClient) -> int:
 
 async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
     decision = args.inbox_command
-    state = await inbox.item(args.item_id)
+    kinds = _DISMISSABLE if decision == "dismiss" else frozenset({"approval"})
+    state = await inbox.item(await _resolve_item_id(args, inbox, kinds))
     item = state.get("item")
     if state.get("status") != "pending" or not isinstance(item, dict):
         raise InboxClientError(
@@ -385,7 +482,7 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
             f"This item is {state.get('status')}, so there is nothing to {decision}.",
             item=state,
         )
-    if decision == "dismiss" and item.get("kind") not in {"recovery", "approval", "question"}:
+    if decision == "dismiss" and item.get("kind") not in _DISMISSABLE:
         raise InboxClientError(
             "not_dismissable",
             "`cayu inbox dismiss` dismisses recovery items, approvals and questions; "
@@ -401,6 +498,11 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
         body["reason"] = args.reason
     if getattr(args, "claim_task", False):
         body["task_continuation"] = "claim"
+    if getattr(args, "adopt_profile", False):
+        body["profile_adoption"] = {
+            "idempotency_key": secrets.token_urlsafe(24),
+            "reason": args.reason,
+        }
     if decision != "dismiss" and _has_review(item):
         reference = await _decision_reference(args, inbox, item, decision)
         if reference is not None:

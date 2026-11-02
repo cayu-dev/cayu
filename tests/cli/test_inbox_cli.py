@@ -700,3 +700,231 @@ def test_unencodable_cloud_refusal_preserves_conflict_and_item(monkeypatch, mess
     assert str(refused.value) == "Cayu Cloud API returned HTTP 409."
     assert refused.value.code == "conflict"
     assert refused.value.item == state
+
+
+def _earlier(item_id: str, session: str) -> dict:
+    item = {**_PENDING, "id": item_id, "session_id": session, "created_at": "2026-11-01T23:44Z"}
+    return {"id": item_id, "kind": "approval", "status": "pending", "item": item}
+
+
+def test_items_an_older_cloud_left_out_as_earlier_are_read_by_id_and_listed(
+    monkeypatch, capsys
+) -> None:
+    """An older Cloud names items asked before the Agent's Release only by id."""
+
+    unreadable = CloudApiError("api_request_failed", "HTTP 502.", status_code=502)
+    cloud = _cloud_cli(
+        monkeypatch,
+        {
+            ("GET", ""): {
+                "items": [],
+                "agents": [
+                    {
+                        "state": "read",
+                        "issues": [],
+                        "earlier_release_items": ["inbox_e1", "inbox_e2", "inbox_gone"],
+                    }
+                ],
+                "complete": True,
+            },
+            ("GET", "/inbox_e1"): _earlier("inbox_e1", "s1"),
+            ("GET", "/inbox_e2"): _earlier("inbox_e2", "s2"),
+            ("GET", "/inbox_gone"): {
+                "id": "inbox_gone",
+                "kind": "approval",
+                "status": "settled",
+                "settlement": {"decision": "deny"},
+            },
+        },
+    )
+    assert main(["inbox", "list", "--application", "bugs", "--json"]) == 0
+    listing = _json(capsys)
+    assert [item["id"] for item in listing["items"]] == ["inbox_e1", "inbox_e2"]
+    assert all(item["asked_before_release"] is True for item in listing["items"])
+    assert listing["complete"] is True
+
+    assert main(["inbox", "list", "--application", "bugs"]) == 0
+    out = capsys.readouterr().out
+    assert "Nothing is waiting." not in out
+    assert out.startswith("Asked before the Agent's current Release (2).")
+    assert "inbox_e1" in out and "inbox_e2" in out
+
+    # The filters go to Cloud, and are applied here too for a Cloud that ignores them.
+    assert main(["inbox", "list", "--application", "bugs", "--session", "s2", "--json"]) == 0
+    assert [item["id"] for item in _json(capsys)["items"]] == ["inbox_e2"]
+    assert ("GET", "/v1/applications/bugs/inbox", {"query": {"session_id": "s2"}}) in (cloud.calls)
+
+    # One that can't be read makes the listing incomplete and says so.
+    cloud.routes[("GET", "/inbox_e2")] = unreadable
+    assert main(["inbox", "list", "--application", "bugs", "--json"]) == 0
+    listing = _json(capsys)
+    assert [item["id"] for item in listing["items"]] == ["inbox_e1"]
+    assert listing["complete"] is False
+    assert "1 item(s) asked before the Agent's current Release" in listing["notes"][0]
+
+
+def test_a_newer_clouds_earlier_release_items_are_listed_in_their_own_section(
+    monkeypatch, capsys
+) -> None:
+    earlier = {**_PENDING, "id": "inbox_e", "created_at": "1", "asked_before_release": True}
+    current = {**_PENDING, "id": "inbox_c", "created_at": "2", "asked_before_release": False}
+    _cloud_cli(
+        monkeypatch,
+        {
+            ("GET", ""): {
+                "items": [earlier, current],
+                "agents": [{"state": "read", "issues": [], "earlier_release_items": []}],
+                "complete": True,
+            }
+        },
+    )
+    assert main(["inbox", "list", "--application", "bugs"]) == 0
+    current_part, earlier_part = capsys.readouterr().out.split("Asked before", 1)
+    assert "inbox_c" in current_part and "inbox_e" not in current_part
+    assert "inbox_e" in earlier_part
+
+
+def test_a_sessions_item_is_shown_and_settled_by_session(monkeypatch, capsys) -> None:
+    """A waiting session leads to its item without the item id."""
+
+    question = {**_PENDING, "id": "inbox_q", "kind": "question", "session_id": "s1"}
+    cloud = _cloud_cli(
+        monkeypatch,
+        {
+            ("GET", ""): {"items": [_PENDING, question], "agents": [], "complete": True},
+            ("GET", "/inbox_a"): {
+                **_STATE,
+                "item": {**_PENDING, "arguments_unavailable_reason": "no_review_policy"},
+            },
+            ("POST", "/inbox_a/settle"): _SETTLED,
+        },
+    )
+    # Denying picks the session's one approval; the question isn't one.
+    assert main(["inbox", "deny", "--session", "s1", "--application", "bugs", "--json"]) == 0
+    assert _json(capsys)["item"]["id"] == "inbox_a"
+    assert cloud.calls[-1][1] == "/v1/applications/bugs/inbox/inbox_a/settle"
+    # Show takes any kind, so two items need the id.
+    assert main(["inbox", "show", "--session", "s1", "--application", "bugs", "--json"]) == 1
+    error = _json(capsys)["error"]
+    assert error["code"] == "several_pending_items"
+    assert "inbox_a (approval)" in error["message"] and "inbox_q (question)" in error["message"]
+    assert main(["inbox", "show", "--session", "s9", "--application", "bugs", "--json"]) == 1
+    assert _json(capsys)["error"]["code"] == "no_pending_item"
+    # One of ITEM_ID or --session.
+    assert main(["inbox", "show", "--application", "bugs", "--json"]) == 1
+    assert _json(capsys)["error"]["code"] == "invalid_input"
+    assert main(["inbox", "show", "inbox_a", "--session", "s1", "--json"]) == 1
+    assert _json(capsys)["error"]["code"] == "invalid_input"
+
+
+def test_an_approval_is_settled_with_a_changed_profile_adopted(monkeypatch, capsys) -> None:
+    unsaid = {**_STATE, "item": {**_PENDING, "arguments_unavailable_reason": "no_review_policy"}}
+    changed = CloudApiError(
+        "api_request_rejected",
+        "Cayu Cloud API returned HTTP 409: The execution profile changed.",
+        status_code=409,
+        code="profile_changed",
+    )
+    cloud = _cloud_cli(
+        monkeypatch, {("GET", "/inbox_a"): unsaid, ("POST", "/inbox_a/settle"): changed}
+    )
+    assert main(["inbox", "approve", "inbox_a", "--application", "bugs"]) == 1
+    assert "--adopt-profile --reason" in capsys.readouterr().err
+    assert main(["inbox", "approve", "inbox_a", "--application", "bugs", "--adopt-profile"]) == 1
+    assert "--adopt-profile needs --reason" in capsys.readouterr().err
+
+    cloud.routes[("POST", "/inbox_a/settle")] = _SETTLED
+    command = ["inbox", "approve", "inbox_a", "--application", "bugs"]
+    assert main([*command, "--adopt-profile", "--reason", "same tools"]) == 0
+    capsys.readouterr()
+    payload = cloud.calls[-1][2]["payload"]
+    adoption = payload.pop("profile_adoption")
+    assert payload == {"decision": "approve", "reason": "same tools"}
+    assert adoption["reason"] == "same tools" and len(adoption["idempotency_key"]) >= 24
+
+    # A Cloud whose settle route doesn't take the adoption says so.
+    cloud.routes[("POST", "/inbox_a/settle")] = CloudApiError(
+        "api_request_rejected",
+        "HTTP 422.",
+        status_code=422,
+        rejected_fields=(("body.profile_adoption", "extra_forbidden"),),
+    )
+    assert main([*command, "--adopt-profile", "--reason", "x", "--json"]) == 1
+    assert _json(capsys)["error"]["code"] == "profile_adoption_unsupported"
+
+
+def test_session_show_names_the_item_the_local_inbox_lists(monkeypatch, tmp_path, capsys) -> None:
+    _local(monkeypatch, tmp_path, policy=None)
+    item = _only_item(capsys)
+    database = str(tmp_path / "sessions.sqlite")
+    assert main(["session", "show", item["session_id"], "--sqlite", database, "--json"]) == 0
+    pending = _json(capsys)["pending_action"]
+    assert pending["inbox_items"] == [{"id": item["id"], "kind": "approval"}]
+
+
+def test_a_session_is_not_settled_by_its_only_listed_item_when_the_listing_is_incomplete(
+    monkeypatch, capsys
+) -> None:
+    unreadable = CloudApiError("api_request_failed", "HTTP 502.", status_code=502)
+    _cloud_cli(
+        monkeypatch,
+        {
+            ("GET", ""): {
+                "items": [_PENDING],
+                "agents": [{"state": "read", "issues": [], "earlier_release_items": ["inbox_e"]}],
+                "complete": True,
+            },
+            ("GET", "/inbox_e"): unreadable,
+        },
+    )
+    assert main(["inbox", "deny", "--session", "s1", "--application", "bugs", "--json"]) == 1
+    assert _json(capsys)["error"]["code"] == "listing_incomplete"
+
+
+def test_an_earlier_item_whose_state_cant_be_read_makes_the_listing_incomplete(
+    monkeypatch, capsys
+) -> None:
+    _cloud_cli(
+        monkeypatch,
+        {
+            ("GET", ""): {
+                "items": [],
+                "agents": [{"state": "read", "issues": [], "earlier_release_items": ["inbox_u"]}],
+                "complete": True,
+            },
+            ("GET", "/inbox_u"): {"id": "inbox_u", "kind": "approval", "status": "unavailable"},
+        },
+    )
+    assert main(["inbox", "list", "--application", "bugs", "--json"]) == 0
+    listing = _json(capsys)
+    assert (listing["items"], listing["complete"]) == ([], False)
+
+
+def test_clouds_profile_changed_refusal_keeps_its_code(monkeypatch) -> None:
+    import httpx
+
+    import cayu.cli._cloud_api as cloud_api
+
+    state = {**_SETTLED["item"], "status": "pending", "settlement": None}
+    detail = {"code": "profile_changed", "message": "The profile changed.", "item": state}
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        cloud_api.httpx,
+        "Client",
+        lambda **options: real_client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(409, json={"detail": detail})),
+            **options,
+        ),
+    )
+    inbox = CloudInbox(cloud_api.CloudApiClient(api_url="https://cloud.example", api_key="k"), "a")
+    with pytest.raises(InboxClientError) as refused:
+        _run(inbox.settle("inbox_a", {"decision": "approve"}))
+    assert refused.value.code == "profile_changed" and refused.value.item == state
+
+
+def test_session_show_names_no_item_for_a_session_id_output_would_redact(tmp_path) -> None:
+    from cayu.cli._session_reader import StoreSessionReader
+
+    reader = StoreSessionReader.__new__(StoreSessionReader)
+    secret = "sk-ant-api03-" + "A" * 40
+    assert _run(reader._inbox_items(f"session-{secret}")) is None

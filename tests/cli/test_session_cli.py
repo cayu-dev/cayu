@@ -1204,11 +1204,18 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
         )
         payload = json.loads(capsys.readouterr().out)
         assert payload["session"]["status"] == "interrupted"
+        [inbox_item] = payload["pending_action"].pop("inbox_items")
         assert payload["pending_action"] == {
             "count": 1,
             "issue_count": 0,
             "kinds": [expected_kind],
         }
+        # The id `cayu inbox show` and the settle commands take.
+        assert (
+            inbox_item["kind"]
+            == {"tool_approval": "approval", "user_input": "question"}[expected_kind]
+        )
+        assert inbox_item["id"].startswith("inbox_")
 
 
 def test_session_detail_commands_report_missing_session_concisely(

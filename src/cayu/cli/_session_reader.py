@@ -26,13 +26,18 @@ from cayu.sessions._call_inspection import (
     inspect_tool_calls,
     redact_inspection_value,
 )
+from cayu.sessions._inbox_item_ids import PENDING_INBOX_KINDS, inbox_session_item_id
 from cayu.sessions._rollup import RollupPage, SessionRollupQuery, rollup_page
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import INTERACTION_TERMINAL_EVENT_TYPES, InteractionSummaryEvidence
+from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord, Session
 from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_queries import TranscriptQuery
+
+#: The most inbox item ids `session show` lists for one session's pending actions.
+MAX_SHOWN_INBOX_ITEMS = 50
 
 
 @dataclass(frozen=True)
@@ -238,6 +243,34 @@ class StoreSessionReader:
             raise ValueError(f"Session not found: {session_id}")
         return state.status.value
 
+    async def _inbox_items(self, session_id: str) -> list[dict[str, str]] | None:
+        """The inbox items the session's pending actions are listed as, in `cayu inbox`.
+
+        None for a session id the output would redact: an item id encodes it, where redaction
+        can't see it (`cayu inbox list --session` names those items).
+        """
+
+        if redact_inspection_value(session_id) != session_id:
+            return None
+        items: list[dict[str, str]] = []
+        cursor: str | None = None
+        while len(items) < MAX_SHOWN_INBOX_ITEMS:
+            page = await self.store.query_pending_actions(
+                PendingActionQuery(session_id=session_id, cursor=cursor, limit=200)
+            )
+            for action in page.actions:
+                kind = PENDING_INBOX_KINDS.get(action.kind)
+                if kind is None or action.attention_id is None:
+                    continue
+                item_id = inbox_session_item_id(
+                    kind, session_id, action.event.sequence, action.attention_id
+                )
+                items.append({"id": item_id, "kind": kind})
+            if not page.has_more or page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+        return items[:MAX_SHOWN_INBOX_ITEMS]
+
     async def overview(self, session_id: str) -> dict[str, Any]:
         try:
             summary = await runtime_checkpoint_session_store(self.store).inspect_summary(session_id)
@@ -288,6 +321,9 @@ class StoreSessionReader:
                 "count": summary.pending_action_count,
                 "kinds": [kind.value for kind in summary.pending_action_kinds],
                 "issue_count": summary.pending_action_issue_count,
+                "inbox_items": await self._inbox_items(session_id)
+                if summary.pending_action_count
+                else [],
             },
             "queue": {
                 "queued": summary.queued_message_count,

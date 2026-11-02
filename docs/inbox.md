@@ -303,7 +303,8 @@ approval stays pending, so deny it and let the agent propose the call again. A
 change to the agent's tool set (a tool added, removed or redescribed) can't be
 adopted: approving answers 409 `conflict`. The
 Developer dashboard offers the same decision under the update after a
-`profile_changed` refusal. Use a new `idempotency_key` for each adoption.
+`profile_changed` refusal, and `cayu inbox approve|deny --adopt-profile --reason ...`
+sends it from a terminal. Use a new `idempotency_key` for each adoption.
 
 A denial always settles. When the change can't be adopted, or the session's
 execution deadline passed while the approval waited, the paused round can't
@@ -465,9 +466,17 @@ $ cayu inbox show inbox_...
 $ cayu inbox approve inbox_... --reason "Checked against the vendor master."
 $ cayu inbox deny inbox_... --reason "Wrong vendor."
 $ cayu inbox dismiss inbox_... --reason "The run ended on Oct 25."
+$ cayu inbox approve --session invoice-7 --reason "Checked."
 ```
 
 `dismiss` takes recovery items, approvals and questions, as described above.
+
+`show`, `approve`, `deny` and `dismiss` take the item's id, or `--session ID` instead:
+the session's pending actions are then read directly (as `list --session` reads them,
+not through the paged listing), and the command acts on the session's one item of
+the kind it settles. A session waiting on several is refused with their ids. `cayu
+session show` lists the inbox item id of each pending action under
+`pending_action.inbox_items`, so a waiting session leads straight to its item.
 
 Without `--application`, the commands open the project's application (`[tool.cayu]
 factory`, or `--target module:factory`) and its store in this process, and serve
@@ -483,6 +492,11 @@ stopped and can be resumed later.
 With `--application NAME`, they read a Cayu Cloud Agent through Cloud's inbox routes
 with your `cayu cloud login` (or `--context`). Cloud carries a decision to the Agent
 as you, so it needs Cloud sign-in on the Agent, and the Agent continues on its own.
+`list` shows items asked before the Agent's current Release in their own section
+(`asked_before_release: true` in `--json`): they may well resume, so show and settle
+them like the others, or dismiss the ones that won't. A Cloud that leaves those items
+out of its listing and names only their ids has each one read by its id; one that
+can't be read makes the listing incomplete, with a note.
 
 `show` prints the item and, for a pending approval or question, the
 [human review](human-review.md) the application's policy builds for you: the
@@ -493,7 +507,9 @@ selects the review purpose (the application's own by default, or `approvals` for
 Cloud Agent). When the application has a policy, `approve` and `deny` ask for a
 fresh review and send its `review_reference` with the decision; a review that
 withholds the call's content can only be denied. For a session whose task worker let
-it go while it waits, `--claim-task` sends `task_continuation: "claim"`.
+it go while it waits, `--claim-task` sends `task_continuation: "claim"`. When a settle
+is refused with `profile_changed`, settle again with `--adopt-profile --reason ...`,
+which sends `profile_adoption` (see [Approvals across an upgrade](#approvals-across-an-upgrade)).
 `dismiss` dismisses a recovery item, with the required `--reason`, by abandoning its
 session (see [Dismissing a recovery item](#dismissing-a-recovery-item)).
 
