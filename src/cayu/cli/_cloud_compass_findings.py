@@ -163,6 +163,63 @@ def _rank(finding: Mapping[str, Any]) -> tuple[int, int, str]:
     )
 
 
+#: Sessions one request reads when listing a finding's sessions.
+_SESSION_PAGE = 500
+
+
+def with_sample(finding: Mapping[str, Any]) -> dict[str, Any]:
+    """The finding, saying whether its cited ``sessions`` are all of them or a sample."""
+
+    count = finding.get("session_count")
+    if type(count) is not int:
+        return dict(finding)
+    cited = finding.get("sessions")
+    shown = len(cited) if isinstance(cited, list) else 0
+    return {
+        **finding,
+        "sessions_cited": f"{shown} of {count}"
+        + ("" if shown >= count else "; `findings sessions` lists every one"),
+    }
+
+
+def finding_sessions(
+    client: CloudApiClient, finding_path: str, *, limit: int | None
+) -> dict[str, Any]:
+    """Every session behind a finding (or the latest ``limit``), following Cloud's pages."""
+
+    sessions: list[dict[str, Any]] = []
+    cursor: str | None = None
+    answer: dict[str, Any] = {}
+    try:
+        while limit is None or len(sessions) < limit:
+            size = _SESSION_PAGE if limit is None else min(_SESSION_PAGE, limit - len(sessions))
+            query = {"limit": str(size), **({} if cursor is None else {"cursor": cursor})}
+            answer = client.request("GET", f"{finding_path}/sessions", query=query)
+            sessions.extend(_records(answer.get("sessions"), key="session_id"))
+            cursor = (
+                answer.get("next_cursor") if isinstance(answer.get("next_cursor"), str) else None
+            )
+            if cursor is None:
+                break
+    except CloudApiError as exc:
+        # Only a bare 404 (an older Cloud's missing route): Cloud's own codes say more.
+        if exc.status_code == 404 and exc.code is None and not sessions:
+            raise CloudApiError(
+                "finding_sessions_unavailable",
+                "No such finding, or this Cayu Cloud can't list a finding's sessions yet.",
+                status_code=404,
+            ) from None
+        raise
+    return {
+        "finding_id": answer.get("finding_id"),
+        "sessions": sessions,
+        "total": answer.get("total"),
+        "first_seen_at": answer.get("first_seen_at"),
+        "last_seen_at": answer.get("last_seen_at"),
+        "complete": cursor is None,
+    }
+
+
 def summarize(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """The findings counted by rule and tool, largest group first."""
 
@@ -343,12 +400,12 @@ def _auth_failure(exc: CloudAuthError) -> CloudApiError:
     return CloudApiError(exc.category, str(exc))
 
 
-def _records(value: object) -> list[dict[str, Any]]:
-    """The objects of a list in Cloud's answer, each with a string ``finding_id``."""
+def _records(value: object, *, key: str = "finding_id") -> list[dict[str, Any]]:
+    """The objects of a list in Cloud's answer, each with a string ``key``."""
 
     listed = cast("list[object]", value) if isinstance(value, list) else []
     records = [cast("dict[str, Any]", item) for item in listed if isinstance(item, dict)]
-    return [item for item in records if isinstance(item.get("finding_id"), str)]
+    return [item for item in records if isinstance(item.get(key), str)]
 
 
 def _ids(value: object) -> list[str]:

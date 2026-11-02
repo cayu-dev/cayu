@@ -39,7 +39,9 @@ _ENROLL_FIELDS = (
 # `findings accept` options, which set the request fields of the same names.
 _ACCEPT_TEXT = ("note", "requirement", "hypothesis", "expected_effect", "risk")
 _MISSION_STATUSES = ("ready", "starting", "started", "failed", "unknown")
-_FINDING_STATUSES = ("proposed", "accepted", "dismissed")
+# `withdrawn` and `resolved` are Compass retiring a finding that no longer holds; `findings list`
+# leaves them out unless --status names one.
+_FINDING_STATUSES = ("proposed", "accepted", "dismissed", "withdrawn", "resolved")
 # `findings dismiss` options that pick findings by what they are rather than by id.
 _BULK_OPTIONS = ("rule", "agent", "dimension", "min_score", "tool")
 
@@ -243,6 +245,21 @@ def add_compass_parser(
             findings_cli.add_output_argument(finding)
         if name != "show":
             finding.add_argument("--idempotency-key")
+    sessions = finding_actions.add_parser(
+        "sessions",
+        description=(
+            "Every session behind a finding, across every pass, latest first: when each last "
+            "showed it and the Release it ran on. A finding cites only some of them; this lists "
+            "them all (--limit for fewer)."
+        ),
+    )
+    sessions.add_argument("application", type=application)
+    sessions.add_argument("finding_id")
+    sessions.add_argument(
+        "--limit",
+        type=findings_cli._positive,
+        help="List at most this many, the latest first (default: every one).",
+    )
 
 
 def _agent_path(application: str) -> str:
@@ -339,7 +356,11 @@ def compass_command(
             return _dismiss_by_rule(client, arguments, path)
     finding = f"{path}/findings/{quote(arguments.finding_id, safe='')}"
     if finding_action == "show":
-        return _answer(operation, client.request("GET", finding))
+        return _answer(operation, findings_cli.with_sample(client.request("GET", finding)))
+    if finding_action == "sessions":
+        return _answer(
+            operation, findings_cli.finding_sessions(client, finding, limit=arguments.limit)
+        )
     if finding_action == "accept":
         review: dict[str, object] = {
             option: getattr(arguments, option)

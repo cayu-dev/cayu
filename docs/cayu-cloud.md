@@ -1958,6 +1958,7 @@ cayu cloud compass findings list my-agent --summary
 cayu cloud compass findings accept my-agent FINDING --note "Worth trying"
 cayu cloud compass findings dismiss my-agent FINDING --note "Expected behavior"
 cayu cloud compass findings dismiss my-agent --rule repeated_tool --note "Paging, not repeats"
+cayu cloud compass findings sessions my-agent FINDING
 cayu cloud compass missions my-agent
 cayu cloud compass disable my-agent
 ```
@@ -1969,6 +1970,13 @@ member is refused with `code` `developer_required`. They mirror Cloud's operator
 `compass` commands, except that waits take `--poll-seconds` and
 `--wait-seconds` like the rest of `cayu cloud`.
 
+- **A finding's sessions.** A finding cites at most 10 sessions. `findings show`
+  says how many it cites of how many (`sessions_cited`, from `session_count`), and
+  `first_seen_at`/`last_seen_at` with `last_seen_release_id` show whether it still
+  happens. `findings sessions` lists every session behind it across every pass,
+  latest first, with when each last showed it and its Release; `--limit N` keeps the
+  latest N. A Cloud or Compass from before this answers
+  `finding_sessions_unavailable`.
 - **Enrolling.** `--agent` names a Cayu agent inside the Agent that Compass
   watches; the Agent must register it, or it won't start with Compass's fork
   controller. Repeat it to watch several (1 to 16). Each `enroll` sets the whole

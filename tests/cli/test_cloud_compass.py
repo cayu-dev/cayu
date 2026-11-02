@@ -994,3 +994,82 @@ def test_dismiss_takes_a_finding_id_or_a_rule(
 
     assert (code, output["error"]["category"]) == (2, "invalid_input")
     assert message in output["error"]["message"]
+
+
+def test_a_findings_sessions_are_listed_in_full_and_show_says_its_a_sample(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`findings sessions` and the sample note in `findings show`."""
+
+    def rows(*names: str) -> list[dict[str, object]]:
+        return [{"session_id": name, "last_seen_at": "2026-10-27T16:56:00Z"} for name in names]
+
+    sessions = f"{_AGENT}/findings/fnd_1/sessions"
+    cloud(
+        {
+            ("GET", f"{_AGENT}/findings/fnd_1"): [
+                httpx.Response(
+                    200, json={"finding_id": "fnd_1", "sessions": ["s1", "s2"], "session_count": 3}
+                )
+            ],
+            ("GET", f"{sessions}?limit=500"): [
+                httpx.Response(
+                    200,
+                    json={"sessions": rows("s3", "s2"), "next_cursor": "c2", "total": 3},
+                )
+            ],
+            ("GET", f"{sessions}?limit=500&cursor=c2"): [
+                httpx.Response(200, json={"sessions": rows("s1"), "next_cursor": None, "total": 3})
+            ],
+            ("GET", f"{sessions}?limit=1"): [
+                httpx.Response(200, json={"sessions": rows("s3"), "next_cursor": "c1", "total": 3})
+            ],
+        }
+    )
+
+    code, shown = _run(["findings", "show", "cayu-scout", "fnd_1"], capsys)
+    assert code == 0
+    assert shown["result"]["sessions_cited"].startswith("2 of 3;")
+
+    code, listed = _run(["findings", "sessions", "cayu-scout", "fnd_1"], capsys)
+    assert code == 0
+    result = listed["result"]
+    assert [row["session_id"] for row in result["sessions"]] == ["s3", "s2", "s1"]
+    assert (result["total"], result["complete"]) == (3, True)
+
+    code, latest = _run(["findings", "sessions", "cayu-scout", "fnd_1", "--limit", "1"], capsys)
+    assert code == 0
+    assert [row["session_id"] for row in latest["result"]["sessions"]] == ["s3"]
+    assert latest["result"]["complete"] is False
+
+
+def test_an_older_cloud_says_it_cant_list_a_findings_sessions(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_AGENT}/findings/fnd_1/sessions?limit=500"): [
+                httpx.Response(404, json={"detail": "Not Found"})
+            ]
+        }
+    )
+
+    code, output = _run(["findings", "sessions", "cayu-scout", "fnd_1"], capsys)
+    assert code != 0
+    assert output["error"]["category"] == "finding_sessions_unavailable"
+
+
+def test_clouds_own_404_codes_for_a_findings_sessions_are_kept(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_AGENT}/findings/fnd_1/sessions?limit=500"): [
+                httpx.Response(404, json={"detail": {"code": "not_enrolled", "message": "x"}})
+            ]
+        }
+    )
+
+    code, output = _run(["findings", "sessions", "cayu-scout", "fnd_1"], capsys)
+    assert code != 0
+    assert output["error"]["category"] != "finding_sessions_unavailable"
