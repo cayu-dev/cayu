@@ -151,11 +151,13 @@ class ToolCallDeadlineProvider(ModelProvider):
     @property
     def stream_deadlines(self) -> ProviderStreamDeadlines:
         return ProviderStreamDeadlines(
-            transport_idle_timeout_s=1,
-            protocol_idle_timeout_s=1,
-            # Allow the first tool call to arrive before testing the subsequent idle deadline.
-            semantic_progress_timeout_s=0.2,
-            absolute_stream_timeout_s=1,
+            transport_idle_timeout_s=5,
+            protocol_idle_timeout_s=5,
+            # The semantic clock starts at dispatch, so it must outlast a loaded runner's
+            # stall before the first tool call; the test then waits out the idle deadline
+            # after that call. The other deadlines stay well above it so it fires first.
+            semantic_progress_timeout_s=1,
+            absolute_stream_timeout_s=5,
         )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:

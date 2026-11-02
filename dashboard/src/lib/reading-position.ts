@@ -114,7 +114,7 @@ export function restoreScrollPosition(
     finished = true
     observer?.disconnect()
     clearTimeout(timer)
-    for (const event of USER_SCROLL_EVENTS) element.removeEventListener(event, finish)
+    stopListening()
     onDone()
   }
   const attempt = () => {
@@ -125,10 +125,22 @@ export function restoreScrollPosition(
   }
   const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(attempt)
   const timer = setTimeout(finish, timeoutMs)
-  for (const event of USER_SCROLL_EVENTS) element.addEventListener(event, finish, { passive: true })
+  const stopListening = listenForUserScroll(element, finish)
   observer?.observe(content)
   attempt()
   return finish
+}
+
+/**
+ * Calls `onScroll` when the person starts scrolling `element` themselves. Returns a
+ * function that stops listening.
+ */
+export function listenForUserScroll(element: EventTarget, onScroll: () => void): () => void {
+  for (const event of USER_SCROLL_EVENTS)
+    element.addEventListener(event, onScroll, { passive: true })
+  return () => {
+    for (const event of USER_SCROLL_EVENTS) element.removeEventListener(event, onScroll)
+  }
 }
 
 const USER_SCROLL_EVENTS = ["wheel", "touchstart", "keydown", "pointerdown"] as const

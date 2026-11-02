@@ -24,6 +24,7 @@ import { executeResolveProviderOperationMutation } from "@/lib/mutation-browser"
 import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
 import {
   anchorOffset,
+  listenForUserScroll,
   readingPositionFromScroll,
   readReadingPosition,
   restoreScrollPosition,
@@ -450,8 +451,14 @@ export function SessionPage({
   useEffect(() => {
     const element = conversationRef.current
     const content = conversationContentRef.current
-    if (!savedReading || !restoringReading.current || !conversation || !transcriptLoaded) return
+    if (!savedReading || !restoringReading.current || !conversation) return
     if (!element || !content) return
+    // Scrolling while the transcript is still loading picks a new place to read, so the
+    // saved position isn't restored over it when the transcript arrives.
+    if (!transcriptLoaded)
+      return listenForUserScroll(element, () => {
+        restoringReading.current = false
+      })
     // Pixel offsets only identify a position within the same bounded transcript window.
     if (savedReading.view !== filterKey || savedReading.transcriptOffset !== transcriptOffset) {
       restoringReading.current = false
@@ -472,7 +479,15 @@ export function SessionPage({
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: follow new transcript and decision content only while pinned, and once Conversation shows
   useEffect(() => {
-    if (pinned && navigation.current === null) endRef.current?.scrollIntoView({ block: "end" })
+    const element = conversationRef.current
+    if (!element || !pinned || navigation.current !== null) return
+    const follow = () => endRef.current?.scrollIntoView({ block: "end" })
+    follow()
+    // Notices that appear under the conversation shrink it; the end stays in view.
+    if (typeof ResizeObserver === "undefined") return
+    const observer = new ResizeObserver(follow)
+    observer.observe(element)
+    return () => observer.disconnect()
   }, [pinned, navigation.current, transcript.data, inbox.data?.items.length, conversation])
   // biome-ignore lint/correctness/useExhaustiveDependencies: close the menus when the session changes
   useEffect(() => {

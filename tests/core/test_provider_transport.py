@@ -1224,10 +1224,11 @@ async def test_openai_transport_classifies_established_sse_reset_separately_from
 
 @pytest.mark.anyio
 async def test_openai_transport_survives_keepalive_heartbeats(monkeypatch) -> None:
-    # Five heartbeats, each within one transport-idle window (0.04 < 0.1)
-    # but 0.2s in total. Comments prove transport activity without claiming
-    # decoded protocol or semantic progress.
-    response = _StreamingResponse(_KEEPALIVE_LINES, heartbeat_sleep_s=0.04)
+    # Five heartbeats, each well within one transport-idle window (0.1 < 0.4)
+    # but 0.5s in total, so only the heartbeats keep the stream alive. The
+    # 0.3s margin absorbs a stalled loaded runner. Comments prove transport
+    # activity without claiming decoded protocol or semantic progress.
+    response = _StreamingResponse(_KEEPALIVE_LINES, heartbeat_sleep_s=0.1)
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
 
     events = [
@@ -1236,11 +1237,11 @@ async def test_openai_transport_survives_keepalive_heartbeats(monkeypatch) -> No
             url="https://api.openai.com/v1/responses",
             headers={},
             payload={},
-            timeout_s=1.0,
-            transport_idle_timeout_s=0.1,
-            protocol_idle_timeout_s=1.0,
-            semantic_progress_timeout_s=1.0,
-            absolute_stream_timeout_s=1.0,
+            timeout_s=5.0,
+            transport_idle_timeout_s=0.4,
+            protocol_idle_timeout_s=5.0,
+            semantic_progress_timeout_s=5.0,
+            absolute_stream_timeout_s=5.0,
         )
     ]
 
@@ -1330,7 +1331,8 @@ async def test_real_sse_absolute_deadline_counts_from_the_last_output(
 
 @pytest.mark.anyio
 async def test_chat_completions_transport_survives_keepalive_heartbeats(monkeypatch) -> None:
-    response = _StreamingResponse(_KEEPALIVE_LINES, heartbeat_sleep_s=0.04)
+    # The same margins as the OpenAI Responses keepalive test above.
+    response = _StreamingResponse(_KEEPALIVE_LINES, heartbeat_sleep_s=0.1)
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
 
     events = [
@@ -1339,11 +1341,11 @@ async def test_chat_completions_transport_survives_keepalive_heartbeats(monkeypa
             url="https://api.openai.com/v1/chat/completions",
             headers={},
             payload={},
-            timeout_s=1.0,
-            transport_idle_timeout_s=0.1,
-            protocol_idle_timeout_s=1.0,
-            semantic_progress_timeout_s=1.0,
-            absolute_stream_timeout_s=1.0,
+            timeout_s=5.0,
+            transport_idle_timeout_s=0.4,
+            protocol_idle_timeout_s=5.0,
+            semantic_progress_timeout_s=5.0,
+            absolute_stream_timeout_s=5.0,
         )
     ]
 

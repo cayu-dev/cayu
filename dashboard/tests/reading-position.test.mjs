@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import {
+  listenForUserScroll,
   READING_END_SLACK,
   READING_POSITION_PREFIX,
   readingPositionFromScroll,
@@ -87,4 +88,16 @@ test("malformed, missing or blocked storage restores nothing", () => {
   }
   assert.equal(readReadingPosition("k", blocked), null)
   assert.doesNotThrow(() => writeReadingPosition("k", { view: "v", top: 1, atEnd: false }, blocked))
+})
+
+test("scrolling by wheel, touch, key or pointer is noticed until listening stops", () => {
+  const element = new EventTarget()
+  const noticed = []
+  const stop = listenForUserScroll(element, () => noticed.push("scroll"))
+  for (const type of ["wheel", "touchstart", "keydown", "pointerdown", "scroll"])
+    element.dispatchEvent(new Event(type))
+  assert.equal(noticed.length, 4)
+  stop()
+  element.dispatchEvent(new Event("wheel"))
+  assert.equal(noticed.length, 4)
 })

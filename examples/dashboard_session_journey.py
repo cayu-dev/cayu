@@ -30,7 +30,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import uvicorn
 from playwright.async_api import FloatRect, Locator, Page, async_playwright, expect
@@ -66,6 +66,7 @@ FINAL_TEXT = "The dashboard journey report is complete."
 DRAFT = "Journey draft: keep the summary to three lines."
 FOLLOW_UP_TEXT = "Follow-up received for the journey."
 DRAFT_KEY_PREFIX = "cayu-dashboard-draft:"
+READING_KEY_PREFIX = "cayu-dashboard-reading:session:"
 EARLIER_SESSIONS = 40
 EARLIER_PROMPT = "Earlier dashboard journey session"
 
@@ -74,6 +75,13 @@ _CONVERSATION = """() => [...document.querySelectorAll('main div')].find(
   (node) => getComputedStyle(node).overflowY === 'auto' && node.querySelector('#session-composer') === null
     && node.scrollHeight > node.clientHeight
 )"""
+
+
+# Whether the conversation shows its end, within the slack the dashboard follows it by.
+_AT_END = f"""() => {{
+  const node = ({_CONVERSATION})()
+  return node && node.scrollHeight - node.scrollTop - node.clientHeight <= 32
+}}"""
 
 
 # The report section whose text is at the top of the conversation's visible area.
@@ -299,6 +307,48 @@ async def _journey(
     await page.reload(wait_until="networkidle")
     await _require_returned(page, reading, resting, "after a reload")
 
+    # Scrolling before the transcript has reloaded picks a new place to read: the saved
+    # position isn't restored over it. The transcript is held until the reader has scrolled.
+    await page.get_by_role("link", name="Sessions", exact=True).first.click()
+    await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
+    transcript_path = f"/api/sessions/{session_id}/transcript"
+    transcript_released = asyncio.Event()
+
+    def is_transcript(url: str) -> bool:
+        parts = urlsplit(url)
+        return parts.path == transcript_path and "role=" not in parts.query
+
+    async def hold_transcript(route) -> None:
+        await transcript_released.wait()
+        await route.fallback()
+
+    await page.route(is_transcript, hold_transcript, times=1)
+    try:
+        async with page.expect_request(lambda request: is_transcript(request.url)):
+            await page.locator(f'a[href$="/sessions/{session_id}"]').first.click()
+        await expect(page).to_have_url(session_url)
+        await expect(composer).to_have_value(DRAFT)
+        box = await _box(composer)
+        await page.mouse.move(box["x"] + box["width"] / 2, box["y"] - 200)
+        await page.mouse.wheel(0, 20000)
+        await page.wait_for_function(
+            f"""(key) => ({_AT_END})()
+              && JSON.parse(sessionStorage.getItem(key) ?? 'null')?.atEnd === true""",
+            arg=READING_KEY_PREFIX + session_id,
+        )
+        # The reload probes the transcript's length, then reads its latest page.
+        async with page.expect_response(
+            lambda response: (
+                is_transcript(response.url)
+                and parse_qs(urlsplit(response.url).query).get("limit") != ["1"]
+            )
+        ):
+            transcript_released.set()
+    finally:
+        transcript_released.set()
+    await page.wait_for_function(_AT_END)
+    await _require_document_still(page, "after scrolling before the transcript reloaded")
+
     # Resume: approving runs the session again; the draft waits in the composer.
     async with page.expect_response(
         lambda response: (
@@ -319,20 +369,35 @@ async def _journey(
     await page.get_by_role("link", name="Sessions", exact=True).first.click()
     row = page.get_by_role("row").filter(has=page.locator(f'a[href$="/sessions/{session_id}"]'))
     await expect(row.get_by_text("Running", exact=True)).to_be_visible()
-    await row.locator(f'a[href$="/sessions/{session_id}"]').click()
-    await expect(page).to_have_url(session_url)
-    await expect(composer).to_have_value(DRAFT)
+    # Back on the session, its refused queue probe adds a notice under the conversation.
+    # The probe is held until the reader has scrolled to the end, so the notice always
+    # arrives while they're following it.
+    probe_path = f"/api/sessions/{session_id}/messages"
+    probe_released = asyncio.Event()
 
-    # Completion: a reader at the end of the conversation follows the final answer in.
-    box = await _box(composer)
-    await page.mouse.move(box["x"] + box["width"] / 2, box["y"] - 200)
-    await page.mouse.wheel(0, 20000)
-    await page.wait_for_function(
-        f"""() => {{
-          const node = ({_CONVERSATION})()
-          return node && node.scrollHeight - node.scrollTop - node.clientHeight <= 2
-        }}"""
-    )
+    def is_probe(url: str) -> bool:
+        return urlsplit(url).path == probe_path
+
+    async def hold_probe(route) -> None:
+        await probe_released.wait()
+        await route.fallback()
+
+    await page.route(is_probe, hold_probe, times=1)
+    try:
+        async with page.expect_request(lambda request: is_probe(request.url)):
+            await row.locator(f'a[href$="/sessions/{session_id}"]').click()
+        await expect(page).to_have_url(session_url)
+        await expect(composer).to_have_value(DRAFT)
+
+        # Completion: a reader at the end of the conversation follows the final answer in.
+        box = await _box(composer)
+        await page.mouse.move(box["x"] + box["width"] / 2, box["y"] - 200)
+        await page.mouse.wheel(0, 20000)
+        await page.wait_for_function(_AT_END)
+    finally:
+        probe_released.set()
+    await expect(page.get_by_text("Sending messages while a session runs is off")).to_be_visible()
+    await page.wait_for_function(_AT_END)
     provider.release()
     await _wait_for_status(sessions, session_id, SessionStatus.COMPLETED)
     await expect(page.get_by_text(FINAL_TEXT, exact=True)).to_be_visible(timeout=15000)
@@ -370,15 +435,10 @@ async def _journey(
           saved.transcriptOffset += 20
           sessionStorage.setItem(key, JSON.stringify(saved))
         }""",
-        "cayu-dashboard-reading:session:" + session_id,
+        READING_KEY_PREFIX + session_id,
     )
     await page.reload(wait_until="networkidle")
-    await page.wait_for_function(
-        f"""() => {{
-          const node = ({_CONVERSATION})()
-          return node && node.scrollHeight - node.scrollTop - node.clientHeight <= 32
-        }}"""
-    )
+    await page.wait_for_function(_AT_END)
 
     # The draft is sent as a follow-up, and sending forgets it.
     await composer.press("Enter")
