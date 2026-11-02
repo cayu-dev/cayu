@@ -1,7 +1,8 @@
 """Control-plane projection of the shared session overview.
 
 Store joins stay in sessions.overview; application-owned projection and artifact
-registration are injected here by router assembly.
+registration are injected here by router assembly, or by the CLI for a local
+store.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pydantic import ValidationError
 from cayu._time_buckets import BucketUnit, TimeSeriesSpec
 from cayu.artifacts.base import ArtifactStore, ArtifactStoreUnavailableError
 from cayu.budgets.pricing import PriceBook
-from cayu.messages import MessageRole, TextPart
+from cayu.messages import Message, MessageRole, TextPart
 from cayu.server._session_overview_query import SessionOverviewSelection
 from cayu.server.contracts import (
     MAX_SESSION_FIRST_MESSAGE_LENGTH,
@@ -188,24 +189,42 @@ class SessionOverviewService:
     async def with_first_messages(
         self, sessions: Sequence[Session], overviews: Sequence[SessionOverviewResponse]
     ) -> list[SessionOverviewResponse]:
-        """Add each session's bounded first user text, read at most a few sessions at a time.
+        """Add each session's bounded first user text, read for the whole page at once.
 
         The caller rechecks every row's incarnation after these reads, as it does
         for the other optional sibling reads, so a replaced session is dropped.
         """
 
+        try:
+            records = await self.store.query_first_transcript_records(
+                tuple(session.id for session in sessions), MessageRole.USER
+            )
+        except Exception:
+            # One session's failure must degrade only its own row, so read
+            # each row on its own. Cancellation is not an Exception.
+            return await self._first_messages_one_by_one(sessions, overviews)
+        previews = []
+        for session, overview in zip(sessions, overviews, strict=True):
+            record = records.get(session.id)
+            try:
+                text = None if record is None else self._preview_text(record.message)
+            except Exception:
+                previews.append(_without_preview(overview))
+                continue
+            previews.append(_with_preview(overview, text))
+        return previews
+
+    async def _first_messages_one_by_one(
+        self, sessions: Sequence[Session], overviews: Sequence[SessionOverviewResponse]
+    ) -> list[SessionOverviewResponse]:
         async def preview(session: Session, overview: SessionOverviewResponse):
             try:
                 text = await self._first_message(session)
             except Exception:
                 # Preview availability must not decide whether a session is
                 # listed. Cancellation still propagates through the read group.
-                return overview.model_copy(
-                    update={"first_message": None, "first_message_unavailable": True}
-                )
-            return overview.model_copy(
-                update={"first_message": text, "first_message_unavailable": False}
-            )
+                return _without_preview(overview)
+            return _with_preview(overview, text)
 
         return await gather_in_order(
             [
@@ -228,7 +247,9 @@ class SessionOverviewService:
             raise
         if not page.records:
             return None
-        message = page.records[0].message
+        return self._preview_text(page.records[0].message)
+
+    def _preview_text(self, message: Message) -> str | None:
         # Redact each part as the transcript route does, then the joined text, so a
         # secret split across parts is still caught. Cut only after redacting.
         text = self.redact(
@@ -311,6 +332,14 @@ class SessionOverviewService:
             eval=is_eval_trial(session),
             forked=facts.forked,
         )
+
+
+def _with_preview(overview: SessionOverviewResponse, text: str | None) -> SessionOverviewResponse:
+    return overview.model_copy(update={"first_message": text, "first_message_unavailable": False})
+
+
+def _without_preview(overview: SessionOverviewResponse) -> SessionOverviewResponse:
+    return overview.model_copy(update={"first_message": None, "first_message_unavailable": True})
 
 
 def overview_http_error(exc: Exception) -> HTTPException:

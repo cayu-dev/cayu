@@ -2161,6 +2161,18 @@ class SQLiteSessionStore(
             lambda connection: page_read_ops.query_latest_events(connection, page, types)
         )
 
+    async def query_first_transcript_records(
+        self, session_ids: Sequence[str], role: MessageRole
+    ) -> dict[str, TranscriptRecord]:
+        page = page_reads.page_session_ids(session_ids)
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        if await page_reads.page_reads_are_bounded():
+            return await super().query_first_transcript_records(page, role)
+        return await self._run_read(
+            lambda connection: page_read_ops.query_first_transcript_records(connection, page, role)
+        )
+
     async def load_session_operations(
         self,
         session_ids: Sequence[str],

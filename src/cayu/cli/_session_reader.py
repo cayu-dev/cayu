@@ -24,6 +24,7 @@ from cayu.sessions._call_inspection import (
     InspectionWindow,
     inspect_model_calls,
     inspect_tool_calls,
+    redact_inspection_value,
 )
 from cayu.sessions._rollup import RollupPage, SessionRollupQuery, rollup_page
 from cayu.sessions.event_queries import EventQuery
@@ -69,7 +70,16 @@ class InteractionPage:
 class SessionReader(Protocol):
     """The reads `cayu session` inspection commands make, from any source."""
 
-    async def list_sessions(self, query: SessionQuery) -> SessionListPage: ...
+    async def list_sessions(
+        self, query: SessionQuery, *, overview: bool = False, pricing: PriceBook | None = None
+    ) -> SessionListPage:
+        """One page of rows; with ``overview``, each row also carries its ``overview``.
+
+        The overview is the `GET /api/sessions?include=overview&include=first_message`
+        projection. ``pricing`` prices a local store's overview costs; an Agent prices
+        its own.
+        """
+        ...
 
     async def require_session(self, session_id: str) -> None:
         """Raise `ValueError("Session not found: ...")` unless the session exists."""
@@ -171,13 +181,52 @@ class StoreSessionReader:
     def __init__(self, store: SessionStore) -> None:
         self.store = store
 
-    async def list_sessions(self, query: SessionQuery) -> SessionListPage:
+    async def list_sessions(
+        self, query: SessionQuery, *, overview: bool = False, pricing: PriceBook | None = None
+    ) -> SessionListPage:
         result = await self.store.list_sessions(query)
-        return SessionListPage(
-            rows=[session_list_row(session) for session in result.sessions],
-            next_cursor=result.next_cursor,
-            total_count=result.total_count,
+        rows = (
+            await self._overview_rows(result.sessions, pricing)
+            if overview
+            else [session_list_row(session) for session in result.sessions]
         )
+        return SessionListPage(
+            rows=rows, next_cursor=result.next_cursor, total_count=result.total_count
+        )
+
+    async def _overview_rows(
+        self, sessions: list[Session], pricing: PriceBook | None
+    ) -> list[dict[str, Any]]:
+        """The rows with the overview the server's list route would add to them.
+
+        The server's projection is composed with what a bare store can supply:
+        private session IDs, the CLI's pattern redaction instead of the
+        application's registered secrets, and no artifact stores, so
+        ``uses.artifacts`` is ``None``. Rows whose session changed meanwhile are
+        dropped, as the route drops them.
+        """
+
+        from cayu.server._session_overview import SessionOverviewService
+
+        service = SessionOverviewService(
+            store=self.store,
+            pricing=pricing,
+            project_session=lambda session_id: session_id,
+            redact=redact_inspection_value,
+            artifact_stores=dict,
+        )
+        kept, overviews = await service.read(sessions)
+        overviews = await service.with_first_messages(kept, overviews)
+        current = await self.store.load_sessions(tuple(session.id for session in kept))
+        rows = []
+        for session, projected in zip(kept, overviews, strict=True):
+            row = current.get(session.id)
+            if row is None or row.instance_id != session.instance_id:
+                continue
+            payload = projected.model_dump(mode="json")
+            payload["uses"]["artifacts"] = None
+            rows.append({**session_list_row(session), "overview": payload})
+        return rows
 
     async def require_session(self, session_id: str) -> None:
         if await self.store.load(session_id) is None:

@@ -467,6 +467,10 @@ cayu session list --status completed --agent reviewer --label tenant=acme
 # means UTC midnight.
 cayu session list --since 2026-10-27 --until 2026-10-28T12:00:00-07:00
 
+# Each session's overview and first user message, as the Sessions page shows them.
+cayu session list --overview
+cayu session list --overview --table --application bug-hunter
+
 # Content-free operational summary, including runtime name/version, usage, and
 # pending-action counts.
 cayu session show SESSION_ID
@@ -507,6 +511,30 @@ cayu session transcript SESSION_ID --interaction-id INTERACTION_ID
 cayu session output SESSION_ID
 cayu session output SESSION_ID --interaction-id INTERACTION_ID --table
 ```
+
+### Session overviews
+
+`cayu session list --overview` adds an `overview` object to each row: the projection
+`GET /api/sessions?include=overview&include=first_message` returns, the same one the
+Developer dashboard's Sessions page shows. It has the session's `state` (such as
+`waiting_approval` or `failed`) and `reason`, `title`, `summary`, `first_message` (the
+session's first user text, redacted, trimmed and cut to 256 characters) with
+`first_message_unavailable`, `started_at`, `ended_at`, `model_steps`, `tool_calls`,
+`tokens`, `cost`, `uses` (`browser`, `subagents`, `artifacts`), `eval` and `forked`. Counts
+are decimal strings, as in the HTTP API. Filters and paging work as without the option.
+`--table` prints one line per session with the state, title, first message, steps,
+tokens and cost; `--jsonl` prints one row per line.
+
+With `--application NAME` the Agent builds the overviews in the list request itself,
+with its own redaction and price book. An Agent whose Cayu predates first-message
+previews still lists overviews, with `first_message` null and
+`first_message_unavailable: true`. With a local store (`--sqlite`, `--postgres` or the
+project's store) the CLI builds the same projection from the store in this process.
+A bare store knows neither the application's registered secrets nor its artifact
+stores, so text is redacted with the CLI's secret patterns, as in the other session
+commands, and `uses.artifacts` is `null`. Costs are priced with Cayu's bundled price
+book, or `--price-book PATH`. Overviews need the `server` extra installed locally
+(`pip install "cayu[server]"`).
 
 ### Structured output
 

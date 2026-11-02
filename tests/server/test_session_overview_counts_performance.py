@@ -73,7 +73,7 @@ def test_counts_skip_presentation_reads_and_preserve_old_usage(session_store_cas
             calls = Counter()
             outcome = store.summarize_outcome
             events = store.query_events
-            pending = store.query_pending_actions
+            pending = store.query_pending_actions_for_sessions
 
             async def observed_outcome(*args, **kwargs):
                 calls["outcome"] += 1
@@ -84,9 +84,11 @@ def test_counts_skip_presentation_reads_and_preserve_old_usage(session_store_cas
                     calls["release"] += 1
                 return await events(query, **kwargs)
 
-            async def observed_pending(query=None, **kwargs):
-                calls[f"pending:{query.session_id}"] += 1
-                return await pending(query, **kwargs)
+            # Overviews and counts read pending actions a page of sessions at a time.
+            async def observed_pending(session_ids, query=None, **kwargs):
+                for session_id in session_ids:
+                    calls[f"pending:{session_id}"] += 1
+                return await pending(session_ids, query, **kwargs)
 
             outcomes = store.summarize_outcomes
             latest = store.query_latest_events
@@ -102,7 +104,7 @@ def test_counts_skip_presentation_reads_and_preserve_old_usage(session_store_cas
 
             monkeypatch.setattr(store, "summarize_outcome", observed_outcome)
             monkeypatch.setattr(store, "query_events", observed_events)
-            monkeypatch.setattr(store, "query_pending_actions", observed_pending)
+            monkeypatch.setattr(store, "query_pending_actions_for_sessions", observed_pending)
             # The overview page reads outcomes and releases a page at a time.
             monkeypatch.setattr(store, "summarize_outcomes", observed_outcomes)
             monkeypatch.setattr(store, "query_latest_events", observed_latest)
@@ -172,18 +174,23 @@ def test_counts_follow_exact_nested_waits_and_refuse_incomplete_leaf(
         try:
             app = _delegating_app(store)
             await _start(app, "root", "root")
-            pending = store.query_pending_actions
+            pending = store.query_pending_actions_for_sessions
 
-            async def incomplete(query=None, **kwargs):
-                page = await pending(query, **kwargs)
-                session = await store.load(query.session_id)
-                if session is not None and session.agent_name == "leaf":
+            async def incomplete(session_ids, query=None, **kwargs):
+                page = await pending(session_ids, query, **kwargs)
+                leaves = [
+                    session
+                    for session in (await store.load_sessions(session_ids)).values()
+                    if session.agent_name == "leaf"
+                ]
+                if leaves:
                     return page.model_copy(
                         update={
                             "issues": [
                                 PendingActionIssue.source_invalid(
-                                    PendingActionSession.from_session(session)
+                                    PendingActionSession.from_session(leaf)
                                 )
+                                for leaf in leaves
                             ]
                         }
                     )
@@ -199,7 +206,7 @@ def test_counts_follow_exact_nested_waits_and_refuse_incomplete_leaf(
                 assert counts.status_code == 200, counts.text
                 assert counts.json()["total_count"] == "3"
                 assert counts.json()["counts_by_state"]["waiting_approval"] == "3"
-                monkeypatch.setattr(store, "query_pending_actions", incomplete)
+                monkeypatch.setattr(store, "query_pending_actions_for_sessions", incomplete)
                 rejected = await client.get(PATH)
                 assert rejected.status_code == 503, rejected.text
                 assert "total_count" not in rejected.json()
@@ -217,7 +224,11 @@ def test_counts_fence_replacement_across_actual_await(session_store_case, monkey
         try:
             app = _app(store)
             await _start(app, "reused", "writer")
-            method = "query_pending_actions" if phase == "selection" else "read_usage_accounting"
+            method = (
+                "query_pending_actions_for_sessions"
+                if phase == "selection"
+                else "read_usage_accounting"
+            )
             original = getattr(store, method)
             reached, release = asyncio.Event(), asyncio.Event()
 
@@ -306,9 +317,9 @@ def test_counts_require_positive_unforked_lineage(session_store_case, names, mon
                     identity=SessionIdentity(provider_name="test", model="test"),
                 )
             original = store.load
+            original_page = store.load_sessions
 
-            async def missing_ancestry(session_id):
-                session = await original(session_id)
+            def without_ancestry(session):
                 if session is not None and session.id == "unknown":
                     # Model a store read with missing ancestry evidence. The real
                     # resolver must attempt the parent and fail closed, regardless
@@ -320,7 +331,16 @@ def test_counts_require_positive_unforked_lineage(session_store_case, names, mon
                     )
                 return session
 
+            async def missing_ancestry(session_id):
+                return without_ancestry(await original(session_id))
+
+            async def missing_page_ancestry(session_ids):
+                loaded = await original_page(session_ids)
+                return {key: without_ancestry(session) for key, session in loaded.items()}
+
             monkeypatch.setattr(store, "load", missing_ancestry)
+            # Counts load a store page of sessions with one read.
+            monkeypatch.setattr(store, "load_sessions", missing_page_ancestry)
             async with _client(app) as client:
                 response = await client.get(PATH)
                 assert response.status_code == 200, response.text
@@ -395,30 +415,20 @@ async def _delegated_replacement_scenario(
             by_agent = {row["agent_name"]: row["id"] for row in listing.json()["sessions"]}
             target = by_agent["middle" if depth == 1 else "leaf"]
             old = await store.load(target)
-            native = store.query_pending_actions
             native_page = store.query_pending_actions_for_sessions
-            delegated = SessionOverviewReader._delegated_child
             delegated_page = SessionOverviewReader._delegated_children
             reached, release = asyncio.Event(), asyncio.Event()
             verified = False
 
-            def observe(child):
-                nonlocal verified
-                if child is not None and child.id == target:
-                    assert child.instance_id == old.instance_id
-                    verified = True
-
-            # Counts walk one session at a time; overview pages walk a level
-            # of the page at once. Catch the target's read after either verifies it.
-            async def observed_delegation(self, parent, action):
-                child = await delegated(self, parent, action)
-                observe(child)
-                return child
-
+            # Counts and overview pages walk one level of delegation for the
+            # whole page at once. Catch the target's read after it is verified.
             async def observed_page_delegation(self, delegations):
+                nonlocal verified
                 children = await delegated_page(self, delegations)
                 for child in children.values():
-                    observe(child)
+                    if child is not None and child.id == target:
+                        assert child.instance_id == old.instance_id
+                        verified = True
                 return children
 
             async def hold(read, wanted):
@@ -429,19 +439,14 @@ async def _delegated_replacement_scenario(
                 await release.wait()
                 return page if page is not None else await read()
 
-            async def paused(query=None, **kwargs):
-                return await hold(lambda: native(query, **kwargs), query.session_id == target)
-
             async def paused_page(session_ids, query=None, **kwargs):
                 return await hold(
                     lambda: native_page(session_ids, query, **kwargs), target in session_ids
                 )
 
-            monkeypatch.setattr(SessionOverviewReader, "_delegated_child", observed_delegation)
             monkeypatch.setattr(
                 SessionOverviewReader, "_delegated_children", observed_page_delegation
             )
-            monkeypatch.setattr(store, "query_pending_actions", paused)
             monkeypatch.setattr(store, "query_pending_actions_for_sessions", paused_page)
             path, params, headers = {
                 "counts": (PATH, {}, {}),
@@ -451,9 +456,7 @@ async def _delegated_replacement_scenario(
             request = asyncio.create_task(client.get(path, params=params, headers=headers))
             await asyncio.wait_for(reached.wait(), 5)
             # Do not hold the replacement writer inside the reader's test barrier.
-            monkeypatch.setattr(store, "query_pending_actions", native)
             monkeypatch.setattr(store, "query_pending_actions_for_sessions", native_page)
-            monkeypatch.setattr(SessionOverviewReader, "_delegated_child", delegated)
             monkeypatch.setattr(SessionOverviewReader, "_delegated_children", delegated_page)
             if change != "same":
                 leaf = by_agent["leaf"]

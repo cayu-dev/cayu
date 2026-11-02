@@ -108,20 +108,45 @@ def test_first_message_requires_the_overview_include():
         assert both.status_code == 422
 
 
-def test_first_message_reads_are_bounded_and_drop_a_session_deleted_meanwhile(monkeypatch):
+def test_first_messages_are_one_page_read_and_drop_a_session_deleted_meanwhile(monkeypatch):
     app = _app()
     store = app.session_store
 
     async def populate():
-        for index in range(OVERVIEW_READ_CONCURRENCY * 3):
+        for index in range(12):
             await _run(app, f"row-{index}", Message.text("user", f"question {index}"))
 
     with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
         portal = client.portal
         assert portal is not None
         portal.call(populate)
-        original = store.query_transcript
+        original = store.query_first_transcript_records
+        pages = []
+
+        async def deleting(session_ids, role):
+            pages.append(tuple(session_ids))
+            await store.delete_session("row-3")
+            return await original(session_ids, role)
+
+        monkeypatch.setattr(store, "query_first_transcript_records", deleting)
+        rows = _overviews(client, "first_message")
+        assert len(pages) == 1 and len(pages[0]) == 12
+        assert "row-3" not in rows
+        assert rows["row-0"]["first_message"] == "question 0"
+        assert rows["row-0"]["first_message_unavailable"] is False
+        assert len(rows) == 11
+
+
+def test_a_failed_page_read_falls_back_to_one_read_per_row(monkeypatch):
+    app = _app()
+    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+        assert client.portal is not None
+        client.portal.call(_populate, app)
+        original = app.session_store.query_transcript
         running = peak = 0
+
+        async def unavailable(session_ids, role):
+            raise OSError("page read unavailable")
 
         async def tracked(query):
             nonlocal running, peak
@@ -129,18 +154,17 @@ def test_first_message_reads_are_bounded_and_drop_a_session_deleted_meanwhile(mo
             peak = max(peak, running)
             try:
                 await asyncio.sleep(0.01)
-                if query.session_id == "row-3":
-                    await store.delete_session("row-3")
                 return await original(query)
             finally:
                 running -= 1
 
-        monkeypatch.setattr(store, "query_transcript", tracked)
+        monkeypatch.setattr(app.session_store, "query_first_transcript_records", unavailable)
+        monkeypatch.setattr(app.session_store, "query_transcript", tracked)
         rows = _overviews(client, "first_message")
         assert 1 < peak <= OVERVIEW_READ_CONCURRENCY
-        assert "row-3" not in rows
-        assert rows["row-0"]["first_message"] == "question 0"
-        assert len(rows) == OVERVIEW_READ_CONCURRENCY * 3 - 1
+        assert rows["plain"]["first_message"] == "Summarize the release notes\nthen stop"
+        assert all(row["first_message_unavailable"] is False for row in rows.values())
+        assert rows["empty"]["first_message"] is None
 
 
 @pytest.mark.parametrize(

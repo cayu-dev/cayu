@@ -51,7 +51,11 @@ class AgentSessionReader:
         # Set once an Agent refuses a priced rollup page; later pages are asked unpriced.
         self.rollup_pricing_unsupported = False
 
-    async def list_sessions(self, query: SessionQuery) -> SessionListPage:
+    async def list_sessions(
+        self, query: SessionQuery, *, overview: bool = False, pricing: PriceBook | None = None
+    ) -> SessionListPage:
+        # The Agent prices overview costs with its own price book.
+        del pricing
         params: dict[str, Any] = {
             "limit": query.limit,
             "offset": query.offset or None,
@@ -67,7 +71,9 @@ class AgentSessionReader:
             "order_by": query.order_by.value,
             "created_since": _instant(query.created_since),
             "created_before": _instant(query.created_before),
+            "include": ["overview", "first_message"] if overview else None,
         }
+        previews = overview
         windowed = query.created_since is not None or query.created_before is not None
         # An Agent whose Cayu predates the creation-time filter ignores it, so with a window
         # the CLI filters rows itself and applies the offset to the filtered rows.
@@ -79,14 +85,30 @@ class AgentSessionReader:
         while True:
             # Ask only for what the page still needs, so no row is read past the cursor.
             params["limit"] = min(query.limit - len(rows) + skip, 1000)
-            body = self.api.get("/sessions", query=_query(params), resource="sessions")
+            try:
+                body = self.api.get("/sessions", query=_query(params), resource="sessions")
+            except CayuApiError as exc:
+                if not previews or exc.category != "request_rejected":
+                    raise
+                # An Agent whose Cayu predates first-message previews rejects them;
+                # list the overviews without them.
+                previews = False
+                params["include"] = ["overview"]
+                body = self.api.get("/sessions", query=_query(params), resource="sessions")
             sessions = body.get("sessions")
             if not isinstance(sessions, list):
                 raise CayuApiError("not_cayu", "The Agent's session list is invalid.")
-            for item in sessions:
+            overviews = body.get("overviews") if overview else None
+            if overview and (not isinstance(overviews, list) or len(overviews) != len(sessions)):
+                raise CayuApiError(
+                    "not_cayu", "The Agent's session list has no overview for every session."
+                )
+            for index, item in enumerate(cast("list[Any]", sessions)):
                 if not isinstance(item, dict):
                     continue
-                row = _session_list_row(item)
+                row = _session_list_row(cast("dict[str, Any]", item))
+                if overviews is not None:
+                    row["overview"] = _overview(overviews[index], previews=previews)
                 if not _created_in_window(row, query):
                     filtered_here = True
                 elif skip:
@@ -461,6 +483,15 @@ def _session_list_row(item: dict[str, Any]) -> dict[str, Any]:
         "last_activity_at": _iso(item.get("last_activity_at")),
         "run_epoch": item.get("run_epoch"),
     }
+
+
+def _overview(item: object, *, previews: bool) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        raise CayuApiError("not_cayu", "The Agent returned a session overview the CLI can't read.")
+    overview = cast("dict[str, Any]", item)
+    if previews:
+        return overview
+    return {**overview, "first_message": None, "first_message_unavailable": True}
 
 
 def _event_record(item: dict[str, Any]) -> EventRecord:

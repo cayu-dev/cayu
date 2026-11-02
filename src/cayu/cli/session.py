@@ -125,6 +125,26 @@ def add_session_parser(subparsers: Any) -> None:
     paging = list_parser.add_mutually_exclusive_group()
     paging.add_argument("--offset", type=_nonnegative_int, default=0)
     paging.add_argument("--cursor")
+    list_parser.add_argument(
+        "--overview",
+        action="store_true",
+        help=(
+            "Add each session's overview, as the Sessions page shows it: state and why, "
+            "title, summary, first user message, steps, tokens, cost, and whether it used "
+            "a browser, subagents or artifacts."
+        ),
+    )
+    list_parser.add_argument(
+        "--price-book",
+        "--price-table",
+        dest="price_book",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "With --overview on a local store: price costs with this price book instead of "
+            "Cayu's bundled one. A Cloud Agent prices with its own."
+        ),
+    )
     add_output_options(list_parser, formats=FORMAT_CHOICES)
 
     rollup_parser = commands.add_parser(
@@ -887,6 +907,9 @@ def _open_read_only_store(target: SessionStoreTarget) -> SessionStore:
 
 async def _list_sessions(args: argparse.Namespace, reader: SessionReader) -> int:
     labels = _parse_labels(args.label)
+    local = isinstance(reader, StoreSessionReader)
+    if args.price_book is not None and not (args.overview and local):
+        raise ValueError("--price-book prices --overview costs of a local store.")
     result = await reader.list_sessions(
         SessionQuery(
             status=None if args.status is None else SessionStatus(args.status),
@@ -900,7 +923,9 @@ async def _list_sessions(args: argparse.Namespace, reader: SessionReader) -> int
             cursor=args.cursor,
             include_total_count=True,
             order_by=SessionOrder.LAST_ACTIVITY_AT_DESC,
-        )
+        ),
+        overview=args.overview,
+        pricing=_price_book(args) if args.overview and local else None,
     )
     sessions = result.rows
     payload = {
@@ -910,6 +935,14 @@ async def _list_sessions(args: argparse.Namespace, reader: SessionReader) -> int
         "has_more": result.next_cursor is not None,
         "total_count": result.total_count,
     }
+    if args.overview:
+        _render_collection(
+            args.output_format,
+            payload,
+            sessions if args.output_format == "jsonl" else [_overview_cells(s) for s in sessions],
+            headers=_OVERVIEW_HEADERS,
+        )
+        return 0
     _render_collection(
         args.output_format,
         payload,
@@ -928,6 +961,58 @@ async def _list_sessions(args: argparse.Namespace, reader: SessionReader) -> int
         ),
     )
     return 0
+
+
+_OVERVIEW_HEADERS = (
+    "id",
+    "state",
+    "agent",
+    "title",
+    "first_message",
+    "model_steps",
+    "tool_calls",
+    "tokens",
+    "cost",
+    "last_activity_at",
+)
+_OVERVIEW_TEXT_CELL_CHARS = 60
+
+
+def _overview_cells(row: dict[str, Any]) -> dict[str, Any]:
+    """One `session list --overview --table` line: short, single-line cells."""
+
+    overview = row.get("overview")
+    overview = overview if isinstance(overview, dict) else {}
+    tokens = overview.get("tokens")
+    tokens = tokens if isinstance(tokens, dict) else {}
+    cost = overview.get("cost")
+    first = overview.get("first_message")
+    if first is None and overview.get("first_message_unavailable") is True:
+        first = "[unavailable]"
+    return {
+        "id": row.get("id"),
+        "state": overview.get("state"),
+        "agent": row.get("agent"),
+        "title": _one_line(overview.get("title")),
+        "first_message": _one_line(first),
+        "model_steps": overview.get("model_steps"),
+        "tool_calls": overview.get("tool_calls"),
+        "tokens": None if not tokens else f"{tokens.get('input')} in / {tokens.get('output')} out",
+        "cost": None
+        if not isinstance(cost, dict)
+        else f"{cost.get('amount')} {cost.get('currency')}"
+        + ("" if cost.get("complete") is True else " (partial)"),
+        "last_activity_at": overview.get("last_activity_at") or row.get("last_activity_at"),
+    }
+
+
+def _one_line(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    if len(text) > _OVERVIEW_TEXT_CELL_CHARS:
+        text = text[: _OVERVIEW_TEXT_CELL_CHARS - 1] + "…"
+    return text
 
 
 # Sessions per rollup page: an Agent reads each page within one request.

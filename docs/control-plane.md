@@ -492,7 +492,9 @@ facts for detail views without making separate status and usage requests.
 running sessions before `until`. Evaluation trials and fork-lineage sessions
 are excluded unless `include_eval=true` or `include_forks=true`. Counts traverse
 all pages before the fixed upper creation boundary, stopping before enriching
-newer rows; they never use the old capped `/sessions/summary` result. Both reads
+newer rows; they never use the old capped `/sessions/summary` result. Each store
+page of 200 sessions is enriched with the overview's page reads, so counts cost a
+fixed number of store reads per page, not per session. Both reads
 are available to members and use `Cache-Control: private, no-store`.
 The response also includes `tokens` (`input`, `output`, `cached`),
 `tokens_complete`, and `cost` using the ordinary overview amount/currency/complete
@@ -526,14 +528,20 @@ redacted exactly as `GET /api/sessions/{id}/transcript?role=user&limit=1`
 redacts them and then as one joined string, trimmed, and cut to 256 characters
 with a trailing ellipsis. It is null when that message has no text (images,
 files and withheld peer content are skipped) or the session has no user
-message, and always null without the include. The server reads one transcript
-row per listed session, at most four sessions at a time, through the same store
-query and data bounds as the transcript route, and drops a row whose session is
+message, and always null without the include. The server reads every listed
+session's first user message in one store read
+(`SessionStore.query_first_transcript_records`), which returns what the
+transcript route's store query returns and falls back to that query, with its
+data bounds, while scoped access bounds apply. It drops a row whose session is
 replaced meanwhile. Without `overview` the include returns 422. Check
 `capabilities.surfaces.session_overview_first_message.read.enabled` before
 sending it; an older server rejects the unknown include value with 422.
 If a preview read fails, that row returns null with `first_message_unavailable: true`;
-other rows remain available. Empty or unrequested previews keep the flag false.
+other rows remain available: when the page read fails, the server reads each row on
+its own, at most four at a time, so only the failing rows lose their preview.
+Empty or unrequested previews keep the flag false. `cayu session list --overview`
+shows the same overviews and previews from the CLI (see
+[Session inspection](session-inspection.md#session-overviews)).
 
 Generate typed clients from the current OpenAPI schema;
 existing session listing and Cloud v1 fields remain available. Display metadata

@@ -19,6 +19,7 @@ from cayu.sessions.invocation import SessionExecutionSource
 
 if TYPE_CHECKING:
     from cayu.events import EventType
+    from cayu.messages import MessageRole
     from cayu.sessions.authority import CheckpointRootFieldGuard
     from cayu.sessions.pending_action_contracts import (
         PendingActionListResult,
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from cayu.sessions.records import EventRecord, Session
     from cayu.sessions.store import SessionStore
     from cayu.sessions.summaries import SessionOutcome
+    from cayu.sessions.transcript_queries import TranscriptRecord
 
 # One overview page holds at most this many sessions (the session list limit).
 MAX_PAGE_READ_SESSIONS = 1000
@@ -173,6 +175,27 @@ async def query_latest_events_one_by_one(
         if records:
             latest[session_id] = records[0]
     return latest
+
+
+async def query_first_transcript_records_one_by_one(
+    store: SessionStore, session_ids: Sequence[str], role: MessageRole
+) -> dict[str, TranscriptRecord]:
+    from cayu.sessions.transcript_queries import TranscriptQuery
+
+    first: dict[str, TranscriptRecord] = {}
+    for session_id in page_session_ids(session_ids):
+        try:
+            page = await store.query_transcript(
+                TranscriptQuery(session_id=session_id, role=role, limit=1)
+            )
+        except KeyError:
+            # As for outcomes: only a missing session is an absence.
+            if await store.load(session_id) is not None:
+                raise
+            continue
+        if page.records:
+            first[session_id] = page.records[0]
+    return first
 
 
 async def count_child_runs_one_by_one(

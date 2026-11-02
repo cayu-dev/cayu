@@ -5208,6 +5208,19 @@ class SessionStore(ABC):
             raise ValueError("event_types must not be empty.")
         return await page_reads.query_latest_events_one_by_one(self, session_ids, event_types)
 
+    async def query_first_transcript_records(
+        self, session_ids: Sequence[str], role: MessageRole
+    ) -> dict[str, TranscriptRecord]:
+        """Each session's first retained transcript record of ``role``.
+
+        The record ``query_transcript`` returns for ``role`` with ``limit=1``.
+        Sessions with no such record, and sessions not found, are absent.
+        """
+
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        return await page_reads.query_first_transcript_records_one_by_one(self, session_ids, role)
+
     async def count_child_runs(self, parents: Sequence[Session]) -> dict[str, int]:
         """Count each parent's direct, non-fork child runs.
 

@@ -12,10 +12,12 @@ from collections.abc import Sequence
 from typing import Any
 
 from cayu.events import EventType
+from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
-from cayu.sessions.records import EventRecord, Session
+from cayu.sessions.records import EventRecord, Session, TranscriptRecord
 from cayu.sessions.summaries import SessionOutcome, session_outcome
 from cayu.storage import _sqlite_records as sqlite_records
+from cayu.storage import _sqlite_transcript_content as transcript_content
 
 _SESSION_COLUMNS = """
     id, instance_id, agent_name, provider_name, model, parent_session_id,
@@ -143,6 +145,51 @@ def query_latest_events(
         assert record is not None
         found[record.event.session_id] = record
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
+def query_first_transcript_records(
+    connection: sqlite3.Connection, session_ids: Sequence[str], role: MessageRole
+) -> dict[str, TranscriptRecord]:
+    if not session_ids:
+        return {}
+
+    def read(connection: sqlite3.Connection) -> dict[str, TranscriptRecord]:
+        rows = connection.execute(
+            """
+            SELECT
+                transcript.session_id,
+                transcript.session_order - 1 AS transcript_index,
+                transcript.interaction_id,
+                transcript.message_json
+            FROM json_each(?) AS page
+            JOIN cayu_transcript_messages AS transcript ON transcript.sequence = (
+                SELECT earliest.sequence
+                FROM cayu_transcript_messages AS earliest
+                WHERE earliest.session_id = CAST(page.value AS TEXT)
+                  AND earliest.role = ?
+                ORDER BY earliest.session_order ASC
+                LIMIT 1
+            )
+            JOIN cayu_sessions ON cayu_sessions.id = transcript.session_id
+            """,
+            (_ids(session_ids), str(role)),
+        ).fetchall()
+        # Tool results a message references live in its session's tool events.
+        messages = transcript_content.messages_by_session(
+            connection, [(row["session_id"], row["message_json"]) for row in rows]
+        )
+        found = {
+            row["session_id"]: TranscriptRecord(
+                index=row["transcript_index"],
+                interaction_id=row["interaction_id"],
+                message=message,
+            )
+            for row, message in zip(rows, messages, strict=True)
+        }
+        return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+    # The rows and the tool events their results live in come from one snapshot.
+    return transcript_content.read_snapshot(connection, read)
 
 
 def load_session_operation_rows(

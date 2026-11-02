@@ -39,7 +39,7 @@ from cayu.sessions._run_identity import (
 )
 from cayu.sessions._supervision_projection import RELEASE_MARKER_EVENT_TYPES
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.fork_overlays import resolve_fork_lineage_async, resolve_fork_lineages_async
+from cayu.sessions.fork_overlays import resolve_fork_lineages_async
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.pending_action_contracts import (
     MAX_PENDING_ACTION_RESULT_BYTES,
@@ -50,6 +50,7 @@ from cayu.sessions.pending_action_contracts import (
 from cayu.sessions.queries import (
     SessionAggregateFilter,
     SessionOrder,
+    SessionQuery,
     _session_matches,
     session_query_from_aggregate_filter,
 )
@@ -238,7 +239,7 @@ class SessionOverviewReader:
         """The session and the sessions above it whose summaries a change in it can alter.
 
         A session waiting on a subagent reports what the subagent waits on, as
-        deep as ``_waiting_kinds`` follows it, so a change in the subagent can
+        deep as ``_waiting_page`` follows it, so a change in the subagent can
         change every summary above it. A fork's source never waits on the fork.
         """
 
@@ -319,39 +320,27 @@ class SessionOverviewReader:
             sessions = [session for session in sessions if session.id in outcomes]
             if not sessions:
                 return ()
-        pending = await self._pending_page(
-            [session for session in sessions if session.status in _PENDING_ACTION_STATUSES]
-        )
-        evidence = [pending.get(session.id, _PendingEvidence()) for session in sessions]
-        waits = await self._waiting_page(list(zip(sessions, evidence, strict=True)), 0)
+        states = await self._states(sessions)
         lineages = await resolve_fork_lineages_async(sessions, self._parents)
         markers = await self._store.query_latest_events(
             tuple(session.id for session in sessions), RELEASE_MARKER_EVENT_TYPES
         )
         runs = []
-        for session, actions, (waiting, children), lineage in zip(
-            sessions, evidence, waits, lineages, strict=True
-        ):
+        for session, (state, children), lineage in zip(sessions, states, lineages, strict=True):
             marker = markers.get(session.id)
             release = None if marker is None else recorded_release_identity(marker.event.payload)
             runs.append(
                 SessionOverviewFacts(
                     session=session,
-                    status=_run_status(
-                        session.status,
-                        waiting.kinds,
-                        delegated=any(
-                            action.delegated_action is not None for action in actions.actions
-                        ),
-                    ),
+                    status=state.status,
                     outcome=outcomes[session.id],
                     usage=usage_by_session.get(session.id),
                     cost=cost_by_session.get(session.id),
                     forked=lineage.forked,
                     fork_controller=lineage.owner() if lineage.settled else None,
                     release_id=None if release is None else release.id,
-                    waiting=tuple(zip(actions.actions, children, strict=True)),
-                    pending_complete=waiting.complete,
+                    waiting=tuple(zip(state.pending.actions, children, strict=True)),
+                    pending_complete=state.complete,
                 )
             )
         # Accounting and outcome reads are separate store snapshots. A
@@ -376,8 +365,13 @@ class SessionOverviewReader:
         await self._load_many(session_ids)
         return {session_id: self._loaded.get(session_id) for session_id in session_ids}
 
-    async def _current(self, sessions: Sequence[Session]) -> set[str]:
-        """The sessions whose selected incarnation is still current, from one uncached read."""
+    async def _current(
+        self, sessions: Sequence[Session], query: SessionQuery | None = None
+    ) -> set[str]:
+        """The sessions whose selected incarnation is still current, from one uncached read.
+
+        With ``query``, a current row must also still match it.
+        """
 
         if not sessions:
             return set()
@@ -387,7 +381,38 @@ class SessionOverviewReader:
             for session in sessions
             if (row := current.get(session.id)) is not None
             and row.instance_id == session.instance_id
+            and (query is None or _session_matches(row, query))
         }
+
+    async def _states(
+        self, sessions: Sequence[Session]
+    ) -> list[tuple[_StateEvidence, tuple[Session | None, ...]]]:
+        """Each session's state evidence and the verified child of each pending action."""
+
+        if not sessions:
+            return []
+        pending = await self._pending_page(
+            [session for session in sessions if session.status in _PENDING_ACTION_STATUSES]
+        )
+        evidence = [pending.get(session.id, _PendingEvidence()) for session in sessions]
+        waits = await self._waiting_page(list(zip(sessions, evidence, strict=True)), 0)
+        return [
+            (
+                _StateEvidence(
+                    _run_status(
+                        session.status,
+                        waiting.kinds,
+                        delegated=any(
+                            action.delegated_action is not None for action in actions.actions
+                        ),
+                    ),
+                    actions,
+                    waiting.complete,
+                ),
+                children,
+            )
+            for session, actions, (waiting, children) in zip(sessions, evidence, waits, strict=True)
+        ]
 
     async def _pending_page(self, sessions: Sequence[Session]) -> dict[str, _PendingEvidence]:
         """``_pending`` for several sessions, reading their pages together."""
@@ -434,7 +459,13 @@ class SessionOverviewReader:
     async def _waiting_page(
         self, items: Sequence[tuple[Session, _PendingEvidence]], depth: int
     ) -> list[tuple[_WaitingEvidence, tuple[Session | None, ...]]]:
-        """``_waiting_kinds`` for several sessions, one level of delegation at a time.
+        """The kinds a person settles, following delegated actions to their children.
+
+        A delegated action names the kind its child waited on when the parent
+        recorded the wait, which can lag the child: a child whose answer finds an
+        unfinished call needs manual recovery while its parent still names the
+        question. So each child's own pending actions are read now, one level of
+        delegation at a time for all the sessions together.
 
         Each item also gets the verified child of each of its pending actions,
         ``None`` for an action that delegates to no current child.
@@ -490,7 +521,11 @@ class SessionOverviewReader:
     async def _delegated_children(
         self, delegated: Sequence[tuple[Session, PendingActionRecord]]
     ) -> dict[tuple[str, int], Session | None]:
-        """``_delegated_child`` for several actions, keyed by parent ID and action identity."""
+        """The verified child each delegated action waits on, keyed by parent ID and action.
+
+        A child counts only when its parent's retained wait names its exact
+        incarnation; otherwise the action maps to ``None``.
+        """
 
         if not delegated:
             return {}
@@ -571,9 +606,12 @@ class SessionOverviewReader:
             reached_until = len(eligible) != len(page.sessions)
             expected = {session.id: session.instance_id for session in eligible}
             self._loaded.clear()
-            accounting_sessions: dict[str, str | None] = {}
+            # Each read below covers the whole store page, so counting costs a
+            # fixed number of reads per 200 sessions.
+            await self._load_many(expected)
+            selected: list[Session] = []
             for session_id, instance_id in expected.items():
-                session = await self._load(session_id)
+                session = self._loaded.get(session_id)
                 if (
                     session is None
                     or session.instance_id != instance_id
@@ -588,21 +626,23 @@ class SessionOverviewReader:
                     continue
                 if not include_eval and is_eval_trial(session):
                     continue
-                if not include_forks:
-                    lineage = await resolve_fork_lineage_async(session, self._load)
-                    if lineage.forked:
-                        continue
-                state = await self._state(session)
-                # Pending and lineage joins may outlive this incarnation. Match
-                # the full overview selection fence before including its facts.
-                current = await self._store.load(session.id)
-                if (
-                    current is None
-                    or current.instance_id != session.instance_id
-                    or not _session_matches(current, filter_query)
-                ):
+                selected.append(session)
+            if not include_forks and selected:
+                lineages = await resolve_fork_lineages_async(selected, self._parents)
+                selected = [
+                    session
+                    for session, lineage in zip(selected, lineages, strict=True)
+                    if not lineage.forked
+                ]
+            states = await self._states(selected)
+            # Pending and lineage joins may outlive this incarnation. Match
+            # the full overview selection fence before including its facts.
+            current = await self._current(selected, filter_query)
+            counted: list[Session] = []
+            for session, (state, _) in zip(selected, states, strict=True):
+                if session.id not in current:
                     continue
-                accounting_sessions[session.id] = session.instance_id
+                counted.append(session)
                 if not state.complete:
                     raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
                 if state.status is SessionOverviewStatus.RUNNING:
@@ -613,9 +653,9 @@ class SessionOverviewReader:
                         index = bucket_index(starts, session.created_at)
                         start_counts[index] += 1
                         failed_counts[index] += int(state.status is SessionOverviewStatus.FAILED)
-            if accounting_sessions:
+            if counted:
                 accounting_query = EventQuery(
-                    session_ids=tuple(accounting_sessions), since=since, until=until
+                    session_ids=tuple(session.id for session in counted), since=since, until=until
                 )
                 try:
                     usage = await self._store.read_usage_accounting(accounting_query)
@@ -640,14 +680,8 @@ class SessionOverviewReader:
                     ) from None
                 # The selection and accounting are separate snapshots. A replacement
                 # must not donate consumption to the selected incarnation.
-                for session_id, instance_id in accounting_sessions.items():
-                    current = await self._store.load(session_id)
-                    if (
-                        current is None
-                        or current.instance_id != instance_id
-                        or not _session_matches(current, filter_query)
-                    ):
-                        raise SessionOverviewUnavailable("Session changed during accounting.")
+                if len(await self._current(counted, filter_query)) != len(counted):
+                    raise SessionOverviewUnavailable("Session changed during accounting.")
                 input_tokens += summary.usage.input_tokens
                 output_tokens += summary.usage.output_tokens
                 cached_tokens += summary.usage.cache.read_tokens
@@ -710,67 +744,8 @@ class SessionOverviewReader:
             cursors.add(page.next_cursor)
             cursor = page.next_cursor
 
-    async def _waiting_kinds(
-        self, session: Session, pending: _PendingEvidence, depth: int
-    ) -> _WaitingEvidence:
-        """The kinds a person settles, following delegated actions to their children.
-
-        A delegated action names the kind its child waited on when the parent
-        recorded the wait, which can lag the child: a child whose answer finds an
-        unfinished call needs manual recovery while its parent still names the
-        question. So each child's own pending actions are read now.
-        """
-
-        kinds: set[PendingActionKind] = set()
-        complete = pending.complete
-        for action in pending.actions:
-            reference = action.delegated_action
-            if reference is None:
-                kinds.add(action.kind)
-            elif (
-                depth < MAX_FOREGROUND_CHAIN_DEPTH
-                and (child := await self._delegated_child(session, action)) is not None
-            ):
-                child_waiting = await self._waiting_kinds(
-                    child, await self._pending(child), depth + 1
-                )
-                # The retained wait was verified before the recursive awaits.
-                # Even an empty or correctly bound page can outlive its child;
-                # use an uncached fence before contributing any descendant state.
-                current = await self._store.load(child.id)
-                if current is None or current.instance_id != child.instance_id:
-                    complete = False
-                    continue
-                kinds |= child_waiting.kinds
-                complete = complete and child_waiting.complete
-        return _WaitingEvidence(frozenset(kinds), complete)
-
-    async def _delegated_child(
-        self, parent: Session, action: PendingActionRecord
-    ) -> Session | None:
-        reference = action.delegated_action
-        child = None if reference is None else await self._load(reference.child_session_id)
-        if child is None:
-            return None
-        return child if await self._retained_wait_matches(parent, child) else None
-
     async def _retained_wait_matches(self, parent: Session, child: Session) -> bool:
         return _wait_matches(await self._store.load_checkpoint(parent.id), parent, child)
-
-    async def _state(self, session: Session) -> _StateEvidence:
-        """Shared state evidence without outcome or display-only joins."""
-        waiting = (
-            await self._pending(session)
-            if session.status in _PENDING_ACTION_STATUSES
-            else _PendingEvidence()
-        )
-        waiting_kinds = await self._waiting_kinds(session, waiting, 0)
-        status = _run_status(
-            session.status,
-            waiting_kinds.kinds,
-            delegated=any(action.delegated_action is not None for action in waiting.actions),
-        )
-        return _StateEvidence(status, waiting, waiting_kinds.complete)
 
 
 class _PendingCollector:

@@ -7,6 +7,7 @@ loops over the single-session methods, and with those methods themselves.
 from __future__ import annotations
 
 import asyncio
+from typing import Any, cast
 
 import pytest
 from tests.core.session_store_conformance.support import (
@@ -15,11 +16,12 @@ from tests.core.session_store_conformance.support import (
     conformance_postgres_dsn,
     session_store_case,
 )
-from tests.core.test_cloud_reporting import _app, _drain, _start
+from tests.core.test_cloud_reporting import _app, _drain, _pending, _start
 
+from cayu.approvals import UserInputResponse
 from cayu.artifacts import ArtifactScope, LocalArtifactStore
 from cayu.artifacts.base import ArtifactListResult, ArtifactStore, ArtifactStoreUnavailableError
-from cayu.messages import Message
+from cayu.messages import Message, MessageRole
 from cayu.sessions import ForkSessionRequest
 from cayu.sessions._browser_usage import BROWSER_USAGE_KEY
 from cayu.sessions._operation_records import SessionOperationPublication
@@ -27,13 +29,17 @@ from cayu.sessions._page_reads import MAX_PAGE_READ_SESSIONS
 from cayu.sessions._supervision_projection import RELEASE_MARKER_EVENT_TYPES
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import PendingActionQuery
+from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.store import SessionStore
+from cayu.sessions.transcript_queries import TranscriptQuery
 
 __all__ = ["conformance_postgres_dsn", "session_store_case"]
 
 SESSIONS = ("written", "asked", "approval", "child", "fork")
 PAGE = (*SESSIONS, "missing", "written")
+# Longer than the size from which a tool result is stored only in its tool event.
+LONG = "answer " * 200
 
 
 async def _populate(app) -> None:
@@ -118,6 +124,70 @@ def test_page_reads_match_single_session_reads(session_store_case):
             # The fork's source is its parent too, but a fork is not a child run.
             assert children == {"written": 1, "asked": 0, "approval": 0, "child": 0, "fork": 0}
             assert children == await SessionStore.count_child_runs(store, parents)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.store_semantics
+def test_first_transcript_records_match_single_transcript_reads(session_store_case):
+    async def scenario():
+        store = await _open_store(session_store_case)
+        try:
+            app = _app(store)
+            await _populate(app)
+            await store.create(
+                RunRequest(agent_name="writer", session_id="silent", messages=[]),
+                identity=SessionIdentity(provider_name="test", model="test"),
+            )
+            await _drain(
+                app.run(
+                    RunRequest(
+                        agent_name="writer",
+                        session_id="twice",
+                        messages=[Message.text("user", "first"), Message.text("user", "second")],
+                    )
+                )
+            )
+            # A long tool result is stored once, in its tool event, so the tool
+            # message is read back through its reference.
+            question = await _pending(app, "asked")
+            assert question.input_id is not None
+            await _drain(
+                app.resolve_user_input(
+                    UserInputResponse(session_id="asked", input_id=question.input_id, answer=LONG)
+                )
+            )
+            page = (*PAGE, "silent", "twice")
+            for role in (MessageRole.USER, MessageRole.ASSISTANT, MessageRole.TOOL):
+                expected = {}
+                for sid in dict.fromkeys(page):
+                    if await store.load(sid) is None:
+                        continue
+                    single = await store.query_transcript(
+                        TranscriptQuery(session_id=sid, role=role, limit=1)
+                    )
+                    if single.records:
+                        expected[sid] = single.records[0]
+                first = await store.query_first_transcript_records(page, role)
+                assert first == expected, role
+                assert list(first) == [sid for sid in dict.fromkeys(page) if sid in expected]
+                assert first == await SessionStore.query_first_transcript_records(store, page, role)
+            users = await store.query_first_transcript_records(page, MessageRole.USER)
+            assert set(users) == {*SESSIONS, "twice"}
+            assert users["twice"].message.content == Message.text("user", "first").content
+            assert users["fork"].message == users["written"].message
+            tools = await store.query_first_transcript_records(page, MessageRole.TOOL)
+            assert list(tools) == ["asked"]
+            assert LONG in tools["asked"].message.model_dump_json()
+            assert await store.query_first_transcript_records((), MessageRole.USER) == {}
+            with pytest.raises(TypeError, match="MessageRole"):
+                await store.query_first_transcript_records(page, cast("Any", "user"))
+            with pytest.raises(ValueError, match="at most"):
+                await store.query_first_transcript_records(
+                    [f"s{index}" for index in range(MAX_PAGE_READ_SESSIONS + 1)], MessageRole.USER
+                )
         finally:
             await _close_store(store)
 

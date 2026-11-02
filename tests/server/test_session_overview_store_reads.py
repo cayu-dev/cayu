@@ -82,7 +82,7 @@ async def _family(app, artifacts, index: int, page: str) -> None:
 
 @pytest.mark.store_semantics
 def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_case, tmp_path):
-    async def page_reads(families: int) -> tuple[Counter, dict]:
+    async def page_reads(families: int) -> tuple[Counter, Counter, dict, dict]:
         kind, _, dsn = session_store_case
         (tmp_path / f"store-{families}").mkdir()
         store = await _open_store((kind, tmp_path / f"store-{families}", dsn))
@@ -101,26 +101,61 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
                 ),
                 base_url="http://test",
             ) as client:
-                params = {"include": "overview", "include_forks": "true", "limit": "100"}
+                params = {
+                    "include": ["overview", "first_message"],
+                    "include_forks": "true",
+                    "limit": "100",
+                }
                 before = await client.get("/api/sessions", params=params)
                 assert before.status_code == 200, before.text
+                counts_before = await client.get("/api/sessions/overview/counts")
+                assert counts_before.status_code == 200, counts_before.text
                 _count_calls(store, calls, "sessions")
                 _count_calls(artifacts, calls, "artifacts")
                 response = await client.get("/api/sessions", params=params)
+                page_calls = calls.copy()
+                calls.clear()
+                counts = await client.get("/api/sessions/overview/counts")
             assert response.status_code == 200, response.text
             body = response.json()
-            # Counting the calls changes nothing the page reports.
+            # Counting the calls changes nothing the page or the counts report.
             assert body == before.json()
+            assert counts.status_code == 200, counts.text
+            window = {"since", "until"}
+            totals = {key: value for key, value in counts.json().items() if key not in window}
+            assert totals == {
+                key: value for key, value in counts_before.json().items() if key not in window
+            }
             assert len(body["overviews"]) == 5 * families
             prefix = f"p{families}-"
-            return calls, {row["session_id"].removeprefix(prefix): row for row in body["overviews"]}
+            rows = {row["session_id"].removeprefix(prefix): row for row in body["overviews"]}
+            return page_calls, calls, rows, totals
         finally:
             await _close_store(store)
 
     async def scenario():
-        small, small_rows = await page_reads(2)
-        large, large_rows = await page_reads(6)
+        small, small_counts, small_rows, small_totals = await page_reads(2)
+        large, large_counts, large_rows, large_totals = await page_reads(6)
         assert small == large, (small, large)
+        # Counts read a store page of sessions at a time, the same reads however
+        # many sessions the page holds.
+        assert small_counts == large_counts, (small_counts, large_counts)
+        for name in (
+            "sessions.load_sessions",
+            "sessions.query_pending_actions_for_sessions",
+            "sessions.read_usage_accounting",
+        ):
+            assert large_counts[name] >= 1, (name, large_counts)
+        for name in (
+            "sessions.load",
+            "sessions.query_pending_actions",
+            "sessions.load_checkpoint",
+        ):
+            assert large_counts[name] == 0, (name, large_counts)
+        # Roots, children, questions and approvals; forks are left out by default.
+        assert small_totals["total_count"] == "8" and large_totals["total_count"] == "24"
+        assert large_totals["counts_by_state"]["waiting_input"] == "6"
+        assert large_totals["counts_by_state"]["waiting_approval"] == "6"
         # Each read the overview needs is made once for the whole page.
         for name in (
             "sessions.load_sessions",
@@ -130,6 +165,7 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
             "sessions.load_checkpoints",
             "sessions.load_session_operations",
             "sessions.count_child_runs",
+            "sessions.query_first_transcript_records",
             "artifacts.count_session_artifacts",
         ):
             assert large[name] >= 1, (name, large)
@@ -139,6 +175,7 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
             "sessions.query_pending_actions",
             "sessions.load_checkpoint",
             "sessions.load_session_operation",
+            "sessions.query_transcript",
             "artifacts.list",
         ):
             assert large[name] == 0, (name, large)
@@ -148,5 +185,7 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
             assert rows["ask-0"]["state"] == "waiting_input"
             assert rows["approve-0"]["state"] == "waiting_approval"
             assert rows["child-0"]["state"] == "completed"
+            assert rows["root-0"]["first_message"] == "go"
+            assert rows["fork-0"]["first_message"] == "go"
 
     asyncio.run(scenario())

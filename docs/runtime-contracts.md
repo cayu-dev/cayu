@@ -20880,8 +20880,11 @@ An overview page reads its sessions a page at a time, so a page costs a fixed
 number of store reads however many sessions it holds. `SessionStore` page reads
 take up to 1000 session IDs: `load_sessions`, `load_checkpoints`,
 `summarize_outcomes`, `load_session_operations`, `query_latest_events`,
-`count_child_runs` and `query_pending_actions_for_sessions` (one cursor page of
-`query_pending_actions` restricted to those sessions). Each answers exactly what
+`count_child_runs`, `query_pending_actions_for_sessions` (one cursor page of
+`query_pending_actions` restricted to those sessions) and
+`query_first_transcript_records(session_ids, role)` (the record
+`query_transcript` returns for that role with `limit=1`, tool results that live
+in their tool event included). Each answers exactly what
 the matching single-session read answers; IDs with nothing to report are absent.
 `ArtifactStore.count_session_artifacts` returns the `list(scope=SESSION, ...)`
 total for each requested session, zero included. The base classes implement every
@@ -20897,7 +20900,12 @@ the incarnation rechecks are one batched read each. If pending actions span
 multiple cursor pages, a final activity-time check detects sessions that could
 have moved before the cursor and reconciles those rows with single-session
 reads. Concurrent incarnation loss retries the outcome batch for surviving rows;
-unrelated store errors still propagate. Overview results, ordering,
+unrelated store errors still propagate. First-message previews are one
+`query_first_transcript_records` read for the page; if that read fails, each row
+is read on its own so only the failing rows report `first_message_unavailable`.
+Overview counts follow the same reads for each store page of 200 sessions they
+traverse, so counting costs a fixed number of reads per page rather than per
+session. Overview results, ordering,
 `SessionOverviewUnavailable` failures and identity-loss handling are unchanged;
 no store schema or HTTP contract changes.
 

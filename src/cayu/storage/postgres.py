@@ -1577,6 +1577,21 @@ class PostgresSessionStore(
         async with self._connection() as conn, conn.cursor() as cur:
             return await page_read_ops.query_latest_events(cur, page, types)
 
+    async def query_first_transcript_records(
+        self, session_ids: Sequence[str], role: MessageRole
+    ) -> dict[str, TranscriptRecord]:
+        page = page_reads.page_session_ids(session_ids)
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        if await page_reads.page_reads_are_bounded():
+            return await super().query_first_transcript_records(page, role)
+        if not page:
+            return {}
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            return await page_read_ops.query_first_transcript_records(cur, page, role)
+
     async def load_session_operations(
         self,
         session_ids: Sequence[str],

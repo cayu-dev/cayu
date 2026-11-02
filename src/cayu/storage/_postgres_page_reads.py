@@ -10,11 +10,13 @@ from collections.abc import Sequence
 from typing import Any, LiteralString, cast
 
 from cayu.events import Event, EventType
+from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
 from cayu.sessions.event_delivery import restore_persisted_event_authority
-from cayu.sessions.records import EventRecord, Session
+from cayu.sessions.records import EventRecord, Session, TranscriptRecord
 from cayu.sessions.summaries import SessionOutcome, session_outcome
 from cayu.storage import _postgres_support as pg_support
+from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._postgres_session_queries import load_session_labels_batch
 
 _LIFECYCLE_EVENT_TYPES = [str(EventType.SESSION_STARTED), str(EventType.SESSION_RESUMED)]
@@ -159,6 +161,48 @@ async def query_latest_events(
             ),
         )
         found[record.event.session_id] = record
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
+async def query_first_transcript_records(
+    cur: Any, session_ids: Sequence[str], role: MessageRole
+) -> dict[str, TranscriptRecord]:
+    """Each session's first transcript record of ``role``.
+
+    Run it in a repeatable-read transaction, so the rows and the tool events
+    their results live in come from the same snapshot.
+    """
+
+    if not session_ids:
+        return {}
+    await cur.execute(
+        """
+        SELECT page.session_id, earliest.transcript_index, earliest.interaction_id,
+               earliest.message
+        FROM unnest(%s::text[]) AS page(session_id)
+        CROSS JOIN LATERAL (
+            SELECT cayu_transcript_messages.session_order - 1 AS transcript_index,
+                   cayu_transcript_messages.interaction_id,
+                   cayu_transcript_messages.message
+            FROM cayu_transcript_messages
+            JOIN cayu_sessions ON cayu_sessions.id = cayu_transcript_messages.session_id
+            WHERE cayu_transcript_messages.session_id = page.session_id
+              AND cayu_transcript_messages.message ->> 'role' = %s
+            ORDER BY cayu_transcript_messages.session_order ASC
+            LIMIT 1
+        ) AS earliest
+        """,
+        (list(session_ids), str(role)),
+    )
+    found: dict[str, TranscriptRecord] = {}
+    for session_id, index, interaction_id, raw in await cur.fetchall():
+        # Tool results a message references live in its session's tool events;
+        # the decoder reads them only for a message that references one.
+        found[session_id] = TranscriptRecord(
+            index=index,
+            interaction_id=interaction_id,
+            message=await transcript_content.message(cur, session_id, raw),
+        )
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 
