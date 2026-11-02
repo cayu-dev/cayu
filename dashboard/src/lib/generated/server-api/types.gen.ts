@@ -2066,6 +2066,112 @@ export type ApiSessionTopologyNode = {
 };
 
 /**
+ * ApiSharedAllocation
+ *
+ * One shared allocation a workflow run recorded, without its reconnect or binding state.
+ */
+export type ApiSharedAllocation = {
+    /**
+     * Agent Name
+     *
+     * The step agent whose session created it.
+     */
+    agent_name: string;
+    /**
+     * Allocation Id
+     *
+     * The allocation's identity, `<run id>.shared-<hex>`.
+     */
+    allocation_id: string;
+    /**
+     * Attempt Id
+     *
+     * The workflow attempt that holds its record.
+     */
+    attempt_id: string;
+    /**
+     * Claim Generation
+     */
+    claim_generation: number;
+    /**
+     * Created At
+     *
+     * When its identity was first recorded; null for older records.
+     */
+    created_at: string | null;
+    /**
+     * Environment Name
+     */
+    environment_name: string;
+    /**
+     * Metadata
+     *
+     * The factory result's non-secret metadata, redacted.
+     */
+    metadata: {
+        [key: string]: unknown;
+    };
+    /**
+     * Reconnectable
+     *
+     * Whether another process can reconnect to it without copying in again.
+     */
+    reconnectable: boolean;
+    /**
+     * Run State
+     */
+    run_state: 'running' | 'stopped' | 'ended';
+    /**
+     * Run State Reason
+     */
+    run_state_reason?: string | null;
+    /**
+     * Scope
+     *
+     * `parent` or `causal_budget`.
+     */
+    scope: string;
+    /**
+     * Scope Id
+     */
+    scope_id: string;
+    /**
+     * State
+     */
+    state: 'creating' | 'live' | 'orphan' | 'reaping';
+    /**
+     * Workflow Name
+     */
+    workflow_name: string | null;
+    /**
+     * Workflow Run Id
+     */
+    workflow_run_id: string;
+};
+
+/**
+ * ApiSharedAllocationRelease
+ */
+export type ApiSharedAllocationRelease = {
+    /**
+     * The allocation as it was before release.
+     */
+    allocation: ApiSharedAllocation;
+    /**
+     * Forced
+     */
+    forced: boolean;
+    /**
+     * Message
+     */
+    message: string;
+    /**
+     * Mode
+     */
+    mode: 'copy_back' | 'discard';
+};
+
+/**
  * ApiStructuredOutputPart
  */
 export type ApiStructuredOutputPart = {
@@ -4876,6 +4982,7 @@ export type ControlPlaneSurfaceCapabilities = {
     session_overview_queries?: OptionalSurfaceCapability | null;
     session_overview_series?: OptionalSurfaceCapability | null;
     session_trace?: OptionalSurfaceCapability | null;
+    shared_allocations?: OptionalSurfaceCapability | null;
     structured_output_transcript?: OptionalSurfaceCapability | null;
     supervision?: OptionalSurfaceCapability | null;
     task_creation?: OptionalSurfaceCapability | null;
@@ -18426,6 +18533,34 @@ export type RegistrationProvenance = {
 };
 
 /**
+ * ReleaseSharedAllocationBody
+ */
+export type ReleaseSharedAllocationBody = {
+    /**
+     * Allocation Id
+     */
+    allocation_id: string;
+    /**
+     * Force
+     *
+     * Release even though the run looks like it is running elsewhere. Never overrides a run this server process is running.
+     */
+    force?: boolean;
+    /**
+     * Inactive For Seconds
+     *
+     * How long the run must have journaled nothing to count as stopped (default 900).
+     */
+    inactive_for_seconds?: number | null;
+    /**
+     * Mode
+     *
+     * `copy_back` reconnects, copies the work back to the source workspace and disposes of the allocation; `discard` disposes of it without copying anything back.
+     */
+    mode: 'copy_back' | 'discard';
+};
+
+/**
  * ReportedCostObservation
  */
 export type ReportedCostObservation = {
@@ -21254,6 +21389,22 @@ export type SessionsSummaryResponse = {
      */
     total_count: number | null;
     usage: AggregateUsageSummary;
+};
+
+/**
+ * SharedAllocationsResponse
+ */
+export type SharedAllocationsResponse = {
+    /**
+     * Allocations
+     */
+    allocations: Array<ApiSharedAllocation>;
+    /**
+     * Next Cursor
+     *
+     * Cursor for the next page of workflow runs. A page reads a bounded number of runs, so it can be short or empty and still have one.
+     */
+    next_cursor?: string | null;
 };
 
 /**
@@ -30767,6 +30918,85 @@ export type GetSessionUsageApiSessionsSessionIdUsageGetResponses = {
 };
 
 export type GetSessionUsageApiSessionsSessionIdUsageGetResponse = GetSessionUsageApiSessionsSessionIdUsageGetResponses[keyof GetSessionUsageApiSessionsSessionIdUsageGetResponses];
+
+export type ListSharedAllocationsApiSharedAllocationsGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Workflow Run Id
+         */
+        workflow_run_id?: string | null;
+        /**
+         * Environment Name
+         */
+        environment_name?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Inactive For Seconds
+         */
+        inactive_for_seconds?: number | null;
+    };
+    url: '/api/shared-allocations';
+};
+
+export type ListSharedAllocationsApiSharedAllocationsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListSharedAllocationsApiSharedAllocationsGetError = ListSharedAllocationsApiSharedAllocationsGetErrors[keyof ListSharedAllocationsApiSharedAllocationsGetErrors];
+
+export type ListSharedAllocationsApiSharedAllocationsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SharedAllocationsResponse;
+};
+
+export type ListSharedAllocationsApiSharedAllocationsGetResponse = ListSharedAllocationsApiSharedAllocationsGetResponses[keyof ListSharedAllocationsApiSharedAllocationsGetResponses];
+
+export type ReleaseSharedAllocationApiSharedAllocationsReleasePostData = {
+    body: ReleaseSharedAllocationBody;
+    path?: never;
+    query?: never;
+    url: '/api/shared-allocations/release';
+};
+
+export type ReleaseSharedAllocationApiSharedAllocationsReleasePostErrors = {
+    /**
+     * No such allocation is recorded (or it was already released).
+     */
+    404: unknown;
+    /**
+     * Refused: the run may still be running, or the mode can't apply.
+     */
+    409: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ReleaseSharedAllocationApiSharedAllocationsReleasePostError = ReleaseSharedAllocationApiSharedAllocationsReleasePostErrors[keyof ReleaseSharedAllocationApiSharedAllocationsReleasePostErrors];
+
+export type ReleaseSharedAllocationApiSharedAllocationsReleasePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiSharedAllocationRelease;
+};
+
+export type ReleaseSharedAllocationApiSharedAllocationsReleasePostResponse = ReleaseSharedAllocationApiSharedAllocationsReleasePostResponses[keyof ReleaseSharedAllocationApiSharedAllocationsReleasePostResponses];
 
 export type QuerySupervisionEventsApiSupervisionEventsQueryPostData = {
     body: SupervisionEventsRequest;

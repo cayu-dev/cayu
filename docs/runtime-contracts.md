@@ -13728,9 +13728,15 @@ coding); otherwise it starts a new allocation and the old one's work is lost
 (a brokered sandbox). A superseded attempt never finalizes or disposes of a
 record a newer attempt holds. `recover_incomplete_sessions` disposes of
 recorded allocations nothing can use any more: orphans, and everything once
-the run's newest attempt journaled `workflow.completed`. See "Sharing one
-allocation across workflow steps and subagents" and its "Crashes and resumed
-runs" in `docs/environment-factories.md`.
+the run's newest attempt journaled `workflow.completed`. A run that crashed and
+is never resumed keeps its record until an operator releases it by hand:
+`CayuApp.list_shared_allocations` and `CayuApp.release_shared_allocation`
+(`GET /api/shared-allocations`, `POST /api/shared-allocations/release`, `cayu
+environment allocations list|release`) fence the record as `reaping`, as
+recovery does, before they copy back or discard, and refuse while the run looks
+like it is still running. See "Sharing one allocation across workflow steps and
+subagents" and its "Crashes and resumed runs" in
+`docs/environment-factories.md`.
 
 A `command()` step on that environment, with the same scope (registered
 or its own `allocation_scope=`), runs in that allocation too (see "Command

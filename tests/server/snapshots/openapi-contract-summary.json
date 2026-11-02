@@ -3995,6 +3995,165 @@
       "title": "ApiSessionTopologyNode",
       "type": "object"
     },
+    "ApiSharedAllocation": {
+      "additionalProperties": false,
+      "description": "One shared allocation a workflow run recorded, without its reconnect or binding state.",
+      "properties": {
+        "agent_name": {
+          "description": "The step agent whose session created it.",
+          "title": "Agent Name",
+          "type": "string"
+        },
+        "allocation_id": {
+          "description": "The allocation's identity, `<run id>.shared-<hex>`.",
+          "title": "Allocation Id",
+          "type": "string"
+        },
+        "attempt_id": {
+          "description": "The workflow attempt that holds its record.",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "claim_generation": {
+          "minimum": 1.0,
+          "title": "Claim Generation",
+          "type": "integer"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When its identity was first recorded; null for older records.",
+          "title": "Created At"
+        },
+        "environment_name": {
+          "title": "Environment Name",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "description": "The factory result's non-secret metadata, redacted.",
+          "title": "Metadata",
+          "type": "object"
+        },
+        "reconnectable": {
+          "description": "Whether another process can reconnect to it without copying in again.",
+          "title": "Reconnectable",
+          "type": "boolean"
+        },
+        "run_state": {
+          "enum": [
+            "running",
+            "stopped",
+            "ended"
+          ],
+          "title": "Run State",
+          "type": "string"
+        },
+        "run_state_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Run State Reason"
+        },
+        "scope": {
+          "description": "`parent` or `causal_budget`.",
+          "title": "Scope",
+          "type": "string"
+        },
+        "scope_id": {
+          "title": "Scope Id",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "creating",
+            "live",
+            "orphan",
+            "reaping"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "workflow_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workflow Name"
+        },
+        "workflow_run_id": {
+          "title": "Workflow Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allocation_id",
+        "workflow_run_id",
+        "workflow_name",
+        "environment_name",
+        "agent_name",
+        "scope",
+        "scope_id",
+        "state",
+        "reconnectable",
+        "attempt_id",
+        "claim_generation",
+        "created_at",
+        "run_state",
+        "metadata"
+      ],
+      "title": "ApiSharedAllocation",
+      "type": "object"
+    },
+    "ApiSharedAllocationRelease": {
+      "additionalProperties": false,
+      "properties": {
+        "allocation": {
+          "$ref": "#/components/schemas/ApiSharedAllocation",
+          "description": "The allocation as it was before release."
+        },
+        "forced": {
+          "title": "Forced",
+          "type": "boolean"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "copy_back",
+            "discard"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allocation",
+        "mode",
+        "forced",
+        "message"
+      ],
+      "title": "ApiSharedAllocationRelease",
+      "type": "object"
+    },
     "ApiStructuredOutputPart": {
       "additionalProperties": true,
       "properties": {
@@ -7772,6 +7931,16 @@
           ]
         },
         "session_trace": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shared_allocations": {
           "anyOf": [
             {
               "$ref": "#/components/schemas/OptionalSurfaceCapability"
@@ -23120,6 +23289,52 @@
       "title": "RegistrationProvenance",
       "type": "object"
     },
+    "ReleaseSharedAllocationBody": {
+      "additionalProperties": false,
+      "properties": {
+        "allocation_id": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Allocation Id",
+          "type": "string"
+        },
+        "force": {
+          "default": false,
+          "description": "Release even though the run looks like it is running elsewhere. Never overrides a run this server process is running.",
+          "title": "Force",
+          "type": "boolean"
+        },
+        "inactive_for_seconds": {
+          "anyOf": [
+            {
+              "maximum": 9.223372036854776e+18,
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long the run must have journaled nothing to count as stopped (default 900).",
+          "title": "Inactive For Seconds"
+        },
+        "mode": {
+          "description": "`copy_back` reconnects, copies the work back to the source workspace and disposes of the allocation; `discard` disposes of it without copying anything back.",
+          "enum": [
+            "copy_back",
+            "discard"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allocation_id",
+        "mode"
+      ],
+      "title": "ReleaseSharedAllocationBody",
+      "type": "object"
+    },
     "ReportedCostObservation": {
       "additionalProperties": false,
       "properties": {
@@ -24638,7 +24853,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "88",
+          "default": "89",
           "title": "Contract Version",
           "type": "string"
         },
@@ -27245,6 +27460,35 @@
         "cost"
       ],
       "title": "SessionsSummaryResponse",
+      "type": "object"
+    },
+    "SharedAllocationsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "allocations": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSharedAllocation"
+          },
+          "title": "Allocations",
+          "type": "array"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Cursor for the next page of workflow runs. A page reads a bounded number of runs, so it can be short or empty and still have one.",
+          "title": "Next Cursor"
+        }
+      },
+      "required": [
+        "allocations"
+      ],
+      "title": "SharedAllocationsResponse",
       "type": "object"
     },
     "SseContract": {
@@ -32225,7 +32469,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "88",
+          "default": "89",
           "title": "Contract Version",
           "type": "string"
         }
@@ -39462,6 +39706,149 @@
             }
           },
           "304": {
+            "content": {}
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/shared-allocations": {
+      "get": {
+        "operation_id": "list_shared_allocations_api_shared_allocations_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Environment Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "inactive_for_seconds",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Inactive For Seconds"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "workflow_run_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workflow Run Id"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SharedAllocationsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/shared-allocations/release": {
+      "post": {
+        "operation_id": "release_shared_allocation_api_shared_allocations_release_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/ReleaseSharedAllocationBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiSharedAllocationRelease"
+              }
+            }
+          },
+          "404": {
+            "content": {}
+          },
+          "409": {
             "content": {}
           },
           "422": {

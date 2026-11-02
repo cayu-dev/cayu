@@ -1295,10 +1295,9 @@ durable record is what cleans it up instead:
   disposal, so a resume that races the reaper starts a fresh allocation
   instead of reattaching one being removed. It leaves alone the allocation of
   a run that can still resume, and anything this process holds.
-- A run that crashed and is never resumed keeps its allocation. Resume it and
-  let it finish, or start a new attempt and call
-  `ctx.release_environments(outcome="failed")`, which reconnects and releases
-  what the record holds.
+- A run that crashed and is never resumed keeps its allocation, since nothing
+  ends the run. Resume it and let it finish, or release the allocation by
+  hand (see "Releasing a crashed run's allocation by hand" below).
 
 What is still process-local:
 
@@ -1333,6 +1332,89 @@ Limits of this version:
   source's allocation.
 - `unregister_environment` refuses an environment while a shared allocation
   of it is live or being released.
+
+#### Releasing a crashed run's allocation by hand
+
+An operator can see every recorded allocation and release one without a
+workflow, a database query or the dashboard:
+
+```bash
+cayu environment allocations list --application my-agent
+cayu environment allocations release RUN_ID.shared-0123456789abcdef --discard --application my-agent
+cayu environment allocations release RUN_ID.shared-0123456789abcdef --copy-back --server-url http://127.0.0.1:8000
+cayu environment allocations list --target myapp.app:build_app --json
+```
+
+With `--application NAME` the commands reach a Cayu Cloud Agent, and with
+`--server-url` a running server; both need full access (developer or admin).
+Without either they open the project's application in this process (or the
+`--target` factory), because a release reaches the sandbox through the
+environment factory that application registers. In code, the same operations
+are `CayuApp.list_shared_allocations()` and
+`CayuApp.release_shared_allocation(allocation_id, mode=...)`.
+
+The listing reads the records of up to `--limit` workflow runs per page,
+newest run first (`--all` follows the cursor; `--workflow-run` and
+`--environment` narrow it). Each allocation shows its ID (the `<run
+id>.shared-<hex>` identity the factory was asked for), its workflow run, scope,
+environment and step agent, the attempt and claim generation that hold it,
+when it was first recorded, and its state: `creating` (the factory hadn't
+returned), `live`, `orphan` or `reaping`. It also says whether the run looks
+`running`, `stopped` or `ended`, and why, and includes the factory result's
+non-secret metadata with the application's secrets redacted, which the run's
+`environment.factory.completed` event already shows. Reconnect metadata and the
+binding's recovery state are never returned.
+
+A release either discards the allocation (`--discard`, mode `discard`) or
+copies its work back first (`--copy-back`, mode `copy_back`). For a crashed
+run, discard is the usual choice. These rules keep it from racing the run:
+
+- It is refused while the process doing the release runs the workflow run or
+  holds any of its allocations. The run releases those itself, so stop it
+  first. `--force` doesn't change this.
+- It is refused while the run looks like it is running somewhere else: one of
+  its step sessions is running or interrupting under an owner that isn't
+  known to be lost (every one is checked; with more than 1,000 running the run
+  counts as running), or the newest event in the run's journal is within the
+  last `--inactive-for` seconds (900 by default). Writes to the allocation
+  records themselves, by a release or by recovery, don't count as activity. A run whose newest attempt has
+  completed counts as ended and is never refused for this. `--force` skips
+  the check, for when you know the process is gone. It can't see a long
+  `command()` step that started before the inactivity window, so don't force
+  a release while such a step might still be running.
+- Before anything is disposed of, the release claims the record: a
+  compare-and-set against the record that was read fences it as `reaping`,
+  raises its claim generation, and holds it under a five-minute lease that the
+  release renews while it runs. A release that finds the record changed since
+  it was read, or held by another release whose lease hasn't expired, is
+  refused, and recovery's reaping leaves a held record alone, so a copy-back
+  can't race a discard. A run resumed after the fence never reattaches: its
+  claim moves the record to the orphans and starts a fresh allocation, and a
+  process that still holds the allocation lets go of it without copying back
+  or disposing of anything. A release whose process dies stops blocking
+  others once its lease expires.
+- A discard goes through the same path as recovery's reaping: a
+  reconnectable allocation is reconnected and discarded without copy-back,
+  and anything else goes through `discard_unreachable_allocation` (the
+  brokered sandbox destroys its sandbox). A record written before the factory
+  returned has nothing to reach the allocation by, so its release is refused.
+- A copy-back reconnects through the factory's RECONNECT path, rebuilds the
+  binding from its recorded state without copying in again, and finalizes it
+  as a completed run would: the work goes to the source workspace, then the
+  allocation is disposed of. It is refused for an orphan, for an allocation
+  the factory can't reconnect to (the brokered sandbox), and for one that was
+  never bound.
+- A release that fails (a copy-back conflict, say) gives its lease up and
+  leaves the allocation and its record, still fenced as `reaping`. Release it
+  again, or discard it. Once the record is an orphan or the run has ended,
+  recovery discards it too. If the failed finalize left the binding holding its
+  finalization state (Docker coding, when the copy-back succeeded but removing
+  the container failed), the process keeps that binding, and the next release
+  of the allocation from the same process finishes that finalization, which
+  also frees the source workspace for new binds.
+- After a release the record is gone, and releasing it again answers "not
+  found". A run resumed later starts a fresh allocation from the source
+  workspace, which after a copy-back includes the released work.
 
 ### Per-job environments
 

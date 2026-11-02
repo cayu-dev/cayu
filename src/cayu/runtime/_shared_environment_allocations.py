@@ -1410,6 +1410,28 @@ class SharedEnvironmentAllocations:
         )
         return any(record.event.payload.get("attempt_id") == latest for record in completions)
 
+    # Operator inspection and release ---------------------------------------
+    # ``cayu.runtime._shared_allocation_operations`` lists and releases
+    # recorded allocations through these, on the same fences as recovery.
+
+    @property
+    def durable_records(self) -> SharedAllocationRecords | None:
+        return self._records
+
+    def registered_factory(self, environment_name: str) -> EnvironmentFactory | None:
+        return self._factory_lookup(environment_name)
+
+    def owner_active_here(self, owner_session_id: str) -> bool:
+        """Whether this process runs ``owner_session_id`` or holds any of its allocations."""
+
+        return owner_session_id in self._open_owners or self._owner_has_entries(owner_session_id)
+
+    def holds_allocation(self, allocation_session_id: str) -> bool:
+        return allocation_session_id in self._held_allocation_ids()
+
+    async def owner_ended(self, owner: Session) -> bool:
+        return await self._owner_ended(owner)
+
     # Workflow commands ----------------------------------------------------
 
     @contextlib.asynccontextmanager

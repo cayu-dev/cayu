@@ -1128,6 +1128,46 @@ Environment links preserve exact registered names. The special names `.` and `..
 use `/environments?name=.` and `/environments?name=..` so browser path normalization
 cannot discard them; other names keep the existing named detail URLs.
 
+### Shared environment allocations
+
+A workflow run whose steps share one sandbox records it in the run's checkpoint
+(see "Crashes and resumed runs" in
+[environment factories](environment-factories.md)). A run that crashed and is
+never resumed keeps that sandbox. Two routes let an operator find and release it:
+
+- `GET /api/shared-allocations` lists the records of up to `limit` workflow runs
+  (1 to 200, default 100), newest run first, with `next_cursor` for the next
+  page. A page can be short or empty and still have a cursor. `workflow_run_id`
+  reads one run and `environment_name` keeps one environment's. Each allocation
+  has `allocation_id`, `workflow_run_id`, `workflow_name`, `environment_name`,
+  `agent_name`, `scope`, `scope_id`, `state` (`creating`, `live`, `orphan` or
+  `reaping`), `reconnectable`, `attempt_id`, `claim_generation`, `created_at`
+  (null for older records), `run_state` (`running`, `stopped` or `ended`) with
+  `run_state_reason`, and `metadata`: the factory result's non-secret metadata
+  with the application's secrets redacted. Reconnect metadata and binding state
+  are never returned. `inactive_for_seconds` (default 900) sets how long a run
+  must have journaled nothing to count as stopped.
+- `POST /api/shared-allocations/release` takes `{"allocation_id": ...,
+  "mode": "discard" | "copy_back", "force": false, "inactive_for_seconds": null}`
+  and returns the allocation as it was, `mode`, `forced` and a `message`.
+  `discard` disposes of the sandbox without copying back, as recovery does;
+  `copy_back` reconnects, copies the work to the source workspace and then
+  disposes of it. It answers 404 for an allocation that isn't recorded,
+  including one already released, and 409 when it refuses: the server process
+  runs the workflow run itself, the run looks like it is running elsewhere
+  (unless `force`), the environment isn't registered, the record changed while
+  it was read or another release holds it, or a copy-back can't apply. A failed copy-back also answers 409
+  and keeps the record fenced for another try.
+
+Neither route is in the read-and-decide role list, so both need full access
+(developer or admin), like the other session mutations. Responses use
+`Cache-Control: private, no-store`. `capabilities.surfaces.shared_allocations`
+advertises both; an older server has no such surface. The CLI is
+`cayu environment allocations list` and `cayu environment allocations release
+ALLOCATION_ID --discard` (or `--copy-back`, `--force`), with `--application`
+for a Cloud Agent, `--server-url` for a running server, or neither to use the
+project's application. The dashboard has no view of these yet.
+
 
 ### Global artifact queries
 

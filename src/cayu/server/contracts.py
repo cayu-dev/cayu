@@ -2894,6 +2894,75 @@ class EnvironmentsResponse(ApiBaseModel):
     total_count: StrictInt = Field(ge=0)
 
 
+class ApiSharedAllocation(ApiBaseModel):
+    """One shared allocation a workflow run recorded, without its reconnect or binding state."""
+
+    allocation_id: str = Field(description="The allocation's identity, `<run id>.shared-<hex>`.")
+    workflow_run_id: str
+    workflow_name: str | None
+    environment_name: str
+    agent_name: str = Field(description="The step agent whose session created it.")
+    scope: str = Field(description="`parent` or `causal_budget`.")
+    scope_id: str
+    state: Literal["creating", "live", "orphan", "reaping"]
+    reconnectable: StrictBool = Field(
+        description="Whether another process can reconnect to it without copying in again."
+    )
+    attempt_id: str = Field(description="The workflow attempt that holds its record.")
+    claim_generation: StrictInt = Field(ge=1)
+    created_at: datetime | None = Field(
+        description="When its identity was first recorded; null for older records."
+    )
+    run_state: Literal["running", "stopped", "ended"]
+    run_state_reason: str | None = None
+    metadata: dict[str, Any] = Field(
+        description="The factory result's non-secret metadata, redacted.",
+    )
+
+
+class SharedAllocationsResponse(ApiBaseModel):
+    allocations: list[ApiSharedAllocation]
+    next_cursor: str | None = Field(
+        default=None,
+        description=(
+            "Cursor for the next page of workflow runs. A page reads a bounded number of "
+            "runs, so it can be short or empty and still have one."
+        ),
+    )
+
+
+class ReleaseSharedAllocationBody(ApiBaseModel):
+    allocation_id: str = Field(min_length=1, max_length=4096)
+    mode: Literal["copy_back", "discard"] = Field(
+        description=(
+            "`copy_back` reconnects, copies the work back to the source workspace and disposes "
+            "of the allocation; `discard` disposes of it without copying anything back."
+        )
+    )
+    force: StrictBool = Field(
+        default=False,
+        description=(
+            "Release even though the run looks like it is running elsewhere. Never overrides "
+            "a run this server process is running."
+        ),
+    )
+    inactive_for_seconds: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+        description=(
+            "How long the run must have journaled nothing to count as stopped (default 900)."
+        ),
+    )
+
+
+class ApiSharedAllocationRelease(ApiBaseModel):
+    allocation: ApiSharedAllocation = Field(description="The allocation as it was before release.")
+    mode: Literal["copy_back", "discard"]
+    forced: StrictBool
+    message: str
+
+
 class ApiArtifactSummary(ApiBaseModel):
     id: str
     artifact_store_id: str

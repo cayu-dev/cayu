@@ -100,6 +100,8 @@ class ControlPlaneCapabilitySnapshot:
                     read_supported=self.environment_activity_supported,
                     mutation_supported=False,
                 ),
+                # Listing and releasing the shared allocations workflow runs record.
+                shared_allocations=_optional_surface(True, mutation_supported=True),
                 task_index=_optional_surface(
                     self.tasks_configured,
                     read_supported=self.task_index_supported,

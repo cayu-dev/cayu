@@ -29,6 +29,7 @@ from __future__ import annotations
 import secrets
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -49,10 +50,28 @@ RecordState = Literal["creating", "created", "live", "reaping"]
 _STATES = frozenset({"creating", "created", "live", "reaping"})
 
 
+_IDENTITY_SEPARATOR = ".shared-"
+
+
 def shared_allocation_session_id(owner_session_id: str) -> str:
     """Return a fresh identity for one shared allocation, named after its owner."""
 
-    return f"{owner_session_id}.shared-{secrets.token_hex(8)}"
+    return f"{owner_session_id}{_IDENTITY_SEPARATOR}{secrets.token_hex(8)}"
+
+
+def shared_allocation_owner(allocation_session_id: str) -> str | None:
+    """The owner session an allocation identity names, or None when it isn't one."""
+
+    owner, separator, suffix = allocation_session_id.rpartition(_IDENTITY_SEPARATOR)
+    if not owner or not separator or len(suffix) != 16:
+        return None
+    if any(character not in "0123456789abcdef" for character in suffix):
+        return None
+    return owner
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass(frozen=True)
@@ -74,6 +93,23 @@ class SharedAllocationRecord:
     reconnect_metadata: dict[str, Any] = field(default_factory=dict)
     binding_state: dict[str, Any] | None = None
     result_metadata: dict[str, Any] = field(default_factory=dict)
+    # When this identity was first recorded; None for records written before
+    # the field existed.
+    created_at: str | None = None
+    # A hand release in progress: {"token": ..., "expires_at": <ISO time>}. While
+    # it hasn't expired, nothing else releases or reaps the allocation.
+    release_lease: dict[str, str] | None = None
+
+    def release_leased(self, now: datetime) -> bool:
+        """Whether a hand release holds this record and its lease hasn't expired."""
+
+        lease = self.release_lease
+        if lease is None:
+            return False
+        try:
+            return datetime.fromisoformat(lease["expires_at"]) > now
+        except (KeyError, TypeError, ValueError):
+            return False
 
     @property
     def reconnectable(self) -> bool:
@@ -115,6 +151,8 @@ class SharedAllocationRecord:
                 else copy_durable_json_object(self.binding_state, "binding_state")
             ),
             "result_metadata": copy_durable_metadata(self.result_metadata, "result_metadata"),
+            "created_at": self.created_at,
+            "release_lease": None if self.release_lease is None else dict(self.release_lease),
         }
 
     @classmethod
@@ -149,6 +187,16 @@ class SharedAllocationRecord:
         binding_state = payload.get("binding_state")
         if binding_state is not None and type(binding_state) is not dict:
             raise ValueError("Shared allocation record binding state is malformed.")
+        release_lease = payload.get("release_lease")
+        if release_lease is not None and (
+            type(release_lease) is not dict
+            or set(release_lease) != {"token", "expires_at"}
+            or any(type(value) is not str for value in release_lease.values())
+        ):
+            raise ValueError("Shared allocation record release lease is malformed.")
+        created_at = payload.get("created_at")
+        if created_at is not None and type(created_at) is not str:
+            raise ValueError("Shared allocation record creation time is malformed.")
         return cls(
             allocation_session_id=payload["allocation_session_id"],
             scope=payload["scope"],
@@ -173,6 +221,8 @@ class SharedAllocationRecord:
             result_metadata=copy_durable_metadata(
                 payload.get("result_metadata") or {}, "result_metadata"
             ),
+            created_at=created_at,
+            release_lease=None if release_lease is None else dict(release_lease),
         )
 
     def same_claim(self, other: SharedAllocationRecord | None) -> bool:
@@ -371,6 +421,7 @@ class SharedAllocationRecords:
                     attempt_sequence=attempt_sequence,
                     claim_generation=generation,
                     state="creating",
+                    created_at=_now(),
                 )
             snapshot.records[record_id] = claimed
             return True, SharedAllocationClaim(claimed, current, orphaned)
@@ -438,6 +489,7 @@ class SharedAllocationRecords:
             result_metadata={},
             disposal_state=None,
             binding_required=True,
+            created_at=_now(),
         )
 
     async def orphan(self, record_id: str, record: SharedAllocationRecord) -> bool:
@@ -492,20 +544,95 @@ class SharedAllocationRecords:
 
         A reaping record is never reconnected: a claim moves it to the orphans
         and starts a fresh allocation, so disposal can't race a reattach.
+        None too while a hand release holds it (``claim_release``).
         """
+
+        now = datetime.now(UTC)
 
         def change(snapshot: SharedAllocationSnapshot) -> Any:
             for table in (snapshot.records, snapshot.orphans):
                 for key, current in tuple(table.items()):
                     if current.allocation_session_id != record.allocation_session_id:
                         continue
-                    if not record.same_claim(current):
+                    if not record.same_claim(current) or current.release_leased(now):
                         return False, None
                     if current.state == "reaping":
                         return False, current
                     fenced = replace(current, state="reaping")
                     table[key] = fenced
                     return True, fenced
+            return False, None
+
+        return await self._mutate(record.owner_session_id, change)
+
+    async def claim_release(
+        self, record: SharedAllocationRecord, *, token: str, lease_seconds: float
+    ) -> SharedAllocationRecord | None:
+        """Fence ``record`` as reaping and hold it for one hand release.
+
+        The claim generation goes up, so a reaper or another release that read
+        the record before this can't fence it any more, and none can while the
+        lease is live. None when the record changed since it was read, or
+        another release's lease on it hasn't expired.
+        """
+
+        now = datetime.now(UTC)
+        lease = {"token": token, "expires_at": (now + timedelta(seconds=lease_seconds)).isoformat()}
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            for table in (snapshot.records, snapshot.orphans):
+                for key, current in tuple(table.items()):
+                    if current.allocation_session_id != record.allocation_session_id:
+                        continue
+                    if not record.same_claim(current) or current.release_leased(now):
+                        return False, None
+                    held = replace(
+                        current,
+                        state="reaping",
+                        claim_generation=current.claim_generation + 1,
+                        release_lease=lease,
+                    )
+                    table[key] = held
+                    return True, held
+            return False, None
+
+        return await self._mutate(record.owner_session_id, change)
+
+    async def renew_release(
+        self, record: SharedAllocationRecord, *, lease_seconds: float
+    ) -> SharedAllocationRecord | None:
+        """Extend the hand release's lease; None when the release no longer holds it."""
+
+        expires_at = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
+        return await self._change_release(record, expires_at=expires_at)
+
+    async def drop_release(self, record: SharedAllocationRecord) -> None:
+        """Give up a failed hand release's lease, keeping the record fenced as reaping."""
+
+        await self._change_release(record, expires_at=None)
+
+    async def _change_release(
+        self, record: SharedAllocationRecord, *, expires_at: str | None
+    ) -> SharedAllocationRecord | None:
+        lease = record.release_lease
+        assert lease is not None
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            for table in (snapshot.records, snapshot.orphans):
+                for key, current in tuple(table.items()):
+                    held = current.release_lease
+                    if not record.same_claim(current) or held is None:
+                        continue
+                    if held.get("token") != lease["token"]:
+                        continue
+                    updated = replace(
+                        current,
+                        release_lease=(
+                            None if expires_at is None else {**lease, "expires_at": expires_at}
+                        ),
+                    )
+                    table[key] = updated
+                    return True, updated
             return False, None
 
         return await self._mutate(record.owner_session_id, change)

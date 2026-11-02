@@ -2,7 +2,9 @@
 
 ``CayuApp`` inherits these; they live here so the application module stays
 within its size limit. Each one composes existing parts: a proposal is an
-ordinary session run, and watchers are delivered by ``dispatch_event_watchers``.
+ordinary session run, watchers are delivered by ``dispatch_event_watchers``,
+and the shared-allocation entrances read and release the records a workflow
+run keeps (``cayu.runtime._shared_allocation_operations``).
 """
 
 from __future__ import annotations
@@ -13,11 +15,16 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from cayu.observability.watchers import EventWatcher, EventWatcherRunResult
 from cayu.runtime._event_watcher_delivery import dispatch_event_watchers
-from cayu.runtime.application_lifecycle import _admitted_entrance
+from cayu.runtime.application_lifecycle import _admitted_entrance, _tracked_entrance
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.approvals.proposals import ToolCallProposalOutcome
+    from cayu.environments.shared_allocations import (
+        SharedAllocationPage,
+        SharedAllocationRelease,
+        SharedAllocationReleaseMode,
+    )
 
 
 _T = TypeVar("_T")
@@ -121,6 +128,109 @@ class WorkflowEntrances:
         async with aclosing(self.run(request)) as stream:
             events = [event async for event in stream]
         return ToolCallProposalOutcome.from_events(events)
+
+    @_tracked_entrance
+    async def list_shared_allocations(
+        self: CayuApp,
+        *,
+        workflow_run_id: str | None = None,
+        environment_name: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+        inactive_for_seconds: int | None = None,
+    ) -> SharedAllocationPage:
+        """List the shared allocations workflow runs have recorded, newest run first.
+
+        Each page reads up to ``limit`` workflow runs (at most 200) and returns
+        every allocation they recorded, so it can be short or empty and still
+        have a ``next_cursor``. ``workflow_run_id`` reads one run. Each entry
+        says whether its run looks like it is running, has stopped, or has
+        ended, judged as ``release_shared_allocation`` judges it with the same
+        ``inactive_for_seconds``. Reconnect metadata and binding state are never returned; the
+        factory's result metadata is, redacted, as its
+        ``environment.factory.completed`` event already shows it.
+        """
+        from cayu.runtime._shared_allocation_operations import (
+            MAX_SHARED_ALLOCATION_RUNS_PER_PAGE,
+            inactivity_window,
+            list_shared_allocations,
+        )
+
+        if type(limit) is not int or not 1 <= limit <= MAX_SHARED_ALLOCATION_RUNS_PER_PAGE:
+            raise ValueError(
+                f"limit must be an integer from 1 to {MAX_SHARED_ALLOCATION_RUNS_PER_PAGE}."
+            )
+        for name, value in (
+            ("workflow_run_id", workflow_run_id),
+            ("environment_name", environment_name),
+            ("cursor", cursor),
+        ):
+            if value is not None and (type(value) is not str or not value.strip()):
+                raise ValueError(f"{name} must be a non-blank string.")
+        return await list_shared_allocations(
+            self._environment_lifecycle.shared_allocations,
+            session_store=self.session_store,
+            redact=self.redact_json,
+            now=self._clock(),
+            workflow_run_id=workflow_run_id,
+            environment_name=environment_name,
+            limit=limit,
+            cursor=cursor,
+            inactive_for_seconds=inactivity_window(inactive_for_seconds),
+        )
+
+    @_admitted_entrance
+    async def release_shared_allocation(
+        self: CayuApp,
+        allocation_id: str,
+        *,
+        mode: SharedAllocationReleaseMode | str,
+        force: bool = False,
+        inactive_for_seconds: int | None = None,
+    ) -> SharedAllocationRelease:
+        """Release one recorded shared allocation by hand: copy its work back, or discard it.
+
+        For a workflow run that crashed and won't be resumed; a running run
+        releases its own. ``mode`` is ``copy_back`` (reconnect, copy the work
+        back to the source workspace as a completed run would, then dispose)
+        or ``discard`` (dispose without copying back, as recovery does).
+
+        Refused (``SharedAllocationReleaseRefused``, before anything changes)
+        while this process runs the workflow run or holds the allocation; while
+        the run looks like it is running elsewhere (a step session runs under
+        a live owner, or it journaled something within
+        ``inactive_for_seconds``, 900 by default), unless ``force``; when its
+        environment isn't registered here; and for a copy-back of an
+        allocation that can't be reconnected or holds no work. The record is
+        fenced as ``reaping`` before disposal, so a run that resumes later
+        starts a fresh allocation instead of reattaching. Raises ``KeyError``
+        when no such allocation is recorded, which includes one already
+        released.
+        """
+        from cayu.environments.shared_allocations import SharedAllocationReleaseMode
+        from cayu.runtime._shared_allocation_operations import (
+            inactivity_window,
+            release_shared_allocation,
+        )
+
+        if type(allocation_id) is not str or not allocation_id.strip():
+            raise ValueError("allocation_id must be a non-blank string.")
+        try:
+            resolved_mode = SharedAllocationReleaseMode(mode)
+        except ValueError:
+            raise ValueError("mode must be 'copy_back' or 'discard'.") from None
+        if type(force) is not bool:
+            raise TypeError("force must be a bool.")
+        return await release_shared_allocation(
+            self._environment_lifecycle.shared_allocations,
+            allocation_id,
+            session_store=self.session_store,
+            redact=self.redact_json,
+            now=self._clock(),
+            mode=resolved_mode,
+            force=force,
+            inactive_for_seconds=inactivity_window(inactive_for_seconds),
+        )
 
 
 __all__ = ["WorkflowEntrances"]

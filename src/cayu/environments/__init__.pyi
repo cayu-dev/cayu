@@ -285,6 +285,19 @@ from cayu.environments.rebuild import EnvironmentRebuildMismatch as EnvironmentR
 from cayu.environments.rebuild import EnvironmentRebuildRecord as EnvironmentRebuildRecord
 from cayu.environments.rebuild import EnvironmentRebuildRequest as EnvironmentRebuildRequest
 from cayu.environments.shared_allocations import AllocationSharingScope as AllocationSharingScope
+from cayu.environments.shared_allocations import SharedAllocation as SharedAllocation
+from cayu.environments.shared_allocations import SharedAllocationPage as SharedAllocationPage
+from cayu.environments.shared_allocations import SharedAllocationRelease as SharedAllocationRelease
+from cayu.environments.shared_allocations import (
+    SharedAllocationReleaseMode as SharedAllocationReleaseMode,
+)
+from cayu.environments.shared_allocations import (
+    SharedAllocationReleaseRefused as SharedAllocationReleaseRefused,
+)
+from cayu.environments.shared_allocations import (
+    SharedAllocationRunState as SharedAllocationRunState,
+)
+from cayu.environments.shared_allocations import SharedAllocationState as SharedAllocationState
 from cayu.environments.snapshot_lifecycle import ExecutionSnapshots as ExecutionSnapshots
 from cayu.environments.snapshot_lifecycle import (
     inspect_execution_snapshots as inspect_execution_snapshots,

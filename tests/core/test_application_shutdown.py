@@ -51,6 +51,7 @@ GATED_ENTRANCES = frozenset(
         "recover_user_input",
         "recover_work_attempt",
         "refresh_mcp_toolset",
+        "release_shared_allocation",
         "replay_session",
         "resolve_completion_result",
         "resolve_provider_operation",

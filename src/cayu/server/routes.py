@@ -227,6 +227,7 @@ from cayu.server._session_overview import (
 )
 from cayu.server._session_overview_query import SessionOverviewSelection
 from cayu.server._session_trace import register_session_trace
+from cayu.server._shared_allocation_routes import register_shared_allocation_routes
 from cayu.server._suite_authoring_routes import register_suite_authoring_routes
 from cayu.server._suite_launch_routes import register_suite_launch_routes
 from cayu.server._task_catalog_routes import register_task_catalog_routes
@@ -7128,6 +7129,14 @@ def create_router(
             ],
             "total_count": 1,
         }
+
+    register_shared_allocation_routes(
+        router,
+        mutation_router=bounded_control_plane_router,
+        cayu_app=cayu_app,
+        protected=protected,
+        optional_auth_context=optional_auth_context,
+    )
 
     @router.get(
         "/artifacts",

@@ -910,3 +910,20 @@ Environment declarations belong to the running agent, so these commands require
 `--server-url` or `--application`. `cayu inspect --environment NAME` remains the
 static source-manifest inspection command. File output uses the shared CLI
 protection for explicit, environment-selected and saved Cloud context files.
+
+The sandboxes workflow runs share have their own commands. A run that crashed
+and is never resumed keeps its sandbox; list the recorded ones and release one,
+discarding it or copying its work back first:
+
+```bash
+cayu environment allocations list --application my-agent --table
+cayu environment allocations list --workflow-run RUN_ID --server-url http://127.0.0.1:8000 --json
+cayu environment allocations release ALLOCATION_ID --discard --application my-agent
+cayu environment allocations release ALLOCATION_ID --copy-back --target myapp.app:build_app
+```
+
+Without `--application` or `--server-url` they open the project's application,
+as `cayu session close` does. A release is refused while the run looks like it
+is still running; `--force` overrides that when you know its process is gone.
+See "Releasing a crashed run's allocation by hand" in
+[environment factories](environment-factories.md) for the rules.
