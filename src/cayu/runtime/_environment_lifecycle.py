@@ -5445,10 +5445,14 @@ class EnvironmentLifecycle:
                 registered_environment = result.registered_environment
                 cleanup_error: BaseException | None = None
                 if registered_environment.bound_workspace is not None:
-                    # Final observation may have dispatched a probe after
-                    # binding completed. Retain its owner even though there
-                    # is no exposed environment (and possibly no factory).
                     setup_owner = self._active_environment_setups.get(session.id)
+                    if setup_owner is not None:
+                        # Exposure advances cleanup ownership before publication.
+                        # Return that exact registration even if publication fails.
+                        registered_environment = setup_owner.registered_environment
+                    # Final observation may have dispatched a probe after
+                    # binding completed. Retain its owner even if exposure
+                    # failed (and possibly without a factory).
                     settlement = combine_environment_factory_cleanup_settlement_tasks(
                         environment_factory_cleanup_settlement_tasks(exc),
                         task_name=f"cayu-pre-exposure-probe-settlement-{session.id}",
