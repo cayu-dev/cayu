@@ -1959,6 +1959,11 @@ async def _renew_task_claim_before_dispatch(
                 )
     if not retry_deadline_elapsed:
         renewed = await enforce_task_event_deadline(task_store, renewed)
+        # Continuations skip execution entry, so cannot rely on its lease check.
+        if monotonic() >= claim_deadline_monotonic:
+            raise TaskClaimLost(
+                "Task event-deadline inspection consumed the renewed lease before dispatch."
+            )
     cancellation_requested = _task_retry_cancellation_requested(
         renewed
     ) or _task_cancellation_requested(renewed)
