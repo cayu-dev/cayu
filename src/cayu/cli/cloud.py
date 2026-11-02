@@ -73,6 +73,11 @@ from cayu.cli._cloud_service_check import (
 from cayu.cli._cloud_service_logs import add_service_logs_arguments, service_logs
 from cayu.cli._cloud_service_switch import ServiceStillSwitchingError, send_when_not_switching
 from cayu.cli._cloud_settings import CloudSettingsError, add_settings_parser, settings_command
+from cayu.cli._cloud_system_agents import (
+    add_admin_parser,
+    admin_command,
+    system_change_warning,
+)
 from cayu.cli._cloud_task_health import fenced_tasks_warning
 from cayu.cli._output import terminal_safe
 
@@ -1295,6 +1300,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_api_keys_parser(commands)
 
+    add_admin_parser(commands)
+
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
 
     add_eval_parser(commands, seconds=_positive_finite_seconds)
@@ -2106,6 +2113,8 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         )
     if arguments.command == "api-keys":
         return api_keys_command(arguments, client=client)
+    if arguments.command == "admin":
+        return admin_command(arguments, client=client)
     if arguments.command == "settings":
         return settings_command(
             arguments,
@@ -3737,7 +3746,18 @@ def _service(
 
         warnings = [
             *drain_warnings(result),
-            *(warning for warning in (fenced_tasks_warning(result),) if warning is not None),
+            *(
+                warning
+                for warning in (
+                    fenced_tasks_warning(result),
+                    system_change_warning(
+                        result,
+                        application=application_id,
+                        recovery_arguments=_cloud_recovery_arguments(arguments),
+                    ),
+                )
+                if warning is not None
+            ),
         ]
         if warnings:
             return {"operation": "service.status", "result": result, "warnings": warnings}

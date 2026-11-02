@@ -41,7 +41,9 @@ cayu cloud service status --application my-agent
 - `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
   read its eval runs;
 - `api-keys create|list|revoke` for the Organization's
-  [API keys](#organization-api-keys), as a signed-in admin; and
+  [API keys](#organization-api-keys), as a signed-in admin;
+- `admin system-agents` to list [the install's system Agents](#the-installs-system-agents), as a
+  signed-in Cayu platform administrator; and
 - `evidence list|show|verify` for local content-free command records.
 
 `deployment timeline` shows the release pipeline milestones and whether a failed
@@ -1687,6 +1689,37 @@ Cloud kept (or keeps it now), or check with `cayu cloud api-keys list`.
 To rotate a key, create its replacement, move its holder to the new key file, then revoke the
 old key. A revoked key stops working at once and stays listed as inactive. The results report
 each key's `id`, `name`, `scopes`, `active` and `created_at`, never the key.
+
+## The install's system Agents
+
+System Agents are a Cayu Cloud install's own services, which Cloud calls directly, such as
+Compound, Compass and Arena's case service. They stay on: the install's default idle timeout
+never applies to their web processes. The install names each as `<organization id>/<agent
+id>` in `CAYU_SYSTEM_AGENTS`; the deprecated `CAYU_AGENT_ALWAYS_ON` may still name some by a
+bare Agent id. An ECS install sets both in its API's task definition, and an EKS install in the
+Helm chart's `agents.systemAgents` and `agents.alwaysOn` values. A Cayu platform administrator
+lists them, as the running API read them, without AWS or Kubernetes access:
+
+```console
+cayu cloud admin system-agents
+cayu cloud admin system-agents --json
+```
+
+Each entry in `result.items` has its `entry`, `organization_id` (null for a bare id),
+`agent_id`, `setting` (`CAYU_SYSTEM_AGENTS` or `CAYU_AGENT_ALWAYS_ON`) and `deprecated`, and as
+`agent` the Agent it matches today: its `organization_id`, `lifecycle` and `recorded_system`.
+`agent` is null when no Agent matches, as for a mistyped entry; a bare id matches only an active
+Agent, in whichever Organization owns it. Cloud refuses anyone else, an Organization admin or an
+API key included, and the command exits `2` with category `platform_admin_required`. A Cloud
+that doesn't list them yet gives `system_agents_unsupported`.
+
+An Agent's service takes a changed list at its next publish or restart. `service status`
+reports `system` from the install's current setting and `recorded_system` from the service's
+last publish or restart, which is what its web process's idle timeout follows. When the two
+differ, the output adds a `warnings` entry saying so and naming the `service restart` command
+that applies the current setting. `admin system-agents` says `not system until restarted` for
+such an Agent. A Cloud from before `recorded_system` leaves it out and reports the recorded
+value as `system`, and no warning is given.
 
 ## Agent settings
 
