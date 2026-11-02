@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Protocol, cast, get_args
+from typing import TYPE_CHECKING, Any, Final, Protocol, cast, get_args
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
@@ -68,6 +68,7 @@ from cayu.evals.capture_policy import (
     WorkflowFailureCapture,
 )
 from cayu.evals.corpus import EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS
+from cayu.evals.eval_reviewer import ApproveAsProposedReviewer, _TrialReviewer
 from cayu.evals.memory_attribution import (
     EVAL_MEMORY_ATTRIBUTION_MAX_BYTES,
     EVAL_MEMORY_ATTRIBUTION_MAX_SOURCES,
@@ -170,7 +171,10 @@ from cayu.runtime._exception_detail import failure_evidence_message
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions._run_identity import eval_trial_scope
-from cayu.sessions._terminal_evidence import TERMINAL_EVENT_TYPES
+from cayu.sessions._terminal_evidence import (
+    _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+    TERMINAL_EVENT_TYPES,
+)
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, RunnerObservedEventIdentity, Session, SessionStatus
 from cayu.sessions.requests import RunRequest, copy_run_request
@@ -255,6 +259,12 @@ _NOT_EVALUATED_MESSAGES = {
     ),
     _CANDIDATE_RUN_FAILED: f"Not evaluated ({_CANDIDATE_RUN_FAILED}): the candidate's run failed.",
 }
+# The category of a run that stopped on a pending tool approval, and why its assertions were
+# not evaluated: the run never reached its answer, and that is not the candidate's failure.
+_AWAITING_APPROVAL: Final = "awaiting_approval"
+# Fields an approval interruption carries when a failure or a recovery, rather than the
+# candidate's own call, left the session waiting for approval.
+_APPROVAL_STOP_FAILURE_FIELDS = frozenset({"error", "error_type", "failure_evidence", "recovered"})
 # The candidate-run failures whose reason a trial records, and a corpus result publishes,
 # in failure_evidence. Their message describes the trial's environment or setup. A
 # provider's or the candidate's own failure can quote what the candidate was sent or did,
@@ -1068,6 +1078,7 @@ async def _run_eval_suite_with_public_projection(
     trial_completed: TrialCompletionCallback | None = None,
     workflow_target: WorkflowEvalTarget | None = None,
     workflow_execution_profile_fingerprint: str | None = None,
+    eval_reviewer: ApproveAsProposedReviewer | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]]]:
     """Run a corpus suite and return its separate runner-owned public sidecar."""
 
@@ -1089,6 +1100,7 @@ async def _run_eval_suite_with_public_projection(
         trial_completed=trial_completed,
         workflow_target=workflow_target,
         workflow_execution_profile_fingerprint=workflow_execution_profile_fingerprint,
+        eval_reviewer=eval_reviewer,
     )
     if public_data is None:
         raise RuntimeError("Corpus execution lost its runner-owned public projection.")
@@ -1109,6 +1121,7 @@ async def _run_claimed_suite_trials_with_public_projection(
     run_id: str | None = None,
     trial_request_transform: TrialRequestTransform | None = None,
     execution_capacity: EvalExecutionCapacity | None = None,
+    eval_reviewer: ApproveAsProposedReviewer | None = None,
 ) -> None:
     """Run the trials of a corpus suite that ``trial_claims`` hands this process.
 
@@ -1131,6 +1144,7 @@ async def _run_claimed_suite_trials_with_public_projection(
         trial_request_transform=trial_request_transform,
         execution_capacity=execution_capacity,
         trial_claims=trial_claims,
+        eval_reviewer=eval_reviewer,
     )
 
 
@@ -1156,6 +1170,7 @@ async def _run_eval_suite(
     workflow_execution_profile_fingerprint: str | None = None,
     workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
     price_book: PriceBook | None = None,
+    eval_reviewer: ApproveAsProposedReviewer | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     execution = await _execute_eval_suite(
         app,
@@ -1177,6 +1192,7 @@ async def _run_eval_suite(
         workflow_execution_profile_fingerprint=workflow_execution_profile_fingerprint,
         workflow_instance_tracker=workflow_instance_tracker,
         price_book=price_book,
+        eval_reviewer=eval_reviewer,
     )
     started_at = execution.started_at
     results = execution.results
@@ -1224,9 +1240,12 @@ async def _execute_eval_suite(
     workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
     trial_claims: _TrialClaims | None = None,
     price_book: PriceBook | None = None,
+    eval_reviewer: ApproveAsProposedReviewer | None = None,
 ) -> _SuiteExecution:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
+    if eval_reviewer is not None and type(eval_reviewer) is not ApproveAsProposedReviewer:
+        raise TypeError("eval_reviewer must be an exact ApproveAsProposedReviewer or None.")
     if price_book is not None and type(price_book) is not PriceBook:
         raise TypeError("run_eval_suite price_book must be an exact PriceBook or None.")
     if type(suite) is not EvalSuite:
@@ -1298,6 +1317,8 @@ async def _execute_eval_suite(
             )
         if run_stream is not None or trial_request_transform is not None:
             raise ValueError("Workflow eval targets own their execution and request identity.")
+        if eval_reviewer is not None:
+            raise ValueError("Workflow eval targets settle their own sessions' approvals.")
         if (
             type(workflow_execution_profile_fingerprint) is not str
             or len(workflow_execution_profile_fingerprint) != 64
@@ -1381,6 +1402,7 @@ async def _execute_eval_suite(
             workflow_instance_tracker=workflow_instance_tracker,
             workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
             trial_claims=trial_claims,
+            eval_reviewer=eval_reviewer,
         )
     return _SuiteExecution(
         suite=suite,
@@ -1491,6 +1513,7 @@ async def _run_suite_cases(
     workflow_instance_tracker: _WorkflowInstanceTracker | None,
     workflow_execution_profile_fingerprint: str | None,
     trial_claims: _TrialClaims | None = None,
+    eval_reviewer: ApproveAsProposedReviewer | None = None,
 ) -> tuple[
     list[EvalCaseResult],
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
@@ -1516,6 +1539,7 @@ async def _run_suite_cases(
             workflow_instance_tracker=workflow_instance_tracker,
             workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
             pricing=pricing,
+            eval_reviewer=eval_reviewer,
         )
         return result
 
@@ -3176,6 +3200,7 @@ async def _run_case_once_with_public_projection(
     workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
     workflow_execution_profile_fingerprint: str | None = None,
     pricing: _ValidatedPricingSnapshot | None = None,
+    eval_reviewer: ApproveAsProposedReviewer | None = None,
 ) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
     if workflow_target is not None:
         if run_id is None:
@@ -3221,6 +3246,7 @@ async def _run_case_once_with_public_projection(
             memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
             pricing=pricing,
             workspace_scope=workspace_scope,
+            eval_reviewer=eval_reviewer,
         )
 
 
@@ -3242,11 +3268,14 @@ async def _run_session_case_once(
     memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
     pricing: _ValidatedPricingSnapshot | None,
     workspace_scope: AsyncExitStack,
+    eval_reviewer: ApproveAsProposedReviewer | None = None,
 ) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
     """Run one trial as a session of ``app``, capture its evidence and evaluate it.
 
     A case with a workspace fixture gets its checkout inside the trial's deadline,
     as the first step of its run, and ``workspace_scope`` removes it afterwards.
+    With ``eval_reviewer``, the reviewer approves the trial's pending tool calls,
+    and each approval's continuation is part of the trial's run.
     """
 
     started_at = datetime.now(UTC)
@@ -3263,6 +3292,16 @@ async def _run_session_case_once(
         trial_request = copy_run_request(transformed)
     if trial_request.session_id is not None:
         observe_eval_session(app.session_store, trial_request.session_id)
+    trial_reviewer: _TrialReviewer | None = None
+    if eval_reviewer is not None:
+        if trial_request.session_id is None:
+            raise RuntimeError("An eval trial lost its session identity before its reviewer.")
+        trial_reviewer = _TrialReviewer(
+            app,
+            eval_reviewer,
+            trial_request.session_id,
+            loop_policies=trial_request.loop_policies,
+        )
     emitted_root_events: list[RunnerObservedEventIdentity] = []
     emitted_root_events_truncated = False
     root_failure_event: Event | None = None
@@ -3274,6 +3313,8 @@ async def _run_session_case_once(
     run_exception: BaseException | None = None
     # Set when the candidate's own run raised or failed while it was being set up.
     not_evaluated_reason: str | None = None
+    # Set when the run stopped on a pending tool approval its case does not expect.
+    approval_stop_unscored = False
     unavailable_reason: str | None = None
     evidence_complete = False
     session: Session | None = None
@@ -3337,6 +3378,8 @@ async def _run_session_case_once(
                         prepared_workspace_fixture(app, case.id, trial_request, case.workspace)
                     )
                 stream = app.run(trial_request) if run_stream is None else run_stream(trial_request)
+                if trial_reviewer is not None:
+                    stream = trial_reviewer.review(stream)
                 async for event in stream:
                     # Anchor the trial to the first emitted session. If app.run() ever forwards
                     # child-session events, they must not replace the root trial identity.
@@ -3499,6 +3542,21 @@ async def _run_session_case_once(
                                 if external_diagnostic is None
                                 else external_diagnostic
                             )
+                    # A run that stopped on a pending tool approval never reached its answer,
+                    # so unless the case expects that stop it cannot fail the candidate.
+                    if (
+                        run_error is None
+                        and session is not None
+                        and _stopped_awaiting_approval(session, events)
+                    ):
+                        approval_stop_flags = tuple(
+                            assertion.evaluates_awaiting_approval for assertion in case.assertions
+                        )
+                        if any(type(flag) is not bool for flag in approval_stop_flags):
+                            raise TypeError(
+                                "EvalAssertion.evaluates_awaiting_approval must return bool."
+                            )
+                        approval_stop_unscored = not any(approval_stop_flags)
                     final_output = final_output_text(transcript)
                     probe_requirements = _collect_probe_requirements(case.assertions)
                     probes = await _capture_probes(
@@ -3688,6 +3746,28 @@ async def _run_session_case_once(
                         max_preview_bytes=public_output_preview_bytes,
                     )
 
+            evaluated: list[EvalAssertionResult] | None = None
+            if run_error is None and unavailable_reason is None and prepared_context is not None:
+                # A model judge would spend a call judging the answer an approval stop kept
+                # the run from reaching, only for the stop to leave that judgment unscored.
+                if not (approval_stop_unscored and _judges_with_a_model(case.assertions)):
+                    evaluated = list(
+                        await _evaluate_assertions_with_prepared_evidence(
+                            case.assertions,
+                            prepared_context,
+                            portable_evidence=prepared_portable_evidence,
+                            portable_evidence_error=portable_evidence_error,
+                            runtime_app=app,
+                        )
+                    )
+                if approval_stop_unscored and (
+                    evaluated is None or _fails_without_error(evaluated)
+                ):
+                    # What failed may be the answer the stop kept the run from reaching:
+                    # report the stop, not a failed candidate. Checks that all hold stand.
+                    unavailable_reason = _awaiting_approval_reason(trial_reviewer)
+                    evaluated = None
+
             if run_error is not None:
                 # A run that failed without a terminal snapshot leaves its assertions
                 # unevaluated; the error itself stays on the trial. Any other error,
@@ -3724,15 +3804,8 @@ async def _run_session_case_once(
                     run_error = identity_error
                     unavailable_reason = None
                     diagnostic_code = EvalTrialDiagnosticCode.ASSERTION_EVALUATION_FAILED
-            elif prepared_context is not None:
-                evaluated = await _evaluate_assertions_with_prepared_evidence(
-                    case.assertions,
-                    prepared_context,
-                    portable_evidence=prepared_portable_evidence,
-                    portable_evidence_error=portable_evidence_error,
-                    runtime_app=app,
-                )
-                assertion_results = list(evaluated)
+            elif evaluated is not None:
+                assertion_results = evaluated
                 assertion_error = _assertion_diagnostic(
                     assertion_results,
                     EvalOutcome.ERROR,
@@ -3753,6 +3826,7 @@ async def _run_session_case_once(
                 elif assertion_unavailable is not None:
                     unavailable_reason = assertion_unavailable
                     diagnostic_code = EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE
+
     except (TimeoutError, _FreshEvalDeadlineExpired) as exc:
         if isinstance(exc, _FreshEvalDeadlineExpired) or (
             deadline is not None and deadline.expired()
@@ -3822,6 +3896,8 @@ async def _run_session_case_once(
         execution_limit = _execution_limit(events)
         if execution_limit is not None:
             failure_category = "limit_reached"
+        elif _stopped_awaiting_approval(session, events):
+            failure_category = _AWAITING_APPROVAL
     failure_evidence: FailureEvidence | None = None
     if failure_category in _FAILURE_CATEGORIES_WITH_PUBLISHED_REASON:
         failure_evidence = _candidate_failure_evidence(
@@ -4695,6 +4771,68 @@ def _execution_failure_category(
     if EventType.MODEL_ERROR in observed:
         return "provider_failure"
     return "execution_failure" if started else "setup_failure"
+
+
+def _stopped_awaiting_approval(session: Session, events: Sequence[Event]) -> bool:
+    """Whether the session stopped on a tool call awaiting approval, from its terminal event.
+
+    A continuation that failed after an approval, or a recovery, can also leave the
+    session waiting for one; its terminal event records why, and that is not a plain stop.
+    """
+
+    if session.status != SessionStatus.INTERRUPTED or not events:
+        return False
+    terminal = events[-1]
+    return (
+        terminal.type == EventType.SESSION_INTERRUPTED
+        and terminal.payload.get("interruption_type") == _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED
+        and _APPROVAL_STOP_FAILURE_FIELDS.isdisjoint(terminal.payload)
+    )
+
+
+def _judges_with_a_model(assertions: Sequence[EvalAssertion]) -> bool:
+    """Whether a case judges its run with a Cayu model judge, directly or through an
+    application evaluator; a judge records the usage and cost of its model call."""
+
+    from cayu.evals.application_evaluators import _CompiledApplicationEvaluatorAssertion
+    from cayu.evals.judges import LLMJudge, StructuredLLMJudge
+    from cayu.evals.portable_assertions import (
+        _CompiledModelJudgeAssertion,
+        _CompiledStructuredModelJudgeAssertion,
+    )
+
+    for assertion in assertions:
+        judged = (
+            assertion._inner
+            if type(assertion) is _CompiledApplicationEvaluatorAssertion
+            else assertion
+        )
+        if isinstance(judged, LLMJudge | StructuredLLMJudge) or type(judged) in {
+            _CompiledModelJudgeAssertion,
+            _CompiledStructuredModelJudgeAssertion,
+        }:
+            return True
+    return False
+
+
+def _fails_without_error(results: Sequence[EvalAssertionResult]) -> bool:
+    """Whether an assertion failed and none errored."""
+
+    outcomes = {result.outcome for result in results}
+    return EvalOutcome.FAILED in outcomes and EvalOutcome.ERROR not in outcomes
+
+
+def _awaiting_approval_reason(reviewer: _TrialReviewer | None) -> str:
+    """Why a trial's assertions were not evaluated when its run stopped awaiting approval."""
+
+    if reviewer is None:
+        detail = "no eval reviewer was declared to approve it"
+    else:
+        detail = reviewer.stop_reason or "the eval reviewer found no approval it could resolve"
+    return (
+        f"Not evaluated ({_AWAITING_APPROVAL}): the candidate's run stopped on a tool call "
+        f"awaiting approval; {detail}."
+    )
 
 
 def _execution_limit(events: Sequence[Event]) -> EvalExecutionLimit | None:

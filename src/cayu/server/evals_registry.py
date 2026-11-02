@@ -19,6 +19,7 @@ from cayu.budgets.run_limits import RunLimits
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.corpus import JudgePrivacyPolicyV1
+from cayu.evals.eval_reviewer import SCENARIO_WITH_EVAL_REVIEWER
 from cayu.evals.execution import (
     CorpusExecutionLimits,
     CorpusTarget,
@@ -171,6 +172,8 @@ def target_for_eval_invocation(
         and request.invocation_origin is not None
     ):
         raise ValueError("HTTP eval execution cannot inherit a host-asserted SDK origin.")
+    if invocation.scenario is not None and target.eval_reviewer is not None:
+        raise ValueError(SCENARIO_WITH_EVAL_REVIEWER)
     scenario_environment = (
         None if invocation.scenario is None else invocation.scenario.environment_name
     )

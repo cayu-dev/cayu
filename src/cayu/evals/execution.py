@@ -59,6 +59,11 @@ from cayu.evals.corpus import (
     eval_run_contract_for_corpus,
     pricing_profile_identity,
 )
+from cayu.evals.eval_reviewer import (
+    ApproveAsProposedReviewer,
+    EvalReviewerIdentityV1,
+    copy_eval_reviewer,
+)
 from cayu.evals.external import (
     ExternalProcessTargetIdentityV1,
     ExternalTrialEnvelopeV1,
@@ -201,6 +206,10 @@ class EvaluationTargetIdentity(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    eval_reviewer: EvalReviewerIdentityV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -250,10 +259,24 @@ class EvaluationTargetIdentity(BaseModel):
             return value.model_dump(mode="json")
         return value
 
+    @field_validator("eval_reviewer", mode="before")
+    @classmethod
+    def copy_eval_reviewer_identity(cls, value: object) -> object:
+        if type(value) is EvalReviewerIdentityV1:
+            return value.model_dump(mode="json")
+        return value
+
     @model_validator(mode="after")
     def validate_app_manifest(self) -> EvaluationTargetIdentity:
         if self.external_process is not None and self.workflow is not None:
             raise ValueError("An eval target cannot be both external-process and workflow-root.")
+        if self.eval_reviewer is not None and (
+            self.external_process is not None or self.workflow is not None
+        ):
+            raise ValueError(
+                "Only an ordinary corpus target declares an eval reviewer, not an "
+                "external-process or workflow-root target."
+            )
         fingerprint = self.app_manifest.fingerprint
         if len(fingerprint) != 64 or any(
             character not in "0123456789abcdef" for character in fingerprint
@@ -711,6 +734,8 @@ class CorpusTarget(BaseModel):
         default=None,
         exclude=True,
     )
+    # Plays the person who approves each pending tool call, inside eval trials only.
+    eval_reviewer: ApproveAsProposedReviewer | None = None
 
     @field_validator("key")
     @classmethod
@@ -852,6 +877,11 @@ class CorpusTarget(BaseModel):
             )
         return ExternalProcessTargetIdentityV1.model_validate(value.model_dump(mode="json"))
 
+    @field_validator("eval_reviewer", mode="before")
+    @classmethod
+    def copy_trusted_eval_reviewer(cls, value: object) -> ApproveAsProposedReviewer | None:
+        return copy_eval_reviewer(value)
+
     @model_validator(mode="after")
     def validate_authority_boundary(self) -> CorpusTarget:
         _require_public_target_text(self.app, self.key, "key")
@@ -911,7 +941,32 @@ class CorpusTarget(BaseModel):
         if self.external_process is not None and self.request_base.structured_output is not None:
             # The external process provider accepts no tool definitions and no native schema.
             raise ValueError("External process targets cannot request structured output.")
+        if self.eval_reviewer is not None:
+            self._validate_eval_reviewer(self.eval_reviewer)
         return self
+
+    def _validate_eval_reviewer(self, reviewer: ApproveAsProposedReviewer) -> None:
+        if self.external_process is not None:
+            # The external process provider accepts no tool definitions, so nothing awaits approval.
+            raise ValueError(
+                "External process targets run no tools for an eval reviewer to approve."
+            )
+        for value, field_name in (
+            (reviewer.subject, "eval_reviewer.subject"),
+            (reviewer.review_purpose, "eval_reviewer.review_purpose"),
+            (reviewer.review_tenant, "eval_reviewer.review_tenant"),
+        ):
+            if value is not None:
+                _require_public_target_text(self.app, value, field_name)
+        if (
+            self.app.human_review_configured
+            and reviewer.review_purpose is None
+            and self.app.human_review_purpose is None
+        ):
+            raise ValueError(
+                "The application's human review policy names no dashboard_purpose, so its "
+                "eval reviewer needs review_purpose to review approvals."
+            )
 
 
 class WorkflowEvalTarget(CorpusTarget):
@@ -992,6 +1047,11 @@ class WorkflowEvalTarget(CorpusTarget):
     def validate_workflow_contract(self) -> WorkflowEvalTarget:
         if self.external_process is not None:
             raise ValueError("WorkflowEvalTarget cannot also configure an external process.")
+        if self.eval_reviewer is not None:
+            raise ValueError(
+                "A WorkflowEvalTarget's workflow drives its own sessions, so it settles their "
+                "approvals itself; it cannot declare an eval reviewer."
+            )
         if self.request_base.structured_output is not None:
             raise ValueError(
                 "WorkflowEvalTarget projects structured output through its result projector; "
@@ -1078,6 +1138,7 @@ def _copy_corpus_target(target: CorpusTarget) -> CorpusTarget:
         application_evaluators=target.application_evaluators,
         limits=target.limits,
         external_process=target.external_process,
+        eval_reviewer=target.eval_reviewer,
     )
 
 
@@ -1117,6 +1178,7 @@ def _evaluation_target_identity_from_validated_target(
         app_manifest=manifest,
         external_process=target.external_process,
         workflow=(target.identity() if type(target) is WorkflowEvalTarget else None),
+        eval_reviewer=(None if target.eval_reviewer is None else target.eval_reviewer.identity()),
     )
 
 
@@ -1391,6 +1453,7 @@ class CorpusExecutionResult(BaseModel):
                 app_manifest=value.app_manifest,
                 external_process=value.external_process,
                 workflow=value.workflow,
+                eval_reviewer=value.eval_reviewer,
             )
         if isinstance(value, BaseModel):
             raise TypeError("target must be an exact EvaluationTargetIdentity or JSON object.")
@@ -1760,6 +1823,7 @@ async def _run_compiled_corpus_suite(
             validated_target if type(validated_target) is WorkflowEvalTarget else None
         ),
         workflow_execution_profile_fingerprint=plan.workflow_execution_profile_fingerprint,
+        eval_reviewer=validated_target.eval_reviewer,
     )
     if plan.workflow_execution_profile_fingerprint is not None:
         try:
@@ -1844,6 +1908,7 @@ async def _run_compiled_corpus_trials(
         run_id=plan.run_id,
         trial_request_transform=plan.trial_request_transform,
         execution_capacity=execution_capacity,
+        eval_reviewer=plan.target.eval_reviewer,
     )
 
 
@@ -1864,6 +1929,7 @@ def _require_unchanged_target(
         or target_after.app_manifest_fingerprint != target_before.app_manifest_fingerprint
         or target_after.external_process != target_before.external_process
         or target_after.workflow != target_before.workflow
+        or target_after.eval_reviewer != target_before.eval_reviewer
     ):
         raise EvalExecutionProfileChangedError(
             "CorpusTarget application manifest changed or execution target identity changed "

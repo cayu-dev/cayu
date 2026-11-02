@@ -19545,8 +19545,11 @@ EvalStore. This changes no database schema or checkpoint size bound.
 Optional trial `execution_failure_category` and `usage_evidence_state` distinguish
 typed execution failure and incomplete accounting independently of assertion
 outcomes. The categories are `provider_failure`, `environment_failure`,
-`execution_failure`, `setup_failure` (the run failed before its session started)
-and `limit_reached`, which comes with `execution_limit` naming the run limit. An
+`execution_failure`, `setup_failure` (the run failed before its session started),
+`limit_reached`, which comes with `execution_limit` naming the run limit, and
+`awaiting_approval`, a run that stopped on a tool call awaiting approval. Unless
+its case expects that stop, an assertion failing on it makes every assertion
+`unavailable`. An
 `environment_failure` or `setup_failure` comes with `failure_evidence` whose `exception_message`
 says why, masked and bounded like a failed tool call's and without session identity; the other
 categories carry no exception text. Missing usage remains unavailable. Campaign comparison binds package,

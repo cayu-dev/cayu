@@ -88,6 +88,7 @@ _ROOT_TERMINAL_PROCESS_EVENTS = frozenset(
         "session_interrupted",
     }
 )
+_ROOT_INTERRUPTED_PROCESS_EVENT = "session_interrupted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +417,17 @@ class _CompiledPortableAssertion(EvalAssertion):
             return spec.event in _ROOT_TERMINAL_PROCESS_EVENTS
         if type(spec) is ProcessEventsInOrderAssertionSpec:
             return not _ROOT_TERMINAL_PROCESS_EVENTS.isdisjoint(spec.events)
+        return False
+
+    @property
+    def evaluates_awaiting_approval(self) -> bool:
+        # Only an assertion that expects the run to stop interrupted owns a stop on a
+        # pending approval; root_status selects only completed or failed runs.
+        spec = self._spec
+        if type(spec) is ProcessEventAssertionSpec:
+            return spec.event == _ROOT_INTERRUPTED_PROCESS_EVENT and spec.min_count >= 1
+        if type(spec) is ProcessEventsInOrderAssertionSpec:
+            return _ROOT_INTERRUPTED_PROCESS_EVENT in spec.events
         return False
 
     @property

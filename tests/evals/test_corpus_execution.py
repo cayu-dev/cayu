@@ -757,7 +757,7 @@ def test_missing_runtime_exposure_evidence_fails_closed_at_publication() -> None
     assert captured_result_for_corpus(corpus, result).score.memory_attribution == evidence
 
 
-def test_run_corpus_suite_scores_completed_tools_when_ask_mode_interrupts_on_sqlite(
+def test_run_corpus_suite_reports_an_ask_mode_approval_stop_on_sqlite(
     tmp_path,
 ):
     store = SQLiteSessionStore(tmp_path / "ask-mode-eval.sqlite")
@@ -822,17 +822,17 @@ def test_run_corpus_suite_scores_completed_tools_when_ask_mode_interrupts_on_sql
         asyncio.run(store.close())
 
     trial = result.run.cases[0].trials[0]
-    assertions = {assertion.assertion_id: assertion for assertion in trial.assertions}
     assert provider.request_count == 3
     assert (get_customer.calls, create_recommendation.calls, send_email.calls) == (1, 1, 0)
+    # The run stopped awaiting the email's approval, with no reviewer to give it: a
+    # runtime outcome with complete evidence, not a failed candidate.
     assert trial.evidence_complete is True
-    assert trial.status == "failed"
-    assert trial.code is EvalTrialDiagnosticCode.ASSERTION_FAILED
-    assert trial.score == pytest.approx(2 / 3)
-    assert assertions["completed"].outcome == "failed"
-    assert assertions["completed"].detail.actual == "interrupted"
-    assert assertions["customer-loaded"].outcome == "passed"
-    assert assertions["recommendation-created"].outcome == "passed"
+    assert trial.execution_failure_category == "awaiting_approval"
+    assert trial.status == "unavailable"
+    assert trial.code is EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE
+    assert trial.score is None
+    assert {assertion.outcome for assertion in trial.assertions} == {"unavailable"}
+    assert trial.usage is not None and trial.usage.tool_calls == 2
 
 
 def test_corpus_trial_whose_candidate_did_not_start_is_a_runtime_failure():

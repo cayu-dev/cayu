@@ -18712,6 +18712,67 @@
         "title": "EvalResultTargetIdentityV1",
         "type": "object"
       },
+      "EvalReviewerIdentityV1": {
+        "additionalProperties": false,
+        "description": "Portable identity of the eval reviewer a corpus target declares.\n\nA target's reviewer is part of its execution identity: results under\ndifferent reviewers are not compared as equals.",
+        "properties": {
+          "max_approvals": {
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Max Approvals",
+            "type": "integer"
+          },
+          "policy": {
+            "const": "approve_as_proposed",
+            "title": "Policy",
+            "type": "string"
+          },
+          "review_purpose": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Purpose"
+          },
+          "review_tenant": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Tenant"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "policy",
+          "subject",
+          "max_approvals",
+          "revision"
+        ],
+        "title": "EvalReviewerIdentityV1",
+        "type": "object"
+      },
       "EvalRunCostBudget-Input": {
         "additionalProperties": false,
         "description": "One server-priced cost ceiling applied independently to each eval-trial session.",
@@ -22769,7 +22830,8 @@
                   "environment_failure",
                   "execution_failure",
                   "setup_failure",
-                  "limit_reached"
+                  "limit_reached",
+                  "awaiting_approval"
                 ],
                 "type": "string"
               },
@@ -24018,6 +24080,16 @@
           "application_release_id": {
             "title": "Application Release Id",
             "type": "string"
+          },
+          "eval_reviewer": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalReviewerIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "external_process": {
             "anyOf": [
@@ -35949,7 +36021,8 @@
                   "environment_failure",
                   "execution_failure",
                   "setup_failure",
-                  "limit_reached"
+                  "limit_reached",
+                  "awaiting_approval"
                 ],
                 "type": "string"
               },
@@ -40427,7 +40500,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "89",
+            "default": "90",
             "title": "Contract Version",
             "type": "string"
           },
@@ -48696,7 +48769,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "89",
+            "default": "90",
             "title": "Contract Version",
             "type": "string"
           }

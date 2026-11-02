@@ -13,6 +13,7 @@ from cayu._validation import (
     reject_nonportable_json_constant,
     require_durable_text,
 )
+from cayu.evals.eval_reviewer import eval_reviewer_text
 from cayu.evals.execution import (
     CORPUS_EXECUTION_RESULT_SCHEMA_VERSION,
     CorpusExecutionResult,
@@ -293,6 +294,8 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
             f"{_maximum_cost_text(exposure.judge_cost)}. Revision "
             f"<code>{_escape(exposure.revision)}</code></p>"
         )
+    reviewer = result.target.eval_reviewer
+    reviewer_html = "" if reviewer is None else f"<p>{_escape(eval_reviewer_text(reviewer))}</p>"
     rendered = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -343,6 +346,7 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
       <p>AppManifest schema <code>{_escape(result.target.app_manifest_schema_version)}</code> · fingerprint <code>{_escape(result.target.app_manifest_fingerprint)}</code></p>
       <p>Corpus <code>{_escape(run.corpus_revision)}</code> · suite <code>{_escape(run.suite_revision)}</code> · evidence policy <code>{_escape(run.evidence_policy_revision)}</code></p>
       <p>Trial policy: {policy.minimum_passed_trials} of {policy.trial_count} must pass · maximum concurrency {policy.max_concurrency} · revision <code>{_escape(policy.revision)}</code>. Runtime errors, evaluator errors, unavailable required evidence, and cancellations fail closed.</p>
+      {reviewer_html}
       {exposure_html}
     </section>
     <h2>Cases</h2>

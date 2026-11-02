@@ -464,6 +464,9 @@ def _eval_execution_target_material_identity(
             else None
         ),
     }
+    if target.eval_reviewer is not None:
+        # Present only when declared, so targets without a reviewer keep their identity.
+        material["eval_reviewer"] = target.eval_reviewer.identity().model_dump(mode="json")
     canonical = canonical_durable_json_bytes(material, "eval execution target material")
     try:
         public_material = target.app.redact_json(material)

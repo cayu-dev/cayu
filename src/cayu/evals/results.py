@@ -487,6 +487,24 @@ def validate_captured_result_for_corpus(
     return validated
 
 
+def _execution_target_revision(target: EvaluationTargetIdentity) -> str | None:
+    """The revision of what the application adds to a target's execution, if anything.
+
+    Projection V2 predates workflow targets and eval reviewers and has one optional
+    application-owned execution-target revision slot. External-process, workflow-root
+    and eval-reviewer identities are mutually exclusive, so they share that stable slot
+    rather than changing the existing result schema; a different one is not comparable.
+    """
+
+    if target.external_process is not None:
+        return target.external_process.revision
+    if target.workflow is not None:
+        return target.workflow.revision
+    if target.eval_reviewer is not None:
+        return target.eval_reviewer.revision
+    return None
+
+
 def eval_result_projection(
     result: CorpusExecutionResult | CapturedEvaluationResultV1,
 ) -> EvalResultProjectionV2:
@@ -510,19 +528,7 @@ def eval_result_projection(
             result_revision=validated_fresh.revision,
             origin=EvalResultOrigin.FRESH_EXECUTION,
             target=EvalResultTargetIdentityV1.from_fresh_target(validated_fresh.target),
-            external_target_revision=(
-                # Projection V2 predates workflow targets and has one optional
-                # application-owned execution-target revision slot. Workflow
-                # and external targets are mutually exclusive, so reuse that
-                # stable slot rather than changing the existing result schema.
-                validated_fresh.target.external_process.revision
-                if validated_fresh.target.external_process is not None
-                else (
-                    None
-                    if validated_fresh.target.workflow is None
-                    else validated_fresh.target.workflow.revision
-                )
-            ),
+            external_target_revision=_execution_target_revision(validated_fresh.target),
             corpus_revision=run.corpus_revision,
             suite_id=run.suite_id,
             suite_revision=run.suite_revision,

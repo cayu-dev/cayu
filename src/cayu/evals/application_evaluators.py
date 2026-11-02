@@ -162,6 +162,10 @@ class _CompiledApplicationEvaluatorAssertion(EvalAssertion):
         return self._inner.evaluates_failed_session
 
     @property
+    def evaluates_awaiting_approval(self) -> bool:
+        return self._inner.evaluates_awaiting_approval
+
+    @property
     def reads_final_output_only(self) -> bool:
         return self._inner.reads_final_output_only
 

@@ -240,13 +240,16 @@ class EvalStatus(StrEnum):
 
 
 # Why a candidate's run did not complete. ``setup_failure`` means the run failed
-# before its session started; ``limit_reached`` means a run limit stopped it.
+# before its session started; ``limit_reached`` means a run limit stopped it;
+# ``awaiting_approval`` means it stopped on a tool call waiting for an approval that
+# no eval reviewer gave, which is a runtime outcome and not the candidate's failure.
 EvalExecutionFailureCategory = Literal[
     "provider_failure",
     "environment_failure",
     "execution_failure",
     "setup_failure",
     "limit_reached",
+    "awaiting_approval",
 ]
 # The run limit named by ``session.limit_reached`` (cayu.runtime.stop_policy.StopLimit).
 EvalExecutionLimit = Literal[
@@ -276,8 +279,14 @@ def candidate_run_failure_text(
     limit: EvalExecutionLimit | None = None,
     reason: str | None = None,
 ) -> str:
-    """``Candidate run: failed (<category>)``, with the limit that stopped it or the reason."""
+    """``Candidate run: failed (<category>)``, with the limit that stopped it or the reason.
 
+    A run that stopped on a pending approval did not fail: ``Candidate run: stopped
+    awaiting approval.``
+    """
+
+    if category == "awaiting_approval":
+        return "Candidate run: stopped awaiting approval."
     cause = category if limit is None else f"{category}: {limit}"
     return f"Candidate run: failed ({cause})" + ("." if reason is None else f": {reason}")
 

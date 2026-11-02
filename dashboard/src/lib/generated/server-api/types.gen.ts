@@ -8978,6 +8978,45 @@ export type EvalResultTargetIdentityV1 = {
 };
 
 /**
+ * EvalReviewerIdentityV1
+ *
+ * Portable identity of the eval reviewer a corpus target declares.
+ *
+ * A target's reviewer is part of its execution identity: results under
+ * different reviewers are not compared as equals.
+ */
+export type EvalReviewerIdentityV1 = {
+    /**
+     * Max Approvals
+     */
+    max_approvals: number;
+    /**
+     * Policy
+     */
+    policy: 'approve_as_proposed';
+    /**
+     * Review Purpose
+     */
+    review_purpose?: string | null;
+    /**
+     * Review Tenant
+     */
+    review_tenant?: string | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Subject
+     */
+    subject: string;
+};
+
+/**
  * EvalRunCostBudget
  *
  * One server-priced cost ceiling applied independently to each eval-trial session.
@@ -10968,7 +11007,7 @@ export type EvalTrialPresentationV1 = {
     /**
      * Execution Failure Category
      */
-    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | 'setup_failure' | 'limit_reached' | null;
+    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | 'setup_failure' | 'limit_reached' | 'awaiting_approval' | null;
     /**
      * Execution Limit
      */
@@ -11519,6 +11558,7 @@ export type EvaluationTargetIdentity = {
      * Application Release Id
      */
     application_release_id: string;
+    eval_reviewer?: EvalReviewerIdentityV1 | null;
     external_process?: ExternalProcessTargetIdentityV1 | null;
     /**
      * Schema Version
@@ -17667,7 +17707,7 @@ export type PublishedEvalTrialResult = {
     /**
      * Execution Failure Category
      */
-    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | 'setup_failure' | 'limit_reached' | null;
+    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | 'setup_failure' | 'limit_reached' | 'awaiting_approval' | null;
     /**
      * Execution Limit
      */

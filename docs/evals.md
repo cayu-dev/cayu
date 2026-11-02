@@ -1404,6 +1404,84 @@ The target key and application release ID are public result identity: both must
 cross the target app's workload-secret redaction boundary unchanged, or target
 validation fails before provider dispatch.
 
+### Agents whose answer waits for a person's approval
+
+Some agents end every turn with a tool that waits for a person's approval, so a
+person reviews each answer before it counts. A corpus trial of such an agent
+stops at the approval and never reaches the answer the corpus checks. The
+trusted target can declare an eval reviewer that plays that person in each
+trial:
+
+```python
+from cayu.evals import ApproveAsProposedReviewer, CorpusTarget
+
+target = CorpusTarget(
+    key="answer-analyst",
+    app=app,
+    request_base=RunRequest(agent_name="analyst", messages=[], max_steps=12),
+    application_release_id="analyst-2026-11-02",
+    eval_reviewer=ApproveAsProposedReviewer(
+        subject="answer-reviewer",
+        max_approvals=3,
+        # Only with a human review policy that names no dashboard_purpose:
+        review_purpose="answer-review",
+    ),
+)
+```
+
+`ApproveAsProposedReviewer` approves each pending tool approval of the trial's
+session as the agent proposed it, never with changed arguments, and records
+`subject` as the resolver (`ResolutionActor(source="system")`). It approves at
+most `max_approvals` calls per trial (up to 64). Under the application's human
+review policy every decision needs the review the policy shows: the reviewer
+inspects it as the recipient `subject` with `review_purpose` (by default the
+policy's `dashboard_purpose`) and the optional `review_tenant`, and passes the
+view's reference with its approval. The policy must authorize that context to
+inspect and decide, and the review must be `permitted`; otherwise the reviewer
+leaves the approval pending.
+
+The reviewer's decisions are ordinary runtime facts, `tool_approval_requested`
+and `tool_approved`, so approval and process assertions read them as they read a
+person's. A corpus can never supply or switch on a reviewer: it exists only on
+the trusted target. The reviewer acts only inside an eval trial: on the trial's
+own root session, while the eval runner runs that trial, and only on a session
+the runtime marked as an eval trial when it created it, which no request can
+claim. Nothing a served application or the server's run and approval routes
+call reaches it, so it cannot approve anything outside an eval. It works
+wherever the target runs: `cayu eval run --corpus`, and the eval worker that
+runs a target declared in `[tool.cayu.evals].targets` for `cayu cloud eval run`.
+A workflow target's workflow settles its own sessions' approvals, an external
+process target runs no tools, and a scenario decides each approval at its own
+checkpoint, so none of those takes a reviewer. The reviewer approves every call
+in every case of its target, so a case that expects a run to end waiting for
+approval belongs on a target without one.
+
+The reviewer is part of the target's identity. The result's
+`target.eval_reviewer` names its policy, subject and bound, the HTML report
+shows it, and the server's execution profile commits it. A result under a
+different reviewer, or under none, is not comparable: comparison reports
+`external_target_revision_mismatch`, the slot an application's execution
+target uses.
+
+A trial whose run still stops on a pending approval, because the target
+declares no reviewer, the reviewer reached its bound, or the review policy did
+not let it review the call, records `execution_failure_category="awaiting_approval"`,
+and reports show `Candidate run: stopped awaiting approval.` Its events, usage
+and output are kept. The run never reached its answer, which is not the
+candidate's failure, so the stop never fails the candidate: when one of the
+case's assertions fails on it, every assertion is `unavailable` and the trial is
+`unavailable`. Checks that all hold on the stop still pass, such as one that the
+agent asked for approval before a tool ran. A case with a model judge, portable
+or Python and also one an application evaluator builds, is not evaluated on the
+stop at all, so no judge spends a call on an answer the run never reached. A case that expects the stop is
+scored on it as usual, failures included: one with a portable `process_event`
+assertion requiring `session_interrupted`, a `process_events_in_order` assertion
+that names it, or a Python assertion whose `evaluates_awaiting_approval` is
+true, such as `SessionStatusIs("interrupted")` or
+`EventOccurred(EventType.SESSION_INTERRUPTED)`. A session left waiting for an
+approval by a failed continuation or a recovery, whose interruption records the
+error, is not such a stop and keeps its ordinary outcome.
+
 ### Application-owned workflow targets
 
 For configurable child capture limits, precise capture failures, and read-only
@@ -2370,6 +2448,13 @@ A trial records its candidate runtime outcome in `execution_status`,
   `execution_limit` naming the limit, such as `elapsed_seconds`. It keeps its
   events, usage and output, and its assertions still score what the candidate
   did before the limit, so its candidate outcome comes from them.
+- A run that stopped on a tool call awaiting approval has the category
+  `awaiting_approval`. It keeps its events, usage and output, but it never
+  reached its answer, so it never fails the candidate: unless the case expects
+  that stop, an assertion failing on it makes every assertion `unavailable` and
+  the trial `unavailable`. Assertions that all hold still pass. An
+  [eval reviewer](#agents-whose-answer-waits-for-a-persons-approval) approves
+  such calls in a corpus trial.
 
 A trial whose candidate run failed with `environment_failure` or `setup_failure`
 also records why in `failure_evidence`, which a published corpus result keeps. Its
@@ -2387,8 +2472,9 @@ and the session's events still have it.
 
 The HTML reports, `cayu eval failures` and `cayu eval runs show` show this as
 `Candidate run: failed (<category>): <type>: <message>`, or `Candidate run:
-failed (<category>).` without a message, and `(limit_reached: <limit>)` for a
-run limit. A benchmark campaign's `cayu eval failures` table gives the reason in
+failed (<category>).` without a message, `(limit_reached: <limit>)` for a
+run limit, and `Candidate run: stopped awaiting approval.` for a run awaiting
+approval. A benchmark campaign's `cayu eval failures` table gives the reason in
 its `REASON` column. `cayu eval runs show` names the failed candidate runs of the
 run's first five failing cases, in `candidate_run_failures` in its JSON.
 

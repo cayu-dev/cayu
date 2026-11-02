@@ -107,6 +107,12 @@ async def eval_trial_scope() -> AsyncIterator[None]:
         _EVAL_TRIAL.reset(token)
 
 
+def in_eval_trial_scope() -> bool:
+    """Whether the caller runs inside the eval runner's trial scope (``eval_trial_scope``)."""
+
+    return _EVAL_TRIAL.get()
+
+
 def is_eval_trial(session: Session) -> bool:
     """Whether the session is an eval trial or was created under one, as a child or fork."""
 

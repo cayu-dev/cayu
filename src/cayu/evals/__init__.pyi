@@ -335,6 +335,9 @@ from cayu.evals.corpus import load_eval_corpus as load_eval_corpus
 from cayu.evals.corpus import merge_eval_corpora as merge_eval_corpora
 from cayu.evals.corpus import merge_eval_corpus_files as merge_eval_corpus_files
 from cayu.evals.corpus import pricing_profile_identity as pricing_profile_identity
+from cayu.evals.eval_reviewer import EVAL_REVIEWER_MAX_APPROVALS as EVAL_REVIEWER_MAX_APPROVALS
+from cayu.evals.eval_reviewer import ApproveAsProposedReviewer as ApproveAsProposedReviewer
+from cayu.evals.eval_reviewer import EvalReviewerIdentityV1 as EvalReviewerIdentityV1
 from cayu.evals.evidence import ASSERTION_EVIDENCE_MAX_BYTES as ASSERTION_EVIDENCE_MAX_BYTES
 from cayu.evals.evidence import (
     ASSERTION_EVIDENCE_SCHEMA_VERSION as ASSERTION_EVIDENCE_SCHEMA_VERSION,

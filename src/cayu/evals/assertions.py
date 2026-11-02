@@ -66,6 +66,18 @@ class EvalAssertion(ABC):
         return False
 
     @property
+    def evaluates_awaiting_approval(self) -> bool:
+        """Whether this assertion expects a run to stop awaiting a tool approval.
+
+        Such a run never reached its answer. When an assertion of its case fails on
+        it, the trial is reported as stopped awaiting approval instead of a failed
+        candidate, unless one assertion of the case returns ``True`` here: then the
+        stop is what the case checks, and its outcome stands.
+        """
+
+        return False
+
+    @property
     def reads_final_output_only(self) -> bool:
         """Whether this assertion reads nothing but the run's final output.
 
@@ -182,6 +194,10 @@ class SessionStatusIs(EvalAssertion):
     @property
     def evaluates_failed_session(self) -> bool:
         return True
+
+    @property
+    def evaluates_awaiting_approval(self) -> bool:
+        return self.status is SessionStatus.INTERRUPTED
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         return _evaluate_root_status(
@@ -355,6 +371,10 @@ class EventOccurred(EvalAssertion):
         self.event_type = _event_type_value(event_type)
         self.min_count = _nonnegative_int(min_count, "min_count")
         self.max_count = None if max_count is None else _nonnegative_int(max_count, "max_count")
+
+    @property
+    def evaluates_awaiting_approval(self) -> bool:
+        return self.event_type == EventType.SESSION_INTERRUPTED.value and self.min_count >= 1
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         count = sum(

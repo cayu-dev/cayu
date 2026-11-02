@@ -180,9 +180,12 @@ def benchmark_failure_category(trial: PublishedEvalTrialResult) -> str:
         return "timeout"
     category = trial.execution_failure_category
     # A run that failed before it started is an execution failure for retries. A run
-    # stopped by a run limit was scored, so its assertion outcome names it below.
+    # stopped by a run limit was scored, so its assertion outcome names it below; so
+    # was a run that stopped awaiting approval, unless the stop left it unavailable.
     if category == "setup_failure" or (category is None and trial.execution_status == "failed"):
         return "execution_failure"
+    if category == "awaiting_approval" and trial.status != "unavailable":
+        category = None
     if category is not None and category != "limit_reached":
         return category
     if code == "passed":

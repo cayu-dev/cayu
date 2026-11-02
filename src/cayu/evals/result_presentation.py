@@ -425,7 +425,7 @@ class EvalTrialPresentationV1(_PortableModel):
             self.assertions,
             runtime=self.dimensions.runtime,
             evidence=self.dimensions.evidence,
-            limit_reached=self.execution_failure_category == "limit_reached",
+            stopped_run_scored=self.execution_failure_category in _SCORED_STOP_CATEGORIES,
         )
         if self.dimensions != expected_dimensions:
             raise ValueError("Presented trial outcome dimensions contradict its assertions.")
@@ -850,6 +850,8 @@ class EvalResultReportV2(_PortableModel):
 
 
 _SEMANTIC_DETAIL_TYPES = (PublishedModelJudgeDetail, PublishedStructuredModelJudgeDetail)
+# Runs that stopped before completing whose assertions may still score what they did.
+_SCORED_STOP_CATEGORIES = frozenset({"limit_reached", "awaiting_approval"})
 _RUNTIME_FAILED_CODES = {
     EvalTrialDiagnosticCode.EXTERNAL_TARGET_FAILED,
     EvalTrialDiagnosticCode.EXECUTION_FAILED,
@@ -897,10 +899,11 @@ def _candidate_outcome(
     runtime: EvalRuntimeOutcome,
     deterministic: EvalAssertionDimension,
     semantic: EvalAssertionDimension,
-    limit_reached: bool,
+    stopped_run_scored: bool,
 ) -> EvalCandidateOutcome:
-    # A run stopped by a run limit failed, yet its assertions still scored what it did.
-    if runtime == "unavailable" or (runtime == "failed" and not limit_reached):
+    # A run stopped by a run limit, or on an approval its case expects, did not complete,
+    # yet its assertions still scored what it did. Unscored assertions are unavailable.
+    if runtime == "unavailable" or (runtime == "failed" and not stopped_run_scored):
         return "not_scored"
     used = tuple(value for value in (deterministic, semantic) if value != "not_used")
     if any(value in {"error", "unavailable"} for value in used):
@@ -917,7 +920,7 @@ def _dimensions(
     *,
     runtime: EvalRuntimeOutcome,
     evidence: EvalEvidenceState,
-    limit_reached: bool = False,
+    stopped_run_scored: bool = False,
 ) -> EvalResultOutcomeDimensionsV1:
     deterministic = _aggregate_assertion_dimension(
         assertion.outcome
@@ -934,7 +937,7 @@ def _dimensions(
             runtime=runtime,
             deterministic=deterministic,
             semantic=semantic,
-            limit_reached=limit_reached,
+            stopped_run_scored=stopped_run_scored,
         ),
         deterministic_assertions=deterministic,
         semantic_quality=semantic,
@@ -949,7 +952,7 @@ def _presented_dimensions(
     *,
     runtime: EvalRuntimeOutcome,
     evidence: EvalEvidenceState,
-    limit_reached: bool,
+    stopped_run_scored: bool,
 ) -> EvalResultOutcomeDimensionsV1:
     deterministic = _aggregate_assertion_dimension(
         assertion.outcome for assertion in assertions if assertion.category == "deterministic"
@@ -973,7 +976,7 @@ def _presented_dimensions(
             runtime=runtime,
             deterministic=deterministic,
             semantic=semantic,
-            limit_reached=limit_reached,
+            stopped_run_scored=stopped_run_scored,
         ),
         deterministic_assertions=deterministic,
         semantic_quality=semantic,
@@ -1103,7 +1106,7 @@ def _present_fresh_trial(trial: PublishedEvalTrialResult) -> EvalTrialPresentati
             validated.assertions,
             runtime=runtime,
             evidence=evidence,
-            limit_reached=validated.execution_failure_category == "limit_reached",
+            stopped_run_scored=validated.execution_failure_category in _SCORED_STOP_CATEGORIES,
         ),
         assertions=assertions,
     )

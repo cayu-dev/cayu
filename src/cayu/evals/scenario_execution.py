@@ -36,6 +36,7 @@ from cayu.evals.corpus import (
     RunInputSpec,
     TrialRequestSpec,
 )
+from cayu.evals.eval_reviewer import SCENARIO_WITH_EVAL_REVIEWER
 from cayu.evals.execution import (
     CompiledCorpusSuite,
     CorpusExecutionResult,
@@ -803,6 +804,8 @@ async def run_compiled_eval_scenario(
 
     if len(compiled.suite.cases) != 1 or compiled.trials != binding.trials:
         raise ValueError("Controlled scenario execution requires its derived one-case corpus.")
+    if target.eval_reviewer is not None:
+        raise ValueError(SCENARIO_WITH_EVAL_REVIEWER)
     if (
         expected_execution_profile is not None
         and type(expected_execution_profile) is not ExecutionProfileIdentity

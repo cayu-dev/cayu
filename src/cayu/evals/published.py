@@ -1602,6 +1602,10 @@ class PublishedEvalTrialResult(_PortableModel):
             self.assertions,
             self.usage,
             evidence_complete=self.evidence_complete,
+            unscored_approval_stop=(
+                self.execution_failure_category == "awaiting_approval"
+                and self.status == "unavailable"
+            ),
         )
         _validate_memory_assertions_for_evidence(
             self.assertions,
@@ -2485,6 +2489,7 @@ def _validate_trial_observations(
     usage: PublishedUsageSummaryV1 | None,
     *,
     evidence_complete: bool,
+    unscored_approval_stop: bool,
 ) -> None:
     metric_values: dict[str, list[int]] = {
         "model_steps": [],
@@ -2560,7 +2565,13 @@ def _validate_trial_observations(
             + ", ".join(inconsistent_areas)
             + "."
         )
-    if evidence_complete and availability_by_area.get("root-status") == {False}:
+    # A run that stopped awaiting approval has complete evidence, yet when the stop is
+    # not scored its assertions, root status among them, are unavailable.
+    if (
+        evidence_complete
+        and not unscored_approval_stop
+        and availability_by_area.get("root-status") == {False}
+    ):
         raise ValueError("Complete published trial evidence requires a root-status observation.")
     if len(root_statuses) > 1:
         raise ValueError("Published root-status observations must agree within a trial.")
