@@ -1302,6 +1302,7 @@ These still refuse to share, and say why in the error:
   and revoked when the owner releases it, not when a step ends; a grant with a
   `ttl_seconds` that expires mid-run fails closed, since no step can renew
   another session's grants.
+
 A factory whose resources live outside the process (Lambda MicroVM, the
 virtual-egress one included) refuses a plain `create()`, because only a
 durable allocation intent makes it crash-safe. It shares anyway: a shared
@@ -1483,6 +1484,16 @@ process-external allocation) can still share. After a crash mid-create:
 - `recover_incomplete_sessions` reaps an interrupted creation, and any orphan
   whose creation left an intent but no reconnect metadata, through the same
   `reap_allocation` once nothing will resume it.
+
+Every recorded create and reconnect, and the reconnect recovery makes to
+dispose of a recorded allocation, carries the record's claim generation as
+`EnvironmentFactoryRequest.ownership_epoch`; `VirtualEgressEnvironmentFactory`
+passes it on to its adapter as `VirtualEgressRunnerRequest.ownership_epoch`. It goes up with every change of
+owner, so a factory whose provider fences attaches by epoch (Lambda MicroVM's
+sidecar does) refuses an attach from an attempt that has since lost the
+allocation, even one that arrives after the newer attempt reconnected.
+Without it, such a late attach would take the MicroVM's owner claim back, and
+the newer attempt's own commands and teardown would be refused.
 
 A factory that doesn't declare an `allocation_scope` still creates through
 `create()`. A crash mid-create then leaves a record with only its identity: a
@@ -1678,9 +1689,12 @@ run, discard is the usual choice. These rules keep it from racing the run:
   others once its lease expires.
 - A discard goes through the same path as recovery's reaping: a
   reconnectable allocation is reconnected and discarded without copy-back,
-  and anything else goes through `discard_unreachable_allocation` (the
-  brokered sandbox destroys its sandbox). A record written before the factory
-  returned has nothing to reach the allocation by, so its release is refused.
+  an interrupted recoverable creation goes through `reap_allocation` with its
+  recorded intent (a Lambda MicroVM's client token finds and terminates what
+  it made), and anything else goes through `discard_unreachable_allocation`
+  (the brokered sandbox destroys its sandbox). A record written before the
+  factory returned, with no intent, has nothing to reach the allocation by,
+  so its release is refused.
 - A copy-back reconnects through the factory's RECONNECT path, rebuilds the
   binding from its recorded state without copying in again, and finalizes it
   as a completed run would: the work goes to the source workspace, then the
@@ -1967,9 +1981,19 @@ How it recovers and fences:
   suspend or terminate call from the runner that owned it before. When the
   request carries `EnvironmentFactoryRequest.ownership_epoch`, the claim is
   epoch-fenced too, so an owner that lost the allocation can't take it back
-  with a late attach. Ordinary per-session requests carry no epoch today and
+  with a late attach. A shared allocation's requests carry its record's
+  claim generation; ordinary per-session requests carry no epoch today and
   rely on the owner fence alone. Set `fence_owner_epochs=False` only for an
   image whose sidecar doesn't advertise `owner_epoch`.
+- The steps of a workflow run, and its `command()` steps, can share one
+  MicroVM (`allocation_scope="parent"` or `"causal_budget"`): a crashed run
+  reconnects to it when it resumes, and recovery reaps it once the run has
+  ended. An interrupted run's shared MicroVM is suspended and kept, with its
+  record, for the run to resume; a resume that can't reconnect to it starts a
+  fresh one and leaves the old one as an orphan for cleanup. Only a workflow
+  run can own a shared MicroVM, because termination goes through durable
+  finalization and an agent session publishes its success before its scope is
+  released.
 - The binding suspends the MicroVM when a session is interrupted and
   terminates it for any other outcome, returning only after the control plane
   reports `SUSPENDED` or `TERMINATED`. `is_allocation_disposed` is True only

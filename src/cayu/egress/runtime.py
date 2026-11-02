@@ -1482,6 +1482,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     if allocation is None
                     else _adapter_allocation_metadata(allocation.intent.provider_metadata)
                 ),
+                ownership_epoch=request.ownership_epoch,
             )
             if allocation is None:
                 runner = await adapter.create_runner(runner_request)

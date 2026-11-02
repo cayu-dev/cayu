@@ -604,6 +604,9 @@ class VirtualEgressRunnerRequest:
     allocation_metadata: Mapping[str, Any] = field(default_factory=dict)
     #: The bound on each of ``setup_commands``, in seconds.
     setup_command_timeout_s: int = DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS
+    #: The factory request's ``ownership_epoch``: an adapter whose provider
+    #: fences attaches by epoch passes it on every create and reconnect.
+    ownership_epoch: int | None = None
 
 
 @dataclass(frozen=True)

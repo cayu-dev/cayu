@@ -60,6 +60,7 @@ from cayu.runners._lambda_microvm_allocation import (
     LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS,
     LambdaMicroVMAllocationRecoveryError,
     client_token,
+    close_control_client,
     pin_allocation_metadata,
     reap_token_owned_microvm,
     replay_deadline,
@@ -516,7 +517,7 @@ class LambdaMicroVMEnvironmentFactory(EnvironmentFactory):
                     now=_wall_clock(),
                 )
             finally:
-                await _close_client(control_client, owns_client)
+                await close_control_client(control_client, owns_client)
         await allocation.mark_reaped()
 
     async def is_allocation_disposed(self, request: EnvironmentFactoryRequest) -> bool:
@@ -534,7 +535,7 @@ class LambdaMicroVMEnvironmentFactory(EnvironmentFactory):
         try:
             state = await read_microvm_state(control_client, identity["microvm_id"])
         finally:
-            await _close_client(control_client, owns_client)
+            await close_control_client(control_client, owns_client)
         return state in {"TERMINATED", None}
 
     async def recover_finalization_disposal(
@@ -568,7 +569,7 @@ class LambdaMicroVMEnvironmentFactory(EnvironmentFactory):
                 ),
             )
         finally:
-            await _close_client(control_client, owns_client)
+            await close_control_client(control_client, owns_client)
 
     # Internals ------------------------------------------------------------
 
@@ -592,7 +593,7 @@ class LambdaMicroVMEnvironmentFactory(EnvironmentFactory):
                 configured_version=self.create_options.get("image_version"),
             )
         finally:
-            await _close_client(control_client, owns_client)
+            await close_control_client(control_client, owns_client)
         if request.replacement_predecessor:
             # A replacement continues the session on the same execution
             # identity, even if a newer image version has become active.
@@ -753,10 +754,3 @@ async def _close_quietly(runner: LambdaMicroVMRunner) -> None:
         await runner.close()
     except Exception:
         return
-
-
-async def _close_client(control_client: Any, owns_client: bool) -> None:
-    if owns_client:
-        close = getattr(control_client, "close", None)
-        if callable(close):
-            await asyncio.to_thread(close)

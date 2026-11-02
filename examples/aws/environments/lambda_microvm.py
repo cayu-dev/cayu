@@ -7,10 +7,12 @@ lost is adopted, not repeated. A resumed session reconnects to the same MicroVM
 with fresh endpoint credentials, and a terminal outcome terminates it with
 positive readback.
 
-Sharing one MicroVM across the steps of a workflow run (``allocation_scope="parent"``
-or ``"causal_budget"``) is refused for now: the shared path does not yet create
-allocations through ``create_recoverable``. See "Sharing one allocation across
-workflow steps and subagents" in ``docs/environment-factories.md``.
+With ``allocation_scope="parent"`` (or ``"causal_budget"``) the steps of one
+workflow run, and its ``command()`` steps, share one MicroVM, so a planner's
+files are there for the solver and the tests. A run that crashes reconnects to
+the same MicroVM when it resumes in another process. Only a workflow run can
+own a shared MicroVM. See "Sharing one allocation across workflow steps and
+subagents" in ``docs/environment-factories.md``.
 
 This factory doesn't mediate the MicroVM's network. For proxied, audited egress
 with virtual credentials use ``SandboxCodingEnvironmentFactory`` with

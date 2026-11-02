@@ -302,3 +302,12 @@ async def reap_token_owned_microvm(
         microvm_id,
         timeout_s=REAP_TERMINATION_TIMEOUT_SECONDS,
     )
+
+
+async def close_control_client(control_client: Any, owns_client: bool) -> None:
+    """Close a control-plane client this caller created; leave an injected one alone."""
+
+    if owns_client:
+        close = getattr(control_client, "close", None)
+        if callable(close):
+            await asyncio.to_thread(close)

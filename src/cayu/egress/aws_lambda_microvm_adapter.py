@@ -52,6 +52,7 @@ from cayu.runners._lambda_microvm_allocation import (
     DEFAULT_CLIENT_TOKEN_REPLAY_WINDOW_SECONDS,
     LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS,
     LambdaMicroVMAllocationRecoveryError,
+    close_control_client,
     pin_allocation_metadata,
     reap_token_owned_microvm,
     require_replay_window,
@@ -300,6 +301,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             "endpoint_transport",
             "env_overlay",
             "client_token",
+            "owner_epoch",
         }
         overlap = reserved.intersection(self.runner_options)
         if overlap:
@@ -552,10 +554,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                 now=now,
             )
         finally:
-            if owns_client:
-                close = getattr(control_client, "close", None)
-                if callable(close):
-                    await asyncio.to_thread(close)
+            await close_control_client(control_client, owns_client)
 
     async def _resolve_exact_image(self, image: str) -> tuple[str, str]:
         configured_version = self.runner_options.get("image_version")
@@ -575,10 +574,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                 unavailable_error=UnsupportedEgressError,
             )
         finally:
-            if owns_client:
-                close = getattr(control_client, "close", None)
-                if callable(close):
-                    await asyncio.to_thread(close)
+            await close_control_client(control_client, owns_client)
 
     def _run_options(self, metadata: _AllocationMetadata) -> dict[str, Any]:
         options = self.runner_options
@@ -625,6 +621,10 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             common_options["client"] = self.client
         if self.endpoint_transport_factory is not None:
             common_options["endpoint_transport"] = self.endpoint_transport_factory()
+        if request.ownership_epoch is not None:
+            # Fence the sidecar claim by epoch, so an owner that lost the
+            # allocation can't take it back with a late attach.
+            common_options["owner_epoch"] = request.ownership_epoch
         return common_options
 
     async def _admit_runner(
@@ -829,10 +829,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         try:
             state = await read_microvm_state(control_client, identity["microvm_id"])
         finally:
-            if owns_client:
-                close = getattr(control_client, "close", None)
-                if callable(close):
-                    await asyncio.to_thread(close)
+            await close_control_client(control_client, owns_client)
         return state in {"TERMINATED", None}
 
     async def finalize_runner(
