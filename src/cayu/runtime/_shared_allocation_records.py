@@ -1,8 +1,9 @@
-"""Durable records of the allocations a workflow run's sessions share.
+"""Durable records of the allocations a scope's sessions share.
 
-A shared allocation that a workflow run owns is recorded in the run's (the
-workflow journal anchor's) checkpoint, under one key per allocation scope and
-environment. The record is written before the factory is called, so the
+A shared allocation is recorded in its owner's checkpoint, under one key per
+allocation scope and environment. The owner is the workflow run (the workflow
+journal anchor) for workflow steps, or the agent session whose subagents share
+its sandbox, when the session store outlives the process. The record is written before the factory is called, so the
 allocation's identity (the ``session_id`` its request names) is durable before
 the allocation exists, and a resumed run in another process asks for the same
 one. It then records what the factory and binding returned: the factory's
@@ -10,8 +11,9 @@ reconnect metadata, and the binding's private recovery state, which lets
 another process rebuild the bound workspace without copying the source in
 again.
 
-Every record carries a claim: the workflow attempt that owns it, and a
-generation that goes up with every change of owner. Every write is a
+Every record carries a claim: the owner's attempt that holds it (a workflow
+attempt, or one run epoch of an agent session), and a generation that goes up
+with every change of owner. Every write is a
 compare-and-set inside one ``transform_checkpoint`` call, so two processes
 never both believe they own one record, and a superseded attempt that is still
 running finds out at its next write that it lost the allocation instead of
@@ -21,7 +23,14 @@ A record that can't be reconnected (its factory published no reconnect
 metadata, or its binding can't be rebuilt) is moved to ``orphans`` when another
 attempt takes the scope over, and the new attempt gets a fresh allocation.
 ``recover_incomplete_sessions`` disposes of orphans, and of records whose
-owning attempt has completed.
+owner has ended.
+
+A record whose factory creates recoverably (it declares an
+``allocation_scope``) also holds that creation's allocation intent, the same
+``EnvironmentAllocationRecord`` an ordinary session keeps in its own
+checkpoint. ``cayu.runtime._shared_allocation_intents`` moves it through its
+states with the same compare-and-set, so a crash during the factory's create
+leaves something the next attempt can recover and recovery can reap.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ from cayu._validation import (
     copy_durable_json_object,
     copy_durable_metadata,
 )
+from cayu.runtime._environment_allocation import EnvironmentAllocationRecord
 
 if TYPE_CHECKING:
     from cayu.sessions.records import Session
@@ -103,6 +113,9 @@ class SharedAllocationRecord:
     reconnect_metadata: dict[str, Any] = field(default_factory=dict)
     binding_state: dict[str, Any] | None = None
     result_metadata: dict[str, Any] = field(default_factory=dict)
+    # The recoverable creation's ``EnvironmentAllocationRecord`` payload, for a
+    # factory that declares an allocation scope; None otherwise.
+    allocation_intent: dict[str, Any] | None = None
     # The latest step sessions whose copy-back after their step completed,
     # written together with the binding state that copy-back left.
     copied_back: tuple[str, ...] = ()
@@ -116,6 +129,11 @@ class SharedAllocationRecord:
     # A hand release in progress: {"token": ..., "expires_at": <ISO time>}. While
     # it hasn't expired, nothing else releases or reaps the allocation.
     release_lease: dict[str, str] | None = None
+    # The owner's interrupted release left the allocation in place (a suspended
+    # Lambda MicroVM) for its resume, with the binding state that release left.
+    # A resume that can't reconnect to it then starts afresh and leaves this
+    # record as an orphan to reap, rather than failing on it for good.
+    kept_for_resume: bool = False
 
     def release_leased(self, now: datetime) -> bool:
         """Whether a hand release holds this record and its lease hasn't expired."""
@@ -145,7 +163,17 @@ class SharedAllocationRecord:
         )
 
     def payload(self) -> dict[str, Any]:
+        intent = (
+            {}
+            if self.allocation_intent is None
+            else {
+                "allocation_intent": copy_durable_json_object(
+                    self.allocation_intent, "allocation_intent"
+                )
+            }
+        )
         return {
+            **intent,
             "version": _SCHEMA_VERSION,
             "allocation_session_id": self.allocation_session_id,
             "scope": self.scope,
@@ -176,6 +204,7 @@ class SharedAllocationRecord:
             ),
             "created_at": self.created_at,
             "release_lease": None if self.release_lease is None else dict(self.release_lease),
+            **({"kept_for_resume": True} if self.kept_for_resume else {}),
         }
 
     @classmethod
@@ -210,6 +239,11 @@ class SharedAllocationRecord:
         binding_state = payload.get("binding_state")
         if binding_state is not None and type(binding_state) is not dict:
             raise ValueError("Shared allocation record binding state is malformed.")
+        allocation_intent = payload.get("allocation_intent")
+        if allocation_intent is not None:
+            # Parsed for validation only; the record keeps the payload.
+            EnvironmentAllocationRecord.from_payload(allocation_intent)
+            allocation_intent = copy_durable_json_object(allocation_intent, "allocation_intent")
         copied_back = _session_ids(payload, "copied_back")
         pending_copy_back = _session_ids(payload, "pending_copy_back")
         release_lease = payload.get("release_lease")
@@ -222,6 +256,9 @@ class SharedAllocationRecord:
         created_at = payload.get("created_at")
         if created_at is not None and type(created_at) is not str:
             raise ValueError("Shared allocation record creation time is malformed.")
+        kept_for_resume = payload.get("kept_for_resume", False)
+        if type(kept_for_resume) is not bool:
+            raise ValueError("Shared allocation record resume flag is malformed.")
         return cls(
             allocation_session_id=payload["allocation_session_id"],
             scope=payload["scope"],
@@ -246,10 +283,12 @@ class SharedAllocationRecord:
             result_metadata=copy_durable_metadata(
                 payload.get("result_metadata") or {}, "result_metadata"
             ),
+            allocation_intent=allocation_intent,
             copied_back=copied_back,
             pending_copy_back=pending_copy_back,
             created_at=created_at,
             release_lease=None if release_lease is None else dict(release_lease),
+            kept_for_resume=kept_for_resume,
         )
 
     def same_claim(self, other: SharedAllocationRecord | None) -> bool:
@@ -350,7 +389,7 @@ class SharedAllocationClaim:
 
 
 class SharedAllocationClaimLost(RuntimeError):
-    """Raised when another workflow attempt took a shared allocation over."""
+    """Raised when another attempt of the owner took a shared allocation over."""
 
 
 def _read(checkpoint: dict[str, Any] | None) -> tuple[dict[str, Any], SharedAllocationSnapshot]:
@@ -435,6 +474,7 @@ class SharedAllocationRecords:
         attempt_sequence: int,
         replace_unreachable: bool = True,
         keep_allocation_session_id: str | None = None,
+        expected_generation: int | None = None,
     ) -> SharedAllocationClaim | None:
         """Claim the scope's record for ``attempt_id``, creating or taking it over.
 
@@ -451,8 +491,21 @@ class SharedAllocationRecords:
 
         def change(snapshot: SharedAllocationSnapshot) -> Any:
             current = snapshot.records.get(record_id)
+            if current is not None and current.owner_session_id != owner_session_id:
+                # A fork starts from a copy of its source's checkpoint; the
+                # source's record names the source's allocation, never the fork's.
+                del snapshot.records[record_id]
+                current = None
             if current is not None and current.attempt_sequence > attempt_sequence:
                 raise SharedAllocationClaimLost("A newer workflow attempt owns this allocation.")
+            if expected_generation is not None and expected_generation != (
+                0 if current is None else current.claim_generation
+            ):
+                # Claimed since the claimant last saw it, so possibly by an
+                # attempt newer than the claimant's last fence check.
+                raise SharedAllocationClaimLost(
+                    "The record changed since this attempt checked that it is the newest."
+                )
             reachable = current is not None and current.state != "reaping"
             if keep_allocation_session_id is not None:
                 if (
@@ -573,10 +626,104 @@ class SharedAllocationRecords:
             result_metadata={},
             disposal_state=None,
             binding_required=True,
+            allocation_intent=None,
             copied_back=(),
             pending_copy_back=(),
             created_at=_now(),
+            kept_for_resume=False,
         )
+
+    async def orphan_and_replace_with_fresh(
+        self, record_id: str, record: SharedAllocationRecord
+    ) -> SharedAllocationRecord:
+        """Move the held record to the orphans and hold a fresh identity in its place.
+
+        For an allocation a resume couldn't reconnect to that isn't proven gone:
+        the run continues on a new one, and recovery or a hand release still
+        owns the old one through its orphan.
+        """
+
+        fresh = replace(
+            record,
+            allocation_session_id=shared_allocation_session_id(record.owner_session_id),
+            claim_generation=record.claim_generation + 1,
+            state="creating",
+            reconnect_metadata={},
+            binding_state=None,
+            result_metadata={},
+            disposal_state=None,
+            binding_required=True,
+            allocation_intent=None,
+            copied_back=(),
+            pending_copy_back=(),
+            created_at=_now(),
+            release_lease=None,
+            kept_for_resume=False,
+        )
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            current = snapshot.records.get(record_id)
+            if current is None or not record.same_claim(current):
+                return False, None
+            snapshot.orphans[current.allocation_session_id] = replace(
+                current, kept_for_resume=False
+            )
+            snapshot.records[record_id] = fresh
+            return True, fresh
+
+        updated = await self._mutate(record.owner_session_id, change)
+        if updated is None:
+            raise SharedAllocationClaimLost(
+                f"Another workflow attempt took over the shared allocation of environment "
+                f"{record.environment_name!r}."
+            )
+        return updated
+
+    async def transition_intent(
+        self,
+        record: SharedAllocationRecord,
+        *,
+        expected: dict[str, Any] | None,
+        desired: dict[str, Any],
+    ) -> SharedAllocationRecord:
+        """Move the record's allocation intent from ``expected`` to ``desired``.
+
+        The record may be held or orphaned, and may be fenced for reaping; the
+        claim must be unchanged. Repeating a transition that already happened
+        returns the record as it is. Raises ``SharedAllocationClaimLost`` when
+        another attempt holds the record now, and ``RuntimeError`` when the
+        intent moved on some other way.
+        """
+
+        conflict = object()
+
+        def change(snapshot: SharedAllocationSnapshot) -> Any:
+            for table in (snapshot.records, snapshot.orphans):
+                for key, current in tuple(table.items()):
+                    if current.allocation_session_id != record.allocation_session_id:
+                        continue
+                    if not record.same_claim(current):
+                        return False, None
+                    if current.allocation_intent == desired:
+                        return False, current
+                    if current.allocation_intent != expected:
+                        return False, conflict
+                    updated = replace(current, allocation_intent=desired)
+                    table[key] = updated
+                    return True, updated
+            return False, None
+
+        updated = await self._mutate(record.owner_session_id, change)
+        if updated is None:
+            raise SharedAllocationClaimLost(
+                f"Another attempt took over the shared allocation of environment "
+                f"{record.environment_name!r}."
+            )
+        if updated is conflict:
+            raise RuntimeError(
+                "The allocation intent of a shared allocation changed while it was in use."
+            )
+        return updated
 
     async def orphan(self, record_id: str, record: SharedAllocationRecord) -> bool:
         """Move the held record to the orphans; False when another attempt holds it."""

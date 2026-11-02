@@ -53,6 +53,9 @@ _SOURCE_OWNED_CHECKPOINT_KEYS = frozenset(
         "execution_snapshots",
         # Abandonment ends the source session only; a fork may still run.
         ABANDONED_SESSION_CHECKPOINT_KEY,
+        # The source's shared allocations belong to its own scopes; a fork's
+        # sessions never join them.
+        "shared_environment_allocations",
     }
 )
 

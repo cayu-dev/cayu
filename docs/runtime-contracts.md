@@ -13732,7 +13732,38 @@ is never resumed keeps its record until an operator releases it by hand:
 (`GET /api/shared-allocations`, `POST /api/shared-allocations/release`, `cayu
 environment allocations list|release`) fence the record as `reaping`, as
 recovery does, before they copy back or discard, and refuse while the run looks
-like it is still running. See "Sharing one allocation across workflow steps and
+like it is still running. A custom journal
+that keeps its events elsewhere reports that through the optional
+`WorkflowJournalRunEnd` capability (`async def run_ended() -> bool`); recovery
+asks the journal factories that `WorkflowBase` objects of the workflow's name
+were built with in the recovering process, and a journal without the
+capability keeps its run's allocations until the run resumes and releases
+them. A custom journal whose attempt markers aren't in the session store
+claims records under its attempt fence alone.
+
+An agent session that owns a scope (it and its subagents share one sandbox,
+released at its run's terminal event) records it the same way in its own
+checkpoint when the session store outlives the process. The claim names one
+run epoch of the session incarnation, ordered by the epoch, and its fence
+checks that the session hasn't started a newer run. A run of the session in
+another process after a crash reconnects to the recorded sandbox; an older
+run's process that still holds it lets go without finalizing. Recovery keeps
+the sandbox of an `interrupted` or `pending` session and reaps it once the
+session is `completed` or `failed`, which includes a `close_session` close and
+an abandonment. The hand release covers workflow runs only; an agent session's
+record goes when the session is closed.
+
+A factory that declares an `allocation_scope` creates a shared allocation
+through `create_recoverable`, never a plain CREATE, with the allocation intent
+(the per-session `EnvironmentAllocationRecord` states) kept in the shared
+record and every transition checked against the record's claim. After a crash
+mid-create, the owner's next attempt passes the intent back to
+`create_recoverable`; when that fails, it reaps the intent through
+`reap_allocation` and creates a fresh allocation. Recovery reaps an interrupted
+creation, and an unreachable orphan that has an intent, through
+`reap_allocation`. Every request for a recorded allocation carries the
+record's claim generation as `ownership_epoch`. See "Sharing one allocation
+across workflow steps and
 subagents" and its "Crashes and resumed runs" in
 `docs/environment-factories.md`.
 
@@ -13921,7 +13952,8 @@ there is no session to own an allocation, and the command is refused with
 `ValueError` before anything is created. The command resolves the same allocation
 key its run's steps resolve. If an earlier step created the allocation, the command
 attaches to it; if no step has yet, the command creates it the way a step would: the
-same factory `create()` under the scope owner's fresh `.shared-<hex>` identity, the
+same factory `create()` (`create_recoverable`, for a factory that declares an
+`allocation_scope`) under the scope owner's fresh `.shared-<hex>` identity, the
 same owner (the workflow run, opened under the attempt fence like a step), and the
 same refusals (a dynamic secret scope, a vault or credential proxy, an egress
 authority that belongs to each session, and MCP servers or request-dependent

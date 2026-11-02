@@ -90,6 +90,7 @@ from cayu.runtime._session_tool_discovery import (
     _require_tool_discovery_view,
     _tool_discovery_operation_initializer,
 )
+from cayu.runtime._shared_allocation_records import SHARED_ALLOCATIONS_CHECKPOINT_KEY
 from cayu.runtime._task_execution_admission import (
     require_ordinary_session_execution,
     verifier_aware_task_execution_outcome,
@@ -823,6 +824,9 @@ def _replace_checkpoint_preserving_runtime_state(
                 "recovery_plan_execution",
                 "recovery_plan_execution",
             ),
+            # An agent session's shared allocations, which its subagents and a
+            # resumed run in another process change while this run works.
+            (SHARED_ALLOCATIONS_CHECKPOINT_KEY, "shared_environment_allocations"),
         ):
             updated.pop(key, None)
             if current is not None and key in current:

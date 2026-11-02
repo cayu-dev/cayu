@@ -305,6 +305,25 @@ class WorkflowJournalStepCompletion(Protocol):
         ...
 
 
+@runtime_checkable
+class WorkflowJournalRunEnd(Protocol):
+    """Optional journal capability that tells whether a run has ended for good.
+
+    ``recover_incomplete_sessions`` asks it before it disposes of the sandboxes
+    a crashed run's steps shared (``allocation_scope``): a run that can still
+    resume keeps them. A journal without it is treated as resumable, so its
+    run's recorded allocations stay until the run resumes and releases them.
+    """
+
+    async def run_ended(self) -> bool:
+        """Whether the run's newest attempt has journaled ``workflow.completed``.
+
+        Return True only from durable evidence that no attempt will resume the
+        run, and False when it can still resume or you can't tell.
+        """
+        ...
+
+
 class EventStoreJournal:
     """Default ``WorkflowJournal`` backed by cayu's event store."""
 
@@ -520,6 +539,21 @@ class EventStoreJournal:
     async def latest_attempt_id(self) -> str | None:
         attempt_id, _sequence = await self._latest_attempt()
         return attempt_id
+
+    async def run_ended(self) -> bool:
+        latest = await self.latest_attempt_id()
+        if latest is None:
+            return False
+        completions = await self._store.query_events(
+            EventQuery(
+                session_id=self._session_id,
+                workflow_name=self._workflow_name,
+                event_type=EventType.WORKFLOW_COMPLETED,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=16,
+            )
+        )
+        return any(record.event.payload.get("attempt_id") == latest for record in completions)
 
     async def _latest_attempt(self) -> tuple[str | None, int]:
         # Appends are sequenced per session; scan past the cursor so any newer

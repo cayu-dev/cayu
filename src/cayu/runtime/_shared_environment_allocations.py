@@ -25,14 +25,24 @@ sandbox) is left behind as an orphan record when another attempt takes over,
 and ``recover_incomplete_sessions`` disposes of it, as it does of records whose
 attempt completed.
 
-An agent session that owns a scope stays process-local: its request carries
-this process's ``process_local_owner`` token, so a factory that labels its
-resources with it (Docker coding does) leaves them to
-``reap_orphaned_docker_coding_containers`` after a crash, and a leased provider
-(a brokered sandbox) lets the lease lapse. A workflow run's request carries the
+An agent session that owns a scope (its subagents share its sandbox) records
+it the same way in its own checkpoint when the session store outlives the
+process. The claim then names one run epoch of the session instead of a
+workflow attempt, and the attempt fence checks that the session hasn't started
+a newer run since. A run of the session in another process (after a crash)
+reconnects to the allocation, and ``recover_incomplete_sessions`` reaps it
+once the session has ended (completed, or failed, which includes a close or an
+abandonment). With a store that ends with the process, an agent session's
+scope stays process-local, unless its factory creates only recoverably and so
+needs a record for its allocation intent. Requests carry this process's ``process_local_owner``
 token only when the session store doesn't outlive the process, as an ordinary
-session's does, so the reaper never removes an allocation a durable record
-still owns.
+session's do, so ``reap_orphaned_docker_coding_containers`` never removes an
+allocation a durable record still owns.
+
+A factory that declares an ``allocation_scope`` creates the shared allocation
+through ``create_recoverable``, with an allocation intent kept in the record
+(``cayu.runtime._shared_allocation_intents``), so a crash during the factory's
+own create can be recovered by the next attempt or reaped by recovery.
 """
 
 from __future__ import annotations
@@ -58,6 +68,7 @@ from cayu.environments.bindings import (
 from cayu.environments.deferred import DeferredWorkspaceBinding
 from cayu.environments.factory import (
     EnvironmentAllocationScope,
+    EnvironmentAllocationState,
     EnvironmentAllocationUnsupportedError,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
@@ -70,7 +81,7 @@ from cayu.environments.shared_allocations import (
     AllocationSharingScope,
     allocation_sharing_scope,
 )
-from cayu.events import EventType
+from cayu.runtime._shared_allocation_intents import SharedAllocationIntentContext
 from cayu.runtime._shared_allocation_records import (
     MAX_COPIED_BACK_SESSIONS,
     SharedAllocationClaimLost,
@@ -89,7 +100,7 @@ from cayu.runtime._shared_session_parts import (
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.forks import session_fork_profile_relationship
-from cayu.sessions.records import Session
+from cayu.sessions.records import Session, SessionStatus
 
 if TYPE_CHECKING:
     from cayu.environments.admission import (
@@ -104,6 +115,7 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _MAX_LINEAGE_DEPTH = 64
 _MAX_ENDED_OWNERS = 4096
+_MAX_JOURNALS_PER_WORKFLOW = 8
 _WORKFLOW_JOURNAL_PROVIDER = "cayu.workflow"
 
 
@@ -122,8 +134,23 @@ __all__ = [
     "shared_allocation_session_id",
 ]
 
-# A workflow owner's attempt id, and the check that it is still the newest attempt.
-_Claimant = tuple[str, Callable[[], Awaitable[None]]]
+
+@dataclass(frozen=True)
+class _Claimant:
+    """The owner attempt that may claim a scope's record, and its attempt fence.
+
+    For a workflow run it is the workflow attempt, ordered by the journal's
+    attempt markers. For an agent session it is one run epoch of the session
+    (``run_epoch`` set), and the fence checks the session hasn't run again.
+    """
+
+    attempt_id: str
+    fence: Callable[[], Awaitable[None]]
+    run_epoch: int | None = None
+
+    @property
+    def workflow(self) -> bool:
+        return self.run_epoch is None
 
 
 @dataclass(frozen=True)
@@ -179,6 +206,9 @@ class _SharedAllocation:
     # this process that may act on it; None for a process-local allocation.
     record: SharedAllocationRecord | None = None
     attempts: set[str] = field(default_factory=set)
+    # Serializes this process's reclaims of the record, so two sessions of a
+    # new attempt never both decide what to do with the entry.
+    reclaim_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Serializes copy-backs after steps.
     copy_back_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Closed while a copy-back after a step runs, so no session or command
@@ -240,16 +270,34 @@ class SharedEnvironmentAllocations:
         self._records: SharedAllocationRecords | None = None
         self._process_local_store: Callable[[], bool] = lambda: True
         self._factory_lookup: Callable[[str], EnvironmentFactory | None] = lambda name: None
+        # Agent session owner -> (incarnation, run epoch) of the run this
+        # process executes for it, as its own environment setup saw it.
+        self._owner_runs: dict[str, tuple[str, int]] = {}
+        self._session_run_here: Callable[[str], tuple[str, int] | None] = lambda session_id: None
+        # Custom journal factories of this process's workflows, by workflow
+        # name, so recovery can ask whether a run they journal has ended.
+        self._workflow_journals: dict[str, list[Callable[[Any], Any]]] = {}
         # Step sessions the workflow asked to copy back after their step, and
         # the allocations each attached to in this process.
         self._copy_back_sessions: dict[str, set[SharedAllocationKey]] = {}
         # The writer turns that steps and commands opting in take, per run.
         self.writer_turns = SharedAllocationWriterTurns()
 
-    def bind_session_presence(self, session_running_here: Callable[[str], bool]) -> None:
-        """Tell the registry how to see whether a session's run is live in this process."""
+    def bind_session_presence(
+        self,
+        session_running_here: Callable[[str], bool],
+        *,
+        session_run_here: Callable[[str], tuple[str, int] | None] | None = None,
+    ) -> None:
+        """Tell the registry how to see whether a session's run is live in this process.
+
+        ``session_run_here`` names the incarnation and run epoch of the run this
+        process executes for a session, when it knows one.
+        """
 
         self._session_running_here = session_running_here
+        if session_run_here is not None:
+            self._session_run_here = session_run_here
 
     def bind_durable_records(
         self, checkpoint_store: SessionStore, *, process_local_store: Callable[[], bool]
@@ -439,7 +487,53 @@ class SharedEnvironmentAllocations:
         fence = self._owner_fences.get(owner_session_id)
         if self._records is None or attempt_id is None or fence is None:
             return None
-        return attempt_id, fence
+        return _Claimant(attempt_id, fence)
+
+    async def _agent_claimant(
+        self, owner_session_id: str, *, durable_only: bool = True
+    ) -> _Claimant | None:
+        """The run of an agent session owner that records its allocations, if any.
+
+        The claimant is the owner's run that this process executes, as its own
+        environment setup (or its invocation) saw it, never whatever run the
+        store holds now: a process whose run was superseded must not act as
+        the newer run. Without a known run here, the scope stays process-local.
+
+        Only with a session store that outlives the process: otherwise nothing
+        could resume the session elsewhere, and the scope stays process-local.
+        ``durable_only=False`` records it anyway, for a factory that creates
+        only recoverably and so needs a record to hold its allocation intent.
+        """
+
+        if (
+            self._records is None
+            or (durable_only and self._process_local_store())
+            or owner_session_id in self._owner_attempts
+        ):
+            return None
+        run = self._owner_runs.get(owner_session_id) or self._session_run_here(owner_session_id)
+        if run is None:
+            return None
+        store = self._session_store
+        instance_id, run_epoch = run
+
+        async def fence() -> None:
+            current = await store.load(owner_session_id)
+            if current is None or (current.instance_id, current.run_epoch) != (
+                instance_id,
+                run_epoch,
+            ):
+                raise SharedAllocationClaimLost(
+                    f"Session {owner_session_id!r} has started a newer run, which owns "
+                    "its shared allocations now."
+                )
+
+        return _Claimant(f"run:{instance_id}:{run_epoch}", fence, run_epoch=run_epoch)
+
+    async def _claimant(self, owner_session_id: str) -> _Claimant | None:
+        return self._durable_claimant(owner_session_id) or await self._agent_claimant(
+            owner_session_id
+        )
 
     def _owner_generation(self, owner_session_id: str) -> int:
         return self._owner_generations.get(owner_session_id, 0)
@@ -497,7 +591,15 @@ class SharedEnvironmentAllocations:
             # A newer attempt took the run over; its steps use the allocation.
             return
         claimant = self._durable_claimant(owner_session_id)
+        if claimant is None and run_epoch is not None:
+            # An agent session owner's run, taken before its run identity is
+            # cleared below: what an earlier run of it recorded and this run
+            # never reattached to (a subagent's environment it didn't use
+            # again after resuming) is still this run's to release.
+            claimant = await self._agent_claimant(owner_session_id)
         self._open_owners.discard(owner_session_id)
+        if run_epoch is not None:
+            self._owner_runs.pop(owner_session_id, None)
         for session_id in self._sessions_by_owner.pop(owner_session_id, ()):
             self._session_scopes.pop(session_id, None)
             self._copy_back_sessions.pop(session_id, None)
@@ -548,9 +650,13 @@ class SharedEnvironmentAllocations:
                 await self._settle(entry)
             except Exception as error:
                 failures.append(error)
-        if claimant is not None:
+        if claimant is not None and not (
+            outcome == "interrupted" and not self._process_local_store()
+        ):
             # Allocations an earlier attempt recorded in another process, which
-            # no step of this attempt attached to.
+            # no step of this attempt attached to. An interrupted run can
+            # resume, so with a durable store those stay for its resume, as
+            # an interrupted release keeps what its binding left in place.
             failures.extend(await self._release_recorded(owner_session_id, claimant, outcome))
         if not self._owner_has_entries(owner_session_id):
             self._owner_generations.pop(owner_session_id, None)
@@ -558,7 +664,7 @@ class SharedEnvironmentAllocations:
             raise failures[0]
         if failures:
             raise ExceptionGroup("Releasing shared environment allocations failed.", failures)
-        if self._durable_claimant(owner_session_id) == claimant:
+        if claimant is not None and claimant == self._durable_claimant(owner_session_id):
             self._owner_attempts.pop(owner_session_id, None)
             self._owner_fences.pop(owner_session_id, None)
 
@@ -666,6 +772,14 @@ class SharedEnvironmentAllocations:
         request: EnvironmentFactoryRequest,
         session: Session | None,
     ) -> _SharedAllocation:
+        if (
+            session is not None
+            and session.id == key.owner_session_id
+            and session.provider_name != _WORKFLOW_JOURNAL_PROVIDER
+        ):
+            # The owner's own run in this process: its scope's records are
+            # claimed as this run, whatever the store says later.
+            self._owner_runs[session.id] = (session.instance_id, session.run_epoch)
         while True:
             # The owner may have ended while this session waited for another
             # session's creation; never create or join after that.
@@ -704,7 +818,32 @@ class SharedEnvironmentAllocations:
             # owner may have ended (and released the new allocation) before
             # this session resumed.
 
-    async def _attempt_sequence(self, owner_session_id: str, attempt_id: str) -> int:
+    async def _unordered_claim_generation(
+        self, owner_session_id: str, record_id: str, sequence: int
+    ) -> int | None:
+        """The record's claim generation before the fence check, for an unordered attempt.
+
+        An attempt with no journal sequence (a custom journal that keeps its
+        markers elsewhere) can't be ordered against the record's holder. It
+        claims only if nothing claimed the record after this read, which comes
+        before its fence check: a holder that claimed earlier is older than an
+        attempt that then passes the fence, and one that claims later changes
+        the generation, so the claim is refused instead of taking it over.
+        """
+
+        if sequence != 0 or self._records is None:
+            return None
+        snapshot = await self._records.load(owner_session_id)
+        current = None if snapshot is None else snapshot.records.get(record_id)
+        if current is not None and current.owner_session_id != owner_session_id:
+            current = None
+        return 0 if current is None else current.claim_generation
+
+    async def _attempt_sequence(self, owner_session_id: str, claimant: _Claimant) -> int:
+        """The claimant's order among the owner's attempts; a newer one is larger."""
+
+        if claimant.run_epoch is not None:
+            return claimant.run_epoch
         from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
         markers = await self._session_store.query_events(
@@ -715,7 +854,12 @@ class SharedEnvironmentAllocations:
                 limit=1,
             )
         )
-        if not markers or markers[0].event.payload.get("attempt_id") != attempt_id:
+        if not markers:
+            # A custom journal that keeps its attempt markers elsewhere. Its
+            # attempt fence, checked on both sides of every claim, is then
+            # what keeps a superseded attempt from holding the record.
+            return 0
+        if markers[0].event.payload.get("attempt_id") != claimant.attempt_id:
             raise SharedAllocationClaimLost("The workflow attempt has been superseded.")
         return markers[0].sequence
 
@@ -730,13 +874,28 @@ class SharedEnvironmentAllocations:
         entry is still usable.
         """
 
-        claimant = self._durable_claimant(entry.key.owner_session_id)
+        if entry.record is None:
+            return True
+        async with entry.reclaim_lock:
+            if self._live.get(entry.key) is not entry:
+                # A session of this attempt that reclaimed first dropped the
+                # entry; the caller looks the allocation up again.
+                return False
+            return await self._reclaim_held(entry)
+
+    async def _reclaim_held(self, entry: _SharedAllocation) -> bool:
         record = entry.record
-        if claimant is None or record is None or claimant[0] in entry.attempts:
+        assert record is not None
+        claimant = await self._claimant(entry.key.owner_session_id)
+        if claimant is None or claimant.attempt_id in entry.attempts:
             return True
         records = self._records
         assert records is not None
-        attempt_id, fence = claimant
+        attempt_id, fence = claimant.attempt_id, claimant.fence
+        sequence = await self._attempt_sequence(record.owner_session_id, claimant)
+        expected = await self._unordered_claim_generation(
+            record.owner_session_id, entry.key.record_id, sequence
+        )
         await fence()
         claim = await records.claim(
             record_id=entry.key.record_id,
@@ -746,8 +905,9 @@ class SharedEnvironmentAllocations:
             environment_name=record.environment_name,
             agent_name=record.agent_name,
             attempt_id=attempt_id,
-            attempt_sequence=await self._attempt_sequence(record.owner_session_id, attempt_id),
+            attempt_sequence=sequence,
             keep_allocation_session_id=record.allocation_session_id,
+            expected_generation=expected,
         )
         if claim is None:
             if self._live.get(entry.key) is entry:
@@ -760,6 +920,23 @@ class SharedEnvironmentAllocations:
             with contextlib.suppress(Exception):
                 await records.restore(entry.key.record_id, claim)
             raise
+        previous = claim.previous
+        if (
+            previous is not None
+            and previous.attempt_id != attempt_id
+            and previous.attempt_id not in entry.attempts
+        ):
+            # An attempt in another process held the allocation since this
+            # process last did. Its RECONNECT may have taken provider-side
+            # ownership away from this process's runner (a Lambda MicroVM's
+            # owner claim), and its steps moved the binding state on. So this
+            # attempt, which now holds the record, reconnects under the new
+            # claim generation instead of reusing the stale handle; the
+            # allocation itself is kept.
+            if self._live.get(entry.key) is entry:
+                del self._live[entry.key]
+            self._forget(entry)
+            return False
         entry.record = claim.record
         entry.attempts.add(attempt_id)
         return True
@@ -772,7 +949,12 @@ class SharedEnvironmentAllocations:
         generation: int,
     ) -> _SharedAllocation:
         try:
-            claimant = self._durable_claimant(key.owner_session_id)
+            claimant = await self._claimant(key.owner_session_id)
+            if claimant is None and _creates_recoverably(factory, request):
+                # A recoverable factory may refuse a plain create (a
+                # process-external allocation, for example), and its intent
+                # needs a record to live in, even if only for this process.
+                claimant = await self._agent_claimant(key.owner_session_id, durable_only=False)
             if claimant is None:
                 return await self._create_process_local(key, factory, request, generation)
             entry = await self._open_recorded(
@@ -791,7 +973,11 @@ class SharedEnvironmentAllocations:
         *,
         owner_session_id: str,
         recorded: bool,
+        ownership_epoch: int | None = None,
     ) -> EnvironmentFactoryRequest:
+        # ``ownership_epoch`` is a recorded allocation's claim generation, which
+        # goes up with every change of owner, so a provider that fences attaches
+        # by epoch refuses an owner that lost the allocation.
         # A recorded allocation outlives this process when the session store
         # does, so it carries the owner token only when the store doesn't, as
         # an ordinary session's request does; the reaper then never removes an
@@ -809,6 +995,7 @@ class SharedEnvironmentAllocations:
             replacement_predecessor={},
             interaction_id=None,
             process_local_owner=owner,
+            ownership_epoch=ownership_epoch,
             # The allocation's identity isn't a session; events about it (a
             # broker's egress audit, say) belong on the scope's owner.
             event_session_id=owner_session_id,
@@ -955,7 +1142,7 @@ class SharedEnvironmentAllocations:
         *,
         create: bool,
     ) -> _SharedAllocation | None:
-        """Claim a workflow-owned scope's record, then reconnect to or create its allocation.
+        """Claim a recorded scope's record, then reconnect to or create its allocation.
 
         The record is claimed for this attempt before the factory is called,
         and the attempt fence is checked on both sides of the claim, so a
@@ -966,8 +1153,10 @@ class SharedEnvironmentAllocations:
 
         records = self._records
         assert records is not None
-        attempt_id, fence = claimant
+        attempt_id, fence = claimant.attempt_id, claimant.fence
         record_id = key.record_id
+        sequence = await self._attempt_sequence(key.owner_session_id, claimant)
+        expected = await self._unordered_claim_generation(key.owner_session_id, record_id, sequence)
         await fence()
         claim = await records.claim(
             record_id=record_id,
@@ -977,8 +1166,9 @@ class SharedEnvironmentAllocations:
             environment_name=key.environment_name,
             agent_name=request.agent_name,
             attempt_id=attempt_id,
-            attempt_sequence=await self._attempt_sequence(key.owner_session_id, attempt_id),
+            attempt_sequence=sequence,
             replace_unreachable=create,
+            expected_generation=expected,
         )
         if claim is None:
             return None
@@ -992,7 +1182,7 @@ class SharedEnvironmentAllocations:
         if claim.orphaned_previous:
             _LOGGER.warning(
                 "The shared allocation of environment %r that an earlier attempt of "
-                "workflow run %s left can't be reconnected; this attempt starts a new "
+                "session %s left can't be reconnected; this attempt starts a new "
                 "one, and work that existed only in the old one is lost.",
                 key.environment_name,
                 key.owner_session_id,
@@ -1004,6 +1194,7 @@ class SharedEnvironmentAllocations:
                     session_id=record.allocation_session_id,
                     operation=EnvironmentFactoryOperation.RECONNECT,
                     reconnect_metadata=record.reconnect_metadata,
+                    ownership_epoch=record.claim_generation,
                 ),
                 record.disposal_state,
             )
@@ -1020,6 +1211,7 @@ class SharedEnvironmentAllocations:
                     record.allocation_session_id,
                     owner_session_id=key.owner_session_id,
                     recorded=True,
+                    ownership_epoch=record.claim_generation,
                 ),
                 operation=EnvironmentFactoryOperation.RECONNECT,
                 reconnect_metadata=record.reconnect_metadata,
@@ -1032,11 +1224,45 @@ class SharedEnvironmentAllocations:
                 # failed adoption gets the same disposal check as a failed
                 # reconnect.
                 return await self._adopt_reconnected(
-                    key, factory, result, record, generation, attempt_id, bind=create
+                    key,
+                    factory,
+                    result,
+                    record,
+                    generation,
+                    attempt_id,
+                    bind=create,
+                    workflow_owner=claimant.workflow,
                 )
             except (SharedAllocationClaimLost, SharedAllocationScopeClosedError):
                 raise
             except Exception:
+                if record.kept_for_resume and not await _positively_disposed(factory, reconnect):
+                    # An interrupted release left this for the resume, but it
+                    # can't be reconnected (its binding may have disposed of it
+                    # in a way the factory can't prove). Continue on a new
+                    # allocation; the old one stays owned as an orphan so
+                    # recovery or a hand release can dispose of it.
+                    _LOGGER.warning(
+                        "The shared allocation of environment %r that workflow run %s's "
+                        "interrupted release kept can't be reconnected; this attempt "
+                        "starts a new one, and work that existed only in the old one is "
+                        "lost. The old one is kept as an orphan for cleanup.",
+                        key.environment_name,
+                        key.owner_session_id,
+                    )
+                    if not create:
+                        await records.orphan(record_id, record)
+                        return None
+                    record = await records.orphan_and_replace_with_fresh(record_id, record)
+                    return await self._create_recorded(
+                        key,
+                        factory,
+                        request,
+                        record,
+                        generation,
+                        attempt_id,
+                        workflow_owner=claimant.workflow,
+                    )
                 if not await _positively_disposed(factory, reconnect):
                     # The allocation may hold the run's only copy of its work;
                     # keep the record for a retry.
@@ -1056,7 +1282,25 @@ class SharedEnvironmentAllocations:
                 record = await records.replace_with_fresh(record_id, record)
         if not create:
             return None
-        return await self._create_recorded(key, factory, request, record, generation, attempt_id)
+        previous = claim.previous
+        return await self._create_recorded(
+            key,
+            factory,
+            request,
+            record,
+            generation,
+            attempt_id,
+            workflow_owner=claimant.workflow,
+            # A record an earlier attempt left mid-create without an intent:
+            # that creation (perhaps by an older Cayu) went through plain
+            # create() under this identity, which adopts what it made.
+            interrupted_plain_create=(
+                previous is not None
+                and previous.allocation_session_id == record.allocation_session_id
+                and previous.state == "creating"
+                and previous.allocation_intent is None
+            ),
+        )
 
     async def _adopt_reconnected(
         self,
@@ -1068,6 +1312,7 @@ class SharedEnvironmentAllocations:
         attempt_id: str,
         *,
         bind: bool,
+        workflow_owner: bool,
     ) -> _SharedAllocation:
         """Attach to a reconnected allocation without disposing of it on failure."""
 
@@ -1087,7 +1332,7 @@ class SharedEnvironmentAllocations:
                 agent_name=record.agent_name,
                 generation=generation,
                 recovery_state=record.binding_state if record.state == "live" else None,
-                workflow_owner=True,
+                workflow_owner=workflow_owner,
             )
         try:
             if record.state == "created" and bound is not None and binding is not None:
@@ -1096,7 +1341,13 @@ class SharedEnvironmentAllocations:
                     record,
                     state="live",
                     binding_state=_binding_recovery_state(binding, bound),
+                    kept_for_resume=False,
                 )
+            elif record.kept_for_resume:
+                # The resume this was kept for has reconnected: from here on a
+                # failed reconnect may be all that stands between the run and
+                # newer work in it, so it is kept for a retry again.
+                record = await records.update(key.record_id, record, kept_for_resume=False)
         except BaseException:
             if bound is not None and binding is not None:
                 with contextlib.suppress(Exception):
@@ -1119,22 +1370,18 @@ class SharedEnvironmentAllocations:
         record: SharedAllocationRecord,
         generation: int,
         attempt_id: str,
+        *,
+        workflow_owner: bool,
+        interrupted_plain_create: bool = False,
     ) -> _SharedAllocation:
         """Create a recorded allocation under its durable identity and record what it returned."""
 
         records = self._records
         assert records is not None
         record_id = key.record_id
-        result = await _create_shared(
-            factory,
-            self._shared_request(
-                request,
-                record.allocation_session_id,
-                owner_session_id=key.owner_session_id,
-                recorded=True,
-            ),
+        result, record = await self._create_allocation(
+            key, factory, request, record, interrupted_plain_create=interrupted_plain_create
         )
-        _require_result(result)
         entry = _SharedAllocation(
             key=key, factory=factory, result=result, bound=None, attempts={attempt_id}
         )
@@ -1154,7 +1401,7 @@ class SharedEnvironmentAllocations:
                 allocation_session_id=record.allocation_session_id,
                 agent_name=request.agent_name,
                 generation=generation,
-                workflow_owner=True,
+                workflow_owner=workflow_owner,
             )
             binding = result.environment.binding
             try:
@@ -1192,6 +1439,104 @@ class SharedEnvironmentAllocations:
         entry.bound = bound
         return entry
 
+    async def _create_allocation(
+        self,
+        key: SharedAllocationKey,
+        factory: EnvironmentFactory,
+        request: EnvironmentFactoryRequest,
+        record: SharedAllocationRecord,
+        *,
+        interrupted_plain_create: bool = False,
+    ) -> tuple[EnvironmentFactoryResult, SharedAllocationRecord]:
+        """Ask the factory for the record's allocation, recoverably when it can.
+
+        ``interrupted_plain_create`` means an earlier attempt left the record
+        mid-create with no intent, so its creation went through plain
+        ``create()`` under this identity (an older Cayu did that for every
+        factory). That create is retried first, so it adopts what the earlier
+        one made instead of leaking it under a new intent's name; a factory
+        that refuses a plain CREATE never made anything that way.
+
+        A factory that declares an ``allocation_scope`` gets ``create_recoverable``
+        with an intent kept in the record. An intent an earlier attempt left
+        (it crashed, or its create failed) goes back to the factory, which
+        recovers that allocation. When it can't, nothing has been bound to the
+        allocation yet, so it is reaped through ``reap_allocation`` and a fresh
+        one is created under a new identity. Returns the result and the record
+        as it now stands.
+        """
+
+        records = self._records
+        assert records is not None
+        create = self._shared_request(
+            request,
+            record.allocation_session_id,
+            owner_session_id=key.owner_session_id,
+            recorded=True,
+            ownership_epoch=record.claim_generation,
+        )
+        scope = factory.allocation_scope(create)
+        if scope is not None and type(scope) is not EnvironmentAllocationScope:
+            raise TypeError(
+                "EnvironmentFactory.allocation_scope must return EnvironmentAllocationScope or None."
+            )
+        if scope is None:
+            if record.allocation_intent is not None:
+                raise RuntimeError(
+                    f"Environment {key.environment_name!r} has an incomplete recoverable "
+                    "shared allocation, but its factory no longer declares an allocation scope."
+                )
+            result = await factory.create(create)
+            _require_result(result)
+            return result, record
+        if interrupted_plain_create and record.allocation_intent is None:
+            try:
+                result = await factory.create(create)
+            except EnvironmentAllocationUnsupportedError:
+                pass
+            else:
+                _require_result(result)
+                return result, record
+        context = SharedAllocationIntentContext.open(records, record, scope)
+        recovering = context.state is not EnvironmentAllocationState.UNPREPARED
+        try:
+            result = await factory.create_recoverable(create, context)
+        except SharedAllocationClaimLost:
+            raise
+        except Exception as error:
+            if not recovering:
+                # The intent stays in the record: a retry recovers it, and
+                # recovery reaps it if nothing does.
+                raise
+            _LOGGER.warning(
+                "Recovering the interrupted creation of environment %r's shared allocation "
+                "failed (%s); reaping it and creating a new one.",
+                key.environment_name,
+                type(error).__name__,
+            )
+            await factory.reap_allocation(create, context)
+            if context.state is not EnvironmentAllocationState.REAPED:
+                raise RuntimeError(
+                    f"Environment {key.environment_name!r} couldn't recover or reap the "
+                    "interrupted creation of its shared allocation; it is kept for a retry."
+                ) from error
+            record = await records.replace_with_fresh(key.record_id, context.record)
+            create = self._shared_request(
+                request,
+                record.allocation_session_id,
+                owner_session_id=key.owner_session_id,
+                recorded=True,
+                ownership_epoch=record.claim_generation,
+            )
+            context = SharedAllocationIntentContext.open(records, record, scope)
+            result = await factory.create_recoverable(create, context)
+        _require_result(result)
+        if context.state is not EnvironmentAllocationState.ACKNOWLEDGED:
+            raise RuntimeError(
+                "Recoverable environment factory returned before provider acknowledgement."
+            )
+        return result, context.record
+
     async def _release_recorded(
         self, owner_session_id: str, claimant: _Claimant, outcome: str
     ) -> list[Exception]:
@@ -1213,7 +1558,8 @@ class SharedEnvironmentAllocations:
         failures: list[Exception] = []
         for record_id, record in snapshot.records.items():
             if (
-                record.allocation_session_id in held
+                record.owner_session_id != owner_session_id
+                or record.allocation_session_id in held
                 or record_id in creating
                 or not record.reconnectable
             ):
@@ -1366,11 +1712,134 @@ class SharedEnvironmentAllocations:
                 await binding.finalize(entry.bound, outcome=outcome)
             finally:
                 finalization_disposal_checkpoint.reset(token)
+            if await self._keep_for_resume(entry, binding, outcome):
+                # The binding left the allocation in place for the owner to
+                # resume (Lambda MicroVM suspends an interrupted one), so its
+                # record stays, holding the binding state this release left.
+                return
+            if not await self._dispose_what_finalize_kept(entry, outcome):
+                # Its disposal isn't confirmed, so the record keeps the
+                # allocation owned, as an orphan: recovery and a hand release
+                # retry the disposal, and a resumed owner, which never claims
+                # an orphan, starts a fresh allocation instead.
+                await self._orphan_record(entry)
+                return
         elif entry.result.release is not None:
             await entry.result.release(EnvironmentFactoryReleaseAction.DISCARD)
         elif (runner := entry.environment.runner) is not None:
             await runner.close()
         await self._forget_record(entry)
+
+    async def _keep_for_resume(
+        self, entry: _SharedAllocation, binding: WorkspaceBinding, outcome: str
+    ) -> bool:
+        """Keep an interrupted owner's allocation and its record for the owner's resume.
+
+        Only an interruption can leave an allocation for its owner, which may
+        resume; any other outcome ends the scope. The record must outlive this
+        process and be reachable by RECONNECT, the factory must not prove the
+        allocation gone, and the binding must still describe it after finalize
+        (a binding that disposed of it, as Docker coding removes its container,
+        no longer can). The record then takes the binding state this finalize
+        left, so a resumed copy-back compares against what the interrupted one
+        published, not against the baselines from before it.
+        """
+
+        record = entry.record
+        if (
+            outcome != "interrupted"
+            or record is None
+            or self._records is None
+            or self._process_local_store()
+            or not record.reconnect_metadata
+            or record.disposal_state is not None
+            or entry.bound is None
+        ):
+            return False
+        binding_state = record.binding_state
+        if binding_state is not None:
+            binding_state = _binding_recovery_state(binding, entry.bound)
+            if binding_state is None:
+                return False
+        reconnect = EnvironmentFactoryRequest(
+            session_id=record.allocation_session_id,
+            agent_name=record.agent_name,
+            environment_name=record.environment_name,
+            operation=EnvironmentFactoryOperation.RECONNECT,
+            reconnect_metadata=record.reconnect_metadata,
+            ownership_epoch=record.claim_generation,
+        )
+        if await _positively_disposed(entry.factory, reconnect):
+            return False
+        try:
+            entry.record = await self._records.update(
+                entry.key.record_id,
+                record,
+                binding_state=binding_state,
+                kept_for_resume=True,
+            )
+        except SharedAllocationClaimLost:
+            # A newer attempt took the allocation over meanwhile; it is that
+            # attempt's to keep or release now.
+            return True
+        return True
+
+    async def _orphan_record(self, entry: _SharedAllocation) -> None:
+        record = entry.record
+        if record is None or self._records is None:
+            return
+        try:
+            await self._records.orphan(entry.key.record_id, record)
+        except Exception as error:
+            _LOGGER.warning(
+                "Keeping the record of environment %r's shared allocation, whose disposal "
+                "isn't confirmed, as an orphan failed (%s).",
+                entry.key.environment_name,
+                type(error).__name__,
+            )
+
+    async def _dispose_what_finalize_kept(self, entry: _SharedAllocation, outcome: str) -> bool:
+        """Dispose of a recorded allocation an interrupted finalize may have kept.
+
+        A binding may keep its allocation on ``interrupted`` so an ordinary
+        session can resume it (Lambda MicroVM suspends the MicroVM). A shared
+        allocation's record is forgotten once its owner releases it, so nothing
+        would own what was kept: unless the factory proves it gone, reconnect
+        and discard it, as recovery would. Returns False when that disposal
+        failed or can't be confirmed (the binding may have disposed of it
+        already, or the provider may be briefly unreachable); the caller then
+        keeps the record so the disposal can be retried.
+        """
+
+        record = entry.record
+        if (
+            outcome != "interrupted"
+            or record is None
+            or not record.reconnect_metadata
+            or record.disposal_state is not None
+        ):
+            return True
+        request = EnvironmentFactoryRequest(
+            session_id=record.allocation_session_id,
+            agent_name=record.agent_name,
+            environment_name=record.environment_name,
+            operation=EnvironmentFactoryOperation.RECONNECT,
+            reconnect_metadata=record.reconnect_metadata,
+            ownership_epoch=record.claim_generation,
+        )
+        if await _positively_disposed(entry.factory, request):
+            return True
+        try:
+            return await _dispose_recorded(entry.factory, record, self._records)
+        except Exception as error:
+            _LOGGER.warning(
+                "After the interrupted release of environment %r's shared allocation, "
+                "disposing of anything its binding kept failed (%s); its record is kept "
+                "as an orphan so recovery or a hand release can retry.",
+                entry.key.environment_name,
+                type(error).__name__,
+            )
+            return False
 
     async def _still_holds(self, entry: _SharedAllocation) -> bool:
         record = entry.record
@@ -1492,25 +1961,35 @@ class SharedEnvironmentAllocations:
         """Dispose of recorded allocations of ``owner_session_id`` that no run can use.
 
         That is every orphan (left by an attempt that couldn't reconnect, or by
-        a failed creation), and every record once the run's newest attempt has
-        completed. A record whose run can still resume is left alone, and so is
-        anything this process holds. Returns how many were disposed of.
+        a failed creation), and every record once the owner has ended: a
+        workflow run whose newest attempt journaled its completion, or an agent
+        session that completed or failed (a close or an abandonment fails it).
+        A record whose owner can still resume is left alone, and so is anything
+        this process holds. Returns how many were disposed of.
         ``recover_incomplete_sessions`` calls it for each session it inspects.
         """
 
         records = self._records
         if records is None:
             return 0
-        owner = await self._session_store.load(owner_session_id)
-        if owner is None or owner.provider_name != _WORKFLOW_JOURNAL_PROVIDER:
-            # Only workflow runs record their shared allocations.
-            return 0
         snapshot = await records.load(owner_session_id)
         if snapshot is None or not (snapshot.records or snapshot.orphans):
             return 0
-        candidates = list(snapshot.orphans.values())
+        # Read after the snapshot: a run that claimed a record before it was
+        # read is already running, and one that claims after changes the claim,
+        # so ``mark_reaping`` refuses the record.
+        owner = await self._session_store.load(owner_session_id)
+        if owner is None:
+            return 0
+
+        def owned(record: SharedAllocationRecord) -> bool:
+            # A fork starts from a copy of its source's checkpoint, records
+            # included; those still belong to the source.
+            return record.owner_session_id == owner_session_id
+
+        candidates = [record for record in snapshot.orphans.values() if owned(record)]
         if await self._owner_ended(owner):
-            candidates.extend(snapshot.records.values())
+            candidates.extend(record for record in snapshot.records.values() if owned(record))
         held = self._held_allocation_ids()
         reaped = 0
         for record in candidates:
@@ -1526,7 +2005,7 @@ class SharedEnvironmentAllocations:
                 continue
             async with keeping_disposal_lease(records, fenced) as hold:
                 try:
-                    disposed = await _dispose_recorded(factory, hold.record)
+                    disposed = await _dispose_recorded(factory, hold.record, records)
                 except Exception as error:
                     _LOGGER.warning(
                         "Disposing of a recorded shared allocation of %r failed (%s); "
@@ -1550,29 +2029,62 @@ class SharedEnvironmentAllocations:
         return reaped
 
     async def _owner_ended(self, owner: Session) -> bool:
-        """Whether the workflow run's newest attempt has journaled its completion."""
+        """Whether no run of the owner will use its recorded allocations again."""
 
-        owner_session_id = owner.id
+        if owner.provider_name != _WORKFLOW_JOURNAL_PROVIDER:
+            # An agent session's run ends its scope at its terminal event; a
+            # record is left only by a crash. An interrupted or pending session
+            # can still continue and reconnect, so only an ended one is reaped.
+            return owner.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}
         workflow_name = owner.metadata.get("cayu.workflow")
         if type(workflow_name) is not str:
             return False
         # Imported here: the workflow package imports the runtime.
-        from cayu.workflows.journal import EventStoreJournal
-
-        latest = await EventStoreJournal(
-            self._session_store, owner_session_id, workflow_name
-        ).latest_attempt_id()
-        if latest is None:
-            return False
-        completions = await self._session_store.query_events(
-            EventQuery(
-                session_id=owner_session_id,
-                event_type=EventType.WORKFLOW_COMPLETED,
-                order_by=EventOrder.SEQUENCE_DESC,
-                limit=16,
-            )
+        from cayu.workflows.journal import (
+            EventStoreJournal,
+            WorkflowJournalContext,
+            WorkflowJournalRunEnd,
         )
-        return any(record.event.payload.get("attempt_id") == latest for record in completions)
+
+        if await EventStoreJournal(self._session_store, owner.id, workflow_name).run_ended():
+            return True
+        # A custom journal keeps its attempts elsewhere; ask the journals that
+        # this process's workflows of that name use, when they can tell.
+        for factory in tuple(self._workflow_journals.get(workflow_name, ())):
+            try:
+                journal = factory(
+                    WorkflowJournalContext(
+                        session_store=self._session_store,
+                        session_id=owner.id,
+                        workflow_name=workflow_name,
+                        emit_events=_refuse_journal_writes,
+                    )
+                )
+                if isinstance(journal, WorkflowJournalRunEnd) and await journal.run_ended() is True:
+                    return True
+            except Exception as error:
+                _LOGGER.warning(
+                    "Asking the journal of workflow run %s whether it ended failed (%s); "
+                    "its shared allocations are kept.",
+                    owner.id,
+                    type(error).__name__,
+                )
+        return False
+
+    def register_workflow_journal(
+        self, workflow_name: str, journal_factory: Callable[[Any], Any]
+    ) -> None:
+        """Let recovery ask a custom journal of ``workflow_name`` whether a run ended.
+
+        ``WorkflowBase`` calls this when it is given a ``journal_factory``. The
+        newest few distinct factories per workflow name are kept.
+        """
+
+        factories = self._workflow_journals.setdefault(workflow_name, [])
+        if any(existing is journal_factory for existing in factories):
+            return
+        factories.append(journal_factory)
+        del factories[:-_MAX_JOURNALS_PER_WORKFLOW]
 
     # Copy-back after a step ----------------------------------------------
 
@@ -1929,6 +2441,22 @@ class SharedEnvironmentAllocations:
         return tuple(entry.key for entry in self._entries())
 
 
+def _creates_recoverably(factory: EnvironmentFactory, request: EnvironmentFactoryRequest) -> bool:
+    """Whether ``factory`` declares an allocation scope for a CREATE like ``request``."""
+
+    return (
+        factory.allocation_scope(
+            replace(
+                request,
+                operation=EnvironmentFactoryOperation.CREATE,
+                reconnect_metadata={},
+                replacement_predecessor={},
+            )
+        )
+        is not None
+    )
+
+
 async def _create_shared(
     factory: EnvironmentFactory, request: EnvironmentFactoryRequest
 ) -> EnvironmentFactoryResult:
@@ -1943,6 +2471,13 @@ async def _create_shared(
             "own identity. Give it allocation_scope='session' so each session gets "
             "its own."
         ) from error
+
+
+async def _refuse_journal_writes(events: list[Any]) -> list[Any]:
+    """The event emitter of a journal recovery only reads from."""
+
+    del events
+    raise RuntimeError("Recovery reads a workflow journal; it never writes to it.")
 
 
 def _pending_copy_backs(entry: _SharedAllocation) -> set[str]:
@@ -2025,23 +2560,42 @@ async def _discard_resources(result: EnvironmentFactoryResult) -> bool:
     return False
 
 
-async def _dispose_recorded(factory: EnvironmentFactory, record: SharedAllocationRecord) -> bool:
+async def _dispose_recorded(
+    factory: EnvironmentFactory,
+    record: SharedAllocationRecord,
+    records: SharedAllocationRecords | None = None,
+) -> bool:
     """Dispose of a recorded allocation that no run will use again, without copying back.
 
-    A reconnectable one goes through the factory's RECONNECT path and is
-    discarded. Anything else can only be disposed of from the metadata of the
-    result that created it, through ``discard_unreachable_allocation``; a
-    factory that can't leaves it to lapse (a brokered sandbox's lease does).
+    One whose creation never finished but left an allocation intent is reaped
+    through the factory's ``reap_allocation``, as an ordinary session's
+    unpublished allocation is. A reconnectable one goes through the factory's
+    RECONNECT path and is discarded. Anything else can only be disposed of from
+    the metadata of the result that created it, through
+    ``discard_unreachable_allocation``, or through ``reap_allocation`` when its
+    creation left an intent; a factory that can do neither leaves it to lapse
+    (a brokered sandbox's lease does).
     """
 
     request = EnvironmentFactoryRequest(
         session_id=record.allocation_session_id,
         agent_name=record.agent_name,
         environment_name=record.environment_name,
+        ownership_epoch=record.claim_generation,
         # Events about the allocation (a broker's grant revocations) belong on
         # the run that owned it; its own identity isn't a session.
         event_session_id=record.owner_session_id,
     )
+
+    if (
+        records is not None
+        and record.allocation_intent is not None
+        and not record.reconnect_metadata
+        and record.disposal_state is None
+    ):
+        context = SharedAllocationIntentContext.open(records, record)
+        await factory.reap_allocation(request, context)
+        return context.state is EnvironmentAllocationState.REAPED
     if record.reconnect_metadata:
         reconnect = replace(
             request,
@@ -2060,13 +2614,10 @@ async def _dispose_recorded(factory: EnvironmentFactory, record: SharedAllocatio
         request, record.result_metadata
     ):
         return True
-    else:
-        _LOGGER.info(
-            "Environment %r can't dispose of an unreachable shared allocation; it is "
-            "left to lapse.",
-            record.environment_name,
-        )
-
+    _LOGGER.info(
+        "Environment %r can't dispose of an unreachable shared allocation; it is left to lapse.",
+        record.environment_name,
+    )
     return False
 
 

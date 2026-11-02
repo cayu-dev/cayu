@@ -221,7 +221,12 @@ async def release_shared_allocation(
         refusal = _copy_back_refusal(record, orphan=orphan)
         if refusal is not None:
             raise SharedAllocationReleaseRefused("not_copyable", refusal)
-    elif not (record.reconnect_metadata or record.result_metadata or record.disposal_state):
+    elif not (
+        record.reconnect_metadata
+        or record.result_metadata
+        or record.disposal_state
+        or record.allocation_intent
+    ):
         raise SharedAllocationReleaseRefused(
             "not_disposable",
             f"The allocation of environment {environment!r} was recorded before its factory "
@@ -274,7 +279,7 @@ async def _release_held(
             assert record_id is not None
             message = await _copy_back(registry, records, factory, record_id, hold)
         elif message is None:
-            if not await _dispose_recorded(factory, hold.record):
+            if not await _dispose_recorded(factory, hold.record, records):
                 raise RuntimeError(
                     f"Environment {environment!r} couldn't confirm that the allocation was "
                     "disposed of. Its record is kept, fenced so no run reattaches to it; "
@@ -523,6 +528,7 @@ async def _copy_back(
         environment_name=environment,
         operation=EnvironmentFactoryOperation.RECONNECT,
         reconnect_metadata=fenced.reconnect_metadata,
+        ownership_epoch=fenced.claim_generation,
         # The allocation's identity isn't a session; events about it belong on
         # the run that owned it.
         event_session_id=fenced.owner_session_id,

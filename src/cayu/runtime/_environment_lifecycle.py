@@ -899,7 +899,8 @@ class EnvironmentLifecycle:
             session_store=session_store
         )
         self.shared_allocations.bind_session_presence(
-            lambda session_id: session_id in self._active_environment_setups
+            lambda session_id: session_id in self._active_environment_setups,
+            session_run_here=self._session_run_here,
         )
         # A workflow run's shared allocations are recorded in its checkpoint,
         # through the same runtime store as every other allocation record.
@@ -938,6 +939,15 @@ class EnvironmentLifecycle:
         self._process_local_store = False
         if not _session_store_survives_restart(session_store):
             self.declare_process_local_session_store()
+
+    def _session_run_here(self, session_id: str) -> tuple[str, int] | None:
+        """The incarnation and run epoch of the run this process executes for a session."""
+
+        owner = self._active_environment_setups.get(session_id)
+        context = None if owner is None else owner.invocation_context
+        if context is None:
+            return None
+        return context.binding.session_instance_id, context.binding.run_epoch
 
     def declare_process_local_session_store(self) -> None:
         """Treat allocation records as ending with this process.

@@ -14,6 +14,7 @@ import shutil
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr
@@ -586,11 +587,17 @@ def test_a_process_whose_attempt_was_taken_over_reclaims_before_reusing_its_sand
             await world.close()
 
     records = asyncio.run(scenario())
-    # A1 created it, B reconnected to it, and A2 reused A1's live handle.
-    assert [request.operation for request in world.sandboxes.requests] == [
+    # A1 created it and B reconnected to it. A2 claimed the record back, but
+    # doesn't reuse A1's live handle: B's reconnect may have taken provider-side
+    # ownership away from it, so A2 reconnects under its own claim generation.
+    requests = world.sandboxes.requests
+    assert [request.operation for request in requests] == [
         EnvironmentFactoryOperation.CREATE,
         EnvironmentFactoryOperation.RECONNECT,
+        EnvironmentFactoryOperation.RECONNECT,
     ]
+    assert [request.ownership_epoch for request in requests] == [1, 2, 3]
+    assert len({request.session_id for request in requests}) == 1
     assert len(world.sandboxes.copy_ins) == 1
     # Only A2, the newest attempt, finalized: one copy-back with everyone's files.
     assert world.sandboxes.finalizations == ["completed"]
@@ -877,3 +884,188 @@ def test_a_command_after_replayed_steps_reconnects_to_the_durable_allocation(tmp
             await world.close()
 
     asyncio.run(scenario())
+
+
+class _Touch(Tool):
+    """Write a file of its own, so parallel steps don't write the same one."""
+
+    spec = ToolSpec(
+        name="touch",
+        parallel_safe=False,
+        workspace_mutation=True,
+        execution_profile_identity=identity("touch"),
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        assert ctx.workspace is not None
+        await ctx.workspace.create_bytes(f"touched-{uuid4().hex}.txt", b"here\n")
+        return ToolResult(content="touched")
+
+
+class _PlanSolveThenTwo(WorkflowBase):
+    """Plan, optionally solve, then two parallel steps on the shared scope."""
+
+    spec = WorkflowSpec(name="plan-then-solve")
+
+    def __init__(self, app, *, solve=False, pause_after=None) -> None:
+        super().__init__(app)
+        self._solve = solve
+        self._pause_after = pause_after or {}
+
+    async def run(self, session_id):
+        ctx = self.context(session_id)
+        yield await ctx.start()
+        await step(ctx, agent="planner", step_id="plan", prompt="plan", run_options=_SHARED)
+        if (pause := self._pause_after.get("plan")) is not None:
+            await pause()
+        if self._solve:
+            await step(ctx, agent="solver", step_id="solve", prompt="solve", run_options=_SHARED)
+            if (pause := self._pause_after.get("solve")) is not None:
+                await pause()
+        await asyncio.gather(
+            step(ctx, agent="toucher", step_id="left", prompt="left", run_options=_SHARED),
+            step(ctx, agent="toucher", step_id="right", prompt="right", run_options=_SHARED),
+        )
+        yield await ctx.completed()
+
+
+def _hold_first_reclaim(monkeypatch) -> list[str]:
+    """Hold the first reclaim's claim a moment, so a second reclaim lands in the gap."""
+
+    original = SharedAllocationRecords.claim
+    held: list[str] = []
+
+    async def claim(self, **kwargs):
+        result = await original(self, **kwargs)
+        if kwargs.get("keep_allocation_session_id") is not None and not held:
+            held.append(kwargs["attempt_id"])
+            await asyncio.sleep(0.3)
+        return result
+
+    monkeypatch.setattr(SharedAllocationRecords, "claim", claim)
+    return held
+
+
+def _record_handed_out(app: CayuApp) -> list[object]:
+    """The entries the registry hands to sessions from now on."""
+
+    registry = app._environment_lifecycle.shared_allocations
+    original = registry._acquire
+    handed: list[object] = []
+
+    async def acquire(*args, **kwargs):
+        entry = await original(*args, **kwargs)
+        handed.append(entry)
+        return entry
+
+    registry._acquire = acquire
+    return handed
+
+
+def _gate():
+    reached, release = asyncio.Event(), asyncio.Event()
+
+    async def pause():
+        reached.set()
+        await release.wait()
+        raise RuntimeError("this attempt fails after it was taken over")
+
+    return reached, release, pause
+
+
+def test_parallel_steps_of_a_new_attempt_reclaiming_together_keep_the_live_handle(
+    tmp_path, monkeypatch
+):
+    """Two sessions of one newer attempt reclaim a live entry at once; neither drops it."""
+
+    world = _World(tmp_path)
+
+    async def scenario():
+        try:
+            app = world.app(
+                _call("write_plan"), _done(), _call("touch"), _call("touch"), _done(), _done()
+            )
+            app.register_agent(AgentSpec(name="toucher", model="scripted"), tools=[_Touch()])
+            paused, _release, pause = _gate()
+            a1 = asyncio.ensure_future(
+                _drain(_PlanSolveThenTwo(app, pause_after={"plan": pause}).execute("run-par"))
+            )
+            await asyncio.wait_for(paused.wait(), 30)
+            held = _hold_first_reclaim(monkeypatch)
+            handed = _record_handed_out(app)
+            # A2 starts in the same process, which holds A1's live sandbox; its
+            # two parallel steps both reclaim it.
+            events = [event async for event in _PlanSolveThenTwo(app).run("run-par")]
+            a1.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await a1
+            return events, held, handed
+        finally:
+            await world.close()
+
+    events, held, handed = asyncio.run(scenario())
+    assert events[-1].type == EventType.WORKFLOW_COMPLETED, events[-1].payload
+    assert held, "the reclaim race was not exercised"
+    # No other process ever held it, so neither session reconnected: one
+    # creation, one copy-in, one finalization, and both got the same handle.
+    assert [request.operation for request in world.sandboxes.requests] == [
+        EnvironmentFactoryOperation.CREATE
+    ]
+    assert len(handed) == 2 and handed[0] is handed[1]
+    assert len(world.sandboxes.copy_ins) == 1
+    assert world.sandboxes.finalizations == ["completed"]
+
+
+def test_parallel_steps_reclaiming_after_a_takeover_share_one_fresh_handle(tmp_path, monkeypatch):
+    """A1 creates, B takes over in another process, then A2's two parallel steps reclaim at once."""
+
+    world = _World(tmp_path)
+
+    async def scenario():
+        try:
+            first = world.app(
+                _call("write_plan"), _done(), _call("touch"), _call("touch"), _done(), _done()
+            )
+            first.register_agent(AgentSpec(name="toucher", model="scripted"), tools=[_Touch()])
+            a1_reached, _a1_release, a1_pause = _gate()
+            a1_run = _PlanSolveThenTwo(first, solve=True, pause_after={"plan": a1_pause})
+            a1 = asyncio.ensure_future(_drain(a1_run.execute("run-tp")))
+            await asyncio.wait_for(a1_reached.wait(), 30)
+            # B resumes the run in a second process and takes the sandbox over.
+            second = world.app(_call("solve"), _done())
+            b_reached, b_release, b_pause = _gate()
+            b_run = _PlanSolveThenTwo(second, solve=True, pause_after={"solve": b_pause})
+            b = asyncio.ensure_future(_drain(b_run.execute("run-tp")))
+            await asyncio.wait_for(b_reached.wait(), 30)
+            held = _hold_first_reclaim(monkeypatch)
+            handed = _record_handed_out(first)
+            # A2 runs back in the first process: both of its parallel steps
+            # reclaim A1's stale handle at once.
+            events = [event async for event in _PlanSolveThenTwo(first, solve=True).run("run-tp")]
+            b_release.set()
+            with pytest.raises(RuntimeError, match="taken over"):
+                await b
+            a1.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await a1
+            assert await first.close_idle_environment_resources(timeout_s=5) is True
+            assert await second.close_idle_environment_resources(timeout_s=5) is True
+            return events, held, handed, await _records(first, "run-tp")
+        finally:
+            await world.close()
+
+    events, held, handed, records = asyncio.run(scenario())
+    assert events[-1].type == EventType.WORKFLOW_COMPLETED, events[-1].payload
+    assert held, "the reclaim race was not exercised"
+    # A1 created it and B reconnected. A2 reconnected once, under its own claim
+    # generation, and both of its parallel steps got that one fresh handle,
+    # never the stale one the first reclaim dropped.
+    assert [request.operation for request in world.sandboxes.requests] == [
+        EnvironmentFactoryOperation.CREATE,
+        EnvironmentFactoryOperation.RECONNECT,
+        EnvironmentFactoryOperation.RECONNECT,
+    ]
+    assert len(handed) == 2 and handed[0] is handed[1]
+    assert world.sandboxes.finalizations == ["completed"]
+    assert len(list(world.source.glob("touched-*.txt"))) == 2
+    assert records == {}

@@ -801,11 +801,12 @@ class SessionRecovery:
     async def _reap_shared_allocations(
         self, result: IncompleteSessionRecoveryResult
     ) -> IncompleteSessionRecoveryResult:
-        """Dispose of shared allocations a workflow run recorded that it can't use any more.
+        """Dispose of shared allocations a scope's owner recorded that it can't use any more.
 
-        Orphans (allocations a resumed run couldn't reconnect to) always go, and
-        so does everything once the run's newest attempt has completed. A run
-        that can still resume keeps its allocation.
+        The owner is a workflow run or an agent session. Orphans (allocations a
+        resumed owner couldn't reconnect to) always go, and so does everything
+        once the owner has ended. An owner that can still resume keeps its
+        allocation.
         """
 
         reaped = await self._environment_lifecycle.shared_allocations.reap_recorded(
@@ -818,7 +819,7 @@ class SessionRecovery:
                 "actions": (*result.actions, IncompleteSessionRecoveryAction.REAPED_ALLOCATION),
                 "message": (
                     f"{result.message} Disposed of {reaped} shared environment "
-                    "allocation(s) the workflow run left behind."
+                    "allocation(s) the session's shared scope left behind."
                 ),
             }
         )

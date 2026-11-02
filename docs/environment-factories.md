@@ -1170,15 +1170,17 @@ How it works:
 
 - The runtime resolves the scope once, before it calls the factory, so every
   factory gets it without changes. The first session of a scope gets the
-  allocation from the factory's ordinary `create()`, under a request whose
-  `session_id` is the scope's owner (the workflow run id for `parent` steps)
-  plus a `.shared-<hex>` suffix. Docker coding and the brokered sandbox key
-  their allocation off that `session_id`, so it is one container or one
-  sandbox per scope. A workflow run records that identity durably before the
-  factory is called (see "Crashes and resumed runs" below), so a resumed run
-  asks for the same one; a retry after a failed `create()` does too, so it
-  adopts or cleans up what the failed attempt left. The factory's own
-  binding then copies the source in once.
+  allocation from the factory, under a request whose `session_id` is the
+  scope's owner (the workflow run id for `parent` steps) plus a `.shared-<hex>`
+  suffix: through `create_recoverable` when the factory declares an
+  `allocation_scope` (Docker coding does), otherwise through its ordinary
+  `create()`. Docker coding and the brokered sandbox key their allocation off
+  that `session_id`, so it is one container or one sandbox per scope. The
+  owner records that identity durably before the factory is called (see
+  "Crashes and resumed runs" below), so a resumed run asks for the same one; a
+  retry after a failed create does too, so it adopts or cleans up what the
+  failed attempt left. The factory's own binding then copies the source in
+  once.
 - Every session of the scope, the first one included, attaches to that live
   allocation: its tools run on the same runner and see the same workspace,
   including files the previous step left and anything it installed. A
@@ -1300,13 +1302,13 @@ These still refuse to share, and say why in the error:
   and revoked when the owner releases it, not when a step ends; a grant with a
   `ttl_seconds` that expires mid-run fails closed, since no step can renew
   another session's grants.
-- **Process-external allocations created only through `create_recoverable`.**
-  A virtual-egress factory on an adapter whose resources live outside the
-  process (Lambda MicroVM) refuses a plain `create()`, because only a
-  session's durable allocation intent makes it crash-safe. A shared
-  allocation is created through `create()` under the scope's own identity, so
-  these fail with an error that says so. Lambda MicroVM's egress authority
-  would share; its creation path doesn't yet.
+A factory whose resources live outside the process (Lambda MicroVM, the
+virtual-egress one included) refuses a plain `create()`, because only a
+durable allocation intent makes it crash-safe. It shares anyway: a shared
+allocation of such a factory is created through `create_recoverable`, with its
+intent kept in the owner's shared record (see "Crashes and resumed runs"), so
+the virtual-egress Lambda factory's egress authority shares like any other that
+follows the allocation.
 
 A deferred-materialization factory (Docker coding with `deferred=True`) shares
 too. Its runner is created and bound once, when the scope's allocation is
@@ -1418,31 +1420,35 @@ doesn't have yet.
 
 #### Crashes and resumed runs
 
-A workflow run records each allocation its steps share in the run's own
-checkpoint (the workflow journal anchor's), under one record per scope and
-environment. The record is written before the factory is called and names
-the allocation's identity, so it exists before the allocation does. Once the
-factory returns, the record gets the result's reconnect metadata and its
-non-secret metadata, and once the binding has copied the source in, the
+The scope's owner records each allocation its sessions share in the owner's
+own checkpoint, under one record per scope and environment. The owner is the
+workflow run (the workflow journal anchor) for workflow steps, or the agent
+session whose subagents share its sandbox. An agent session records it only
+when the session store outlives the process, or when the factory creates only
+recoverably (below); otherwise its scope stays process-local, since nothing
+could resume it elsewhere. The record is written before the factory is called
+and names the allocation's identity, so it exists before the allocation does.
+Once the factory returns, the record gets the result's reconnect metadata and
+its non-secret metadata, and once the binding has copied the source in, the
 binding's private recovery state: the same bounded state completion recovery
 uses to retry a copy-back without copying in again.
 
-When the run resumes in another process (a new attempt of the same run id,
-after a crash or a deploy), its first step that shares the scope finds the
-record:
+When the owner resumes in another process (a new attempt of the same workflow
+run id, or a new run of the same agent session, after a crash or a deploy),
+its first session that shares the scope finds the record:
 
 - If the factory published reconnect metadata and any binding gave its
-  recovery state (Docker coding does both; an unbound environment needs no binding state), the step reconnects through the
+  recovery state (Docker coding does both; an unbound environment needs no binding state), the session reconnects through the
   factory's RECONNECT path, under the recorded identity, and the binding
   rebuilds its bound workspace from the recorded state. Nothing is copied in
-  again: the earlier steps' files, and anything they installed, are still
-  there. Copy-back and disposal still happen once, when the run releases the
-  allocation. If the factory proves the allocation gone
-  (`is_allocation_disposed`), the step starts a fresh one; any other reconnect
-  failure fails the step and keeps the record, since the allocation may hold
-  the run's only copy of its work.
-- If not (the brokered sandbox: it can't be reattached), the resumed run gets
-  a fresh allocation, and **work that existed only in the old sandbox is
+  again: the earlier steps' files (or the subagents' files), and anything
+  they installed, are still there. Copy-back and disposal still happen once,
+  when the owner releases the allocation. If the factory proves the
+  allocation gone (`is_allocation_disposed`), the session starts a fresh one;
+  any other reconnect failure fails the session and keeps the record, since
+  the allocation may hold the only copy of the work.
+- If not (the brokered sandbox: it can't be reattached), the resumed owner
+  gets a fresh allocation, and **work that existed only in the old sandbox is
   lost**. The old one is kept as an orphan record. Its lease lapses on its own;
   `recover_incomplete_sessions` destroys it sooner, through the factory's
   `discard_unreachable_allocation(request, metadata)` hook, which the brokered
@@ -1455,59 +1461,132 @@ record:
   A resumed run finishes that disposal directly, including immutable-input
   cleanup, instead of trying to reconnect to a container already removed.
 
-Ownership is fenced by the workflow's attempt fence. Each record names the
-attempt that holds it, its journal sequence, and a claim generation. The
-checkpoint transaction refuses a claim older than the recorded attempt,
-so a stale claimant cannot temporarily displace a newer owner. Every change is a
-compare-and-set inside one checkpoint transform. An attempt claims the record
-only between two checks that it is still the run's newest attempt, and puts
-the previous claim back if the second check fails. Before it finalizes or
-discards, a process checks that one of its attempts still holds the record;
-if a newer attempt in another process took it over, the older one lets go of
-its handles without copying back or disposing of anything. Two processes
-resuming the same run therefore never both own the allocation, though an
-older attempt's step that is still running when a newer attempt takes over
-keeps running in the sandbox until its next fence check, as workflow steps
-already do.
+A crash can also come while the factory is still creating the allocation. A
+factory that declares an `allocation_scope` (Docker coding, or an egress
+adapter whose allocation is process-external) creates a shared allocation
+through `create_recoverable`, the same crash-safe path an ordinary session's
+allocation takes. Its allocation intent (prepared, dispatched, acknowledged,
+reaping, reaped) is kept in the shared record instead of a session's own
+checkpoint, and every transition is a compare-and-set that also checks the
+record's claim. The intent names the allocation's `.shared-<hex>` identity, so
+the factory sees its request and intent agree as it does for a session. Such a
+factory never gets a plain CREATE, so one that refuses it (a recoverable-only,
+process-external allocation) can still share. After a crash mid-create:
+
+- The owner's next attempt passes the recorded intent back to
+  `create_recoverable`, which recovers the allocation the crashed attempt
+  dispatched (Docker coding finds its container by the intent's name).
+- If the factory can't recover it, nothing has been bound to it yet, so the
+  attempt hands the intent to `reap_allocation`, which removes it, and starts
+  a fresh allocation under a new identity. If that reap fails too, the session
+  fails and the record keeps the intent for a retry.
+- `recover_incomplete_sessions` reaps an interrupted creation, and any orphan
+  whose creation left an intent but no reconnect metadata, through the same
+  `reap_allocation` once nothing will resume it.
+
+A factory that doesn't declare an `allocation_scope` still creates through
+`create()`. A crash mid-create then leaves a record with only its identity: a
+resumed owner asks for the same identity, which adopts what the crashed
+creation made only if the factory finds resources by that name; otherwise
+what it made is left to lapse.
+
+Ownership is fenced by the owner's attempt fence. For a workflow run that is
+the workflow attempt. For an agent session it is one run epoch of the session
+incarnation, and the fence checks that the session hasn't started a newer run
+since. Each record names the attempt that holds it, its order (a workflow
+attempt's journal sequence, or the session's run epoch), and a claim
+generation. The checkpoint transaction refuses a claim older than the
+recorded attempt, so a stale claimant cannot temporarily displace a newer
+owner. Every change is a compare-and-set inside one checkpoint transform. An
+attempt claims the record only between two checks that it is still the
+owner's newest attempt, and puts the previous claim back if the second check
+fails. Before it finalizes or discards, a process checks that one of its
+attempts still holds the record; if a newer attempt in another process took
+it over, the older one lets go of its handles without copying back or
+disposing of anything. When a still newer attempt then runs back in that
+older process, it claims the record and reconnects under its own claim
+generation rather than reusing the process's old handle, since the other
+process's reconnect may have taken provider-side ownership from it (a Lambda
+MicroVM's owner claim) and its steps moved the binding state on. Two processes resuming the same owner therefore never
+both own the allocation, though an older attempt's session that is still
+running when a newer attempt takes over keeps running in the sandbox until
+its next fence check, as workflow steps already do. A custom `WorkflowJournal`
+that keeps its attempt markers outside the session store gives the store no
+journal sequence, so its claims rely on the attempt fence alone.
 
 The requests of a recorded allocation carry `process_local_owner` only when
 the session store ends with the process (the in-memory store), as an ordinary
 session's do. With a durable store, Docker coding never labels the container,
 so `reap_orphaned_docker_coding_containers` never lists it and can't remove a
-container that a resumed run adopted after the crashed process exited. The
+container that a resumed owner adopted after the crashed process exited. The
 durable record is what cleans it up instead:
 
-- `recover_incomplete_sessions` checks each workflow run it inspects (runs
-  are stored as `completed` sessions, so include `completed` in `statuses`).
-  It disposes of every orphan, and of every record once the run's newest
-  attempt has journaled `workflow.completed`, and reports
-  `reaped_allocation`. A reconnectable allocation is reconnected and
-  discarded without copy-back; anything else goes through
-  `discard_unreachable_allocation`. Unconfirmed disposal retains the record for
-  another recovery and is not counted as reaped. A record is fenced as `reaping` before
-  disposal, so a resume that races the reaper starts a fresh allocation
-  instead of reattaching one being removed. The fence is the same renewed
-  disposal lease a hand release takes, and it raises the record's claim
-  generation, so while recovery disposes of an allocation neither a hand
+- `recover_incomplete_sessions` checks each session it inspects (workflow
+  runs are stored as `completed` sessions, so include `completed` in
+  `statuses`). It disposes of every orphan, and of every record once the owner
+  has ended, and reports `reaped_allocation`.
+  - A workflow run has ended once its newest attempt has journaled
+    `workflow.completed`. For a run with a custom journal, recovery also asks
+    the journal factories that `WorkflowBase` objects of that workflow name
+    were built with in this process. A journal that implements the optional
+    `WorkflowJournalRunEnd` capability (`async def run_ended() -> bool`)
+    answers; one without it is treated as resumable, as before, so nothing
+    is reaped for it.
+  - An agent session has ended once it is `completed` or `failed`. A close
+    through `close_session` (or the abandonment sweep finishing one) fails the
+    session and runs this recovery pass, so the close reaps the sandbox. An
+    `interrupted` or `pending` session can still continue, so it keeps its
+    sandbox for its next run.
+
+  A reconnectable allocation is reconnected and discarded without copy-back;
+  an interrupted creation goes through `reap_allocation`; anything else goes
+  through `discard_unreachable_allocation`. Unconfirmed disposal retains the
+  record for another recovery and is not counted as reaped. A record is fenced
+  as `reaping` before disposal, so a resume that races the reaper starts a
+  fresh allocation instead of reattaching one being removed. The fence is the
+  same renewed disposal lease a hand release takes, and it raises the record's
+  claim generation, so while recovery disposes of an allocation neither a hand
   release nor another recovery can take it. Recovery gives the lease up when
   the disposal fails or can't be confirmed, so the next recovery or a release
-  can try again. It leaves alone the allocation of
-  a run that can still resume, and anything this process holds.
-- A run that crashed and is never resumed keeps its allocation, since nothing
-  ends the run. Resume it and let it finish, or release the allocation by
-  hand (see "Releasing a crashed run's allocation by hand" below).
+  can try again. It leaves alone the allocation of an owner that can still
+  resume, and anything this process holds.
+- An agent session's run that ends in its own process releases its scope at
+  its terminal event, whatever the outcome, as before; only a crash leaves a
+  record behind. If the session runs again before recovery reaps that record,
+  the new run reconnects to the recorded sandbox.
+- An interrupted owner (a workflow run whose `execute` was cancelled, or an
+  agent run that was interrupted) finalizes its allocation with `interrupted`.
+  The owner can resume, so with a durable store the release keeps an
+  allocation the binding left in place (Lambda MicroVM suspends the MicroVM)
+  and its record, and it leaves other recorded allocations of the run alone.
+  The kept record takes the binding state that finalize left, so the resumed
+  run reconnects to the allocation and its copy-back compares against what
+  the interrupted one published. The release forgets the record instead when
+  the factory proves the allocation gone (`is_allocation_disposed`), or when
+  the binding can no longer describe it after finalize (Docker coding removes
+  its container); then, unless the factory proves it gone, it reconnects to
+  the allocation and discards it, as recovery does, and keeps the record as
+  an orphan if that disposal fails or can't be confirmed. A resumed run that
+  can't reconnect to a kept allocation starts a fresh one, and work that
+  existed only in the old one is lost; the old one stays owned as an orphan,
+  so recovery or a hand release can dispose of it. A resumed owner never
+  claims an orphan. With a store that ends with the process, nothing could
+  resume the run, so the release disposes of everything as for any other
+  outcome.
+- An owner that crashed and is never resumed keeps its allocation, since
+  nothing ends it. Resume a workflow run and let it finish, or release the
+  allocation by hand (see "Releasing a crashed run's allocation by hand"
+  below). Close an agent session that nobody will continue; the close reaps
+  its sandbox.
 
 What is still process-local:
 
-- An agent session that owns a scope (its subagents share it) keeps no
-  durable record. Its requests always carry the process-local owner, so the
-  reaper removes a Docker container after a crash, a brokered sandbox's lease
-  lapses, and the work is lost.
-- A crash while the factory is creating the allocation leaves a record with
-  only its identity. A resumed run asks for the same identity, which Docker
-  coding adopts by container name; for a factory that can't, what the crashed
-  creation made is left to lapse. Recovery drops such a record once the run
-  has ended.
+- An agent session's scope with a session store that ends with the process,
+  unless its factory creates only recoverably. Its requests carry the
+  process-local owner, so the reaper removes a Docker container after a
+  crash, and a brokered sandbox's lease lapses.
+- Recovery can ask a custom journal only through a `WorkflowBase` of that
+  workflow built in the recovering process with that `journal_factory`.
 
 Limits of this version:
 
@@ -1526,19 +1605,13 @@ Limits of this version:
 - Forked sessions don't share. A fork keeps its source's causal budget, but
   its own subagents' `causal_budget` scope stops at the fork, so they never
   join the source's allocation.
-- Factories that allocate a process-external resource, and so declare an
-  `allocation_scope`, don't share yet. Both Lambda MicroVM factories are in
-  this group. The shared path creates a scope's allocation with plain
-  `create()`, and these factories may only be created through
-  `create_recoverable` under a durable intent, so the step fails before any
-  provider call (`LambdaMicroVMEnvironmentFactory` refuses a plain CREATE).
-  To lift this, the shared path has to keep the allocation intent in the
-  workflow run's shared allocation record, call `create_recoverable` with a
-  context over that record, reap an unacknowledged intent from
-  `recover_incomplete_sessions`, and pass the record's claim generation as
-  `ownership_epoch`. The virtual-egress Lambda factory's egress authority
-  already follows its allocation (see "What each session gets as its own"),
-  so only its creation path stands in the way.
+- A factory that allocates a process-external resource, and so declares an
+  `allocation_scope` (both Lambda MicroVM factories, the virtual-egress one
+  included), shares through `create_recoverable` with the allocation intent
+  kept in the shared record (see "Crashes and resumed runs" above). Every
+  request for a recorded allocation carries the record's claim generation as
+  `ownership_epoch`, so a provider that fences attaches by epoch refuses an
+  owner that lost the allocation.
 - `unregister_environment` refuses an environment while a shared allocation
   of it is live or being released.
 

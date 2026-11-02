@@ -731,6 +731,12 @@ class WorkflowBase(Workflow):
         self.app = app
         self.spec = copy_workflow_spec(resolved_spec)
         self._journal_factory = journal_factory or _default_journal_factory
+        if journal_factory is not None:
+            # Recovery asks this journal whether a crashed run has ended, so it
+            # can dispose of the sandboxes the run's steps shared.
+            app._environment_lifecycle.shared_allocations.register_workflow_journal(
+                self.spec.name, journal_factory
+            )
 
     async def execute(
         self, session_id: str, *, execution_deadline: ExecutionDeadline | None = None

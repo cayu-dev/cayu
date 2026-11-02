@@ -209,7 +209,11 @@ def test_an_egress_authority_that_belongs_to_each_session_is_refused(tmp_path):
     assert adapter.prepared == []
 
 
-def test_a_process_external_egress_sandbox_says_why_it_cant_share_yet(tmp_path):
+def test_a_shared_process_external_egress_sandbox_needs_create_or_lookup_recovery(tmp_path):
+    # A shared allocation of a process-external sandbox is created through
+    # create_recoverable, under an intent kept in the run's shared record. An
+    # adapter that can't look a dispatched creation up again can't make that
+    # safe, so sharing it is refused before anything is allocated.
     adapter = _ProcessExternalAdapter(tmp_path, runner_kind="lambda-microvm")
     app = _app(adapter)
 
@@ -220,8 +224,8 @@ def test_a_process_external_egress_sandbox_says_why_it_cant_share_yet(tmp_path):
     with pytest.raises(StepError) as raised:
         asyncio.run(scenario())
     message = str(raised.value)
-    assert "only through create_recoverable" in message
-    assert "allocation_scope='session'" in message
+    assert "durable create-or-lookup recovery" in message
+    assert "lambda-microvm" in message
     assert adapter.prepared == []
 
 

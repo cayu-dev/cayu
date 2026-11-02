@@ -11,6 +11,7 @@ from cayu.workflows.journal import EventStoreJournal as EventStoreJournal
 from cayu.workflows.journal import WorkflowJournal as WorkflowJournal
 from cayu.workflows.journal import WorkflowJournalContext as WorkflowJournalContext
 from cayu.workflows.journal import WorkflowJournalReplayEvidence as WorkflowJournalReplayEvidence
+from cayu.workflows.journal import WorkflowJournalRunEnd as WorkflowJournalRunEnd
 from cayu.workflows.journal import WorkflowJournalStepCompletion as WorkflowJournalStepCompletion
 from cayu.workflows.journal import WorkflowStepCompletionSnapshot as WorkflowStepCompletionSnapshot
 from cayu.workflows.journal import (
