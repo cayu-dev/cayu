@@ -51,6 +51,7 @@ from cayu.environments.bindings import (
     BoundWorkspace,
     WorkspaceBinding,
     WorkspaceSnapshot,
+    _binding_copies_back,
     _validate_bind_request,
     _validate_finalize_request,
 )
@@ -70,6 +71,7 @@ from cayu.environments.shared_allocations import (
 )
 from cayu.events import EventType
 from cayu.runtime._shared_allocation_records import (
+    MAX_COPIED_BACK_SESSIONS,
     SharedAllocationClaimLost,
     SharedAllocationRecord,
     SharedAllocationRecords,
@@ -77,6 +79,7 @@ from cayu.runtime._shared_allocation_records import (
     shared_allocation_record_id,
     shared_allocation_session_id,
 )
+from cayu.runtime._shared_allocation_writers import SharedAllocationWriterTurns
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.forks import session_fork_profile_relationship
 from cayu.sessions.records import Session
@@ -99,6 +102,10 @@ _WORKFLOW_JOURNAL_PROVIDER = "cayu.workflow"
 
 class SharedAllocationScopeClosedError(RuntimeError):
     """Raised when a session asks to share an allocation whose owner isn't running here."""
+
+
+class SharedAllocationCopyBackPendingError(RuntimeError):
+    """Raised when a release would dispose of work a failed copy-back after a step left."""
 
 
 __all__ = [
@@ -137,6 +144,14 @@ class SharedAllocationKey:
 class _Attachment:
     session_id: str
     released: bool = False
+    # A copy-back's own attachment, which never waits for the copy-back gate.
+    copy_back: bool = False
+
+
+def _open_gate() -> asyncio.Event:
+    gate = asyncio.Event()
+    gate.set()
+    return gate
 
 
 @dataclass(eq=False)
@@ -157,6 +172,16 @@ class _SharedAllocation:
     # this process that may act on it; None for a process-local allocation.
     record: SharedAllocationRecord | None = None
     attempts: set[str] = field(default_factory=set)
+    # Serializes copy-backs after steps.
+    copy_back_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Closed while a copy-back after a step runs, so no session or command
+    # attaches and writes in the middle of it; set by every detach, so the
+    # copy-back can wait for the ones already attached to leave.
+    copy_back_gate: asyncio.Event = field(default_factory=_open_gate)
+    detached: asyncio.Event = field(default_factory=asyncio.Event)
+    # Step sessions whose copy-back failed in this process and hasn't been
+    # published since; the record holds the durable copy.
+    pending_copy_back: set[str] = field(default_factory=set)
 
     @property
     def environment(self) -> Environment:
@@ -208,6 +233,11 @@ class SharedEnvironmentAllocations:
         self._records: SharedAllocationRecords | None = None
         self._process_local_store: Callable[[], bool] = lambda: True
         self._factory_lookup: Callable[[str], EnvironmentFactory | None] = lambda name: None
+        # Step sessions the workflow asked to copy back after their step, and
+        # the allocations each attached to in this process.
+        self._copy_back_sessions: dict[str, set[SharedAllocationKey]] = {}
+        # The writer turns that steps and commands opting in take, per run.
+        self.writer_turns = SharedAllocationWriterTurns()
 
     def bind_session_presence(self, session_running_here: Callable[[str], bool]) -> None:
         """Tell the registry how to see whether a session's run is live in this process."""
@@ -274,6 +304,18 @@ class SharedEnvironmentAllocations:
 
         self._in_use = True
         self._session_scopes[session_id] = allocation_sharing_scope(scope)
+        self._sessions_by_owner.setdefault(owner_session_id, set()).add(session_id)
+
+    def assign_session_copy_back(self, session_id: str, *, owner_session_id: str) -> None:
+        """Copy ``session_id``'s shared work back after its step, through ``copy_back_session``.
+
+        The workflow layer calls this for a step run with
+        ``StepRunOptions(copy_back="after_step")``. The assignment is dropped
+        when ``owner_session_id`` ends.
+        """
+
+        self._in_use = True
+        self._copy_back_sessions.setdefault(session_id, set())
         self._sessions_by_owner.setdefault(owner_session_id, set()).add(session_id)
 
     async def resolve_key(
@@ -451,6 +493,7 @@ class SharedEnvironmentAllocations:
         self._open_owners.discard(owner_session_id)
         for session_id in self._sessions_by_owner.pop(owner_session_id, ()):
             self._session_scopes.pop(session_id, None)
+            self._copy_back_sessions.pop(session_id, None)
         self._ended_owners[owner_session_id] = run_epoch
         self._ended_owners.move_to_end(owner_session_id)
         while len(self._ended_owners) > _MAX_ENDED_OWNERS:
@@ -473,6 +516,14 @@ class SharedEnvironmentAllocations:
             for entry in self._closing
             if entry.key.owner_session_id == owner_session_id and entry not in ending
         ]
+        if outcome == "completed":
+            # A retry asked to publish (a failed run's release kept the work,
+            # and the caller fixed the source) takes that outcome; one never
+            # moves the other way, which could dispose of unpublished work.
+            for entry in retry:
+                task = entry.release_task
+                if task is None or task.done():
+                    entry.release_outcome = outcome
         failures: list[Exception] = []
         for entry in (*ending, *retry):
             if entry.attachments:
@@ -529,6 +580,7 @@ class SharedEnvironmentAllocations:
         self._open_owners.clear()
         self._session_scopes.clear()
         self._sessions_by_owner.clear()
+        self._copy_back_sessions.clear()
         if self._creating:
             _, pending = await asyncio.wait(tuple(self._creating.values()), timeout=remaining())
             if pending:
@@ -557,6 +609,17 @@ class SharedEnvironmentAllocations:
                 self._closing.discard(entry)
                 continue
             clean = False
+            if (
+                keep_recorded
+                and entry.record is not None
+                and entry.record.reconnectable
+                and _pending_copy_backs(entry)
+            ):
+                # A failed copy-back after a step left work only this
+                # allocation has; its run can resume elsewhere and retry it.
+                self._closing.discard(entry)
+                self._forget(entry)
+                continue
             _LOGGER.warning(
                 "Finalizing shared environment allocation of %r failed; discarding it.",
                 entry.key.environment_name,
@@ -1150,8 +1213,38 @@ class SharedEnvironmentAllocations:
                 failures.append(error)
         return failures
 
-    def _attach(self, entry: _SharedAllocation, session_id: str) -> _Attachment:
-        attachment = _Attachment(session_id=session_id)
+    async def _acquire_attachable(
+        self,
+        key: SharedAllocationKey,
+        factory: EnvironmentFactory,
+        request: EnvironmentFactoryRequest,
+        session: Session | None,
+    ) -> _SharedAllocation:
+        """``_acquire``, then wait out any copy-back after a step before attaching.
+
+        The caller attaches with no await in between. A subagent of a session
+        that is attached doesn't wait: the copy-back is waiting for its parent
+        to detach.
+        """
+
+        while True:
+            entry = await self._acquire(key, factory, request, session)
+            parent = None if session is None else session.parent_session_id
+            # Not a copy-back's own attachment, which names the finished step:
+            # a subagent it left behind waits like anything else.
+            if entry.copy_back_gate.is_set() or any(
+                attachment.session_id == parent
+                and not attachment.released
+                and not attachment.copy_back
+                for attachment in entry.attachments
+            ):
+                return entry
+            await entry.copy_back_gate.wait()
+
+    def _attach(
+        self, entry: _SharedAllocation, session_id: str, *, copy_back: bool = False
+    ) -> _Attachment:
+        attachment = _Attachment(session_id=session_id, copy_back=copy_back)
         entry.attachments.add(attachment)
         return attachment
 
@@ -1160,6 +1253,7 @@ class SharedEnvironmentAllocations:
             return
         attachment.released = True
         entry.attachments.discard(attachment)
+        entry.detached.set()
         if entry.attachments or entry.release_outcome is None or entry not in self._closing:
             return
         task = asyncio.get_running_loop().create_task(
@@ -1201,6 +1295,21 @@ class SharedEnvironmentAllocations:
             self._forget(entry)
             return
         binding = entry.environment.binding
+        if (
+            entry.bound is not None
+            and binding is not None
+            and _pending_copy_backs(entry)
+            and not _binding_copies_back(binding, outcome)
+        ):
+            # A step's copy-back failed, so the allocation holds work the
+            # source hasn't got; this outcome would dispose of it unpublished.
+            raise SharedAllocationCopyBackPendingError(
+                f"A step's copy-back of environment {entry.key.environment_name!r} failed "
+                f"and its work isn't in the source yet, so the shared allocation isn't "
+                f"released with outcome {outcome!r}, which wouldn't copy it back; it is "
+                "kept. Resolve the conflict and resume the run, or release it with "
+                "outcome='completed'."
+            )
         if entry.bound is not None and binding is not None:
 
             async def checkpoint_disposal(state: dict[str, Any]) -> None:
@@ -1423,6 +1532,239 @@ class SharedEnvironmentAllocations:
         )
         return any(record.event.payload.get("attempt_id") == latest for record in completions)
 
+    # Copy-back after a step ----------------------------------------------
+
+    async def copy_back_session(
+        self,
+        session_id: str,
+        *,
+        owner_session_id: str,
+        environment_name: str | None,
+    ) -> int:
+        """Copy the work in the allocations ``session_id`` shared back to their source.
+
+        The allocations stay live for the run's next steps; the owner's release
+        later copies back only what changed after this. Each copy-back goes
+        through the factory binding's own copy-back. It waits until no other
+        session or command is attached and keeps new ones out until it is
+        done, so nothing writes in the sandbox while it is copied: it copies
+        what parallel steps finished, never half a write. A recorded
+        allocation's binding recovery state is then rewritten, so a process
+        that reconnects after a crash continues from this copy-back instead of
+        the original copy-in.
+
+        A session that attached in this process copies back what it attached
+        to. One that didn't (its step is being replayed after a crash, or after
+        its run ended on a failed copy-back) copies back the allocations
+        ``owner_session_id`` holds for ``environment_name``: a live one, one
+        kept after a failed release, or a recorded one, which it reconnects
+        first. A conflict raises, as at the owner's release: the allocation
+        stays live with the work in it, marked as holding unpublished work, so
+        no release with an outcome that wouldn't copy back disposes of it.
+        Returns how many allocations were copied back.
+        """
+
+        keys = self._copy_back_sessions.get(session_id) or await self._replayed_copy_back_keys(
+            session_id, owner_session_id, environment_name
+        )
+        copied = 0
+        for key in sorted(keys, key=lambda item: item.record_id):
+            entry = await self._copy_back_entry(key, session_id)
+            if entry is None:
+                continue
+            attachment = self._attach(entry, session_id, copy_back=True)
+            try:
+                async with entry.copy_back_lock:
+                    entry.copy_back_gate.clear()
+                    try:
+                        await _until_quiet(entry, session_id)
+                        if self._live.get(key) is not entry:
+                            # The owner ended meanwhile; its release copies back.
+                            continue
+                        if await self._copy_back(entry, session_id):
+                            copied += 1
+                    finally:
+                        entry.copy_back_gate.set()
+            finally:
+                self._detach(entry, attachment)
+        return copied
+
+    async def _replayed_copy_back_keys(
+        self, session_id: str, owner_session_id: str, environment_name: str | None
+    ) -> set[SharedAllocationKey]:
+        scope = self._session_scopes.get(session_id)
+        if environment_name is None or (scope or self.default_scope(environment_name)) is (
+            AllocationSharingScope.SESSION
+        ):
+            return set()
+        keys = {
+            entry.key
+            for entry in self._entries()
+            if entry.key.owner_session_id == owner_session_id
+            and entry.key.environment_name == environment_name
+        }
+        if self._records is None:
+            return keys
+        snapshot = await self._records.load(owner_session_id)
+        held = self._held_allocation_ids()
+        for record in () if snapshot is None else snapshot.records.values():
+            if (
+                record.environment_name == environment_name
+                and record.state == "live"
+                and record.reconnectable
+                and record.allocation_session_id not in held
+            ):
+                keys.add(
+                    SharedAllocationKey(
+                        AllocationSharingScope(record.scope),
+                        record.scope_id,
+                        owner_session_id,
+                        environment_name,
+                    )
+                )
+        return keys
+
+    async def _copy_back_entry(
+        self, key: SharedAllocationKey, session_id: str
+    ) -> _SharedAllocation | None:
+        """The live entry for ``key``, revived or reconnected if need be; None if none."""
+
+        if key not in self._live:
+            retained = next((entry for entry in self._closing if entry.key == key), None)
+            if retained is not None and not self._revive(retained):
+                # Its release or discard is running now.
+                return None
+        entry = self._live.get(key)
+        factory = self._factory_lookup(key.environment_name) if entry is None else entry.factory
+        if factory is None:
+            return None
+        agent_name = (
+            session_id if entry is None or entry.record is None else entry.record.agent_name
+        )
+        if entry is None and key not in self._creating:
+            # A record an earlier process left: reconnect to it through the
+            # path a step attaching to it takes, so the run's next steps reuse it.
+            records = self._records
+            if records is None or self._durable_claimant(key.owner_session_id) is None:
+                return None
+            snapshot = await records.load(key.owner_session_id)
+            record = None if snapshot is None else snapshot.records.get(key.record_id)
+            if (
+                record is None
+                or not record.reconnectable
+                or record.state != "live"
+                or record.allocation_session_id in self._held_allocation_ids()
+            ):
+                return None
+            agent_name = record.agent_name
+        # A live entry, one a sibling step is creating, or a record to
+        # reconnect, all through the path a step attaching takes, which also
+        # reclaims a record an earlier attempt of this run holds.
+        return await self._acquire(
+            key,
+            factory,
+            EnvironmentFactoryRequest(
+                session_id=session_id,
+                agent_name=agent_name,
+                environment_name=key.environment_name,
+            ),
+            None,
+        )
+
+    def _revive(self, entry: _SharedAllocation) -> bool:
+        """Make an allocation kept after a failed release live again for its reopened owner.
+
+        A release that failed (a copy-back conflict, or one refused because a
+        step's copy-back is pending) keeps the allocation; a resumed run's
+        step then needs it back to retry its copy-back. One whose release or
+        discard is still running is left to it.
+        """
+
+        task = entry.release_task
+        if (
+            entry.key.owner_session_id not in self._open_owners
+            or entry.key in self._live
+            or entry.discard_task is not None
+            or (task is not None and not task.done())
+        ):
+            return False
+        self._closing.discard(entry)
+        entry.release_outcome = None
+        entry.release_task = None
+        self._live[entry.key] = entry
+        return True
+
+    async def _copy_back(self, entry: _SharedAllocation, session_id: str) -> bool:
+        binding = entry.environment.binding
+        bound = entry.bound
+        record = entry.record
+        if binding is None or bound is None:
+            return False
+        if record is not None and session_id in record.copied_back:
+            # Done before a crash that came ahead of the step's journaling.
+            return False
+        _require_copy_back_while_bound(entry)
+        if record is not None and not await self._still_holds(entry):
+            raise SharedAllocationClaimLost(
+                "Another workflow attempt took over the shared allocation of environment "
+                f"{entry.key.environment_name!r}; this one can't copy it back."
+            )
+        try:
+            await binding._copy_back_while_bound(bound, outcome="completed")
+        except BaseException:
+            await self._mark_copy_back_pending(entry, session_id)
+            raise
+        # Everything in the allocation is published now, including the work of
+        # steps whose copy-back failed earlier.
+        published = (*sorted(_pending_copy_backs(entry) - {session_id}), session_id)
+        entry.pending_copy_back.clear()
+        record = entry.record
+        if record is not None:
+            assert self._records is not None
+            # The bound workspace's baseline moved: a process that reconnects
+            # must rebuild it from here, or its next copy-back would see this
+            # one's writes to the source as conflicts. Recorded together with
+            # the steps it published, so replaying one doesn't copy back again.
+            copied_back = (
+                *(item for item in record.copied_back if item not in published),
+                *published,
+            )
+            entry.record = await self._records.update(
+                entry.key.record_id,
+                record,
+                binding_state=(
+                    None
+                    if record.binding_state is None
+                    else _binding_recovery_state(binding, bound)
+                ),
+                copied_back=copied_back[-MAX_COPIED_BACK_SESSIONS:],
+                pending_copy_back=(),
+            )
+        return True
+
+    async def _mark_copy_back_pending(self, entry: _SharedAllocation, session_id: str) -> None:
+        """Remember that ``entry`` holds work a failed copy-back didn't publish."""
+
+        entry.pending_copy_back.add(session_id)
+        record = entry.record
+        if record is None or self._records is None or session_id in record.pending_copy_back:
+            return
+        try:
+            entry.record = await self._records.update(
+                entry.key.record_id,
+                record,
+                pending_copy_back=(*record.pending_copy_back, session_id)[
+                    -MAX_COPIED_BACK_SESSIONS:
+                ],
+            )
+        except Exception as error:
+            # This process still knows, so its own releases keep the work.
+            _LOGGER.warning(
+                "Recording the failed copy-back of environment %r failed (%s).",
+                entry.key.environment_name,
+                type(error).__name__,
+            )
+
     # Operator inspection and release ---------------------------------------
     # ``cayu.runtime._shared_allocation_operations`` lists and releases
     # recorded allocations through these, on the same fences as recovery.
@@ -1480,7 +1822,7 @@ class SharedEnvironmentAllocations:
             raise ValueError("A session-scoped allocation is not shared.")
         _require_shareable_factory(factory)
         self._in_use = True
-        entry = await self._acquire(key, factory, request, None)
+        entry = await self._acquire_attachable(key, factory, request, None)
         attachment = self._attach(entry, request.session_id)
         try:
             if self._live.get(key) is not entry:
@@ -1590,6 +1932,35 @@ def _require_shareable(
             + "; ".join(reasons)
             + ". Every session of a scope would get the first session's authority."
         )
+
+
+def _pending_copy_backs(entry: _SharedAllocation) -> set[str]:
+    """Step sessions whose copy-back failed and whose work only ``entry`` holds."""
+
+    recorded = () if entry.record is None else entry.record.pending_copy_back
+    return {*entry.pending_copy_back, *recorded}
+
+
+async def _until_quiet(entry: _SharedAllocation, session_id: str) -> None:
+    """Wait until nothing but ``session_id`` and copy-backs is attached to ``entry``."""
+
+    while any(
+        not attachment.copy_back and attachment.session_id != session_id
+        for attachment in entry.attachments
+    ):
+        entry.detached.clear()
+        await entry.detached.wait()
+
+
+def _require_copy_back_while_bound(entry: _SharedAllocation) -> None:
+    binding = entry.environment.binding
+    if binding is None or entry.bound is None or binding._copies_back_while_bound():
+        return
+    raise RuntimeError(
+        f"Environment {entry.key.environment_name!r} uses {type(binding).__name__}, which "
+        "can't copy its work back while its allocation stays live, so a step can't use "
+        "copy_back='after_step' with it. Use the default, copy_back='on_release'."
+    )
 
 
 def _discarded(task: asyncio.Task[bool]) -> bool:
@@ -1754,9 +2125,13 @@ class _SharedAllocationFactory(EnvironmentFactory):
         _require_shareable_factory(self._inner)
         registry = self._registry
         key = await registry.resolve_key(self._session, self._environment_name, self._scope)
-        entry = await registry._acquire(key, self._inner, request, self._session)
+        entry = await registry._acquire_attachable(key, self._inner, request, self._session)
         attachment = registry._attach(entry, request.session_id)
         try:
+            copy_back = registry._copy_back_sessions.get(request.session_id)
+            if copy_back is not None:
+                _require_copy_back_while_bound(entry)
+                copy_back.add(key)
             environment = entry.environment
             bound = entry.bound
             attached = Environment(

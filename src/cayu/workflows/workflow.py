@@ -16,10 +16,18 @@ from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from cayu._clock import normalize_utc_datetime
 from cayu._task_wait import (
@@ -96,7 +104,7 @@ from cayu.sessions.creation_claims import (
     runtime_session_create_claim_reference,
 )
 from cayu.sessions.invocation import SessionExecutionSource
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import (
     RunRequest,
@@ -224,6 +232,20 @@ class StepRunOptions(BaseModel):
     allocation_scope: AllocationSharingScope | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    #: When a shared allocation's work reaches the source workspace.
+    #: ``"on_release"`` (the default) copies it back once, when the workflow run
+    #: releases the allocation; ``"after_step"`` also copies it back when this
+    #: step's session ends, before the step's completion is journaled, and keeps
+    #: the allocation live for the next step. A copy-back conflict fails the
+    #: step with ``StepError``. No effect on an allocation the step doesn't share.
+    copy_back: Literal["on_release", "after_step"] = Field(
+        default="on_release", exclude_if=lambda value: value == "on_release"
+    )
+    #: Take turns with the run's other steps and commands that set it: wait for
+    #: the run's writer turn, then hold it for the whole child session and its
+    #: copy-back. Steps that don't set it still run alongside, and parallel
+    #: steps sharing one allocation can then race on its files. Process-local.
+    serialize_writers: StrictBool = Field(default=False, exclude_if=lambda value: value is False)
 
     @field_validator("allocation_scope", mode="before")
     @classmethod
@@ -896,7 +918,7 @@ class _StepInvocation(Coroutine[Any, Any, StepResult]):
 
     def _ensure_coro(self) -> Coroutine[Any, Any, StepResult]:
         if self._coro is None:
-            self._coro = _run_step(
+            self._coro = _run_step_in_turn(
                 self.ctx,
                 agent=self._agent,
                 step_id=self.step_id,
@@ -955,6 +977,21 @@ def step(
         session_id=session_id,
         run_options=run_options,
     )
+
+
+async def _run_step_in_turn(
+    ctx: WorkflowContext,
+    *,
+    run_options: StepRunOptions | None,
+    step_id: str,
+    **options: Any,
+) -> StepResult:
+    """Run the step, holding the run's writer turn throughout when it asks for one."""
+    if type(run_options) is not StepRunOptions or not run_options.serialize_writers:
+        return await _run_step(ctx, run_options=run_options, step_id=step_id, **options)
+    turns = ctx.app._environment_lifecycle.shared_allocations.writer_turns
+    async with turns.turn(ctx.session_id, holder=step_id):
+        return await _run_step(ctx, run_options=run_options, step_id=step_id, **options)
 
 
 async def _run_step(
@@ -1159,6 +1196,10 @@ async def _run_step(
         shared_allocations.assign_session_scope(
             child_session_id, opts.allocation_scope, owner_session_id=ctx.session_id
         )
+    if opts.copy_back == "after_step":
+        shared_allocations.assign_session_copy_back(
+            child_session_id, owner_session_id=ctx.session_id
+        )
     existing_child = await ctx.app.session_store.load(child_session_id)
     if existing_child is not None:
         if generated_child_ownership.is_generated:
@@ -1220,6 +1261,15 @@ async def _run_step(
                 step_id=step_id,
                 child_session_id=child_session_id,
                 structured_output=spec,
+            )
+            # The child ended but its step wasn't journaled, so its copy-back
+            # may not have happened (or conflicted); copy back before journaling.
+            await _copy_back_after_step(
+                ctx,
+                opts,
+                step_id=step_id,
+                child_session_id=child_session_id,
+                child=existing_child,
             )
             await _append_step_completed(ctx, agent, result)
             return result
@@ -1615,8 +1665,47 @@ async def _run_step(
     else:
         output = state.output
     result = state.step_result(step_id=step_id, session_id=child_session_id, output=output)
+    await _copy_back_after_step(ctx, opts, step_id=step_id, child_session_id=child_session_id)
     await _append_step_completed(ctx, agent, result)
     return result
+
+
+async def _copy_back_after_step(
+    ctx: WorkflowContext,
+    opts: StepRunOptions,
+    *,
+    step_id: str,
+    child_session_id: str,
+    child: Session | None = None,
+) -> None:
+    """Copy the step's shared work back to the source, for ``copy_back="after_step"``.
+
+    It runs before ``workflow.step.completed`` is journaled, so a step whose
+    completion is journaled has had its copy-back. A conflict or other failure
+    raises ``StepError`` and journals nothing: the allocation keeps the work,
+    marked as unpublished so a failed run's release doesn't dispose of it, and
+    a resumed run retries the copy-back before journaling this step.
+    """
+    if opts.copy_back != "after_step":
+        return
+    if child is None:
+        child = await ctx.app.session_store.load(child_session_id)
+    if child is None:
+        return
+    await ctx._check_fence(establish=False)
+    try:
+        await ctx.app._environment_lifecycle.shared_allocations.copy_back_session(
+            child.id, owner_session_id=ctx.session_id, environment_name=child.environment_name
+        )
+    except Exception as exc:
+        raise StepError(
+            f"step {step_id!r} finished, but copying its shared work back to the source "
+            f"failed ({type(exc).__name__}); the work stays in the shared allocation",
+            step_id=step_id,
+            session_id=child.id,
+            evidence=exception_evidence(exc),
+            workflow_attempt_id=ctx.attempt_id,
+        ) from exc
 
 
 async def _reserve_step_started(

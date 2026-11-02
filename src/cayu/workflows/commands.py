@@ -98,6 +98,7 @@ async def command(
     output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT_BYTES,
     rerun: bool = False,
     allocation_scope: AllocationSharingScope | str | None = None,
+    serialize_writers: bool = False,
 ) -> CommandResult:
     """Run one command in a registered environment and journal its outcome.
 
@@ -124,6 +125,12 @@ async def command(
     ``StepRunOptions.allocation_scope``). The command attaches to that
     allocation, or creates it when no step has yet; either way the workflow
     run releases it, never the command.
+
+    ``serialize_writers=True`` makes the command take turns with the run's
+    steps and commands that set it too (``StepRunOptions.serialize_writers``):
+    it waits for the run's writer turn, then holds it while it attaches and
+    runs. Without it, a command runs alongside parallel steps in the same
+    allocation and can race with them on files.
     """
     if not isinstance(ctx, WorkflowContext):
         raise TypeError("command() requires a WorkflowContext.")
@@ -140,6 +147,8 @@ async def command(
         environment_name = require_clean_nonblank(environment_name, "environment_name")
     if type(rerun) is not bool:
         raise TypeError("command() rerun must be a bool.")
+    if type(serialize_writers) is not bool:
+        raise TypeError("command() serialize_writers must be a bool.")
     if (
         type(output_limit_bytes) is not int
         or not 1 <= output_limit_bytes <= MAX_COMMAND_OUTPUT_LIMIT_BYTES
@@ -174,6 +183,7 @@ async def command(
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
             allocation_scope=scope,
+            serialize_writers=serialize_writers,
         )
     )
 
@@ -191,6 +201,7 @@ async def _execute_command(
     stdin: str | None,
     output_limit_bytes: int,
     allocation_scope: AllocationSharingScope | None,
+    serialize_writers: bool,
 ) -> CommandResult:
     (await ctx.execution_deadline()).require_admission("workflow_command")
     anchor = await ctx._workflow_anchor()
@@ -217,7 +228,13 @@ async def _execute_command(
         environment_name=resolved_environment_name,
         output_limit_bytes=output_limit_bytes,
     )
-    async with _command_runner(ctx, request, registered, anchor=anchor) as runner:
+    async with contextlib.AsyncExitStack() as stack:
+        if serialize_writers:
+            turns = ctx.app._environment_lifecycle.shared_allocations.writer_turns
+            await stack.enter_async_context(turns.turn(ctx.session_id, holder=step_id))
+        runner = await stack.enter_async_context(
+            _command_runner(ctx, request, registered, anchor=anchor)
+        )
         return await _run_and_journal(
             ctx,
             step_id=step_id,

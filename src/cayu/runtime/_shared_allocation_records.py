@@ -56,6 +56,8 @@ _LOGGER = logging.getLogger(__name__)
 
 RecordState = Literal["creating", "created", "live", "reaping"]
 _STATES = frozenset({"creating", "created", "live", "reaping"})
+# How many step sessions a record remembers having copied back after their step.
+MAX_COPIED_BACK_SESSIONS = 64
 
 
 _IDENTITY_SEPARATOR = ".shared-"
@@ -101,6 +103,13 @@ class SharedAllocationRecord:
     reconnect_metadata: dict[str, Any] = field(default_factory=dict)
     binding_state: dict[str, Any] | None = None
     result_metadata: dict[str, Any] = field(default_factory=dict)
+    # The latest step sessions whose copy-back after their step completed,
+    # written together with the binding state that copy-back left.
+    copied_back: tuple[str, ...] = ()
+    # Step sessions whose copy-back after their step failed, so the allocation
+    # holds work the source hasn't got; a release that wouldn't copy back
+    # refuses to dispose of it.
+    pending_copy_back: tuple[str, ...] = ()
     # When this identity was first recorded; None for records written before
     # the field existed.
     created_at: str | None = None
@@ -159,6 +168,12 @@ class SharedAllocationRecord:
                 else copy_durable_json_object(self.binding_state, "binding_state")
             ),
             "result_metadata": copy_durable_metadata(self.result_metadata, "result_metadata"),
+            **({"copied_back": list(self.copied_back)} if self.copied_back else {}),
+            **(
+                {"pending_copy_back": list(self.pending_copy_back)}
+                if self.pending_copy_back
+                else {}
+            ),
             "created_at": self.created_at,
             "release_lease": None if self.release_lease is None else dict(self.release_lease),
         }
@@ -195,6 +210,8 @@ class SharedAllocationRecord:
         binding_state = payload.get("binding_state")
         if binding_state is not None and type(binding_state) is not dict:
             raise ValueError("Shared allocation record binding state is malformed.")
+        copied_back = _session_ids(payload, "copied_back")
+        pending_copy_back = _session_ids(payload, "pending_copy_back")
         release_lease = payload.get("release_lease")
         if release_lease is not None and (
             type(release_lease) is not dict
@@ -229,6 +246,8 @@ class SharedAllocationRecord:
             result_metadata=copy_durable_metadata(
                 payload.get("result_metadata") or {}, "result_metadata"
             ),
+            copied_back=copied_back,
+            pending_copy_back=pending_copy_back,
             created_at=created_at,
             release_lease=None if release_lease is None else dict(release_lease),
         )
@@ -240,6 +259,17 @@ class SharedAllocationRecord:
             and other.attempt_id == self.attempt_id
             and other.claim_generation == self.claim_generation
         )
+
+
+def _session_ids(payload: dict[str, Any], name: str) -> tuple[str, ...]:
+    value = payload.get(name, [])
+    if (
+        type(value) is not list
+        or len(value) > MAX_COPIED_BACK_SESSIONS
+        or any(type(item) is not str or not item for item in value)
+    ):
+        raise ValueError(f"Shared allocation record field {name!r} is malformed.")
+    return tuple(value)
 
 
 class DisposalHold:
@@ -543,6 +573,8 @@ class SharedAllocationRecords:
             result_metadata={},
             disposal_state=None,
             binding_required=True,
+            copied_back=(),
+            pending_copy_back=(),
             created_at=_now(),
         )
 

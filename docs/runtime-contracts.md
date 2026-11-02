@@ -13716,9 +13716,7 @@ environment registered with `allocation_scope="parent"`, makes the steps of one
 run share one allocation (one Docker container, one brokered sandbox). The run
 owns it: `ctx.completed()` copies the shared work back and disposes of it
 before journaling completion, and `WorkflowBase.execute` does the same with a
-`failed` or `interrupted` outcome when the run raises. Steps that run in
-parallel in one scope share the sandbox concurrently and can race on the same
-files. The run records each shared allocation in its checkpoint before the
+`failed` or `interrupted` outcome when the run raises. The run records each shared allocation in its checkpoint before the
 factory is called, and every record change is a compare-and-set naming the
 workflow attempt that holds it. A run resumed in another process reconnects
 to a recorded allocation through the factory's RECONNECT path and rebuilds
@@ -13741,6 +13739,36 @@ subagents" and its "Crashes and resumed runs" in
 A `command()` step on that environment, with the same scope (registered
 or its own `allocation_scope=`), runs in that allocation too (see "Command
 steps"): it attaches while it runs and never releases it.
+
+`StepRunOptions(copy_back="after_step")` also copies the shared work back when
+that step's child session ends, through the binding's own copy-back without
+disposal, and keeps the allocation live for the next step. The default,
+`"on_release"`, copies back only at the release. The copy-back runs before
+`workflow.step.completed` is journaled. It waits until no other session or
+command is attached, and holds new ones off until it is done, so it copies
+what parallel steps finished and nothing writes during it. A conflict raises,
+keeps the allocation, and fails the step with `StepError` (cause: the
+binding's error) without journaling it; the child session stays completed,
+so a resumed run retries only the copy-back before journaling the step. Until
+a copy-back succeeds the allocation and its record are marked as holding
+unpublished work: a release whose outcome wouldn't copy back (for example a
+failed run's release on `sync_back="on_success"`) refuses and keeps it, and
+with a durable store shutdown leaves it for the run to resume. A resumed run
+in the same process takes a kept allocation back for the retry. A recorded allocation's binding recovery state is rewritten
+after each copy-back, together with the step session it was for, so a run
+reconnected after a crash continues from the latest copy-back and never runs
+a journaled or already-recorded step's copy-back twice.
+
+Steps that run in parallel in one scope, and commands beside them, share the
+sandbox concurrently. By default nothing serializes them, so two of them
+writing the same files race. `StepRunOptions(serialize_writers=True)` and
+`command(..., serialize_writers=True)` make them take turns: each waits for
+the workflow run's writer turn and holds it, a step for its whole child
+session and copy-back, a command while it attaches and runs. Only those that
+set it take turns. Cancellation or interruption gives the turn up, or leaves
+the queue. The turn is process-local, keyed by the run id: a crash drops it,
+a run resumed in another process starts with a free turn, and a superseded
+attempt still running in another process isn't held back by it.
 
 ### Workflow failure evidence
 
@@ -13905,8 +13933,10 @@ when it was created, so the binding restriction above doesn't apply here. A work
 whose journal has no anchor session (a custom journal) has no shared scope for its
 steps, and a factory-backed command there is refused.
 
-The command holds an attachment only while it runs. It never copies back or releases
-the allocation: the workflow run does, in `ctx.completed()` or through
+With `serialize_writers=True` the command first waits for the run's writer turn and
+holds it while it attaches and runs, so it never runs while a step or command that
+also set it is writing (see "Steps that share a sandbox"). The command holds an
+attachment only while it runs. It never copies back or releases the allocation: the workflow run does, in `ctx.completed()` or through
 `WorkflowBase.execute` (see "Steps that share a sandbox"). A release requested while
 a command still runs waits for it to detach. A failure to create or attach raises
 `StepError` before `workflow.step.started` is journaled, so a resume tries again. A

@@ -848,6 +848,26 @@ class WorkspaceBinding(ABC):
             f"{type(self).__name__} does not support durable completion finalization recovery."
         )
 
+    def _copies_back_while_bound(self) -> bool:
+        """Whether ``_copy_back_while_bound`` can publish work and keep the binding live."""
+
+        return False
+
+    async def _copy_back_while_bound(
+        self, bound: BoundWorkspace, *, outcome: str = "completed"
+    ) -> WorkspaceSnapshot | None:
+        """Publish ``bound``'s work to its source now, leaving ``bound`` live for more work.
+
+        A shared allocation uses this to copy a workflow step's work back
+        before the next step runs. It runs the copy-back that ``finalize``
+        runs for ``outcome``, without releasing or disposing of anything, and
+        a later ``finalize`` publishes only what changed since. A conflict
+        raises as it does from ``finalize`` and leaves ``bound`` live.
+        """
+
+        del bound, outcome
+        raise RuntimeError(f"{type(self).__name__} can't copy its work back while it stays bound.")
+
 
 class NativeBinding(WorkspaceBinding):
     """Binding for backends where workspace and runner already share state.
@@ -900,6 +920,16 @@ class NativeBinding(WorkspaceBinding):
         metadata: dict[str, Any] | None = None,
     ) -> WorkspaceSnapshot | None:
         _validate_finalize_request(bound, outcome=outcome, metadata=metadata)
+        return None
+
+    def _copies_back_while_bound(self) -> bool:
+        return True
+
+    async def _copy_back_while_bound(
+        self, bound: BoundWorkspace, *, outcome: str = "completed"
+    ) -> WorkspaceSnapshot | None:
+        # The runner already works in the source workspace: nothing to copy.
+        _validate_finalize_request(bound, outcome=outcome, metadata=None)
         return None
 
 
@@ -2648,6 +2678,38 @@ class SyncBinding(WorkspaceBinding):
         if type(bound) is not BoundWorkspace:
             raise TypeError("SyncBinding completion query requires a BoundWorkspace.")
         return _should_sync_back(self.sync_back, "completed")
+
+    def _copies_back_while_bound(self) -> bool:
+        return True
+
+    async def _copy_back_while_bound(
+        self, bound: BoundWorkspace, *, outcome: str = "completed"
+    ) -> WorkspaceSnapshot | None:
+        # SyncBinding's own copy-back, never a subclass's finalize, which may
+        # dispose of the target. Deferring the release keeps the bind state
+        # active after it, with the source paths, target baseline and source
+        # revisions advanced, so the next pass publishes only later changes.
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("SyncBinding copy-back requires a BoundWorkspace.")
+        state_key = bound.state_key
+        if state_key is None:
+            raise ValueError("SyncBinding copy-back requires in-process bind state.")
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is None:
+                raise ValueError("SyncBinding copy-back requires an active bind generation.")
+            _validate_sync_generation_ownership(bound, state)
+            if state.phase != "active":
+                raise RuntimeError("SyncBinding can't copy back while it is finalizing.")
+            deferred = state.defer_finalize_release
+            self._states[state_key] = replace(state, defer_finalize_release=True)
+        try:
+            return await SyncBinding.finalize(self, bound, outcome=outcome)
+        finally:
+            with self._state_lock:
+                state = self._states.get(state_key)
+                if state is not None and not deferred:
+                    self._states[state_key] = replace(state, defer_finalize_release=False)
 
     def _completion_finalization_recovery_state(
         self,

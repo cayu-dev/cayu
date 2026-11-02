@@ -1223,6 +1223,106 @@ How it works:
   session whose requirements the runner can't meet is refused, not given a
   new sandbox.
 
+#### Copying back after each step
+
+By default the source workspace gets the shared work once, when the run
+releases the allocation. `StepRunOptions(copy_back="after_step")` also copies
+it back when that step's session ends, and keeps the allocation live for the
+next step:
+
+```python
+each = StepRunOptions(allocation_scope="parent", copy_back="after_step")
+await step(ctx, agent="planner", step_id="plan", prompt=task, run_options=each)
+# plan.md is in the source workspace now, and the sandbox is still up.
+await step(ctx, agent="solver", step_id="solve", prompt=task, run_options=each)
+yield await ctx.completed()
+```
+
+- The copy-back is the factory binding's own, the same one the release runs,
+  minus the disposal. For a `SyncBinding` (Docker coding and the brokered
+  sandbox use one) it advances the binding's baseline, so the release later
+  publishes only what changed after the last step's copy-back. A binding that
+  can't copy back and stay bound refuses the option when the step attaches; a
+  `NativeBinding`, whose runner already works in the source, has nothing to
+  copy.
+- It copies everything in the allocation, and nothing writes in it while it
+  does: the copy-back waits until no other session or command is attached
+  (parallel steps finish their sessions, a running command finishes), and a
+  session or command that wants to attach meanwhile waits for it. So it
+  publishes what parallel steps finished, never a half-written file, and a
+  check such as Docker coding's ignored-paths check sees the same tree that
+  is copied. A subagent of a session the copy-back is still waiting for gets
+  in, since the copy-back waits for it too; one whose parent has already
+  ended (a background subagent left behind by the finished step) waits like
+  anything else.
+- It runs after the step's child session ended and before
+  `workflow.step.completed` is journaled. A step whose completion is journaled
+  has had its copy-back.
+- A conflict (the source changed under the allocation) behaves like a
+  conflict at the release: it raises, and the allocation keeps the work. The
+  step fails with a `StepError` whose cause is the binding's error, and
+  nothing is journaled for it, though its child session stays completed. The
+  workflow can catch that and go on (later steps still see the work, and the
+  release tries the copy-back again), or let the run fail. Resolve the
+  conflict and resume the run: the step's child is already done, so the
+  resumed step only retries the copy-back, then journals the step.
+- Until a copy-back succeeds, the allocation (and its record) is marked as
+  holding work the source hasn't got. A release whose outcome wouldn't copy
+  back, such as `WorkflowBase.execute`'s `failed` release on a binding with
+  `sync_back="on_success"` (the brokered sandbox's default), refuses and
+  keeps the allocation instead of disposing of the only copy of that work;
+  one that does copy back (`sync_back="always"`, Docker coding's) tries and,
+  while the conflict lasts, keeps it too. With a durable store, shutdown
+  leaves such an allocation and its record for the run to resume. A resumed
+  run in the same process takes the kept allocation back for the step's
+  retry; one in another process reconnects to it through the record. To
+  publish it without resuming, fix the source and call
+  `ctx.release_environments(outcome="completed")`, which retries the kept
+  release with that outcome. To give the work up, discard it with
+  `cayu environment allocations release ... --discard` once the run has
+  stopped; with the in-memory store, shutdown discards it.
+- For a recorded allocation, each copy-back rewrites the record's binding
+  recovery state and remembers the step session it copied back for, in the
+  same compare-and-set. A run that reconnects after a crash rebuilds the bound
+  workspace from that state, so its next copy-back doesn't mistake the earlier
+  copy-back's writes to the source for conflicts. A step replayed after a
+  crash that came between its copy-back and its journaling sees from the
+  record that the copy-back happened and doesn't run it again; one whose
+  copy-back hadn't finished copies back then.
+
+#### Parallel steps and commands in one allocation
+
+Steps that run at the same time in one scope (under `parallel`, say), and a
+command running beside them, work in the same sandbox at the same time. By
+default nothing serializes them and their bindings report no writer
+isolation, so **two of them writing the same files race**. Keep them on
+separate paths, run them in sequence, give them `allocation_scope="session"`,
+or let them take turns:
+
+```python
+turns = StepRunOptions(allocation_scope="parent", serialize_writers=True)
+await parallel([
+    step(ctx, agent="frontend", step_id="ui", prompt=task, run_options=turns),
+    step(ctx, agent="backend", step_id="api", prompt=task, run_options=turns),
+])
+await command(ctx, step_id="tests", argv=["pytest"], serialize_writers=True)
+```
+
+A step with `serialize_writers=True` waits for its workflow run's writer turn,
+then holds it for its whole child session and its copy-back. A command with
+`serialize_writers=True` holds it while it attaches and runs. Only the steps
+and commands that set it take turns; anything else in the run still runs
+alongside them. Cancelling or interrupting a step gives its turn up (or takes
+it out of the queue if it was waiting), and its subagents never wait for it.
+
+The turn is process-local: it lives in this process's memory, keyed by the
+workflow run id. A crash drops it with the process, and a run resumed in
+another process starts with a free turn there. That is safe for the crashed
+process's steps, which are gone, but a superseded attempt still running in a
+live process isn't held back by a newer attempt's turn. Serializing writers
+across processes needs a writer authority on the resource itself, which Cayu
+doesn't have yet.
+
 #### Crashes and resumed runs
 
 A workflow run records each allocation its steps share in the run's own
@@ -1326,10 +1426,10 @@ Limits of this version:
   running in this process, or has already ended, fails with a clear error
   instead of creating an allocation nothing would release.
 - Steps that run at the same time in one scope (for example under
-  `parallel`) work in the same sandbox at the same time. Cayu doesn't
-  serialize their writes, and their bindings report no writer isolation; two
-  steps writing the same files race. Keep such steps on separate paths, run
-  them in sequence, or give them `allocation_scope="session"`.
+  `parallel`) work in the same sandbox at the same time and race on the same
+  files, unless they set `serialize_writers=True` (see "Parallel steps and
+  commands in one allocation" above). Their bindings report no writer
+  isolation either way.
 - Forked sessions, deferred-materialization factories and factories that
   declare an egress authority don't share; the last two fail with an error
   when asked to.

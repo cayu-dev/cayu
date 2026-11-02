@@ -884,6 +884,27 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                 )
             raise
 
+    async def _copy_back_while_bound(
+        self, bound: BoundWorkspace, *, outcome: str = "completed"
+    ) -> WorkspaceSnapshot | None:
+        # The copy-back half of finalize: the container stays up.
+        state_key = bound.state_key
+        if state_key is None:
+            raise RuntimeError("Docker coding copy-back lost its sync generation.")
+        with self._coding_authority_lock:
+            finalizing = state_key in self._coding_finalize_states
+        runner = bound.runner
+        if (
+            finalizing
+            or not isinstance(runner, DockerRunner)
+            or runner.is_closed
+            or not self._docker_target.is_bound_to_runner(runner)
+        ):
+            raise RuntimeError("Docker coding copy-back requires its live, unfinalized container.")
+        if self._git_baseline and _should_sync_back(self.sync_back, outcome):
+            await _require_no_publishable_ignored_paths(bound)
+        return await super()._copy_back_while_bound(bound, outcome=outcome)
+
     async def _dispose_finalized(
         self,
         bound: BoundWorkspace,
