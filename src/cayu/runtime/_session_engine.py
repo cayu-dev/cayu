@@ -2485,8 +2485,11 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 diagnostic=failure_diagnostic,
             )
+            # Settle setup failure before yielding: closing in this exception
+            # handler cannot reach the sibling GeneratorExit handler.
+            failure_events: list[Event] = []
             if task_failure_event is not None:
-                yield task_failure_event
+                failure_events.append(task_failure_event)
             (
                 session,
                 interaction_failed_event,
@@ -2502,7 +2505,7 @@ class SessionEngine:
                 execution_profile=execution_profile,
             )
             if interaction_failed_event is not None:
-                yield interaction_failed_event
+                failure_events.append(interaction_failed_event)
             failure_payload = exception_failure_payload(
                 exc,
                 diagnostic=failure_diagnostic,
@@ -2530,11 +2533,13 @@ class SessionEngine:
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
             ):
-                yield event
+                failure_events.append(event)
                 async for queued_event in self._session_control.drain_out_of_band_events(
                     session.id
                 ):
-                    yield queued_event
+                    failure_events.append(queued_event)
+            for event in failure_events:
+                yield event
             return
         except BaseExceptionGroup as exc:
             if binding_finalize_explicit_cancellation(exc) is not None:
