@@ -24,6 +24,7 @@ cayu cloud service status --application my-agent
 - `login`, `logout`, and `whoami` for interactive identity;
 - `applications list|show|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
+- `platform` for [which Cayu Cloud revision runs and when it rolled out](#cloud-rollouts);
 - `init` and `deploy` for local project setup and publication;
 - `deployment list|logs|status|timeline|wait|source|promote|discard|retry` and `rollback`
   for immutable releases, including [candidate releases](#candidate-releases) and
@@ -842,6 +843,17 @@ operational handoffs, and automation:
 cayu cloud context use /private/path/cloud-context.json
 CAYU_CLOUD_API_KEY_FILE=/private/path/key cayu cloud doctor
 ```
+
+## Cloud rollouts
+
+`cayu cloud platform` says what Cayu Cloud itself runs, so "did Cloud change under me?" has an
+answer from the terminal. For each component (the API, scheduler, deployment, evaluation and
+studio workers, the sandbox broker and the Gateway) it prints the source `revision` it serves,
+`serving_since` (when that revision rolled out), and its recent `rollouts` and `restarts`,
+newest first with their times and pods. A restart is a start on the same revision: a pod
+rescheduled or replaced, which still ends what that pod held (a sandbox broker restart is how
+brokered sandboxes get handed over). Cloud keeps 90 days of starts. `cayu cloud doctor` includes
+each component's revision and `serving_since`, or `null` from a Cloud that doesn't report them.
 
 ## Candidate releases
 

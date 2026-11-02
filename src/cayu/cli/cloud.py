@@ -887,6 +887,16 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         help="Show the current user and Organization.",
         description="Show the current Cayu Cloud user and Organization.",
     )
+    commands.add_parser(
+        "platform",
+        help="Show which Cayu Cloud revision runs and when it rolled out.",
+        description=(
+            "Show Cayu Cloud's own components (API, scheduler, workers, sandbox broker, "
+            "Gateway): the source revision each serves, when it rolled out, and its recent "
+            "rollouts and restarts with their times. Use it to tell whether Cloud changed "
+            "or restarted around a failure."
+        ),
+    )
 
     applications = commands.add_parser(
         "applications",
@@ -2063,12 +2073,19 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         applications = client.request("GET", "/v1/applications").get("items")
         if not isinstance(applications, list):
             raise CloudApiError("api_response_invalid", "Application list is invalid.")
+        try:
+            platform = _platform_summary(_platform(client))
+        except CloudApiError:
+            platform = None
         return {
             "operation": "doctor",
             "result": {
                 "api_reachable": True,
                 "api_url": client.api_url,
                 "application_count": len(applications),
+                # Each Cloud component's revision and when it rolled out; null when this Cloud
+                # doesn't say (`cayu cloud platform` has its history).
+                "platform": platform,
                 "context": None if context_path is None else str(context_path),
                 "deployment_id": context.get("deployment_id"),
                 "region": context.get("region"),
@@ -2083,6 +2100,8 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             "operation": "whoami",
             "result": client.request("GET", "/v1/me"),
         }
+    if arguments.command == "platform":
+        return {"operation": "platform", "result": _platform(client)}
     if arguments.command == "applications":
         return _applications(arguments, client=client)
     if arguments.command == "deploy":
@@ -5081,6 +5100,38 @@ def _cloud_login_authority_fingerprint(credentials: CloudAuthCredentials) -> str
     }
     payload = json.dumps(authority, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return hashlib.sha256(b"cayu.cloud-login-authority.v1\0" + payload).hexdigest()
+
+
+def _platform(client: CloudApiClient) -> dict[str, Any]:
+    """Cloud's `GET /v1/platform`: its components, revisions, rollouts and restarts."""
+
+    try:
+        result = client.request("GET", "/v1/platform")
+    except CloudApiError as exc:
+        if exc.status_code == 404:
+            raise CloudApiError(
+                "platform_unavailable",
+                "This Cayu Cloud doesn't report its own rollouts yet.",
+                status_code=404,
+            ) from None
+        raise
+    if not isinstance(result.get("components"), list):
+        raise CloudApiError("api_response_invalid", "Cayu Cloud's platform report is invalid.")
+    return result
+
+
+def _platform_summary(platform: dict[str, Any]) -> dict[str, Any] | None:
+    if platform.get("recorded") is False:
+        return None
+    return {
+        str(component.get("name")): {
+            "revision": component.get("revision"),
+            "serving_since": component.get("serving_since"),
+            "last_started_at": component.get("last_started_at"),
+        }
+        for component in platform["components"]
+        if isinstance(component, dict)
+    }
 
 
 def _cloud_client(

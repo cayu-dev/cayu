@@ -1253,7 +1253,11 @@ def test_cloud_doctor_authenticates_through_the_core_package(
     output = json.loads(rendered)
     assert output["result"]["api_reachable"] is True
     assert output["result"]["application_count"] == 1
-    assert requests == [("/v1/applications", "Bearer customer-secret-material")]
+    # It also asks which revision Cloud runs, with the same credential.
+    assert requests == [
+        ("/v1/applications", "Bearer customer-secret-material"),
+        ("/v1/platform", "Bearer customer-secret-material"),
+    ]
     assert "customer-secret-material" not in rendered
 
 
@@ -5004,3 +5008,65 @@ def test_cloud_error_wrappers_preserve_transport_diagnostics(wrapper, capsys):
     detail = json.loads(capsys.readouterr().out)["error"]
     assert detail["transport_error"] == "read_timeout"
     assert detail["request"] == "POST /v1/example"
+
+
+class _PlatformClient:
+    api_url = "https://api.cloud.example"
+
+    def __init__(self, platform: object) -> None:
+        self.platform = platform
+
+    def request(self, method: str, path: str, **_options: object) -> dict[str, object]:
+        if path == "/v1/applications":
+            return {"items": []}
+        assert (method, path) == ("GET", "/v1/platform")
+        if isinstance(self.platform, Exception):
+            raise self.platform
+        return self.platform  # type: ignore[return-value]
+
+
+def test_cloud_platform_shows_when_cloud_rolled_out(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`cayu cloud platform` answers "did Cloud change under me?" (cayu-cloud#715)."""
+
+    broker = {
+        "name": "sandbox-broker",
+        "revision": "bbbbbbbbbbbb",
+        "serving_since": "2026-11-02T07:06:00+00:00",
+        "last_started_at": "2026-11-02T07:06:00+00:00",
+        "rollouts": [{"at": "2026-11-02T07:06:00+00:00", "revision": "bbbbbbbbbbbb"}],
+        "restarts": [],
+    }
+    platform = {"as_of": "x", "recorded": True, "components": [broker]}
+    monkeypatch.setattr(
+        cloud_cli, "_cloud_client", lambda *_args, **_kwargs: _PlatformClient(platform)
+    )
+
+    assert main(["cloud", "platform"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"] == platform
+
+    assert main(["cloud", "doctor"]) == 0
+    doctor = json.loads(capsys.readouterr().out)["result"]
+    assert doctor["platform"] == {
+        "sandbox-broker": {
+            "revision": "bbbbbbbbbbbb",
+            "serving_since": "2026-11-02T07:06:00+00:00",
+            "last_started_at": "2026-11-02T07:06:00+00:00",
+        }
+    }
+
+
+def test_an_older_cloud_says_it_doesnt_report_rollouts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = CloudApiError("api_request_rejected", "HTTP 404.", status_code=404)
+    monkeypatch.setattr(
+        cloud_cli, "_cloud_client", lambda *_args, **_kwargs: _PlatformClient(missing)
+    )
+
+    assert main(["cloud", "platform"]) != 0
+    assert json.loads(capsys.readouterr().out)["error"]["category"] == "platform_unavailable"
+    # Doctor still answers, without the platform.
+    assert main(["cloud", "doctor"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["platform"] is None
