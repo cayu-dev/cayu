@@ -3175,6 +3175,9 @@ class RecoveryCoordinator:
                     isinstance(replay, _ToolEffectObservationReplay)
                     and loaded_session.status is SessionStatus.INTERRUPTED
                 ):
+                    # A retry keeps its identity, not its permission: recheck current authority.
+                    for ref in (request.review_reference, response.review_reference):
+                        await self.require_human_review_resolution_authority(loaded_session.id, ref)
                     yield copy_event(replay.event)
                     assert replay.record.observation is not None
                     if replay.record.observation.result.outcome == "conflict":
