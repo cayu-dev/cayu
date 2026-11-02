@@ -481,6 +481,32 @@ def test_options_are_checked_before_any_request(capsys: pytest.CaptureFixture[st
         assert (error["category"], error["message"]) == ("invalid_input", message)
 
 
+def test_cloud_eval_commands_wait_for_a_sleeping_agent_as_their_options_say(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cayu.cli import _cloud_evals
+    from cayu.cli._cloud_agent_api import DEFAULT_WAKE_TIMEOUT_SECONDS, CayuApiError
+
+    opened: list[dict] = []
+
+    def asleep(_client, _application_id, **options) -> CayuApi:
+        opened.append(options)
+        raise CayuApiError("starting", "The Agent is starting.", status_code=503)
+
+    monkeypatch.setattr(_cloud_evals, "cloud_agent_api", asleep)
+    monkeypatch.setattr(cloud_cli, "cloud_client", lambda **_: object())
+    monkeypatch.setattr(cloud_cli, "resolve_application_id", lambda _client, name: name)
+    for wake in ((), ("--no-wait",), ("--wake-timeout-seconds", "300")):
+        code, answer = _eval(capsys, "suites", "list", "--application", _AGENT, *wake)
+        assert code != 0 and answer["error"]["category"] == "starting"
+
+    assert [(o["wake_timeout_seconds"], o["offers_wake_option"]) for o in opened] == [
+        (DEFAULT_WAKE_TIMEOUT_SECONDS, True),
+        (0.0, True),
+        (300.0, True),
+    ]
+
+
 def test_publication_refusals_the_cli_tells_apart_are_the_servers_own() -> None:
     tree = ast.parse(inspect.getsource(_eval_addition_routes))
     literals = {

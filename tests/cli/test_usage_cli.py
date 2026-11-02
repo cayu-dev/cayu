@@ -36,8 +36,11 @@ def test_usage_cli_rollup_and_counts_use_real_http_contract(monkeypatch, capsys,
 
         monkeypatch.setattr("cayu.cli._cloud_agent_api.CayuApi", api)
 
-        def cloud(application, *, context, timeout_seconds):
+        def cloud(
+            application, *, context, timeout_seconds, wake_timeout_seconds, offers_wake_option
+        ):
             assert application == "demo" and context is None
+            assert wake_timeout_seconds == 180
             return api("http://127.0.0.1", timeout_seconds=timeout_seconds)
 
         monkeypatch.setattr("cayu.cli._cloud_agent_api.open_cloud_agent_api", cloud)

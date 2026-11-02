@@ -46,6 +46,9 @@ def add_usage_parser(subparsers: Any) -> None:
             "--context", type=Path, help="Private Cloud context file for --application."
         )
         command.add_argument("--timeout-seconds", type=_positive_seconds, default=30.0)
+        from cayu.cli._cloud_agent_api import add_wake_options
+
+        add_wake_options(command)
         command.add_argument(
             "--since", type=_instant, required=True, help="Inclusive start, ISO8601 with timezone."
         )
@@ -176,7 +179,11 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
     else:
         assert target.application is not None
         api = open_cloud_agent_api(
-            target.application, context=target.context, timeout_seconds=target.timeout_seconds
+            target.application,
+            context=target.context,
+            timeout_seconds=target.timeout_seconds,
+            wake_timeout_seconds=target.wake_timeout_seconds,
+            offers_wake_option=True,
         )
     filters = {
         key: value

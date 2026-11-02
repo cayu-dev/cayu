@@ -442,3 +442,88 @@ def test_other_successful_statuses_are_still_not_answers() -> None:
     with pytest.raises(CayuApiError, match="answered HTTP 204") as raised:
         _api(handler).get("/sessions", resource="sessions")
     assert raised.value.category == "server_error"
+
+
+def _waking_api(
+    wakes: int,
+    *,
+    wake_timeout_seconds: float,
+    notices: list[str],
+    offers_wake_option: bool = True,
+) -> CayuApi:
+    """An Agent whose router answers 503 with Retry-After ``wakes`` times, then its sessions."""
+
+    answered = {"count": 0}
+    clock = {"now": 0.0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        answered["count"] += 1
+        if answered["count"] <= wakes:
+            return httpx.Response(503, headers={"retry-after": "5"})
+        return httpx.Response(200, json=_SESSIONS)
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    return CayuApi(
+        "https://agent.example/cayu/",
+        authorization="Basic secret",
+        description="The Agent bug-hunter",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+        wake_timeout_seconds=wake_timeout_seconds,
+        sleep=sleep,
+        monotonic=lambda: clock["now"],
+        notice=notices.append,
+        offers_wake_option=offers_wake_option,
+    )
+
+
+def test_a_read_waits_for_the_agent_it_woke_and_says_so_once() -> None:
+    notices: list[str] = []
+    # A wake of about two minutes, within the default bound.
+    api = _waking_api(
+        24, wake_timeout_seconds=agent_api.DEFAULT_WAKE_TIMEOUT_SECONDS, notices=notices
+    )
+
+    assert api.get("/sessions", resource="sessions") == _SESSIONS
+    assert notices == ["The Agent bug-hunter is waking up; waiting up to 3 minutes."]
+    api.get("/sessions", resource="sessions")
+    assert len(notices) == 1
+
+
+def test_a_wake_past_the_bound_or_no_wait_fails_and_says_how_to_wait() -> None:
+    notices: list[str] = []
+    with pytest.raises(CayuApiError, match="didn't answer within 30 seconds") as late:
+        _waking_api(100, wake_timeout_seconds=30, notices=notices).get(
+            "/sessions", resource="sessions"
+        )
+    assert late.value.category == "starting" and "--wake-timeout-seconds" in str(late.value)
+
+    quiet: list[str] = []
+    with pytest.raises(CayuApiError, match="is starting") as at_once:
+        _waking_api(1, wake_timeout_seconds=0, notices=quiet).get("/sessions", resource="sessions")
+    assert at_once.value.category == "starting" and quiet == []
+    assert "--wake-timeout-seconds" in str(at_once.value)
+
+
+def test_a_command_without_the_wake_options_is_not_told_to_pass_them() -> None:
+    with pytest.raises(CayuApiError, match="didn't answer within 30 seconds") as late:
+        _waking_api(100, wake_timeout_seconds=30, notices=[], offers_wake_option=False).get(
+            "/sessions", resource="sessions"
+        )
+    assert late.value.category == "starting"
+    assert "--wake-timeout-seconds" not in str(late.value)
+
+
+def test_the_wake_options_parse_into_one_bound() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    agent_api.add_wake_options(parser)
+    assert parser.parse_args([]).wake_timeout_seconds == agent_api.DEFAULT_WAKE_TIMEOUT_SECONDS
+    assert parser.parse_args(["--no-wait"]).wake_timeout_seconds == 0
+    assert parser.parse_args(["--wake-timeout-seconds", "45"]).wake_timeout_seconds == 45
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--no-wait", "--wake-timeout-seconds", "45"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--wake-timeout-seconds", "-1"])

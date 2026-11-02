@@ -1223,7 +1223,13 @@ does (`cayu cloud login`, `--context PATH`, or `CAYU_CLOUD_API_KEY`), asks Cloud
 Agent's Cayu address and its [Developer dashboard login](#agent-developer-dashboard-credentials),
 and reads the Agent's own Cayu API with that login, so the same people who can read the
 login can use these commands. It reads `/cayu/api/` first and `/api/` when the Agent runs
-`cayu serve`. A sleeping Agent is woken by the read. Nothing is stored locally.
+`cayu serve`. A sleeping Agent is woken by the read, and the command waits for it: it says
+once on stderr that the Agent is waking and for how long it waits (`--wake-timeout-seconds`,
+default 180), then answers. `--no-wait` fails at once with `starting` instead (the wake still
+starts, so a later command finds it awake); `cayu task wait --no-wait` fails too rather than
+reading through the wake. The `cayu eval` commands that take `--application` take both
+options as well. `--timeout-seconds` stays the bound on each request. Nothing is stored
+locally.
 
 A failure names its cause in `error.category`: `not_serving` when the Agent's service is
 stopped or failing, `no_address` when it serves no Cayu address (an Agent without a `[web]`

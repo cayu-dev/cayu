@@ -77,7 +77,9 @@ def test_environment_cli_cloud_and_custom_unknown_activity(monkeypatch, capsys):
         _http_bridge(client) as http,
     ):
 
-        def cloud(application, *, context, timeout_seconds):
+        def cloud(
+            application, *, context, timeout_seconds, wake_timeout_seconds, offers_wake_option
+        ):
             assert application == "demo"
             return CayuApi("http://127.0.0.1", http=http, timeout_seconds=timeout_seconds)
 

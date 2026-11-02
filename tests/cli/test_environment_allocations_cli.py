@@ -54,7 +54,9 @@ def test_list_and_discard_through_a_running_server(tmp_path: Path, monkeypatch, 
         table = capsys.readouterr().out
         assert allocation_id in table and "running" in table
 
-        def cloud(application, *, context, timeout_seconds):
+        def cloud(
+            application, *, context, timeout_seconds, wake_timeout_seconds, offers_wake_option
+        ):
             assert application == "demo"
             return CayuApi("http://127.0.0.1", http=http, timeout_seconds=timeout_seconds)
 

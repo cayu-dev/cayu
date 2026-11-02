@@ -12,7 +12,12 @@ from typing import Any
 from urllib.parse import quote
 
 from cayu._validation import require_durable_clean_nonblank
-from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, open_cloud_agent_api
+from cayu.cli._cloud_agent_api import (
+    CayuApi,
+    CayuApiError,
+    add_wake_options,
+    open_cloud_agent_api,
+)
 from cayu.cli._cloud_private_state import write_private_json
 from cayu.cli._json_inputs import json_object_file
 from cayu.cli._output import add_output_options, output_destination, terminal_safe
@@ -43,6 +48,7 @@ def add_action_target_options(
         help="Environment variable holding the complete Authorization header.",
     )
     parser.add_argument("--timeout-seconds", type=_positive_seconds, default=30.0)
+    add_wake_options(parser)
     add_output_options(parser, formats=("json", "table"), default=output_format)
 
 
@@ -50,7 +56,11 @@ def open_action_api(args: argparse.Namespace) -> CayuApi:
     if args.application is not None:
         name = require_durable_clean_nonblank(args.application, "application")
         return open_cloud_agent_api(
-            name, context=args.context, timeout_seconds=args.timeout_seconds
+            name,
+            context=args.context,
+            timeout_seconds=args.timeout_seconds,
+            wake_timeout_seconds=args.wake_timeout_seconds,
+            offers_wake_option=True,
         )
     if args.context is not None:
         raise ValueError("--context applies only with --application.")

@@ -578,7 +578,12 @@ def _target_api(
         target = ["--application", application_id]
         if args.context is not None:
             target += ["--context", str(args.context)]
-        with _agent_api(client, application_id, args.timeout_seconds) as api:
+        with _agent_api(
+            client,
+            application_id,
+            args.timeout_seconds,
+            wake_timeout_seconds=args.wake_timeout_seconds,
+        ) as api:
             yield api, {"application_id": application_id}, target
         return
     from cayu.cli._control_plane_actions import action_server_url, open_action_api

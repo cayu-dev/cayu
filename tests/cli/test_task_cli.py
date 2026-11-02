@@ -679,7 +679,11 @@ def test_wait_never_reports_an_earlier_attempts_end_for_an_unread_successor(
 
     monkeypatch.setattr(task_cli, "_retry_series", after_the_wait)
     args = argparse.Namespace(
-        task_id="a", wait_seconds=0.05, poll_seconds=0.01, output_format="json"
+        task_id="a",
+        wait_seconds=0.05,
+        poll_seconds=0.01,
+        output_format="json",
+        wake_timeout_seconds=180.0,
     )
 
     with pytest.raises(CayuApiError, match="Could not connect"):
@@ -717,7 +721,11 @@ def test_wait_keeps_the_task_it_read_when_its_series_history_cant_be_read(
             return None
 
     args = argparse.Namespace(
-        task_id="retry-2", wait_seconds=1.0, poll_seconds=0.01, output_format="json"
+        task_id="retry-2",
+        wait_seconds=1.0,
+        poll_seconds=0.01,
+        output_format="json",
+        wake_timeout_seconds=180.0,
     )
 
     code = asyncio.run(_wait_for_task(args, Reader()))  # type: ignore[arg-type]
@@ -740,3 +748,37 @@ def test_series_history_still_fails_on_a_refusal_that_wont_pass() -> None:
     task = {"id": "b", "status": "failed", "retry_series": {"predecessor_task_id": "a"}}
     with pytest.raises(CayuApiError, match="did not accept"):
         asyncio.run(_retry_series(Reader(), task))  # type: ignore[arg-type]
+
+
+def test_wait_with_no_wait_fails_at_once_on_a_sleeping_agent() -> None:
+    """``--no-wait`` makes the first read of a sleeping Agent fail, so the wait does too,
+    rather than reading through the wake as it reads through other transient failures."""
+
+    import argparse
+
+    from cayu.cli._cloud_agent_api import CayuApiError
+    from cayu.cli.task import _wait_for_task
+
+    reads: list[str] = []
+
+    class Reader:
+        source: dict[str, Any] = {}
+
+        async def load_task(self, task_id: str) -> dict[str, Any] | None:
+            reads.append(task_id)
+            raise CayuApiError("starting", "The Agent a is starting.", status_code=503)
+
+        async def close(self) -> None:
+            return None
+
+    args = argparse.Namespace(
+        task_id="t",
+        wait_seconds=5.0,
+        poll_seconds=0.01,
+        output_format="json",
+        wake_timeout_seconds=0.0,
+    )
+
+    with pytest.raises(CayuApiError, match="is starting"):
+        asyncio.run(_wait_for_task(args, Reader()))  # type: ignore[arg-type]
+    assert reads == ["t"]

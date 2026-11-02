@@ -457,6 +457,9 @@ def add_session_parser(subparsers: Any) -> None:
         metavar="PATH",
         help="Private Cayu Cloud context JSON for --application; defaults to `cayu cloud`'s.",
     )
+    from cayu.cli._cloud_agent_api import add_wake_options
+
+    add_wake_options(close_parser)
     close_parser.add_argument(
         "--as",
         dest="closed_by",
@@ -608,7 +611,12 @@ def _close_cloud_session(args: argparse.Namespace) -> dict[str, Any]:
     from cayu.cli._cloud_agent_api import CayuApiError, CayuApiNotFound, open_cloud_agent_api
 
     try:
-        api = open_cloud_agent_api(args.application, context=args.context)
+        api = open_cloud_agent_api(
+            args.application,
+            context=args.context,
+            wake_timeout_seconds=args.wake_timeout_seconds,
+            offers_wake_option=True,
+        )
     except CayuApiError as exc:
         raise RuntimeError(str(exc)) from None
     try:
@@ -833,7 +841,14 @@ def _open_cloud_reader(args: argparse.Namespace) -> SessionReader:
     from cayu.cli._agent_session_reader import AgentSessionReader
     from cayu.cli._cloud_agent_api import open_cloud_agent_api
 
-    return AgentSessionReader(open_cloud_agent_api(args.application, context=args.context))
+    return AgentSessionReader(
+        open_cloud_agent_api(
+            args.application,
+            context=args.context,
+            wake_timeout_seconds=args.wake_timeout_seconds,
+            offers_wake_option=True,
+        )
+    )
 
 
 async def _run_session_command(
@@ -2147,6 +2162,9 @@ def _add_target_options(parser: argparse.ArgumentParser, *, cloud: bool = True) 
         metavar="PATH",
         help="Private Cayu Cloud context JSON for --application; defaults to `cayu cloud`'s.",
     )
+    from cayu.cli._cloud_agent_api import add_wake_options
+
+    add_wake_options(parser)
 
 
 def _parse_labels(values: list[str]) -> dict[str, str]:

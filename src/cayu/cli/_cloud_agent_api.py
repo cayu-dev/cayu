@@ -15,8 +15,11 @@ Cloud supplies both.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import ipaddress
+import math
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -41,6 +44,8 @@ _MAX_DETAIL_CHARS = 512
 _SUCCESS_STATUSES = frozenset({200, 201, 202})
 # Agent states in which its web process can't answer; Cloud wakes a sleeping one.
 _NOT_SERVING_STATUSES = frozenset({"stopping", "stopped", "deleting", "archived", "failed"})
+#: How long a read waits for a sleeping Cloud Agent it woke (``--wake-timeout-seconds``).
+DEFAULT_WAKE_TIMEOUT_SECONDS = 180.0
 # Failures of one read that say nothing about the next: the Agent was waking, or the request
 # timed out or could not connect.
 _TRANSIENT_CATEGORIES = frozenset({"starting", "timeout", "unreachable"})
@@ -100,9 +105,11 @@ class CayuApi:
         description: str = "The Cayu server",
         http: httpx.Client | None = None,
         timeout_seconds: float = 30.0,
-        wake_timeout_seconds: float = 60.0,
+        wake_timeout_seconds: float = DEFAULT_WAKE_TIMEOUT_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        notice: Callable[[str], None] | None = None,
+        offers_wake_option: bool = False,
     ) -> None:
         parts = urlsplit(url)
         if parts.scheme not in {"http", "https"} or not parts.netloc:
@@ -123,6 +130,11 @@ class CayuApi:
         self._owns_http = http is None
         self._timeout = httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds))
         self._wake_timeout_seconds = wake_timeout_seconds
+        # Whether the command reading through this API takes --wake-timeout-seconds, so an
+        # Agent that is still starting can point at it.
+        self._offers_wake_option = offers_wake_option
+        self._notice = _stderr_notice if notice is None else notice
+        self._told_waking = False
         self._sleep = sleep
         self._monotonic = monotonic
 
@@ -286,14 +298,28 @@ class CayuApi:
             if response.status_code == 503 and "retry-after" in response.headers:
                 # Cayu Cloud's router is waking a sleeping Agent; this request did the waking.
                 if self._monotonic() >= deadline:
-                    raise CayuApiError(
-                        "starting",
-                        f"{self.description} is starting and could not answer yet; try again.",
-                        status_code=503,
+                    raise CayuApiError("starting", self._starting_message(), status_code=503)
+                if not self._told_waking:
+                    self._told_waking = True
+                    self._notice(
+                        f"{self.description} is waking up; waiting up to "
+                        f"{_duration(self._wake_timeout_seconds)}."
                     )
                 self._sleep(_retry_after_seconds(response.headers["retry-after"]))
                 continue
             return self._body(response, resource)
+
+    def _starting_message(self) -> str:
+        if self._wake_timeout_seconds <= 0:
+            message = f"{self.description} is starting and could not answer yet; try again"
+            hint = ", or wait for it with --wake-timeout-seconds."
+        else:
+            message = (
+                f"{self.description} is starting and didn't answer within "
+                f"{self._wake_timeout_seconds:g} seconds; try again"
+            )
+            hint = ", or wait longer with --wake-timeout-seconds."
+        return message + (hint if self._offers_wake_option else ".")
 
     def _bounded_request(
         self,
@@ -459,6 +485,8 @@ def open_cloud_agent_api(
     *,
     context: Path | None = None,
     timeout_seconds: float = 30.0,
+    wake_timeout_seconds: float = DEFAULT_WAKE_TIMEOUT_SECONDS,
+    offers_wake_option: bool = False,
     http: httpx.Client | None = None,
 ) -> CayuApi:
     """The Cayu API of the Cayu Cloud Agent ``application`` (its slug or name).
@@ -476,7 +504,14 @@ def open_cloud_agent_api(
         application_id = resolve_application_id(client, application)
     except (CloudApiError, CloudAuthError, CloudCommandError) as exc:
         raise CayuApiError(exc.category, str(exc)) from None
-    return cloud_agent_api(client, application_id, timeout_seconds=timeout_seconds, http=http)
+    return cloud_agent_api(
+        client,
+        application_id,
+        timeout_seconds=timeout_seconds,
+        wake_timeout_seconds=wake_timeout_seconds,
+        offers_wake_option=offers_wake_option,
+        http=http,
+    )
 
 
 def cloud_agent_api(
@@ -484,7 +519,8 @@ def cloud_agent_api(
     application_id: str,
     *,
     timeout_seconds: float = 30.0,
-    wake_timeout_seconds: float = 60.0,
+    wake_timeout_seconds: float = DEFAULT_WAKE_TIMEOUT_SECONDS,
+    offers_wake_option: bool = False,
     http: httpx.Client | None = None,
 ) -> CayuApi:
     """The Cayu API of the Agent ``application_id``, found with a signed-in ``client``.
@@ -528,6 +564,7 @@ def cloud_agent_api(
         http=http,
         timeout_seconds=timeout_seconds,
         wake_timeout_seconds=wake_timeout_seconds,
+        offers_wake_option=offers_wake_option,
     )
 
 
@@ -561,6 +598,50 @@ def _detail(body: Any) -> str | None:
     if safe_text(detail, 64 * 1024) is None:
         return None
     return detail if len(detail) <= _MAX_DETAIL_CHARS else detail[: _MAX_DETAIL_CHARS - 1] + "…"
+
+
+def add_wake_options(parser: argparse.ArgumentParser) -> None:
+    """``--wake-timeout-seconds`` and ``--no-wait``, for a command that reads a Cloud Agent."""
+
+    wait = parser.add_mutually_exclusive_group()
+    wait.add_argument(
+        "--wake-timeout-seconds",
+        type=_wake_seconds,
+        default=DEFAULT_WAKE_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "With --application: how long to wait for a sleeping Agent this command wakes "
+            f"(default: {DEFAULT_WAKE_TIMEOUT_SECONDS:g})."
+        ),
+    )
+    wait.add_argument(
+        "--no-wait",
+        dest="wake_timeout_seconds",
+        action="store_const",
+        const=0.0,
+        help="With --application: fail at once if the Agent is asleep (its wake still starts).",
+    )
+
+
+def _wake_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("must be zero or more seconds")
+    return seconds
+
+
+def _duration(seconds: float) -> str:
+    if seconds >= 60 and seconds % 60 == 0:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute" + ("" if minutes == 1 else "s")
+    return f"{seconds:g} seconds"
+
+
+def _stderr_notice(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 def _retry_after_seconds(value: str) -> float:

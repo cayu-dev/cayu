@@ -315,7 +315,11 @@ def open_task_reader(target: ReadTarget) -> TaskReader:
         return open_store_task_reader(target.store)
     assert target.application is not None
     api = open_cloud_agent_api(
-        target.application, context=target.context, timeout_seconds=target.timeout_seconds
+        target.application,
+        context=target.context,
+        timeout_seconds=target.timeout_seconds,
+        wake_timeout_seconds=target.wake_timeout_seconds,
+        offers_wake_option=True,
     )
     return ApiTaskReader(api, source={"kind": "cayu_cloud", "application": target.application})
 
@@ -373,7 +377,8 @@ async def _wait_for_task(args: argparse.Namespace, reader: TaskReader) -> int:
     """Read the task until it ends or ``--wait-seconds`` pass, then show it.
 
     A terminal attempt with a successor in its retry series hands the wait to that attempt.
-    Failures to reach a server say nothing about the task, so they are read through.
+    Failures to reach a server say nothing about the task, so they are read through, except a
+    sleeping Agent under ``--no-wait``, which fails at once as every read does.
     """
 
     deadline = time.monotonic() + args.wait_seconds
@@ -382,11 +387,12 @@ async def _wait_for_task(args: argparse.Namespace, reader: TaskReader) -> int:
     unread: CayuApiError | None = None
     shown: str | None = None
     followed = {task_id}
+    no_wake_wait = args.wake_timeout_seconds == 0
     while True:
         try:
             current = await reader.load_task(task_id)
         except CayuApiError as exc:
-            if not exc.transient:
+            if not exc.transient or (exc.category == "starting" and no_wake_wait):
                 raise
             if unread is None:
                 note(f"{exc} Reading task {task_id} again.")

@@ -30,6 +30,8 @@ class ReadTarget:
     application: str | None = None
     context: Path | None = None
     timeout_seconds: float = 30.0
+    #: With ``application``: how long to wait for the sleeping Agent a read wakes.
+    wake_timeout_seconds: float = 180.0
 
 
 def add_read_target_options(parser: argparse.ArgumentParser, *, allow_store: bool = True) -> None:
@@ -68,6 +70,9 @@ def add_read_target_options(parser: argparse.ArgumentParser, *, allow_store: boo
         metavar="SECONDS",
         help="With --application or --server-url: how long each request may take (default: 30).",
     )
+    from cayu.cli._cloud_agent_api import add_wake_options
+
+    add_wake_options(parser)
 
 
 def resolve_read_target(args: argparse.Namespace) -> ReadTarget:
@@ -97,6 +102,7 @@ def resolve_read_target(args: argparse.Namespace) -> ReadTarget:
         application=application,
         context=args.context,
         timeout_seconds=args.timeout_seconds,
+        wake_timeout_seconds=args.wake_timeout_seconds,
     )
 
 

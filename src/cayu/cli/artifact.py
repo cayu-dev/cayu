@@ -69,7 +69,11 @@ async def _run_artifact(args: argparse.Namespace, target: ReadTarget) -> int:
     else:
         assert target.application is not None
         api = open_cloud_agent_api(
-            target.application, context=target.context, timeout_seconds=target.timeout_seconds
+            target.application,
+            context=target.context,
+            timeout_seconds=target.timeout_seconds,
+            wake_timeout_seconds=target.wake_timeout_seconds,
+            offers_wake_option=True,
         )
     try:
         if (

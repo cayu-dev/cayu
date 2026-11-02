@@ -1336,16 +1336,27 @@ def _run_id_commands(
 
 @contextmanager
 def _agent_api(
-    client: CloudApiClient, application_id: str, timeout_seconds: float
+    client: CloudApiClient,
+    application_id: str,
+    timeout_seconds: float,
+    *,
+    wake_timeout_seconds: float | None = None,
 ) -> Iterator[CayuApi]:
-    """The Agent's Cayu API; its failures become `cayu cloud` errors."""
+    """The Agent's Cayu API; its failures become `cayu cloud` errors.
+
+    ``wake_timeout_seconds`` is the bound a command's ``--wake-timeout-seconds`` or
+    ``--no-wait`` set; without one, a sleeping Agent gets this module's fixed bound.
+    """
 
     try:
         api = cloud_agent_api(
             client,
             application_id,
             timeout_seconds=timeout_seconds,
-            wake_timeout_seconds=_WAKE_TIMEOUT_SECONDS,
+            wake_timeout_seconds=(
+                _WAKE_TIMEOUT_SECONDS if wake_timeout_seconds is None else wake_timeout_seconds
+            ),
+            offers_wake_option=wake_timeout_seconds is not None,
         )
     except CayuApiError as exc:
         raise CloudEvalError(exc.category, str(exc), status_code=exc.status_code) from None

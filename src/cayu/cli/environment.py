@@ -182,6 +182,9 @@ def _add_allocation_target_options(parser: argparse.ArgumentParser) -> None:
         metavar="SECONDS",
         help="With --application or --server-url: how long each request may take (default: 30).",
     )
+    from cayu.cli._cloud_agent_api import add_wake_options
+
+    add_wake_options(parser)
 
 
 def run_environment(args: argparse.Namespace) -> int:
@@ -204,7 +207,11 @@ def _open_api(target: ReadTarget):
         )
     assert target.application is not None
     return open_cloud_agent_api(
-        target.application, context=target.context, timeout_seconds=target.timeout_seconds
+        target.application,
+        context=target.context,
+        timeout_seconds=target.timeout_seconds,
+        wake_timeout_seconds=target.wake_timeout_seconds,
+        offers_wake_option=True,
     )
 
 
@@ -329,7 +336,10 @@ def _target(args: argparse.Namespace) -> ReadTarget:
     if not application:
         raise ValueError("--application must name an Agent.")
     return ReadTarget(
-        application=application, context=args.context, timeout_seconds=args.timeout_seconds
+        application=application,
+        context=args.context,
+        timeout_seconds=args.timeout_seconds,
+        wake_timeout_seconds=args.wake_timeout_seconds,
     )
 
 

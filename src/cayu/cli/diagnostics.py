@@ -380,7 +380,11 @@ async def _run_system(args: argparse.Namespace, target: ReadTarget) -> int:
         )
     elif target.application is not None:
         api = open_cloud_agent_api(
-            target.application, context=target.context, timeout_seconds=target.timeout_seconds
+            target.application,
+            context=target.context,
+            timeout_seconds=target.timeout_seconds,
+            wake_timeout_seconds=target.wake_timeout_seconds,
+            offers_wake_option=True,
         )
     else:
         raise ValueError("System diagnostics requires a server URL or Cloud application.")
