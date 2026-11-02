@@ -21,7 +21,8 @@ cayu cloud service status --application my-agent
 
 `cayu cloud --help` is the authoritative summary. The top-level commands are:
 
-- `login`, `logout`, and `whoami` for interactive identity;
+- `login`, `logout`, and `whoami` for interactive identity, and `organizations` to
+  [list and choose your Organizations](#organizations);
 - `applications list|show|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
 - `platform` for [which Cayu Cloud revision runs and when it rolled out](#cloud-rollouts);
@@ -843,6 +844,26 @@ operational handoffs, and automation:
 cayu cloud context use /private/path/cloud-context.json
 CAYU_CLOUD_API_KEY_FILE=/private/path/key cayu cloud doctor
 ```
+
+## Organizations
+
+A person can belong to several Cayu Cloud Organizations; a login acts in one of them.
+
+```console
+cayu cloud organizations
+cayu cloud organizations use org_01...
+cayu cloud login --organization org_01...
+```
+
+`organizations` lists yours, with your role in each, and `current_organization_id` names the one
+this login acts in. `organizations use ORG_ID` makes the saved login act in another of them: the
+refresh token is exchanged for one in that Organization, with no new browser sign-in, and Cloud
+confirms it (`GET /v1/me`). An Organization that requires its own sign-in (for example SSO), or
+one you aren't in, is refused with `organization_unavailable` and the login stays as it was.
+`login --organization ORG_ID` signs in and then switches to it, whichever Organization the browser
+chose; nothing is saved until the switch succeeds, so a refused Organization leaves the previous
+login and context in use. Every later command acts in the chosen Organization; `cayu cloud whoami` shows it. An
+Organization API key belongs to one Organization, so these commands need `cayu cloud login`.
 
 ## Cloud rollouts
 

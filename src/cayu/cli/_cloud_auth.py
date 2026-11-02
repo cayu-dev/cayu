@@ -402,7 +402,23 @@ class WorkOSDeviceAuthClient:
             raise CloudAuthError("login_failed", "Cayu Cloud login failed.")
         raise CloudAuthError("login_expired", "Cayu Cloud login expired.")
 
-    def refresh(self, credentials: CloudAuthCredentials) -> CloudAuthCredentials:
+    def refresh(
+        self, credentials: CloudAuthCredentials, *, organization_id: str | None = None
+    ) -> CloudAuthCredentials:
+        """A refreshed login; with ``organization_id``, one for that Organization instead.
+
+        WorkOS issues a token for another of the person's Organizations from the refresh token,
+        without a new browser sign-in. The user must stay the same, and the Organization must be
+        the one asked for (or, without one, the same as before).
+        """
+
+        form = {
+            "client_id": credentials.workos_client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": credentials.refresh_token,
+        }
+        if organization_id is not None:
+            form["organization_id"] = organization_id
         response: httpx.Response | None = None
         retry_started_monotonic = time.monotonic()
         retry_started_wall = time.time()
@@ -420,11 +436,7 @@ class WorkOSDeviceAuthClient:
                 response = self._request(
                     "POST",
                     f"{_workos_base_url(credentials.workos_api_hostname)}/user_management/authenticate",
-                    form={
-                        "client_id": credentials.workos_client_id,
-                        "grant_type": "refresh_token",
-                        "refresh_token": credentials.refresh_token,
-                    },
+                    form=form,
                     timeout_seconds=attempt_timeout_seconds,
                     total_timeout_seconds=attempt_timeout_seconds,
                 )
@@ -435,6 +447,16 @@ class WorkOSDeviceAuthClient:
                 if 200 <= response.status_code < 300:
                     break
                 if not _transient_refresh_status(response.status_code):
+                    if (
+                        organization_id is not None
+                        and response.status_code in {400, 403}
+                        and _workos_error(response) != "invalid_grant"
+                    ):
+                        raise CloudAuthError(
+                            "organization_unavailable",
+                            f"You can't sign in to Organization {organization_id}; "
+                            "`cayu cloud organizations` lists yours.",
+                        )
                     if response.status_code == 400 and _workos_error(response) == "invalid_grant":
                         raise CloudAuthError(
                             "login_refresh_failed",
@@ -463,10 +485,8 @@ class WorkOSDeviceAuthClient:
             client_id=credentials.workos_client_id,
             api_hostname=credentials.workos_api_hostname,
         )
-        if (
-            refreshed.organization_id != credentials.organization_id
-            or refreshed.user_id != credentials.user_id
-        ):
+        wanted = credentials.organization_id if organization_id is None else organization_id
+        if refreshed.organization_id != wanted or refreshed.user_id != credentials.user_id:
             raise CloudAuthError(
                 "login_refresh_failed",
                 "The Cayu Cloud login identity changed; run `cayu cloud login` again.",
@@ -602,6 +622,52 @@ def fresh_cloud_credentials(
         if refreshed is current:
             return store.load()
         return publication.publish(refreshed)
+
+
+def switch_cloud_organization(
+    store: CloudAuthStore, organization_id: str, *, timeout_seconds: float
+) -> CloudAuthCredentials:
+    """Make the saved login act in ``organization_id``, one of the person's Organizations.
+
+    It rotates the saved login under the same lock a refresh takes, so a concurrent command
+    never spends the refresh token this replaces.
+    """
+
+    credentials = store.load()
+    if credentials is None:
+        raise CloudAuthError("login_required", "Sign in first with `cayu cloud login`.")
+    if credentials.organization_id == organization_id:
+        # Already there: the login as any command would use it, refreshed if it's expiring.
+        fresh = fresh_cloud_credentials(store, timeout_seconds=timeout_seconds)
+        if fresh is None:
+            raise CloudAuthError("login_required", "Sign in first with `cayu cloud login`.")
+        return fresh
+    with store.prepare_refresh(credentials) as publication:
+        current = publication.current
+        if current is None:
+            raise CloudAuthError("login_required", "Sign in first with `cayu cloud login`.")
+        if not _same_cloud_auth_credentials(current, credentials):
+            # Another command rotated the login meanwhile; its refresh token isn't ours to spend.
+            raise CloudAuthError(
+                "cloud_auth_unavailable",
+                "Another command changed the login while switching; retry this command.",
+            )
+        switched = WorkOSDeviceAuthClient(
+            api_url=current.api_url, timeout_seconds=timeout_seconds
+        ).refresh(current, organization_id=organization_id)
+        if switched is current:
+            # WorkOS couldn't be reached and the old login was kept.
+            raise CloudAuthError(
+                "login_refresh_unavailable",
+                "Couldn't switch Organizations right now; retry this command.",
+            )
+        published = publication.publish(switched)
+        if published is None or published.organization_id != organization_id:
+            raise CloudAuthError(
+                "cloud_auth_unavailable",
+                "Another command changed the login while switching; retry this command.",
+            )
+        return published
 
 
 def _transient_refresh_status(status_code: int) -> bool:

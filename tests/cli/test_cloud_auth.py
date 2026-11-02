@@ -2424,3 +2424,238 @@ def test_workos_device_polling_stops_at_authorization_deadline(
         thread.join()
 
     assert raised.value.category == "login_expired"
+
+
+def _fake_workos_and_cloud(monkeypatch, *, organizations, refused=None):
+    """WorkOS's refresh grant and Cloud's `/v1/me`, answering for the requested Organization."""
+
+    forms: list[dict[str, str]] = []
+
+    def request(
+        _client, _method, url, *, form=None, timeout_seconds=None, total_timeout_seconds=None
+    ):
+        del timeout_seconds, total_timeout_seconds
+        forms.append(dict(form or {}))
+        organization = (form or {}).get("organization_id", "org_test")
+        if refused is not None and organization == refused:
+            return httpx.Response(403, json={"error": "organization_membership_required"})
+        token = _jwt(expires_at=time.time() + 3600, marker=organization)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": token,
+                "refresh_token": f"refresh-{organization}",
+                "organization_id": organization,
+                "user": {"id": "user_test"},
+            },
+        )
+
+    def cloud_request(client, method, path, **_options):
+        encoded = client.api_key.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        # The saved login's token is marked "current"; refreshed ones name their Organization.
+        organization = {"current": "org_test"}.get(claims["marker"], claims["marker"])
+        if path == "/v1/me":
+            return {
+                "authentication": "workos",
+                "organization_id": organization,
+                "role": "admin",
+                "user_id": "user_test",
+            }
+        assert path == "/v1/me/organizations"
+        return {
+            "items": [{**item, "current": item["id"] == organization} for item in organizations]
+        }
+
+    monkeypatch.setattr(WorkOSDeviceAuthClient, "_request", request)
+    monkeypatch.setattr(CloudApiClient, "request", cloud_request)
+    return forms
+
+
+def test_a_person_lists_their_organizations_and_switches_without_a_browser(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`cayu cloud organizations` and `organizations use`."""
+
+    store, _credentials = _configure_saved_workos_login(
+        monkeypatch, tmp_path, api_url="http://127.0.0.1:9", expires_at=time.time() + 3600
+    )
+    organizations = [
+        {"id": "org_demo", "name": "Cayu Demo", "role": "admin"},
+        {"id": "org_test", "name": "Cayu", "role": "developer"},
+    ]
+    forms = _fake_workos_and_cloud(monkeypatch, organizations=organizations)
+
+    assert main(["cloud", "organizations"]) == 0
+    listed = json.loads(capsys.readouterr().out)["result"]
+    assert listed["current_organization_id"] == "org_test"
+    assert [item["id"] for item in listed["items"] if item["current"]] == ["org_test"]
+
+    assert main(["cloud", "organizations", "use", "org_demo"]) == 0
+    switched = json.loads(capsys.readouterr().out)["result"]
+    assert (switched["organization_id"], switched["status"]) == ("org_demo", "switched")
+    # The refresh token asked WorkOS for the other Organization, and the rotated login is saved.
+    assert forms[-1]["organization_id"] == "org_demo"
+    saved = store.load()
+    assert saved is not None
+    assert (saved.organization_id, saved.refresh_token) == ("org_demo", "refresh-org_demo")
+
+    assert main(["cloud", "organizations"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["current_organization_id"] == "org_demo"
+    # Choosing the current one changes nothing.
+    calls = len(forms)
+    assert main(["cloud", "organizations", "use", "org_demo"]) == 0
+    capsys.readouterr()
+    assert len(forms) == calls
+
+
+def test_an_organization_the_person_isnt_in_is_refused_and_the_login_kept(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store, credentials = _configure_saved_workos_login(
+        monkeypatch, tmp_path, api_url="http://127.0.0.1:9", expires_at=time.time() + 3600
+    )
+    _fake_workos_and_cloud(monkeypatch, organizations=[], refused="org_other")
+
+    assert main(["cloud", "organizations", "use", "org_other"]) != 0
+    assert json.loads(capsys.readouterr().out)["error"]["category"] == "organization_unavailable"
+    assert store.load() == credentials
+
+
+def test_switching_needs_a_login(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("CAYU_CLOUD_AUTH", str(tmp_path / "missing.json"))
+    assert main(["cloud", "organizations", "use", "org_demo"]) != 0
+    assert json.loads(capsys.readouterr().out)["error"]["category"] == "login_required"
+
+
+def test_a_switch_never_spends_a_refresh_token_another_command_rotated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store, credentials = _configure_saved_workos_login(
+        monkeypatch, tmp_path, api_url="http://127.0.0.1:9", expires_at=time.time() + 3600
+    )
+    spent: list[str] = []
+    _fake_workos_and_cloud(monkeypatch, organizations=[])
+    real_request = WorkOSDeviceAuthClient._request
+
+    def spending(client, method, url, *, form=None, **options):
+        spent.append((form or {}).get("refresh_token", ""))
+        return real_request(client, method, url, form=form, **options)
+
+    monkeypatch.setattr(WorkOSDeviceAuthClient, "_request", spending)
+    rotated = replace(credentials, refresh_token="refresh-rotated-by-other")
+    real_prepare = CloudAuthStore.prepare_refresh
+
+    @contextmanager
+    def rotate_first(self, expected):
+        # Another command refreshes the login between the switch's read and its reservation.
+        self.save(rotated)
+        with real_prepare(self, expected) as publication:
+            yield publication
+
+    monkeypatch.setattr(CloudAuthStore, "prepare_refresh", rotate_first)
+
+    with pytest.raises(CloudAuthError) as refused:
+        cloud_auth.switch_cloud_organization(store, "org_demo", timeout_seconds=5)
+
+    assert refused.value.category == "cloud_auth_unavailable"
+    assert spent == []
+    assert store.load() == rotated
+
+
+def test_switching_to_the_current_organization_refreshes_an_expired_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store, _credentials = _configure_saved_workos_login(
+        monkeypatch, tmp_path, api_url="http://127.0.0.1:9", expires_at=time.time() - 10
+    )
+    _fake_workos_and_cloud(monkeypatch, organizations=[])
+
+    switched = cloud_auth.switch_cloud_organization(store, "org_test", timeout_seconds=5)
+
+    assert switched.expires_at > time.time()
+    assert store.load() == switched
+
+
+def test_switching_clears_a_selected_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configure_saved_workos_login(
+        monkeypatch, tmp_path, api_url="http://127.0.0.1:9", expires_at=time.time() + 3600
+    )
+    _fake_workos_and_cloud(monkeypatch, organizations=[])
+    cleared: list[bool] = []
+    monkeypatch.setattr(cloud_cli, "_clear_active_context", lambda: cleared.append(True) or {})
+
+    assert main(["cloud", "organizations", "use", "org_demo"]) == 0
+    capsys.readouterr()
+    assert cleared == [True]
+
+
+def _browser_signs_in_to(monkeypatch, credentials, organization_id):
+    """The device login completes in ``organization_id`` (the browser's choice)."""
+
+    signed_in = replace(
+        credentials,
+        access_token=_jwt(expires_at=time.time() + 3600, marker=organization_id),
+        organization_id=organization_id,
+        refresh_token=f"refresh-{organization_id}",
+    )
+    monkeypatch.setattr(
+        WorkOSDeviceAuthClient, "portal_config", lambda _self: ("client_test", "127.0.0.1:9")
+    )
+    monkeypatch.setattr(
+        WorkOSDeviceAuthClient, "authorize_device", lambda _self, **_kw: _device_authorization()
+    )
+    monkeypatch.setattr(
+        WorkOSDeviceAuthClient, "poll_for_credentials", lambda _self, *_a, **_kw: signed_in
+    )
+
+
+def test_login_into_a_refused_organization_keeps_the_previous_login_and_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store, credentials = _configure_saved_workos_login(
+        monkeypatch, tmp_path, api_url="http://127.0.0.1:9", expires_at=time.time() + 3600
+    )
+    _fake_workos_and_cloud(monkeypatch, organizations=[], refused="org_sso")
+    _browser_signs_in_to(monkeypatch, credentials, "org_browser")
+    cleared: list[bool] = []
+    monkeypatch.setattr(cloud_cli, "_clear_active_context", lambda: cleared.append(True) or {})
+
+    assert main(["cloud", "login", "--no-browser", "--organization", "org_sso"]) != 0
+    assert json.loads(capsys.readouterr().out)["error"]["category"] == "organization_unavailable"
+    # Neither the browser's Organization nor a cleared context: the old login still acts.
+    assert store.load() == credentials
+    assert cleared == []
+
+
+def test_login_into_another_organization_saves_only_that_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store, credentials = _configure_saved_workos_login(
+        monkeypatch, tmp_path, api_url="http://127.0.0.1:9", expires_at=time.time() + 3600
+    )
+    forms = _fake_workos_and_cloud(monkeypatch, organizations=[])
+    _browser_signs_in_to(monkeypatch, credentials, "org_browser")
+
+    assert main(["cloud", "login", "--no-browser", "--organization", "org_demo"]) == 0
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert (result["organization_id"], result["status"]) == ("org_demo", "signed_in")
+    assert forms[-1] == {
+        "client_id": credentials.workos_client_id,
+        "grant_type": "refresh_token",
+        "organization_id": "org_demo",
+        "refresh_token": "refresh-org_browser",
+    }
+    saved = store.load()
+    assert saved is not None
+    assert (saved.organization_id, saved.refresh_token) == ("org_demo", "refresh-org_demo")

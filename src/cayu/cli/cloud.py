@@ -32,6 +32,7 @@ from cayu.cli._cloud_auth import (
     CloudAuthStore,
     WorkOSDeviceAuthClient,
     fresh_cloud_credentials,
+    switch_cloud_organization,
 )
 from cayu.cli._cloud_compass import CompassWriteError, add_compass_parser, compass_command
 from cayu.cli._cloud_data import add_data_parser, data_command
@@ -877,6 +878,31 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Print the verification URL and code without opening a browser.",
     )
+    login.add_argument(
+        "--organization",
+        metavar="ORG_ID",
+        help=(
+            "Act in this Organization (one of `cayu cloud organizations`) once signed in, "
+            "whichever one the browser sign-in chose."
+        ),
+    )
+    organizations = commands.add_parser(
+        "organizations",
+        help="List your Organizations, or choose the one to act in.",
+        description=(
+            "List the Cayu Cloud Organizations you belong to, with your role in each and which "
+            "one this login acts in (`current`). `organizations use ORG_ID` makes the login act "
+            "in another of them, without a new browser sign-in. Needs `cayu cloud login`; an "
+            "Organization API key belongs to one Organization."
+        ),
+    )
+    organization_commands = organizations.add_subparsers(dest="organization_command")
+    use = organization_commands.add_parser(
+        "use",
+        help="Act in another of your Organizations.",
+        description="Make the saved login act in ORG_ID, one of your Organizations.",
+    )
+    use.add_argument("organization_id", metavar="ORG_ID")
     commands.add_parser(
         "logout",
         help="Delete the local login.",
@@ -2024,6 +2050,8 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         return {"operation": "init", "result": result}
     if arguments.command == "login":
         return _login(arguments)
+    if arguments.command == "organizations" and arguments.organization_command == "use":
+        return _use_organization(arguments, arguments.organization_id)
     if arguments.command == "logout":
         return {
             "operation": "logout",
@@ -2095,6 +2123,8 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
     selected_context = _selected_context_path(arguments.context)
     context = _read_context(selected_context) if selected_context is not None else {}
     client = _cloud_client(arguments, context=context, context_path=selected_context)
+    if arguments.command == "organizations":
+        return {"operation": "organizations", "result": _organizations(client)}
     if arguments.command == "whoami":
         return {
             "operation": "whoami",
@@ -2189,8 +2219,39 @@ def _login(arguments: argparse.Namespace) -> dict[str, Any]:
         client_id=client_id,
         api_hostname=api_hostname,
     )
+    _confirm_login_identity(arguments, credentials)
+    if arguments.organization is not None and arguments.organization != credentials.organization_id:
+        # Switch before saving anything: if the Organization is refused, the login and
+        # context in use before this command stay as they were.
+        switched = auth.refresh(credentials, organization_id=arguments.organization)
+        if switched is credentials:
+            raise CloudAuthError(
+                "login_refresh_unavailable",
+                "Couldn't switch Organizations right now; retry this command.",
+            )
+        _confirm_login_identity(arguments, switched)
+        credentials = switched
+    CloudAuthStore().save(credentials)
+    _clear_active_context()
+    return {
+        "operation": "login",
+        "result": {
+            "api_url": api_url,
+            "authentication": "workos",
+            "organization_id": credentials.organization_id,
+            "status": "signed_in",
+            "user_id": credentials.user_id,
+        },
+    }
+
+
+def _confirm_login_identity(
+    arguments: argparse.Namespace, credentials: CloudAuthCredentials
+) -> None:
+    """Refuse a WorkOS login Cloud doesn't see as this person in this Organization."""
+
     identity = CloudApiClient(
-        api_url=api_url,
+        api_url=credentials.api_url,
         api_key=credentials.access_token,
         timeout_seconds=arguments.timeout_seconds,
     ).request("GET", "/v1/me")
@@ -2203,15 +2264,55 @@ def _login(arguments: argparse.Namespace) -> dict[str, Any]:
             "login_failed",
             "Cayu Cloud rejected the WorkOS login identity.",
         )
-    CloudAuthStore().save(credentials)
+
+
+def _organizations(client: CloudApiClient) -> dict[str, Any]:
+    """The person's Organizations (`GET /v1/me/organizations`), `current` marking this login's."""
+
+    try:
+        result = client.request("GET", "/v1/me/organizations")
+    except CloudApiError as exc:
+        if exc.status_code == 403:
+            raise CloudApiError(
+                "login_required",
+                "Listing your Organizations needs `cayu cloud login`; an Organization API key "
+                "belongs to one Organization.",
+                status_code=403,
+            ) from None
+        raise
+    items = result.get("items")
+    if not isinstance(items, list):
+        raise CloudApiError("api_response_invalid", "Cayu Cloud's Organization list is invalid.")
+    current = next(
+        (item.get("id") for item in items if isinstance(item, dict) and item.get("current")), None
+    )
+    return {"current_organization_id": current, "items": items}
+
+
+def _use_organization(arguments: argparse.Namespace, organization_id: str) -> dict[str, Any]:
+    """Switch the saved login to ``organization_id`` and confirm Cloud sees it there."""
+
+    credentials = switch_cloud_organization(
+        CloudAuthStore(), organization_id, timeout_seconds=arguments.timeout_seconds
+    )
+    identity = CloudApiClient(
+        api_url=credentials.api_url,
+        api_key=credentials.access_token,
+        timeout_seconds=arguments.timeout_seconds,
+    ).request("GET", "/v1/me")
+    if identity.get("organization_id") != organization_id:
+        raise CloudAuthError(
+            "login_failed", "Cayu Cloud didn't accept the login in that Organization."
+        )
+    # A selected context's key would otherwise keep acting in the earlier Organization.
     _clear_active_context()
     return {
-        "operation": "login",
+        "operation": "organizations.use",
         "result": {
-            "api_url": api_url,
-            "authentication": "workos",
+            "api_url": credentials.api_url,
             "organization_id": credentials.organization_id,
-            "status": "signed_in",
+            "role": identity.get("role"),
+            "status": "switched",
             "user_id": credentials.user_id,
         },
     }
