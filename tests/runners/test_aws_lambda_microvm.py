@@ -462,6 +462,20 @@ async def test_known_failure_survives_later_cleanup_timeout(monkeypatch, allocat
     client = FakeLambdaMicroVMClient()
     terminate = client.terminate_microvm
     runner = None
+    loop = asyncio.get_running_loop()
+    owner: list[asyncio.Task] = []
+    # The owner is cancelled from inside the blocked cleanup, the moment it starts, rather
+    # than after a thread hop back to the test. A cancellation can only shorten the
+    # deadline it lands in, so in the owner-cancel case both the allocation deadline
+    # (ready plus request timeout) and the cleanup timeout get a budget no runner stall
+    # before the queued cancel can use up. The other case only waits for the timeout.
+    cleanup_timeout_s = 1.0 if cancel_owner else 0.05
+
+    def cleanup_started() -> None:
+        started.set()
+        if cancel_owner:
+            loop.call_soon_threadsafe(owner[0].cancel, "owner")
+
     if allocation:
 
         async def fail_ready(self, timeout):
@@ -470,7 +484,7 @@ async def test_known_failure_survives_later_cleanup_timeout(monkeypatch, allocat
         monkeypatch.setattr(LambdaMicroVMRunner, "_wait_until_ready", fail_ready)
 
         def blocked(**kwargs):
-            started.set()
+            cleanup_started()
             assert release.wait(5)
             return terminate(**kwargs)
 
@@ -479,9 +493,10 @@ async def test_known_failure_survives_later_cleanup_timeout(monkeypatch, allocat
             "image",
             client=client,
             endpoint_transport=FakeEndpointTransport(),
-            ready_timeout_s=0.05,
+            # fail_ready raises at once, so this budget costs no time.
+            ready_timeout_s=cleanup_timeout_s,
             request_timeout_s=0.05,
-            cancel_timeout_s=0.05,
+            cancel_timeout_s=cleanup_timeout_s,
         )
     else:
 
@@ -492,7 +507,7 @@ async def test_known_failure_survives_later_cleanup_timeout(monkeypatch, allocat
 
         class Transport(FakeEndpointTransport):
             async def aclose(self):
-                started.set()
+                cleanup_started()
                 await asyncio.to_thread(release.wait, 5)
 
         runner = LambdaMicroVMRunner(
@@ -500,15 +515,15 @@ async def test_known_failure_survives_later_cleanup_timeout(monkeypatch, allocat
             microvm_id="mvm-123",
             endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
             endpoint_transport=Transport(),
-            cancel_timeout_s=0.05,
+            cancel_timeout_s=cleanup_timeout_s,
         )
         runner._owns_endpoint_transport = True
         operation = runner.kill()
     task = asyncio.create_task(operation)
+    owner.append(task)
     try:
         assert await asyncio.to_thread(started.wait, 2)
         if cancel_owner:
-            task.cancel("owner")
             with pytest.raises(asyncio.CancelledError) as caught:
                 await task
             assert task.cancelled() and task.cancelling() == 1
