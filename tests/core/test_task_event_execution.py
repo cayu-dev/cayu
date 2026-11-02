@@ -179,8 +179,9 @@ def test_idle_event_expires_and_unlimited_work_remains_available(backend, tmp_pa
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("budget_read_delay", [0, 0.25], ids=["normal", "delayed-budget-read"])
 def test_event_deadline_retains_ownership_until_cancellation_cleanup_finishes(
-    backend, tmp_path, request
+    backend, tmp_path, request, monkeypatch, budget_read_delay
 ):
     async def scenario():
         store = _store(backend, tmp_path, request)
@@ -189,6 +190,15 @@ def test_event_deadline_retains_ownership_until_cancellation_cleanup_finishes(
         budget = TaskRetryBudget(max_attempts=None, max_elapsed_seconds=1.0)
         task = await app.create_task(TaskCreate(type="job", event_id="one", retry_budget=budget))
         cancelled, release = asyncio.Event(), asyncio.Event()
+        remaining_seconds = store.task_event_remaining_seconds
+
+        async def delayed_remaining_seconds(retry_key):
+            # The worker subtracts query latency conservatively. A slow read
+            # can therefore cancel the handler before the store deadline.
+            await asyncio.sleep(budget_read_delay)
+            return await remaining_seconds(retry_key)
+
+        monkeypatch.setattr(store, "task_event_remaining_seconds", delayed_remaining_seconds)
 
         async def handler(app, task, worker_id):
             try:
@@ -203,8 +213,17 @@ def test_event_deadline_retains_ownership_until_cancellation_cleanup_finishes(
         )
         try:
             await asyncio.wait_for(cancelled.wait(), 5)
-            state = await store.refresh_task_retry_key(task.invocation.event_retry_key)
+            # Cancellation uses a conservative local deadline; it does not prove
+            # the store's deadline has elapsed. Keep cleanup blocked until that
+            # durable transition is observable, then check ownership and refusal.
+            async with asyncio.timeout(5):
+                while True:
+                    state = await store.refresh_task_retry_key(task.invocation.event_retry_key)
+                    if state.status is not TaskRetryKeyStatus.ACTIVE:
+                        break
+                    await asyncio.sleep(0.01)
             assert state.status is TaskRetryKeyStatus.GIVEN_UP
+            assert state.given_up_reason.value == "elapsed_exhausted"
             assert not worker.done()
             current = await store.load_task(task.id)
             assert current.worker_id == "owner"
