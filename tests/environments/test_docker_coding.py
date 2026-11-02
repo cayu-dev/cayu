@@ -1579,6 +1579,9 @@ def test_docker_coding_container_removal_keeps_the_released_fingerprint() -> Non
     assert fingerprint(**configuration) == released
     assert fingerprint(**configuration, command_cleanup="sandbox") == released
     assert fingerprint(**configuration, command_cleanup="command_or_sandbox") != released
+    # Workspace setup commands are opt-in, so factories without them keep it too.
+    assert fingerprint(**configuration, workspace_setup_commands=()) == released
+    assert fingerprint(**configuration, workspace_setup_commands=("true",)) != released
 
 
 def test_docker_coding_factory_reconnects_exact_preserved_container(

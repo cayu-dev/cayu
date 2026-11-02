@@ -14505,7 +14505,15 @@ copy-in. `DockerCodingEnvironmentFactory(git_baseline=False)` skips that
 baseline, so the image needs no `git`; copy-in, copy-back, recovery and
 disposal are unchanged, but no Git evidence is captured and coding-product
 source-copy authority is refused. The agent preset's Docker sandbox uses this
-mode. Copy-back stages bounded output, preflights the original host file
+mode. `workspace_setup_commands` (default none) run in the container, one at
+a time, in `/workspace` as the workspace's user, after copy-in and after the
+Git baseline, as the brokered coding factory's do, so they can adjust the tree
+or amend the baseline commit before the agent starts. Each may run for
+`setup_command_timeout_s` (default 600 seconds); a nonzero exit or a timeout
+fails the binding with a masked tail of the command's output, and the runtime
+discards the container like any other failed binding. They never run on
+copy-back. They are part of the factory's configuration fingerprint (the
+timeout is not), and coding-product source-copy authority refuses them. Copy-back stages bounded output, preflights the original host file
 revisions, and publishes with conditional create/replace/delete operations.
 A pre-existing host conflict performs no writes. A race during publication is
 reported as `SyncBindingSourceConflictError` with the exact already-applied

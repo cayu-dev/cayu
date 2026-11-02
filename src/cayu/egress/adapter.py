@@ -42,14 +42,6 @@ DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS = 300
 _CleanupResultT = TypeVar("_CleanupResultT")
 
 
-def validate_setup_command_timeout(value: object) -> int:
-    """Return a setup command timeout: a positive whole number of seconds."""
-
-    if type(value) is not int or value <= 0:
-        raise ValueError("setup_command_timeout_s must be a positive integer number of seconds.")
-    return value
-
-
 _ExecutionCapabilityPosture = Literal[
     "available",
     "live_verified",

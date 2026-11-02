@@ -42,6 +42,12 @@ from cayu.environments._ephemeral_git import (
     sync_bound_tree_size,
 )
 from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
+from cayu.environments._setup_commands import (
+    run_setup_commands,
+    setup_commands_sha256,
+    validate_setup_command_timeout,
+    validated_setup_commands,
+)
 from cayu.environments._sync_staging import SyncBindingStagingCapacity
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
@@ -141,6 +147,8 @@ _WARM_SPARE_DOCKER_TIMEOUT_S = 30.0
 # ``docker rm -f`` on a loaded host can take far longer than the standalone
 # runner's five seconds.
 DEFAULT_DOCKER_CODING_CANCEL_TIMEOUT_SECONDS = 30.0
+#: How long each workspace setup command may run, unless the factory sets otherwise.
+DEFAULT_DOCKER_CODING_SETUP_COMMAND_TIMEOUT_SECONDS = 600
 _DOCKER_CODING_RUNTIME_EXECUTABLES = ("git", "python3", "rm", "sh", "sleep")
 _GIT_HASH_PATH_CHUNK_BYTES = 24 * 1024
 _GIT_HASH_PATH_CHUNK_COUNT = 512
@@ -409,6 +417,12 @@ class DockerCodingWorkspaceBinding(SyncBinding):
     With ``git_baseline=False`` the guest needs no ``git`` executable: copy-in,
     copy-back, recovery and disposal are unchanged, but no Git evidence is
     captured and coding-product source-copy authority is unavailable.
+
+    ``workspace_setup_commands`` run one at a time as shell commands in the
+    workspace, as the workspace's user, after copy-in and after the Git
+    baseline. Each may run for ``setup_command_timeout_s`` seconds; a failure
+    fails the bind. They never run on copy-back. Coding-product source-copy
+    authority refuses them, since they would change the admitted baseline.
     """
 
     def __init__(
@@ -423,9 +437,15 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         git_baseline: bool = True,
         staging_capacity: SyncBindingStagingCapacity | None = None,
         workspace_repository: str | None = None,
+        workspace_setup_commands: Sequence[str] = (),
+        setup_command_timeout_s: int = DEFAULT_DOCKER_CODING_SETUP_COMMAND_TIMEOUT_SECONDS,
     ) -> None:
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
+        owned_setup = validated_setup_commands(
+            workspace_setup_commands, field_name="workspace_setup_commands"
+        )
+        self._setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
         if not isinstance(target_workspace, RunnerWorkspace):
             raise TypeError("Docker coding target_workspace must be a RunnerWorkspace.")
         if not isinstance(limits, DockerWorkspaceTransferLimits):
@@ -447,6 +467,11 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             raise ValueError(
                 "Coding product source-copy authority requires the guest Git baseline."
             )
+        if source_copy_authority is not None and owned_setup:
+            raise ValueError(
+                "Coding product source-copy authority can't be combined with "
+                "workspace_setup_commands, which would change its admitted baseline."
+            )
         expected_exclusions = frozenset(DOCKER_CODING_PROTECTED_DIRECTORY_NAMES)
         if not expected_exclusions.issubset(target_workspace.excluded_directory_names):
             raise ValueError(
@@ -454,6 +479,7 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             )
         self._docker_target = target_workspace
         self._git_baseline = git_baseline
+        self._workspace_setup_commands = owned_setup
         self._workspace_repository = (
             None if workspace_repository is None else _source_name(workspace_repository)
         )
@@ -564,6 +590,14 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                 await initialize_ephemeral_git_baseline(
                     runner, tree_bytes=tree_bytes, tree_files=tree_files
                 )
+            await run_setup_commands(
+                runner,
+                self._workspace_setup_commands,
+                label="Docker coding workspace setup command",
+                timeout_s=self._setup_command_timeout_s,
+            )
+            if self._git_baseline:
+                # Read after setup, which may have amended the baseline.
                 git_baseline = await ephemeral_git_baseline(runner)
                 if self.sync_back != "never":
                     # Fail before the first model call, not after the session's
@@ -1001,6 +1035,19 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     needs no ``git``. Use it for sandboxes that only sync files in and out; keep
     the default for coding products that publish Git changes.
 
+    ``workspace_setup_commands`` run in the container as shell commands, one
+    at a time, in ``/workspace`` as the workspace's user, after copy-in and
+    after the Git baseline, so they can adjust the tree or the baseline commit
+    before the agent starts. Each may run for ``setup_command_timeout_s``
+    seconds (default 600). A nonzero exit or a timeout fails the binding with a
+    masked tail of the command's output, and the allocation is discarded like
+    any other failed binding. They never run on copy-back. They are part of the
+    execution profile, so changing them changes the profile; the timeout is
+    operational and is not. The container has no network, so they can't
+    download anything, and whatever they write under ``/workspace`` is copied
+    back like any other change. Coding products, which admit the copied tree as
+    their baseline, refuse them.
+
     ``command_cleanup`` selects what a command timeout or cancellation stops.
     The default ``"sandbox"`` always removes the container. ``"command_or_sandbox"``
     kills the command's process tree and keeps the container and its workspace
@@ -1073,6 +1120,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         cancel_timeout_s: float | None = None,
         staging_capacity: SyncBindingStagingCapacity | None = None,
         workspace_repository: str | None = None,
+        workspace_setup_commands: Sequence[str] = (),
+        setup_command_timeout_s: int = DEFAULT_DOCKER_CODING_SETUP_COMMAND_TIMEOUT_SECONDS,
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
@@ -1155,6 +1204,11 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self.restrictions = self.toolchain_profile.restrictions
         self.image_identity = self.toolchain_profile.image_identity
         self.git_baseline = git_baseline
+        self.workspace_setup_commands = validated_setup_commands(
+            workspace_setup_commands, field_name="workspace_setup_commands"
+        )
+        # Operational, so it stays out of the configuration fingerprint.
+        self.setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
         self.deferred = deferred
         self.warm_spares = warm_spares
         self.command_cleanup: Literal["command_or_sandbox", "sandbox"] = command_cleanup
@@ -1219,6 +1273,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             git_baseline=git_baseline,
             deferred=deferred,
             command_cleanup=command_cleanup,
+            workspace_setup_commands=self.workspace_setup_commands,
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
@@ -1257,6 +1312,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 self.immutable_input_runtime_compatibility_fingerprint
             ),
             "git_baseline": self.git_baseline,
+            "workspace_setup_commands": self.workspace_setup_commands,
+            "setup_command_timeout_s": self.setup_command_timeout_s,
             "knowledge_store": self._knowledge_store,
             "knowledge_access_scope": self._knowledge_access_scope,
             "deferred": self.deferred,
@@ -1429,6 +1486,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             git_baseline=self.git_baseline,
             staging_capacity=self.staging_capacity,
             workspace_repository=self.workspace_repository,
+            workspace_setup_commands=self.workspace_setup_commands,
+            setup_command_timeout_s=self.setup_command_timeout_s,
         )
 
     def allocation_scope(
@@ -2998,6 +3057,7 @@ def _docker_coding_configuration_fingerprint(
     git_baseline: bool = True,
     deferred: bool = False,
     command_cleanup: Literal["command_or_sandbox", "sandbox"] = "sandbox",
+    workspace_setup_commands: tuple[str, ...] = (),
 ) -> str:
     material = {
         "schema": "cayu.docker_coding_environment.v3",
@@ -3040,6 +3100,11 @@ def _docker_coding_configuration_fingerprint(
         # container changes the identity: a preserved session cannot resume
         # under different cleanup rules.
         material["command_cleanup"] = command_cleanup
+    if workspace_setup_commands:
+        # Factories without setup commands keep their earlier fingerprints.
+        material["workspace_setup_commands_sha256"] = setup_commands_sha256(
+            workspace_setup_commands
+        )
     return (
         "sha256:"
         + sha256(canonical_durable_json_bytes(material, "docker_coding_configuration")).hexdigest()

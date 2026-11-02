@@ -643,6 +643,10 @@ any other change, so put environments elsewhere
 code or the timeout and ends with the last lines of the command's stderr and
 stdout, masked like other setup diagnostics.
 
+`DockerCodingEnvironmentFactory` takes the same `workspace_setup_commands`
+and `setup_command_timeout_s`, next to its `git_baseline`; its container has
+no network, so there they suit Git and file changes rather than installs.
+
 On Cayu Cloud a broker request passes the portal (which waits 35 seconds), API
 Gateway (30 seconds) and the broker's own wait for an archive transfer (up to 20
 seconds, inside the gateway's bound). The 45-second default outlasts all of them,

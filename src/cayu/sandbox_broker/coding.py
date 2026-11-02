@@ -28,8 +28,6 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.egress._remote_adapter import setup_command_failure_message
-from cayu.egress.adapter import validate_setup_command_timeout
 from cayu.egress.sandbox_coding import SandboxWorkspaceTransferLimits
 from cayu.environments import (
     Environment,
@@ -43,6 +41,13 @@ from cayu.environments import (
 from cayu.environments._ephemeral_git import (
     initialize_ephemeral_git_baseline,
     sync_bound_tree_size,
+)
+from cayu.environments._setup_commands import (
+    run_setup_commands,
+    setup_command_failure_message,
+    setup_commands_sha256,
+    validate_setup_command_timeout,
+    validated_setup_commands,
 )
 from cayu.environments._sync_staging import SyncBindingStagingCapacity
 from cayu.environments.admission import (
@@ -191,7 +196,7 @@ class BrokeredSandboxCodingBinding(SyncBinding):
         self._workspace_repository = (
             None if workspace_repository is None else _source_name(workspace_repository)
         )
-        self._workspace_setup_commands = _validated_commands(
+        self._workspace_setup_commands = validated_setup_commands(
             workspace_setup_commands, field_name="workspace_setup_commands"
         )
 
@@ -238,20 +243,13 @@ class BrokeredSandboxCodingBinding(SyncBinding):
                     tree_bytes=tree_bytes,
                     tree_files=tree_files,
                 )
-            for command in self._workspace_setup_commands:
-                result = await bound.runner.exec(
-                    ExecCommand.bash(command),
-                    cwd=target.runner_cwd,
-                    timeout_s=self._setup_command_timeout_s,
-                )
-                if result.exit_code != 0 or result.timed_out or result.cancelled:
-                    raise RuntimeError(
-                        setup_command_failure_message(
-                            "Brokered sandbox workspace setup command",
-                            result,
-                            timeout_s=self._setup_command_timeout_s,
-                        )
-                    )
+            await run_setup_commands(
+                bound.runner,
+                self._workspace_setup_commands,
+                label="Brokered sandbox workspace setup command",
+                timeout_s=self._setup_command_timeout_s,
+                cwd=target.runner_cwd,
+            )
         except BaseException:
             self.abandon(bound)
             raise
@@ -531,8 +529,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             raise ValueError("ready_timeout_s must be positive.")
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
-        owned_setup = _validated_commands(setup_commands, field_name="setup_commands")
-        owned_workspace_setup = _validated_commands(
+        owned_setup = validated_setup_commands(setup_commands, field_name="setup_commands")
+        owned_workspace_setup = validated_setup_commands(
             workspace_setup_commands, field_name="workspace_setup_commands"
         )
         owned_profile = _brokered_toolchain_profile(
@@ -1090,15 +1088,6 @@ def _env_list(env: Mapping[str, str], name: str) -> tuple[str, ...] | None:
     return items or None
 
 
-def _validated_commands(commands: Sequence[str], *, field_name: str) -> tuple[str, ...]:
-    if isinstance(commands, str | bytes):
-        raise TypeError(f"{field_name} must be a sequence of shell commands, not one string.")
-    owned = tuple(commands)
-    if any(type(command) is not str or not command.strip() for command in owned):
-        raise ValueError(f"{field_name} entries must be nonblank shell commands.")
-    return owned
-
-
 def _brokered_toolchain_profile(
     profile: object,
     *,
@@ -1196,12 +1185,8 @@ def _configuration_fingerprint(factory: BrokeredSandboxCodingEnvironmentFactory)
         },
         "excluded_directory_names": list(factory._excluded),
         "excluded_path_patterns": list(factory._excluded_patterns),
-        "setup_commands_sha256": sha256(
-            "\0".join(factory.setup_commands).encode("utf-8")
-        ).hexdigest(),
-        "workspace_setup_commands_sha256": sha256(
-            "\0".join(factory.workspace_setup_commands).encode("utf-8")
-        ).hexdigest(),
+        "setup_commands_sha256": setup_commands_sha256(factory.setup_commands),
+        "workspace_setup_commands_sha256": setup_commands_sha256(factory.workspace_setup_commands),
         "toolchain_profile_fingerprint": (
             None if factory.toolchain_profile is None else factory.toolchain_profile.fingerprint
         ),

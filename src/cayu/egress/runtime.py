@@ -83,7 +83,6 @@ from cayu.egress.adapter import (
     VirtualEgressAllocationPreparation,
     VirtualEgressAllocationReap,
     _await_bounded_cleanup_task,
-    validate_setup_command_timeout,
 )
 from cayu.egress.authority import _copy_egress_authority_identity
 from cayu.egress.broker import (
@@ -109,6 +108,7 @@ from cayu.egress.transitions import (
     _runtime_egress_authority_adoption_result,
     egress_authority_owner_fingerprint,
 )
+from cayu.environments._setup_commands import validate_setup_command_timeout
 from cayu.environments.admission import (
     _REQUIRED_LIVE_OBSERVATIONS,
     ExecutionAdmissionCandidate,

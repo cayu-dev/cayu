@@ -5,7 +5,6 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
 from cayu._exception_groups import add_exception_note_safely
-from cayu.egress._docker_diagnostics import docker_stderr_tail
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     DEFAULT_SETUP_COMMAND_TIMEOUT_SECONDS,
@@ -21,7 +20,8 @@ from cayu.egress.errors import UnsupportedEgressCapabilityError, UnsupportedEgre
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ExposedProxy, HttpProxyEndpoint, ProxyExposure
 from cayu.egress.proxy_server import SessionCertificateAuthority, TransparentEgressProxyServer
-from cayu.runners.base import ExecCommand, ExecResult, Runner
+from cayu.environments._setup_commands import setup_command_failure_message
+from cayu.runners.base import ExecCommand, Runner
 from cayu.vaults import SecretRedactor
 
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
@@ -287,26 +287,6 @@ async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest
                     ),
                 )
             )
-
-
-def setup_command_failure_message(
-    label: str,
-    result: ExecResult,
-    *,
-    timeout_s: int,
-    redactor: SecretRedactor | None = None,
-) -> str:
-    """Say why a setup command failed, ending with a bounded, masked tail of its output."""
-
-    if result.timed_out:
-        reason = f"timed out after {timeout_s} seconds"
-    elif result.cancelled:
-        reason = "was cancelled"
-    else:
-        reason = f"exit code {result.exit_code}"
-    stderr = docker_stderr_tail(result.stderr, redactor=redactor)
-    stdout = docker_stderr_tail(result.stdout, redactor=redactor)
-    return f"{label} failed ({reason}); stderr: {stderr}; stdout: {stdout}"
 
 
 def _preflight_script(
