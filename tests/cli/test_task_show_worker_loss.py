@@ -15,7 +15,7 @@ import json
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -420,3 +420,83 @@ def test_application_evidence_that_only_looks_like_cayus_is_read_without_its_num
     assert [row["cancellation"]["worker_loss"] for row in listed] == [loss]
     assert (loss["evidence_kind"], loss["evidence_id"]) == (kind, evidence_id)
     assert loss["restart_limit"] is None and loss["session_run_epoch"] is None
+
+
+def test_list_and_show_say_whether_worker_loss_or_a_request_fenced_a_cancelled_task(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """While a fenced task waits to stop, its list row has the fence's code and says which.
+
+    Once it's settled the code is only in the task's error, which list rows leave out, so the
+    row says nothing rather than guess; ``show`` still says.
+    """
+
+    from tests.core.test_task_restart_after_worker_loss import SETTLE
+    from tests.core.test_task_restart_after_worker_loss import _Clock as _StoreClock
+
+    from cayu.tasks import reconcile_abandoned_tasks
+    from cayu.tasks.queries import TaskQuery
+
+    database = tmp_path / "tasks.sqlite"
+
+    async def fence(store: SQLiteTaskStore, clock: _StoreClock, task_id: str, asked: bool) -> None:
+        await store.create_task(TaskCreate(task_id=task_id, type=task_id))
+        claimed = await store.claim_task("worker-a", TaskQuery(type=task_id), lease_seconds=30)
+        assert claimed is not None and claimed.lease_expires_at is not None
+        await store.mark_claimed_task_execution_started(
+            task_id, "worker-a", claimed.lease_expires_at
+        )
+        if asked:
+            await store.cancel_task(task_id)
+        else:
+            clock.value = claimed.lease_expires_at + timedelta(seconds=1)
+            await store.reclaim_expired(query=TaskQuery(type=task_id))
+
+    async def build() -> None:
+        clock = _StoreClock()
+        store = SQLiteTaskStore(database, ownership_clock=clock)
+        try:
+            await fence(store, clock, "lost-settled", asked=False)
+            await fence(store, clock, "asked-settled", asked=True)
+            clock.value += timedelta(seconds=31)
+            await store.reclaim_expired(query=TaskQuery(type="asked-settled"))
+            settled = await reconcile_abandoned_tasks(store, **{**SETTLE, "settlement": "cancel"})
+            assert {task.id for task in settled} == {"lost-settled", "asked-settled"}
+            await fence(store, clock, "lost-waiting", asked=False)
+            await fence(store, clock, "asked-waiting", asked=True)
+        finally:
+            await store.close()
+
+    asyncio.run(build())
+    expected = {
+        "lost-waiting": ("worker_loss", "worker_loss"),
+        "asked-waiting": ("request", "request"),
+        "lost-settled": (None, "worker_loss"),
+        "asked-settled": (None, "request"),
+    }
+    targets = {
+        "local": ("--sqlite", str(database)),
+        "server": ("--server-url", "http://127.0.0.1"),
+        "cloud": ("--application", _APPLICATION),
+    }
+    with _served(database, monkeypatch):
+        for name, target in targets.items():
+            rows = json.loads(_task(capsys, "list", *target, "--json"))["tasks"]
+            listed = {row["id"]: row["cancellation"]["fenced_by"] for row in rows}
+            shown = {
+                task_id: json.loads(_task(capsys, "show", task_id, *target, "--json"))[
+                    "cancellation"
+                ]["fenced_by"]
+                for task_id in expected
+            }
+            assert listed == {task_id: pair[0] for task_id, pair in expected.items()}, name
+            assert shown == {task_id: pair[1] for task_id, pair in expected.items()}, name
+            table = {
+                line.split()[0]: line
+                for line in _task(capsys, "list", *target).splitlines()[1:]
+                if line.strip()
+            }
+            assert "(worker lost)" in table["lost-waiting"], name
+            assert "(requested)" in table["asked-waiting"], name
+            for task_id in ("lost-settled", "asked-settled"):
+                assert "(quiescent)" in table[task_id], name

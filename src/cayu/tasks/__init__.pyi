@@ -252,6 +252,7 @@ from cayu.tasks.records import TaskSessionClosureClaim as TaskSessionClosureClai
 from cayu.tasks.records import TaskStatus as TaskStatus
 from cayu.tasks.restart import AbandonedTaskRestartRequest as AbandonedTaskRestartRequest
 from cayu.tasks.restart import TaskRestartLimitReached as TaskRestartLimitReached
+from cayu.tasks.restart import fenced_by_worker_loss as fenced_by_worker_loss
 from cayu.tasks.restart import requeue_restartable_task as requeue_restartable_task
 from cayu.tasks.restart import restart_abandoned_task as restart_abandoned_task
 from cayu.tasks.retry import TaskRetryAttemptDisposition as TaskRetryAttemptDisposition

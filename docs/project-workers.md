@@ -234,11 +234,15 @@ cayu task wait TASK_ID --application my-agent --wait-seconds 3600
 
 `list` prints the newest-updated tasks first with their status, the reason for it, the
 assigned agent, the retry attempt and the worker holding the claim; add `--offset` for
-the next page. Like `GET /api/tasks`, its rows leave out each task's input and result.
+the next page. Like `GET /api/tasks`, its rows leave out each task's input, result and error.
 `show` adds the input, result or error, a `cancellation` summary (whether cancelling was
 asked for or done, the reason, and for a task cancelled after its worker was lost, the
-reconciliation outcome such as `quiescent`), and every attempt of the task's retry series
-found through its predecessor and successor links. Table output is the default;
+reconciliation outcome such as `quiescent`, and `fenced_by`: `worker_loss` when the worker or
+expired-claim reclamation fenced it, `request` when someone asked to cancel it), and every
+attempt of the task's retry series found through its predecessor and successor links. The
+list's reason column shows `fenced_by` as `worker lost` or `requested` while the task waits
+to stop. Once it's settled, the fence's code is only in the task's error, so a settled row's
+`fenced_by` is `null` and `show` is where to read it. Table output is the default;
 `--json` (and `--jsonl` for `list`) prints the same data with a `schema_version`.
 
 A task Cayu settled after its worker was lost also gets a `Worker loss` section

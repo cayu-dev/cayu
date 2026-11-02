@@ -36,6 +36,7 @@ from cayu.tasks.cancellation import (
     TaskRetryCancellationReconciliationEventType,
 )
 from cayu.tasks.records import TaskStatus
+from cayu.tasks.restart import WORKER_LOSS_FENCE_CODES
 
 CLI_SCHEMA_VERSION = "1"
 # A retry series has at most 100 attempts (`TaskRetryPolicy.max_attempts`).
@@ -55,6 +56,9 @@ class WorkerLossEvidence(StrEnum):
     HANDLER_STOPPED = "handler_stopped"
     OTHER = "other"
 
+
+#: How the task table output names what fenced a cancelled task.
+_FENCED_BY_TEXT = {"worker_loss": "worker lost", "request": "requested"}
 
 # The evidence id prefixes Cayu records when it settles such a task; see `_worker_loss`.
 _WORKER_LOSS_EVIDENCE_PREFIXES = (
@@ -463,6 +467,12 @@ def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:
     cancelled after its worker was lost carries the reconciliation in ``status_payload``,
     with its outcome (for example ``quiescent``), and ``worker_loss`` tells what happened;
     otherwise a cancelled task's reason is its ``error``.
+
+    ``fenced_by`` says what fenced a task that was asked to stop or settled after its worker
+    was lost: ``worker_loss`` when the worker or expired-claim reclamation fenced it,
+    ``request`` when someone asked to cancel it. Both settle the same way, so only the fence's
+    error code tells them apart. Once a task is settled that code is only in its ``error``,
+    which list rows leave out, so a settled task's list row has ``fenced_by`` ``None``.
     """
 
     status = task.get("status")
@@ -476,6 +486,10 @@ def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:
     request_event = _object(payload.get("event"))
     error = _object(task.get("error")) or _object(payload.get("error"))
     actor = _object(reconciliation.get("reconciled_by"))
+    code = _text(error.get("code"))
+    fenced_by = None
+    if (requested or reconciliation) and code is not None:
+        fenced_by = "worker_loss" if code in WORKER_LOSS_FENCE_CODES else "request"
     return {
         "state": "cancelled" if status == TaskStatus.CANCELLED.value else "requested",
         "reason": reason,
@@ -483,8 +497,9 @@ def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:
         or _text(request_event.get("occurred_at")),
         "outcome": _text(_object(reconciliation.get("evidence")).get("outcome")),
         "reconciled_by": _text(actor.get("subject")),
-        "error_code": _text(error.get("code")),
+        "error_code": code,
         "error_message": _text(error.get("message")),
+        "fenced_by": fenced_by,
         "worker_loss": _worker_loss(task, reconciliation),
     }
 
@@ -670,8 +685,17 @@ def _table_row(task: dict[str, Any]) -> dict[str, Any]:
         attempt = f"{series.get('attempt')}/{limit}" if limit is not None else series.get("attempt")
     cancellation = task.get("cancellation")
     reason = task.get("status_reason")
-    if isinstance(cancellation, dict) and cancellation.get("outcome"):
-        reason = f"{reason or 'cancelled'} ({cancellation['outcome']})"
+    if isinstance(cancellation, dict):
+        details = [
+            detail
+            for detail in (
+                cancellation.get("outcome"),
+                _FENCED_BY_TEXT.get(cancellation.get("fenced_by")),
+            )
+            if detail
+        ]
+        if details:
+            reason = f"{reason or 'cancelled'} ({', '.join(details)})"
     return {
         "id": task.get("id"),
         "type": task.get("type"),
@@ -712,7 +736,10 @@ def _print_task(payload: dict[str, Any]) -> None:
         print_table(
             ("field", "value"),
             [
-                {"field": key, "value": value}
+                {
+                    "field": key,
+                    "value": _FENCED_BY_TEXT.get(value, value) if key == "fenced_by" else value,
+                }
                 for key, value in cancellation.items()
                 if value and key != "worker_loss"
             ],

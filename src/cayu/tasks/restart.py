@@ -99,7 +99,7 @@ def abandoned_restarts_used(task: Task) -> int:
 #: record. Any other code, such as ``cancel_task``'s ``"cancelled"``, a handler
 #: time limit or an error the caller passed, means someone asked to cancel the
 #: task, and that request must not be undone by a restart.
-_WORKER_LOSS_FENCE_CODES = frozenset(
+WORKER_LOSS_FENCE_CODES = frozenset(
     {
         "task_worker_lease_expired_after_dispatch",
         "task_worker_owner_cancelled",
@@ -109,12 +109,23 @@ _WORKER_LOSS_FENCE_CODES = frozenset(
 
 
 def fenced_by_worker_loss(task: Task) -> bool:
-    """Whether ``task``'s cancellation fence was left by worker loss, not asked for."""
+    """Whether ``task``'s cancellation fence was left by worker loss, not asked for.
 
-    payload = task.status_payload
-    error = payload.get("error") if type(payload) is dict else None
+    While the task is still held, the fence's error is in its ``status_payload``. Once a
+    reconciliation settles it as cancelled, ``status_payload`` holds that reconciliation and
+    the fence's error is the task's ``error``, so the answer stays the same afterwards.
+    """
+
+    payload = task.status_payload if type(task.status_payload) is dict else {}
+    error = payload.get("error")
+    if (
+        error is None
+        and task.status is TaskStatus.CANCELLED
+        and "cancellation_reconciliation" in payload
+    ):
+        error = task.error
     code = error.get("code") if type(error) is dict else None
-    return type(code) is str and code in _WORKER_LOSS_FENCE_CODES
+    return type(code) is str and code in WORKER_LOSS_FENCE_CODES
 
 
 def _same_evidence(record: TaskRestartRecord, request: AbandonedTaskRestartRequest) -> bool:

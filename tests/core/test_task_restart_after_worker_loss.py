@@ -570,3 +570,42 @@ def test_a_capped_batch_never_cancels_a_replacement_claim(
         assert current.status is TaskStatus.CLAIMED and current.worker_id == "worker-live"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("requested", [False, True])
+def test_a_settled_cancellation_still_says_whether_worker_loss_or_a_request_fenced_it(
+    backend: str, requested: bool, tmp_path: Path
+) -> None:
+    """Both settle into the same reconciliation; the fence's error code tells them apart."""
+
+    from cayu.cli.task import cancellation_summary
+    from cayu.tasks import fenced_by_worker_loss
+
+    async def scenario() -> None:
+        clock = _Clock()
+        store = _store(backend, tmp_path, clock)
+        await store.create_task(TaskCreate(task_id="scan-1", type="scan"))
+        claimed = await store.claim_task("worker-a", TaskQuery(type="scan"), lease_seconds=30)
+        assert claimed is not None and claimed.lease_expires_at is not None
+        await store.mark_claimed_task_execution_started(
+            "scan-1", "worker-a", claimed.lease_expires_at
+        )
+        if requested:
+            await store.cancel_task("scan-1")
+        clock.value = claimed.lease_expires_at + timedelta(seconds=1)
+        await store.reclaim_expired(query=TaskQuery(type="scan"))
+        fenced = await store.load_task("scan-1")
+        assert fenced is not None and fenced_by_worker_loss(fenced) is not requested
+
+        await reconcile_abandoned_tasks(store, **{**SETTLE, "settlement": "cancel"})
+        settled = await store.load_task("scan-1")
+        assert settled is not None and settled.status is TaskStatus.CANCELLED
+        assert "error" not in settled.status_payload
+        assert fenced_by_worker_loss(settled) is not requested
+        summary = cancellation_summary(settled.model_dump(mode="json"))
+        assert summary is not None
+        assert summary["fenced_by"] == ("request" if requested else "worker_loss")
+        await _close(store)
+
+    asyncio.run(scenario())

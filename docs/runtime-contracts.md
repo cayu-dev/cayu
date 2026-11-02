@@ -8086,7 +8086,9 @@ store boundary: it requires the exact fenced claim (worker id and final lease
 expiry), an expired lease by the store's clock, an ordinary task without a
 session or admitted work attempt, a fence that worker loss left (its error code
 is one the worker or expired-claim reclamation records, so an explicit
-`cancel_task` or handler time limit is never undone), and fewer restarts after
+`cancel_task` or handler time limit is never undone; `fenced_by_worker_loss(task)` is that
+check, and it gives the same answer after the task is settled as cancelled, when the fence's
+error is the task's `error` rather than in `status_payload`), and fewer restarts after
 worker loss than its
 cap (`Task.max_restarts`, else the request's `max_restarts`, default 2). It
 returns the task to `pending`, clears its claim and dispatch evidence,
