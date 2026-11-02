@@ -143,6 +143,7 @@ from cayu.environments.factory import (
     environment_factory_cleanup_settlement_task,
     environment_factory_cleanup_settlement_tasks,
 )
+from cayu.environments.shared_allocations import SharedSessionParts
 from cayu.events import Event, EventType
 from cayu.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
@@ -838,6 +839,18 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
 
         return _copy_egress_authority_identity(self._egress_authority_identity)
 
+    @property
+    def egress_authority_follows_allocation(self) -> bool:
+        """Every grant comes from this factory's fixed credentials, policies and destinations.
+
+        One broker and one grant set serve each allocation, and the resolver is
+        asked by grant, never by session, so a session sharing the allocation
+        holds the authority its own ``create()`` would have minted. Audit and
+        grant events go to ``request.event_session``.
+        """
+
+        return True
+
     async def adopt_authority(
         self,
         *,
@@ -1134,6 +1147,35 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
 
         return self._artifact_store
 
+    @property
+    def attaches_session_parts(self) -> bool:
+        """Sessions sharing an allocation each get their own knowledge scope."""
+
+        return True
+
+    async def attach_session_parts(
+        self,
+        request: EnvironmentFactoryRequest,
+        shared: EnvironmentFactoryResult,
+    ) -> SharedSessionParts:
+        """Return this factory's stores with ``request``'s own knowledge scope.
+
+        ``knowledge_access_scope_factory`` is asked with the attaching
+        session's request, as ``create()`` would ask it, so a session sharing
+        the sandbox never reads knowledge under another session's scope.
+        """
+
+        del shared
+        return SharedSessionParts(
+            artifact_store=self._artifact_store,
+            knowledge_store=self._knowledge_store,
+            knowledge_access_scope=(
+                None
+                if self._knowledge_access_scope_factory is None
+                else self._knowledge_access_scope_factory(request)
+            ),
+        )
+
     def allocation_scope(
         self,
         request: EnvironmentFactoryRequest,
@@ -1352,7 +1394,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         audit = _EgressAuditBridge(
             loop=loop,
             emitter=self._emitter,
-            session_id=request.session_id,
+            session_id=request.event_session,
             interaction_id=request.interaction_id,
             agent_name=request.agent_name,
             environment_name=request.environment_name,
@@ -1537,7 +1579,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 grants=grants,
                 emitter=self._emitter,
                 audit=audit,
-                session_id=request.session_id,
+                session_id=request.event_session,
                 agent_name=request.agent_name,
                 environment_name=request.environment_name,
                 execution_profile_fingerprint=request.execution_profile_fingerprint,
@@ -1827,7 +1869,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         runner_kind: str,
     ) -> None:
         await self._emit_grant_events_for_identity(
-            session_id=request.session_id,
+            session_id=request.event_session,
             agent_name=request.agent_name,
             environment_name=request.environment_name,
             execution_profile_fingerprint=request.execution_profile_fingerprint,

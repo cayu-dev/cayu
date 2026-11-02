@@ -7753,7 +7753,12 @@ def create_router(
         redact=cayu_app.redact_json,
         artifact_stores=lambda: _artifact_stores_by_id(cayu_app),
     )
-    register_session_overview_counts(router, service=overview_service, protected=protected)
+    register_session_overview_counts(
+        router,
+        service=overview_service,
+        protected=protected,
+        resolve_lineage_filters=_resolve_session_query_authority_filters,
+    )
 
     @router.get("/sessions", response_model=ListSessionsResponse, dependencies=protected)
     async def list_sessions(

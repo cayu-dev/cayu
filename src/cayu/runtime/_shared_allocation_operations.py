@@ -523,6 +523,9 @@ async def _copy_back(
         environment_name=environment,
         operation=EnvironmentFactoryOperation.RECONNECT,
         reconnect_metadata=fenced.reconnect_metadata,
+        # The allocation's identity isn't a session; events about it belong on
+        # the run that owned it.
+        event_session_id=fenced.owner_session_id,
     )
     if fenced.disposal_state is not None:
         await factory.recover_finalization_disposal(request, fenced.disposal_state)

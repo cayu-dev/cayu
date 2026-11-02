@@ -22,6 +22,7 @@ from tests.sandbox_broker.test_brokered_shared_allocation import _call, _done, _
 
 from cayu import AgentSpec, CayuApp, EventType
 from cayu.environments import (
+    DeferredMaterialization,
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
@@ -31,7 +32,9 @@ from cayu.environments import (
     EnvironmentSpec,
     SyncBinding,
 )
+from cayu.environments.deferred import EnvironmentMaterializationError
 from cayu.evals import ScriptedModelProvider
+from cayu.runners import LocalRunner
 from cayu.runtime._shared_allocation_records import (
     SHARED_ALLOCATIONS_CHECKPOINT_KEY,
     SharedAllocationClaimLost,
@@ -132,6 +135,59 @@ class _ReconnectingFactory(EnvironmentFactory):
         return not self._sandboxes.path(request.reconnect_metadata["sandbox"]).exists()
 
 
+class _DeferredReconnectingFactory(_ReconnectingFactory):
+    """Like Docker coding with ``deferred=True``: RECONNECT never checks the sandbox.
+
+    A missing sandbox only shows when the binding recovers, by materializing
+    in ``recover`` mode.
+    """
+
+    @property
+    def deferred_materialization(self) -> bool:
+        return True
+
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        sandboxes = self._sandboxes
+        sandboxes.requests.append(request)
+        if request.operation is EnvironmentFactoryOperation.RECONNECT:
+            name = request.reconnect_metadata["sandbox"]
+        else:
+            name = sha256(request.session_id.encode()).hexdigest()[:16]
+            sandboxes.path(name).mkdir(parents=True, exist_ok=True)
+        path = sandboxes.path(name)
+
+        async def materialize(mode):
+            if not path.is_dir():
+                raise EnvironmentMaterializationError(
+                    "The deferred sandbox holding unpublished output is gone.",
+                    reason="deferred_resource_missing",
+                )
+            return LocalRunner(path), _SandboxBinding(sandboxes, name)
+
+        materialization = DeferredMaterialization(
+            materialize,
+            default_cwd=str(path),
+            placeholder_workspace=lambda runner: LocalWorkspace(
+                path if path.is_dir() else sandboxes.root, workspace_id=f"placeholder-{name}"
+            ),
+        )
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            if action is EnvironmentFactoryReleaseAction.DISCARD:
+                sandboxes.dispose(name)
+
+        return EnvironmentFactoryResult(
+            environment=Environment(
+                EnvironmentSpec(name=request.environment_name),
+                workspace=LocalWorkspace(self._source, workspace_id="project"),
+                runner=materialization.runner,
+                binding=materialization.binding,
+            ),
+            reconnect_metadata={"sandbox": name},
+            release=release,
+        )
+
+
 class _SolveIfPlanned(Tool):
     spec = ToolSpec(name="solve", parallel_safe=False, workspace_mutation=True)
 
@@ -189,7 +245,20 @@ def _keyring() -> PublicAuthorityAliasKeyring:
 class _World:
     """One source checkout, one sandbox host and one session database, shared by every app."""
 
-    def __init__(self, tmp_path: Path) -> None:
+    @classmethod
+    def reopen(cls, root: Path, *, factory_type: type = _ReconnectingFactory) -> _World:
+        """Open a world another app already set up under ``root``, without writing anything."""
+
+        world = cls.__new__(cls)
+        world.factory_type = factory_type
+        world.source = root / "source"
+        world.sandboxes = _Sandboxes(root / "sandboxes")
+        world.database = root / "sessions.sqlite"
+        world.stores = []
+        return world
+
+    def __init__(self, tmp_path: Path, *, factory_type: type = _ReconnectingFactory) -> None:
+        self.factory_type = factory_type
         self.source = tmp_path / "source"
         self.source.mkdir()
         (self.source / "calc.py").write_bytes(b"def add(a, b):\n    return a - b\n")
@@ -209,7 +278,7 @@ class _World:
         app.register_provider(ScriptedModelProvider(list(turns)), default=True)
         app.register_environment_factory(
             EnvironmentSpec(name="sandbox", execution_profile_identity=identity("sandboxes")),
-            _ReconnectingFactory(self.source, self.sandboxes),
+            self.factory_type(self.source, self.sandboxes),
             default=True,
         )
         app.register_agent(AgentSpec(name="planner", model="scripted"), tools=[_WritePlan()])
@@ -278,6 +347,40 @@ def test_a_resumed_run_reconnects_to_the_crashed_runs_allocation(tmp_path):
     assert (world.source / "solution.py").read_bytes() == b"def add(a, b):\n    return a + b\n"
     assert world.sandboxes.finalizations == ["completed"]
     assert len(world.sandboxes.disposed) == 1
+    assert records == {}
+
+
+def test_a_resumed_run_replaces_a_deferred_allocation_whose_sandbox_is_gone(tmp_path):
+    world = _World(tmp_path, factory_type=_DeferredReconnectingFactory)
+
+    async def scenario():
+        try:
+            first = await _crash_after_plan(world, "run-gone")
+            (record,) = (await _records(first, "run-gone"))["records"].values()
+            assert record["state"] == "live" and record["binding_state"] is not None
+            # The sandbox goes away while nothing runs (docker rm, a reaper,
+            # another Docker host): RECONNECT still succeeds, and only the
+            # binding's recovery finds it missing.
+            world.sandboxes.dispose(
+                sha256(record["allocation_session_id"].encode()).hexdigest()[:16]
+            )
+            second = world.app(_done())
+            events = [event async for event in _PlanThenSolve(second).run("run-gone")]
+            return events, await _records(second, "run-gone"), record
+        finally:
+            await world.close()
+
+    events, records, lost = asyncio.run(scenario())
+    # Like an eager factory's failed reconnect, the proven-gone allocation is
+    # replaced with a fresh one instead of failing every resume.
+    assert events[-1].type == EventType.WORKFLOW_COMPLETED, events[-1].payload
+    created, reconnected, fresh = world.sandboxes.requests
+    assert created.operation is EnvironmentFactoryOperation.CREATE
+    assert reconnected.operation is EnvironmentFactoryOperation.RECONNECT
+    assert reconnected.session_id == lost["allocation_session_id"]
+    assert fresh.operation is EnvironmentFactoryOperation.CREATE
+    assert fresh.session_id != lost["allocation_session_id"]
+    assert world.sandboxes.finalizations == ["completed"]
     assert records == {}
 
 

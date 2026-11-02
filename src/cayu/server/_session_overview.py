@@ -7,7 +7,7 @@ store.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any
@@ -348,11 +348,17 @@ def overview_http_error(exc: Exception) -> HTTPException:
     return HTTPException(503, detail="Session overview evidence is unavailable.")
 
 
+# Resolves public ``parent_session_id`` and ``causal_budget_id`` filters to the
+# private ids stored lineage keeps, raising HTTPException for a bad value.
+LineageFilterResolver = Callable[..., Awaitable[tuple[str | None, str | None]]]
+
+
 def register_session_overview_counts(
     router: APIRouter,
     *,
     service: SessionOverviewService,
     protected: list[Any],
+    resolve_lineage_filters: LineageFilterResolver,
 ) -> None:
     @router.get(
         "/sessions/overview/counts",
@@ -376,6 +382,12 @@ def register_session_overview_counts(
         bucket_unit: BucketUnit | None = None,
         timezone: str = "UTC",
     ) -> SessionOverviewCountsResponse:
+        # /api/sessions exposes lineage under public aliases; resolve them as the
+        # list and summary routes do before they reach private store queries.
+        parent_session_id, causal_budget_id = await resolve_lineage_filters(
+            parent_session_id=parent_session_id,
+            causal_budget_id=causal_budget_id,
+        )
         try:
             # The same current-session filter the Usage rollup takes as session_filter,
             # with labels and selectors in the GET /api/sessions text syntax.

@@ -304,6 +304,7 @@ from cayu.environments.shared_allocations import (
     SharedAllocationRunState as SharedAllocationRunState,
 )
 from cayu.environments.shared_allocations import SharedAllocationState as SharedAllocationState
+from cayu.environments.shared_allocations import SharedSessionParts as SharedSessionParts
 from cayu.environments.snapshot_lifecycle import ExecutionSnapshots as ExecutionSnapshots
 from cayu.environments.snapshot_lifecycle import (
     inspect_execution_snapshots as inspect_execution_snapshots,

@@ -34,6 +34,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 if TYPE_CHECKING:
     from cayu.egress.authority import EgressAuthorityIdentity
     from cayu.environments.rebuild import EnvironmentRebuildRecord
+    from cayu.environments.shared_allocations import SharedSessionParts
     from cayu.workspaces.local import LocalWorkspace
 
 DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS = 15.0
@@ -592,6 +593,12 @@ class EnvironmentFactoryRequest:
     #: once :func:`cayu.environments.process_local_owner_exited` reports the
     #: owner gone. See ``cayu.environments.process_ownership``.
     process_local_owner: str | None = None
+    #: The session that events about this allocation belong on, when that isn't
+    #: ``session_id``. Only the runtime sets it: a shared allocation's request
+    #: names the allocation (``<owner>.shared-<hex>``), which isn't a session,
+    #: so this names the scope's owner session instead. ``None`` means
+    #: ``session_id``; read it through ``event_session``.
+    event_session_id: str | None = None
     #: Monotonic epoch of the caller's claim on the allocation this request
     #: names, when the runtime tracks one: whoever takes the allocation over
     #: later gets a larger epoch. A factory whose provider can fence attaches
@@ -599,6 +606,12 @@ class EnvironmentFactoryRequest:
     #: displace its successor with a late attach. ``None`` when the runtime
     #: tracks no epoch for the allocation (ordinary per-session requests today).
     ownership_epoch: int | None = None
+
+    @property
+    def event_session(self) -> str:
+        """The session a factory records events about this allocation on."""
+
+        return self.event_session_id or self.session_id
 
     def __post_init__(self) -> None:
         if not isinstance(self.operation, EnvironmentFactoryOperation):
@@ -659,6 +672,12 @@ class EnvironmentFactoryRequest:
             "replacement_predecessor",
             copy_durable_metadata(self.replacement_predecessor, "replacement_predecessor"),
         )
+        if self.event_session_id is not None:
+            object.__setattr__(
+                self,
+                "event_session_id",
+                require_clean_nonblank(self.event_session_id, "event_session_id"),
+            )
         if self.process_local_owner is not None and not is_process_local_owner_token(
             self.process_local_owner
         ):
@@ -792,6 +811,62 @@ class EnvironmentFactory(ABC):
         """Return the immutable egress authority proposed for future invocations."""
 
         return None
+
+    @property
+    def egress_authority_follows_allocation(self) -> bool:
+        """Whether a result's egress authority belongs to its allocation, not its session.
+
+        Sessions that share one allocation (an ``allocation_scope`` other than
+        ``session``) never reach ``create()`` after the first, so a factory with
+        an egress authority shares only when this is True. Return True only
+        when every grant a result carries comes from this factory's fixed
+        configuration, one broker serves the whole allocation, and nothing in
+        the authority depends on the request other than its ``session_id``
+        (which names the allocation) and ``event_session``, where audit events
+        go. Every session of a scope then holds exactly the authority its own
+        ``create()`` would have given it. The default False keeps refusing.
+        """
+
+        return False
+
+    @property
+    def attaches_session_parts(self) -> bool:
+        """Whether ``attach_session_parts`` gives each session of a shared allocation its parts.
+
+        When True, a session attaching to a shared allocation gets the shared
+        runner and workspace plus the artifact store, knowledge store, knowledge
+        scope and MCP servers that ``attach_session_parts`` returns for its own
+        request, and the shared result's own parts reach no session. When
+        False (the default), sharing is refused unless the shared result's
+        parts are this factory's fixed configuration.
+        """
+
+        return False
+
+    async def attach_session_parts(
+        self,
+        request: EnvironmentFactoryRequest,
+        shared: EnvironmentFactoryResult,
+    ) -> SharedSessionParts:
+        """Return the parts ``request``'s session gets on a shared allocation.
+
+        Called once for every session that attaches to a shared allocation,
+        the one that created it included, with that session's own request
+        (its ``session_id``, lineage, labels and execution requirements).
+        ``shared`` is the result the allocation was created with; read it,
+        don't change it. Return what this factory's ``create()`` would have
+        given that session: only ``cayu.environments.SharedSessionParts``
+        that live outside the runner. Never put request-dependent authority
+        into the shared runner or workspace, since every session of the scope
+        uses them. It must not allocate anything that needs releasing.
+        Wrappers must forward this hook and ``attaches_session_parts``. The
+        default refuses.
+        """
+
+        del request, shared
+        raise EnvironmentAllocationUnsupportedError(
+            "This environment factory gives no per-session parts to a shared allocation."
+        )
 
     @property
     def rebuild_record(self) -> EnvironmentRebuildRecord | None:
@@ -1017,6 +1092,7 @@ def copy_environment_factory_request(
         interaction_id=request.interaction_id,
         replacement_predecessor=request.replacement_predecessor,
         process_local_owner=request.process_local_owner,
+        event_session_id=request.event_session_id,
         ownership_epoch=request.ownership_epoch,
     )
 

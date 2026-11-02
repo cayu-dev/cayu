@@ -6,8 +6,9 @@ MicroVM factories allocate a process-external resource and declare an
 allocation scope, so they may only be created through ``create_recoverable``
 under a durable intent. Until the shared path routes such factories through
 ``create_recoverable``, sharing either of them is refused before any AWS call,
-never satisfied with a non-recoverable create. The egress-mediated factory is
-also refused for its egress authority.
+never satisfied with a non-recoverable create. The egress-mediated factory's
+egress authority follows its allocation, so that isn't what stops it; its
+create path is.
 """
 
 from __future__ import annotations
@@ -85,7 +86,7 @@ def test_sharing_the_lambda_factory_is_refused_before_any_provider_call(tmp_path
     assert world.model.created_ids() == []
 
 
-def test_the_virtual_egress_lambda_factory_is_refused_for_its_egress_authority(
+def test_the_virtual_egress_lambda_factory_is_refused_until_shared_creates_are_recoverable(
     tmp_path: Path,
 ) -> None:
     model = ClientTokenLambdaModel()
@@ -121,5 +122,10 @@ def test_the_virtual_egress_lambda_factory_is_refused_for_its_egress_authority(
 
     text = _run_refused(world, app, "egress-planner")
 
-    assert "egress authority" in text
+    # Its egress authority follows the allocation, so that isn't what stops it:
+    # a MicroVM is a process-external resource, created only through
+    # create_recoverable, and a shared allocation is created through create().
+    assert "egress authority" not in text
+    assert "creates a process-external resource" in text
+    assert "create_recoverable" in text
     assert model.run_calls == []

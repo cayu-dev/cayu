@@ -1628,3 +1628,50 @@ def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> No
         assert response.status_code == 200
         list(response.iter_lines())
     assert captured[1].resolved_by is None
+
+
+def test_public_session_lineage_aliases_resolve_in_overview_count_filters() -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor("private"),
+        enable_logging=False,
+    )
+    private_root_id = "private-root-session"
+
+    async def seed() -> None:
+        identity = SessionIdentity(provider_name="fake", model="fakemodel")
+        await store.create(
+            RunRequest(agent_name="assistant", session_id=private_root_id, messages=[]),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="child-session",
+                parent_session_id=private_root_id,
+                causal_budget_id=private_root_id,
+                messages=[],
+            ),
+            identity=identity,
+        )
+
+    asyncio.run(seed())
+    public_root_id = app.project_session_id_for_exposure(private_root_id)
+    assert public_root_id != private_root_id
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    # /api/sessions shows the root under its public alias; the counts route
+    # must resolve that alias as the list and summary routes do, not compare
+    # it with the private ids the stored lineage keeps.
+    by_parent = client.get(
+        "/api/sessions/overview/counts", params={"parent_session_id": public_root_id}
+    )
+    by_budget = client.get(
+        "/api/sessions/overview/counts", params={"causal_budget_id": public_root_id}
+    )
+
+    assert by_parent.status_code == 200, by_parent.text
+    assert int(by_parent.json()["total_count"]) == 1
+    assert by_budget.status_code == 200, by_budget.text
+    assert int(by_budget.json()["total_count"]) == 2

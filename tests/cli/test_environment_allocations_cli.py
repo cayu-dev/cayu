@@ -13,7 +13,7 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 from tests.cli.test_environment_cli import _http_bridge
-from tests.environments.test_durable_shared_allocations import _Sandboxes, _World
+from tests.environments.test_durable_shared_allocations import _World
 from tests.server.test_shared_allocation_routes import crashed_world
 
 from cayu.cli import main
@@ -26,13 +26,7 @@ _ROOT_ENV = "CAYU_TEST_SHARED_ALLOCATION_ROOT"
 def build_app():
     """The project factory `--target` names: an app over the test's world."""
 
-    root = Path(os.environ[_ROOT_ENV])
-    world = _World.__new__(_World)
-    world.source = root / "source"
-    world.sandboxes = _Sandboxes(root / "sandboxes")
-    world.database = root / "sessions.sqlite"
-    world.stores = []
-    return world.app()
+    return _World.reopen(Path(os.environ[_ROOT_ENV])).app()
 
 
 def _sandbox_names(world: _World) -> list[str]:

@@ -13923,9 +13923,12 @@ key its run's steps resolve. If an earlier step created the allocation, the comm
 attaches to it; if no step has yet, the command creates it the way a step would: the
 same factory `create()` under the scope owner's fresh `.shared-<hex>` identity, the
 same owner (the workflow run, opened under the attempt fence like a step), and the
-same refusals (dynamic secret scope, a vault or credential proxy, MCP servers,
-request-dependent artifact or knowledge stores, deferred materialization, an egress
-authority). That request names the workflow as `agent_name`, carries the run's
+same refusals (a dynamic secret scope, a vault or credential proxy, an egress
+authority that belongs to each session, and MCP servers or request-dependent
+artifact or knowledge stores from a factory that doesn't attach per-session parts;
+see "What each session gets as its own" in `docs/environment-factories.md`). A
+deferred factory's runner is materialized when the allocation is created. A command
+gets only the runner, never any session's parts. That request names the workflow as `agent_name`, carries the run's
 lineage, and has default (trusted) execution requirements, since a command has no
 agent tools to admit; a later step is still admitted against the live runner with
 its own requirements. The factory's own binding prepared the allocation's workspace

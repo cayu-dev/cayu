@@ -1212,16 +1212,109 @@ How it works:
   for the run to resume. A release or discard still running at the timeout isn't
   cancelled; the call returns `False` and a later call waits for that same
   task.
-- Later sessions of a scope never reach the factory, so the first session's
-  grant has to be the factory's fixed configuration. Sharing is refused for a
-  factory with a dynamic secret scope, or whose result has a vault, a
-  credential proxy, MCP servers, or an artifact store, knowledge store or
-  knowledge scope other than the factory's configured one. Docker coding and the brokered sandbox qualify.
+- Later sessions of a scope never reach the factory's `create()`, so no
+  session may get authority from the first session's call that its own call
+  wouldn't have given it. "What each session gets as its own" below says what
+  can still be per session and what refuses to share.
 - Each attaching session is still admitted against the live runner's
   evidence with its own execution requirements. The first session's request
   shapes the allocation (its network and image, for example); a later
   session whose requirements the runner can't meet is refused, not given a
   new sandbox.
+
+#### What each session gets as its own
+
+Every session of a scope runs on the shared runner and workspace. What it
+doesn't share is what lives in this process, outside the sandbox: its
+artifact store, its knowledge store and knowledge scope, and its MCP servers
+(an MCP server runs as a host subprocess or is reached over HTTP from the
+host, never inside the runner). A factory whose result gives those per
+request can share by setting `attaches_session_parts` and implementing
+`attach_session_parts(request, shared)`:
+
+```python
+from cayu.environments import SharedSessionParts
+
+
+class TenantFactory(EnvironmentFactory):
+    @property
+    def attaches_session_parts(self) -> bool:
+        return True
+
+    async def attach_session_parts(self, request, shared) -> SharedSessionParts:
+        tenant = tenant_for(request)  # whatever create() would use
+        return SharedSessionParts(
+            artifact_store=artifact_store_for(tenant),
+            knowledge_store=knowledge,
+            knowledge_access_scope=KnowledgeAccessScope.for_namespace(f"tenant:{tenant}"),
+            mcp_servers=mcp_servers_for(tenant),
+        )
+```
+
+The runtime calls it once for every session that attaches, the one that
+created the allocation included, with that session's own request (its
+`session_id`, lineage, labels and execution requirements). The session's
+environment gets the shared runner and workspace with those parts, and the
+parts of the shared result, which `create()` built for the scope's own
+`<owner>.shared-<hex>` request, reach no session. The hook must not put
+request-dependent authority into the runner or workspace, since every session
+uses them, and must not allocate anything that needs releasing. The default
+refuses. `VirtualEgressEnvironmentFactory` implements it, so a
+`knowledge_access_scope_factory` is asked once per session, as `create()`
+would ask it. (It is also asked once with the scope's own request when the
+allocation is created; that scope reaches nobody.)
+
+Without the hook, the shared result's parts must be the factory's fixed
+configuration, and sharing is refused for a result with MCP servers, or an
+artifact store, knowledge store or knowledge scope other than the factory's
+configured one. Docker coding and the brokered sandbox qualify as they are.
+
+These still refuse to share, and say why in the error:
+
+- **Secrets.** A factory with a dynamic secret scope, or a result with a vault
+  or credential proxy. Whatever a session resolves can reach the shared
+  sandbox (a command's environment, a file it writes), and every other
+  session's commands run as the same user in the same sandbox, so they could
+  read it. Runners offer no per-command or per-session process boundary to
+  scope a secret to, so per-session secrets can't be made safe by attaching
+  them to the session's view. Give such an environment
+  `allocation_scope="session"`, or move the credentialed call into a host-side
+  tool. The exception is a virtual-egress factory whose authority follows the
+  allocation (next item): it declares a dynamic scope only because its runner
+  holds the grants' virtual credentials, which are the same for every session.
+- **Egress authority that belongs to each session.** One sandbox has one
+  network path to one egress broker, and the broker can't tell which session
+  sent a request, so per-session grants on one sandbox can't be kept apart. A
+  factory with an egress authority shares only when it declares
+  `egress_authority_follows_allocation`: every grant comes from its fixed
+  configuration, one broker serves the allocation, and nothing in the
+  authority depends on the request. Then every session of the scope holds
+  exactly what its own `create()` would have minted.
+  `VirtualEgressEnvironmentFactory` (Docker, Lambda MicroVM and the other
+  adapters) declares it: its grants come from its `credentials`,
+  `approved_destinations` and policies, and its resolver is asked by grant,
+  never by session. Its audit and grant events go to the scope's owner (the
+  workflow run), named by the request's `event_session_id`, because the
+  allocation's identity isn't a session and the broker can't attribute a
+  request to one step. Grants are minted once, when the allocation is created,
+  and revoked when the owner releases it, not when a step ends; a grant with a
+  `ttl_seconds` that expires mid-run fails closed, since no step can renew
+  another session's grants.
+- **Process-external allocations created only through `create_recoverable`.**
+  A virtual-egress factory on an adapter whose resources live outside the
+  process (Lambda MicroVM) refuses a plain `create()`, because only a
+  session's durable allocation intent makes it crash-safe. A shared
+  allocation is created through `create()` under the scope's own identity, so
+  these fail with an error that says so. Lambda MicroVM's egress authority
+  would share; its creation path doesn't yet.
+
+A deferred-materialization factory (Docker coding with `deferred=True`) shares
+too. Its runner is created and bound once, when the scope's allocation is
+created, instead of on some session's first tool call: every session of the
+scope uses it, so deferring it to one of them would only move the cost. A
+resumed run that reconnects to a recorded deferred allocation adopts the
+existing container through the binding's recovery path, as completion
+recovery does.
 
 #### Copying back after each step
 
@@ -1430,9 +1523,9 @@ Limits of this version:
   files, unless they set `serialize_writers=True` (see "Parallel steps and
   commands in one allocation" above). Their bindings report no writer
   isolation either way.
-- Forked sessions, deferred-materialization factories and factories that
-  declare an egress authority don't share; the last two fail with an error
-  when asked to.
+- Forked sessions don't share. A fork keeps its source's causal budget, but
+  its own subagents' `causal_budget` scope stops at the fork, so they never
+  join the source's allocation.
 - Factories that allocate a process-external resource, and so declare an
   `allocation_scope`, don't share yet. Both Lambda MicroVM factories are in
   this group. The shared path creates a scope's allocation with plain
@@ -1443,10 +1536,9 @@ Limits of this version:
   workflow run's shared allocation record, call `create_recoverable` with a
   context over that record, reap an unacknowledged intent from
   `recover_incomplete_sessions`, and pass the record's claim generation as
-  `ownership_epoch`. The virtual-egress Lambda factory is also refused for its
-  egress authority until that refusal is lifted. A fork keeps its source's causal budget, but its own
-  subagents' `causal_budget` scope stops at the fork, so they never join the
-  source's allocation.
+  `ownership_epoch`. The virtual-egress Lambda factory's egress authority
+  already follows its allocation (see "What each session gets as its own"),
+  so only its creation path stands in the way.
 - `unregister_environment` refuses an environment while a shared allocation
   of it is live or being released.
 

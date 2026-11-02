@@ -19,6 +19,12 @@ Session and run metadata can't change it, so a model can't opt a session in or
 out. The runtime resolves the scope once, before it calls the factory, so every
 factory gets it without changing.
 
+Later sessions of a scope never reach the factory's ``create()``. A factory
+whose stores or MCP servers depend on the requesting session can still share
+by setting ``EnvironmentFactory.attaches_session_parts`` and implementing
+``EnvironmentFactory.attach_session_parts``: every session of the scope then
+gets its own ``SharedSessionParts`` on the shared runner and workspace.
+
 A workflow run records the allocations its steps share in its checkpoint.
 ``CayuApp.list_shared_allocations`` reads those records and
 ``CayuApp.release_shared_allocation`` releases one by hand, for an operator
@@ -28,10 +34,21 @@ the types below.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+from cayu.artifacts.base import ArtifactStore
+from cayu.mcp.base import McpServerSpec, copy_mcp_server_spec
+
+if TYPE_CHECKING:
+    from cayu.knowledge.base import KnowledgeStore
+    from cayu.knowledge.scopes import KnowledgeAccessScope
+else:
+    KnowledgeAccessScope = Any
+    KnowledgeStore = Any
 
 
 class AllocationSharingScope(StrEnum):
@@ -54,6 +71,37 @@ def allocation_sharing_scope(value: object) -> AllocationSharingScope:
     except ValueError:
         choices = ", ".join(scope.value for scope in AllocationSharingScope)
         raise ValueError(f"allocation_scope must be one of: {choices}.") from None
+
+
+@dataclass(frozen=True)
+class SharedSessionParts:
+    """One session's own parts of an allocation it shares with the rest of its scope.
+
+    ``EnvironmentFactory.attach_session_parts`` returns these for each session
+    that attaches to a shared allocation. The session's environment gets the
+    shared runner and workspace with these parts, and never the parts of the
+    session that created the allocation. Everything here lives outside the
+    sandbox, in this process: an artifact store, a knowledge store and the
+    access scope that goes with it, and MCP server specs (an MCP server runs
+    as a host subprocess or is reached over HTTP from the host, never inside
+    the runner). Secrets aren't a part: anything a session resolves can reach
+    the shared sandbox, where every other session's commands could read it.
+    """
+
+    artifact_store: ArtifactStore | None = None
+    knowledge_store: KnowledgeStore | None = None
+    knowledge_access_scope: KnowledgeAccessScope | None = None
+    mcp_servers: tuple[McpServerSpec, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if self.artifact_store is not None and not isinstance(self.artifact_store, ArtifactStore):
+            raise TypeError("SharedSessionParts.artifact_store must be an ArtifactStore or None.")
+        servers: Iterable[Any] = self.mcp_servers
+        if isinstance(servers, str | bytes) or not isinstance(servers, Iterable):
+            raise TypeError("SharedSessionParts.mcp_servers must be an iterable of McpServerSpec.")
+        object.__setattr__(
+            self, "mcp_servers", tuple(copy_mcp_server_spec(server) for server in servers)
+        )
 
 
 SharedAllocationState = Literal["creating", "live", "orphan", "reaping"]

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from tests.environments.test_durable_shared_allocations import (
+    _crash,
     _crash_after_plan,
     _PlanThenSolve,
     _ReconnectingFactory,
@@ -23,6 +24,8 @@ from cayu.environments import EnvironmentFactoryOperation, SharedAllocationRelea
 from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
 from cayu.environments.bindings import SyncBindingSourceConflictError
 from cayu.runtime._shared_allocation_records import SharedAllocationRecords
+from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionsRecoveryRequest
 
 
 def test_a_second_release_is_refused_while_a_copy_back_runs(tmp_path: Path, monkeypatch):
@@ -281,6 +284,78 @@ def test_a_live_step_past_the_first_page_of_running_steps_counts():
 
     reason = asyncio.run(_running_step_reason(Store(), "run"))  # type: ignore[arg-type]
     assert reason == "Its step session 'live' is running."
+
+
+def test_a_hand_release_is_refused_while_recovery_disposes_of_the_allocation(
+    tmp_path: Path, monkeypatch
+):
+    world = _World(tmp_path)
+    disposing = asyncio.Event()
+    go_on = asyncio.Event()
+    original_create = _ReconnectingFactory.create
+
+    async def journal_completion_then_crash(ctx):
+        await ctx._append_current_attempt_event(
+            ctx.event(EventType.WORKFLOW_COMPLETED, payload={"workflow": ctx.workflow_name})
+        )
+        raise RuntimeError("the process died before releasing")
+
+    async def slow_reconnect(self, request):
+        # Only recovery's reconnect waits, so a copy-back that wrongly got
+        # through fails the test instead of waiting with it.
+        if request.operation is EnvironmentFactoryOperation.RECONNECT and not disposing.is_set():
+            disposing.set()
+            await go_on.wait()
+        return await original_create(self, request)
+
+    async def scenario():
+        ended = world.app(_call("write_plan"), _done(), _call("solve"), _done())
+        with pytest.raises(RuntimeError, match="died before releasing"):
+            workflow = _PlanThenSolve(ended, before_completion=journal_completion_then_crash)
+            async for _ in workflow.run("run-reaping"):
+                pass
+        _crash(ended)
+        operator = world.app()
+        (allocation,) = (await operator.list_shared_allocations()).allocations
+        monkeypatch.setattr(_ReconnectingFactory, "create", slow_reconnect)
+        recovering = world.app()
+        recovery = asyncio.ensure_future(
+            recovering.recover_incomplete_sessions(
+                IncompleteSessionsRecoveryRequest(statuses={SessionStatus.COMPLETED})
+            )
+        )
+        await asyncio.wait_for(disposing.wait(), 30)
+        # Recovery is disposing of the ended run's allocation. A copy-back now
+        # would read the sandbox while recovery removes it, so it is refused,
+        # whether the operator listed the record before recovery fenced it or
+        # after.
+        with pytest.raises(SharedAllocationReleaseRefused) as stale:
+            await operator.release_shared_allocation(
+                allocation.allocation_id, mode="copy_back", inactive_for_seconds=0, force=True
+            )
+        (fenced,) = (await operator.list_shared_allocations()).allocations
+        with pytest.raises(SharedAllocationReleaseRefused) as fresh:
+            await operator.release_shared_allocation(
+                fenced.allocation_id, mode="copy_back", inactive_for_seconds=0, force=True
+            )
+        finalizations_mid_disposal = list(world.sandboxes.finalizations)
+        go_on.set()
+        await recovery
+        return (
+            stale.value,
+            fresh.value,
+            finalizations_mid_disposal,
+            await _records(operator, "run-reaping"),
+        )
+
+    stale, fresh, finalizations_mid_disposal, records = _run(world, scenario)
+    assert stale.reason == "changed"
+    assert fresh.reason == "changed"
+    assert finalizations_mid_disposal == []
+    # Recovery finished its disposal: nothing copied back, the record is gone.
+    assert world.sandboxes.finalizations == []
+    assert len(world.sandboxes.disposed) == 1
+    assert records == {}
 
 
 def test_a_recovery_cancelled_mid_disposal_gives_its_lease_up(tmp_path: Path, monkeypatch):

@@ -46,7 +46,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from cayu.environments._finalization_disposal import finalization_disposal_checkpoint
-from cayu.environments.base import Environment, copy_environment_spec
+from cayu.environments.base import Environment
 from cayu.environments.bindings import (
     BoundWorkspace,
     WorkspaceBinding,
@@ -58,6 +58,7 @@ from cayu.environments.bindings import (
 from cayu.environments.deferred import DeferredWorkspaceBinding
 from cayu.environments.factory import (
     EnvironmentAllocationScope,
+    EnvironmentAllocationUnsupportedError,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
@@ -80,6 +81,12 @@ from cayu.runtime._shared_allocation_records import (
     shared_allocation_session_id,
 )
 from cayu.runtime._shared_allocation_writers import SharedAllocationWriterTurns
+from cayu.runtime._shared_session_parts import (
+    require_shareable_factory,
+    require_shareable_result,
+    session_environment,
+    session_parts,
+)
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.forks import session_fork_profile_relationship
 from cayu.sessions.records import Session
@@ -782,6 +789,7 @@ class SharedEnvironmentAllocations:
         request: EnvironmentFactoryRequest,
         allocation_session_id: str,
         *,
+        owner_session_id: str,
         recorded: bool,
     ) -> EnvironmentFactoryRequest:
         # A recorded allocation outlives this process when the session store
@@ -801,6 +809,9 @@ class SharedEnvironmentAllocations:
             replacement_predecessor={},
             interaction_id=None,
             process_local_owner=owner,
+            # The allocation's identity isn't a session; events about it (a
+            # broker's egress audit, say) belong on the scope's owner.
+            event_session_id=owner_session_id,
         )
 
     async def _bind_and_check(
@@ -826,11 +837,7 @@ class SharedEnvironmentAllocations:
         binding = environment.binding
         bound: BoundWorkspace | None = None
         try:
-            if isinstance(binding, DeferredWorkspaceBinding):
-                raise RuntimeError(
-                    "A deferred-materialization environment can't share its allocation."
-                )
-            _require_shareable(factory, environment, key.environment_name)
+            require_shareable_result(factory, environment, key.environment_name)
             if binding is not None:
                 if recovery_state is not None:
                     bound = await binding._recover_completion_finalization(
@@ -849,6 +856,12 @@ class SharedEnvironmentAllocations:
                         agent_name=agent_name,
                         environment_name=key.environment_name,
                     )
+                    if isinstance(binding, DeferredWorkspaceBinding):
+                        # A deferred factory creates its runner on first use.
+                        # Every session of the scope uses this one, so it is
+                        # created and bound once, now, rather than by whichever
+                        # session's tool call happens to come first.
+                        await binding.materialization.materialize("use")
             if (
                 not workflow_owner
                 and key.owner_session_id not in self._open_owners
@@ -900,8 +913,14 @@ class SharedEnvironmentAllocations:
         allocation_session_id = self._allocation_ids.setdefault(
             key, shared_allocation_session_id(key.owner_session_id)
         )
-        result = await factory.create(
-            self._shared_request(request, allocation_session_id, recorded=False)
+        result = await _create_shared(
+            factory,
+            self._shared_request(
+                request,
+                allocation_session_id,
+                owner_session_id=key.owner_session_id,
+                recorded=False,
+            ),
         )
         _require_result(result)
         try:
@@ -996,28 +1015,45 @@ class SharedEnvironmentAllocations:
             record = await records.replace_with_fresh(record_id, record)
         if record.reconnectable:
             reconnect = replace(
-                self._shared_request(request, record.allocation_session_id, recorded=True),
+                self._shared_request(
+                    request,
+                    record.allocation_session_id,
+                    owner_session_id=key.owner_session_id,
+                    recorded=True,
+                ),
                 operation=EnvironmentFactoryOperation.RECONNECT,
                 reconnect_metadata=record.reconnect_metadata,
             )
             try:
                 result = await factory.create(reconnect)
                 _require_result(result)
+                # A deferred factory's RECONNECT only rebuilds a placeholder; it
+                # finds a missing resource when the binding recovers, here. So a
+                # failed adoption gets the same disposal check as a failed
+                # reconnect.
+                return await self._adopt_reconnected(
+                    key, factory, result, record, generation, attempt_id, bind=create
+                )
+            except (SharedAllocationClaimLost, SharedAllocationScopeClosedError):
+                raise
             except Exception:
                 if not await _positively_disposed(factory, reconnect):
                     # The allocation may hold the run's only copy of its work;
                     # keep the record for a retry.
                     raise
+                _LOGGER.warning(
+                    "The shared allocation of environment %r that workflow run %s "
+                    "recorded is gone; this attempt starts a new one, and work that "
+                    "existed only in the old one is lost.",
+                    key.environment_name,
+                    key.owner_session_id,
+                )
                 if not create:
                     await records.remove(
                         key.owner_session_id, record.allocation_session_id, {attempt_id}
                     )
                     return None
                 record = await records.replace_with_fresh(record_id, record)
-            else:
-                return await self._adopt_reconnected(
-                    key, factory, result, record, generation, attempt_id, bind=create
-                )
         if not create:
             return None
         return await self._create_recorded(key, factory, request, record, generation, attempt_id)
@@ -1089,8 +1125,14 @@ class SharedEnvironmentAllocations:
         records = self._records
         assert records is not None
         record_id = key.record_id
-        result = await factory.create(
-            self._shared_request(request, record.allocation_session_id, recorded=True)
+        result = await _create_shared(
+            factory,
+            self._shared_request(
+                request,
+                record.allocation_session_id,
+                owner_session_id=key.owner_session_id,
+                recorded=True,
+            ),
         )
         _require_result(result)
         entry = _SharedAllocation(
@@ -1820,7 +1862,7 @@ class SharedEnvironmentAllocations:
             )
         else:
             raise ValueError("A session-scoped allocation is not shared.")
-        _require_shareable_factory(factory)
+        require_shareable_factory(factory)
         self._in_use = True
         entry = await self._acquire_attachable(key, factory, request, None)
         attachment = self._attach(entry, request.session_id)
@@ -1887,51 +1929,20 @@ class SharedEnvironmentAllocations:
         return tuple(entry.key for entry in self._entries())
 
 
-def _require_shareable_factory(factory: EnvironmentFactory) -> None:
-    """Refuse a factory whose allocations can't be shared, before asking it for one."""
-
-    if factory.egress_authority_identity is not None:
+async def _create_shared(
+    factory: EnvironmentFactory, request: EnvironmentFactoryRequest
+) -> EnvironmentFactoryResult:
+    try:
+        return await factory.create(request)
+    except EnvironmentAllocationUnsupportedError as error:
         raise RuntimeError(
-            "An environment factory with an egress authority can't share its allocation."
-        )
-    if getattr(factory, "deferred_materialization", False) is True:
-        raise RuntimeError(
-            "A deferred-materialization environment factory can't share its allocation."
-        )
-
-
-def _require_shareable(
-    factory: EnvironmentFactory, environment: Environment, environment_name: str
-) -> None:
-    """Refuse an allocation whose authority might depend on the session that created it.
-
-    Later sessions of the scope never reach the factory, so whatever the first
-    request was granted must be the factory's fixed configuration: no vault or
-    credential proxy, the factory's configured artifact store, knowledge store
-    and scope, and no MCP servers.
-    """
-
-    reasons: list[str] = []
-    if factory.secret_resolution_scope != "static":
-        reasons.append("its secret resolution scope is dynamic")
-    if environment.vault is not None or environment.proxy is not None:
-        reasons.append("it exposes a vault or credential proxy")
-    if environment.knowledge_store is not getattr(
-        factory, "configured_knowledge_store", None
-    ) or environment.knowledge_access_scope != getattr(
-        factory, "configured_knowledge_access_scope", None
-    ):
-        reasons.append("its knowledge store or scope isn't the factory's configured one")
-    if environment.artifact_store is not factory.configured_artifact_store:
-        reasons.append("its artifact store isn't the factory's configured one")
-    if environment.mcp_servers:
-        reasons.append("it exposes MCP servers")
-    if reasons:
-        raise RuntimeError(
-            f"Environment {environment_name!r} can't share its allocation: "
-            + "; ".join(reasons)
-            + ". Every session of a scope would get the first session's authority."
-        )
+            f"Environment {request.environment_name!r} can't share its allocation: its "
+            "factory creates a process-external resource (a Lambda MicroVM, say) only "
+            "through create_recoverable, under a session's durable allocation intent, "
+            "and a shared allocation is created through create() under the scope's "
+            "own identity. Give it allocation_scope='session' so each session gets "
+            "its own."
+        ) from error
 
 
 def _pending_copy_backs(entry: _SharedAllocation) -> set[str]:
@@ -2027,6 +2038,9 @@ async def _dispose_recorded(factory: EnvironmentFactory, record: SharedAllocatio
         session_id=record.allocation_session_id,
         agent_name=record.agent_name,
         environment_name=record.environment_name,
+        # Events about the allocation (a broker's grant revocations) belong on
+        # the run that owned it; its own identity isn't a session.
+        event_session_id=record.owner_session_id,
     )
     if record.reconnect_metadata:
         reconnect = replace(
@@ -2091,6 +2105,10 @@ class _SharedAllocationFactory(EnvironmentFactory):
         return self._inner.egress_authority_identity
 
     @property
+    def egress_authority_follows_allocation(self) -> bool:
+        return self._inner.egress_authority_follows_allocation
+
+    @property
     def configured_artifact_store(self):
         return self._inner.configured_artifact_store
 
@@ -2122,7 +2140,7 @@ class _SharedAllocationFactory(EnvironmentFactory):
                 f"environment {request.environment_name!r}; it can't move to a shared "
                 f"{self._scope.value} allocation."
             )
-        _require_shareable_factory(self._inner)
+        require_shareable_factory(self._inner)
         registry = self._registry
         key = await registry.resolve_key(self._session, self._environment_name, self._scope)
         entry = await registry._acquire_attachable(key, self._inner, request, self._session)
@@ -2132,20 +2150,15 @@ class _SharedAllocationFactory(EnvironmentFactory):
             if copy_back is not None:
                 _require_copy_back_while_bound(entry)
                 copy_back.add(key)
-            environment = entry.environment
-            bound = entry.bound
-            attached = Environment(
-                copy_environment_spec(environment.spec),
-                workspace=bound.workspace if bound is not None else environment.workspace,
-                artifact_store=environment.artifact_store,
+            # This session's own stores and MCP servers, from its own request;
+            # never the ones of the session that created the allocation.
+            parts = await session_parts(self._inner, request, entry.result)
+            attached = session_environment(
+                entry.environment,
+                parts,
+                bound=entry.bound,
                 runner=entry.runner,
-                vault=environment.vault,
-                proxy=environment.proxy,
-                knowledge_store=environment.knowledge_store,
-                knowledge_access_scope=environment.knowledge_access_scope,
                 binding=_SharedAllocationBinding(registry, entry, attachment),
-                mcp_servers=environment.mcp_servers,
-                workspace_instructions=environment.workspace_instructions,
             )
 
             async def release(action: EnvironmentFactoryReleaseAction) -> None:
