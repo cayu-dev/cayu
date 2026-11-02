@@ -37,7 +37,6 @@ them). They read the same records and go through the same fences as
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 import secrets
@@ -58,9 +57,12 @@ from cayu.environments.shared_allocations import (
     SharedAllocationState,
 )
 from cayu.runtime._shared_allocation_records import (
+    DISPOSAL_LEASE_SECONDS,
+    DisposalHold,
     SharedAllocationRecord,
     SharedAllocationRecords,
     SharedAllocationSnapshot,
+    keeping_disposal_lease,
     shared_allocation_owner,
 )
 from cayu.runtime._shared_environment_allocations import (
@@ -89,10 +91,6 @@ MAX_SHARED_ALLOCATION_RUNS_PER_PAGE = 200
 # how many it reads per page.
 _MAX_STEP_SESSIONS_CHECKED = 1000
 _STEP_SESSION_PAGE = 100
-# A hand release holds its record under a lease it renews while it runs, so a
-# release whose process died stops blocking others once the lease expires.
-_RELEASE_LEASE_SECONDS = 300.0
-_RELEASE_RENEW_SECONDS = 60.0
 # Bindings a failed copy-back left mid-finalization, per registry, by allocation.
 _RETAINED_BINDINGS: weakref.WeakKeyDictionary[Any, dict[str, tuple[Any, Any]]] = (
     weakref.WeakKeyDictionary()
@@ -231,16 +229,45 @@ async def release_shared_allocation(
             "its own, and recovery drops the record once the run has ended.",
         )
     token = f"release-{secrets.token_hex(8)}"
-    held = await records.claim_release(record, token=token, lease_seconds=_RELEASE_LEASE_SECONDS)
+    held = await records.claim_release(record, token=token, lease_seconds=DISPOSAL_LEASE_SECONDS)
     if held is None:
         raise SharedAllocationReleaseRefused(
             "changed",
-            "The allocation's record changed while it was read, or another release of it is "
-            "in progress (another attempt claimed it, or something is releasing it). List "
-            "the allocations again.",
+            "The allocation's record changed while it was read, or recovery or another "
+            "release is disposing of it (another attempt claimed it, or something is "
+            "releasing it). List the allocations again.",
         )
-    hold = _ReleaseHold(held)
-    renewal = asyncio.ensure_future(_renew(records, hold))
+    async with keeping_disposal_lease(records, held) as hold:
+        message = await _release_held(
+            registry, allocation_id, records, record_id, hold, factory, mode=mode
+        )
+    fenced = hold.record
+    await records.remove_reaped(fenced)
+    forced = force and run_state == "running"
+    _LOGGER.warning(
+        "Released shared allocation %s of workflow run %s by hand (%s%s).",
+        allocation_id,
+        owner_id,
+        mode.value,
+        ", forced" if forced else "",
+    )
+    return SharedAllocationRelease(allocation=allocation, mode=mode, forced=forced, message=message)
+
+
+async def _release_held(
+    registry: SharedEnvironmentAllocations,
+    allocation_id: str,
+    records: SharedAllocationRecords,
+    record_id: str | None,
+    hold: DisposalHold,
+    factory: EnvironmentFactory,
+    *,
+    mode: SharedAllocationReleaseMode,
+) -> str:
+    """Copy back or discard the allocation this release holds the lease on."""
+
+    environment = hold.record.environment_name
+    owner_id = hold.record.owner_session_id
     try:
         message = await _settle_retained(registry, allocation_id, records, record_id, hold)
         if mode is SharedAllocationReleaseMode.COPY_BACK and message is None:
@@ -258,55 +285,13 @@ async def release_shared_allocation(
                 f"workflow run {owner_id!r} recorded; nothing was copied back."
             )
     except BaseException:
-        renewal.cancel()
         # Give the lease up so the release can be tried again at once; the record
         # stays fenced as reaping, so no run reattaches to it meanwhile.
         with contextlib.suppress(Exception):
             await records.drop_release(hold.record)
         raise
-    renewal.cancel()
     assert message is not None
-    fenced = hold.record
-    await records.remove_reaped(fenced)
-    forced = force and run_state == "running"
-    _LOGGER.warning(
-        "Released shared allocation %s of workflow run %s by hand (%s%s).",
-        allocation_id,
-        owner_id,
-        mode.value,
-        ", forced" if forced else "",
-    )
-    return SharedAllocationRelease(allocation=allocation, mode=mode, forced=forced, message=message)
-
-
-class _ReleaseHold:
-    """The record a hand release holds, as its writes and lease renewals change it."""
-
-    def __init__(self, record: SharedAllocationRecord) -> None:
-        self.record = record
-
-
-async def _renew(records: SharedAllocationRecords, hold: _ReleaseHold) -> None:
-    """Keep the release's lease live while the release runs."""
-
-    while True:
-        await asyncio.sleep(_RELEASE_RENEW_SECONDS)
-        try:
-            renewed = await records.renew_release(hold.record, lease_seconds=_RELEASE_LEASE_SECONDS)
-        except Exception as error:
-            _LOGGER.warning(
-                "Renewing the hand release of shared allocation %s failed (%s).",
-                hold.record.allocation_session_id,
-                type(error).__name__,
-            )
-            continue
-        if renewed is None:
-            _LOGGER.warning(
-                "The hand release of shared allocation %s lost its lease.",
-                hold.record.allocation_session_id,
-            )
-            return
-        hold.record = renewed
+    return message
 
 
 def _retained(registry: SharedEnvironmentAllocations) -> dict[str, tuple[Any, Any]]:
@@ -321,7 +306,7 @@ async def _settle_retained(
     allocation_id: str,
     records: SharedAllocationRecords,
     record_id: str | None,
-    hold: _ReleaseHold,
+    hold: DisposalHold,
 ) -> str | None:
     """Finish an earlier release's finalization that this process still holds.
 
@@ -348,7 +333,7 @@ async def _settle_retained(
 async def _finalize(
     records: SharedAllocationRecords,
     record_id: str | None,
-    hold: _ReleaseHold,
+    hold: DisposalHold,
     binding: Any,
     bound: Any,
 ) -> None:
@@ -526,7 +511,7 @@ async def _copy_back(
     records: SharedAllocationRecords,
     factory: EnvironmentFactory,
     record_id: str,
-    hold: _ReleaseHold,
+    hold: DisposalHold,
 ) -> str:
     """Reconnect, rebuild the binding from its recorded state, and finalize it as completed."""
 

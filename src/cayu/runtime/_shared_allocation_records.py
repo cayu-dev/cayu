@@ -26,8 +26,11 @@ owning attempt has completed.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 import secrets
-from collections.abc import Callable, Collection
+from collections.abc import AsyncIterator, Callable, Collection
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -44,7 +47,12 @@ if TYPE_CHECKING:
     from cayu.sessions.store import SessionStore
 
 SHARED_ALLOCATIONS_CHECKPOINT_KEY = "shared_environment_allocations"
+#: How long a disposal lease (recovery's reaping, or a hand release) lasts
+#: without renewal, and how often its holder renews it while it works.
+DISPOSAL_LEASE_SECONDS = 300.0
+DISPOSAL_RENEW_SECONDS = 60.0
 _SCHEMA_VERSION = 1
+_LOGGER = logging.getLogger(__name__)
 
 RecordState = Literal["creating", "created", "live", "reaping"]
 _STATES = frozenset({"creating", "created", "live", "reaping"})
@@ -232,6 +240,52 @@ class SharedAllocationRecord:
             and other.attempt_id == self.attempt_id
             and other.claim_generation == self.claim_generation
         )
+
+
+class DisposalHold:
+    """The record a disposal lease holder holds, as its writes and renewals change it."""
+
+    def __init__(self, record: SharedAllocationRecord) -> None:
+        self.record = record
+
+
+@contextlib.asynccontextmanager
+async def keeping_disposal_lease(
+    records: SharedAllocationRecords, record: SharedAllocationRecord
+) -> AsyncIterator[DisposalHold]:
+    """Renew the disposal lease on ``record`` in the background while the body runs."""
+
+    hold = DisposalHold(record)
+
+    async def renew() -> None:
+        while True:
+            await asyncio.sleep(DISPOSAL_RENEW_SECONDS)
+            try:
+                renewed = await records.renew_release(
+                    hold.record, lease_seconds=DISPOSAL_LEASE_SECONDS
+                )
+            except Exception as error:
+                _LOGGER.warning(
+                    "Renewing the disposal lease of shared allocation %s failed (%s).",
+                    hold.record.allocation_session_id,
+                    type(error).__name__,
+                )
+                continue
+            if renewed is None:
+                _LOGGER.warning(
+                    "The disposal lease of shared allocation %s was lost.",
+                    hold.record.allocation_session_id,
+                )
+                return
+            hold.record = renewed
+
+    renewal = asyncio.ensure_future(renew())
+    try:
+        yield hold
+    finally:
+        renewal.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await renewal
 
 
 def shared_allocation_record_id(scope: str, scope_id: str, environment_name: str) -> str:
@@ -540,40 +594,33 @@ class SharedAllocationRecords:
         return await self._mutate(owner_session_id, change)
 
     async def mark_reaping(self, record: SharedAllocationRecord) -> SharedAllocationRecord | None:
-        """Fence ``record`` for disposal; None when it changed since it was read.
+        """Fence ``record`` for recovery's disposal; None when someone else has it.
 
         A reaping record is never reconnected: a claim moves it to the orphans
-        and starts a fresh allocation, so disposal can't race a reattach.
-        None too while a hand release holds it (``claim_release``).
+        and starts a fresh allocation, so disposal can't race a reattach. The
+        fence is the same disposal lease a hand release takes
+        (``claim_release``), so recovery and a release never both hold the
+        allocation. None when the record changed since it was read, or another
+        reaper or release holds a lease on it that hasn't expired. The reaper
+        gives the lease up with ``drop_release`` if it can't finish.
         """
 
-        now = datetime.now(UTC)
-
-        def change(snapshot: SharedAllocationSnapshot) -> Any:
-            for table in (snapshot.records, snapshot.orphans):
-                for key, current in tuple(table.items()):
-                    if current.allocation_session_id != record.allocation_session_id:
-                        continue
-                    if not record.same_claim(current) or current.release_leased(now):
-                        return False, None
-                    if current.state == "reaping":
-                        return False, current
-                    fenced = replace(current, state="reaping")
-                    table[key] = fenced
-                    return True, fenced
-            return False, None
-
-        return await self._mutate(record.owner_session_id, change)
+        return await self.claim_release(
+            record, token=f"reaping-{secrets.token_hex(8)}", lease_seconds=DISPOSAL_LEASE_SECONDS
+        )
 
     async def claim_release(
         self, record: SharedAllocationRecord, *, token: str, lease_seconds: float
     ) -> SharedAllocationRecord | None:
-        """Fence ``record`` as reaping and hold it for one hand release.
+        """Fence ``record`` as reaping and hold it under a disposal lease named ``token``.
 
-        The claim generation goes up, so a reaper or another release that read
-        the record before this can't fence it any more, and none can while the
-        lease is live. None when the record changed since it was read, or
-        another release's lease on it hasn't expired.
+        Both a hand release and recovery's reaping (``mark_reaping``) take this
+        lease, and only one can hold it at a time. The claim generation goes
+        up, so a reaper or release that read the record before this can't
+        fence it any more, and none can while the lease is live. A record that
+        is already reaping can be taken once its holder gave the lease up or
+        let it expire. None when the record changed since it was read, or
+        another holder's lease on it hasn't expired.
         """
 
         now = datetime.now(UTC)
@@ -601,13 +648,13 @@ class SharedAllocationRecords:
     async def renew_release(
         self, record: SharedAllocationRecord, *, lease_seconds: float
     ) -> SharedAllocationRecord | None:
-        """Extend the hand release's lease; None when the release no longer holds it."""
+        """Extend the holder's disposal lease; None when it no longer holds it."""
 
         expires_at = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
         return await self._change_release(record, expires_at=expires_at)
 
     async def drop_release(self, record: SharedAllocationRecord) -> None:
-        """Give up a failed hand release's lease, keeping the record fenced as reaping."""
+        """Give up a disposal lease that couldn't finish, keeping the record fenced as reaping."""
 
         await self._change_release(record, expires_at=None)
 

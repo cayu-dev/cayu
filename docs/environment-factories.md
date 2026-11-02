@@ -1293,7 +1293,12 @@ durable record is what cleans it up instead:
   `discard_unreachable_allocation`. Unconfirmed disposal retains the record for
   another recovery and is not counted as reaped. A record is fenced as `reaping` before
   disposal, so a resume that races the reaper starts a fresh allocation
-  instead of reattaching one being removed. It leaves alone the allocation of
+  instead of reattaching one being removed. The fence is the same renewed
+  disposal lease a hand release takes, and it raises the record's claim
+  generation, so while recovery disposes of an allocation neither a hand
+  release nor another recovery can take it. Recovery gives the lease up when
+  the disposal fails or can't be confirmed, so the next recovery or a release
+  can try again. It leaves alone the allocation of
   a run that can still resume, and anything this process holds.
 - A run that crashed and is never resumed keeps its allocation, since nothing
   ends the run. Resume it and let it finish, or release the allocation by
@@ -1398,9 +1403,10 @@ run, discard is the usual choice. These rules keep it from racing the run:
   compare-and-set against the record that was read fences it as `reaping`,
   raises its claim generation, and holds it under a five-minute lease that the
   release renews while it runs. A release that finds the record changed since
-  it was read, or held by another release whose lease hasn't expired, is
-  refused, and recovery's reaping leaves a held record alone, so a copy-back
-  can't race a discard. A run resumed after the fence never reattaches: its
+  it was read, or held by another release or by recovery's reaping (which
+  takes the same lease) whose lease hasn't expired, is refused, and
+  recovery's reaping leaves a held record alone. Only one of them holds the
+  allocation at a time, so a copy-back can't race a discard. A run resumed after the fence never reattaches: its
   claim moves the record to the orphans and starts a fresh allocation, and a
   process that still holds the allocation lets go of it without copying back
   or disposing of anything. A release whose process dies stops blocking

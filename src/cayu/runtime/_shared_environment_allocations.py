@@ -73,6 +73,7 @@ from cayu.runtime._shared_allocation_records import (
     SharedAllocationClaimLost,
     SharedAllocationRecord,
     SharedAllocationRecords,
+    keeping_disposal_lease,
     shared_allocation_record_id,
     shared_allocation_session_id,
 )
@@ -1367,21 +1368,33 @@ class SharedEnvironmentAllocations:
             factory = self._factory_lookup(record.environment_name)
             if factory is None:
                 continue
+            # The same disposal lease a hand release takes: while recovery holds
+            # it, no release (and no other reaper) touches the allocation.
             fenced = await records.mark_reaping(record)
             if fenced is None:
                 continue
-            try:
-                if not await _dispose_recorded(factory, fenced):
+            async with keeping_disposal_lease(records, fenced) as hold:
+                try:
+                    disposed = await _dispose_recorded(factory, hold.record)
+                except Exception as error:
+                    _LOGGER.warning(
+                        "Disposing of a recorded shared allocation of %r failed (%s); "
+                        "the next recovery retries it.",
+                        record.environment_name,
+                        type(error).__name__,
+                    )
+                    disposed = False
+                except BaseException:
+                    # Cancelled mid-disposal: give the lease up so the next recovery
+                    # or a release can try again at once.
+                    with contextlib.suppress(Exception):
+                        await records.drop_release(hold.record)
+                    raise
+                if not disposed:
+                    with contextlib.suppress(Exception):
+                        await records.drop_release(hold.record)
                     continue
-            except Exception as error:
-                _LOGGER.warning(
-                    "Disposing of a recorded shared allocation of %r failed (%s); "
-                    "the next recovery retries it.",
-                    record.environment_name,
-                    type(error).__name__,
-                )
-                continue
-            await records.remove_reaped(fenced)
+            await records.remove_reaped(hold.record)
             reaped += 1
         return reaped
 

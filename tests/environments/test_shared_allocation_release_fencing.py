@@ -19,7 +19,7 @@ from tests.environments.test_shared_allocation_release import _run
 from tests.sandbox_broker.test_brokered_shared_allocation import _call, _done
 
 from cayu import EventType
-from cayu.environments import SharedAllocationReleaseRefused
+from cayu.environments import EnvironmentFactoryOperation, SharedAllocationReleaseRefused
 from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
 from cayu.environments.bindings import SyncBindingSourceConflictError
 from cayu.runtime._shared_allocation_records import SharedAllocationRecords
@@ -87,15 +87,97 @@ def test_an_expired_release_lease_no_longer_blocks_reaping(tmp_path: Path):
         held = await records.claim_release(record, token="release-dead", lease_seconds=0)
         assert held is not None and held.state == "reaping"
         assert await records.claim_release(record, token="release-stale", lease_seconds=60) is None
+        # Recovery takes the lapsed lease over. Recovery then holds it, so a
+        # release, whether it read the record before or after, is refused.
+        reaped = await records.mark_reaping(held)
+        assert reaped is not None
+        refused = (
+            await records.claim_release(held, token="release-early", lease_seconds=60),
+            await records.claim_release(reaped, token="release-late", lease_seconds=60),
+        )
+        # Once recovery gives its lease up (it couldn't dispose), a release can take it.
+        await records.drop_release(reaped)
+        snapshot = await records.load("run-lapsed")
+        assert snapshot is not None
+        (dropped,) = snapshot.all()
+        taken = await records.claim_release(dropped, token="release-next", lease_seconds=60)
+        return held, reaped, refused, taken
+
+    held, reaped, refused, taken = _run(world, scenario)
+    assert reaped is not None and reaped.allocation_session_id == held.allocation_session_id
+    assert reaped.claim_generation == held.claim_generation + 1
+    assert refused == (None, None)
+    assert taken is not None and taken.claim_generation == reaped.claim_generation + 1
+
+
+def test_a_release_is_refused_while_recovery_holds_the_reaping_fence(tmp_path: Path):
+    world = _World(tmp_path)
+
+    async def scenario():
+        await _crash_after_plan(world, "run-fenced-first")
+        operator = world.app()
+        records = SharedAllocationRecords(operator._runtime_session_store)
+        snapshot = await records.load("run-fenced-first")
+        assert snapshot is not None
+        (read_before,) = snapshot.all()
+        reaped = await records.mark_reaping(read_before)
+        assert reaped is not None
         return (
-            held,
-            await records.mark_reaping(held),
-            await records.claim_release(held, token="release-next", lease_seconds=60),
+            await records.claim_release(read_before, token="release-a", lease_seconds=60),
+            await records.claim_release(reaped, token="release-b", lease_seconds=60),
+            await records.mark_reaping(read_before),
+            await records.mark_reaping(reaped),
         )
 
-    held, reaped, next_release = _run(world, scenario)
-    assert reaped is not None and reaped.allocation_session_id == held.allocation_session_id
-    assert next_release is not None and next_release.claim_generation == held.claim_generation + 1
+    # Neither a release nor a second reaper gets an allocation recovery is reaping.
+    assert _run(world, scenario) == (None, None, None, None)
+
+
+def test_a_copy_back_is_refused_while_recovery_disposes_of_the_allocation(
+    tmp_path: Path, monkeypatch
+):
+    world = _World(tmp_path)
+    reconnecting = asyncio.Event()
+    go_on = asyncio.Event()
+    original_create = _ReconnectingFactory.create
+    blocked = {"first": True}
+
+    async def slow_reconnect(self, request):
+        if request.operation is EnvironmentFactoryOperation.RECONNECT and blocked["first"]:
+            blocked["first"] = False
+            reconnecting.set()
+            await go_on.wait()
+        return await original_create(self, request)
+
+    async def scenario():
+        await _crash_after_plan(world, "run-reaped")
+        operator = world.app()
+        registry = operator._environment_lifecycle.shared_allocations
+
+        async def ended(owner):
+            return True
+
+        # The run has ended, so recovery reaps its record.
+        monkeypatch.setattr(registry, "_owner_ended", ended)
+        monkeypatch.setattr(_ReconnectingFactory, "create", slow_reconnect)
+        (allocation,) = (await operator.list_shared_allocations()).allocations
+        reaping = asyncio.ensure_future(registry.reap_recorded("run-reaped"))
+        await asyncio.wait_for(reconnecting.wait(), 30)
+        # The operator read the allocation before recovery fenced it.
+        with pytest.raises(SharedAllocationReleaseRefused) as refused:
+            await operator.release_shared_allocation(
+                allocation.allocation_id, mode="copy_back", inactive_for_seconds=0
+            )
+        go_on.set()
+        return refused.value, await reaping, await _records(operator, "run-reaped")
+
+    refused, reaped, records = _run(world, scenario)
+    assert refused.reason == "changed"
+    assert reaped == 1 and records == {}
+    # Recovery discarded it; nothing was copied back alongside.
+    assert world.sandboxes.finalizations == []
+    assert not (world.source / "plan.md").exists()
+    assert len(world.sandboxes.disposed) == 1
 
 
 def test_a_retry_after_a_failed_copy_back_is_not_refused_as_activity(tmp_path: Path):
@@ -199,3 +281,40 @@ def test_a_live_step_past_the_first_page_of_running_steps_counts():
 
     reason = asyncio.run(_running_step_reason(Store(), "run"))  # type: ignore[arg-type]
     assert reason == "Its step session 'live' is running."
+
+
+def test_a_recovery_cancelled_mid_disposal_gives_its_lease_up(tmp_path: Path, monkeypatch):
+    world = _World(tmp_path)
+    reconnecting = asyncio.Event()
+    original_create = _ReconnectingFactory.create
+
+    async def hanging_reconnect(self, request):
+        if request.operation is EnvironmentFactoryOperation.RECONNECT:
+            reconnecting.set()
+            await asyncio.Event().wait()
+        return await original_create(self, request)
+
+    async def scenario():
+        await _crash_after_plan(world, "run-cancelled")
+        operator = world.app()
+        registry = operator._environment_lifecycle.shared_allocations
+
+        async def ended(owner):
+            return True
+
+        monkeypatch.setattr(registry, "_owner_ended", ended)
+        monkeypatch.setattr(_ReconnectingFactory, "create", hanging_reconnect)
+        reaping = asyncio.ensure_future(registry.reap_recorded("run-cancelled"))
+        await asyncio.wait_for(reconnecting.wait(), 30)
+        reaping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reaping
+        monkeypatch.setattr(_ReconnectingFactory, "create", original_create)
+        # The next recovery takes the allocation at once and disposes of it.
+        return await registry.reap_recorded("run-cancelled"), await _records(
+            operator, "run-cancelled"
+        )
+
+    reaped, records = _run(world, scenario)
+    assert reaped == 1 and records == {}
+    assert len(world.sandboxes.disposed) == 1
