@@ -6560,10 +6560,11 @@ class SessionEngine:
                 )
             return await self._event_writer.emit(event)
 
-        async def park_external_completion() -> AsyncIterator[Event]:
+        async def park_whole_turn_completion() -> AsyncIterator[Event]:
             # Successful structured/final-tool outcomes are whole-turn boundaries,
-            # just like before-stop COMPLETE. Park before terminalizing the writer.
-            assert isinstance(execution_to_wait, _ExternalExecutionToWait)
+            # just like before-stop COMPLETE, for an external or a participant wait
+            # alike. Park before terminalizing the writer.
+            assert execution_to_wait is not None
             await execution_to_wait.park(invocation_context)
             async for event in self._session_outcomes.publish_stop_interruption(
                 outcome_context(),
@@ -7357,8 +7358,8 @@ class SessionEngine:
                     await self._session_finalization.stop_at_requested_tool_round_boundary(
                         outcome_state.session
                     )
-                if isinstance(execution_to_wait, _ExternalExecutionToWait):
-                    async for event in park_external_completion():
+                if execution_to_wait is not None:
+                    async for event in park_whole_turn_completion():
                         yield event
                     return
                 (
@@ -8233,8 +8234,8 @@ class SessionEngine:
                             async for event in finish_interruption(pending=False):
                                 yield event
                             return
-                        if isinstance(execution_to_wait, _ExternalExecutionToWait):
-                            async for event in park_external_completion():
+                        if execution_to_wait is not None:
+                            async for event in park_whole_turn_completion():
                                 yield event
                             return
                         (
@@ -8374,8 +8375,8 @@ class SessionEngine:
                                     async for event in finish_interruption(pending=False):
                                         yield event
                                     return
-                                if isinstance(execution_to_wait, _ExternalExecutionToWait):
-                                    async for event in park_external_completion():
+                                if execution_to_wait is not None:
+                                    async for event in park_whole_turn_completion():
                                         yield event
                                     return
                                 (
@@ -8712,8 +8713,8 @@ class SessionEngine:
                     outcome_state.session
                 )
                 if tool_completion_result is not None:
-                    if isinstance(execution_to_wait, _ExternalExecutionToWait):
-                        async for event in park_external_completion():
+                    if execution_to_wait is not None:
+                        async for event in park_whole_turn_completion():
                             yield event
                         return
                     (

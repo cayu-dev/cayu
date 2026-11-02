@@ -1040,7 +1040,10 @@ exact operation, never by rerunning a request producer.
 An authenticated host can explicitly stop a participant-owned root execution at
 its completed assistant/tool-turn boundary with
 `execute_participant_session_to_wait(execution, wait, participant=..., context=...,
-wait_context=...)`. Creation remains inert; the execution uses the existing
+wait_context=...)`. Every whole-turn result is such a boundary: plain text, validated
+structured output (native or tool strategy), and a turn that satisfies
+`ToolCompletionPolicy`. Each parks the wait and interrupts the session instead of
+completing it. Creation remains inert; the execution uses the existing
 participant permit, and the complete wait is part of its exact execution identity.
 No scheduler or model-facing orchestration is implied.
 
