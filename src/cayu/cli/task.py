@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import time
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
@@ -30,6 +31,10 @@ from cayu.cli._task_readers import (
     open_store_task_reader,
 )
 from cayu.cli.session import _redact_sensitive
+from cayu.tasks.cancellation import (
+    TaskCancellationReconciliationEventType,
+    TaskRetryCancellationReconciliationEventType,
+)
 from cayu.tasks.records import TaskStatus
 
 CLI_SCHEMA_VERSION = "1"
@@ -37,6 +42,39 @@ CLI_SCHEMA_VERSION = "1"
 _MAX_SERIES_ATTEMPTS = 100
 _CANCELLATION_REQUEST_REASONS = frozenset(
     {"cancellation_requested", "retry_cancellation_requested"}
+)
+
+
+class WorkerLossEvidence(StrEnum):
+    """What made it safe to settle a task whose worker lost its lease (``evidence_kind``)."""
+
+    LEASE_EXPIRED = "lease_expired"
+    RESTART_LIMIT_REACHED = "restart_limit_reached"
+    SESSION_INTERRUPTED = "session_interrupted"
+    TASK_ENDED = "task_ended"
+    HANDLER_STOPPED = "handler_stopped"
+    OTHER = "other"
+
+
+# The evidence id prefixes Cayu records when it settles such a task; see `_worker_loss`.
+_WORKER_LOSS_EVIDENCE_PREFIXES = (
+    ("lease-expired-at:", WorkerLossEvidence.LEASE_EXPIRED),
+    ("restart-limit-reached:", WorkerLossEvidence.RESTART_LIMIT_REACHED),
+    ("session-interrupted:", WorkerLossEvidence.SESSION_INTERRUPTED),
+    ("task-ended:", WorkerLossEvidence.TASK_ENDED),
+    ("task-worker-quiescence:", WorkerLossEvidence.HANDLER_STOPPED),
+    ("task-worker-retry-quiescence:", WorkerLossEvidence.HANDLER_STOPPED),
+    ("dispatch-quiescence:", WorkerLossEvidence.HANDLER_STOPPED),
+)
+# Evidence ids that end in ":<session instance>:<run epoch>".
+_SESSION_RUN_EVIDENCE = frozenset(
+    {WorkerLossEvidence.SESSION_INTERRUPTED, WorkerLossEvidence.TASK_ENDED}
+)
+_RECONCILED_EVENT_TYPES = frozenset(
+    {
+        TaskCancellationReconciliationEventType.RECONCILED.value,
+        TaskRetryCancellationReconciliationEventType.RECONCILED.value,
+    }
 )
 
 #: ``cayu task wait`` exit codes. 1 remains any other error and 2 an argparse usage error.
@@ -152,8 +190,9 @@ def add_task_parser(subparsers: Any) -> None:
         "show",
         help="Show one task with its result, cancellation and retry series.",
         description=(
-            "Show one task: its status, result or error, why it was cancelled, and every "
-            "attempt of its retry series."
+            "Show one task: its status, result or error, why it was cancelled (for a task "
+            "Cayu settled after its worker was lost, which worker, when its lease expired "
+            "and what made settling it safe), and every attempt of its retry series."
         ),
     )
     show_parser.add_argument("task_id")
@@ -383,8 +422,8 @@ def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:
     ``cancellation_requested`` (``retry_cancellation_requested`` in a retry series) until
     its worker stops, with the request's error and event in ``status_payload``. A task
     cancelled after its worker was lost carries the reconciliation in ``status_payload``,
-    with its outcome (for example ``quiescent``); otherwise a cancelled task's reason is
-    its ``error``.
+    with its outcome (for example ``quiescent``), and ``worker_loss`` tells what happened;
+    otherwise a cancelled task's reason is its ``error``.
     """
 
     status = task.get("status")
@@ -407,7 +446,111 @@ def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:
         "reconciled_by": _text(actor.get("subject")),
         "error_code": _text(error.get("code")),
         "error_message": _text(error.get("message")),
+        "worker_loss": _worker_loss(task, reconciliation),
     }
+
+
+def _worker_loss(task: dict[str, Any], reconciliation: dict[str, Any]) -> dict[str, Any] | None:
+    """How a task was settled after the worker holding it lost its lease; ``None`` otherwise.
+
+    The reconciliation's evidence id says what made settling it safe. Cayu records:
+
+    - ``lease-expired-at:TIME``: the worker was found gone once its lease expired, by a
+      worker declared the only one (``--reconcile-abandoned-after-seconds``) or by the
+      application (``reconcile_abandoned_tasks``).
+    - ``restart-limit-reached:LIMIT:lease-expired-at:TIME``: the same, for a restartable
+      task that had used up its restarts after a lost worker.
+    - ``session-interrupted:INSTANCE:EPOCH``: the task's agent session is interrupted,
+      which fences the lost worker's run.
+    - ``task-ended:INSTANCE:EPOCH``: a session wake whose task had already ended.
+    - ``task-worker-quiescence:``, ``task-worker-retry-quiescence:`` and
+      ``dispatch-quiescence:``: the worker's lease expired before it settled the
+      cancellation, and it saw its handler stop.
+
+    An application that settles a task itself may record other evidence (``other``).
+    """
+
+    worker_id = _text(reconciliation.get("original_worker_id"))
+    lease_expired_at = _text(reconciliation.get("original_lease_expires_at"))
+    if worker_id is None or lease_expired_at is None:
+        return None
+    evidence = _object(reconciliation.get("evidence"))
+    evidence_id = _text(evidence.get("evidence_id")) or ""
+    kind = next(
+        (kind for prefix, kind in _WORKER_LOSS_EVIDENCE_PREFIXES if evidence_id.startswith(prefix)),
+        WorkerLossEvidence.OTHER,
+    )
+    # What follows the prefix: "LIMIT:lease-expired-at:TIME" or "INSTANCE:EPOCH".
+    detail = evidence_id.partition(":")[2]
+    limit = detail.partition(":")[0]
+    instance, _, epoch = detail.rpartition(":")
+    session_run = kind in _SESSION_RUN_EVIDENCE
+    actor = _object(reconciliation.get("reconciled_by"))
+    events = reconciliation.get("events")
+    settled = next(
+        (
+            event
+            for event in map(_object, events if isinstance(events, list) else ())
+            if event.get("type") in _RECONCILED_EVENT_TYPES
+        ),
+        {},
+    )
+    loss: dict[str, Any] = {
+        "worker_id": worker_id,
+        "lease_expired_at": lease_expired_at,
+        "settled_at": _text(settled.get("occurred_at")),
+        "settled_by": _text(actor.get("subject")),
+        "settled_by_source": _text(actor.get("source")),
+        "evidence_kind": kind.value,
+        "evidence_id": evidence_id or None,
+        "validator_id": _text(evidence.get("validator_id")),
+        "validator_version": _text(evidence.get("validator_version")),
+        "session_instance_id": (instance or None) if session_run else None,
+        "session_run_epoch": _count(epoch) if session_run else None,
+        "restart_limit": (
+            _count(limit) if kind is WorkerLossEvidence.RESTART_LIMIT_REACHED else None
+        ),
+    }
+    loss["summary"] = _worker_loss_summary(task, loss, kind)
+    return loss
+
+
+def _worker_loss_summary(
+    task: dict[str, Any], loss: dict[str, Any], kind: WorkerLossEvidence
+) -> str:
+    worker, expired = loss["worker_id"], loss["lease_expired_at"]
+    if kind is WorkerLossEvidence.HANDLER_STOPPED:
+        sentences = [
+            f"Worker {worker}'s lease expired at {expired} before it settled the "
+            "cancellation, and it saw its handler stop."
+        ]
+    else:
+        sentences = [f"Worker {worker} stopped renewing its lease, which expired at {expired}."]
+    limit = loss["restart_limit"]
+    if limit is not None:
+        sentences.append(
+            f"It wasn't restarted: it had reached its limit of {limit} "
+            f"restart{'' if limit == 1 else 's'} after a lost worker."
+        )
+    elif kind is WorkerLossEvidence.SESSION_INTERRUPTED:
+        session = _text(task.get("session_id"))
+        epoch = loss["session_run_epoch"]
+        sentences.append(
+            "Its session"
+            + ("" if session is None else f" {session}")
+            + " was interrupted"
+            + ("" if epoch is None else f" (run epoch {epoch})")
+            + ", so the lost run couldn't go on."
+        )
+    elif kind is WorkerLossEvidence.TASK_ENDED:
+        sentences.append("The task this session wake would have continued had already ended.")
+    cancelled = "Cayu cancelled the task"
+    if loss["settled_at"] is not None:
+        cancelled += f" at {loss['settled_at']}"
+    if loss["settled_by"] is not None:
+        cancelled += f" (settled by {loss['settled_by']})"
+    sentences.append(cancelled + ".")
+    return " ".join(sentences)
 
 
 def _object(value: object) -> dict[str, Any]:
@@ -416,6 +559,11 @@ def _object(value: object) -> dict[str, Any]:
 
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _count(text: str) -> int | None:
+    # Only ASCII digits: `int` refuses others that `isdigit` accepts, such as "²".
+    return int(text) if text.isascii() and text.isdigit() else None
 
 
 async def _retry_series(reader: TaskReader, task: dict[str, Any]) -> dict[str, Any] | None:
@@ -524,8 +672,24 @@ def _print_task(payload: dict[str, Any]) -> None:
         print("\nCancellation")
         print_table(
             ("field", "value"),
-            [{"field": key, "value": value} for key, value in cancellation.items() if value],
+            [
+                {"field": key, "value": value}
+                for key, value in cancellation.items()
+                if value and key != "worker_loss"
+            ],
         )
+        loss = cancellation["worker_loss"]
+        if loss is not None:
+            print("\nWorker loss")
+            print(terminal_safe(loss["summary"]))
+            print_table(
+                ("field", "value"),
+                [
+                    {"field": key, "value": value}
+                    for key, value in loss.items()
+                    if value is not None and key != "summary"
+                ],
+            )
     series = payload["retry_series"]
     if series is not None:
         print(

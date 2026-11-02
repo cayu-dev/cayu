@@ -241,6 +241,41 @@ reconciliation outcome such as `quiescent`), and every attempt of the task's ret
 found through its predecessor and successor links. Table output is the default;
 `--json` (and `--jsonl` for `list`) prints the same data with a `schema_version`.
 
+A task Cayu settled after its worker was lost also gets a `Worker loss` section
+(`cancellation.worker_loss` in JSON, `null` otherwise). It says in a sentence which worker
+was lost, when its lease expired, and when Cayu cancelled the task, then lists the details:
+
+```text
+Worker loss
+Worker worker-1 stopped renewing its lease, which expired at 2026-11-02T06:47:33.495892Z. Its session s-job-1 was interrupted (run epoch 3), so the lost run couldn't go on. Cayu cancelled the task at 2026-11-02T07:47:32.495892Z (settled by after-crash).
+field                value
+worker_id            worker-1
+lease_expired_at     2026-11-02T06:47:33.495892Z
+settled_at           2026-11-02T07:47:32.495892Z
+settled_by           after-crash
+settled_by_source    system
+evidence_kind        session_interrupted
+evidence_id          session-interrupted:7705138b-f301-4a02-a25d-f59166a22e9e:3
+validator_id         cayu.task-worker.expired-attached-owner
+validator_version    1
+session_instance_id  7705138b-f301-4a02-a25d-f59166a22e9e
+session_run_epoch    3
+```
+
+`settled_by` is who settled it: the worker that did, the check that vouched for it, or the
+person or service that reconciled it. `evidence_kind` says what made settling it safe:
+
+| `evidence_kind` | What happened |
+| --- | --- |
+| `lease_expired` | The worker was found gone once its lease expired, by a worker declared the only one (`--reconcile-abandoned-after-seconds`) or by `reconcile_abandoned_tasks`. |
+| `restart_limit_reached` | The same, for a restartable task that had used its restarts after a lost worker (`restart_limit`). |
+| `session_interrupted` | The task's agent session was interrupted, which fences the lost worker's run (`session_instance_id`, `session_run_epoch`). |
+| `task_ended` | A session wake whose task had already ended (`session_instance_id`, `session_run_epoch`). |
+| `handler_stopped` | The worker's lease expired before it settled the cancellation, and it saw its handler stop. |
+| `other` | Evidence the application recorded when it settled the task itself; see `evidence_id`. |
+
+`show` reads the same section from a local store, `--server-url` and `--application`.
+
 `wait` reads the task every `--poll-seconds` (default 5) until it ends, then prints it as
 `show` does, with `wait.task_id` (the task you named) and `wait.outcome` added to the JSON.
 It notes each status it sees on stderr. An attempt that failed with a retry scheduled is

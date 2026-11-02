@@ -357,9 +357,11 @@ await reconcile_abandoned_task_cancellation(
 ```
 
 The task becomes `cancelled` with that evidence recorded; create a new task if the
-work should run again. The store refuses while the original lease is live, but
-lease expiry does not prove that the handler stopped: a cancellation-fenced handler
-may still be draining after expiry. The application must independently establish
+work should run again. `cayu task show TASK_ID` presents the evidence of a task
+settled after its worker was lost, whichever way it was settled
+([Inspect tasks](project-workers.md#inspect-tasks)). The store refuses while the
+original lease is live, but lease expiry does not prove that the handler stopped: a
+cancellation-fenced handler may still be draining after expiry. The application must independently establish
 quiescence before calling this helper. This helper does not support session-attached
 tasks: their session fences the old worker's run instead. Once a session-attached
 task's lease expires, a task worker that recovers interrupted handoffs (the default,
