@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Literal, cast
@@ -11,6 +12,12 @@ from cayu.runners._adapter_identity import trusted_runner_adapter_name
 from cayu.runners._diagnostics import (
     trusted_runner_error_type_name,
     trusted_runner_exception_type_name,
+)
+
+# A leased cleanup operation must retain the workspace if a command is
+# interrupted. Stop only that command, never fall back to deleting its sandbox.
+preserve_sandbox_on_command_cleanup: ContextVar[bool] = ContextVar(
+    "preserve_sandbox_on_command_cleanup", default=False
 )
 
 DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS = 5.0
@@ -235,6 +242,11 @@ async def cleanup_runner_command_with_diagnostic(
     cleanup_policy = validate_runner_cleanup_policy(
         policy, "cleanup policy", allow_sandbox_fallback=True
     )
+    if preserve_sandbox_on_command_cleanup.get() and cleanup_policy in {
+        "sandbox",
+        "command_or_sandbox",
+    }:
+        cleanup_policy = "command"
     if cleanup_policy == "command_or_sandbox":
         command = await cleanup_runner_command_with_diagnostic(
             sandbox,

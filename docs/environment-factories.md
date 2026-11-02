@@ -1686,7 +1686,15 @@ run, discard is the usual choice. These rules keep it from racing the run:
   claim moves the record to the orphans and starts a fresh allocation, and a
   process that still holds the allocation lets go of it without copying back
   or disposing of anything. A release whose process dies stops blocking
-  others once its lease expires.
+  others once its lease expires. If renewal reports lost ownership, or the
+  last confirmed lease expires while renewal fails or stalls, the runtime
+  cancels the guarded cleanup and preserves its record for retry. An expired
+  holder cannot renew its old lease. During guarded cleanup, interrupted runner
+  commands stop only their own command; they cannot fall back to destroying
+  the sandbox and its unpublished work. Docker requires verified command-tree
+  termination before allowing runner reuse; otherwise it fences the runner.
+  This guard also covers recovery
+  reaping, which skips a lost lease and continues with the other allocations.
 - A discard goes through the same path as recovery's reaping: a
   reconnectable allocation is reconnected and discarded without copy-back,
   an interrupted recoverable creation goes through `reap_allocation` with its

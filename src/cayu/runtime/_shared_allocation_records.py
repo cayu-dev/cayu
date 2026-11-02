@@ -50,6 +50,7 @@ from cayu._validation import (
     copy_durable_json_object,
     copy_durable_metadata,
 )
+from cayu.runners._cleanup import preserve_sandbox_on_command_cleanup
 from cayu.runtime._environment_allocation import EnvironmentAllocationRecord
 
 if TYPE_CHECKING:
@@ -314,47 +315,100 @@ def _session_ids(payload: dict[str, Any], name: str) -> tuple[str, ...]:
 class DisposalHold:
     """The record a disposal lease holder holds, as its writes and renewals change it."""
 
-    def __init__(self, record: SharedAllocationRecord) -> None:
+    def __init__(self, record: SharedAllocationRecord, timeout: asyncio.Timeout) -> None:
         self.record = record
+        self._timeout = timeout
+        self._renewal_lock = asyncio.Lock()
+        self._finished = False
+
+    def expired(self) -> bool:
+        deadline = self._timeout.when()
+        assert deadline is not None
+        return self._timeout.expired() or asyncio.get_running_loop().time() >= deadline
+
+    def check_active(self) -> None:
+        if self.expired():
+            raise SharedAllocationClaimLost("The disposal lease was lost or expired.")
+
+    async def remove_record(self, records: SharedAllocationRecords) -> None:
+        # Renewal must not interpret our own committed deletion as lease loss
+        # while the store is still returning its successful removal response.
+        async with self._renewal_lock:
+            self.check_active()
+            await records.remove_reaped(self.record)
+            self._finished = True
 
 
 @contextlib.asynccontextmanager
 async def keeping_disposal_lease(
     records: SharedAllocationRecords, record: SharedAllocationRecord
 ) -> AsyncIterator[DisposalHold]:
-    """Renew the disposal lease on ``record`` in the background while the body runs."""
+    """Renew the lease, cancelling the guarded work if ownership is lost or expires."""
 
-    hold = DisposalHold(record)
+    loop = asyncio.get_running_loop()
+
+    def deadline(record: SharedAllocationRecord) -> float:
+        lease = record.release_lease
+        if lease is None:
+            raise SharedAllocationClaimLost("The disposal lease is missing.")
+        remaining = (
+            datetime.fromisoformat(lease["expires_at"]) - datetime.now(UTC)
+        ).total_seconds()
+        return loop.time() + remaining
+
+    expires_at = deadline(record)
+    if expires_at <= loop.time():
+        raise SharedAllocationClaimLost("The disposal lease has expired.")
+    lease_timeout = asyncio.timeout_at(expires_at)
+    hold = DisposalHold(record, lease_timeout)
 
     async def renew() -> None:
         while True:
             await asyncio.sleep(DISPOSAL_RENEW_SECONDS)
-            try:
-                renewed = await records.renew_release(
-                    hold.record, lease_seconds=DISPOSAL_LEASE_SECONDS
-                )
-            except Exception as error:
-                _LOGGER.warning(
-                    "Renewing the disposal lease of shared allocation %s failed (%s).",
-                    hold.record.allocation_session_id,
-                    type(error).__name__,
-                )
-                continue
-            if renewed is None:
-                _LOGGER.warning(
-                    "The disposal lease of shared allocation %s was lost.",
-                    hold.record.allocation_session_id,
-                )
-                return
-            hold.record = renewed
+            async with hold._renewal_lock:
+                if hold._finished:
+                    return
+                try:
+                    renewed = await records.renew_release(
+                        hold.record, lease_seconds=DISPOSAL_LEASE_SECONDS
+                    )
+                except Exception as error:
+                    _LOGGER.warning(
+                        "Renewing the disposal lease of shared allocation %s failed (%s).",
+                        hold.record.allocation_session_id,
+                        type(error).__name__,
+                    )
+                    # The deadline still cancels work if renewal fails or stalls.
+                    continue
+                if hold.expired():
+                    # A late response must never revive authority after expiry.
+                    return
+                if renewed is None:
+                    lease_timeout.reschedule(loop.time())
+                    return
+                hold.record = renewed
+                lease_timeout.reschedule(deadline(renewed))
 
-    renewal = asyncio.ensure_future(renew())
+    preservation = preserve_sandbox_on_command_cleanup.set(True)
     try:
-        yield hold
+        async with lease_timeout:
+            renewal = asyncio.ensure_future(renew())
+            try:
+                yield hold
+            finally:
+                renewal.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await renewal
+    except TimeoutError as error:
+        if not lease_timeout.expired():
+            raise
+        raise SharedAllocationClaimLost("The disposal lease was lost or expired.") from error
     finally:
-        renewal.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await renewal
+        preserve_sandbox_on_command_cleanup.reset(preservation)
+    if lease_timeout.expired():
+        # Even a binding that swallowed cancellation cannot report success or
+        # cause its caller to forget a still-owned allocation.
+        raise SharedAllocationClaimLost("The disposal lease was lost or expired.")
 
 
 def shared_allocation_record_id(scope: str, scope_id: str, environment_name: str) -> str:
@@ -850,6 +904,10 @@ class SharedAllocationRecords:
                     if not record.same_claim(current) or held is None:
                         continue
                     if held.get("token") != lease["token"]:
+                        continue
+                    if expires_at is not None and not current.release_leased(datetime.now(UTC)):
+                        # An expired holder cannot revive its lease, even if no
+                        # replacement has claimed the allocation yet.
                         continue
                     updated = replace(
                         current,

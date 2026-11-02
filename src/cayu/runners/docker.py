@@ -42,6 +42,7 @@ from cayu.runners._cleanup import (
     RunnerCleanupPolicy,
     RunnerCleanupResult,
     cleanup_runner_command_with_diagnostic,
+    preserve_sandbox_on_command_cleanup,
     runner_cleanup_observation_timeout,
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
@@ -4117,7 +4118,16 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
             # A durable receipt command has its own guest owner and no PID
             # file; its tree cannot be stopped at command level from here.
             policy = "sandbox"
-        handle.require_confirmed_tree = policy == "command_or_sandbox"
+        preserving_sandbox = preserve_sandbox_on_command_cleanup.get() and policy in {
+            "sandbox",
+            "command_or_sandbox",
+        }
+        handle.require_confirmed_tree = policy == "command_or_sandbox" or preserving_sandbox
+        if preserving_sandbox:
+            # Preserve strict termination evidence when replacing sandbox removal
+            # with command-only cleanup. Unverified stop acknowledgements cannot
+            # authorize runner reuse, even if the guest reports success.
+            policy = "command"
 
         async def cleanup_owned() -> RunnerCleanupResult:
             if policy == "none" and not await handle.has_started():

@@ -246,8 +246,7 @@ async def release_shared_allocation(
         message = await _release_held(
             registry, allocation_id, records, record_id, hold, factory, mode=mode
         )
-    fenced = hold.record
-    await records.remove_reaped(fenced)
+        await hold.remove_record(records)
     forced = force and run_state == "running"
     _LOGGER.warning(
         "Released shared allocation %s of workflow run %s by hand (%s%s).",
