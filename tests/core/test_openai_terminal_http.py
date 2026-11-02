@@ -205,10 +205,21 @@ def test_direct_parser_acknowledges_its_own_transport_without_runtime_scope():
     assert body.closed and body.tail_read
 
 
+# The semantic-idle deadline must outlast stream setup on a slow runner, so the terminal
+# arrives first, and fire before the transport and protocol idle deadlines, so the
+# failure is the post-terminal semantic idle the test reproduces.
+IDLE_REPRODUCTION_DEADLINES = ProviderStreamDeadlines(
+    semantic_progress_timeout_s=1,
+    transport_idle_timeout_s=5,
+    protocol_idle_timeout_s=5,
+    absolute_stream_timeout_s=10,
+)
+
+
 def test_without_acknowledgment_original_idle_failure_reproduces(monkeypatch):
     monkeypatch.setattr("cayu.providers.openai._accept_sse_terminal", lambda _: None)
     body = Body([frame(terminal())])
-    events, error = asyncio.run(consume(body))
+    events, error = asyncio.run(consume(body, deadlines=IDLE_REPRODUCTION_DEADLINES))
     assert sum(e.type is ModelStreamEventType.COMPLETED for e in events) == 1
     assert isinstance(error, ModelStreamDeadlineError)
     assert error.error_payload_fields()["provider_last_progress_kind"] == "terminal"
