@@ -7246,7 +7246,8 @@ class EnvironmentLifecycle:
                 finalization_delta=finalization_delta,
             )
             event = _copy_event_with_payload(event, terminal_payload)
-        if terminal_marker is not None and not publication_failures:
+        # Diagnostic publication cannot retain replay authority for settled effects.
+        if terminal_marker is not None:
             if setup_owner is not None:
                 # A lost clear acknowledgement must retry the clear, not finalize
                 # an already disposed binding a second time.
