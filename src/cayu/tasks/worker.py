@@ -1651,24 +1651,28 @@ async def _handle_with_heartbeat_owned(
         if retry_elapsed or retry_cancellation_requested:
             terminalization_label = "cancellation" if retry_cancellation_requested else "deadline"
             if retry_cancellation_requested and task.retry_series is None:
-                current = await task_store.load_task(task.id)
-                if current is None:
-                    raise RuntimeError(
-                        "Task cancellation lost its store-authoritative task after handler "
-                        "quiescence."
+                # The heartbeat may still be renewing (cancellation can win before dispatch,
+                # with no handler to stop it); a renewal between reading the claim and writing
+                # the cancellation would make the write's lease stale, so hold the lease.
+                async with lease_authority.lock:
+                    current = await task_store.load_task(task.id)
+                    if current is None:
+                        raise RuntimeError(
+                            "Task cancellation lost its store-authoritative task after handler "
+                            "quiescence."
+                        )
+                    request = _task_cancellation_terminalization_request(
+                        current,
+                        worker_id=worker_id,
                     )
-                request = _task_cancellation_terminalization_request(
-                    current,
-                    worker_id=worker_id,
-                )
-                if request is None:
-                    raise RuntimeError(
-                        "Task cancellation lost its durable request after handler quiescence."
+                    if request is None:
+                        raise RuntimeError(
+                            "Task cancellation lost its durable request after handler quiescence."
+                        )
+                    await _terminalize_claimed_task_or_detect_peer_winner(
+                        task_store,
+                        request,
                     )
-                await _terminalize_claimed_task_or_detect_peer_winner(
-                    task_store,
-                    request,
-                )
                 ownership_settled = True
                 if retry_elapsed_cancellation is not None:
                     raise retry_elapsed_cancellation
@@ -1685,13 +1689,14 @@ async def _handle_with_heartbeat_owned(
                         cancellation_baseline=cancellation_baseline,
                         owner_cancellation=retry_elapsed_cancellation,
                         report=retry_terminal_report,
+                        lease_authority=lease_authority,
                     )
                     if retry_cancellation_requested
                     else await _enforce_task_retry_deadline_resisting_cancellation(
                         task_store,
                         task,
                         worker_id,
-                        lease_expires_at=lease_authority.lease_expires_at,
+                        lease_authority=lease_authority,
                         cancellation_baseline=cancellation_baseline,
                         owner_cancellation=retry_elapsed_cancellation,
                         report=retry_terminal_report,
@@ -5207,22 +5212,27 @@ async def _enforce_task_retry_deadline_resisting_cancellation(
     task: Task,
     worker_id: str,
     *,
-    lease_expires_at: datetime,
+    lease_authority: _TaskLeaseAuthority,
     cancellation_baseline: int,
     owner_cancellation: asyncio.CancelledError | None,
     report: TaskRetryAttemptReport | None,
 ) -> tuple[TaskRetrySettlementResult | None, asyncio.CancelledError | None]:
     """Finish terminal ownership before redelivering caller cancellation."""
 
+    async def enforce() -> TaskRetrySettlementResult | None:
+        # Under the lease, at its current generation: the heartbeat may renew until now.
+        async with lease_authority.lock:
+            return await _enforce_task_retry_deadline_with_retry(
+                task_store,
+                task,
+                worker_id,
+                lease_expires_at=lease_authority.lease_expires_at,
+                token_count=0 if report is None else report.token_count,
+                estimated_cost=Decimal(0) if report is None else report.estimated_cost,
+            )
+
     return await _complete_task_retry_terminalization_resisting_cancellation(
-        _enforce_task_retry_deadline_with_retry(
-            task_store,
-            task,
-            worker_id,
-            lease_expires_at=lease_expires_at,
-            token_count=0 if report is None else report.token_count,
-            estimated_cost=Decimal(0) if report is None else report.estimated_cost,
-        ),
+        enforce(),
         label="deadline",
         cancellation_baseline=cancellation_baseline,
         owner_cancellation=owner_cancellation,
@@ -5289,10 +5299,21 @@ async def _settle_task_retry_cancellation_resisting_cancellation(
     cancellation_baseline: int,
     owner_cancellation: asyncio.CancelledError | None,
     report: TaskRetryAttemptReport | None,
+    lease_authority: _TaskLeaseAuthority | None = None,
 ) -> tuple[TaskRetrySettlementResult | None, asyncio.CancelledError | None]:
-    """Settle an operator cancellation without releasing its live owner early."""
+    """Settle an operator cancellation without releasing its live owner early.
+
+    With ``lease_authority`` (a heartbeat may still be renewing the lease), the attempt is
+    read and settled under its lock, so no renewal makes the settlement's lease stale.
+    """
 
     async def settle() -> TaskRetrySettlementResult:
+        if lease_authority is None:
+            return await attempt()
+        async with lease_authority.lock:
+            return await attempt()
+
+    async def attempt() -> TaskRetrySettlementResult:
         task = await task_store.load_task(task_id)
         if task is None:
             raise RuntimeError("Task retry cancellation lost its durable attempt.")
