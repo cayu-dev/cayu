@@ -1447,7 +1447,9 @@ def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup(tmp_pa
             limits=guest._Limits(
                 max_response_bytes=100,
                 max_content_bytes=100,
-                timeout_seconds=0.5,
+                # Room for a runner stall during CA setup to still leave the
+                # browser started, so cleanup runs after the deadline as intended.
+                timeout_seconds=1.0,
                 max_redirects=1,
                 max_requests=4,
                 max_dom_nodes=100,
@@ -1455,6 +1457,7 @@ def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup(tmp_pa
         )
         cleanup_calls: list[str] = []
         observed_budgets: list[tuple[float, float]] = []
+        cleanup_errors: list[BaseException] = []
         loop = asyncio.get_running_loop()
         ca_started_at: float | None = None
 
@@ -1520,7 +1523,9 @@ def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup(tmp_pa
                 ca_started_at + request.limits.timeout_seconds - loop.time(),
             )
             observed_budgets.append((cleanup_budget, remaining_budget))
-            return await original_cleanup(**kwargs)
+            errors = await original_cleanup(**kwargs)
+            cleanup_errors.extend(errors)
+            return errors
 
         async def delayed_ca_install(_home: Path, _ca_path: Path) -> None:
             nonlocal ca_started_at
@@ -1574,8 +1579,11 @@ def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup(tmp_pa
         # remains stable; the preceding dedicated-reserve test proves that a
         # blocked context does not prevent later owners from being attempted.
         assert cleanup_calls == ["context", "browser", "playwright"][: len(cleanup_calls)]
-        # With no stage started there is no cleanup error, only the timeout.
-        assert captured.value.code == ("cleanup_failed" if cleanup_calls else "timeout")
+        # Whether a stage ran before the deadline ran out depends on the runner,
+        # and a stage can fail without running (its share of the budget is
+        # already gone, or it is cancelled before its first step), so the
+        # outcome follows the errors cleanup actually returned, not the calls.
+        assert captured.value.code == ("cleanup_failed" if cleanup_errors else "timeout")
 
     asyncio.run(exercise())
 
