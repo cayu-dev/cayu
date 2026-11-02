@@ -503,6 +503,8 @@ def test_workos_login_refresh_and_logout_power_normal_cloud_commands(
         assert login["result"] == {
             "api_url": api_url,
             "authentication": "workos",
+            # Production's login selects no context.
+            "context": None,
             "organization_id": "org_test",
             "status": "signed_in",
             "user_id": "user_test",
@@ -566,7 +568,12 @@ def test_workos_login_refresh_and_logout_power_normal_cloud_commands(
 
         assert main(["cloud", "logout"]) == 0
         logout = json.loads(capsys.readouterr().out)
-        assert logout["result"] == {"signed_out": True, "status": "signed_out"}
+        assert logout["result"] == {
+            "api_url": cloud_cli._PRODUCTION_API_URL,
+            "login": str(auth_path),
+            "signed_out": True,
+            "status": "signed_out",
+        }
         assert not auth_path.exists()
     finally:
         server.shutdown()
@@ -1578,7 +1585,12 @@ def test_workos_logout_reclaims_rotated_credentials_after_cleanup_failure(
     assert main(["cloud", "logout"]) == 0
 
     logout = json.loads(capsys.readouterr().out)
-    assert logout["result"] == {"signed_out": True, "status": "signed_out"}
+    assert logout["result"] == {
+        "api_url": "https://cloud.cayu.dev",
+        "login": str(store.path),
+        "signed_out": True,
+        "status": "signed_out",
+    }
     assert not store.path.exists()
     assert _private_json_staging_paths(tmp_path) == []
 

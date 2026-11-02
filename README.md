@@ -251,8 +251,9 @@ cayu guide applications#planning --json
 ### Deploy with Cayu Cloud
 
 Cloud commands ship in the same `cayu` package; no additional CLI package is
-required. Cayu Cloud is currently invite-only. Login-backed commands are pinned to
-the production service at `https://cloud.cayu.dev`; users never select an API URL.
+required. Cayu Cloud is currently invite-only. `cayu cloud login` signs in to the
+production service at `https://cloud.cayu.dev`; `cayu cloud login --api-url URL` signs in
+to another Cayu Cloud install and selects a context for it.
 
 ```bash
 cayu cloud --help

@@ -435,7 +435,8 @@ def _named_files(args: argparse.Namespace, names: Sequence[str]) -> list[tuple[s
 def _cloud_files(args: argparse.Namespace) -> list[tuple[str, Path]]:
     """The files an `--application` command may sign in to Cayu Cloud with: the active
     selection, the context it selects (`--context`, `CAYU_CLOUD_CONTEXT` or the selection), the
-    API key file that context or `CAYU_CLOUD_API_KEY_FILE` names, and the saved login."""
+    API key file or install login that context or `CAYU_CLOUD_API_KEY_FILE` names, and the saved
+    login."""
 
     if getattr(args, "application", None) is None:
         return []
@@ -460,8 +461,14 @@ def _cloud_files(args: argparse.Namespace) -> list[tuple[str, Path]]:
         if context is not None:
             files.append(("the Cloud context", context))
             if _rereadable(context):
-                named = _context_file_path(context, str(_read_context(context)["api_key_file"]))
-                files.append(("the Cloud API key file", named))
+                selected = _read_context(context)
+                # A context signs in with an API-key file or with its install's own login.
+                key, label = (
+                    ("login_file", "the Cloud login")
+                    if "login_file" in selected
+                    else ("api_key_file", "the Cloud API key file")
+                )
+                files.append((label, _context_file_path(context, str(selected[key]))))
     except CloudCommandError:
         # No valid context is selected; signing in reports that.
         pass

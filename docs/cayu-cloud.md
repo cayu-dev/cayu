@@ -1,9 +1,10 @@
 # Cayu Cloud CLI
 
 The `cayu cloud` command group deploys and operates complete Cayu Agent applications.
-Cayu Cloud is currently invite-only. Login-backed commands are pinned to the production
-service at `https://cloud.cayu.dev`; users never select an API URL. Run the remaining
-commands from an Agent repository.
+Cayu Cloud is currently invite-only. `cayu cloud login` signs in to the production service
+at `https://cloud.cayu.dev`; `cayu cloud login --api-url URL` signs in to another Cayu Cloud
+install instead (see [Signing in to another install](#signing-in-to-another-install)). Run the
+remaining commands from an Agent repository.
 
 ```console
 cayu cloud login
@@ -31,9 +32,9 @@ cayu cloud service status --application my-agent
   for immutable releases, including [candidate releases](#candidate-releases) and
   [downloading a release's source](#downloading-a-releases-source);
 - `runtimes list|status` for retained runtime artifacts;
-- `service check|credentials|destroy|logs|pause|restart|resume|sleep|status|wake` for Agent
-  infrastructure and [its own post-deploy check](#operator-check), and `schedule run` to run a
-  schedule now;
+- `service check|credentials|destroy|logs|pause|redeploy|restart|resume|sleep|status|wake` for
+  Agent infrastructure, [publishing its Release again](#redeploying-an-agents-service) and
+  [its own post-deploy check](#operator-check), and `schedule run` to run a schedule now;
 - `env list|set|unset` for Agent-owned configuration, and `settings list|set|unset`
   for the Agent's [managed settings](#agent-settings);
 - `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
@@ -831,8 +832,9 @@ it with HTTP 401, for example when the local clock runs behind, Cayu refreshes t
 once and retries that call, so a long `deploy --wait` keeps polling. `cayu cloud logout`
 deletes that local login.
 
-Authentication selection is explicit: a successful `cayu cloud login` clears the
-persisted private-context selection, while `cayu cloud context use PATH` selects that
+Authentication selection is explicit: a successful `cayu cloud login` to production clears
+the persisted private-context selection (a login to [another install](#signing-in-to-another-install)
+selects that install's context instead), while `cayu cloud context use PATH` selects that
 context for later commands. Clearing the context falls back to the saved WorkOS login
 and the fixed production endpoint. A saved login for any other endpoint is rejected;
 run `cayu cloud login` again to sign in to production.
@@ -844,6 +846,46 @@ operational handoffs, and automation:
 cayu cloud context use /private/path/cloud-context.json
 CAYU_CLOUD_API_KEY_FILE=/private/path/key cayu cloud doctor
 ```
+
+## Signing in to another install
+
+A staging or dedicated Cayu Cloud install has its own WorkOS sign-in. Sign in to it as yourself
+with its address, the one its portal opens at:
+
+```console
+cayu cloud login --api-url https://cloud.example.com --no-browser
+```
+
+The login reads that install's own WorkOS client from its `GET /v1/portal-config` and runs the
+same device sign-in. It keeps the install's login apart from the production one, in a directory
+of its own beside the context selection (`~/.config/cayu-cloud/installs/<host>-<digest>/`
+by default, under `CAYU_CLOUD_CONFIG`'s directory when that is set). There it writes the
+install's context, `context.json`, which names the install's `api_url` and its `login_file`
+instead of an `api_key_file`, and selects it, so later commands act on that install;
+`result.context` names it. Select it again later with `cayu cloud context use PATH`, and go
+back to production with `cayu cloud context clear` or `cayu cloud login`. A login is used only
+for the Cloud it was made for: if the context's `api_url` and its login's differ, commands exit
+`2` with `login_api_mismatch`, and a refreshed login whose Cloud, WorkOS client, Organization
+or user changed is never sent. `--api-url` and an explicit `--context` or `CAYU_CLOUD_CONTEXT`
+for another Cloud are refused together. The URL is compared in one spelling (lowercase scheme
+and host, the host in IDNA, no default port or trailing slash), so `https://Cloud.cayu.dev:443/`
+is production. The directories Cayu creates for it are private to the user (mode `0700`).
+
+`cayu cloud logout` and `organizations use` act on the login of the selected install context,
+and `context show` reports its `authentication` as `workos`. `logout` reports the `api_url` and
+the `login` file it removed. It always removes an install's own `installs/<install>/auth.json`,
+even a corrupt one, and any other `login_file` a context names only when it holds a login for
+that install. If the persisted selection can't be read, for example because its file was
+deleted, both act on the production login and say so in `warnings`, naming the unreadable file
+and any install login it leaves behind. A context named with `--context` or
+`CAYU_CLOUD_CONTEXT` that can't be read is an error, and nothing is removed.
+
+When an install refuses CLI sign-in, the error says where. An address that doesn't serve the
+sign-in settings, such as an install's bare API host, exits `2` with
+`portal_config_unavailable` and the HTTP status. When WorkOS refuses to start the device sign-in,
+the error is `device_authorization_refused` with WorkOS's HTTP status and error code: check that
+the install's WorkOS environment allows device authorization (CLI sign-in) for the client named
+in the message.
 
 ## Organizations
 
@@ -864,6 +906,8 @@ one you aren't in, is refused with `organization_unavailable` and the login stay
 chose; nothing is saved until the switch succeeds, so a refused Organization leaves the previous
 login and context in use. Every later command acts in the chosen Organization; `cayu cloud whoami` shows it. An
 Organization API key belongs to one Organization, so these commands need `cayu cloud login`.
+With an install's context selected (`login --api-url`), they switch that install's login, and
+its context stays selected.
 
 ## Cloud rollouts
 
@@ -1212,6 +1256,32 @@ publication creates them. A Cayu Cloud that predates per-Agent credentials exits
 category `operator_credentials_unsupported`. To use a different login, set the same names
 with `cayu cloud env set` (the password as a `--secret`); Agent values win over Cloud's.
 The older environment-wide `AUTH_USER`/`AUTH_PASS` pair Cloud also injects is deprecated.
+
+## Redeploying an Agent's service
+
+A service keeps the bindings it was published with: the variables and credentials Cloud gave
+its processes then. When the install changes what it binds, for example when it turns on its
+Gateway after the Agent was deployed, `service status` shows the issue `gateway_key_unbound`
+("The Agent runs without this install's Gateway"). `service restart` replays the old bindings,
+and a `deploy` of unchanged source reuses the Release without publishing it again. Publish the
+selected Release again instead:
+
+```console
+cayu cloud service redeploy --application my-agent
+```
+
+`service redeploy` asks Cloud for a forced publication of the Agent's selected Release
+(`PUT /v1/applications/<agent>/service?force=true`), as the portal's **Redeploy service**
+does. Cloud queues it and its deployment worker publishes it shortly after, with the bindings
+it gives Agents now, so the command returns at once: `status` is `queued`, `result` is Cloud's
+answer (the service as `deploying`), and `commands.status` is the `service status` command to
+watch the service until it runs again, with the issue gone. Cloud replaces the service's
+processes as it does for a deploy.
+
+An Agent with no selected Release exits `2` with `no_selected_release`, one deleted meanwhile
+with `application_not_found`, and Cloud's other refusals (such as for an archived Agent) are
+reported as for any request. A Release that runs no web process, worker or schedule gets a
+warning that nothing will run.
 
 ## Reading an Agent's state from the CLI
 

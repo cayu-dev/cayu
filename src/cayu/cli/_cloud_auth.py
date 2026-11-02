@@ -10,6 +10,7 @@ import hmac
 import json
 import math
 import os
+import re
 import sys
 import time
 from collections.abc import Coroutine, Iterator
@@ -40,6 +41,8 @@ _REFRESH_HTTP_ATTEMPT_TIMEOUT_SECONDS = 5.0
 _AUTH_LOCK_DIRECTORY = "cayu-cloud-auth-locks-v1"
 _AUTH_TEXT_MAX_BYTES = 32_768
 _AUTH_REFRESH_STAGING_PREFIX = ".cayu-cloud-auth-refresh-"
+_WORKOS_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_WORKOS_CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 class CloudAuthError(RuntimeError):
@@ -320,7 +323,20 @@ class WorkOSDeviceAuthClient:
         self.timeout_seconds = timeout_seconds
 
     def portal_config(self) -> tuple[str, str]:
-        payload = self._request_json("GET", f"{self.api_url}/v1/portal-config")
+        response = self._request("GET", f"{self.api_url}/v1/portal-config")
+        if not 200 <= response.status_code < 300:
+            # The portal serves its sign-in settings; an install's bare API host doesn't.
+            hint = (
+                " Use the install's Cayu Cloud address (where its portal opens), not its API host."
+                if response.status_code == 404
+                else ""
+            )
+            raise CloudAuthError(
+                "portal_config_unavailable",
+                f"{self.api_url} didn't give its sign-in settings: GET /v1/portal-config "
+                f"answered HTTP {response.status_code}.{hint}",
+            )
+        payload = _json_object(response)
         if payload.get("authentication") != "workos":
             raise CloudAuthError(
                 "workos_unavailable",
@@ -337,11 +353,23 @@ class WorkOSDeviceAuthClient:
         client_id: str,
         api_hostname: str,
     ) -> DeviceAuthorization:
-        payload = self._request_json(
+        response = self._request(
             "POST",
             f"{_workos_base_url(api_hostname)}/user_management/authorize/device",
             form={"client_id": client_id},
         )
+        if not 200 <= response.status_code < 300:
+            code = _workos_error_code(response)
+            reason = "" if code is None else f", error `{code}`"
+            # The client ID comes from the install's portal config; only a plain one is shown.
+            client = f" {client_id}" if _WORKOS_CLIENT_ID.fullmatch(client_id) is not None else ""
+            raise CloudAuthError(
+                "device_authorization_refused",
+                f"WorkOS refused CLI sign-in to {self.api_url} (HTTP {response.status_code}"
+                f"{reason}). Check that the install's WorkOS environment allows device "
+                f"authorization (CLI sign-in) for its client{client}.",
+            )
+        payload = _json_object(response)
         expires_in = _required_positive_number(payload, "expires_in")
         interval = _required_positive_number(payload, "interval")
         return DeviceAuthorization(
@@ -492,21 +520,6 @@ class WorkOSDeviceAuthClient:
                 "The Cayu Cloud login identity changed; run `cayu cloud login` again.",
             )
         return refreshed
-
-    def _request_json(
-        self,
-        method: str,
-        url: str,
-        *,
-        form: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        response = self._request(method, url, form=form)
-        if not 200 <= response.status_code < 300:
-            raise CloudAuthError(
-                "login_failed",
-                "Cayu Cloud authentication service rejected the request.",
-            )
-        return _json_object(response)
 
     def _request(
         self,
@@ -699,15 +712,32 @@ def _transient_refresh_fallback(
     )
 
 
-def _workos_error(response: httpx.Response) -> str | None:
+def _workos_payload(response: httpx.Response) -> dict[str, Any] | None:
+    """WorkOS's JSON object answer, or None when it isn't one."""
+
     try:
         payload = response.json()
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return None
-    if not isinstance(payload, dict):
-        return None
-    error = payload.get("error")
+    return payload if isinstance(payload, dict) else None
+
+
+def _workos_error(response: httpx.Response) -> str | None:
+    payload = _workos_payload(response)
+    error = None if payload is None else payload.get("error")
     return error if isinstance(error, str) else None
+
+
+def _workos_error_code(response: httpx.Response) -> str | None:
+    """WorkOS's error code for a refusal (OAuth's `error`, or its API's `code`), when it is a
+    plain identifier; its free-text description is never repeated."""
+
+    payload = _workos_payload(response) or {}
+    for key in ("error", "code"):
+        value = payload.get(key)
+        if isinstance(value, str) and _WORKOS_ERROR_CODE.fullmatch(value):
+            return value
+    return None
 
 
 def _same_cloud_auth_credentials(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -17,12 +18,13 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Never
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from cayu.cli._cloud_api import (
     CANDIDATE_REFUSAL_CODES,
     CloudApiClient,
     CloudApiError,
+    _is_loopback,
     archived_agent_error,
 )
 from cayu.cli._cloud_api_keys import add_api_keys_parser, api_keys_command
@@ -31,6 +33,7 @@ from cayu.cli._cloud_auth import (
     CloudAuthError,
     CloudAuthStore,
     WorkOSDeviceAuthClient,
+    _canonical_http_url,
     fresh_cloud_credentials,
     switch_cloud_organization,
 )
@@ -110,6 +113,10 @@ _SERVICE_POLL_TRANSIENT_LIMIT = 5
 _TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 _CLOUD_DEPLOYMENT_ID = re.compile(r"dep_[a-z0-9]{1,64}")
 _PRODUCTION_API_URL = "https://cloud.cayu.dev"
+# `login --api-url` keeps each other install's context and login in a directory of its own.
+_INSTALLS_DIRECTORY = "installs"
+_INSTALL_CONTEXT_FILE = "context.json"
+_INSTALL_LOGIN_FILE = "auth.json"
 # Cloud's bounds on the breaking Cayu storage revisions one Release acknowledges.
 _MAX_STORAGE_REVISION = 1_000_000
 _MAX_STORAGE_ACKNOWLEDGEMENTS = 32
@@ -879,6 +886,15 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         help="Print the verification URL and code without opening a browser.",
     )
     login.add_argument(
+        "--api-url",
+        type=_install_api_url,
+        metavar="URL",
+        help=(
+            "Sign in to the Cayu Cloud install at URL (where its portal opens) instead of "
+            "production, and select a context for it."
+        ),
+    )
+    login.add_argument(
         "--organization",
         metavar="ORG_ID",
         help=(
@@ -1235,7 +1251,18 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "Scale the Agent worker to zero and stop its schedules starting runs; the web "
             "process keeps serving. Deploys and restarts keep the Agent paused until resume."
         ),
-        "restart": "Restart the Agent service on its selected immutable release.",
+        "redeploy": (
+            "Publish the Agent's selected Release to its service again, with the bindings Cayu "
+            "Cloud gives Agents now (for example its Gateway once the install turns it on). "
+            "Cayu Cloud queues the publication and this returns at once; `service status` "
+            "shows when the service runs. `restart` keeps the bindings the service was "
+            "published with, and `deploy` of unchanged source reuses the Release without "
+            "publishing it again."
+        ),
+        "restart": (
+            "Restart the Agent service on its selected immutable release, with the bindings it "
+            "was published with; `redeploy` publishes it again with current ones."
+        ),
         "resume": "Start the paused Agent worker again and let its schedules run.",
         "sleep": "Scale only the Agent web service to zero.",
         "status": "Show the Agent web, worker, schedule, and endpoint state.",
@@ -2053,13 +2080,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
     if arguments.command == "organizations" and arguments.organization_command == "use":
         return _use_organization(arguments, arguments.organization_id)
     if arguments.command == "logout":
-        return {
-            "operation": "logout",
-            "result": {
-                "signed_out": CloudAuthStore().delete(),
-                "status": "signed_out",
-            },
-        }
+        return _logout(arguments)
     recorder = EvidenceRecorder(_evidence_directory(arguments))
     if arguments.command == "context":
         if arguments.context_command == "use":
@@ -2199,6 +2220,10 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
 
 def _login(arguments: argparse.Namespace) -> dict[str, Any]:
     api_url = _login_api_url(arguments)
+    # Production keeps the one default login; every other install has a login of its own,
+    # so a login never answers for an install it wasn't made for.
+    install = None if api_url == _PRODUCTION_API_URL else _install_directory(api_url)
+    store = CloudAuthStore() if install is None else CloudAuthStore(install / _INSTALL_LOGIN_FILE)
     auth = WorkOSDeviceAuthClient(
         api_url=api_url,
         timeout_seconds=arguments.timeout_seconds,
@@ -2231,13 +2256,31 @@ def _login(arguments: argparse.Namespace) -> dict[str, Any]:
             )
         _confirm_login_identity(arguments, switched)
         credentials = switched
-    CloudAuthStore().save(credentials)
-    _clear_active_context()
+    if install is not None:
+        _create_install_directory(install)
+    store.save(credentials)
+    if install is None:
+        _clear_active_context()
+        context_path = None
+    else:
+        # The install's context names its own login, and is selected like any other context.
+        context_path = install / _INSTALL_CONTEXT_FILE
+        _write_private_json(
+            context_path,
+            {
+                "api_url": api_url,
+                "login_file": _INSTALL_LOGIN_FILE,
+                "schema_version": 1,
+                "status": "ready",
+            },
+        )
+        _activate_context(context_path)
     return {
         "operation": "login",
         "result": {
             "api_url": api_url,
             "authentication": "workos",
+            "context": None if context_path is None else str(context_path),
             "organization_id": credentials.organization_id,
             "status": "signed_in",
             "user_id": credentials.user_id,
@@ -2292,8 +2335,10 @@ def _organizations(client: CloudApiClient) -> dict[str, Any]:
 def _use_organization(arguments: argparse.Namespace, organization_id: str) -> dict[str, Any]:
     """Switch the saved login to ``organization_id`` and confirm Cloud sees it there."""
 
+    store, api_url, warning, _ = _selected_login(arguments.context)
+    _require_login_for(store.load(), api_url=api_url)
     credentials = switch_cloud_organization(
-        CloudAuthStore(), organization_id, timeout_seconds=arguments.timeout_seconds
+        store, organization_id, timeout_seconds=arguments.timeout_seconds
     )
     identity = CloudApiClient(
         api_url=credentials.api_url,
@@ -2304,9 +2349,11 @@ def _use_organization(arguments: argparse.Namespace, organization_id: str) -> di
         raise CloudAuthError(
             "login_failed", "Cayu Cloud didn't accept the login in that Organization."
         )
-    # A selected context's key would otherwise keep acting in the earlier Organization.
-    _clear_active_context()
-    return {
+    if api_url == _PRODUCTION_API_URL:
+        # A selected context's key would otherwise keep acting in the earlier Organization.
+        # An install's own login context already acts with the switched login.
+        _clear_active_context()
+    result: dict[str, Any] = {
         "operation": "organizations.use",
         "result": {
             "api_url": credentials.api_url,
@@ -2316,19 +2363,254 @@ def _use_organization(arguments: argparse.Namespace, organization_id: str) -> di
             "user_id": credentials.user_id,
         },
     }
+    if warning is not None:
+        result["warnings"] = [warning]
+    return result
 
 
 def _login_api_url(arguments: argparse.Namespace) -> str:
     context_path = _selected_context_path(arguments.context)
+    context_url = None
     if context_path is not None and _context_source(arguments.context) != "persisted":
-        return str(_read_context(context_path)["api_url"]).rstrip("/")
-    return _PRODUCTION_API_URL
+        context_url = _context_api_url(_read_context(context_path))
+    if arguments.api_url is None:
+        return context_url or _PRODUCTION_API_URL
+    if context_url is not None and context_url != arguments.api_url:
+        raise CloudCommandError(
+            "invalid_input",
+            "--api-url names another Cayu Cloud than the selected context; give one of them.",
+        )
+    return arguments.api_url
+
+
+def _context_api_url(context: dict[str, Any]) -> str:
+    """A context's `api_url` in its one spelling (`_normalized_api_url`)."""
+
+    try:
+        return _normalized_api_url(str(context["api_url"]))
+    except ValueError:
+        raise CloudCommandError(
+            "context_invalid",
+            "The selected context's api_url isn't an https:// URL (http:// only on loopback) "
+            "without credentials, query or fragment.",
+        ) from None
+
+
+def _install_api_url(value: str) -> str:
+    """`login --api-url`: ``value`` in its one spelling (`_normalized_api_url`), which a saved
+    login also accepts, so the URL is refused before the browser sign-in rather than after."""
+
+    try:
+        api_url = _normalized_api_url(value)
+        _canonical_http_url(api_url, "API URL")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "must be an https:// URL (http:// only on loopback) without credentials, query or "
+            "fragment"
+        ) from exc
+    return api_url
+
+
+def _normalized_api_url(value: str) -> str:
+    """``value`` as one spelling per Cloud: lowercase scheme and host, the host in IDNA, no
+    default port and no trailing slash, so a differently written production URL is production
+    and one install never gets two logins. Plain http is accepted only on loopback, by the same
+    rule as the API client. An invalid URL raises ValueError."""
+
+    parsed = urlsplit(value.strip())
+    scheme = parsed.scheme.lower()
+    if (
+        scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Cayu Cloud API URL is invalid.")
+    if scheme == "http" and not _is_loopback(parsed.hostname):
+        raise ValueError("Cayu Cloud API URL must use HTTPS outside loopback.")
+    try:
+        host = (parsed.hostname or "").encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("Cayu Cloud API URL host is invalid.") from exc
+    port = parsed.port
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None and port != {"https": 443, "http": 80}[scheme]:
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}{parsed.path}".rstrip("/")
+
+
+def _install_directory(api_url: str) -> Path:
+    """Where `login --api-url` keeps that install's context and login, beside the selection.
+
+    The host names it for people; the digest of the whole URL keeps two installs apart.
+    """
+
+    digest = hashlib.sha256(api_url.encode("utf-8")).hexdigest()[:12]
+    name = f"{_slug(urlsplit(api_url).netloc)}-{digest}"
+    return _active_config_path().parent / _INSTALLS_DIRECTORY / name
+
+
+def _create_install_directory(directory: Path) -> None:
+    """Create an install's directory, and the config and `installs` directories it is in, each
+    private to the user (`mkdir(parents=True, mode=...)` applies the mode only to the last)."""
+
+    installs = directory.parent
+    installs.parent.parent.mkdir(parents=True, exist_ok=True)
+    for level in (installs.parent, installs, directory):
+        level.mkdir(mode=0o700, exist_ok=True)
+
+
+def _context_login(context_path: Path, context: dict[str, Any]) -> CloudAuthStore | None:
+    """The saved login a context signs in with (`login --api-url`), or None for an API key."""
+
+    if "login_file" not in context:
+        return None
+    return CloudAuthStore(_context_file_path(context_path, str(context["login_file"])))
+
+
+def _require_context_credential(context_path: Path, context: dict[str, Any]) -> str:
+    """Check that the context's API key or login is there; its kind of authentication."""
+
+    store = _context_login(context_path, context)
+    if store is None:
+        _read_api_key_file(_context_file_path(context_path, str(context["api_key_file"])))
+        return "file"
+    _require_login_for(store.load(), api_url=_context_api_url(context))
+    return "workos"
+
+
+def _require_login_for(
+    credentials: CloudAuthCredentials | None, *, api_url: str
+) -> CloudAuthCredentials:
+    """The saved login, made for the Cloud at ``api_url``; never one made for another."""
+
+    login = _login_command(api_url)
+    if credentials is None:
+        raise CloudAuthError("login_required", f"Sign in first with `{login}`.")
+    if credentials.api_url != api_url:
+        raise CloudAuthError(
+            "login_api_mismatch",
+            f"The saved login belongs to another Cayu Cloud; run `{login}`"
+            + (" to sign in to production." if api_url == _PRODUCTION_API_URL else "."),
+        )
+    return credentials
+
+
+def _login_command(api_url: str) -> str:
+    """The command that signs in to the Cloud at ``api_url``."""
+
+    if api_url == _PRODUCTION_API_URL:
+        return "cayu cloud login"
+    return shlex.join(["cayu", "cloud", "login", "--api-url", api_url])
+
+
+def _selected_login(
+    explicit: Path | None,
+) -> tuple[CloudAuthStore, str, str | None, Path | None]:
+    """The login `logout` and `organizations use` change, its Cloud, a warning, and the context
+    it came from: the selected context's own login, or the default production login.
+
+    A context named with `--context` or `CAYU_CLOUD_CONTEXT` must be readable. A persisted
+    selection that can't be read any more (its file was deleted, say) would otherwise keep
+    every login from being signed out, so it falls back to the production login and says so.
+    """
+
+    try:
+        context_path = _selected_context_path(explicit)
+        context = None if context_path is None else _read_context(context_path)
+    except CloudCommandError:
+        if _context_source(explicit) != "persisted":
+            raise
+        return CloudAuthStore(), _PRODUCTION_API_URL, _unreadable_selection_warning(), None
+    if context_path is not None and context is not None:
+        store = _context_login(context_path, context)
+        if store is not None:
+            return store, _context_api_url(context), None, context_path
+    return CloudAuthStore(), _PRODUCTION_API_URL, None, None
+
+
+def _unreadable_selection_warning() -> str:
+    """Name the persisted selection that can't be read, and an install login it leaves."""
+
+    try:
+        selected = _persisted_context_path()
+    except CloudCommandError:
+        selected = None
+    named = _active_config_path() if selected is None else selected
+    warning = (
+        f"The selected Cayu Cloud context {named} can't be read, so this acted on the "
+        "production login; clear the selection with `cayu cloud context clear`."
+    )
+    if selected is not None:
+        login = selected.parent / _INSTALL_LOGIN_FILE
+        if _is_install_login(login) and login.exists():
+            warning += f" That install's login is still at {login}; delete it to sign out there."
+    return warning
+
+
+def _is_install_login(path: Path) -> bool:
+    """Whether ``path`` is the `auth.json` of an install `login --api-url` keeps."""
+
+    installs = _active_config_path().parent / _INSTALLS_DIRECTORY
+    resolved = path.expanduser().resolve()
+    return resolved.name == _INSTALL_LOGIN_FILE and resolved.parent.parent == installs.resolve()
+
+
+def _own_install_login(login: Path, context: Path | None) -> bool:
+    """Whether ``login`` is an install's `auth.json`, selected through its own `context.json`."""
+
+    return (
+        context is not None
+        and _is_install_login(login)
+        and context.expanduser().resolve()
+        == login.expanduser().resolve().parent / _INSTALL_CONTEXT_FILE
+    )
+
+
+def _logout(arguments: argparse.Namespace) -> dict[str, Any]:
+    """Delete the login in use: the selected install context's own login, or production's.
+
+    An install's own `installs/<install>/auth.json`, selected through that install's own
+    `context.json` beside it, is always deleted, even when it is corrupt. Any other `login_file`
+    a context names is deleted only when it holds a saved login for that install, so a context
+    that names some other file, another install's login included, never removes it.
+    """
+
+    store, api_url, warning, context_path = _selected_login(arguments.context)
+    if context_path is not None and not _own_install_login(store.path, context_path):
+        try:
+            credentials = store.load()
+        except CloudAuthError:
+            raise CloudAuthError(
+                "cloud_auth_unavailable",
+                "The context's login file isn't a Cayu Cloud login; it was kept.",
+            ) from None
+        if credentials is not None and credentials.api_url != api_url:
+            raise CloudAuthError(
+                "login_api_mismatch",
+                "The context's login file holds a login for another Cayu Cloud; it was kept.",
+            )
+    result: dict[str, Any] = {
+        "operation": "logout",
+        "result": {
+            "api_url": api_url,
+            "login": str(store.path),
+            "signed_out": store.delete(),
+            "status": "signed_out",
+        },
+    }
+    if warning is not None:
+        result["warnings"] = [warning]
+    return result
 
 
 def _activate_context(context_path: Path) -> dict[str, Any]:
     selected = context_path.expanduser().resolve()
     context = _read_context(selected)
-    _read_api_key_file(_context_file_path(selected, str(context["api_key_file"])))
+    _require_context_credential(selected, context)
     _write_private_json(
         _active_config_path(),
         {"active_context": str(selected), "schema_version": 1},
@@ -2343,10 +2625,10 @@ def _activate_context(context_path: Path) -> dict[str, Any]:
 
 def _context_summary(explicit: Path | None) -> dict[str, Any]:
     selected, context = _selected_context(explicit)
-    _read_api_key_file(_context_file_path(selected, str(context["api_key_file"])))
+    authentication = _require_context_credential(selected, context)
     return {
         "api_url": context["api_url"],
-        "authentication": "file",
+        "authentication": authentication,
         "context": str(selected),
         "deployment_id": context.get("deployment_id"),
         "region": context.get("region"),
@@ -3883,6 +4165,8 @@ def _service(
             return {"operation": "service.status", "result": result, "warnings": warnings}
     elif action in {"restart", "sleep", "wake"}:
         result = change("POST", f"{path}/{action}")
+    elif action == "redeploy":
+        return _redeploy(arguments, client=client, application_id=application_id)
     elif action in {"pause", "resume"}:
         result = _unsupported_when_missing(
             lambda: change("POST", f"{path}/{action}"),
@@ -3919,6 +4203,76 @@ def _service(
                 result = client.request("GET", path)
                 result_status = _service_status(result)
     return {"operation": f"service.{action}", "result": result}
+
+
+def _redeploy(
+    arguments: argparse.Namespace, *, client: CloudApiClient, application_id: str
+) -> dict[str, Any]:
+    """Queue a new publication of the Agent's selected Release (`PUT /service?force=true`).
+
+    Cloud answers at once with the service as `deploying`; its deployment worker publishes
+    the Release later, with the bindings Cloud gives Agents now, as a deploy does. Cloud
+    reports nothing that marks one publication done, so this returns Cloud's answer and
+    names `service status` to follow it, as the portal's Redeploy service does.
+    """
+
+    path = f"/v1/applications/{application_id}/service"
+    try:
+        queued = client.request("PUT", path, query={"force": "true"})
+    except CloudApiError as exc:
+        if exc.status_code != 404 or exc.code is not None:
+            raise
+        # Cloud answers 404 both for an Agent without a selected Release and for one that
+        # is gone; the Agent's own read tells them apart.
+        if _read_or_none(client, f"/v1/applications/{application_id}") is None:
+            raise CloudCommandError(
+                "application_not_found", "Cayu Cloud no longer has this Agent."
+            ) from None
+        raise CloudCommandError(
+            "no_selected_release",
+            "The Agent has no selected Release to publish; deploy one with `cayu cloud deploy`.",
+        ) from None
+    deployment_id = queued.get("deployment_id")
+    release_id = _cloud_deployment_id(deployment_id) if isinstance(deployment_id, str) else None
+    status_command = shlex.join(
+        [
+            "cayu",
+            "cloud",
+            *_cloud_recovery_arguments(arguments),
+            "service",
+            "status",
+            "--application",
+            application_id,
+        ]
+    )
+    release_name = "the selected Release" if release_id is None else f"Release {release_id}"
+    message = (
+        f"Cayu Cloud queued a new publication of {release_name} to the Agent's service; its "
+        f"deployment worker publishes it shortly. Run `{status_command}` to see the service "
+        "running."
+    )
+    print(f"cayu cloud: {message}", file=sys.stderr)
+    result: dict[str, Any] = {
+        "commands": {"status": status_command},
+        "message": message,
+        "operation": "service.redeploy",
+        "result": queued,
+        "status": "queued",
+    }
+    release = None
+    if release_id is not None:
+        # Cloud already took the request; the warning below is only a courtesy, so no refusal
+        # of this read changes the outcome.
+        with contextlib.suppress(CloudApiError):
+            release = _read_or_none(
+                client, f"/v1/applications/{application_id}/deployments/{release_id}"
+            )
+    if release is not None and _release_runs_no_service(release):
+        result["warnings"] = [
+            "The selected Release runs no web process, worker or schedule, so nothing will "
+            "run; its publication only retires any service left running."
+        ]
+    return result
 
 
 def _unsupported_when_missing(
@@ -5082,14 +5436,21 @@ def _read_context(path: Path) -> dict[str, Any]:
         payload = json.loads(path.read_text())
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise CloudCommandError("context_invalid", "Could not read Cayu Cloud context.") from exc
+    # It signs in with an API-key file or with the saved login `login --api-url` made.
+    keys = (
+        [key for key in ("api_key_file", "login_file") if key in payload]
+        if isinstance(payload, dict)
+        else []
+    )
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != 1
         or payload.get("status") != "ready"
         or not isinstance(payload.get("api_url"), str)
         or not payload["api_url"]
-        or not isinstance(payload.get("api_key_file"), str)
-        or not payload["api_key_file"]
+        or len(keys) != 1
+        or not isinstance(payload[keys[0]], str)
+        or not payload[keys[0]]
     ):
         raise CloudCommandError("context_invalid", "Cayu Cloud context is invalid.")
     return payload
@@ -5124,6 +5485,12 @@ def _selected_context_path(explicit: Path | None) -> Path | None:
     configured = os.environ.get("CAYU_CLOUD_CONTEXT")
     if configured:
         return Path(configured).expanduser()
+    return _persisted_context_path()
+
+
+def _persisted_context_path() -> Path | None:
+    """The context `cayu cloud context use` selected, or None when none is selected."""
+
     config_path = _active_config_path()
     try:
         payload = json.loads(config_path.read_text())
@@ -5181,13 +5548,18 @@ def _configured_cloud_api_url(
         if context_path is None:
             return None
         selected_context = context if context is not None else _read_context(context_path)
-        return str(selected_context["api_url"]).rstrip("/")
+        return _context_api_url(selected_context)
 
     if context_path is not None and _context_source(arguments.context) != "persisted":
         return context_url()
     environment_url = os.environ.get("CAYU_CLOUD_API_URL")
     if environment_url:
-        return environment_url.rstrip("/")
+        # The same spelling as a context's, so only another Cloud is a mismatch.
+        try:
+            return _normalized_api_url(environment_url)
+        except ValueError as exc:
+            # The URL check's own reason, never the variable's value.
+            raise CloudCommandError("invalid_input", str(exc)) from None
     return context_url()
 
 
@@ -5259,13 +5631,17 @@ def _cloud_client(
             timeout_seconds=arguments.timeout_seconds,
         )
     if context_is_selected and key_file_value is None:
-        context_api_url = str(context["api_url"]).rstrip("/")
+        context_api_url = _context_api_url(context)
         if configured_api_url != context_api_url:
             raise CloudAuthError(
                 "context_api_mismatch",
                 "CAYU_CLOUD_API_URL differs from the persisted context; provide "
                 "an explicit API key for that Cayu Cloud or select a matching context.",
             )
+        assert context_path is not None
+        install_login = _context_login(context_path, context)
+        if install_login is not None:
+            return _login_client(arguments, install_login, api_url=context_api_url)
     if key_file_value is not None or context_is_selected:
         api_url = configured_api_url or _PRODUCTION_API_URL
         selected_key_file = key_file_value or context.get("api_key_file")
@@ -5288,61 +5664,66 @@ def _cloud_client(
         )
 
     auth_store = CloudAuthStore()
-    credentials = auth_store.load()
-    if credentials is not None:
-        api_url = _PRODUCTION_API_URL
-        if api_url != credentials.api_url:
-            raise CloudAuthError(
-                "login_api_mismatch",
-                "The saved login belongs to another Cayu Cloud; run "
-                "`cayu cloud login` to sign in to production.",
-            )
-        authority_fingerprint = _cloud_login_authority_fingerprint(credentials)
-
-        def require_same_login_authority(current: CloudAuthCredentials) -> None:
-            if _cloud_login_authority_fingerprint(current) != authority_fingerprint:
-                raise CloudAuthError(
-                    "login_authority_changed",
-                    "The Cayu Cloud login authority changed; run `cayu cloud login` again.",
-                )
-
-        def current_access_token(rejected: str | None = None) -> str:
-            current = fresh_cloud_credentials(
-                auth_store,
-                timeout_seconds=arguments.timeout_seconds,
-                rejected_access_token=rejected,
-            )
-            if current is None:
-                raise CloudAuthError(
-                    "cloud_auth_unavailable",
-                    "Could not read the local Cayu Cloud login.",
-                )
-            require_same_login_authority(current)
-            return current.access_token
-
-        credentials = fresh_cloud_credentials(
-            auth_store,
-            timeout_seconds=arguments.timeout_seconds,
-        )
-        if credentials is None:
-            raise CloudAuthError(
-                "cloud_auth_unavailable",
-                "Could not read the local Cayu Cloud login.",
-            )
-        require_same_login_authority(credentials)
-        return CloudApiClient(
-            api_url=api_url,
-            api_key=credentials.access_token,
-            timeout_seconds=arguments.timeout_seconds,
-            api_key_provider=current_access_token,
-            # A long deploy wait can outlive a token Cloud rejects before the local
-            # clock says it expires; refresh it once instead of failing the wait.
-            rejected_api_key_provider=current_access_token,
-        )
+    if auth_store.load() is not None:
+        return _login_client(arguments, auth_store, api_url=_PRODUCTION_API_URL)
 
     raise CloudAuthError(
         "login_required",
         "Sign in with `cayu cloud login`, select a private context, or provide an API key.",
+    )
+
+
+def _login_client(
+    arguments: argparse.Namespace, auth_store: CloudAuthStore, *, api_url: str
+) -> CloudApiClient:
+    """A client signed in with ``auth_store``'s login, which must be made for ``api_url``.
+
+    Its WorkOS authority (Cloud, WorkOS client, Organization and user) is fixed for the whole
+    command: a refreshed login made for anything else is refused before it is sent.
+    """
+
+    credentials = _require_login_for(auth_store.load(), api_url=api_url)
+    authority_fingerprint = _cloud_login_authority_fingerprint(credentials)
+
+    def require_same_login_authority(current: CloudAuthCredentials) -> None:
+        if _cloud_login_authority_fingerprint(current) != authority_fingerprint:
+            raise CloudAuthError(
+                "login_authority_changed",
+                f"The Cayu Cloud login authority changed; run `{_login_command(api_url)}` again.",
+            )
+
+    def current_access_token(rejected: str | None = None) -> str:
+        current = fresh_cloud_credentials(
+            auth_store,
+            timeout_seconds=arguments.timeout_seconds,
+            rejected_access_token=rejected,
+        )
+        if current is None:
+            raise CloudAuthError(
+                "cloud_auth_unavailable",
+                "Could not read the local Cayu Cloud login.",
+            )
+        require_same_login_authority(current)
+        return current.access_token
+
+    credentials = fresh_cloud_credentials(
+        auth_store,
+        timeout_seconds=arguments.timeout_seconds,
+    )
+    if credentials is None:
+        raise CloudAuthError(
+            "cloud_auth_unavailable",
+            "Could not read the local Cayu Cloud login.",
+        )
+    require_same_login_authority(credentials)
+    return CloudApiClient(
+        api_url=api_url,
+        api_key=credentials.access_token,
+        timeout_seconds=arguments.timeout_seconds,
+        api_key_provider=current_access_token,
+        # A long deploy wait can outlive a token Cloud rejects before the local
+        # clock says it expires; refresh it once instead of failing the wait.
+        rejected_api_key_provider=current_access_token,
     )
 
 
