@@ -5935,6 +5935,25 @@
           "title": "Parallel Safe",
           "type": "boolean"
         },
+        "policy_conditions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Policy Conditions"
+        },
+        "policy_conditions_complete": {
+          "default": false,
+          "title": "Policy Conditions Complete",
+          "type": "boolean"
+        },
         "source": {
           "$ref": "#/components/schemas/ToolSource"
         },
@@ -25263,6 +25282,59 @@
       "title": "SessionDebugState",
       "type": "string"
     },
+    "SessionDisplay": {
+      "additionalProperties": false,
+      "properties": {
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        }
+      },
+      "required": [
+        "session_id",
+        "run_id",
+        "title"
+      ],
+      "title": "SessionDisplay",
+      "type": "object"
+    },
+    "SessionDisplaysResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "title": "Generation",
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/components/schemas/SessionDisplay"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "generation",
+        "items"
+      ],
+      "title": "SessionDisplaysResponse",
+      "type": "object"
+    },
     "SessionExecutionProfiles": {
       "additionalProperties": false,
       "description": "Redacted profiles a later invocation of one session must match.\n\n``boundary`` is where Runtime meets this session next. ``continuation``\n(pending approval, user input, tool round, child wait, model-completion\nstage or provider-operation resolution, or an unreleased invocation) must\nmatch ``active_invocation.profile`` exactly. ``resume`` (the last invocation\nreleased with nothing pending) is compared with ``expected``. ``boundary``\nis ``None`` when the profile it needs is missing or the records conflict;\na conflict is reported in ``issues``. Both profiles contain only component\nclasses, strengths, fingerprints and typed authority.",
@@ -37116,6 +37188,44 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ListSessionsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/display": {
+      "get": {
+        "operation_id": "session_displays_api_sessions_display_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "ids",
+            "required": true,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Ids",
+              "type": "array"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionDisplaysResponse"
               }
             }
           },

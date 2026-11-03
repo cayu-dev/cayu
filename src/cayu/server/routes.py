@@ -7758,6 +7758,15 @@ def create_router(
         redact=cayu_app.redact_json,
         artifact_stores=lambda: _artifact_stores_by_id(cayu_app),
     )
+    from cayu.server._session_displays import register_session_displays
+
+    register_session_displays(
+        router,
+        app=cayu_app,
+        protected=protected,
+        resolve=cayu_app._resolve_public_session_id,
+        title=overview_service.project_title,
+    )
     register_session_overview_counts(
         router,
         service=overview_service,

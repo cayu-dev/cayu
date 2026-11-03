@@ -2295,6 +2295,17 @@ class SessionOverviewCountsResponse(ApiBaseModel):
     cost: SessionOverviewCost | None
 
 
+class SessionDisplay(ApiBaseModel):
+    session_id: str
+    run_id: str
+    title: str | None
+
+
+class SessionDisplaysResponse(ApiBaseModel):
+    generation: str
+    items: list[SessionDisplay]
+
+
 class ListSessionsResponse(ApiBaseModel):
     overviews: list[SessionOverviewResponse] | None = None
     sessions: list[ApiSessionBase]
@@ -2819,6 +2830,8 @@ class ApiToolDisplay(ApiBaseModel):
 
 
 class ApiToolSummary(ApiBaseModel):
+    policy_conditions: list[str] | None = None
+    policy_conditions_complete: StrictBool = False
     display: ApiToolDisplay | None = None
     source: ToolSource
     approval: ToolApproval

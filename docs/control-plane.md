@@ -1244,3 +1244,19 @@ cayu artifact list --application my-agent --artifact-store-id files --limit 25 -
 Use `--session`, `--agent`, `--environment` and `--scope` for owner filters. JSON
 retains exact store/file identities, nullable titles, unknown counts and continuation
 fields; table output shows titles and the next offset.
+
+Tool declarations on `GET /api/agents` optionally include `policy_conditions` and
+`policy_conditions_complete`. These are redacted explanations of maintained Runtime
+policy classes, not authorization results. Private allowlist values and deny patterns
+are never published; custom policies, rules and guards are explicitly incomplete.
+Provider controls, grants, mandatory controls, hooks, argument validation and execution
+admission still apply. The explanations are not added to Cloud registry uploads.
+
+`GET /api/sessions/display?ids=<public-session-id>` returns only validated, redacted
+Runtime-authored titles with public session IDs, stable run IDs and the session-store
+generation. Repeat `ids` for the requested sessions. It reads no prompt or transcript,
+uses the existing control-plane read authorization and returns `private, no-store`.
+Missing sessions are omitted; null titles mean no valid public title is available.
+A store without stable identity returns 501; an identity change during the read returns
+409. Consumers must match both generation and run identity before attaching a title
+to previously reported activity.

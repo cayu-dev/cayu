@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from cayu.runtime.manifest import describe_inventory_tools
+from cayu.server.tool_policy_details import policy_details
 from cayu.tool_inventory import (
     APPROVALS,
     EFFECTS,
@@ -44,6 +45,8 @@ def tool_declarations(
         for tool, (_, registered) in zip(
             declarations[agent_name], sorted(registration.tools.items()), strict=True
         ):
+            conditions, complete = policy_details(registration.tool_policy, registered.name)
+            public_conditions = [sanitize(value) for value in conditions]
             rows.append(
                 {
                     "name": sanitize(registered.name),
@@ -65,6 +68,8 @@ def tool_declarations(
                         tool, registered.tool, sanitize, source_metadata=source_metadata
                     ).model_dump(mode="json"),
                     "approval": APPROVALS.get(tool.policy_coverage, "unknown"),
+                    "policy_conditions": public_conditions,
+                    "policy_conditions_complete": complete and public_conditions == conditions,
                 }
             )
         for hosted in registration.hosted_tools:
@@ -81,6 +86,10 @@ def tool_declarations(
                         kind="provider", provider=sanitize(hosted.type.partition("_")[0])
                     ).model_dump(mode="json"),
                     "approval": "never",
+                    "policy_conditions": [
+                        "Provider-hosted tools execute under provider controls, outside this Runtime tool policy."
+                    ],
+                    "policy_conditions_complete": False,
                 }
             )
         result[agent_name] = rows

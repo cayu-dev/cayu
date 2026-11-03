@@ -37,6 +37,24 @@ def test_http_title_is_persisted_and_redacted():
     assert result.status_code == 200
     assert result.json()["metadata"]["cayu:title"].startswith("Review ")
     assert "title-secret" not in result.text
+    labels = client.get(
+        "/api/sessions/display",
+        params={
+            "ids": [
+                "metadata-http-run",
+                "cayu_authority_v1.k1.session_id." + "A" * 43,
+                "missing-session",
+            ]
+        },
+    )
+    assert labels.status_code == 200
+    assert len(labels.json()["items"]) == 1
+    assert labels.headers["cache-control"] == "private, no-store"
+    assert labels.json()["generation"] == asyncio.run(app.session_store.read_store_identity())
+    assert labels.json()["items"][0]["title"].startswith("Review ")
+    assert "title-secret" not in labels.text
+    assert "hello" not in labels.text
+    assert set(labels.json()["items"][0]) == {"session_id", "run_id", "title"}
     asyncio.run(app.aclose())
 
 
@@ -111,4 +129,19 @@ def test_display_metadata_schema_uses_canonical_limits_and_tones():
     assert overview["title"]["anyOf"][0]["maxLength"] == MAX_SESSION_TITLE_LENGTH
     assert overview["summary"]["anyOf"][0]["maxLength"] == MAX_SESSION_SUMMARY_LENGTH
     assert set(overview["summary_tone"]["anyOf"][0]["enum"]) == SUMMARY_TONES
+    asyncio.run(app.aclose())
+
+
+def test_session_display_refuses_store_identity_change(monkeypatch):
+    app = CayuApp(enable_logging=False)
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    identities = iter(["11111111111111111111111111111111", "22222222222222222222222222222222"])
+
+    async def changing_identity():
+        return next(identities)
+
+    monkeypatch.setattr(app.session_store, "read_store_identity", changing_identity)
+    result = client.get("/api/sessions/display", params={"ids": "missing"})
+    assert result.status_code == 409
+    assert "items" not in result.json()
     asyncio.run(app.aclose())

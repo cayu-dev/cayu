@@ -2977,6 +2977,14 @@ export type ApiToolSummary = {
      * Parallel Safe
      */
     parallel_safe: boolean;
+    /**
+     * Policy Conditions
+     */
+    policy_conditions?: Array<string> | null;
+    /**
+     * Policy Conditions Complete
+     */
+    policy_conditions_complete?: boolean;
     source: ToolSource;
     /**
      * Workspace Mutation
@@ -20206,6 +20214,38 @@ export type SessionCostSummary = {
 export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_issue' | 'interruption';
 
 /**
+ * SessionDisplay
+ */
+export type SessionDisplay = {
+    /**
+     * Run Id
+     */
+    run_id: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Title
+     */
+    title: string | null;
+};
+
+/**
+ * SessionDisplaysResponse
+ */
+export type SessionDisplaysResponse = {
+    /**
+     * Generation
+     */
+    generation: string;
+    /**
+     * Items
+     */
+    items: Array<SessionDisplay>;
+};
+
+/**
  * SessionExecutionProfiles
  *
  * Redacted profiles a later invocation of one session must match.
@@ -29521,6 +29561,36 @@ export type ListSessionsApiSessionsGetResponses = {
 };
 
 export type ListSessionsApiSessionsGetResponse = ListSessionsApiSessionsGetResponses[keyof ListSessionsApiSessionsGetResponses];
+
+export type SessionDisplaysApiSessionsDisplayGetData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Ids
+         */
+        ids: Array<string>;
+    };
+    url: '/api/sessions/display';
+};
+
+export type SessionDisplaysApiSessionsDisplayGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type SessionDisplaysApiSessionsDisplayGetError = SessionDisplaysApiSessionsDisplayGetErrors[keyof SessionDisplaysApiSessionsDisplayGetErrors];
+
+export type SessionDisplaysApiSessionsDisplayGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionDisplaysResponse;
+};
+
+export type SessionDisplaysApiSessionsDisplayGetResponse = SessionDisplaysApiSessionsDisplayGetResponses[keyof SessionDisplaysApiSessionsDisplayGetResponses];
 
 export type GetSessionOverviewCountsApiSessionsOverviewCountsGetData = {
     body?: never;

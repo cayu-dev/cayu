@@ -320,6 +320,27 @@ function ToolDetail({
           Approval policy:{" "}
           {tool.approval ? (APPROVAL[tool.approval]?.label ?? "Unknown") : "Unknown"}
         </p>
+        <section aria-label="Policy conditions" className="space-y-2">
+          <p className="text-xs font-medium text-muted-foreground">Policy conditions</p>
+          {tool.policy_conditions == null ? (
+            <p>This Runtime does not publish policy conditions.</p>
+          ) : (
+            <ul className="list-disc space-y-1 pl-4">
+              {tool.policy_conditions.map((condition, index) => (
+                <li key={index}>{condition}</li>
+              ))}
+            </ul>
+          )}
+          {tool.policy_conditions != null && !tool.policy_conditions_complete ? (
+            <p>
+              Some conditions are private or application-defined; this explanation is incomplete.
+            </p>
+          ) : null}
+          <p className="text-xs text-muted-foreground">
+            These declarations do not authorize a call. Argument validation, grants, mandatory
+            controls, hooks and execution admission still apply.
+          </p>
+        </section>
         <div>
           <p className="text-xs text-muted-foreground">
             {row.specialists.length} published{" "}

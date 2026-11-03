@@ -48,6 +48,12 @@ def test_control_plane_tool_sources_and_approval_match_cloud():
             assert tool["source"] == cloud.tools[0].source.model_dump(mode="json")
             assert tool["approval"] == cloud.tools[0].approval == "always"
             assert tool["input_schema"]
+            assert tool["policy_conditions_complete"] is True
+            assert (
+                tool["policy_conditions"][0]
+                == "Every call to this tool requires a person's approval."
+            )
+            assert "policy_conditions" not in cloud.tools[0].model_dump()
         await app.aclose()
 
     asyncio.run(run())
@@ -1229,3 +1235,107 @@ def test_sqlite_http_usage_does_not_mix_retention_between_pages(tmp_path):
             await app.aclose()
 
     asyncio.run(run())
+
+
+def test_policy_inspection_does_not_publish_private_values_or_assume_extension_semantics():
+    from cayu.server.tool_policy_details import policy_details
+    from cayu.tools.policy import (
+        AllowlistRule,
+        ParameterConstrainedToolPolicy,
+        RequiredFieldRule,
+        ToolPolicyDecision,
+    )
+
+    policy = ParameterConstrainedToolPolicy(
+        {"send": [RequiredFieldRule("to"), AllowlistRule("to", values=["private-value"])]},
+        decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+    )
+    conditions, complete = policy_details(policy, "send")
+    assert complete is False
+    assert "private-value" not in str(conditions)
+    assert "requires approval" in conditions[0]
+    assert "deny the call" in conditions[1]
+
+    class Custom(AlwaysRequireApprovalToolPolicy):
+        pass
+
+    conditions, complete = policy_details(Custom(), "send")
+    assert complete is False
+    assert "application-defined" in conditions[0]
+
+
+def test_policy_inspection_never_evaluates_a_custom_rule():
+    from cayu.server.tool_policy_details import policy_details
+    from cayu.tools.policy import ParameterConstrainedToolPolicy, RequiredFieldRule
+
+    class CustomRule(RequiredFieldRule):
+        @property
+        def parameter(self):
+            raise AssertionError("Do not inspect extension properties")
+
+        def check(self, arguments):
+            raise AssertionError("Do not evaluate authorization")
+
+    conditions, complete = policy_details(
+        ParameterConstrainedToolPolicy({"send": [CustomRule("to")]}), "send"
+    )
+    assert complete is False
+    assert "application-defined" in conditions[1]
+
+
+def test_policy_condition_redaction_keeps_protocol_fields():
+    from cayu.server.tool_inventory import tool_declarations
+    from cayu.tools.policy import ParameterConstrainedToolPolicy, RequiredFieldRule
+    from cayu.vaults.redaction import SecretRedactor
+
+    app = CayuApp(
+        secret_redactor=SecretRedactor(["private-field", "policy_conditions_complete"]),
+        enable_logging=False,
+    )
+    tool = _Tool()
+    app.register_agent(
+        AgentSpec(name="specialist", model="model"),
+        tools=[tool],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {tool.spec.name: [RequiredFieldRule("private-field")]}
+        ),
+    )
+    declaration = tool_declarations(app)["specialist"][0]
+    assert declaration["policy_conditions_complete"] is False
+    assert "private-field" not in str(declaration["policy_conditions"])
+    asyncio.run(app.aclose())
+
+
+def test_required_value_description_matches_non_string_enforcement():
+    from cayu.server.tool_policy_details import policy_details
+    from cayu.tools.policy import ParameterConstrainedToolPolicy, RequiredFieldRule
+
+    rule = RequiredFieldRule("count")
+    for value in (1, False, ["item"], {"item": 1}):
+        assert rule.check({"count": value}) is None
+    assert rule.check({}) is not None
+    conditions, complete = policy_details(
+        ParameterConstrainedToolPolicy({"count": [rule]}), "count"
+    )
+    assert complete is True
+    assert "non-empty value" in conditions[1]
+    assert "string" not in conditions[1]
+
+
+def test_structured_command_conditions_keep_base_policy_and_private_authority():
+    from tests.core.test_structured_commands import _profile
+
+    from cayu.server.tool_policy_details import policy_details
+    from cayu.tools.structured_commands import StructuredCommandToolPolicy
+
+    policy = StructuredCommandToolPolicy(
+        toolchain_profile=_profile(), base_policy=AlwaysRequireApprovalToolPolicy()
+    )
+    conditions, complete = policy_details(policy, "read_file")
+    assert complete is True
+    assert "requires a person's approval" in conditions[0]
+    command, complete = policy_details(policy, "run_command")
+    assert complete is False
+    assert "base policy is evaluated first" in command[0]
+    assert "admitted selector" in command[-1]
+    assert "application-defined" not in str(command)

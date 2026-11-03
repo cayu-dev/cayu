@@ -159,6 +159,7 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/pending-actions",
             "/sessions",
             "/sessions/overview/counts",
+            "/sessions/display",
             "/sessions/{session_id}",
             "/sessions/{session_id}/events",
             "/sessions/{session_id}/trace",
