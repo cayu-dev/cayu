@@ -290,7 +290,8 @@ def test_set_refuses_a_malformed_assignment_without_a_request(
 
     assert code == 2
     assert output["error"]["category"] in {"setting_assignment_invalid", "setting_key_invalid"}
-    assert [request.url.path for request in fake.requests] == ["/v1/applications"]
+    # Only reads: the Agent resolved once to check where it deploys, and once to change it.
+    assert [request.url.path for request in fake.requests] == ["/v1/applications"] * 2
 
 
 def test_a_revision_conflict_says_nothing_changed_and_names_the_operation(
@@ -358,13 +359,15 @@ def test_a_validation_refusal_lists_each_settings_reason(
     code, out, err = _text(["set", 'web.resources={"cpu_millis": 99}'], capsys)
 
     assert (code, out) == (2, "")
-    assert err.splitlines()[:3] == [
+    assert err.splitlines()[:4] == [
+        # Said before the change is sent (`tests/cli/conftest.py` names the Organization).
+        "cayu cloud: acting in Organization Test Organization (org_test) on https://cloud.example",
         "Error: Cayu Cloud refused 2 settings, so nothing was changed.",
         "  platform:web.resources: this install can't run that size "
         '(allowed: [{"cpu_millis":512,"memory_mb":1024}])',
         "  agent:agent.x.y: refused",
     ]
-    assert err.splitlines()[3].startswith("Operation op_")
+    assert err.splitlines()[4].startswith("Operation op_")
 
 
 def test_an_admin_only_setting_names_the_key(cloud, capsys: pytest.CaptureFixture[str]) -> None:
@@ -424,7 +427,9 @@ def test_unset_refuses_an_ambiguous_key(cloud, capsys: pytest.CaptureFixture[str
     code, out, err = _text(["unset", "shared.flag"], capsys)
 
     assert (code, out) == (2, "")
-    assert err.startswith("Error: shared.flag is both a platform and an agent setting")
+    assert err.splitlines()[1].startswith(
+        "Error: shared.flag is both a platform and an agent setting"
+    )
     assert fake.sent("DELETE") == []
 
 

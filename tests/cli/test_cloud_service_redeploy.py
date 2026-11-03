@@ -76,12 +76,22 @@ def test_redeploy_queues_a_forced_publication_and_names_the_next_step(
         "message": message,
         "ok": True,
         "operation": "service.redeploy",
+        # The Organization `tests/cli/conftest.py` says a change acts in.
+        "organization": {
+            "api_url": "https://cloud.cayu.dev",
+            "id": "org_test",
+            "name": "Test Organization",
+        },
         "result": _QUEUED,
         "status": "queued",
     }
-    assert streams.err == f"cayu cloud: {message}\n"
-    # One request and no polling: the Release is read only for its declared processes.
-    assert cloud.requests[1:] == [
+    assert streams.err == (
+        "cayu cloud: acting in Organization Test Organization (org_test) on "
+        f"https://cloud.cayu.dev\ncayu cloud: {message}\n"
+    )
+    # One request and no polling: the Release is read only for its declared processes. (The
+    # Agent is resolved twice first: to check where it deploys, then to act on it.)
+    assert cloud.requests[2:] == [
         ("PUT", _SERVICE, {"force": "true"}),
         ("GET", _RELEASE, None),
     ]

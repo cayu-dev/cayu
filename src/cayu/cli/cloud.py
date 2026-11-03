@@ -20,6 +20,15 @@ from pathlib import Path
 from typing import Any, Never
 from urllib.parse import quote, urlsplit
 
+from cayu.cli._cloud_agent_homes import (
+    AgentOrganizationError,
+    Organization,
+    acting_organization,
+    find_agent_home,
+    remember_agent_home,
+    require_agent_home,
+    require_intended_organization,
+)
 from cayu.cli._cloud_api import (
     CANDIDATE_REFUSAL_CODES,
     CloudApiClient,
@@ -116,6 +125,43 @@ _SERVICE_STATUSES = _SERVICE_FAILURES | _SERVICE_IN_PROGRESS | _SERVICE_READY | 
 # `schedule run`.
 _SWITCH_REFUSED_SERVICE_ACTIONS = frozenset(
     {"destroy", "pause", "restart", "resume", "sleep", "wake"}
+)
+# The commands that change something, and how each names what it changes: "agent" names an
+# Agent by any reference `_application_id` resolves, "agent_slug" by its exact slug (its id), and
+# "organization" changes the Organization itself. Each says which Organization it acts in, and
+# one that changes an Agent is refused outside the Cloud and Organization the Agent deploys to
+# (`_cloud_agent_homes`).
+_CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
+    ("deploy",): "agent_slug",
+    ("applications", "archive"): "agent_slug",
+    ("deployment", "promote"): "agent",
+    ("deployment", "discard"): "agent",
+    ("deployment", "retry"): "agent",
+    ("rollback",): "agent",
+    **{
+        ("service", action): "agent"
+        for action in ("destroy", "pause", "redeploy", "restart", "resume", "sleep", "wake")
+    },
+    ("env", "set"): "agent",
+    ("env", "unset"): "agent",
+    ("settings", "set"): "agent",
+    ("settings", "unset"): "agent",
+    ("schedule", "run"): "agent",
+    ("compass", "enroll"): "agent_slug",
+    ("compass", "disable"): "agent_slug",
+    ("compass", "verify"): "agent_slug",
+    ("compass", "pass"): "agent_slug",
+    ("compass", "findings", "accept"): "agent_slug",
+    ("compass", "findings", "dismiss"): "agent_slug",
+    ("eval", "run"): "agent",
+    ("eval", "runs", "cancel"): "agent",
+    ("eval", "baseline"): "agent",
+    ("api-keys", "create"): "organization",
+    ("api-keys", "revoke"): "organization",
+}
+_ORGANIZATION_HELP = (
+    "The Organization (its id) this command must act in; it's refused in any other. Naming it "
+    "also lets a command act on an Agent that deploys to another Organization or Cayu Cloud."
 )
 # A service or archive wait tolerates this many consecutive throttled, unavailable or 5xx reads.
 _SERVICE_POLL_TRANSIENT_LIMIT = 5
@@ -835,6 +881,7 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
         exc,
         (
             _CloudDeployCheckError,
+            AgentOrganizationError,
             CompassWriteError,
             CloudSettingsError,
             CloudEvalError,
@@ -879,11 +926,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _configure_parser(parser: argparse.ArgumentParser) -> None:
-    parser.set_defaults(_cloud_preflight=None, _cloud_render=None, _cloud_render_failure=None)
+    parser.set_defaults(
+        _cloud_change=None,
+        _cloud_preflight=None,
+        _cloud_render=None,
+        _cloud_render_failure=None,
+    )
     parser.add_argument("--api-key-file", type=Path, help="Defaults to context.")
     parser.add_argument("--context", type=Path, help="Private Cayu Cloud context JSON.")
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--timeout-seconds", type=_positive_finite_seconds, default=30.0)
+    parser.add_argument(
+        "--organization", dest="intended_organization", metavar="ORG_ID", help=_ORGANIZATION_HELP
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     login = commands.add_parser(
@@ -1405,6 +1460,30 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "verify",
         description="Verify the integrity of every local evidence record.",
     )
+    _mark_changing_commands(parser)
+
+
+def _mark_changing_commands(parser: argparse.ArgumentParser) -> None:
+    """Give each of `_CHANGING_COMMANDS` its kind of change and its own `--organization`."""
+
+    for path, change in _CHANGING_COMMANDS.items():
+        command = parser
+        for name in path:
+            (choices,) = (
+                action.choices
+                for action in command._actions
+                if isinstance(action, argparse._SubParsersAction)
+            )
+            command = choices[name]
+        command.set_defaults(_cloud_change=change)
+        # Also after the command; without a default, so `cayu cloud --organization` stays.
+        command.add_argument(
+            "--organization",
+            dest="intended_organization",
+            metavar="ORG_ID",
+            default=argparse.SUPPRESS,
+            help=_ORGANIZATION_HELP,
+        )
 
 
 def _add_switch_wait_argument(parser: argparse.ArgumentParser) -> None:
@@ -2062,6 +2141,20 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
     preflight: Callable[[argparse.Namespace], None] | None = arguments._cloud_preflight
     if preflight is not None:
         preflight(arguments)
+    if arguments.intended_organization is not None and arguments.command in {
+        "context",
+        "evidence",
+        "init",
+        "login",
+        "logout",
+        "organizations",
+    }:
+        raise CloudCommandError(
+            "invalid_input",
+            f"`--organization` names where a command acts in Cayu Cloud; `cayu cloud "
+            f"{arguments.command}` doesn't. Sign in to an Organization with `cayu cloud login "
+            "--organization ORG_ID` or switch with `cayu cloud organizations use ORG_ID`.",
+        )
     if arguments.command == "init":
         initialized = initialize_project(arguments.path, force=arguments.force)
         result: dict[str, Any] = {
@@ -2122,6 +2215,8 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
                 "result": recorder.show(arguments.evidence_id),
             }
         return {"operation": "evidence.verify", "result": recorder.verify()}
+    project: ResolvedCloudProject | None = None
+    deploy_check: dict[str, Any] | None = None
     if arguments.command == "deploy":
         recorder.preflight()
         if not arguments.no_wait:
@@ -2136,6 +2231,11 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         context_path = _selected_context_path(arguments.context)
         context = _read_context(context_path) if context_path is not None else {}
         client = _cloud_client(arguments, context=context, context_path=context_path)
+        acting = (
+            None
+            if arguments.intended_organization is None
+            else _require_acting_organization(arguments, client)
+        )
         applications = client.request("GET", "/v1/applications").get("items")
         if not isinstance(applications, list):
             raise CloudApiError("api_response_invalid", "Application list is invalid.")
@@ -2144,6 +2244,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         except CloudApiError:
             platform = None
         return {
+            **({} if acting is None else {"organization": acting.public()}),
             "operation": "doctor",
             "result": {
                 "api_reachable": True,
@@ -2161,6 +2262,122 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
     selected_context = _selected_context_path(arguments.context)
     context = _read_context(selected_context) if selected_context is not None else {}
     client = _cloud_client(arguments, context=context, context_path=selected_context)
+    if arguments._cloud_change is None and arguments.intended_organization is None:
+        return _client_command(
+            arguments, client=client, recorder=recorder, project=project, deploy_check=deploy_check
+        )
+    # A change says where it happens before it happens, and an Agent's is refused anywhere
+    # but the Cloud and Organization the Agent deploys to.
+    acting = _require_acting_organization(arguments, client)
+    agent = _changed_agent(arguments, project, client=client, acting=acting)
+    if agent is not None and arguments._cloud_change == "agent":
+        # The command acts on the Agent just checked, even if another one has since taken
+        # the name or slug it was given.
+        arguments.application = agent
+    response = _client_command(
+        arguments, client=client, recorder=recorder, project=project, deploy_check=deploy_check
+    )
+    response["organization"] = acting.public()
+    if arguments.command == "deploy" and agent is not None:
+        assert project is not None
+        note = remember_agent_home(
+            _agent_homes_directory(), agent, acting, name=project.manifest.name
+        )
+        if note is not None:
+            response["warnings"] = [*response.get("warnings", []), note]
+    return response
+
+
+def _require_acting_organization(
+    arguments: argparse.Namespace, client: CloudApiClient
+) -> Organization:
+    """Say which Organization ``client`` acts in, and refuse when `--organization` names
+    another."""
+
+    acting = _acting_organization(client)
+    print(f"cayu cloud: acting in {terminal_safe(acting.describe())}", file=sys.stderr)
+    require_intended_organization(arguments.intended_organization, acting)
+    return acting
+
+
+def _changed_agent(
+    arguments: argparse.Namespace,
+    project: ResolvedCloudProject | None,
+    *,
+    client: CloudApiClient,
+    acting: Organization,
+) -> str | None:
+    """The id of the Agent a changing command acts on, once it is known to deploy where the
+    command acts (`require_agent_home`); None when the command changes no one Agent.
+
+    A reference is resolved as the command itself resolves it, so every name or alias the
+    command accepts for an Agent is checked against that Agent's record.
+    """
+
+    change = arguments._cloud_change
+    if change not in {"agent", "agent_slug"}:
+        return None
+    if arguments.command == "deploy":
+        assert project is not None
+        reference = str(arguments.application or project.manifest.application)
+    elif getattr(arguments, "application", None) is None:
+        # A release named only by its id, which belongs to one Organization.
+        return None
+    else:
+        reference = str(arguments.application)
+    directory = _agent_homes_directory()
+
+    def require(application_id: str) -> None:
+        require_agent_home(
+            directory,
+            application_id,
+            acting,
+            intended=arguments.intended_organization,
+            login_command=_login_command,
+        )
+
+    if change == "agent_slug":
+        require(reference)
+        return reference
+    try:
+        application_id = _application_id(client, reference)
+    except CloudApiError as exc:
+        if exc.category not in {"application_not_found", "application_ambiguous"}:
+            raise
+        # No one Agent here answers to it, so the command would fail the same way; when this
+        # machine knows where an Agent of that name deploys, say so instead.
+        known = find_agent_home(directory, reference)
+        if known is not None:
+            require(known.application)
+        raise
+    require(application_id)
+    return application_id
+
+
+def _agent_homes_directory() -> Path:
+    """The directory whose `agents/` keeps where each Agent deploys: the config's own."""
+
+    return _active_config_path().parent
+
+
+def _acting_organization(client: CloudApiClient) -> Organization:
+    """The Cloud, in its one spelling, and the Organization ``client`` acts in."""
+
+    try:
+        api_url = _normalized_api_url(client.api_url)
+    except ValueError:
+        api_url = client.api_url
+    return acting_organization(client, api_url=api_url)
+
+
+def _client_command(
+    arguments: argparse.Namespace,
+    *,
+    client: CloudApiClient,
+    recorder: EvidenceRecorder,
+    project: ResolvedCloudProject | None,
+    deploy_check: dict[str, Any] | None,
+) -> dict[str, Any]:
     if arguments.command == "organizations":
         return {"operation": "organizations", "result": _organizations(client)}
     if arguments.command == "whoami":
@@ -2173,6 +2390,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
     if arguments.command == "applications":
         return _applications(arguments, client=client)
     if arguments.command == "deploy":
+        assert project is not None
         return _deploy(
             arguments,
             client=client,
@@ -5768,6 +5986,8 @@ def _cloud_recovery_arguments(arguments: argparse.Namespace) -> tuple[str, ...]:
     for flag, value in (
         ("--context", getattr(arguments, "context", None)),
         ("--api-key-file", getattr(arguments, "api_key_file", None)),
+        # A command that had to name its Organization prints follow-ups that name it too.
+        ("--organization", getattr(arguments, "intended_organization", None)),
     ):
         if value is not None:
             result.extend((flag, str(value)))

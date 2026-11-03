@@ -348,7 +348,10 @@ def test_decisions_and_cancellation_reach_a_cloud_agent(
         assert main(["eval", "runs", "cancel", waiting, *on_cloud]) == 0
         answer = json.loads(capsys.readouterr().out)
         assert main(["cloud", "eval", "runs", "cancel", *on_cloud, waiting, "--json"]) == 0
-        assert json.loads(capsys.readouterr().out) == answer
+        cloud_answer = json.loads(capsys.readouterr().out)
+        # `cayu cloud` also says which Organization the change acted in.
+        assert cloud_answer.pop("organization")["id"] == "org_test"
+        assert cloud_answer == answer
         assert answer["result"]["run"]["status"] == "cancelled"
         assert tool.run_count == 2
 

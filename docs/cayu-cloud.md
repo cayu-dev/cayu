@@ -965,6 +965,45 @@ Organization API key belongs to one Organization, so these commands need `cayu c
 With an install's context selected (`login --api-url`), they switch that install's login, and
 its context stays selected.
 
+### Where an Agent deploys
+
+A command that changes something first says, on standard error, which Organization it acts in
+and on which Cayu Cloud, for example
+`cayu cloud: acting in Organization Cayu Demo (org_01...) on https://cloud.cayu.dev`, and its JSON
+output carries the same as `organization` (`api_url`, `id`, and `name`, which is null for an
+Organization API key). It asks Cloud (`GET /v1/me`) before it changes anything. These commands
+are `deploy`, `applications archive`, `deployment promote|discard|retry`, `rollback`,
+`service destroy|pause|redeploy|restart|resume|sleep|wake`, `env set|unset`,
+`settings set|unset`, `schedule run`, `compass enroll|disable|verify|pass`,
+`compass findings accept|dismiss`, `eval run|baseline`, `eval runs cancel` and
+`api-keys create|revoke`. Commands that only read say nothing.
+
+Each Agent also remembers where it deploys. The first successful `cayu cloud deploy` of an Agent
+from this machine records its Cloud and Organization in
+`~/.config/cayu-cloud/agents/<slug>.json` (beside the context selection, so under
+`CAYU_CLOUD_CONFIG`'s directory when that is set), and says so once in `warnings`; an Agent
+deployed before this record existed gets it on its next successful deploy the same way. From
+then on, a command above that changes that Agent is refused with `agent_organization_mismatch`
+when the login or context in use acts in another Organization or on another Cloud, before
+anything is changed. The command resolves its Agent reference (a slug, a name, or the slug of a
+name) as it always does, and the Agent it resolves to is the one checked and then changed; an Agent that isn't
+found where the command acts is explained by its record when this machine has one. The error
+names both Organizations, and how to switch: `cayu cloud organizations use ORG_ID` (or `cayu
+cloud login --organization ORG_ID`) for another Organization of the same Cloud, or `cayu cloud
+login --api-url URL --organization ORG_ID` for another install. This keeps a deploy meant for
+staging from going to production only because no `--context` was given.
+
+To act on the Agent where you are anyway, name that Organization with `--organization ORG_ID`,
+either right after `cayu cloud` or after the command. It must be the Organization the command
+acts in: any other is refused with `organization_mismatch`, so `--organization` also works on its
+own as a check that a command, a read or `doctor` included, runs where you mean it to. A `deploy` with it
+moves the record to the new Organization and says so in `warnings`; the other commands act once
+and leave the record as it was. The follow-up commands a command prints (`deployment status`,
+`rollback`, `eval baseline` and so on) carry its `--organization`, like `--context`. A record
+that can't be read (`agent_record_invalid`) names its file; delete it and the next deploy records
+it again. An Organization name with control characters is never printed; its id names it
+instead. Records are kept per machine and per user, so CI and a teammate's laptop keep their own.
+
 ## Cloud rollouts
 
 `cayu cloud platform` says what Cayu Cloud itself runs, so "did Cloud change under me?" has an

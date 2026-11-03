@@ -16,6 +16,8 @@ from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_project import CloudProjectManifest
 
 _APP = "/v1/applications/cayu-scout"
+# The Organization `tests/cli/conftest.py` says a change acts in.
+_ORGANIZATION = {"api_url": "https://cloud.example", "id": "org_test", "name": "Test Organization"}
 _LIST = ("GET", "/v1/applications?lifecycle=all")
 _AGENTS = httpx.Response(200, json={"items": [{"id": "cayu-scout", "name": "Cayu Scout"}]})
 
@@ -145,7 +147,12 @@ def test_schedule_run_sends_the_input_and_answers_the_run(
     )
 
     assert code == 0
-    assert output == {"ok": True, "operation": "schedule.run", "result": run}
+    assert output == {
+        "ok": True,
+        "operation": "schedule.run",
+        "organization": _ORGANIZATION,
+        "result": run,
+    }
     assert json.loads(fake.requests[-1].content) == {"input": {"limit": 3, "prompt": "Look again"}}
 
 

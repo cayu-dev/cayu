@@ -912,6 +912,8 @@ def test_bulk_dismiss_that_fails_partway_says_how_many_it_dismissed(
 
     assert code == 2
     assert capsys.readouterr().err.splitlines() == [
+        # Said before the change is sent (`tests/cli/conftest.py` names the Organization).
+        "cayu cloud: acting in Organization Test Organization (org_test) on https://cloud.example",
         "Error: Cayu Cloud API returned HTTP 503. Dismissed 1 findings before that; repeating "
         "the command with the same --idempotency-key dismisses the rest.",
         "Idempotency key: bulk-3",

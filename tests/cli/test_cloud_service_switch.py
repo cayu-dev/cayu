@@ -246,6 +246,12 @@ def test_schedule_run_wait_from_the_command_line(
     assert json.loads(capsys.readouterr().out) == {
         "ok": True,
         "operation": "schedule.run",
+        # The Organization `tests/cli/conftest.py` says a change acts in.
+        "organization": {
+            "api_url": "https://cloud.example",
+            "id": "org_test",
+            "name": "Test Organization",
+        },
         "result": _STARTED,
     }
 
