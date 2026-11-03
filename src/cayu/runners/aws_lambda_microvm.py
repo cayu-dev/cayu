@@ -12,7 +12,7 @@ import secrets
 import threading
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -453,6 +453,7 @@ class LambdaMicroVMEndpointTransport(Protocol):
         token: str,
         command_id: str,
         timeout_s: float,
+        owner_claim: str | None = None,
     ) -> Mapping[str, Any]: ...
 
     async def claim_owner(
@@ -463,6 +464,7 @@ class LambdaMicroVMEndpointTransport(Protocol):
         claim_id: str,
         timeout_s: float,
         owner_epoch: int | None = None,
+        carry_commands: Sequence[str] | None = None,
     ) -> Mapping[str, Any]: ...
 
     async def check_owner(
@@ -561,6 +563,7 @@ class HttpxLambdaMicroVMEndpointTransport:
         token: str,
         command_id: str,
         timeout_s: float,
+        owner_claim: str | None = None,
     ) -> Mapping[str, Any]:
         return await self._request(
             "DELETE",
@@ -568,6 +571,7 @@ class HttpxLambdaMicroVMEndpointTransport:
             token=token,
             path=f"/v1/commands/{command_id}",
             timeout_s=timeout_s,
+            payload=None if owner_claim is None else {"owner_claim": owner_claim},
         )
 
     async def release_command(
@@ -577,6 +581,7 @@ class HttpxLambdaMicroVMEndpointTransport:
         token: str,
         command_id: str,
         timeout_s: float,
+        owner_claim: str | None = None,
     ) -> Mapping[str, Any]:
         return await self._request(
             "POST",
@@ -584,6 +589,7 @@ class HttpxLambdaMicroVMEndpointTransport:
             token=token,
             path=f"/v1/commands/{command_id}/release",
             timeout_s=timeout_s,
+            payload=None if owner_claim is None else {"owner_claim": owner_claim},
         )
 
     async def write_command_stdin(
@@ -776,6 +782,7 @@ class HttpxLambdaMicroVMEndpointTransport:
         claim_id: str,
         timeout_s: float,
         owner_epoch: int | None = None,
+        carry_commands: Sequence[str] | None = None,
     ) -> Mapping[str, Any]:
         return await self._request(
             "POST",
@@ -785,6 +792,7 @@ class HttpxLambdaMicroVMEndpointTransport:
             payload={
                 "claim_id": claim_id,
                 **({"owner_epoch": owner_epoch} if owner_epoch is not None else {}),
+                **({"carry_commands": list(carry_commands)} if carry_commands is not None else {}),
             },
             timeout_s=timeout_s,
         )
@@ -985,11 +993,18 @@ class LambdaMicroVMRunner(Runner):
         ready_timeout_s: float = DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS,
         lifecycle_timeout_s: float = DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS,
         owner_epoch: int | None = None,
+        carry_commands: Sequence[str] = (),
     ) -> None:
         if client is None:
             raise TypeError("LambdaMicroVMRunner client cannot be None.")
         self._owner_epoch = _validate_owner_epoch(owner_epoch)
         self._owner_epoch_verified = False
+        self._carry_requested = _validate_carry_commands(carry_commands, self._owner_epoch)
+        # What the sidecar's health last advertised, and what this runner's claim took over.
+        self._command_carry_supported = False
+        self._carried_commands: tuple[str, ...] = ()
+        # Set by ``detach_commands``: interrupted waits leave their guest commands running.
+        self._commands_detached = False
         self._client = client
         self._owns_client = owns_client
         self.microvm_id = require_clean_nonblank(microvm_id, "microvm_id")
@@ -1554,14 +1569,24 @@ class LambdaMicroVMRunner(Runner):
         env_overlay: Mapping[str, str] | None = None,
         lifecycle_timeout_s: float = DEFAULT_LAMBDA_MICROVM_LIFECYCLE_TIMEOUT_SECONDS,
         owner_epoch: int | None = None,
+        carry_commands: Sequence[str] = (),
     ) -> LambdaMicroVMRunner:
         """Attach and claim an existing MicroVM, optionally with ``owner_epoch``.
 
         An epoch lower than any previously accepted epoch is refused without
         disturbing the current owner. Equal epochs retain normal claim behavior.
         Omitting it keeps legacy claims; those never reset the retained maximum.
+
+        ``carry_commands`` names commands of the earlier owner to take over
+        instead of cancelling them (it needs ``owner_epoch``). The sidecar moves
+        them only when it advertises ``carry_commands`` and this claim's epoch
+        is strictly above every epoch it accepted before; ``carried_commands``
+        then lists the ones this runner holds, and ``resume_exec`` waits for
+        each. Every other command of the earlier owner is cancelled, as a claim
+        always does.
         """
         owner_epoch = _validate_owner_epoch(owner_epoch)
+        carry = _validate_carry_commands(carry_commands, owner_epoch)
         identifier = require_clean_nonblank(microvm_id, "microvm_id")
         guest_root = _validate_guest_root(default_cwd)
         environment_overlay = _preflight_runner_creation(
@@ -1628,6 +1653,7 @@ class LambdaMicroVMRunner(Runner):
                     ready_timeout_s=ready_timeout_s,
                     lifecycle_timeout_s=lifecycle_timeout_s,
                     owner_epoch=owner_epoch,
+                    carry_commands=carry,
                 )
                 reclamation.runner = runner
 
@@ -1667,7 +1693,15 @@ class LambdaMicroVMRunner(Runner):
         timeout_s: int | None = None,
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+        command_id: str | None = None,
     ) -> ExecResult:
+        """Run one agent command to its end.
+
+        ``command_id`` names the command in the sidecar instead of a random ID,
+        so a successor can name it in ``carry_commands`` (1 to 128 of
+        ``[A-Za-z0-9._:-]``). The caller keeps it unique within the MicroVM:
+        the sidecar answers a repeated ID with that command's existing state.
+        """
         operation = self._exec(
             command,
             execution_profile="agent",
@@ -1678,9 +1712,79 @@ class LambdaMicroVMRunner(Runner):
             timeout_s=timeout_s,
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
+            command_id=_validate_command_id(command_id),
         )
         del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
         return await operation
+
+    @property
+    def command_carry_supported(self) -> bool:
+        """Whether this MicroVM's sidecar advertised ``carry_commands`` at its last health check.
+
+        A runner holding commands a successor may carry over checks this before
+        ``detach_commands``; without it, a successor's claim cancels them.
+        """
+
+        return self._command_carry_supported
+
+    @property
+    def carried_commands(self) -> tuple[str, ...]:
+        """The commands this runner's claim took over from an earlier owner (``carry_commands``).
+
+        Empty when none were asked for, the sidecar can't carry commands, or
+        the claim's epoch wasn't strictly newer than every earlier one.
+        """
+
+        return self._carried_commands
+
+    def detach_commands(self) -> None:
+        """Stop serving this runner's commands without stopping them, for a successor to carry.
+
+        From now on the runner never starts a command again (``reopen_exec``
+        refuses and a resume doesn't reopen it), and an ``exec`` or
+        ``resume_exec`` whose wait is cancelled or fails returns or raises
+        without cancelling its guest command, which keeps running until a
+        successor claims the MicroVM. A successor that names it in
+        ``carry_commands`` takes it over; any other claim cancels it, as claims
+        always have. Interactive processes aren't carried over and still stop
+        when closed. Cancel the waits still running after this call; the runner
+        doesn't end them itself.
+        """
+
+        self._commands_detached = True
+        self._close_exec(_DETACHED_REASON)
+
+    def reopen_exec(self) -> None:
+        if self._commands_detached:
+            raise RuntimeError(f"LambdaMicroVMRunner is closed: {_DETACHED_REASON}")
+        super().reopen_exec()
+
+    def _open_exec(self) -> None:
+        super()._open_exec()
+        if self._commands_detached:
+            # Detaching is final: a resume doesn't make the runner run commands again.
+            self._close_exec(_DETACHED_REASON)
+
+    async def resume_exec(self, command_id: str, *, timeout_s: int | None = None) -> ExecResult:
+        """Wait for a command this runner carried over (``carried_commands``) and return its result.
+
+        It behaves as the rest of an ``exec`` of that command would: cancelled,
+        it stops the command; at its end the result is read and released.
+        ``timeout_s`` bounds this wait (the command's own timeout, which the
+        sidecar enforces, still applies); ``None`` waits for the command's end.
+        """
+
+        if command_id not in self._carried_commands:
+            raise ValueError("resume_exec takes only a command this runner carried over.")
+        timeout = validate_timeout(timeout_s)
+        self._ensure_exec_open()
+        return await self._await_command(
+            command_id,
+            payload=None,
+            timeout=timeout,
+            output_redactor=None,
+            output_limit=LAMBDA_MICROVM_MAX_OUTPUT_BYTES,
+        )
 
     async def exec_redacted(
         self,
@@ -1814,6 +1918,7 @@ class LambdaMicroVMRunner(Runner):
         timeout_s: int | None,
         stdin: str | None,
         output_limit_bytes: int | None,
+        command_id: str | None = None,
     ) -> ExecResult:
         try:
             (
@@ -1832,7 +1937,8 @@ class LambdaMicroVMRunner(Runner):
                 stdin=stdin,
                 output_limit_bytes=output_limit_bytes,
             )
-            command_id = f"cmd-{uuid.uuid4()}"
+            if command_id is None:
+                command_id = f"cmd-{uuid.uuid4()}"
             payload: dict[str, Any] = {
                 "execution_profile": execution_profile,
                 "kind": owned_command.kind,
@@ -1871,8 +1977,27 @@ class LambdaMicroVMRunner(Runner):
             raise
         finally:
             del command
+        return await self._await_command(
+            command_id,
+            payload=payload,
+            timeout=timeout,
+            output_redactor=output_redactor,
+            output_limit=output_limit,
+        )
+
+    async def _await_command(
+        self,
+        command_id: str,
+        *,
+        payload: dict[str, Any] | None,
+        timeout: int | None,
+        output_redactor: SecretRedactor | None,
+        output_limit: int | None,
+    ) -> ExecResult:
+        """Start the command (unless ``payload`` is None: it already runs) and wait for its end."""
+
         handle = _LambdaMicroVMCommandHandle(self, command_id)
-        start_acknowledged = False
+        start_acknowledged = payload is None
         release_after_read = False
         loop = asyncio.get_running_loop()
         deadline = (
@@ -1882,8 +2007,9 @@ class LambdaMicroVMRunner(Runner):
         )
         try:
             async with asyncio.timeout_at(deadline):
-                await self._endpoint_start(command_id, payload)
-                start_acknowledged = True
+                if payload is not None:
+                    await self._endpoint_start(command_id, payload)
+                    start_acknowledged = True
                 while True:
                     response = await self._endpoint_get(command_id)
                     state = _required_response_string(response, "state")
@@ -1967,7 +2093,9 @@ class LambdaMicroVMRunner(Runner):
         if not callable(getattr(self._endpoint_transport, "release_command", None)):
             return
         try:
-            await self._endpoint_call("release_command", command_id=command_id)
+            await self._endpoint_call(
+                "release_command", command_id=command_id, **self._carried_owner(command_id)
+            )
         except Exception:
             _LOGGER.debug("Lambda MicroVM command release failed", exc_info=True)
 
@@ -1979,6 +2107,9 @@ class LambdaMicroVMRunner(Runner):
         start_acknowledged: bool,
         cancellation: asyncio.CancelledError | None = None,
     ) -> RunnerCleanupResult:
+        if self._commands_detached:
+            # Handed to a successor (``detach_commands``): its claim decides the command's fate.
+            policy = "none"
         if not start_acknowledged and policy == "none":
             self._poison_exec()
         cleanup = await self._settle_command_cleanup(
@@ -2509,6 +2640,9 @@ class LambdaMicroVMRunner(Runner):
                 "Lambda MicroVM sidecar does not advertise owner_epoch support."
             )
 
+        self._command_carry_supported = (
+            isinstance(capabilities, list) and "carry_commands" in capabilities
+        )
         self._owner_epoch_verified = True
 
     async def _claim_owner(self) -> None:
@@ -2529,7 +2663,13 @@ class LambdaMicroVMRunner(Runner):
             return
         if self._owner_epoch is not None and not self._owner_epoch_verified:
             await self._endpoint_health()
-        options = {} if self._owner_epoch is None else {"owner_epoch": self._owner_epoch}
+        options: dict[str, Any] = (
+            {} if self._owner_epoch is None else {"owner_epoch": self._owner_epoch}
+        )
+        # Only a sidecar that advertises it is asked; any other cancels them as before.
+        carry = self._carry_requested if self._command_carry_supported else ()
+        if carry:
+            options["carry_commands"] = list(carry)
         try:
             response = await self._endpoint_call(
                 "claim_owner", claim_id=self._owner_claim, **options
@@ -2540,7 +2680,20 @@ class LambdaMicroVMRunner(Runner):
         generation = response.get("generation")
         if type(generation) is not int or generation <= 0:
             raise LambdaMicroVMProtocolError("Lambda MicroVM owner claim returned no generation.")
+        carried: tuple[str, ...] = ()
+        if carry:
+            reported = response.get("carried_commands")
+            if (
+                not isinstance(reported, list)
+                or any(type(command_id) is not str for command_id in reported)
+                or not set(reported) <= set(carry)
+            ):
+                raise LambdaMicroVMProtocolError(
+                    "Lambda MicroVM owner claim returned invalid carried commands."
+                )
+            carried = tuple(dict.fromkeys(cast("list[str]", reported)))
         self._owner_generation = generation
+        self._carried_commands = carried
         self._owner_claimed = True
 
     def workspace_capability(
@@ -2705,7 +2858,15 @@ class LambdaMicroVMRunner(Runner):
         raise AssertionError("unreachable command-state retry loop")
 
     async def _endpoint_cancel(self, command_id: str) -> Mapping[str, Any]:
-        return await self._endpoint_call("cancel_command", command_id=command_id)
+        return await self._endpoint_call(
+            "cancel_command", command_id=command_id, **self._carried_owner(command_id)
+        )
+
+    def _carried_owner(self, command_id: str) -> dict[str, Any]:
+        # The sidecar lets only the current owner cancel or release a carried command.
+        if command_id in self._carried_commands:
+            return {"owner_claim": self._owner_claim}
+        return {}
 
     async def _idempotent_owner_call(self, method_name: str, **kwargs: Any) -> Mapping[str, Any]:
         for attempt in range(_LAMBDA_POLL_ATTEMPTS):
@@ -4327,3 +4488,30 @@ def _validate_owner_epoch(value: int | None) -> int | None:
     if value is not None and (type(value) is not int or value < 0):
         raise ValueError("owner_epoch must be a nonnegative integer or None.")
     return value
+
+
+_COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_DETACHED_REASON = "Lambda MicroVM commands were detached for a successor owner"
+_MAX_CARRIED_COMMANDS = 256
+
+
+def _validate_command_id(value: str | None) -> str | None:
+    # "." and ".." would name another route once the transport puts the ID in a URL path.
+    if value is not None and (
+        type(value) is not str or value in {".", ".."} or not _COMMAND_ID_PATTERN.fullmatch(value)
+    ):
+        raise ValueError("command_id must be 1 to 128 of [A-Za-z0-9._:-], other than . and ..")
+    return value
+
+
+def _validate_carry_commands(value: Sequence[str], owner_epoch: int | None) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        raise TypeError("carry_commands must be a sequence of command IDs.")
+    carried = tuple(dict.fromkeys(value))
+    if len(carried) > _MAX_CARRIED_COMMANDS:
+        raise ValueError(f"carry_commands names at most {_MAX_CARRIED_COMMANDS} commands.")
+    for command_id in carried:
+        _validate_command_id(command_id)
+    if carried and owner_epoch is None:
+        raise ValueError("carry_commands requires an owner_epoch.")
+    return carried

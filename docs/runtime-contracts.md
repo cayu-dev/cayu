@@ -15295,7 +15295,7 @@ A failed open that cannot confirm closure retains its cleanup handle on the orig
 and retry `close()` before treating the listener as closed. Idle guest receive timeouts keep
 waiting, and transient accept-poll failures retry until closure or owner supersession.
 Protocol 8 adds optional `owner_epoch` to runner creation, attachment and direct
-construction. The sidecar's `/health` advertises `capabilities: ["owner_epoch"]`;
+construction. The sidecar's `/health` advertises `capabilities: ["owner_epoch", "carry_commands"]`;
 the runner requires that capability and protocol 8 before sending a numbered claim.
 The sidecar remembers the highest accepted nonnegative integer epoch under its owner
 lock. A lower epoch returns HTTP 409 (`LambdaMicroVMStaleOwnerEpoch`, a subclass of
@@ -15304,6 +15304,16 @@ Equal epochs retain ordinary claim behavior. Claims without an epoch keep their
 existing behavior and do not lower the remembered maximum. This caller epoch is
 separate from the sidecar's internal generation. Like the owner fence, its high-water
 mark survives suspend/resume but not a sidecar restart.
+With the `carry_commands` capability, `from_existing(..., owner_epoch=..., carry_commands=[...])`
+takes the named commands of the earlier owner over instead of cancelling them, but only when
+its epoch is strictly above every epoch the sidecar accepted before and the owner it supersedes
+claimed with an epoch; interactive processes are never carried; `carried_commands` lists
+the ones it holds and `resume_exec(command_id, timeout_s=None)` waits for each one's result as
+the rest of its `exec` would. Every other command of the earlier owner is cancelled, as claims
+always do. Only the new owner can cancel or release a carried command. `exec(...,
+command_id=...)` names a command so a successor can list it, and `detach_commands()` makes a
+runner stop serving its commands for good (interrupted waits no longer cancel them, and it
+never runs commands again) so a successor can take them; `command_carry_supported` reports whether the sidecar advertised the capability.
 Protocol 6 adds interactive processes through
 `interactive_process_capability()`: stdio streams by byte offset, and each process runs in its
 own guest PID namespace, so `close()` confirms that the whole process tree exited. Protocol 4 carries up to 24 MiB of stdin (larger stdin is

@@ -35,6 +35,8 @@ INTERACTIVE_STDOUT_WINDOW_BYTES = 8 * 1024 * 1024
 MAX_INTERACTIVE_STDIN_CHUNK_BYTES = 4 * 1024 * 1024
 MAX_INTERACTIVE_READ_BYTES = 4 * 1024 * 1024
 MAX_INTERACTIVE_WAIT_SECONDS = 20.0
+# The most command IDs one owner claim may ask to carry over from earlier owners.
+MAX_CARRIED_COMMANDS = 256
 _INTERACTIVE_START_TIMEOUT_SECONDS = 5.0
 # The first process inside an interactive command's PID namespace. It starts
 # the command, reaps orphaned descendants, and exits with the command's status.
@@ -131,6 +133,12 @@ class OwnerFence:
     Until then no claim or command is admitted, so a host that dies while
     holding a lease blocks takeover of this MicroVM until it ends (at the
     latest at its maximum duration) or the allocation reap terminates it.
+
+    A claim may ask to carry the earlier owner's commands over instead of
+    cancelling them (``carry``). The fence grants that only to a claim that
+    supersedes a numbered owner with an ``owner_epoch`` strictly above every
+    epoch accepted before it, so a delayed, equal or unordered claim never
+    takes work over; ``carrying`` reports the grant while holding the fence.
     """
 
     def __init__(self) -> None:
@@ -140,6 +148,10 @@ class OwnerFence:
         self._digest: bytes | None = None
         self._lease: _LifecycleLease | None = None
         self._pending_supersede: Callable[[], None] | None = None
+        # The generation whose claim was granted a carry-over, if the current one was.
+        self._carry_generation: int | None = None
+        # Whether the current owner's own claim carried an epoch.
+        self._owner_numbered = False
 
     def claim(
         self,
@@ -147,6 +159,8 @@ class OwnerFence:
         *,
         on_supersede: Callable[[], None] | None = None,
         owner_epoch: object = None,
+        carry: bool = False,
+        on_carry: Callable[[int], object] | None = None,
     ) -> tuple[int, bool]:
         """Return the current generation and whether this claim superseded another.
 
@@ -154,10 +168,21 @@ class OwnerFence:
         command of the new owner can be admitted. If it fails, its exact
         callback remains mandatory and neither owner has authority. A retry
         settles it before completing that claim or advancing another claim.
+
+        ``carry`` asks for the earlier owner's commands; it needs an
+        ``owner_epoch``, and is granted only when this claim supersedes an
+        owner that claimed with an epoch of its own, and its epoch is strictly
+        above every epoch accepted so far.
+        A granted claim calls ``on_carry`` with its generation under the lock,
+        right after the swap, so no earlier owner can act on what it moves.
         """
 
         if owner_epoch is not None and (type(owner_epoch) is not int or owner_epoch < 0):
             raise CommandRequestError("owner_epoch must be a nonnegative integer or null")
+        if type(carry) is not bool:
+            raise CommandRequestError("carry must be a boolean")
+        if carry and owner_epoch is None:
+            raise CommandRequestError("carrying commands requires an owner_epoch")
         digest = _claim_digest(claim_id)
         with self._lock:
             if (
@@ -169,6 +194,7 @@ class OwnerFence:
             same_claim = self._digest is not None and hmac.compare_digest(self._digest, digest)
             if same_claim and owner_epoch is not None:
                 self._highest_owner_epoch = owner_epoch
+                self._owner_numbered = True
             if self._pending_supersede is not None:
                 self._pending_supersede()
                 self._pending_supersede = None
@@ -182,10 +208,26 @@ class OwnerFence:
                     "the current MicroVM owner is suspending or terminating it"
                 )
             superseded = self._digest is not None
+            previous_epoch = self._highest_owner_epoch
+            previous_numbered = self._owner_numbered
             if owner_epoch is not None:
                 self._highest_owner_epoch = owner_epoch
+            self._owner_numbered = owner_epoch is not None
             self._generation += 1
             self._digest = digest
+            # Only from an owner that claimed with an epoch of its own, and only by an epoch
+            # strictly above every one accepted: never merely equal or unordered.
+            granted = (
+                carry
+                and superseded
+                and previous_numbered
+                and previous_epoch is not None
+                and type(owner_epoch) is int
+                and owner_epoch > previous_epoch
+            )
+            self._carry_generation = self._generation if granted else None
+            if granted and on_carry is not None:
+                on_carry(self._generation)
             if superseded and on_supersede is not None:
                 self._pending_supersede = on_supersede
                 self._pending_supersede()
@@ -222,6 +264,33 @@ class OwnerFence:
     def require(self, claim_id: object) -> int:
         with self.admitted(claim_id) as generation:
             return generation
+
+    def current_generation(self, claim_id: object) -> int | None:
+        """The generation of ``claim_id`` while it is the current owner, else None."""
+
+        try:
+            digest = _claim_digest(claim_id)
+        except CommandRequestError:
+            return None
+        with self._lock:
+            return self._generation if self._is_current_locked(digest) else None
+
+    @contextlib.contextmanager
+    def carrying(self, generation: int) -> Iterator[bool]:
+        """Hold the fence and yield whether ``generation`` may take earlier owners' commands.
+
+        True only while that generation is still the current, settled owner and
+        its claim was granted a carry-over, so a newer claim can never interleave
+        with the commands being moved to it.
+        """
+
+        with self._lock:
+            yield (
+                self._pending_supersede is None
+                and self._digest is not None
+                and generation == self._generation
+                and self._carry_generation == generation
+            )
 
     def acquire_lifecycle(self, claim_id: object, action: object) -> dict[str, Any]:
         """Atomically confirm the owner and block takeover until the lease ends."""
@@ -574,6 +643,8 @@ class _CommandRecord:
     command_id: str
     payload_fingerprint: str | None
     owner_generation: int | None = None
+    # Taken over from an earlier owner: only its current owner may cancel or release it.
+    carried: bool = False
     state: str = "accepted"
     process: subprocess.Popen[bytes] | None = None
     cancel_requested: bool = False
@@ -861,13 +932,14 @@ class CommandSupervisor:
             return {"command_id": identifier, "state": "not_found"}
         return self._snapshot(record)
 
-    def release(self, command_id: str) -> dict[str, Any]:
+    def release(self, command_id: str, *, owner_generation: int | None = None) -> dict[str, Any]:
         """Drop a delivered terminal result so its output is not retained.
 
         The host releases a command after it has read the terminal result. The
         record keeps only its payload digest, so a replayed start stays
         idempotent while stdout and stderr are gone. Releasing a running or
-        unknown command changes nothing.
+        unknown command changes nothing. A carried command is released only by
+        its current owner (``owner_generation``, see ``carry``).
         """
         identifier = _command_id(command_id)
         self._prune()
@@ -876,12 +948,72 @@ class CommandSupervisor:
         if record is None:
             return {"command_id": identifier, "state": "not_found"}
         with record.lock:
+            _require_carried_owner(record, owner_generation)
             if record.state in _TERMINAL_STATES:
                 record.state = "released"
                 record.result = None
             return self._snapshot_locked(record)
 
-    def cancel(self, command_id: str, *, reason: str | None = None) -> dict[str, Any]:
+    def carry(self, command_ids: list[str], *, generation: int) -> list[str]:
+        """Move the listed commands of earlier owners to ``generation`` instead of cancelling them.
+
+        The sidecar calls this inside ``OwnerFence.carrying`` for a claim the
+        fence granted a carry-over, before it cancels the earlier owners' other
+        commands. A command keeps running (or keeps its unread result) and from
+        then on only ``generation`` may cancel or release it, or move its stdio.
+        One already being cancelled, released, unknown or never admitted by an
+        owner is left alone, and so is an interactive one: its stdio moves by
+        offsets only its first owner knows, so it ends with that owner as
+        before. Returns the listed commands ``generation`` now holds this way,
+        so a repeated claim reports the same ones.
+        """
+
+        carried: list[str] = []
+        with self._lock:
+            records = [
+                (identifier, self._records.get(identifier))
+                for identifier in dict.fromkeys(command_ids)
+            ]
+        for identifier, record in records:
+            if record is None:
+                continue
+            with record.lock:
+                if record.owner_generation == generation and record.carried:
+                    carried.append(identifier)
+                    continue
+                if (
+                    record.owner_generation is None
+                    or record.owner_generation >= generation
+                    or record.interactive is not None
+                    or record.cancel_requested
+                    or record.state == "released"
+                ):
+                    continue
+                record.owner_generation = generation
+                record.carried = True
+                carried.append(identifier)
+        return carried
+
+    def cancel(
+        self,
+        command_id: str,
+        *,
+        reason: str | None = None,
+        owner_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Cancel one command; a carried one only for its current owner (``owner_generation``)."""
+
+        return self._cancel(command_id, reason=reason, owner_generation=owner_generation)
+
+    def _cancel(
+        self,
+        command_id: str,
+        *,
+        reason: str | None,
+        owner_generation: int | None,
+        authorized: bool = False,
+        before_generation: int | None = None,
+    ) -> dict[str, Any]:
         identifier = _command_id(command_id)
         self._prune()
         with self._lock:
@@ -899,6 +1031,13 @@ class CommandSupervisor:
                 self._records[identifier] = record
                 return self._snapshot(record)
         with record.lock:
+            if not authorized:
+                _require_carried_owner(record, owner_generation)
+            if before_generation is not None and (
+                record.owner_generation is None or record.owner_generation >= before_generation
+            ):
+                # Carried to a newer owner since the takeover listed it: not that takeover's.
+                return self._snapshot_locked(record)
             terminal = record.state in _TERMINAL_STATES
             if terminal and not (
                 record.interactive is not None
@@ -949,7 +1088,14 @@ class CommandSupervisor:
                 )
             ]
         for command_id in command_ids:
-            self.cancel(command_id, reason=reason)
+            # The sidecar's own takeover or lifecycle hook: no owner check applies.
+            self._cancel(
+                command_id,
+                reason=reason,
+                owner_generation=None,
+                authorized=True,
+                before_generation=before_generation,
+            )
         if before_generation is None:
             self.execution_boundary.close()
 
@@ -1642,6 +1788,18 @@ def _interactive_result(
     if state == "cancelled" and record.cancel_reason is not None:
         result["cancel_reason"] = record.cancel_reason
     return result
+
+
+def _require_carried_owner(record: _CommandRecord, owner_generation: int | None) -> None:
+    """Refuse anyone but its current owner a carried command; others keep the open rules.
+
+    Called with the record's lock held, the lock ``carry`` moves it under, so a
+    stale owner's cancel or release either lands before the carry-over (and the
+    command is not carried) or is refused after it.
+    """
+
+    if record.carried and owner_generation != record.owner_generation:
+        raise OwnerSupersededError("command owner is not the current MicroVM owner")
 
 
 def _cancelled_result(command_id: str) -> dict[str, Any]:

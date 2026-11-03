@@ -6,12 +6,13 @@ import asyncio
 import functools
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException
 
 from .forwards import FORWARD_PORTS, MAX_FORWARD_CONNECTIONS, PortForwardRegistry
 from .supervisor import (
+    MAX_CARRIED_COMMANDS,
     CommandConflictError,
     CommandExecutionBoundary,
     CommandNotFoundError,
@@ -25,6 +26,8 @@ from .supervisor import (
 
 ROOT = os.environ.get("CAYU_MICROVM_WORKSPACE_ROOT", "/workspace")
 PROTOCOL_VERSION = "8"
+# Optional protocol 8 features a host checks for before using them.
+CAPABILITIES = ["owner_epoch", "carry_commands"]
 AGENT_UID = int(os.environ.get("CAYU_MICROVM_AGENT_UID", "1000"))
 AGENT_GID = int(os.environ.get("CAYU_MICROVM_AGENT_GID", "1000"))
 AGENT_NETNS = os.environ.get("CAYU_MICROVM_AGENT_NETNS", "cayu-agent")
@@ -68,7 +71,11 @@ def _close_guest_relays() -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "protocol_version": PROTOCOL_VERSION, "capabilities": ["owner_epoch"]}
+    return {
+        "status": "ok",
+        "protocol_version": PROTOCOL_VERSION,
+        "capabilities": list(CAPABILITIES),
+    }
 
 
 @app.post("/aws/lambda-microvms/runtime/v1/ready")
@@ -86,13 +93,23 @@ async def claim_owner(payload: dict[str, Any]) -> dict[str, Any]:
     every command of earlier owners. The
     response is sent only after that cancellation, so a completed takeover
     leaves no earlier owner's command able to run.
+
+    With ``carry_commands`` (command IDs, which needs ``owner_epoch``) the
+    listed commands of earlier owners are moved to the new owner instead of
+    cancelled, when the fence grants it: the claim supersedes an owner with an
+    epoch strictly above every accepted one. ``carried_commands`` in the
+    response lists the ones the new owner now holds; every other command of an
+    earlier owner is cancelled as without it.
     """
     try:
+        carry = _carry_request(payload.get("carry_commands"))
         generation, superseded = await asyncio.to_thread(
             OWNER.claim,
             payload.get("claim_id"),
             on_supersede=_close_guest_relays,
             owner_epoch=payload.get("owner_epoch"),
+            carry=carry is not None,
+            on_carry=None if carry is None else functools.partial(_carry_listed, carry),
         )
     except StaleOwnerEpochError as exc:
         raise HTTPException(status_code=STALE_OWNER_EPOCH_STATUS, detail=str(exc)) from exc
@@ -100,13 +117,45 @@ async def claim_owner(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OwnerLifecycleLeasedError as exc:
         raise HTTPException(status_code=OWNER_LIFECYCLE_LEASED_STATUS, detail=str(exc)) from exc
+    carried = None
+    if carry is not None:
+        carried = await asyncio.to_thread(_carry_granted, generation, carry)
     if superseded:
         await asyncio.to_thread(
             SUPERVISOR.cancel_all,
             reason=OWNER_SUPERSEDED_REASON,
             before_generation=generation,
         )
-    return {"generation": generation, "superseded_previous": superseded}
+    response: dict[str, Any] = {"generation": generation, "superseded_previous": superseded}
+    if carried is not None:
+        response["carried_commands"] = carried
+    return response
+
+
+def _carry_request(value: object) -> list[str] | None:
+    if value is None:
+        return None
+    if type(value) is not list or len(value) > MAX_CARRIED_COMMANDS:
+        raise CommandRequestError(
+            f"carry_commands must be a list of at most {MAX_CARRIED_COMMANDS} command IDs"
+        )
+    for command_id in value:
+        if type(command_id) is not str or not command_id.strip() or "/" in command_id:
+            raise CommandRequestError("carry_commands must list command IDs")
+    return cast("list[str]", value)
+
+
+def _carry_listed(command_ids: list[str], generation: int) -> list[str]:
+    # Run by the claim under the fence, right after the swap: no other owner acts meanwhile.
+    return SUPERVISOR.carry(command_ids, generation=generation)
+
+
+def _carry_granted(generation: int, command_ids: list[str]) -> list[str]:
+    # What the claim moved (and, for a repeated claim, still holds), read under the fence.
+    with OWNER.carrying(generation) as granted:
+        if not granted:
+            return []
+        return SUPERVISOR.carry(command_ids, generation=generation)
 
 
 @app.post("/v1/owner/check")
@@ -395,22 +444,37 @@ async def _interactive_call(
 
 
 @app.post("/v1/commands/{command_id}/release")
-async def release_command(command_id: str) -> dict[str, Any]:
+async def release_command(command_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Drop a read result; a carried command needs its current owner's ``owner_claim``."""
     try:
-        result = await asyncio.to_thread(SUPERVISOR.release, command_id)
+        result = await asyncio.to_thread(
+            SUPERVISOR.release, command_id, owner_generation=_caller_generation(payload)
+        )
     except CommandRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OwnerSupersededError as exc:
+        raise HTTPException(status_code=OWNER_SUPERSEDED_STATUS, detail=str(exc)) from exc
     if result["state"] == "not_found":
         raise HTTPException(status_code=404, detail="command not found")
     return result
 
 
 @app.delete("/v1/commands/{command_id}")
-async def cancel_command(command_id: str) -> dict[str, Any]:
+async def cancel_command(command_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Cancel a command; a carried command needs its current owner's ``owner_claim``."""
     try:
-        return await asyncio.to_thread(SUPERVISOR.cancel, command_id)
+        return await asyncio.to_thread(
+            SUPERVISOR.cancel, command_id, owner_generation=_caller_generation(payload)
+        )
     except CommandRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OwnerSupersededError as exc:
+        raise HTTPException(status_code=OWNER_SUPERSEDED_STATUS, detail=str(exc)) from exc
+
+
+def _caller_generation(payload: dict[str, Any] | None) -> int | None:
+    claim = None if payload is None else payload.get("owner_claim")
+    return None if claim is None else OWNER.current_generation(claim)
 
 
 @app.post("/aws/lambda-microvms/runtime/v1/run")

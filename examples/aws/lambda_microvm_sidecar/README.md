@@ -109,7 +109,7 @@ uv run python scripts/generate_sidecar_manifest.py --check
 ## Protocol
 
 The sidecar implements Cayu Lambda MicroVM command protocol version `8`. `GET /health` returns
-`{"status":"ok","protocol_version":"8","capabilities":["owner_epoch"]}` so the host can reject an incompatible image before
+`{"status":"ok","protocol_version":"8","capabilities":["owner_epoch","carry_commands"]}` so the host can reject an incompatible image before
 sending a command. The host requires the exact version, so an image built from an earlier
 release must be rebuilt. Version 2 added the boolean `omit_truncated_output` command field: redacted
 executions use it to suppress a channel whose unavailable suffix could complete a workload
@@ -137,6 +137,35 @@ constructor. Before relying on this feature, check protocol 8 and the `owner_epo
 health capability; the runner checks both before sending a numbered claim. This
 caller-supplied epoch is separate from the sidecar-generated `generation` returned
 by a successful claim.
+
+A protocol 8 sidecar that advertises the `carry_commands` capability lets a new owner take
+over the earlier owner's commands instead of cancelling them, so a host handing a MicroVM to
+another (a rolling restart, say) doesn't end the commands running in it. The new owner lists
+them in its claim: `POST /v1/owner` with `{"claim_id", "owner_epoch", "carry_commands": [ids]}`
+(at most 256 IDs; `owner_epoch` is required with it). The sidecar moves the listed commands to
+the new owner only when the claim supersedes an owner and its epoch is strictly above every
+epoch accepted before, and the owner it supersedes claimed with an epoch too (never an equal,
+older or unnumbered one), and does so while it holds the owner fence, so no other claim can
+interleave. A moved command keeps running, or keeps a result nobody read yet; one already being
+cancelled or released isn't moved, and neither is an interactive one (its stdio moves by offsets
+only its first owner knows). Every other command of an
+earlier owner is cancelled as without the field, and the response's `carried_commands` lists the
+ones the new owner now holds (empty when the claim wasn't granted a carry-over; a repeated claim
+reports the same ones). A claim without the field cancels as it always has.
+
+A carried command belongs to its new owner alone: `DELETE /v1/commands/{id}` and
+`POST /v1/commands/{id}/release` for it need that owner's claim in the body
+(`{"owner_claim"}`), and answer HTTP 412 to anyone else, so the earlier owner can no longer stop
+it or drop its result. An earlier owner's takeover still finishing its cancellations leaves it
+alone. Commands that were never carried keep the open cancel and release they always had.
+
+On the host, `LambdaMicroVMRunner.exec(..., command_id=...)` names a command so its successor
+can list it (not `.` or `..`), `detach_commands()` stops a runner for good without stopping
+its commands,
+`from_existing(..., owner_epoch=..., carry_commands=[...])` claims with the list, and
+`carried_commands` and `resume_exec(command_id)` give the new owner each carried command's
+result. The runner sends the list only to a sidecar that advertises the capability
+(`command_carry_supported`); any other cancels the commands as before.
 
 Takeover is atomic with command admission. The owner check, request validation (which may
 install the agent proxy relay), and registration of a start all run while the fence is held,

@@ -265,7 +265,7 @@ def test_sidecar_health_reports_protocol_version(
         assert asyncio.run(app_module.health()) == {
             "status": "ok",
             "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION,
-            "capabilities": ["owner_epoch"],
+            "capabilities": ["owner_epoch", "carry_commands"],
         }
         assert asyncio.run(app_module.ready_hook()) == {"status": "ok"}
     finally:
@@ -292,7 +292,7 @@ def test_exported_sidecar_preserves_guest_runtime_contract(
         assert asyncio.run(app_module.health()) == {
             "status": "ok",
             "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION,
-            "capabilities": ["owner_epoch"],
+            "capabilities": ["owner_epoch", "carry_commands"],
         }
         assert asyncio.run(app_module.ready_hook()) == {"status": "ok"}
         assert asyncio.run(app_module.run_hook()) == {"status": "ok"}
