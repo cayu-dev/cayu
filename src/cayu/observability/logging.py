@@ -37,6 +37,8 @@ _TRACE_EVENTS = {
 _DEBUG_EVENTS = {
     EventType.HOOK_STARTED,
     EventType.HOOK_COMPLETED,
+    # The process already logs one warning for the lag each of these records.
+    EventType.RUNTIME_EVENT_LOOP_LAGGED,
 }
 _WARNING_EVENTS = {
     EventType.SESSION_INTERRUPTED,

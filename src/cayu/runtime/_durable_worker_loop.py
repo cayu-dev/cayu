@@ -20,6 +20,7 @@ from time import monotonic
 from typing import Generic, TypeVar
 
 from cayu.observability.event_loop_lag import EventLoopLagMonitor
+from cayu.runtime._event_loop_lag_sessions import SessionEventLoopLagRecorder
 
 _HeartbeatUpdateT = TypeVar("_HeartbeatUpdateT")
 _HeartbeatOutcomeT = TypeVar("_HeartbeatOutcomeT")
@@ -269,13 +270,26 @@ def worker_event_loop_lag_monitor(
     metrics: DurableWorkerMetrics | None,
     *,
     active_sessions: Callable[[], int] | None,
+    session_lag: SessionEventLoopLagRecorder | None = None,
 ) -> EventLoopLagMonitor:
     """One sampler for a worker run: it warns on lag while the worker runs sessions
-    and feeds caller-owned metrics. Without a session count it warns on lag alone."""
+    and feeds caller-owned metrics. Without a session count it warns on lag alone.
+    ``session_lag`` also records the lag on the sessions running when it happened."""
 
+    on_sample: Callable[[float], None] | None = None
+    if session_lag is not None:
+
+        def on_sample(seconds: float) -> None:
+            if metrics is not None:
+                metrics.event_loop_lag(seconds)
+            session_lag.sample(seconds)
+
+    elif metrics is not None:
+        on_sample = metrics.event_loop_lag
     return EventLoopLagMonitor(
         active_sessions=active_sessions,
-        on_sample=None if metrics is None else metrics.event_loop_lag,
+        on_sample=on_sample,
+        on_warning=None if session_lag is None else session_lag.warned,
     )
 
 

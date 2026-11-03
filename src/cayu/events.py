@@ -269,6 +269,7 @@ class EventType(StrEnum):
     RUNNER_EXEC_COMPLETED = "runner.exec.completed"
 
     RUNTIME_SINK_FAILED = "runtime.sink.failed"
+    RUNTIME_EVENT_LOOP_LAGGED = "runtime.event_loop.lagged"
     RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED = (
         "runtime.interaction_transition.acknowledgement_failed"
     )

@@ -31,6 +31,7 @@ from cayu.cli._session_reader import (
 )
 from cayu.events import Event
 from cayu.sessions._call_inspection import InspectionWindow
+from cayu.sessions._event_loop_lag import read_event_loop_lag
 from cayu.sessions._rollup import RollupPage, SessionRollupQuery, SessionTiming
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.queries import SessionQuery
@@ -203,12 +204,24 @@ class AgentSessionReader:
             "queue": {"queued": None, "delivered": None, "outstanding": None},
             "operation": {"accepted_event_count": None, "state": None},
             "provider_operation": state.get("provider_operation"),
+            "event_loop_lag": await self.event_loop_lag(session_id),
             "terminal_failure": {
                 "state": status if status in {"failed", "interrupted"} else "none"
             },
             "budget": None,
             "timing": self._timing(session_id),
         }
+
+    async def event_loop_lag(self, session_id: str) -> dict[str, Any] | None:
+        """The worker's event-loop lag recorded on the session; ``None`` from an Agent whose
+        Cayu predates the record, which refuses its event type."""
+
+        try:
+            return await read_event_loop_lag(self, session_id)
+        except CayuApiError as exc:
+            if exc.category in {"request_rejected", "unsupported"}:
+                return None
+            raise
 
     def _timing(self, session_id: str) -> dict[str, Any] | None:
         """The session's time breakdown; ``None`` from an Agent whose Cayu predates it."""

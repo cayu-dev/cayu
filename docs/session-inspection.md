@@ -472,7 +472,7 @@ cayu session list --overview
 cayu session list --overview --table --application bug-hunter
 
 # Content-free operational summary, including runtime name/version, usage,
-# pending-action counts, and where the session's time went.
+# pending-action counts, session timing, and the worker's event-loop lag.
 cayu session show SESSION_ID
 
 # A workflow run as a whole: steps, child sessions, usage and custom events.
@@ -677,6 +677,17 @@ from its `model.completed` event (see [Request controls](runtime-contracts.md#re
 `cayu session events --type model.started --include-payload 2048` shows the same record
 for every attempt, retries included. A Cloud Agent whose Cayu predates these fields returns
 its calls without them.
+
+### Event-loop lag
+
+A worker records on each session it runs when its process's event loop fell behind while
+the session ran (`runtime.event_loop.lagged` events; see
+[Watch for saturation](project-workers.md#watch-for-saturation)). `cayu session show`
+sums them as `event_loop_lag`: `reports`, `lagging_ms` (about how long the loop was late),
+`max_lag_ms`, `first_at`, `last_at`, `processes` and `truncated` (more than 1,440 reports,
+of which the first were read). The table adds a sentence when there were any. A session
+slowed by its process shows lag here; one slowed by its own work doesn't. A Cloud Agent
+whose Cayu predates these events reports `event_loop_lag` as `null`.
 
 ### Workflow runs
 

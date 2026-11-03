@@ -286,6 +286,11 @@ class SessionControl(Generic[UsageTrackerT]):
 
         return len(self._active_runs)
 
+    def active_session_ids(self) -> tuple[str, ...]:
+        """The sessions that have a run in progress in this process."""
+
+        return tuple(self._active_runs)
+
     def active_runs(self, session_id: str) -> tuple[ActiveSessionRun[UsageTrackerT], ...]:
         return tuple(self._active_runs.get(session_id, {}).values())
 

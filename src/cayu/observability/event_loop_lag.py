@@ -58,7 +58,8 @@ class EventLoopLagMonitor:
     how many sessions the caller is running: a lagging sample counts towards a
     warning only while it is above zero, and the warning names the count.
     ``on_sample`` receives every sample in seconds, for an application's own
-    metrics. A callback that raises is logged once and dropped.
+    metrics, and ``on_warning`` the lag in seconds each time the monitor warns. A
+    callback that raises is logged once and dropped.
 
     ``start()`` and ``stop()`` must be called on the loop's thread.
     ``snapshot()`` can be read from any thread.
@@ -73,6 +74,7 @@ class EventLoopLagMonitor:
         warning_interval_s: float = DEFAULT_WARNING_INTERVAL_S,
         active_sessions: Callable[[], int] | None = None,
         on_sample: Callable[[float], None] | None = None,
+        on_warning: Callable[[float], None] | None = None,
     ) -> None:
         _require_positive_seconds(interval_s, "interval_s")
         if warning_threshold_s is not None:
@@ -84,12 +86,15 @@ class EventLoopLagMonitor:
             raise TypeError("active_sessions must be callable.")
         if on_sample is not None and not callable(on_sample):
             raise TypeError("on_sample must be callable.")
+        if on_warning is not None and not callable(on_warning):
+            raise TypeError("on_warning must be callable.")
         self._interval_s = float(interval_s)
         self._warning_threshold_s = warning_threshold_s
         self._sustained_samples = sustained_samples
         self._warning_interval_s = float(warning_interval_s)
         self._active_sessions = active_sessions
         self._on_sample = on_sample
+        self._on_warning = on_warning
         self._loop: asyncio.AbstractEventLoop | None = None
         self._handle: asyncio.TimerHandle | None = None
         self._lock = threading.Lock()
@@ -159,16 +164,25 @@ class EventLoopLagMonitor:
             self._lagging_in_a_row += 1
         else:
             self._lagging_in_a_row = 0
-        if self._lagging_in_a_row >= self._sustained_samples and _claim_warning(
-            self._warning_interval_s
-        ):
-            self._warn(lag_s, sessions)
+        # The sample goes out before a warning it causes, so a warning callback sees it.
         if self._on_sample is not None:
             try:
                 self._on_sample(lag_s)
             except Exception:
                 self._on_sample = None
                 logger.warning("An event-loop lag callback failed and was removed.", exc_info=True)
+        if self._lagging_in_a_row >= self._sustained_samples and _claim_warning(
+            self._warning_interval_s
+        ):
+            self._warn(lag_s, sessions)
+            if self._on_warning is not None:
+                try:
+                    self._on_warning(lag_s)
+                except Exception:
+                    self._on_warning = None
+                    logger.warning(
+                        "An event-loop lag warning callback failed and was removed.", exc_info=True
+                    )
 
     def _count_active_sessions(self) -> int | None:
         if self._active_sessions is None:

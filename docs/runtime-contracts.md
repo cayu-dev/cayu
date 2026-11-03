@@ -5431,7 +5431,10 @@ event loop runs a timer every half second (`event_loop_lag_samples`,
 and logs a warning, at most once a minute per process, when four samples in a
 row are a quarter of a second late or more while the worker is running
 sessions; `cayu.observability.EventLoopLagMonitor` is the same sampler for
-use on its own. Eval runs use the same sampler and warning, counting their
+use on its own. With a `CayuApp`, each warning also writes a content-free
+`runtime.event_loop.lagged` event to every session the process was running that saw a
+late sample since its last such event (see
+[Watch for saturation](project-workers.md#watch-for-saturation)). Eval runs use the same sampler and warning, counting their
 running trials. Failed and cancelled claims remain distinct from successful empty
 claims. A received hint becomes accepted only when it obtains a cohort-gated
 authoritative claim attempt. That attempt is counted as ignored if it fails,

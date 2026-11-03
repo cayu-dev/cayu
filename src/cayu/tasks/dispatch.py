@@ -74,6 +74,7 @@ from cayu.runtime._durable_worker_loop import (
     wait_or_stop,
     worker_event_loop_lag_monitor,
 )
+from cayu.runtime._event_loop_lag_sessions import app_session_event_loop_lag_recorder
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime._task_store_operation_boundary import (
     task_store_cancellation_reconciliation_capability_is_complete,
@@ -2837,12 +2838,15 @@ class TaskStoreDispatcher(Dispatcher):
         if durable_runtime.lifecycle_state != "open":
             return
         admission_wakeup = None
+        # A CayuApp also records the lag on the sessions it slowed.
+        session_lag = app_session_event_loop_lag_recorder(durable_runtime)
         lag_monitor = worker_event_loop_lag_monitor(
             metrics,
             # Only the base claim boundary counts the handlers an override runs.
             active_sessions=(
                 poller.metrics.active_handler_count if uses_base_claim_boundary else None
             ),
+            session_lag=session_lag,
         )
         try:
             lag_monitor.start()
@@ -2872,6 +2876,9 @@ class TaskStoreDispatcher(Dispatcher):
             if admission_wakeup is not None:
                 admission_wakeup.close()
             poller.close()
+            # Last: waiting for lag writes in flight can be cancelled.
+            if session_lag is not None:
+                await session_lag.aclose()
 
     async def _acknowledge_terminal_task(
         self,

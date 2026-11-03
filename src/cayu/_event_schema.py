@@ -3351,6 +3351,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.RUNTIME_SINK_FAILED] = _observed_policy(
         "error error_type event_id event_sequence event_type sink"
     )
+    policies[EventType.RUNTIME_EVENT_LOOP_LAGGED] = _observed_policy(
+        "lag_ms lagging_ms lagging_samples max_lag_ms pid sample_interval_ms sessions_running "
+        "threshold_ms window_ms"
+    )
     policies[EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED] = _observed_policy(
         "interaction_transition_failures transition_event_type",
         untrusted_container_keys={"interaction_transition_failures"},

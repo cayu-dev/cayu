@@ -84,6 +84,7 @@ from cayu.runtime._durable_worker_loop import (
     worker_event_loop_lag_monitor,
     worker_stop_requested,
 )
+from cayu.runtime._event_loop_lag_sessions import app_session_event_loop_lag_recorder
 from cayu.runtime._task_lease_authority import (
     TaskLeaseAuthority as _TaskLeaseAuthority,
 )
@@ -1299,9 +1300,13 @@ async def run_task_worker(
                 admission_wakeup.close()
             poller.close()
 
-    # One lag sampler per worker run, kept until every slot has drained.
+    # One lag sampler per worker run, kept until every slot has drained. It also
+    # records the lag on the sessions it slowed.
+    session_lag = app_session_event_loop_lag_recorder(app)
     lag_monitor = worker_event_loop_lag_monitor(
-        metrics, active_sessions=app._session_control.active_session_count
+        metrics,
+        active_sessions=app._session_control.active_session_count,
+        session_lag=session_lag,
     )
     lag_monitor.start()
     try:
@@ -1352,6 +1357,8 @@ async def run_task_worker(
         return sum(slot.result() for slot in slots)
     finally:
         lag_monitor.stop()
+        if session_lag is not None:
+            await session_lag.aclose()
 
 
 async def _settle_wake_attempts_of_ended_tasks(

@@ -284,6 +284,11 @@ person or service that reconciled it. `evidence_kind` says what made settling it
 
 `show` reads the same section from a local store, `--server-url` and `--application`.
 
+A task whose session ran while its worker's event loop was late also gets an `Event loop`
+section (`event_loop_lag` in JSON; `null` for a task without a session or from a Cloud Agent
+whose Cayu predates it). It is the session's summary described in
+[Watch for saturation](#watch-for-saturation).
+
 `wait` reads the task every `--poll-seconds` (default 5) until it ends, then prints it as
 `show` does, with `wait.task_id` (the task you named) and `wait.outcome` added to the JSON.
 It notes each status it sees on stderr. An attempt that failed with a retry scheduled is
@@ -509,6 +514,32 @@ sessions in more processes. One slow callback, or lag while no session runs,
 doesn't warn. `run_task_worker` counts the sessions its app is running, the
 dispatcher the tasks it is handling, and an eval its running trials.
 
+`run_task_worker` and `TaskStoreDispatcher.run_worker` (with a `CayuApp`) also record the
+lag on each session that was running in the process while the loop was late, so it shows
+where someone looks at a slow session. Each time the worker warns, every running session
+that saw a late sample since its last report gets one `runtime.event_loop.lagged` event:
+
+| Field | Meaning |
+| --- | --- |
+| `lag_ms` | The lag of the sample that set off the warning. |
+| `max_lag_ms` | The worst sample the session saw since its last report. |
+| `lagging_samples`, `lagging_ms` | How many late samples it saw, and that many sample intervals: about how long the loop was late while it ran. |
+| `window_ms` | The time the report covers, from the session's first late sample since its last report. |
+| `sample_interval_ms`, `threshold_ms` | The sampler's settings. |
+| `sessions_running` | How many sessions the process was running. |
+| `pid` | The worker process, to tell processes apart when a worker runs several. |
+
+`cayu session show` sums them as `event_loop_lag` (`reports`, `lagging_ms`, `max_lag_ms`,
+`first_at`, `last_at`, `processes`, `truncated`; all zero or `null` for a session with
+none), and `cayu task show` reports the same for the task's session. The tables add a
+sentence such as "The worker's event loop was late for 6m00s while this session ran, up
+to 1.20 s". `cayu session events SESSION_ID --type runtime.event_loop.lagged` lists the
+reports. Every worker of one app shares one recorder, so running several worker loops on
+an app counts each late interval once. A session that ends between two warnings keeps the reports it already got; the
+late samples after its last one aren't recorded. Writing them can fail (it's logged) without
+affecting the session. For a Cloud Agent whose Cayu predates these events, `event_loop_lag`
+is `null`.
+
 A `DurableWorkerMetrics` passed to the worker receives every sample in its
 snapshot, next to the active handler count, for an application's own metrics
 or alerts:
@@ -545,10 +576,12 @@ monitor.stop()
 
 `interval_s` (0.5 by default), `warning_threshold_s` (0.25; `None` turns the
 warning off), `sustained_samples` (4), `warning_interval_s` (60),
-`active_sessions` and `on_sample` are keyword options. `active_sessions` is a
+`active_sessions`, `on_sample` and `on_warning` are keyword options. `active_sessions` is a
 callable that returns how many sessions the process is running; with it, lag
 counts towards a warning only while that number is above zero, and the
-warning names it. The defaults are the module's `DEFAULT_*` constants.
+warning names it. `on_warning` receives the lag in seconds each time the monitor warns,
+after `on_sample` has received that sample. The defaults are the module's `DEFAULT_*`
+constants.
 
 ## Use multiple CPU cores
 

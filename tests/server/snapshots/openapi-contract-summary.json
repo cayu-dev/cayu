@@ -14692,6 +14692,7 @@
         "runner.exec.started",
         "runner.exec.completed",
         "runtime.sink.failed",
+        "runtime.event_loop.lagged",
         "runtime.interaction_transition.acknowledgement_failed"
       ],
       "title": "EventType",

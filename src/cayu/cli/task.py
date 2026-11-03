@@ -31,6 +31,7 @@ from cayu.cli._task_readers import (
     open_store_task_reader,
 )
 from cayu.cli.session import _redact_sensitive
+from cayu.sessions._event_loop_lag import event_loop_lag_text
 from cayu.tasks.cancellation import (
     TaskCancellationReconciliationEventType,
     TaskRetryCancellationReconciliationEventType,
@@ -446,6 +447,7 @@ async def _wait_for_task(args: argparse.Namespace, reader: TaskReader) -> int:
 
 
 async def _task_payload(reader: TaskReader, task: dict[str, Any]) -> dict[str, Any]:
+    session_id = task.get("session_id")
     return _redact_sensitive(
         {
             "schema_version": CLI_SCHEMA_VERSION,
@@ -453,6 +455,9 @@ async def _task_payload(reader: TaskReader, task: dict[str, Any]) -> dict[str, A
             "task": task,
             "cancellation": cancellation_summary(task),
             "retry_series": await _retry_series(reader, task),
+            "event_loop_lag": (
+                await reader.event_loop_lag(session_id) if isinstance(session_id, str) else None
+            ),
         }
     )
 
@@ -764,6 +769,10 @@ def _print_task(payload: dict[str, Any]) -> None:
                     if value is not None and key != "summary"
                 ],
             )
+    lag = event_loop_lag_text(payload.get("event_loop_lag"))
+    if lag is not None:
+        print("\nEvent loop")
+        print(terminal_safe(lag))
     series = payload["retry_series"]
     if series is not None:
         print(

@@ -16,6 +16,8 @@ from urllib.parse import quote
 
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, CayuApiNotFound
 from cayu.cli.store_targets import SessionStoreBackend, SessionStoreTarget
+from cayu.sessions._event_loop_lag import read_event_loop_lag
+from cayu.sessions.store import SessionStore
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task, TaskStatus, task_error_code
 from cayu.tasks.store import TaskStore
@@ -51,14 +53,23 @@ class TaskReader(Protocol):
         """The task's detail, with its result, or ``None`` when there is no such task."""
         ...
 
+    async def event_loop_lag(self, session_id: str) -> dict[str, Any] | None:
+        """The worker's event-loop lag recorded on the task's session
+        (``cayu.sessions._event_loop_lag``), or ``None`` when the source can't say."""
+        ...
+
     async def close(self) -> None: ...
 
 
 class StoreTaskReader:
-    """Reads a ``TaskStore`` the caller opened; ``close`` closes it."""
+    """Reads a ``TaskStore`` the caller opened, and its sessions from ``sessions`` when
+    given; ``close`` closes both."""
 
-    def __init__(self, store: TaskStore, *, source: dict[str, Any]) -> None:
+    def __init__(
+        self, store: TaskStore, *, source: dict[str, Any], sessions: SessionStore | None = None
+    ) -> None:
         self._store = store
+        self._sessions = sessions
         self.source = source
 
     async def list_tasks(self, request: TaskListRequest) -> list[dict[str, Any]]:
@@ -80,10 +91,16 @@ class StoreTaskReader:
         task = await self._store.load_task(task_id)
         return None if task is None else task_projection(task, detail=True)
 
+    async def event_loop_lag(self, session_id: str) -> dict[str, Any] | None:
+        if self._sessions is None:
+            return None
+        return await read_event_loop_lag(self._sessions, session_id)
+
     async def close(self) -> None:
-        close = getattr(self._store, "close", None)
-        if close is not None:
-            await close()
+        for store in (self._store, self._sessions):
+            close = getattr(store, "close", None)
+            if close is not None:
+                await close()
 
 
 class ApiTaskReader:
@@ -124,6 +141,20 @@ class ApiTaskReader:
             raise CayuApiError("not_cayu", f"{self._api.description} returned an invalid task.")
         return body
 
+    async def event_loop_lag(self, session_id: str) -> dict[str, Any] | None:
+        from cayu.cli._agent_session_reader import AgentSessionReader
+
+        try:
+            return await AgentSessionReader(self._api).event_loop_lag(session_id)
+        except ValueError:
+            # The task names a session the server no longer has.
+            return None
+        except CayuApiError as exc:
+            if not exc.transient:
+                raise
+            # The server didn't answer just now; the task itself was read.
+            return None
+
     async def close(self) -> None:
         self._api.close()
 
@@ -144,7 +175,9 @@ def open_store_task_reader(target: SessionStoreTarget) -> StoreTaskReader:
         store: TaskStore = SQLiteTaskStore(
             path, schema_mode=schema.SchemaMode.VALIDATE, read_only=True
         )
-        return StoreTaskReader(store, source={"kind": "sqlite", "path": str(path)})
+        return StoreTaskReader(
+            store, source={"kind": "sqlite", "path": str(path)}, sessions=_session_store(target)
+        )
     if target.postgres_dsn is None:
         raise AssertionError("Resolved Postgres target has no DSN.")
     from cayu.storage import PostgresTaskStore
@@ -152,7 +185,27 @@ def open_store_task_reader(target: SessionStoreTarget) -> StoreTaskReader:
     store = PostgresTaskStore(
         target.postgres_dsn, schema_mode=schema.SchemaMode.VALIDATE, read_only=True
     )
-    return StoreTaskReader(store, source={"kind": "postgres"})
+    return StoreTaskReader(store, source={"kind": "postgres"}, sessions=_session_store(target))
+
+
+def _session_store(target: SessionStoreTarget) -> SessionStore:
+    """The session store in the task store's database, opened read-only."""
+
+    from cayu.storage import migrations as schema
+
+    if target.backend is SessionStoreBackend.SQLITE:
+        from cayu.storage import SQLiteSessionStore
+
+        assert target.sqlite_path is not None
+        return SQLiteSessionStore(
+            target.sqlite_path, schema_mode=schema.SchemaMode.VALIDATE, read_only=True
+        )
+    from cayu.storage import PostgresSessionStore
+
+    assert target.postgres_dsn is not None
+    return PostgresSessionStore(
+        target.postgres_dsn, schema_mode=schema.SchemaMode.VALIDATE, read_only=True
+    )
 
 
 def task_projection(task: Task, *, detail: bool = False) -> dict[str, Any]:

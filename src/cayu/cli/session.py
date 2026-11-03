@@ -42,6 +42,7 @@ from cayu.runtime.public_authority import public_authority_alias_codec_from_envi
 from cayu.sessions._call_inspection import InspectionWindow
 from cayu.sessions._call_inspection import redact_inspection_value as _redact_sensitive
 from cayu.sessions._call_inspection import truncate_utf8 as _truncate_utf8
+from cayu.sessions._event_loop_lag import event_loop_lag_text
 from cayu.sessions._rollup import (
     RollupGroup,
     SessionRollupQuery,
@@ -1215,6 +1216,9 @@ async def _show_session(args: argparse.Namespace, reader: SessionReader) -> int:
         return 0
     timing = payload.pop("timing", None)
     _render_detail(args.output_format, payload)
+    lag = event_loop_lag_text(payload.get("event_loop_lag"))
+    if lag is not None:
+        print("\n" + terminal_safe(lag))
     print()
     _print_timing(cast("dict[str, Any] | None", _redact_sensitive(timing)))
     return 0
