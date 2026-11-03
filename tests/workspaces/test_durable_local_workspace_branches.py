@@ -47,6 +47,7 @@ from cayu.workspaces import (
     WorkspaceBranchResourceExhaustedError,
     WorkspaceBranchRollbackRequest,
     WorkspaceBranchStoreDurability,
+    WorkspaceRevisionMismatchError,
     WorkspaceRevisionObservationLimits,
 )
 from cayu.workspaces.branches import workspace_branch_change_set_digest
@@ -970,6 +971,119 @@ def test_terminal_recovery_retires_surviving_process_attachment(
         with pytest.raises(WorkspaceBranchClosedError, match="rolled_back"):
             await branch.changes()
         await _assert_terminal_handle_released_capacity(root, store)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["create", "replace", "delete"])
+@pytest.mark.parametrize("overlay", [False, True])
+def test_rejected_precondition_keeps_every_exact_attachment_active(
+    tmp_path: Path,
+    operation: str,
+    overlay: bool,
+) -> None:
+    async def scenario() -> None:
+        store = _TemporarySQLiteSessionStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        (root / "answer.txt").write_bytes(b"baseline")
+        source, branch, request = await _durable_branch(root, store)
+        if overlay:
+            await branch.write_bytes("answer.txt", b"private edit")
+        repeated = await source.create_branch(request)
+        assert repeated.branch is not None
+        sibling = repeated.branch
+        before = await branch.read_bytes("answer.txt")
+        changes = await branch.changes()
+
+        if operation == "create":
+            with pytest.raises(FileExistsError):
+                await branch.create_bytes("answer.txt", b"must not replace")
+        elif operation == "replace":
+            with pytest.raises(WorkspaceRevisionMismatchError):
+                await branch.replace_bytes(
+                    "answer.txt", b"must not replace", expected_revision=f"{before.revision}-stale"
+                )
+        else:
+            with pytest.raises(WorkspaceRevisionMismatchError):
+                await branch.delete_if_revision(
+                    "answer.txt", expected_revision=f"{before.revision}-stale"
+                )
+
+        for attachment in (branch, sibling):
+            assert attachment.lifecycle_status is WorkspaceBranchLifecycleStatus.ACTIVE
+            assert (await attachment.read_bytes("answer.txt")).content == before.content
+            assert await attachment.changes() == changes
+        await branch.replace_bytes("answer.txt", b"valid edit", expected_revision=before.revision)
+        assert (await branch.read_bytes("answer.txt")).content == b"valid edit"
+        await branch.rollback(
+            WorkspaceBranchRollbackRequest(
+                branch_id=branch.branch_id,
+                idempotency_key="rollback-alpha",
+                expected_run_epoch=0,
+                binding_generation="binding-1",
+            )
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["replace", "delete"])
+@pytest.mark.parametrize("overlay", [False, True])
+@pytest.mark.parametrize("corruption", ["truncate", "modify", "remove"])
+def test_private_content_integrity_failure_fences_every_exact_attachment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    overlay: bool,
+    corruption: str,
+) -> None:
+    async def scenario() -> None:
+        import cayu.workspaces._local_branch as branch_module
+
+        _isolate_retained_branch_state(monkeypatch, branch_module)
+        store = _TemporarySQLiteSessionStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        (root / "answer.txt").write_bytes(b"baseline")
+        source, branch, request = await _durable_branch(root, store)
+        if overlay:
+            await branch.write_bytes("answer.txt", b"private edit")
+        repeated = await source.create_branch(request)
+        assert repeated.branch is not None
+        sibling = repeated.branch
+        before = await branch.read_bytes("answer.txt")
+        private_file = (branch._overlay_root if overlay else branch._baseline_root) / "answer.txt"
+        if corruption == "remove":
+            private_file.unlink()
+        elif corruption == "truncate":
+            private_file.write_bytes(b"")
+        else:
+            private_file.write_bytes(before.content.upper())
+
+        error = FileNotFoundError if corruption == "remove" else WorkspaceBranchFencedError
+        with pytest.raises(error):
+            if operation == "replace":
+                await branch.replace_bytes(
+                    "answer.txt", b"must not replace", expected_revision=before.revision
+                )
+            else:
+                await branch.delete_if_revision("answer.txt", expected_revision=before.revision)
+
+        for attachment in (branch, sibling):
+            assert attachment.lifecycle_status is WorkspaceBranchLifecycleStatus.FENCED
+            with pytest.raises(WorkspaceBranchFencedError, match="fenced"):
+                await attachment.write_bytes("answer.txt", b"must not overwrite evidence")
+            with pytest.raises(WorkspaceBranchFencedError, match="fenced"):
+                await attachment.delete("answer.txt")
+        if corruption == "remove":
+            assert not private_file.exists()
+        else:
+            expected = b"" if corruption == "truncate" else before.content.upper()
+            assert private_file.read_bytes() == expected
+        assert (root / "answer.txt").read_bytes() == b"baseline"
 
     asyncio.run(scenario())
 

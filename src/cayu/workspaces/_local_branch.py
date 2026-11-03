@@ -4515,9 +4515,12 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 )
                 updated = _validated_durable_branch_record(updated)
             result: list[_ResultT] = []
+            operation_started = False
 
             def guarded_operation() -> None:
+                nonlocal operation_started
                 self._validate_live_binding(binding_claim_lease)
+                operation_started = True
                 result.append(operation())
 
             try:
@@ -4547,6 +4550,18 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                         raise
                     return result[0]
                 with self._state_lock:
+                    # Rejected or reconciled mutations can leave both the durable
+                    # record and private state unchanged without an uncertain outcome.
+                    if (
+                        loaded == current
+                        and operation_started
+                        and not result
+                        and self._lifecycle is WorkspaceBranchLifecycleStatus.ACTIVE
+                        and self._overlay
+                        == {path: identity.private() for path, identity in current.overlay.items()}
+                        and self._tombstones == set(current.tombstones)
+                    ):
+                        raise
                     self._set_shared_uncertain_lifecycle_unlocked()
                 raise
             durable.record = updated
@@ -6597,10 +6612,16 @@ def _read_identity_bytes(
     path: str,
     identity: _FileIdentity,
 ) -> bytes:
-    location, current = branch._visible_location(path)
-    if location is None or current != identity:
-        raise WorkspaceBranchFencedError("Private branch identity changed during mutation.")
-    return _read_regular_bytes(location, path, expected=identity)
+    try:
+        location, current = branch._visible_location(path)
+        if location is None or current != identity:
+            raise WorkspaceBranchFencedError("Private branch identity changed during mutation.")
+        return _read_regular_bytes(location, path, expected=identity)
+    except BaseException:
+        if branch._durable is not None:
+            # Unchanged cached metadata cannot prove private content is intact.
+            branch._set_shared_uncertain_lifecycle_unlocked()
+        raise
 
 
 def _read_regular_bytes(
