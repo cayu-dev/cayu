@@ -42,6 +42,8 @@ _REQUIREMENT = re.compile(
 )
 _SPECIFIER = re.compile(r"\s*(?P<op>~=|===|==|!=|<=|>=|<|>)\s*(?P<version>[^\s,;()]+)\s*\Z")
 _VERSION = re.compile(r"v?(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)(?P<suffix>.*)\Z", re.I)
+# The full commit uv.lock records after a Git source URL's `#`.
+_LOCKED_COMMIT = re.compile(r"[0-9a-f]{40}")
 _SERVE_HEADER = re.compile(r"^\[\s*tool\s*\.\s*cayu\s*\.\s*serve\s*\][ \t]*(?:#[^\n]*)?$", re.M)
 # Each of these runtime extras includes every dependency in the server extra.
 _SERVER_RUNTIME_EXTRAS = frozenset({"server", "server-settings", "all", "oidc"})
@@ -342,9 +344,11 @@ def environment_auth_unavailable_reason(
     Returns None when it guarantees the module: the `cayu` requirements in
     `[project].dependencies`, or the uv overrides that replace them, exclude every
     release up to and including 0.8.1. When `[tool.uv.sources]` installs `cayu`
-    from elsewhere, only a local path source inside `root` counts: a source
-    tree, wheel, or `.tar.gz` source distribution that contains the module, named
-    by a relative path that, with any symlinks on the way, stays inside `root`.
+    from elsewhere, a Git source counts when `root`'s `uv.lock` locks it to a commit
+    whose version is newer than 0.8.1, and a local path source inside `root` counts
+    when it is a source tree, wheel, or `.tar.gz` source distribution that contains
+    the module, named by a relative path that, with any symlinks on the way, stays
+    inside `root`.
     `uploaded`, when given, says whether Cayu Cloud receives a file (a path
     relative to `root`); the archive or the source tree's module file, and every
     directory and symlink on the way to it, must be among them. Otherwise returns a lowercase
@@ -592,6 +596,10 @@ def _path_source_unavailable_reason(
 
     path = _source_path(source)
     if path is None:
+        if isinstance(source, Mapping) and isinstance(
+            cast("Mapping[str, object]", source).get("git"), str
+        ):
+            return _git_source_unavailable_reason(root)
         return (
             "[tool.uv.sources] installs cayu from a source that is not a local path, "
             f"which the check cannot inspect for {_ENVIRONMENT_AUTH_MODULE}"
@@ -620,6 +628,58 @@ def _path_source_unavailable_reason(
         f"receive {missing.as_posix()}: Git ignores it, or it is under a directory "
         "`cayu cloud deploy` never uploads, such as dist or build"
     )
+
+
+def _git_source_unavailable_reason(root: Path | None) -> str | None:
+    """Why a cayu Git source may lack the module, or None when uv.lock shows it ships it.
+
+    Cayu Cloud installs the commit `uv.lock` records, and that commit's own version
+    is locked beside it, so a locked version newer than the last release without
+    the module guarantees it, as a requirement would. Every Cayu entry must be
+    checked: platform markers can select a registry package instead of Git.
+    """
+
+    described = "the cayu Git source in [tool.uv.sources]"
+    if root is None:
+        return f"{described} was not checked for {_ENVIRONMENT_AUTH_MODULE}"
+    try:
+        lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return f"{described} is not locked in a readable uv.lock; run `uv lock`"
+    packages = lock.get("package")
+    locked = [
+        package
+        for package in (packages if isinstance(packages, list) else ())
+        if isinstance(package, Mapping) and _normalize_name(package.get("name")) == "cayu"
+    ]
+    if not any(
+        isinstance(package.get("source"), Mapping) and isinstance(package["source"].get("git"), str)
+        for package in locked
+    ):
+        return f"uv.lock does not lock {described}; run `uv lock`"
+    for package in locked:
+        source = package.get("source")
+        git = source.get("git") if isinstance(source, Mapping) else None
+        if isinstance(git, str):
+            if git.partition(":")[0].lower() in {"file", "git+file"}:
+                return (
+                    "uv.lock locks cayu to a local Git repository that Cayu Cloud cannot fetch; "
+                    "use a remote Git URL and run `uv lock`"
+                )
+            if not _LOCKED_COMMIT.fullmatch(git.partition("#")[2]):
+                return f"uv.lock does not record the commit {described} resolves to; run `uv lock`"
+        elif not (isinstance(source, Mapping) and isinstance(source.get("registry"), str)):
+            return (
+                "uv.lock contains a cayu source that the check cannot inspect for "
+                f"{_ENVIRONMENT_AUTH_MODULE}"
+            )
+        version = package.get("version")
+        if not isinstance(version, str) or not _guarantees_newer("==", version):
+            return (
+                f"uv.lock locks cayu {version}, and releases up to "
+                f"{LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} lack {_ENVIRONMENT_AUTH_MODULE}"
+            )
+    return None
 
 
 @dataclass(frozen=True)

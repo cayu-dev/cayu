@@ -433,7 +433,9 @@ def test_declared_runtime_reads_uv_overrides_and_sources(tmp_path: Path) -> None
     assert environment_auth_unavailable_reason(sourced, root=tmp_path) is None
     assert environment_auth_unavailable_reason(sourced) is not None
     git = document('[tool.uv.sources]\ncayu = { git = "https://example.com/cayu.git" }\n')
-    assert "not a local path" in (environment_auth_unavailable_reason(git, root=tmp_path) or "")
+    assert "not locked in a readable uv.lock" in (
+        environment_auth_unavailable_reason(git, root=tmp_path) or ""
+    )
     assert environment_auth_upgrade_edits(git) == (
         "Remove the cayu entry from [tool.uv.sources] so a released cayu is installed.",
     )
@@ -461,6 +463,93 @@ def _sourced(path: str) -> dict:
         '[project]\nname = "a"\ndependencies = ["cayu[postgres,server]>=0.16.1"]\n'
         f"[tool.uv.sources]\ncayu = {{ path = {json.dumps(path)} }}\n"
     )
+
+
+def test_a_git_source_counts_when_uv_lock_locks_a_commit_that_ships_the_module(
+    tmp_path: Path,
+) -> None:
+    pin = "c0aa269ee30816581e30a5254c15c327354193ed"
+    url = "https://example.com/cayu.git"
+    document = tomllib.loads(
+        '[project]\nname = "a"\ndependencies = ["cayu[server]>=0.9"]\n'
+        f'[tool.uv.sources]\ncayu = {{ git = "{url}", rev = "{pin}" }}\n'
+    )
+
+    def lock(version: str, fragment: str = pin) -> None:
+        (tmp_path / "uv.lock").write_text(
+            f'version = 1\n[[package]]\nname = "cayu"\nversion = "{version}"\n'
+            f'source = {{ git = "{url}?rev={pin}#{fragment}" }}\n'
+        )
+
+    # Without the project, there is no lock to read.
+    assert environment_auth_unavailable_reason(document) == (
+        "the cayu Git source in [tool.uv.sources] was not checked for cayu.server.environment_auth"
+    )
+    assert "readable uv.lock" in (
+        environment_auth_unavailable_reason(document, root=tmp_path) or ""
+    )
+    # Cayu Cloud installs the locked commit, whose own version says it has the module.
+    lock("0.17.0")
+    assert environment_auth_unavailable_reason(document, root=tmp_path) is None
+    lock("0.8.1")
+    assert environment_auth_unavailable_reason(document, root=tmp_path) == (
+        "uv.lock locks cayu 0.8.1, and releases up to 0.8.1 lack cayu.server.environment_auth"
+    )
+    lock("0.17.0", fragment="main")
+    assert "does not record the commit" in (
+        environment_auth_unavailable_reason(document, root=tmp_path) or ""
+    )
+
+
+@pytest.mark.parametrize("scheme", ["file", "git+file"])
+def test_git_readiness_rejects_local_repositories(tmp_path: Path, scheme: str) -> None:
+    pin = "a" * 40
+    url = f"{scheme}:///home/example/cayu"
+    document = tomllib.loads(
+        '[project]\nname = "a"\ndependencies = ["cayu[server]"]\n'
+        f'[tool.uv.sources]\ncayu = {{ git = "{url}", rev = "{pin}" }}\n'
+    )
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n[[package]]\nname = "cayu"\nversion = "0.17.0"\n'
+        f'source = {{ git = "{url}?rev={pin}#{pin}" }}\n'
+    )
+
+    assert "local Git repository that Cayu Cloud cannot fetch" in (
+        environment_auth_unavailable_reason(document, root=tmp_path) or ""
+    )
+
+
+@pytest.mark.parametrize(
+    ("other_source", "other_version", "ready"),
+    [
+        ('{ registry = "https://pypi.org/simple" }', "0.8.1", False),
+        ('{ registry = "https://pypi.org/simple" }', "0.17.0", True),
+        ('{ git = "https://example.com/cayu.git#' + "b" * 40 + '" }', "0.8.1", False),
+        ('{ git = "https://example.com/cayu.git#main" }', "0.17.0", False),
+        ('{ directory = "vendor/cayu" }', "0.17.0", False),
+        ("{}", "0.17.0", False),
+    ],
+)
+def test_git_readiness_checks_every_marker_qualified_lock_entry(
+    tmp_path: Path, other_source: str, other_version: str, ready: bool
+) -> None:
+    pin = "a" * 40
+    document = tomllib.loads(
+        '[project]\nname = "a"\ndependencies = ["cayu[server]"]\n'
+        '[tool.uv.sources]\ncayu = { git = "https://example.com/cayu.git", '
+        f'rev = "{pin}", marker = "sys_platform == \'darwin\'" }}\n'
+    )
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n[[package]]\nname = "cayu"\nversion = "0.17.0"\n'
+        f'source = {{ git = "https://example.com/cayu.git#{pin}" }}\n'
+        "resolution-markers = [\"sys_platform == 'darwin'\"]\n"
+        f'[[package]]\nname = "cayu"\nversion = "{other_version}"\n'
+        f"source = {other_source}\n"
+        "resolution-markers = [\"sys_platform != 'darwin'\"]\n"
+    )
+
+    reason = environment_auth_unavailable_reason(document, root=tmp_path)
+    assert (reason is None) is ready
 
 
 @pytest.mark.parametrize(
