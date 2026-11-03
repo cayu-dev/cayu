@@ -1251,7 +1251,10 @@ class HttpxUpstream:
             client.stream(
                 request.method,
                 target.url,
-                headers=headers,
+                # Captured values are Latin-1; HTTPX encodes string values as ASCII.
+                headers=[
+                    (key.encode("ascii"), value.encode("latin-1")) for key, value in headers.items()
+                ],
                 content=request.body or None,
                 extensions=extensions,
             ) as response,
