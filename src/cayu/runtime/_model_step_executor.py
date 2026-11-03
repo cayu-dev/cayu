@@ -2781,6 +2781,10 @@ class ModelStepRun:
         self._invocation_context = invocation_context
         self._model_execution_selection = selection
         self._interaction_id = invocation_context.binding.interaction_id
+        # Targeted grants belong to the completed interaction, not the queued turn.
+        self._targeted_tool_grants = None
+        self._targeted_tool_grant_ids = ()
+        self._targeted_tool_generation_id = None
 
     def _resolve_tool_exposure(
         self,
