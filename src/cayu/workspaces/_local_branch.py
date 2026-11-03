@@ -5055,21 +5055,12 @@ class LocalWorkspaceBranch(WorkspaceBranch):
         publication: _DurablePublication,
     ) -> None:
         change_set = publication.change_set
+        deleted_paths = frozenset(
+            change.path for change in change_set.changes if change.operation == "deleted"
+        )
+        created_ancestors = _created_ancestor_paths(change_set)
         with workspace_source_lock(self._source.root, exclusive=True):
             self._validate_source_root()
-            for change in change_set.changes:
-                if change.after is None:
-                    continue
-                try:
-                    settle_regular_staging(
-                        self._source.root,
-                        change.path,
-                        _durable_publication_staging_name(publication, change.path),
-                        expected_sha256=change.after.sha256,
-                        expected_bytes=change.after.bytes,
-                    )
-                except _LocalGuardStagingConflictError:
-                    raise _DurablePublicationAmbiguous((change.path,)) from None
             positions: dict[str, Literal["before", "after"]] = {}
             conflicts: dict[str, WorkspaceBranchConflict] = {}
             after_count = 0
@@ -5095,6 +5086,27 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                             )
                         )
                     ) from None
+                if (
+                    change.operation == "created"
+                    and actual_path != change.path
+                    and actual_path in deleted_paths
+                    and actual_kind == "file"
+                ):
+                    # A file scheduled for deletion still blocks this child.
+                    # Neither the child nor its staging file can exist yet;
+                    # the ancestor's own change checks its baseline identity.
+                    actual_path, actual_kind, actual = change.path, "missing", None
+                elif change.after is not None:
+                    try:
+                        settle_regular_staging(
+                            self._source.root,
+                            change.path,
+                            _durable_publication_staging_name(publication, change.path),
+                            expected_sha256=change.after.sha256,
+                            expected_bytes=change.after.bytes,
+                        )
+                    except _LocalGuardStagingConflictError:
+                        raise _DurablePublicationAmbiguous((change.path,)) from None
                 before_matches = actual_path == change.path and (
                     (change.before is None and actual_kind == "missing")
                     or (
@@ -5105,7 +5117,13 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                     )
                 )
                 after_matches = actual_path == change.path and (
-                    (change.after is None and actual_kind == "missing")
+                    (
+                        change.after is None
+                        and (
+                            actual_kind == "missing"
+                            or (actual_kind == "directory" and change.path in created_ancestors)
+                        )
+                    )
                     or (
                         change.after is not None
                         and actual_kind == "file"
@@ -5539,13 +5557,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
         change_set: WorkspaceBranchChangeSet,
     ) -> tuple[WorkspaceBranchConflict, ...]:
         conflicts: list[WorkspaceBranchConflict] = []
-        created_ancestors = {
-            "/".join(parts[: index + 1])
-            for change in change_set.changes
-            if change.operation == "created"
-            for parts in (change.path.split("/")[:-1],)
-            for index in range(len(parts))
-        }
+        created_ancestors = _created_ancestor_paths(change_set)
         for change in change_set.changes:
             actual_path, kind, actual = _inspect_source_path(
                 self._source.root,
@@ -6728,6 +6740,16 @@ def _inspect_source_path(
         if current_fd != root_fd:
             os.close(current_fd)
         os.close(root_fd)
+
+
+def _created_ancestor_paths(change_set: WorkspaceBranchChangeSet) -> frozenset[str]:
+    ancestors: set[str] = set()
+    for change in change_set.changes:
+        if change.operation == "created":
+            parts = change.path.split("/")[:-1]
+            for index in range(len(parts)):
+                ancestors.add("/".join(parts[: index + 1]))
+    return frozenset(ancestors)
 
 
 def _missing_ancestor_paths(
