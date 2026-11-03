@@ -663,11 +663,12 @@ class TransparentEgressProxyServer:
                 headers=headers,
                 body=body,
             )
+            is_head = method.upper() == "HEAD"
             # Chunked framing lets a truncated stream be told apart from a
             # complete one, so only HTTP/1.1 responses that carry a body stream.
             response_stream = (
                 _ResponseStreamChannel(self._loop)
-                if version == "HTTP/1.1" and method.upper() != "HEAD"
+                if version == "HTTP/1.1" and not is_head
                 else None
             )
             response, response_buffers = self._call_broker(
@@ -678,7 +679,7 @@ class TransparentEgressProxyServer:
             if response is None:
                 return
             try:
-                response_head = _serialize_response_head(response)
+                response_head = _serialize_response_head(response, is_head=is_head)
                 _send_all(tls, response_head, stop=self._stop)
                 _send_all(tls, response.body, stop=self._stop)
             finally:
@@ -1266,7 +1267,9 @@ def _content_length(headers: dict[str, str]) -> int | None:
     return None
 
 
-def _serialize_response_head(response: CapturedResponse, *, chunked: bool = False) -> bytes:
+def _serialize_response_head(
+    response: CapturedResponse, *, chunked: bool = False, is_head: bool = False
+) -> bytes:
     from cayu.egress.broker import _validated_set_cookie_headers
 
     cookies = _validated_set_cookie_headers(response.set_cookie_headers)
@@ -1282,7 +1285,9 @@ def _serialize_response_head(response: CapturedResponse, *, chunked: bool = Fals
     }
     if chunked:
         headers["Transfer-Encoding"] = "chunked"
-    else:
+    elif not is_head:
+        # HEAD's empty body does not reveal the corresponding GET representation
+        # size. The broker strips the upstream length, so omit it for HEAD.
         headers["Content-Length"] = str(len(response.body))
     headers["Connection"] = "close"
     for key, value in headers.items():
