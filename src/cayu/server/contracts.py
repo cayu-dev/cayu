@@ -3555,6 +3555,7 @@ class ApiKnowledgeChunk(ApiBaseModel):
 
 
 class PendingKnowledgeDetailResponse(ApiKnowledgeEntryBase):
+    content_redacted: Literal[True]
     text: str
     metadata: dict[str, Any]
     expires_at: str | None

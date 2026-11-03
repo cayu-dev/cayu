@@ -27376,6 +27376,11 @@
             ],
             "title": "Confidence"
           },
+          "content_redacted": {
+            "const": true,
+            "title": "Content Redacted",
+            "type": "boolean"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -27547,6 +27552,7 @@
           "importance",
           "importance_source",
           "confidence",
+          "content_redacted",
           "text",
           "metadata",
           "expires_at",
@@ -33782,6 +33788,11 @@
             ],
             "title": "Confidence"
           },
+          "content_redacted": {
+            "const": true,
+            "title": "Content Redacted",
+            "type": "boolean"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -33953,6 +33964,7 @@
           "importance",
           "importance_source",
           "confidence",
+          "content_redacted",
           "text",
           "metadata",
           "expires_at",

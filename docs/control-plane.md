@@ -945,6 +945,12 @@ repeat, and every label must match. They stay inside the configured scope: a
 chunks (`max_chunks` up to 50, `max_bytes` up to 128,000), shaped like
 `GET /api/knowledge/pending/{entry_id}`. An entry that isn't active, is outside the
 scope, or is hidden from the caller answers 404 the same way.
+Both detail routes apply the application's redactor to complete content before
+bounding chunks and return `content_redacted: true`. This flag confirms redaction
+was applied, including when no secrets matched; it does not assert that content is
+secret-free. Pending-list previews likewise redact before shortening the text.
+Clients that display pending content can require the flag to distinguish older
+Runtime versions that returned pending content without redaction.
 
 Each entry includes its existing provenance fields and a public preview. A
 registered model actor supplies `specialist`; a matching retained source session

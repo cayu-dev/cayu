@@ -141,6 +141,14 @@ def test_kept_http_attribution_redaction_precedes_preview_truncation(
     with TestClient(
         create_server(app, config=ServerConfig.protected(lambda _: AuthContext(subject="reviewer")))
     ) as client:
+        listed = client.get("/api/knowledge/pending")
+        assert listed.status_code == 200
+        assert secret[:9] not in listed.text
+        detail = client.get("/api/knowledge/pending/reviewed?max_bytes=500")
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["content_redacted"] is True
+        assert secret[:9] not in detail.text
+        assert detail.json()["text"].endswith(" end")
         pending = client.get("/api/inbox").json()["items"]
         assert len(pending) == 1
         assert secret[:9] not in pending[0]["detail"]

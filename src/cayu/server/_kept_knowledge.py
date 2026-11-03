@@ -30,6 +30,7 @@ from cayu.server.auth import AuthContext
 from cayu.server.contracts import (
     KeptKnowledgeDetailResponse,
     KeptKnowledgeListResponse,
+    PendingKnowledgeDetailResponse,
     RetireKnowledgeRequest,
     RetireKnowledgeResponse,
 )
@@ -51,6 +52,7 @@ def register_kept_knowledge(
     router: APIRouter,
     *,
     app: CayuApp,
+    pending_router: APIRouter,
     protected: list[Any],
     workflow: Callable[[], KnowledgeReviewWorkflow],
     gate: InboxAccessGate,
@@ -275,15 +277,55 @@ def register_kept_knowledge(
     ):
         """One kept (active) entry with its text and chunks; 404 for anything else."""
 
+        return await knowledge_detail(entry_id, max_chunks, max_bytes, auth_context, pending=False)
+
+    @pending_router.get(
+        "/knowledge/pending/{entry_id}",
+        response_model=PendingKnowledgeDetailResponse,
+    )
+    async def get_pending_knowledge(
+        entry_id: NonBlankString,
+        max_chunks: int = Query(default=50, ge=1, le=50),
+        max_bytes: int = Query(default=128_000, ge=1, le=128_000),
+        auth_context: AuthContext | None = auth_default,
+    ):
+        return await knowledge_detail(entry_id, max_chunks, max_bytes, auth_context, pending=True)
+
+    async def knowledge_detail(
+        entry_id: str,
+        max_chunks: int,
+        max_bytes: int,
+        auth_context: AuthContext | None,
+        *,
+        pending: bool,
+    ):
         owner = workflow()
         store = cast("KnowledgeStore", owner.store)
-        try:
-            entry = await owner.get_entry(entry_id)
+        if pending:
+            try:
+                entry = await owner.get_pending(entry_id)
+            except NotImplementedError:
+                raise HTTPException(501, "This store does not support knowledge reads.") from None
+            except KeyError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+        else:
+            try:
+                entry = await owner.get_entry(entry_id)
+            except NotImplementedError:
+                raise HTTPException(501, "This store does not support knowledge reads.") from None
+            except PermissionError:
+                raise HTTPException(404, "Knowledge entry not found.") from None
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
             if entry is None or entry.status is not KnowledgeStatus.ACTIVE:
                 raise HTTPException(404, "Knowledge entry not found.")
-            await gate.require_knowledge(auth_context, entry)
-            # Read whole chunks and redact them before applying the caller's byte bound,
-            # so a truncation can't split a secret the redactor would have matched.
+        await gate.require_knowledge(auth_context, entry)
+        try:
+            # Redact whole chunks before the caller's byte bound can split a secret.
             read = await store.read_chunks(
                 entry.id,
                 revision=entry.revision,
@@ -292,9 +334,8 @@ def register_kept_knowledge(
                 max_bytes=_CHUNK_READ_BYTES,
             )
         except NotImplementedError:
-            raise HTTPException(501, "This store does not support kept knowledge reads.") from None
+            raise HTTPException(501, "This store does not support knowledge reads.") from None
         except PermissionError:
-            # Outside the review scope reads the same as absent.
             raise HTTPException(404, "Knowledge entry not found.") from None
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
@@ -309,7 +350,11 @@ def register_kept_knowledge(
         for chunk in read[:max_chunks]:
             if remaining <= 0:
                 break
-            row = serialize_chunk(chunk)
+            row = {
+                key: app.redact_json(value)
+                for key, value in serialize_chunk(chunk).items()
+                if key != "text"
+            }
             text = app.redact_json(chunk.text)
             if text != chunk.text:
                 row["content_hash"] = None
@@ -332,14 +377,13 @@ def register_kept_knowledge(
                 limited=gate.applies(auth_context),
                 identities={},
             )
-        return app.redact_json(
-            {
-                **detail,
-                "chunks": chunks,
-                "chunk_limit": max_chunks,
-                "chunk_max_bytes": max_bytes,
-            }
-        )
+        return {
+            **{key: app.redact_json(value) for key, value in detail.items()},
+            "content_redacted": True,
+            "chunks": chunks,
+            "chunk_limit": max_chunks,
+            "chunk_max_bytes": max_bytes,
+        }
 
     @router.post(
         "/knowledge/{entry_id}/retire",

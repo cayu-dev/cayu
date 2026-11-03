@@ -165,13 +165,20 @@ def test_filters_the_store_refuses_answer_422_not_500() -> None:
     assert many.json()["detail"] == "Invalid knowledge filters: labels."
 
 
-def test_kept_detail_redacts_whole_chunks_before_bounding_them() -> None:
+@pytest.mark.parametrize("state", ["kept", "pending"])
+def test_detail_redacts_whole_chunks_before_bounding_them(state: str) -> None:
     from cayu.vaults.redaction import SecretRedactor
 
     secret = "abcdefghijklmnop"
     scope = KnowledgeAccessScope.privileged()
     store = InMemoryKnowledgeStore(
-        [KnowledgeEntry(id="s", text=f"token={secret}", status=KnowledgeStatus.ACTIVE)],
+        [
+            KnowledgeEntry(
+                id="s",
+                text=f"token={secret}",
+                status=KnowledgeStatus.ACTIVE if state == "kept" else KnowledgeStatus.PENDING,
+            )
+        ],
         access_scope=scope,
     )
     app = CayuApp(
@@ -181,9 +188,10 @@ def test_kept_detail_redacts_whole_chunks_before_bounding_them() -> None:
         enable_logging=False,
     )
     with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
-        bounded = client.get("/api/knowledge/kept/s?max_bytes=21")
+        bounded = client.get(f"/api/knowledge/{state}/s?max_bytes=21")
 
     assert bounded.status_code == 200, bounded.text
+    assert bounded.json()["content_redacted"] is True
     assert "abcdefghijklmno" not in bounded.text
     assert bounded.json()["chunks"][0]["text"].startswith("token=[REDACTED")
 
@@ -236,3 +244,39 @@ def test_redaction_that_grows_a_chunk_never_yields_a_blank_one() -> None:
         assert response.status_code == 200, response.text
         assert all(chunk["text"].strip() for chunk in response.json()["chunks"])
     assert responses[0].json()["chunks"][0]["text"] == "[REDACTED_SECRET]"
+
+
+@pytest.mark.parametrize("entry_id", ["x" * 600, "a%00b"])
+def test_kept_invalid_identifiers_remain_validation_errors(entry_id: str) -> None:
+    with _client() as client:
+        assert client.get(f"/api/knowledge/kept/{entry_id}").status_code == 422
+
+
+def test_pending_preview_preserves_the_requested_byte_bound() -> None:
+    with _client() as client:
+        response = client.get("/api/knowledge/pending?max_bytes=10")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert sum(len(row["text_preview"].encode()) for row in body["entries"]) <= 10
+    assert body["max_bytes"] == 10
+    assert body["truncated"] is True
+
+
+def test_pending_parameter_validation_keeps_its_existing_shape() -> None:
+    with _client() as client:
+        response = client.get("/api/knowledge/pending/proposal?max_chunks=0")
+    assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)
+
+
+@pytest.mark.parametrize("state,entry_id", [("kept", "denial"), ("pending", "proposal")])
+def test_detail_protocol_keys_survive_redaction(state: str, entry_id: str) -> None:
+    from cayu.vaults.redaction import SecretRedactor
+
+    with _client(secret_redactor=SecretRedactor(["redacted", "source", "text"])) as client:
+        response = client.get(f"/api/knowledge/{state}/{entry_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["content_redacted"] is True
+    assert "source_uri" in body and "text" in body
+    assert "text" in body["chunks"][0]

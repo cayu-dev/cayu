@@ -13250,6 +13250,10 @@ export type KeptKnowledgeDetailResponse = {
      */
     confidence: string | null;
     /**
+     * Content Redacted
+     */
+    content_redacted: true;
+    /**
      * Created At
      */
     created_at: string;
@@ -16550,6 +16554,10 @@ export type PendingKnowledgeDetailResponse = {
      * Confidence
      */
     confidence: string | null;
+    /**
+     * Content Redacted
+     */
+    content_redacted: true;
     /**
      * Created At
      */

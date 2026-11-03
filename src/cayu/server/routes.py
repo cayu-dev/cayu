@@ -125,6 +125,7 @@ from cayu.exceptions import TerminalEventPublicationUncertain
 from cayu.execution_profiles import (
     ExecutionProfileAdoptionIntent,
 )
+from cayu.knowledge._retrieval_results import _truncate_text_to_bytes
 from cayu.knowledge.activation_contracts import KnowledgeActivationConflict, KnowledgeReviewApproval
 from cayu.knowledge.records import (
     MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
@@ -208,6 +209,7 @@ from cayu.server._inbox_cursor import InboxCursorSeal
 from cayu.server._inbox_routes import register_inbox_routes
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
 from cayu.server._kept_knowledge import register_kept_knowledge
+from cayu.server._knowledge_preview import knowledge_preview
 from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._model_check_routes import register_model_check_route
 from cayu.server._request_timing import RequestTimingRecorder
@@ -299,7 +301,6 @@ from cayu.server.contracts import (
     OperationalSnapshotRequest,
     OperationalSnapshotResponse,
     PendingActionsResponse,
-    PendingKnowledgeDetailResponse,
     PendingKnowledgeListResponse,
     RoleForbiddenDetail,
     RoleForbiddenResponse,
@@ -1170,8 +1171,6 @@ _ARTIFACT_FILENAME_HEADER_ASCII_MAX_CHARS = 255
 _ARTIFACT_ID_HEADER_MAX_CHARS = 512
 _ARTIFACT_UNSAFE_FILENAME_UNICODE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 _KNOWLEDGE_REVIEW_PREVIEW_CHARS = 1200
-_KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS = 50
-_KNOWLEDGE_PENDING_DETAIL_MAX_BYTES = 128_000
 _KNOWLEDGE_REVIEW_AUTH_SUBJECT_DIGEST_DOMAIN = b"cayu-knowledge-review-auth-subject-v1\0"
 _KNOWLEDGE_REVIEW_AUTH_SUBJECT_DIGEST_PREFIX = "cayu:http-auth-subject-sha256:"
 _CAUSAL_BUDGET_SUMMARY_MAX_SESSIONS = 500
@@ -9669,64 +9668,34 @@ def create_router(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        entries = [
-            _serialize_knowledge_list_item(item)
-            for item in result.entries
-            if await inbox_gate.permits(auth_context, inbox_gate.knowledge_scope(item.entry))
-        ]
+        entries = []
+        remaining = result.max_bytes
+        truncated = result.truncated
+        for item in result.entries:
+            if await inbox_gate.permits(auth_context, inbox_gate.knowledge_scope(item.entry)):
+                row = _serialize_knowledge_list_item(item)
+                row["text_preview"] = knowledge_preview(
+                    item.entry.title or item.entry.text, cayu_app.redact_json
+                )
+                preview = _truncate_text_to_bytes(row["text_preview"], remaining)
+                truncated = truncated or preview != row["text_preview"]
+                remaining -= len(preview.encode("utf-8"))
+                row = {
+                    key: cayu_app.redact_json(value)
+                    for key, value in row.items()
+                    if key != "text_preview"
+                }
+                row["text_preview"] = preview
+                entries.append(row)
         return {
             "entries": entries,
-            "truncated": result.truncated,
+            "truncated": truncated,
             "limit": result.limit,
             "max_bytes": result.max_bytes,
             # The store's count would include proposals the inbox access rule hides.
             "total_entries_known": (
                 len(entries) if inbox_gate.applies(auth_context) else result.total_entries_known
             ),
-        }
-
-    @router.get(
-        "/knowledge/pending/{entry_id}",
-        response_model=PendingKnowledgeDetailResponse,
-    )
-    async def get_pending_knowledge(
-        entry_id: NonBlankString,
-        max_chunks: Annotated[
-            int,
-            Query(ge=1, le=_KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS),
-        ] = _KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS,
-        max_bytes: Annotated[
-            int,
-            Query(ge=1, le=_KNOWLEDGE_PENDING_DETAIL_MAX_BYTES),
-        ] = _KNOWLEDGE_PENDING_DETAIL_MAX_BYTES,
-        auth_context: AuthContext | None = optional_auth_context,
-    ):
-        workflow = _knowledge_review_workflow()
-        assert knowledge_store is not None
-        try:
-            entry = await workflow.get_pending(entry_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        await inbox_gate.require_knowledge(auth_context, entry)
-        try:
-            chunks = await knowledge_store.read_chunks(
-                entry.id,
-                revision=entry.revision,
-                access_scope=knowledge_access_scope,
-                max_chunks=max_chunks,
-                max_bytes=max_bytes,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {
-            **_serialize_knowledge_detail(entry),
-            "chunks": [_serialize_knowledge_chunk(chunk) for chunk in chunks],
-            "chunk_limit": max_chunks,
-            "chunk_max_bytes": max_bytes,
         }
 
     @router.post(
@@ -9771,6 +9740,7 @@ def create_router(
     register_kept_knowledge(
         bounded_control_plane_router,
         app=cayu_app,
+        pending_router=router,
         protected=protected,
         workflow=_knowledge_review_workflow,
         gate=inbox_gate,
