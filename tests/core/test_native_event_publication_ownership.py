@@ -325,11 +325,11 @@ def test_postgres_event_publication_composes_with_direct_connection(postgres_dsn
             assert active and session_id == sid and all(event.session_id == sid for event in events)
             assert cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
 
-        async def first_existing_event_id(session_id, ids):
+        async def first_existing_event_id(connection, session_id, ids):
             assert active and session_id == sid
-            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cur:
                 for event_id in ids:
-                    cur = await connection.execute(
+                    await cur.execute(
                         "SELECT 1 FROM cayu_events WHERE session_id = %s AND event_id = %s",
                         (session_id, event_id),
                     )

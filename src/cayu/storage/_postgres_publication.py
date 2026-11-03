@@ -892,7 +892,7 @@ async def publish_checkpoint_events(
     store_now: Callable[[Any], Awaitable[datetime]],
     closure_owners: Callable[[Any, Iterable[str]], Awaitable[tuple[dict[str, Any], ...]]],
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
-    first_existing_event_id: Callable[[str, list[str]], Awaitable[str | None]],
+    first_existing_event_id: Callable[[Any, str, list[str]], Awaitable[str | None]],
     publish_budget_identities: Callable[[Any, list[Event]], Awaitable[None]],
     record_terminal_receipts: TerminalReceiptRecorder,
     upsert_checkpoint: Callable[[Any, str, dict[str, Any], datetime], Awaitable[None]],
@@ -1228,6 +1228,7 @@ async def publish_checkpoint_events(
             if commit_guard_signal is not None:
                 raise commit_guard_signal from exc
             existing = await first_existing_event_id(
+                conn,
                 session_id,
                 [event.id for event in copied_events],
             )

@@ -3295,6 +3295,7 @@ class PostgresSessionStore(
                 existing_event_id = None
                 if admission is not None:
                     existing_event_id = await self._first_existing_event_id(
+                        conn,
                         session_id,
                         [
                             *(
@@ -7840,10 +7841,12 @@ class PostgresSessionStore(
 
     async def _first_existing_event_id(
         self,
+        conn: Any,
         session_id: str,
         event_ids: list[str],
     ) -> str | None:
-        async with self._connection() as conn, conn.cursor() as cur:
+        # Rollback ends the transaction, but the caller still owns the pool checkout.
+        async with conn.cursor() as cur:
             for event_id in event_ids:
                 await cur.execute(
                     "SELECT 1 FROM cayu_events WHERE session_id = %s AND event_id = %s",

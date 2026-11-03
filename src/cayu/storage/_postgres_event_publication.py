@@ -141,7 +141,7 @@ async def append_events(
     load_session: Callable[[Any, str], Awaitable[Session | None]],
     closure_owners: Callable[[Any, Iterable[str]], Awaitable[tuple[dict[str, Any], ...]]],
     append_events: EventWriter,
-    first_existing_event_id: Callable[[str, list[str]], Awaitable[str | None]],
+    first_existing_event_id: Callable[[Any, str, list[str]], Awaitable[str | None]],
     unique_violation: type[UniqueViolation],
 ) -> None:
     session_id, copied_events = _copy_session_event_batch(session_id, events)
@@ -169,7 +169,9 @@ async def append_events(
         except unique_violation as exc:
             await conn.rollback()
             existing = await first_existing_event_id(
-                session_id, [event.id for event in copied_events]
+                conn,
+                session_id,
+                [event.id for event in copied_events],
             )
             if existing is not None:
                 raise ValueError(
@@ -271,7 +273,7 @@ async def append_workflow_step_started(
     register_event_authorities: Callable[
         [Any, str, list[Event] | tuple[Event, ...]], Awaitable[None]
     ],
-    first_existing_event_id: Callable[[str, list[str]], Awaitable[str | None]],
+    first_existing_event_id: Callable[[Any, str, list[str]], Awaitable[str | None]],
     raise_write_conflict: Callable[[Any, str, int], Awaitable[None]],
     unique_violation: type[UniqueViolation],
 ) -> bool:
@@ -398,7 +400,7 @@ async def append_workflow_step_started(
             return True
         except unique_violation as exc:
             await conn.rollback()
-            existing = await first_existing_event_id(session_id, [copied_event.id])
+            existing = await first_existing_event_id(conn, session_id, [copied_event.id])
             if existing is not None:
                 return False
             raise exc
@@ -445,7 +447,7 @@ async def compare_and_publish_mcp_manifest_checks(
     register_event_authorities: Callable[
         [Any, str, list[Event] | tuple[Event, ...]], Awaitable[None]
     ],
-    first_existing_event_id: Callable[[str, list[str]], Awaitable[str | None]],
+    first_existing_event_id: Callable[[Any, str, list[str]], Awaitable[str | None]],
     raise_write_conflict: Callable[[Any, str, int], Awaitable[None]],
     unique_violation: type[UniqueViolation],
 ) -> McpManifestPublicationResult:
@@ -618,6 +620,7 @@ async def compare_and_publish_mcp_manifest_checks(
         except unique_violation as exc:
             await conn.rollback()
             existing = await first_existing_event_id(
+                conn,
                 session_id,
                 [event.id for event in copied_events],
             )
