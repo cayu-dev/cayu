@@ -5071,7 +5071,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 except _LocalGuardStagingConflictError:
                     raise _DurablePublicationAmbiguous((change.path,)) from None
             positions: dict[str, Literal["before", "after"]] = {}
-            conflicts: list[WorkspaceBranchConflict] = []
+            conflicts: dict[str, WorkspaceBranchConflict] = {}
             after_count = 0
             for change in change_set.changes:
                 try:
@@ -5119,19 +5119,17 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 elif before_matches:
                     positions[change.path] = "before"
                 else:
-                    conflicts.append(
-                        WorkspaceBranchConflict(
-                            path=actual_path,
-                            expected=change.before,
-                            actual=None if actual is None else actual.public(),
-                            actual_kind=actual_kind,
-                        )
+                    conflicts[actual_path] = WorkspaceBranchConflict(
+                        path=actual_path,
+                        expected=change.before,
+                        actual=None if actual is None else actual.public(),
+                        actual_kind=actual_kind,
                     )
             if conflicts:
-                paths = tuple(sorted({item.path for item in conflicts}))
+                paths = tuple(sorted(conflicts))
                 if after_count:
                     raise _DurablePublicationAmbiguous(paths)
-                raise _DurablePublicationConflict(tuple(conflicts))
+                raise _DurablePublicationConflict(tuple(conflicts[path] for path in paths))
             for change in change_set.changes:
                 if positions[change.path] == "after":
                     continue
