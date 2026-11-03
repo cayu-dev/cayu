@@ -90,7 +90,10 @@ def _limit(name: str, label: str, description: str) -> ConfigSetting:
             minimum=1,
             maximum=MAX_DURABLE_JSON_INTEGER,
             label=label,
-            description=description,
+            description=(
+                description + " When Not set, this field imposes no explicit limit. "
+                "Other run limits, budgets and policies still apply."
+            ),
         ),
         "run.limits",
         lambda config: getattr(config.run.limits, name),
