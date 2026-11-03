@@ -3817,10 +3817,6 @@ class ModelStepRun:
         # physical retention. The separately loaded permanent cursor is the
         # store fence and logical-step identity authority.
         logical_step_id = model_step_identity.model_step_id
-        next_dispatch_ordinal = fallback_dispatch_ordinal_from_checkpoint(
-            await self._executor._session_store.load_checkpoint(self._session.id),
-            logical_step_id,
-        )
 
         async def prepare_model_completion_dispatch(
             attempt_model_request: ModelRequest,
@@ -4241,6 +4237,10 @@ class ModelStepRun:
             lifecycle=lifecycle,
         )
         try:
+            next_dispatch_ordinal = fallback_dispatch_ordinal_from_checkpoint(
+                await self._executor._session_store.load_checkpoint(self._session.id),
+                logical_step_id,
+            )
             async for event, outcome in guarded_events:
                 if event is not None:
                     yield event, None
