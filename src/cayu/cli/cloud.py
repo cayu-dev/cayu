@@ -39,6 +39,15 @@ from cayu.cli._cloud_auth import (
 )
 from cayu.cli._cloud_compass import CompassWriteError, add_compass_parser, compass_command
 from cayu.cli._cloud_data import add_data_parser, data_command
+from cayu.cli._cloud_data_transfers import (
+    COMMANDS as DATA_TRANSFER_COMMANDS,
+)
+from cayu.cli._cloud_data_transfers import (
+    AgentDataTransferFailedError,
+    AgentDataTransferStillRunningError,
+    add_data_transfer_parsers,
+    data_transfer_command,
+)
 from cayu.cli._cloud_diagnostics import CloudDeploymentFailure as _CloudDeploymentFailure
 from cayu.cli._cloud_diagnostics import parse_build_failure, safe_text
 from cayu.cli._cloud_evals import CloudEvalError, add_eval_parser, eval_command
@@ -841,6 +850,8 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
             _CloudArchiveStillRunningError,
             _CloudDeploymentStillRunningError,
             _CloudServiceStillRunningError,
+            AgentDataTransferFailedError,
+            AgentDataTransferStillRunningError,
         ),
     ):
         error.update(exc.public_details())
@@ -942,8 +953,11 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     applications = commands.add_parser(
         "applications",
-        help="List or show deployed Agent applications.",
-        description="List Agent applications deployed in the selected Cayu Cloud.",
+        help="List, show, archive, export or import deployed Agent applications.",
+        description=(
+            "List Agent applications deployed in the selected Cayu Cloud, archive one, or "
+            "export one's database and /data files and import them into another."
+        ),
     )
     application_commands = applications.add_subparsers(
         dest="application_command",
@@ -983,6 +997,9 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         description="Show an Agent's lifecycle, revision and archive progress.",
     )
     archive_status.add_argument("application", type=_application_slug)
+    add_data_transfer_parsers(
+        application_commands, application=_application_slug, seconds=_positive_finite_seconds
+    )
     application_show = application_commands.add_parser(
         "show",
         description=(
@@ -4426,6 +4443,16 @@ def _applications(
                 client, _application_id(client, _shown_application(arguments))
             ),
         }
+    if action in DATA_TRANSFER_COMMANDS:
+        return data_transfer_command(
+            arguments,
+            client=client,
+            validate_wait=_validate_wait,
+            transient=_transient_api_error,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
+            sleep=sleep,
+            monotonic=monotonic,
+        )
     application_id = arguments.application
     path = f"/v1/applications/{application_id}"
     if action == "archive-status":

@@ -476,7 +476,63 @@ refuses a Release that keeps durable database state in local files there unless
 you acknowledge them (see [Local file acknowledgements](#local-file-acknowledgements)),
 and `cayu cloud service status` reports what it finds under `/data` as
 `storage_audit`. Cloud names the directory to the Agent's Cayu as `CAYU_DATA_VOLUME`, so
-`cayu cloud data` can [read its files](#reading-an-agents-data-files).
+`cayu cloud data` can [read its files](#reading-an-agents-data-files). To copy an Agent's
+files and records into another Agent, [export and import them](#export-and-import-an-agents-data).
+
+## Export and import an Agent's data
+
+`cayu cloud applications export` copies an Agent's PostgreSQL database and its `/data` files
+into one archive in the Cayu Cloud install's own storage; `import` restores an export into
+another Agent (or the same one). Use them to redeploy an Agent under a new slug or in another
+Organization and keep its records, to copy production data into a staging or test Agent, to
+hand an Agent's data over, or to restore an Agent's data into a fresh Agent. They need an
+organization administrator signed in with `cayu cloud login`; an Organization API key is
+refused with error `code` `admin_required`.
+
+```bash
+cayu cloud applications export my-agent                  # waits; prints the export and its id
+cayu cloud applications exports my-agent                 # the Agent's exports, newest first
+cayu cloud applications export-status my-agent EXPORT_ID
+
+cayu cloud service destroy --application my-agent-copy   # the target must be stopped
+cayu cloud applications import my-agent-copy --from EXPORT_ID
+cayu cloud applications import-status my-agent-copy IMPORT_ID
+cayu cloud env set OPENAI_API_KEY --secret --application my-agent-copy   # each missing secret
+cayu cloud rollback RELEASE_ID --application my-agent-copy --wait   # start it (its selected Release)
+```
+
+Both take the exact Agent slug and wait until Cayu Cloud finishes (`--wait-seconds`, 3600 by
+default; `--no-wait` returns once it is queued). The result is the export or import record:
+its `id`, `status` (`queued`, `running`, `succeeded` or `failed`) and, when it failed,
+`error.code` and `error.message`. A failed one exits `2` with category
+`agent_data_export_failed` or `agent_data_import_failed`, Cloud's `code` and the record; a
+wait that runs out exits `2` with category `agent_data_transfer_still_running` and the
+`export-status` or `import-status` command to read it with, and Cayu Cloud carries on.
+
+- An export dumps the database as the Agent's own database role and archives `/data` from a
+  one-off process of the Agent itself. Secret values never leave Cayu Cloud: the export
+  records only the secret names (`secret_names`). An export of a running Agent is consistent
+  within its database, but files written meanwhile may be newer or older than the dump. For an
+  exact copy, stop it first with `cayu cloud service destroy`; `service pause` leaves its web
+  process and runs already started writing. An archived Agent can't be exported yet
+  (`application_archived`).
+- An import needs a stopped target: deploy it once, then `cayu cloud service destroy`
+  (`target_not_stopped` otherwise). A target whose database already holds records, or whose
+  `/data` holds files, is refused with `target_has_data` and left unchanged; `--overwrite`
+  replaces both. Its `missing_secrets` lists the export's secret names the target doesn't set
+  yet. Set them, then start the target by deploying or rolling back; its next publication
+  checks and migrates the restored database. An import interrupted part way fails with
+  `import_interrupted`; run it again with `--overwrite`.
+- Only one export or import of an Agent runs at a time (`agent_data_transfer_in_progress`).
+  `/data` may be at most 5 GiB compressed.
+
+A Cayu platform administrator works on any Organization's Agents by adding
+`--organization ORG_ID`, and may import any Organization's export into them:
+
+```bash
+cayu cloud applications export my-agent --organization org_source
+cayu cloud applications import my-agent --organization org_target --from EXPORT_ID
+```
 
 ### What a deploy uploads
 
