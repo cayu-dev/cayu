@@ -7824,14 +7824,30 @@ async def _retry_durable_terminal_settlement(
             )
             return
     else:
-        terminal = await _publish_or_reconcile_exact_record(
-            durable.store,
-            session_id=retained.terminal_record.authority.session_id,
-            storage_key=durable.storage_key,
-            expected=retained.publication_expected,
-            updated=retained.terminal_record,
-            expected_run_epoch=retained.terminal_record.authority.expected_run_epoch,
-        )
+        try:
+            terminal = await _publish_or_reconcile_exact_record(
+                durable.store,
+                session_id=retained.terminal_record.authority.session_id,
+                storage_key=durable.storage_key,
+                expected=retained.publication_expected,
+                updated=retained.terminal_record,
+                expected_run_epoch=retained.terminal_record.authority.expected_run_epoch,
+            )
+        except WorkspaceBranchOperationConflict:
+            terminal = await _load_durable_branch_record(
+                durable.store,
+                session_id=retained.terminal_record.authority.session_id,
+                storage_key=durable.storage_key,
+            )
+            # Recovery can commit the same terminal outcome after repeating a
+            # progress transition. Only its revision may differ from ours.
+            if (
+                terminal is None
+                or terminal.revision <= retained.terminal_record.revision
+                or terminal
+                != retained.terminal_record.model_copy(update={"revision": terminal.revision})
+            ):
+                raise
     await branch._settle_observed_durable_terminal_handle(
         terminal,
         binding_claim_lease=retained.binding_claim_lease,
