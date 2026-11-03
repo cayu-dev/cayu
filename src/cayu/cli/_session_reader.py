@@ -27,7 +27,7 @@ from cayu.sessions._call_inspection import (
     redact_inspection_value,
 )
 from cayu.sessions._inbox_item_ids import PENDING_INBOX_KINDS, inbox_session_item_id
-from cayu.sessions._rollup import RollupPage, SessionRollupQuery, rollup_page
+from cayu.sessions._rollup import RollupPage, SessionRollupQuery, rollup_page, session_timing
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import INTERACTION_TERMINAL_EVENT_TYPES, InteractionSummaryEvidence
 from cayu.sessions.pending_action_contracts import PendingActionQuery
@@ -337,6 +337,7 @@ class StoreSessionReader:
             "provider_operation": provider_operation.model_dump(mode="json"),
             "terminal_failure": {"state": summary.terminal_failure_state},
             "budget": summary.budget.model_dump(mode="json"),
+            "timing": (await session_timing(self.store, session_id)).model_dump(mode="json"),
         }
 
     async def latest_interactions(

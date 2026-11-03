@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 
 from cayu._validation import require_clean_nonblank
+from cayu.environments._phase_timing import EnvironmentPhaseTimer
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, Runner
 from cayu.runners._exit_cleanup import close_runners_at_exit
@@ -51,7 +52,7 @@ it and create a fresh one instead of adopting it.
 """
 
 MaterializationEventKind = Literal[
-    "started", "completed", "failed", "binding_started", "binding_completed"
+    "started", "completed", "failed", "binding_started", "binding_completed", "binding_failed"
 ]
 MaterializationObserver = Callable[
     [MaterializationEventKind, dict[str, Any], "BoundWorkspace | None"], Awaitable[None]
@@ -273,6 +274,8 @@ class DeferredMaterialization:
                 # "started"; this bind completes (or fails) that same record.
                 started = self._created_started
             runner: Runner | None = None if created is None else created.runner
+            # Set while the bind runs, so a failure can still report its steps.
+            bind_timer: EnvironmentPhaseTimer | None = None
             try:
                 if created is None:
                     runner, binding = await self._materialize(mode)
@@ -302,15 +305,19 @@ class DeferredMaterialization:
                     request = self._bind_request
                     if binding is not None and request is not None and mode == "use":
                         await self._notify("binding_started", {})
-                        bound = await binding.bind(
-                            request.workspace,
-                            runner,
-                            session_id=request.session_id,
-                            agent_name=request.agent_name,
-                            environment_name=request.environment_name,
-                            metadata=request.metadata,
-                        )
-                        await self._notify("binding_completed", {}, bound)
+                        bind_timer = EnvironmentPhaseTimer()
+                        with bind_timer.installed():
+                            bound = await binding.bind(
+                                request.workspace,
+                                runner,
+                                session_id=request.session_id,
+                                agent_name=request.agent_name,
+                                environment_name=request.environment_name,
+                                metadata=request.metadata,
+                            )
+                        timings = bind_timer.payload(include_unfinished=False)
+                        bind_timer = None
+                        await self._notify("binding_completed", {"phase_timings": timings}, bound)
                     self._state = _Materialized(runner=runner, binding=binding, bound=bound)
                     self._created = None
                 else:
@@ -329,6 +336,19 @@ class DeferredMaterialization:
                     if isinstance(error, EnvironmentMaterializationError)
                     else type(error).__name__
                 )
+                if bind_timer is not None:
+                    # Close the binding record like an eager bind's, with the steps it ran.
+                    # Shielded and best effort: the materialization failure follows.
+                    with suppress(BaseException):
+                        await asyncio.shield(
+                            self._notify(
+                                "binding_failed",
+                                {
+                                    "error_type": type(error).__name__,
+                                    "phase_timings": bind_timer.payload(include_unfinished=True),
+                                },
+                            )
+                        )
                 if isinstance(error, asyncio.CancelledError):
                     # Close the started record; the cancellation still propagates.
                     # Shielded so a repeated cancellation cannot leave it half-written.

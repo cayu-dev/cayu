@@ -171,6 +171,7 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/sessions/{session_id}/state",
             "/sessions/{session_id}/summary",
             "/sessions/{session_id}/task-replay",
+            "/sessions/{session_id}/timing",
             "/sessions/{session_id}/tool-calls",
             "/sessions/{session_id}/tool-view",
             "/sessions/{session_id}/transcript",

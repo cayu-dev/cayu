@@ -1740,6 +1740,12 @@ export type ApiSessionModelCall = {
      */
     cost_state?: 'priced' | 'unpriced' | null;
     /**
+     * Duration Ms
+     *
+     * From the request's start to the call's completion.
+     */
+    duration_ms?: number | null;
+    /**
      * Echoed Request Controls
      *
      * The controls the provider echoed back on its response, where its API returns them. A null value means the provider echoed the control as null.
@@ -1753,6 +1759,12 @@ export type ApiSessionModelCall = {
      * Why the call ended, normalized: stop, tool_calls, length, content_filter, error or unknown.
      */
     finish_reason?: string | null;
+    /**
+     * First Output Ms
+     *
+     * From the request's start to its first streamed text or thinking delta. Null when the call streamed none, such as a call that only returned tool calls.
+     */
+    first_output_ms?: number | null;
     /**
      * Input Tokens
      */
@@ -1809,6 +1821,12 @@ export type ApiSessionModelCall = {
      * Sequence
      */
     sequence: number;
+    /**
+     * Started At
+     *
+     * When the call's request started (its `model.started` event).
+     */
+    started_at?: string | null;
     /**
      * Timestamp
      */
@@ -19071,6 +19089,10 @@ export type RollupDurations = {
      */
     setup_ms?: number;
     /**
+     * Teardown Ms
+     */
+    teardown_ms?: number;
+    /**
      * Tool Ms
      */
     tool_ms?: number;
@@ -21083,6 +21105,150 @@ export type SessionSummaryResponse = {
     session: ApiSession;
     transcript: TranscriptSummary;
     usage: SessionUsageSummary;
+};
+
+/**
+ * SessionTimingOperation
+ *
+ * One environment operation: ``factory`` (allocate or reconnect), ``binding`` (copy-in
+ * and setup), ``materialization`` (a deferred environment starting) or ``finalize``
+ * (copy-back and release). ``phases`` is empty for a session recorded before Cayu timed
+ * the steps, or for a binding that reports none.
+ */
+export type SessionTimingOperation = {
+    /**
+     * Duration Ms
+     */
+    duration_ms?: number | null;
+    /**
+     * Environment
+     */
+    environment?: string | null;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Outcome
+     */
+    outcome: 'completed' | 'failed' | 'running';
+    /**
+     * Phases
+     */
+    phases?: Array<SessionTimingPhase>;
+    /**
+     * Started At
+     */
+    started_at?: string | null;
+};
+
+/**
+ * SessionTimingPhase
+ *
+ * One step of an environment operation, from its ``phase_timings`` (see
+ * ``cayu.environments._phase_timing``). ``depth`` is how many steps it runs inside.
+ */
+export type SessionTimingPhase = {
+    /**
+     * Bytes
+     */
+    bytes?: number | null;
+    /**
+     * Depth
+     */
+    depth?: number;
+    /**
+     * Duration Ms
+     */
+    duration_ms: number;
+    /**
+     * Items
+     */
+    items?: number | null;
+    /**
+     * Outcome
+     */
+    outcome: string;
+    /**
+     * Phase
+     */
+    phase: string;
+    /**
+     * Started At
+     */
+    started_at: string;
+};
+
+/**
+ * SessionTimingResponse
+ *
+ * `cayu session show`'s time breakdown for one session; see `SessionTiming`.
+ */
+export type SessionTimingResponse = {
+    /**
+     * Elapsed Ms
+     */
+    elapsed_ms?: number;
+    /**
+     * Ended At
+     */
+    ended_at?: string | null;
+    /**
+     * Environment
+     */
+    environment?: Array<SessionTimingOperation>;
+    /**
+     * Environment Truncated
+     */
+    environment_truncated?: boolean;
+    /**
+     * First Model Call Ms
+     */
+    first_model_call_ms?: number | null;
+    /**
+     * Idle Ms
+     */
+    idle_ms?: number;
+    /**
+     * Model Calls
+     */
+    model_calls?: number;
+    /**
+     * Model Ms
+     */
+    model_ms?: number;
+    /**
+     * Other Ms
+     */
+    other_ms?: number;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Setup Ms
+     */
+    setup_ms?: number;
+    /**
+     * Started At
+     */
+    started_at?: string | null;
+    /**
+     * Teardown Ms
+     */
+    teardown_ms?: number;
+    /**
+     * Tool Calls
+     */
+    tool_calls?: number;
+    /**
+     * Tool Ms
+     */
+    tool_ms?: number;
+    /**
+     * Waiting Ms
+     */
+    waiting_ms?: number;
 };
 
 /**
@@ -30682,6 +30848,40 @@ export type SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponses 
 };
 
 export type SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponse = SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponses[keyof SessionReplayAvailabilityApiSessionsSessionIdTaskReplayGetResponses];
+
+export type GetSessionTimingApiSessionsSessionIdTimingGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/timing';
+};
+
+export type GetSessionTimingApiSessionsSessionIdTimingGetErrors = {
+    /**
+     * The session does not exist.
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionTimingApiSessionsSessionIdTimingGetError = GetSessionTimingApiSessionsSessionIdTimingGetErrors[keyof GetSessionTimingApiSessionsSessionIdTimingGetErrors];
+
+export type GetSessionTimingApiSessionsSessionIdTimingGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionTimingResponse;
+};
+
+export type GetSessionTimingApiSessionsSessionIdTimingGetResponse = GetSessionTimingApiSessionsSessionIdTimingGetResponses[keyof GetSessionTimingApiSessionsSessionIdTimingGetResponses];
 
 export type GetSessionToolCallsApiSessionsSessionIdToolCallsGetData = {
     body?: never;

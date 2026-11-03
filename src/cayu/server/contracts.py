@@ -205,6 +205,7 @@ from cayu.server.sse import (
 )
 from cayu.session_metadata import MAX_SESSION_SUMMARY_LENGTH, MAX_SESSION_TITLE_LENGTH, SummaryTone
 from cayu.sessions._execution_profile_checkpoint import SessionExecutionProfiles
+from cayu.sessions._rollup import SessionTiming
 from cayu.sessions.execution import SessionExecutionState
 from cayu.sessions.interactions import InteractionSummaryEvidence
 from cayu.sessions.invocation import (
@@ -3176,6 +3177,21 @@ class ApiSessionLedgerReservation(ApiBaseModel):
 class ApiSessionModelCall(ApiBaseModel):
     sequence: StrictInt = Field(ge=1)
     timestamp: str
+    started_at: str | None = Field(
+        default=None,
+        description="When the call's request started (its `model.started` event).",
+    )
+    duration_ms: StrictInt | None = Field(
+        default=None, ge=0, description="From the request's start to the call's completion."
+    )
+    first_output_ms: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "From the request's start to its first streamed text or thinking delta. Null "
+            "when the call streamed none, such as a call that only returned tool calls."
+        ),
+    )
     provider: str | None
     requested_model: str | None
     resolved_model: str | None
@@ -3296,6 +3312,12 @@ class ApiSessionToolCall(ApiBaseModel):
     artifact_bytes: StrictInt | None = Field(ge=0)
     returned: StrictInt | None = Field(ge=0)
     truncated: StrictBool | None
+
+
+class SessionTimingResponse(SessionTiming):
+    """`cayu session show`'s time breakdown for one session; see `SessionTiming`."""
+
+    session_id: str
 
 
 class SessionToolCallsResponse(ApiBaseModel):

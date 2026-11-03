@@ -61,6 +61,7 @@ from cayu.egress.transitions import (
     _reserve_egress_authority_allocation_parking,
 )
 from cayu.environments._finalization_disposal import finalization_disposal_checkpoint
+from cayu.environments._phase_timing import EnvironmentPhaseTimer
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionAdmissionDecision,
@@ -351,7 +352,12 @@ def _transition_evidence_fields(
 async def _await_with_environment_lifecycle_reporter(
     reporter: RuntimeEnvironmentLifecycleProgressReporter | None,
     operation: Callable[[], Awaitable[Any]],
+    *,
+    phase_timer: EnvironmentPhaseTimer | None = None,
 ) -> Any:
+    if phase_timer is not None:
+        with phase_timer.installed():
+            return await _await_with_environment_lifecycle_reporter(reporter, operation)
     if reporter is None:
         return await operation()
     token = _set_environment_lifecycle_progress_reporter(reporter)
@@ -365,11 +371,29 @@ async def _report_environment_lifecycle(
     reporter: RuntimeEnvironmentLifecycleProgressReporter | None,
     phase: EnvironmentLifecyclePhase,
     status: EnvironmentLifecycleProgressStatus,
+    *,
+    phase_timer: EnvironmentPhaseTimer | None = None,
     **counters: int | None,
 ) -> EnvironmentLifecycleProgress | None:
+    if phase_timer is not None:
+        phase_timer.observe(
+            phase,
+            status,
+            items=counters.get("items_completed"),
+            bytes_=counters.get("bytes_completed"),
+        )
     if reporter is None:
         return None
     return await reporter.report(phase, status, **counters)
+
+
+def _phase_timings_payload(
+    phase_timer: EnvironmentPhaseTimer, *, include_unfinished: bool
+) -> dict[str, Any]:
+    """The operation's step timings for its terminal event; nothing when none were timed."""
+
+    timings = phase_timer.payload(include_unfinished=include_unfinished)
+    return {"phase_timings": timings} if timings else {}
 
 
 async def _finish_environment_lifecycle(
@@ -3306,6 +3330,7 @@ class EnvironmentLifecycle:
             execution_profile=execution_profile,
             events=events,
         )
+        phase_timer = EnvironmentPhaseTimer()
 
         async def invoke_factory(
             operation_factory: Callable[[], Awaitable[EnvironmentFactoryResult]],
@@ -3334,6 +3359,7 @@ class EnvironmentLifecycle:
                     operation_name=operation_name,
                     redactor=self._secret_redactor,
                 ),
+                phase_timer=phase_timer,
             )
             if type(resolved) is not EnvironmentFactoryResult:
                 raise TypeError(
@@ -3764,6 +3790,7 @@ class EnvironmentLifecycle:
                         if allocation_context is None
                         else {"allocation_id": (allocation_context.intent.allocation_id)}
                     ),
+                    **_phase_timings_payload(phase_timer, include_unfinished=False),
                 },
             )
             if allocation_context is not None:
@@ -3977,6 +4004,7 @@ class EnvironmentLifecycle:
                                     exc,
                                     redactor=self._secret_redactor,
                                 ),
+                                **_phase_timings_payload(phase_timer, include_unfinished=True),
                             },
                         )
                         if allocation_context is not None:
@@ -5663,6 +5691,7 @@ class EnvironmentLifecycle:
             execution_profile=execution_profile,
             events=events,
         )
+        phase_timer = EnvironmentPhaseTimer()
         base_payload = _binding_base_payload(
             registered_environment,
             session_id=session.id,
@@ -5718,6 +5747,7 @@ class EnvironmentLifecycle:
                         operation_name="Environment workspace completion recovery",
                         redactor=self._secret_redactor,
                     ),
+                    phase_timer=phase_timer,
                 )
             elif registered_environment.unclaimed_factory_result is not None:
                 attempt = _EnvironmentLifecycleBindAttempt()
@@ -5736,6 +5766,7 @@ class EnvironmentLifecycle:
                             operation_name="Environment workspace binding",
                             redactor=self._secret_redactor,
                         ),
+                        phase_timer=phase_timer,
                     )
                 finally:
                     release_failed_binding_reservations = attempt.release_failed_reservations
@@ -5756,6 +5787,7 @@ class EnvironmentLifecycle:
                         operation_name="Environment workspace binding",
                         redactor=self._secret_redactor,
                     ),
+                    phase_timer=phase_timer,
                 )
         except BaseException as exc:
             progress_failure: BaseException | None = None
@@ -5890,6 +5922,7 @@ class EnvironmentLifecycle:
                             exc,
                             redactor=self._secret_redactor,
                         ),
+                        **_phase_timings_payload(phase_timer, include_unfinished=True),
                     }
                     try:
                         events.append(
@@ -6047,6 +6080,7 @@ class EnvironmentLifecycle:
                                             self._session_store.public_authority_alias_codec
                                         ),
                                     ),
+                                    **_phase_timings_payload(phase_timer, include_unfinished=False),
                                 },
                             ),
                             execution_profile,
@@ -6140,8 +6174,15 @@ class EnvironmentLifecycle:
             else:
                 session_start_events.append(persisted)
 
-        def binding_event(event_type: EventType, bound: BoundWorkspace | None) -> Event:
+        def binding_event(
+            event_type: EventType,
+            bound: BoundWorkspace | None,
+            phase_timings: object = None,
+            error_type: object = None,
+        ) -> Event:
             payload = copy_json_value(base_payload, "binding_payload")
+            if type(error_type) is str and error_type:
+                payload["error_type"] = error_type[:128]
             if bound is not None:
                 payload.update(
                     _bound_workspace_payload(
@@ -6153,6 +6194,8 @@ class EnvironmentLifecycle:
                         ),
                     )
                 )
+            if isinstance(phase_timings, list) and phase_timings:
+                payload["phase_timings"] = copy_json_value(phase_timings, "phase_timings")
             return _event_with_binding_generation_authority(
                 event_with_execution_profile_authority(
                     Event(
@@ -6167,6 +6210,18 @@ class EnvironmentLifecycle:
             )
 
         async def observe(kind: str, payload: dict[str, Any], bound: BoundWorkspace | None) -> None:
+            if kind == "binding_failed":
+                publish(
+                    await self._event_writer.emit(
+                        binding_event(
+                            EventType.ENVIRONMENT_BINDING_FAILED,
+                            None,
+                            payload.get("phase_timings"),
+                            payload.get("error_type"),
+                        )
+                    )
+                )
+                return
             if kind in {"binding_started", "binding_completed"}:
                 # The same binding events an eager bind records, now that the
                 # deferred binding really binds.
@@ -6177,6 +6232,7 @@ class EnvironmentLifecycle:
                             if kind == "binding_started"
                             else EventType.ENVIRONMENT_BINDING_COMPLETED,
                             bound,
+                            payload.get("phase_timings"),
                         )
                     )
                 )
@@ -6734,6 +6790,7 @@ class EnvironmentLifecycle:
             execution_profile=execution_profile,
             events=events,
         )
+        phase_timer = EnvironmentPhaseTimer()
         start_publication_error: BaseException | None = None
         try:
             events.append(
@@ -6786,6 +6843,7 @@ class EnvironmentLifecycle:
                 progress_reporter,
                 EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
                 EnvironmentLifecycleProgressStatus.STARTED,
+                phase_timer=phase_timer,
             )
             final_revision = await environment_operation_boundary.await_environment_operation(
                 lambda: _observe_final_workspace_revision(
@@ -6801,6 +6859,7 @@ class EnvironmentLifecycle:
                 progress_reporter,
                 EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
                 EnvironmentLifecycleProgressStatus.COMPLETED,
+                phase_timer=phase_timer,
             )
             finalization_delta = await _final_workspace_delta_payload(
                 session_store=self._session_store,
@@ -6865,6 +6924,7 @@ class EnvironmentLifecycle:
                     operation_name="Environment binding finalization",
                     redactor=self._secret_redactor,
                 ),
+                phase_timer=phase_timer,
             )
             if setup_owner is not None:
                 # The binding reached its own terminal boundary. Any retained
@@ -6934,6 +6994,7 @@ class EnvironmentLifecycle:
                 error_payload = {
                     **base_payload,
                     **finalize_error_payload,
+                    **_phase_timings_payload(phase_timer, include_unfinished=True),
                 }
                 if final_revision_payload is not None:
                     error_payload["final_revision"] = final_revision_payload
@@ -7214,6 +7275,7 @@ class EnvironmentLifecycle:
                                         ),
                                         finalization_delta=finalization_delta,
                                     ),
+                                    **_phase_timings_payload(phase_timer, include_unfinished=False),
                                 },
                             ),
                             execution_profile,

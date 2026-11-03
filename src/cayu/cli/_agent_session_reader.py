@@ -31,7 +31,7 @@ from cayu.cli._session_reader import (
 )
 from cayu.events import Event
 from cayu.sessions._call_inspection import InspectionWindow
-from cayu.sessions._rollup import RollupPage, SessionRollupQuery
+from cayu.sessions._rollup import RollupPage, SessionRollupQuery, SessionTiming
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord
@@ -207,7 +207,23 @@ class AgentSessionReader:
                 "state": status if status in {"failed", "interrupted"} else "none"
             },
             "budget": None,
+            "timing": self._timing(session_id),
         }
+
+    def _timing(self, session_id: str) -> dict[str, Any] | None:
+        """The session's time breakdown; ``None`` from an Agent whose Cayu predates it."""
+
+        try:
+            body = self._session_get(session_id, "timing")
+        except CayuApiError as exc:
+            if exc.category == "unsupported" or exc.status_code in {404, 405}:
+                return None
+            raise
+        try:
+            timing = SessionTiming.model_validate_json(json.dumps(body))
+        except ValueError as exc:
+            raise CayuApiError("not_cayu", "The Agent's session timing is invalid.") from exc
+        return timing.model_dump(mode="json")
 
     async def latest_interactions(
         self, session_id: str, *, before_sequence: int | None, limit: int

@@ -718,6 +718,17 @@ def test_a_session_copies_in_runs_tools_through_the_broker_and_copies_back(
     assert os.access(sandbox.root / "run.sh", os.X_OK)
     assert broker.archive_gets == 1
 
+    # Each environment operation records how long its steps took.
+    def steps(event_type: EventType) -> list[str]:
+        (event,) = [item for item in events if item.type == event_type]
+        return [step["phase"] for step in event.payload["phase_timings"]]
+
+    assert steps(EventType.ENVIRONMENT_FACTORY_COMPLETED) == ["sandbox_allocation"]
+    assert {"transfer", "git_baseline"} <= set(steps(EventType.ENVIRONMENT_BINDING_COMPLETED))
+    assert {"copy_back_publication", "sandbox_release"} <= set(
+        steps(EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED)
+    )
+
 
 def test_factory_release_and_binding_destroy_the_sandbox(tmp_path: Path) -> None:
     source = _project(tmp_path)

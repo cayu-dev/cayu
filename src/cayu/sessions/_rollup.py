@@ -16,8 +16,14 @@ Time per session:
   environment setup intervals (factory, binding and materialization), so parallel tool
   calls count once, with waits for a person (approval or input requests until answered)
   cut out, as turn time leaves them out.
+- ``teardown_ms``: the union of environment teardown intervals (binding finalization:
+  copy-back and release). Teardown runs after a turn's answer, so it is not part of
+  ``active_ms``.
 - ``gap_ms``: active time not covered by any of those intervals, the runtime's own work
   between steps. It is approximate: an interval of an unfinished turn still counts as busy.
+
+`session_timing` reads the same events for one session and splits its whole elapsed time
+into parts that add up to it (`cayu session show`).
 """
 
 from __future__ import annotations
@@ -79,6 +85,22 @@ _SETUP_ENDS: dict[EventType | str, tuple[str, str]] = {
     EventType.ENVIRONMENT_MATERIALIZATION_COMPLETED: ("materialization", "binding_generation_id"),
     EventType.ENVIRONMENT_MATERIALIZATION_FAILED: ("materialization", "binding_generation_id"),
 }
+_TEARDOWN_STARTS: dict[EventType | str, tuple[str, str]] = {
+    EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED: ("finalize", "binding_generation_id"),
+}
+_TEARDOWN_ENDS: dict[EventType | str, tuple[str, str]] = {
+    EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED: ("finalize", "binding_generation_id"),
+    EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED: ("finalize", "binding_generation_id"),
+}
+_FAILED_ENVIRONMENT_ENDS = frozenset(
+    {
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.ENVIRONMENT_BINDING_FAILED,
+        EventType.ENVIRONMENT_MATERIALIZATION_FAILED,
+        EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+    }
+)
+_TURN_STARTS = (EventType.INTERACTION_STARTED, EventType.INTERACTION_RESUMED)
 _TURN_ENDS = (
     EventType.INTERACTION_COMPLETED,
     EventType.INTERACTION_FAILED,
@@ -97,6 +119,10 @@ ROLLUP_EVENT_TYPES = (
     EventType.TOOL_CALL_BLOCKED,
     *_SETUP_STARTS,
     *_SETUP_ENDS,
+    *_TEARDOWN_STARTS,
+    *_TEARDOWN_ENDS,
+    *_TURN_STARTS,
+    EventType.INTERACTION_PAUSED,
     *_TURN_ENDS,
     # Waits for a person, which turn time leaves out.
     EventType.TOOL_CALL_APPROVAL_REQUESTED,
@@ -217,6 +243,8 @@ class RollupDurations(BaseModel):
     model_ms: StrictInt = Field(default=0, ge=0)
     tool_ms: StrictInt = Field(default=0, ge=0)
     setup_ms: StrictInt = Field(default=0, ge=0)
+    # An Agent whose Cayu predates teardown timing reports 0.
+    teardown_ms: StrictInt = Field(default=0, ge=0)
     gap_ms: StrictInt = Field(default=0, ge=0)
 
 
@@ -309,6 +337,7 @@ class SessionFacts:
     model_ms: int = 0
     tool_ms: int = 0
     setup_ms: int = 0
+    teardown_ms: int = 0
     gap_ms: int = 0
 
 
@@ -334,20 +363,102 @@ async def session_facts(
 ) -> SessionFacts:
     """Read one session's rollup facts from its events, a bounded page at a time."""
 
+    return (await _scan_session(store, session_id, pricing=pricing)).facts
+
+
+Span = tuple[datetime, datetime]
+_NEVER = datetime.max.replace(tzinfo=UTC)
+
+
+@dataclass
+class _EnvironmentOperation:
+    kind: str
+    environment: str | None
+    started_at: datetime | None
+    ended_at: datetime | None = None
+    outcome: Literal["completed", "failed", "running"] = "running"
+    phase_timings: object = None
+
+
+@dataclass
+class _SessionScan:
+    facts: SessionFacts
+    model_spans: list[Span]
+    tool_spans: list[Span]
+    setup_spans: list[Span]
+    teardown_spans: list[Span]
+    wait_spans: list[Span]
+    turn_spans: list[Span]
+    # Model calls, tool calls, environment operations and a turn still running when the
+    # read ended, from their start; the rollup leaves them out, the timing view doesn't.
+    unfinished: dict[str, list[Span]]
+    operations: list[_EnvironmentOperation]
+    operations_truncated: bool
+    first_at: datetime | None
+    last_at: datetime | None
+    first_model_at: datetime | None
+
+
+async def _scan_session(
+    store: SessionStore, session_id: str, *, pricing: PriceBook | None
+) -> _SessionScan:
     facts = SessionFacts()
     model_open: dict[str, datetime] = {}
     tool_open: dict[tuple[str, str], datetime] = {}
+    # Setup and teardown keys never collide: teardown's family is always "finalize".
     setup_open: dict[tuple[str, str], datetime] = {}
-    model_spans: list[tuple[datetime, datetime]] = []
-    tool_spans: list[tuple[datetime, datetime]] = []
-    setup_spans: list[tuple[datetime, datetime]] = []
+    turn_open: datetime | None = None
+    model_spans: list[Span] = []
+    tool_spans: list[Span] = []
+    setup_spans: list[Span] = []
+    teardown_spans: list[Span] = []
+    turn_spans: list[Span] = []
+    operations: list[_EnvironmentOperation] = []
+    open_operations: dict[tuple[str, str], _EnvironmentOperation] = {}
+    operations_truncated = False
+    first_at: datetime | None = None
+    last_at: datetime | None = None
+    first_model_at: datetime | None = None
     pricer = None if pricing is None else CallPricer(pricing)
     wait_open: dict[tuple[str, str], datetime] = {}
-    wait_spans: list[tuple[datetime, datetime]] = []
+    wait_spans: list[Span] = []
+
+    def start_operation(key: tuple[str, str] | None, event: Event) -> None:
+        nonlocal operations_truncated
+        if key is None or key in open_operations:
+            return
+        if len(operations) >= SESSION_TIMING_MAX_OPERATIONS:
+            operations_truncated = True
+            return
+        operation = _EnvironmentOperation(
+            kind=key[0], environment=event.environment_name, started_at=event.timestamp
+        )
+        operations.append(operation)
+        open_operations[key] = operation
+
+    def end_operation(key: tuple[str, str] | None, event: Event, started: datetime | None) -> None:
+        nonlocal operations_truncated
+        operation = None if key is None else open_operations.pop(key, None)
+        if operation is None:
+            if len(operations) >= SESSION_TIMING_MAX_OPERATIONS:
+                operations_truncated = True
+                return
+            operation = _EnvironmentOperation(
+                kind=key[0] if key is not None else "environment",
+                environment=event.environment_name,
+                started_at=started,
+            )
+            operations.append(operation)
+        operation.ended_at = event.timestamp
+        operation.outcome = "failed" if event.type in _FAILED_ENVIRONMENT_ENDS else "completed"
+        operation.phase_timings = event.payload.get("phase_timings")
+
     async for record in _events(store, session_id):
         event = record.event
         payload = event.payload
         at = event.timestamp
+        first_at = at if first_at is None else min(first_at, at)
+        last_at = at if last_at is None else max(last_at, at)
         if event.type == EventType.SESSION_STARTED:
             release = recorded_release_identity(payload)
             if facts.release is None and release is not None:
@@ -357,6 +468,7 @@ async def session_facts(
             # resolved it.
             wait_spans.extend((started, at) for started in wait_open.values())
             wait_open.clear()
+            first_model_at = at if first_model_at is None else min(first_model_at, at)
             attempt = _text(payload.get("model_attempt_id"))
             if attempt is not None:
                 model_open.setdefault(attempt, at)
@@ -409,18 +521,23 @@ async def session_facts(
                 wait_spans.append((waited, at))
             if event.type != EventType.TOOL_CALL_COMPLETED:
                 facts.tool_failures[(event.tool_name or _NO_VALUE, tool_failure_kind(event))] += 1
-        elif (start := _SETUP_STARTS.get(event.type)) is not None:
+        elif (
+            start := _SETUP_STARTS.get(event.type) or _TEARDOWN_STARTS.get(event.type)
+        ) is not None:
             setup_key = _setup_key(event, start)
             if setup_key is not None:
                 setup_open.setdefault(setup_key, at)
-        elif (end := _SETUP_ENDS.get(event.type)) is not None:
+            start_operation(setup_key, event)
+        elif (end := _SETUP_ENDS.get(event.type) or _TEARDOWN_ENDS.get(event.type)) is not None:
+            teardown = event.type in _TEARDOWN_ENDS
             setup_key = _setup_key(event, end)
             started = None if setup_key is None else setup_open.pop(setup_key, None)
             elapsed = payload.get("elapsed_ms")
             if started is None and type(elapsed) is int and elapsed >= 0:
                 started = at - timedelta(milliseconds=elapsed)
             if started is not None:
-                setup_spans.append((started, at))
+                (teardown_spans if teardown else setup_spans).append((started, at))
+            end_operation(setup_key, event, started)
         elif event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED:
             approval = _text(payload.get("approval_id"))
             if approval is not None:
@@ -439,23 +556,209 @@ async def session_facts(
                 started = wait_open.pop((kind, _text(payload.get(field_name)) or ""), None)
                 if started is not None:
                     wait_spans.append((started, at))
+        elif event.type in _TURN_STARTS:
+            turn_open = at if turn_open is None else turn_open
+        elif event.type == EventType.INTERACTION_PAUSED:
+            # A paused turn waits for a person; its terminal event covers it if it ends.
+            turn_open = None
         elif event.type in _TURN_ENDS:
+            turn_open = None
             facts.active_ms += _milliseconds(payload.get("active_duration_ms"))
-            facts.wall_ms += _milliseconds(payload.get("wall_duration_ms"))
+            wall_ms = _milliseconds(payload.get("wall_duration_ms"))
+            facts.wall_ms += wall_ms
+            if wall_ms:
+                turn_spans.append((at - timedelta(milliseconds=wall_ms), at))
     for cost in [] if pricer is None else pricer.unclaimed():
         # A hosted call no model call claimed still leaves the total incomplete when unpriced.
         _count_cost(facts, cost, model_call=True)
     # A tool call that waited for approval spans the wait; turn time leaves waits out, so
     # every phase does too. A wait still open runs to the end of what was read.
-    wait_spans.extend((started, datetime.max.replace(tzinfo=UTC)) for started in wait_open.values())
+    wait_spans.extend((started, _NEVER) for started in wait_open.values())
     model_spans = _without(model_spans, wait_spans)
     tool_spans = _without(tool_spans, wait_spans)
     setup_spans = _without(setup_spans, wait_spans)
+    teardown_spans = _without(teardown_spans, wait_spans)
     facts.model_ms = _union_ms(model_spans)
     facts.tool_ms = _union_ms(tool_spans)
     facts.setup_ms = _union_ms(setup_spans)
+    facts.teardown_ms = _union_ms(teardown_spans)
     facts.gap_ms = max(facts.active_ms - _union_ms([*model_spans, *tool_spans, *setup_spans]), 0)
-    return facts
+    unfinished: dict[str, list[Span]] = {
+        "model": [(started, _NEVER) for started in model_open.values()],
+        "tool": [(started, _NEVER) for started in tool_open.values()],
+        "setup": [(started, _NEVER) for key, started in setup_open.items() if key[0] != "finalize"],
+        "teardown": [
+            (started, _NEVER) for key, started in setup_open.items() if key[0] == "finalize"
+        ],
+        "turn": [] if turn_open is None else [(turn_open, _NEVER)],
+    }
+    return _SessionScan(
+        facts=facts,
+        model_spans=model_spans,
+        tool_spans=tool_spans,
+        setup_spans=setup_spans,
+        teardown_spans=teardown_spans,
+        wait_spans=wait_spans,
+        turn_spans=turn_spans,
+        unfinished=unfinished,
+        operations=operations,
+        operations_truncated=operations_truncated,
+        first_at=first_at,
+        last_at=last_at,
+        first_model_at=first_model_at,
+    )
+
+
+SESSION_TIMING_MAX_OPERATIONS = 100
+
+
+class SessionTimingPhase(BaseModel):
+    """One step of an environment operation, from its ``phase_timings`` (see
+    ``cayu.environments._phase_timing``). ``depth`` is how many steps it runs inside."""
+
+    model_config = _RESPONSE_CONFIG
+
+    phase: str
+    started_at: datetime
+    duration_ms: StrictInt = Field(ge=0)
+    outcome: str
+    depth: StrictInt = Field(default=0, ge=0)
+    items: StrictInt | None = Field(default=None, ge=0)
+    bytes: StrictInt | None = Field(default=None, ge=0)
+
+
+class SessionTimingOperation(BaseModel):
+    """One environment operation: ``factory`` (allocate or reconnect), ``binding`` (copy-in
+    and setup), ``materialization`` (a deferred environment starting) or ``finalize``
+    (copy-back and release). ``phases`` is empty for a session recorded before Cayu timed
+    the steps, or for a binding that reports none."""
+
+    model_config = _RESPONSE_CONFIG
+
+    kind: str
+    environment: str | None = None
+    started_at: datetime | None = None
+    duration_ms: StrictInt | None = Field(default=None, ge=0)
+    outcome: Literal["completed", "failed", "running"]
+    phases: list[SessionTimingPhase] = Field(default_factory=list)
+
+
+class SessionTiming(BaseModel):
+    """Where one session's time went, in milliseconds.
+
+    ``elapsed_ms`` runs from the session's first recorded event to its last. It splits into
+    parts that add up to it, each moment counted once, in the first part it belongs to:
+    ``waiting_ms`` (approval or input requests until answered), ``setup_ms`` (environment
+    factory, binding and materialization), ``teardown_ms`` (binding finalization), then
+    ``model_ms`` and ``tool_ms`` (calls running, parallel calls counted once).
+    ``other_ms`` is the rest of the time inside turns, the runtime's own work between
+    steps; ``idle_ms`` is time outside any turn and its teardown, such as between turns.
+    A call, environment operation or turn still running when the events were read counts
+    until the last event. ``first_model_call_ms`` is how long after the start the first
+    model call began.
+    """
+
+    model_config = _RESPONSE_CONFIG
+
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    elapsed_ms: StrictInt = Field(default=0, ge=0)
+    setup_ms: StrictInt = Field(default=0, ge=0)
+    model_ms: StrictInt = Field(default=0, ge=0)
+    tool_ms: StrictInt = Field(default=0, ge=0)
+    teardown_ms: StrictInt = Field(default=0, ge=0)
+    waiting_ms: StrictInt = Field(default=0, ge=0)
+    other_ms: StrictInt = Field(default=0, ge=0)
+    idle_ms: StrictInt = Field(default=0, ge=0)
+    model_calls: StrictInt = Field(default=0, ge=0)
+    tool_calls: StrictInt = Field(default=0, ge=0)
+    first_model_call_ms: StrictInt | None = Field(default=None, ge=0)
+    environment: list[SessionTimingOperation] = Field(default_factory=list)
+    environment_truncated: bool = False
+
+
+async def session_timing(store: SessionStore, session_id: str) -> SessionTiming:
+    """Split one session's elapsed time into setup, model, tools, teardown and the rest."""
+
+    scan = await _scan_session(store, session_id, pricing=None)
+    # The scan reads only the event types it accounts for; the session's own first and
+    # last events (streamed text, progress, ...) bound its elapsed time.
+    bounds = [
+        record.event.timestamp
+        for order in (EventOrder.SEQUENCE_ASC, EventOrder.SEQUENCE_DESC)
+        for record in await store.query_events(
+            EventQuery(session_id=session_id, limit=1, order_by=order)
+        )
+    ]
+    seen = [*bounds, *(at for at in (scan.first_at, scan.last_at) if at is not None)]
+    if not seen:
+        return SessionTiming()
+    start = min([*seen, *(span[0] for span in scan.turn_spans)])
+    end = max(seen)
+    unfinished = scan.unfinished
+    # Each part is what its spans add to everything claimed before it, so rounding to
+    # milliseconds keeps the parts adding up to the elapsed time.
+    claimed: list[Span] = []
+    claimed_ms = 0
+    parts: dict[str, int] = {}
+    for name, spans in (
+        ("waiting", scan.wait_spans),
+        ("setup", [*scan.setup_spans, *unfinished["setup"]]),
+        ("teardown", [*scan.teardown_spans, *unfinished["teardown"]]),
+        ("model", [*scan.model_spans, *unfinished["model"]]),
+        ("tool", [*scan.tool_spans, *unfinished["tool"]]),
+        ("other", [*scan.turn_spans, *unfinished["turn"]]),
+    ):
+        claimed = _merged([*claimed, *_clip(spans, start, end)])
+        total = _union_ms(claimed)
+        parts[name] = total - claimed_ms
+        claimed_ms = total
+    elapsed = _union_ms([(start, end)])
+    return SessionTiming(
+        started_at=start,
+        ended_at=end,
+        elapsed_ms=elapsed,
+        setup_ms=parts["setup"],
+        model_ms=parts["model"],
+        tool_ms=parts["tool"],
+        teardown_ms=parts["teardown"],
+        waiting_ms=parts["waiting"],
+        other_ms=parts["other"],
+        idle_ms=max(elapsed - claimed_ms, 0),
+        model_calls=scan.facts.model_calls,
+        tool_calls=scan.facts.tool_calls,
+        first_model_call_ms=(
+            None
+            if scan.first_model_at is None
+            else max(round((scan.first_model_at - start).total_seconds() * 1000), 0)
+        ),
+        environment=[_timing_operation(item) for item in scan.operations],
+        environment_truncated=scan.operations_truncated,
+    )
+
+
+def _timing_operation(operation: _EnvironmentOperation) -> SessionTimingOperation:
+    duration = (
+        None
+        if operation.started_at is None or operation.ended_at is None
+        else max(round((operation.ended_at - operation.started_at).total_seconds() * 1000), 0)
+    )
+    phases: list[SessionTimingPhase] = []
+    if isinstance(operation.phase_timings, list):
+        for item in operation.phase_timings:
+            try:
+                phases.append(SessionTimingPhase.model_validate(item))
+            except ValueError:
+                # Recorded by a binding this reader can't read; the operation still shows.
+                continue
+    return SessionTimingOperation(
+        kind=operation.kind,
+        environment=operation.environment,
+        started_at=operation.started_at,
+        duration_ms=duration,
+        outcome=operation.outcome,
+        phases=phases,
+    )
 
 
 def tool_failure_kind(event: Event) -> str:
@@ -540,6 +843,7 @@ def _session_group(key: str, session: Session, facts: SessionFacts) -> RollupGro
             model_ms=facts.model_ms,
             tool_ms=facts.tool_ms,
             setup_ms=facts.setup_ms,
+            teardown_ms=facts.teardown_ms,
             gap_ms=facts.gap_ms,
         ),
         failure_kinds=_kind_rows(facts.tool_failures),
@@ -646,6 +950,10 @@ def _without(
         if start < end:
             kept.append((start, end))
     return kept
+
+
+def _clip(spans: list[Span], start: datetime, end: datetime) -> list[Span]:
+    return [(max(a, start), min(b, end)) for a, b in spans if min(b, end) > max(a, start)]
 
 
 def _union_ms(spans: list[tuple[datetime, datetime]]) -> int:

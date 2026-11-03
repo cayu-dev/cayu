@@ -3202,7 +3202,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "binding_cleanup binding_generation_id binding_type bound_metadata bound_path bound_snapshot "
         "bound_workspace_id configured_workspace_id environment_factory_release error "
         "error_type execution_profile_fingerprint factory_allocation_action failures final_git_receipt final_revision final_snapshot has_bound_runner "
-        "has_configured_runner outcome source_publication_receipt source_workspace_id terminal_outcome",
+        "has_configured_runner outcome phase_timings source_publication_receipt source_workspace_id "
+        "terminal_outcome",
         owned_nested_paths=(
             terminal_finalization_owned_paths
             | {
@@ -3244,6 +3245,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "failures",
             "final_git_receipt",
             "final_revision",
+            "phase_timings",
         },
     )
     for event_type in (
@@ -3259,7 +3261,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "allocation_id causal_budget_id durable_value_error_code durable_value_error_path "
         "environment_factory_release environment_name environment_rebuild error error_type "
         "execution_profile_fingerprint factory_type labels "
-        "parent_session_id reconnect_metadata requested_environment_name result_metadata",
+        "parent_session_id phase_timings reconnect_metadata requested_environment_name "
+        "result_metadata",
         owned_nested_paths={
             ("reconnect_metadata", "allocation_fingerprint"),
         },
@@ -3269,6 +3272,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "environment_factory_release",
             "environment_rebuild",
             "labels",
+            "phase_timings",
             "reconnect_metadata",
             "result_metadata",
         },

@@ -1,7 +1,8 @@
-"""HTTP assembly for one session's model-call usage and paired tool calls, and rollups.
+"""HTTP assembly for one session's model-call usage, paired tool calls, timing, and rollups.
 
 `GET /sessions/{id}/model-calls` and `GET /sessions/{id}/tool-calls` serve the views behind
-`cayu session usage` and `cayu session tools` (`cayu.sessions._call_inspection`). They pair
+`cayu session usage` and `cayu session tools` (`cayu.sessions._call_inspection`), and
+`GET /sessions/{id}/timing` the time breakdown `cayu session show` reports. They pair
 events by private identity on the server and publish only what the public event API does: a
 tool call is named by its `tool_call_correlation_id`, and model step, attempt, round and
 budget reservation ids are withheld.
@@ -23,6 +24,7 @@ from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.server.contracts import (
     SessionModelCallsRequest,
     SessionModelCallsResponse,
+    SessionTimingResponse,
     SessionToolCallsResponse,
 )
 from cayu.sessions._call_inspection import (
@@ -32,7 +34,7 @@ from cayu.sessions._call_inspection import (
     inspect_model_calls,
     inspect_tool_calls,
 )
-from cayu.sessions._rollup import RollupPage, SessionRollupQuery, rollup_page
+from cayu.sessions._rollup import RollupPage, SessionRollupQuery, rollup_page, session_timing
 from cayu.sessions.store import SessionStore
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -209,6 +211,33 @@ def register_session_call_routes(
             "session_id": project_session(private_id),
             **result,
             "calls": [_public_tool_call(row, private_id, alias_codec) for row in result["calls"]],
+        }
+
+    @router.get(
+        "/sessions/{session_id}/timing",
+        response_model=SessionTimingResponse,
+        responses={404: _RESPONSES[404]},
+        dependencies=protected,
+        description=(
+            "Where one session's time went, as `cayu session show` reports it: its elapsed "
+            "time split into environment setup, model calls, tool calls, teardown, waits for "
+            "a person, the runtime's own work and idle time between turns, plus each "
+            "environment operation with the steps it timed."
+        ),
+    )
+    async def get_session_timing(session_id: NonBlankString, response: Response):
+        private_id = await resolve_session(session_id)
+        if await store.load_state(private_id) is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        timing = (await session_timing(store, private_id)).model_dump(mode="json")
+        response.headers["Cache-Control"] = "private, no-store"
+        return {
+            "session_id": project_session(private_id),
+            **timing,
+            "environment": [
+                {**operation, "environment": redact(operation["environment"])}
+                for operation in timing["environment"]
+            ],
         }
 
 

@@ -42,6 +42,7 @@ from cayu.environments._ephemeral_git import (
     sync_bound_tree_size,
 )
 from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
+from cayu.environments._phase_timing import environment_phase_step
 from cayu.environments._setup_commands import (
     run_setup_commands,
     setup_commands_sha256,
@@ -590,15 +591,19 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             git_baseline: EphemeralGitBaseline | None = None
             if self._git_baseline:
                 tree_bytes, tree_files = sync_bound_tree_size(bound.metadata)
-                await initialize_ephemeral_git_baseline(
-                    runner, tree_bytes=tree_bytes, tree_files=tree_files
+                with environment_phase_step("git_baseline"):
+                    await initialize_ephemeral_git_baseline(
+                        runner, tree_bytes=tree_bytes, tree_files=tree_files
+                    )
+            with environment_phase_step(
+                "workspace_setup_commands", when=bool(self._workspace_setup_commands)
+            ):
+                await run_setup_commands(
+                    runner,
+                    self._workspace_setup_commands,
+                    label="Docker coding workspace setup command",
+                    timeout_s=self._setup_command_timeout_s,
                 )
-            await run_setup_commands(
-                runner,
-                self._workspace_setup_commands,
-                label="Docker coding workspace setup command",
-                timeout_s=self._setup_command_timeout_s,
-            )
             if self._git_baseline:
                 # Read after setup, which may have amended the baseline.
                 git_baseline = await ephemeral_git_baseline(runner)

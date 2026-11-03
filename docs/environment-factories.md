@@ -98,6 +98,9 @@ execution-ready publication, copy-back conflict preflight/publication, release, 
 cleanup. `SyncBinding` publishes aggregate progress for its built-in phases. Custom factories
 and bindings can obtain the runtime-owned reporter with
 `current_environment_lifecycle_progress_reporter()` while their lifecycle callback is active.
+Whether or not a policy is set, the runtime also times `SyncBinding`'s built-in phases and
+Cayu's sandbox steps and records them on the operation's terminal event as `phase_timings`
+(see [Environment step timings](runtime-contracts.md#environment-step-timings)).
 Release callbacks run under the release reporter as well. When delegated cleanup remains
 owned after a release bound, the release operation terminates as `retained` and Cayu publishes
 an explicit terminal retained-cleanup owner rather than claiming a clean release.

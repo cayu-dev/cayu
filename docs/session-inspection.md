@@ -471,8 +471,8 @@ cayu session list --since 2026-10-27 --until 2026-10-28T12:00:00-07:00
 cayu session list --overview
 cayu session list --overview --table --application bug-hunter
 
-# Content-free operational summary, including runtime name/version, usage, and
-# pending-action counts.
+# Content-free operational summary, including runtime name/version, usage,
+# pending-action counts, and where the session's time went.
 cayu session show SESSION_ID
 
 # A workflow run as a whole: steps, child sessions, usage and custom events.
@@ -536,6 +536,65 @@ commands, and `uses.artifacts` is `null`. Costs are priced with Cayu's bundled p
 book, or `--price-book PATH`. Overviews need the `server` extra installed locally
 (`pip install "cayu[server]"`).
 
+### Where a session's time went
+
+`cayu session show` ends with a `timing` object that splits the session's elapsed time,
+from its first recorded event to its last, into parts that add up to it. Each moment
+counts once, in the first part it belongs to, in this order:
+
+| Field | Meaning |
+| --- | --- |
+| `waiting_ms` | Waiting for a person: an approval or input request until it was answered. |
+| `setup_ms` | Environment setup: factory allocation or reconnect, binding (copy-in, Git baseline, setup commands) and deferred materialization. |
+| `teardown_ms` | Environment teardown: binding finalization (copy-back and releasing the sandbox), which runs after the turn's answer. |
+| `model_ms` | Model calls running. |
+| `tool_ms` | Tool calls running; parallel calls count once. |
+| `other_ms` | The rest of the time inside turns: the runtime's own work between steps. |
+| `idle_ms` | Time outside any turn and its teardown, such as between two turns. |
+
+A model call, tool call, environment operation or turn that is still running (in a live
+session, or one whose process died) counts until the last recorded event, so a session
+read mid-turn shows its work as it stands rather than as idle time.
+
+`elapsed_ms`, `started_at` and `ended_at` give the whole span, `model_calls` and
+`tool_calls` the counts, and `first_model_call_ms` how long after the start the first
+model call began. `environment` lists each environment operation in the order it
+started (at most 100; `environment_truncated` says more were left out): its `kind`
+(`factory`, `binding`, `materialization` or `finalize`), `environment`, `started_at`,
+`duration_ms`, `outcome` (`completed`, `failed` or `running`) and `phases`, the steps the
+operation timed (see [Environment step timings](runtime-contracts.md#environment-step-timings)).
+Each step has its `phase`, `started_at`, `duration_ms`, `outcome` (`completed`, `failed`,
+or `unfinished` for a failed operation's step that was still running), `depth` (how many
+steps it ran inside: `archive_preparation` runs inside `transfer`) and, when the step
+reported them, `items` and `bytes`. A session recorded before Cayu timed the steps, or a
+binding that reports none, has empty `phases`; the operation and the parts still show.
+
+The table prints the parts with their share of the elapsed time, then one row per
+operation and step:
+
+```console
+Time (53m48s elapsed)
+part      time    share  notes
+setup     7m42s   14%    environment setup: allocate, copy in, setup commands
+model     17m02s  32%    22 calls, first after 8m42s
+tool      11m24s  21%    62 calls
+teardown  12m12s  23%    environment teardown: copy back, release
+...
+
+Environment operations
+step                          time   outcome    work
+binding (sandbox)             7m42s  completed  -
+  transfer                    2m54s  completed  4877 items, 129048576 bytes
+    archive_preparation       1m18s  completed  4877 items, 131072000 bytes
+  final_source_observation    4m12s  completed  4877 items
+finalize (sandbox)            12m12s completed  -
+  copy_back_publication       11m58s completed  45 items, 138412032 bytes
+  sandbox_release             2.1s   completed  -
+```
+
+For a Cloud Agent the CLI reads `GET /api/sessions/{id}/timing`. An Agent whose Cayu
+predates it reports `timing` as `null`, and the table says to redeploy.
+
 ### Structured output
 
 `cayu session output SESSION_ID` prints the structured output the session's latest
@@ -580,6 +639,17 @@ call ended (`stop`, `tool_calls`, `length`, `content_filter`, `error` or `unknow
 are `null` for a call recorded without completion details. A Cloud Agent whose Cayu
 predates these fields doesn't send them, so its JSON and JSONL rows have no
 `finish_reason` or `raw_finish_reason` keys and the table shows `-`.
+
+### Call timing
+
+Each `session usage` call row also says how long the call took: `started_at`, when its
+request started (its `model.started` event), `duration_ms`, from then to its completion,
+and `first_output_ms`, from then to its first streamed text or thinking delta. A slow
+provider shows a long `first_output_ms`; a call that streamed quickly but finished late
+spent its time generating. `first_output_ms` is `null` for a call that streamed no text or
+thinking, such as one that only returned tool calls, and all three are `null` for a call
+whose start is outside the selected window or that a Cloud Agent on an older Cayu
+reported. The table shows `duration` and `first_output`.
 
 ### Request controls
 
@@ -698,6 +768,7 @@ and time in milliseconds:
 | `model_ms` | Union of model-call intervals (start to completion or error). |
 | `tool_ms` | Union of tool-call intervals; parallel calls count once. |
 | `setup_ms` | Union of environment factory, binding and materialization intervals. |
+| `teardown_ms` | Union of binding finalization intervals (copy-back and release). Teardown runs after a turn's answer, so it is not part of `active_ms`. An Agent whose Cayu predates it reports `0`. |
 | `gap_ms` | Active time no model call, tool call or setup covered: the runtime's own work between steps. |
 
 Time spent waiting for a person (from an approval request to its decision, block or resume,

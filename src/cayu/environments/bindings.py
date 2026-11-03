@@ -36,6 +36,7 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
+from cayu.environments._phase_timing import observe_environment_phase
 from cayu.environments._sync_staging import (
     DEFAULT_SYNC_BINDING_STAGING_CAPACITY,
     SyncBindingStagingCapacity,
@@ -86,6 +87,7 @@ async def _report_sync_lifecycle(
     status: EnvironmentLifecycleProgressStatus,
     **counters: int | None,
 ) -> None:
+    observe_environment_phase(phase, status, **counters)
     reporter = current_environment_lifecycle_progress_reporter()
     if reporter is not None:
         await reporter.report(phase, status, **counters)

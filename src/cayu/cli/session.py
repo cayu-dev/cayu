@@ -1142,7 +1142,7 @@ def _render_rollup(
             "unpriced": row["unpriced_model_calls"],
             **{
                 name: _duration_text(row["durations"][f"{name}_ms"])
-                for name in ("active", "model", "tool", "setup", "gap")
+                for name in ("active", "model", "tool", "setup", "teardown", "gap")
             },
         }
         for row in rows
@@ -1163,6 +1163,7 @@ def _render_rollup(
             "model",
             "tool",
             "setup",
+            "teardown",
             "gap",
         ),
         cast("list[dict[str, Any]]", _redact_sensitive(table)),
@@ -1185,6 +1186,12 @@ def _render_rollup(
     print(f"{payload['sessions']} sessions ({state}).")
 
 
+def _optional_duration_text(milliseconds: object) -> str | None:
+    """A duration, or nothing when it wasn't recorded (an older Agent or session)."""
+
+    return _duration_text(milliseconds) if type(milliseconds) is int else None
+
+
 def _duration_text(milliseconds: int) -> str:
     seconds, ms = divmod(milliseconds, 1000)
     if not seconds:
@@ -1203,8 +1210,96 @@ async def _show_session(args: argparse.Namespace, reader: SessionReader) -> int:
         "schema_version": CLI_SCHEMA_VERSION,
         **await reader.overview(args.session_id),
     }
+    if args.output_format in {"json", "jsonl"}:
+        _render_detail(args.output_format, payload)
+        return 0
+    timing = payload.pop("timing", None)
     _render_detail(args.output_format, payload)
+    print()
+    _print_timing(cast("dict[str, Any] | None", _redact_sensitive(timing)))
     return 0
+
+
+_TIMING_PARTS = (
+    ("setup", "environment setup: allocate, copy in, setup commands"),
+    ("model", "model calls"),
+    ("tool", "tool calls"),
+    ("teardown", "environment teardown: copy back, release"),
+    ("waiting", "waiting for a person"),
+    ("other", "runtime work inside turns"),
+    ("idle", "outside turns"),
+)
+
+
+def _print_timing(timing: dict[str, Any] | None) -> None:
+    """Print where the session's time went and each environment operation's steps."""
+
+    if timing is None:
+        print(
+            "Time: this Agent's Cayu doesn't report session timing; redeploy it with a newer "
+            "cayu release to see it."
+        )
+        return
+    print(f"Time ({_duration_text(timing['elapsed_ms'])} elapsed)")
+    calls = {
+        name: f"{count} call" + ("" if count == 1 else "s")
+        for name, count in (("model", timing["model_calls"]), ("tool", timing["tool_calls"]))
+    }
+    first = timing.get("first_model_call_ms")
+    if type(first) is int:
+        calls["model"] += f", first after {_duration_text(first)}"
+    _print_table(
+        ("part", "time", "share", "notes"),
+        [
+            {
+                "part": name,
+                "time": _duration_text(timing[f"{name}_ms"]),
+                "share": _share_text(timing[f"{name}_ms"], timing["elapsed_ms"]),
+                "notes": calls.get(name, meaning),
+            }
+            for name, meaning in _TIMING_PARTS
+        ],
+    )
+    operations = timing.get("environment") or []
+    if not operations:
+        return
+    print()
+    print("Environment operations")
+    rows: list[dict[str, Any]] = []
+    for operation in operations:
+        rows.append(
+            {
+                "step": f"{operation['kind']} ({operation.get('environment') or '-'})",
+                "time": _optional_duration_text(operation.get("duration_ms")),
+                "outcome": operation["outcome"],
+                "work": None,
+            }
+        )
+        for phase in operation.get("phases") or []:
+            rows.append(
+                {
+                    "step": "  " * (1 + phase.get("depth", 0)) + phase["phase"],
+                    "time": _duration_text(phase["duration_ms"]),
+                    "outcome": phase["outcome"],
+                    "work": _phase_work_text(phase),
+                }
+            )
+    _print_table(("step", "time", "outcome", "work"), rows)
+    if timing.get("environment_truncated"):
+        print("More environment operations were left out.")
+
+
+def _share_text(part_ms: int, elapsed_ms: int) -> str:
+    return f"{round(100 * part_ms / elapsed_ms)}%" if elapsed_ms else "-"
+
+
+def _phase_work_text(phase: dict[str, Any]) -> str | None:
+    work = []
+    if type(phase.get("items")) is int:
+        work.append(f"{phase['items']} items")
+    if type(phase.get("bytes")) is int:
+        work.append(f"{phase['bytes']} bytes")
+    return ", ".join(work) or None
 
 
 async def _session_workflow(args: argparse.Namespace, reader: SessionReader) -> int:
@@ -1641,13 +1736,20 @@ def _render_usage(
         )
         return
     safe_calls = [
-        {**call, "cost": _cost_text(call)}
+        {
+            **call,
+            "cost": _cost_text(call),
+            "duration": _optional_duration_text(call.get("duration_ms")),
+            "first_output": _optional_duration_text(call.get("first_output_ms")),
+        }
         for call in cast("list[dict[str, Any]]", _redact_sensitive(calls))
     ]
     _print_table(
         (
             "sequence",
             "timestamp",
+            "duration",
+            "first_output",
             "provider",
             "requested_model",
             "resolved_model",

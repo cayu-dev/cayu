@@ -42,6 +42,7 @@ from cayu.environments._ephemeral_git import (
     initialize_ephemeral_git_baseline,
     sync_bound_tree_size,
 )
+from cayu.environments._phase_timing import environment_phase_step
 from cayu.environments._setup_commands import (
     run_setup_commands,
     setup_command_failure_message,
@@ -237,19 +238,23 @@ class BrokeredSandboxCodingBinding(SyncBinding):
                 raise RuntimeError("Brokered coding binding lost its sandbox target.")
             if self._git_baseline:
                 tree_bytes, tree_files = sync_bound_tree_size(bound.metadata)
-                await initialize_ephemeral_git_baseline(
+                with environment_phase_step("git_baseline"):
+                    await initialize_ephemeral_git_baseline(
+                        bound.runner,
+                        cwd=target.runner_cwd,
+                        tree_bytes=tree_bytes,
+                        tree_files=tree_files,
+                    )
+            with environment_phase_step(
+                "workspace_setup_commands", when=bool(self._workspace_setup_commands)
+            ):
+                await run_setup_commands(
                     bound.runner,
+                    self._workspace_setup_commands,
+                    label="Brokered sandbox workspace setup command",
+                    timeout_s=self._setup_command_timeout_s,
                     cwd=target.runner_cwd,
-                    tree_bytes=tree_bytes,
-                    tree_files=tree_files,
                 )
-            await run_setup_commands(
-                bound.runner,
-                self._workspace_setup_commands,
-                label="Brokered sandbox workspace setup command",
-                timeout_s=self._setup_command_timeout_s,
-                cwd=target.runner_cwd,
-            )
         except BaseException:
             self.abandon(bound)
             raise
@@ -289,7 +294,8 @@ class BrokeredSandboxCodingBinding(SyncBinding):
                     await runner.lease_keeper.stop()
             raise
         try:
-            await runner.close()
+            with environment_phase_step("sandbox_release"):
+                await runner.close()
         except Exception as error:
             # Publication succeeded and renewal has stopped, so the broker
             # destroys the sandbox when its lease lapses.
@@ -810,7 +816,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         if profile is not None:
             # Like Docker: a stale source fails before any sandbox is allocated.
             verify_local_coding_toolchain_dependencies(profile, self.source_workspace.root)
-        sandbox = await self._allocate(request)
+        with environment_phase_step("sandbox_allocation"):
+            sandbox = await self._allocate(request)
         keeper: SandboxLeaseKeeper | None = None
         runner: BrokeredSandboxRunner | None = None
         try:
@@ -829,19 +836,21 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             )
             self._require_transfer_capacity(sandbox)
             if profile is not None:
-                await _admit_toolchain(runner, profile)
-            for command in self.setup_commands:
-                result = await runner.exec(
-                    ExecCommand.bash(command), timeout_s=self.setup_command_timeout_s
-                )
-                if result.exit_code != 0 or result.timed_out:
-                    raise RuntimeError(
-                        setup_command_failure_message(
-                            "Brokered sandbox setup command",
-                            result,
-                            timeout_s=self.setup_command_timeout_s,
-                        )
+                with environment_phase_step("toolchain_admission"):
+                    await _admit_toolchain(runner, profile)
+            with environment_phase_step("setup_commands", when=bool(self.setup_commands)):
+                for command in self.setup_commands:
+                    result = await runner.exec(
+                        ExecCommand.bash(command), timeout_s=self.setup_command_timeout_s
                     )
+                    if result.exit_code != 0 or result.timed_out:
+                        raise RuntimeError(
+                            setup_command_failure_message(
+                                "Brokered sandbox setup command",
+                                result,
+                                timeout_s=self.setup_command_timeout_s,
+                            )
+                        )
             environment = Environment(
                 EnvironmentSpec(name=request.environment_name),
                 workspace=self._protected_source,

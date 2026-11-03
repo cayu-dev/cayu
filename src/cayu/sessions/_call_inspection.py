@@ -240,6 +240,7 @@ def model_call_usage(
     reservations: dict[str, dict[str, Any]] = {}
     settled_reservation_ids: set[str] = set()
     sent_controls: dict[str, dict[str, Any]] = {}
+    started: dict[str, EventRecord] = {}
     for record in records:
         event = record.event
         if event.type == EventType.MODEL_STARTED:
@@ -249,6 +250,8 @@ def model_call_usage(
             )
             if type(attempt_id) is str and controls is not None:
                 sent_controls[attempt_id] = controls
+            if type(attempt_id) is str:
+                started.setdefault(attempt_id, record)
             continue
         if event.type == EventType.BUDGET_RESERVED:
             reservation_id = event.payload.get("reservation_id")
@@ -268,9 +271,12 @@ def model_call_usage(
             except (TypeError, ValueError):
                 metrics = None
             cache = None if metrics is None else metrics.cache
+            attempt_id = event.payload.get("model_attempt_id")
+            start = started.pop(attempt_id, None) if type(attempt_id) is str else None
             call = {
                 "sequence": record.sequence,
                 "timestamp": event.timestamp.isoformat(),
+                **_call_timing(start, record, attempt_id),
                 "provider": None if metrics is None else metrics.provider_name,
                 "requested_model": None if metrics is None else metrics.requested_model,
                 "resolved_model": None if metrics is None else metrics.model,
@@ -328,6 +334,63 @@ def model_call_usage(
             continue
         unmatched_ledger.append({**ledger, "outcome": "open"})
     return calls, unmatched_ledger
+
+
+# Output events whose arrival marks a call's first streamed token.
+_FIRST_OUTPUT_EVENT_TYPES = (EventType.MODEL_TEXT_DELTA, EventType.MODEL_THINKING_DELTA)
+# Output events read past a call's start to find its own first one.
+_FIRST_OUTPUT_SCAN = 20
+_START_SEQUENCE_KEY = "_cayu_started_sequence"
+_ATTEMPT_KEY = "_cayu_model_attempt_id"
+
+
+def _call_timing(
+    start: EventRecord | None, completed: EventRecord, attempt_id: object
+) -> dict[str, Any]:
+    """When a call started and how long it ran, from its `model.started` event."""
+
+    if start is None:
+        return {"started_at": None, "duration_ms": None, "first_output_ms": None}
+    return {
+        "started_at": start.event.timestamp.isoformat(),
+        "duration_ms": _duration_ms(start, completed),
+        "first_output_ms": None,
+        _START_SEQUENCE_KEY: start.sequence,
+        _ATTEMPT_KEY: attempt_id,
+    }
+
+
+async def _add_first_output(
+    reader: EventReader, session_id: str, calls: list[dict[str, Any]]
+) -> None:
+    """Set each call's `first_output_ms`: from its start to its first streamed text or
+    thinking delta, read from the events between its start and its completion."""
+
+    for call in calls:
+        started_sequence = call.pop(_START_SEQUENCE_KEY, None)
+        attempt_id = call.pop(_ATTEMPT_KEY, None)
+        if type(started_sequence) is not int or call.get("started_at") is None:
+            continue
+        page = await reader.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_types=_FIRST_OUTPUT_EVENT_TYPES,
+                after_sequence=started_sequence,
+                before_sequence=call["sequence"],
+                limit=_FIRST_OUTPUT_SCAN,
+                order_by=EventOrder.SEQUENCE_ASC,
+            )
+        )
+        started_at = datetime.fromisoformat(call["started_at"])
+        for record in page:
+            if attempt_id is not None and record.event.payload.get("model_attempt_id") not in {
+                None,
+                attempt_id,
+            }:
+                continue
+            elapsed = (record.event.timestamp - started_at).total_seconds()
+            call["first_output_ms"] = max(round(elapsed * 1000), 0)
+            break
 
 
 def _call_request_controls(
@@ -1618,6 +1681,7 @@ async def inspect_model_calls(
     calls, unmatched_ledger = model_call_usage(records)
     estimated_cost, unpriced_calls = ({}, 0) if pricer is None else _cost_totals(records, pricer)
     page = calls[offset : offset + limit]
+    await _add_first_output(reader, session_id, page)
     ledger_page = unmatched_ledger[offset : offset + limit]
     next_offset = offset + len(page)
     ledger_next_offset = offset + len(ledger_page)

@@ -378,6 +378,8 @@ def test_cloud_session_list_and_show_report_what_the_agent_api_exposes(agent, ca
     assert remote["events"]["event_count"] == local["events"]["event_count"]
     assert remote["session"] == {**local["session"], "run_epoch": None}
     assert remote["budget"] is None
+    assert remote["timing"] == local["timing"]
+    assert remote["timing"]["model_calls"] == 2
 
     # The CLI signed in once per command and read the Agent where `cayu serve` mounts the
     # API, after the embedded `/cayu/api` layout answered 404, with the Agent's login.
@@ -385,6 +387,23 @@ def test_cloud_session_list_and_show_report_what_the_agent_api_exposes(agent, ca
     paths = [request.url.path for request in seen]
     assert paths[0] == "/cayu/api/sessions" and paths[1] == "/api/sessions"
     assert all(request.headers["authorization"].startswith("Basic ") for request in seen)
+
+
+def test_cloud_show_without_timing_from_an_older_agent(agent, capsys, monkeypatch) -> None:
+    from cayu.cli import _agent_session_reader
+
+    original = _agent_session_reader.AgentSessionReader._session_get
+
+    def older_agent(self, session_id, *resource, params=None):
+        if resource == ("timing",):
+            raise _agent_session_reader._unsupported("/sessions/x/timing")
+        return original(self, session_id, *resource, params=params)
+
+    monkeypatch.setattr(_agent_session_reader.AgentSessionReader, "_session_get", older_agent)
+
+    assert _json(capsys, "show", _SESSION, "--application", "bug-hunter-agent")["timing"] is None
+    assert main(["session", "show", _SESSION, "--application", "bug-hunter-agent", "--table"]) == 0
+    assert "doesn't report session timing" in capsys.readouterr().out
 
 
 def test_cloud_reads_name_missing_sessions_and_never_print_the_login(agent, capsys) -> None:

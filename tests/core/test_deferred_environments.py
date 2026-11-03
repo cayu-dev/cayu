@@ -712,6 +712,43 @@ class EagerLocalFactory(DeferredLocalFactory):
         )
 
 
+def test_a_deferred_bind_that_fails_records_the_steps_it_ran(dirs, monkeypatch) -> None:
+    from cayu.environments._phase_timing import environment_phase_step
+
+    source, target = dirs
+    original = ObservedSyncBinding.bind
+
+    async def bind_then_fail_setup(self, *args, **kwargs):
+        bound = await original(self, *args, **kwargs)
+        self.abandon(bound)
+        with environment_phase_step("workspace_setup_commands"):
+            raise RuntimeError("setup command failed")
+
+    monkeypatch.setattr(ObservedSyncBinding, "bind", bind_then_fail_setup)
+    store = InMemorySessionStore()
+
+    async def run():
+        outcome = await run_to_completion(
+            _app(DeferredLocalFactory(source, target), store, _turns("write")),
+            RunRequest(agent_name="agent", messages=[Message.text("user", "go")]),
+        )
+        return await store.load_events(outcome.session_id)
+
+    events = asyncio.run(run())
+
+    types = [str(event.type) for event in events]
+    # Like an eager bind, the failed deferred bind closes its binding record first.
+    assert types.index("environment.binding.started") < types.index("environment.binding.failed")
+    assert types.index("environment.binding.failed") < types.index(
+        "environment.materialization.failed"
+    )
+    (failed,) = [event for event in events if event.type == EventType.ENVIRONMENT_BINDING_FAILED]
+    assert failed.payload["error_type"] == "RuntimeError"
+    steps = failed.payload["phase_timings"]
+    assert "transfer" in {step["phase"] for step in steps}
+    assert (steps[-1]["phase"], steps[-1]["outcome"]) == ("workspace_setup_commands", "failed")
+
+
 def test_eager_factories_emit_no_deferral_events_and_bind_at_session_start(dirs) -> None:
     source, target = dirs
     factory = EagerLocalFactory(source, target)
@@ -757,6 +794,8 @@ def test_materialization_events_reach_the_live_stream_with_the_bound_workspace(d
     # The normal binding events now describe the real bind into the runner.
     bound = outcome.events[binding_completed].payload
     assert bound["bound_path"] == str(target)
+    # A deferred bind records its steps like an eager one.
+    assert "transfer" in {step["phase"] for step in bound["phase_timings"]}
     assert (
         bound["binding_generation_id"]
         == outcome.events[binding_started].payload["binding_generation_id"]

@@ -3501,6 +3501,19 @@
             "description": "Null unless the request carried a price book.",
             "title": "Cost State"
           },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "From the request's start to the call's completion.",
+            "title": "Duration Ms"
+          },
           "echoed_request_controls": {
             "anyOf": [
               {
@@ -3540,6 +3553,19 @@
             ],
             "description": "Why the call ended, normalized: stop, tool_calls, length, content_filter, error or unknown.",
             "title": "Finish Reason"
+          },
+          "first_output_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "From the request's start to its first streamed text or thinking delta. Null when the call streamed none, such as a call that only returned tool calls.",
+            "title": "First Output Ms"
           },
           "input_tokens": {
             "anyOf": [
@@ -3674,6 +3700,18 @@
             "minimum": 1.0,
             "title": "Sequence",
             "type": "integer"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the call's request started (its `model.started` event).",
+            "title": "Started At"
           },
           "timestamp": {
             "title": "Timestamp",
@@ -38740,6 +38778,12 @@
             "title": "Setup Ms",
             "type": "integer"
           },
+          "teardown_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Teardown Ms",
+            "type": "integer"
+          },
           "tool_ms": {
             "default": 0,
             "minimum": 0.0,
@@ -42505,6 +42549,255 @@
           "usage"
         ],
         "title": "SessionSummaryResponse",
+        "type": "object"
+      },
+      "SessionTimingOperation": {
+        "description": "One environment operation: ``factory`` (allocate or reconnect), ``binding`` (copy-in\nand setup), ``materialization`` (a deferred environment starting) or ``finalize``\n(copy-back and release). ``phases`` is empty for a session recorded before Cayu timed\nthe steps, or for a binding that reports none.",
+        "properties": {
+          "duration_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "environment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Environment"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "completed",
+              "failed",
+              "running"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "phases": {
+            "items": {
+              "$ref": "#/components/schemas/SessionTimingPhase"
+            },
+            "title": "Phases",
+            "type": "array"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          }
+        },
+        "required": [
+          "kind",
+          "outcome"
+        ],
+        "title": "SessionTimingOperation",
+        "type": "object"
+      },
+      "SessionTimingPhase": {
+        "description": "One step of an environment operation, from its ``phase_timings`` (see\n``cayu.environments._phase_timing``). ``depth`` is how many steps it runs inside.",
+        "properties": {
+          "bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytes"
+          },
+          "depth": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Depth",
+            "type": "integer"
+          },
+          "duration_ms": {
+            "minimum": 0.0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "items": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items"
+          },
+          "outcome": {
+            "title": "Outcome",
+            "type": "string"
+          },
+          "phase": {
+            "title": "Phase",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "phase",
+          "started_at",
+          "duration_ms",
+          "outcome"
+        ],
+        "title": "SessionTimingPhase",
+        "type": "object"
+      },
+      "SessionTimingResponse": {
+        "description": "`cayu session show`'s time breakdown for one session; see `SessionTiming`.",
+        "properties": {
+          "elapsed_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Elapsed Ms",
+            "type": "integer"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "environment": {
+            "items": {
+              "$ref": "#/components/schemas/SessionTimingOperation"
+            },
+            "title": "Environment",
+            "type": "array"
+          },
+          "environment_truncated": {
+            "default": false,
+            "title": "Environment Truncated",
+            "type": "boolean"
+          },
+          "first_model_call_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Model Call Ms"
+          },
+          "idle_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Idle Ms",
+            "type": "integer"
+          },
+          "model_calls": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Model Calls",
+            "type": "integer"
+          },
+          "model_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Model Ms",
+            "type": "integer"
+          },
+          "other_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Other Ms",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "setup_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Setup Ms",
+            "type": "integer"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "teardown_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Teardown Ms",
+            "type": "integer"
+          },
+          "tool_calls": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Tool Calls",
+            "type": "integer"
+          },
+          "tool_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Tool Ms",
+            "type": "integer"
+          },
+          "waiting_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Waiting Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionTimingResponse",
         "type": "object"
       },
       "SessionToolCallsResponse": {
@@ -59863,6 +60156,50 @@
           }
         },
         "summary": "Session Replay Availability"
+      }
+    },
+    "/api/sessions/{session_id}/timing": {
+      "get": {
+        "description": "Where one session's time went, as `cayu session show` reports it: its elapsed time split into environment setup, model calls, tool calls, teardown, waits for a person, the runtime's own work and idle time between turns, plus each environment operation with the steps it timed.",
+        "operationId": "get_session_timing_api_sessions__session_id__timing_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTimingResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "The session does not exist."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Timing"
       }
     },
     "/api/sessions/{session_id}/tool-calls": {

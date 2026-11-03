@@ -3636,6 +3636,41 @@ publication lag. Large validation/projection work is offloaded under a
 separate bounded cooperative scheduling domain so unrelated sessions,
 interrupts, and lease heartbeats can run.
 
+## Environment step timings
+
+Each environment operation records how long its steps took, whether or not the
+environment sets a lifecycle policy. The terminal event of the operation carries them
+as `phase_timings`: `environment.factory.completed` and `environment.factory.failed` for
+an allocation or reconnect, `environment.binding.completed` and
+`environment.binding.failed` for a binding (a deferred environment's bind too: when it
+fails, Cayu now records `environment.binding.failed`, with the exception type as
+`error_type`, before `environment.materialization.failed`), and
+`environment.binding.finalize_completed`
+and `environment.binding.finalize_failed` for a finalization. The key is absent when the
+operation timed no step, so events of bindings that report nothing, and events recorded
+before Cayu timed steps, are unchanged.
+
+`phase_timings` is a list in the order the steps started, at most 64 entries. Each entry
+has `phase`, `started_at` (UTC, millisecond precision), `duration_ms`, `outcome` and
+`depth`, the number of steps it ran inside (a `SyncBinding`'s `archive_preparation` runs
+inside its `transfer` or `copy_back_publication`). `items` and `bytes` are present when
+the step's completion reported them as `items_completed` and `bytes_completed`. On a
+completed operation every entry is `completed` or `failed`; a failed operation also lists
+the steps still running when it failed, as `unfinished` with the time they had run.
+
+Steps come from two sources. `SyncBinding` and its subclasses time their built-in
+lifecycle phases: each phase's `started` report opens a step and its `completed` or
+`failed` report closes it, named by its `EnvironmentLifecyclePhase` value, and the
+runtime adds its own `final_target_observation` before a finalization. Progress a custom
+binding reports through `current_environment_lifecycle_progress_reporter()` is not timed.
+Cayu's sandbox bindings also time steps
+of their own: `sandbox_allocation`, `toolchain_admission` and `setup_commands` in a
+brokered sandbox factory, `git_baseline` and `workspace_setup_commands` in the brokered
+and Docker coding bindings, and `sandbox_release` when a brokered binding destroys its
+sandbox. Durations are wall time, so they include time the process's event loop spent on
+other work. `cayu session show` reads them into its time breakdown (see
+[Session inspection](session-inspection.md#where-a-sessions-time-went)).
+
 ## Runtime phase timing
 
 `ToolRoundTiming` and `ModelStepPreparationTiming` are content-free, bounded,
