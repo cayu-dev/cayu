@@ -252,6 +252,34 @@ def test_cancelled_request_releases_its_reservation() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("settle_first", [False, True])
+def test_buffer_release_requires_upstream_settlement_and_body_cleanup(settle_first: bool) -> None:
+    budget = EgressResponseBufferBudget(1000)
+    response_buffer = _held(budget, 700)
+    response_buffer._hold_for_upstream()
+
+    if settle_first:
+        response_buffer._upstream_settled()
+        # The response may still be queued for the client after settlement.
+        assert budget.used_bytes == 700
+        assert not response_buffer.released
+    else:
+        response_buffer.release()
+        response_buffer.release()
+        # An unsettled upstream can still hold and grow its body.
+        assert not response_buffer.released
+        response_buffer.reserve_to(800)
+        response_buffer._shrink_to(0)
+        assert budget.used_bytes == 800
+        response_buffer._upstream_settled()
+        assert response_buffer.released
+        assert budget.used_bytes == 0
+
+    response_buffer.release()
+    assert response_buffer.released
+    assert budget.used_bytes == 0
+
+
 def test_holding_entrance_keeps_the_reservation_until_released() -> None:
     broker, registry = _broker(
         _BodyUpstream(b"z" * 500), response_buffer_budget_bytes=1000, **_SMALL

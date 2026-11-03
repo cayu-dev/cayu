@@ -444,6 +444,7 @@ class _ForwardingAuthorization:
 class _ActiveUpstreamOperation:
     operation: EgressUpstreamOperation
     result_task: asyncio.Task[CapturedResponse]
+    response_buffer: EgressResponseBuffer | None = None
     settlement_task: asyncio.Task[None] | None = None
 
 
@@ -529,12 +530,20 @@ class EgressResponseBuffer:
     The broker creates one per forwarded request. It holds the reservation until
     the response body has been handed on: ``handle_request`` releases it when it
     returns, and the proxy server releases it only after it has written or
-    dropped the body. ``reserve_to`` only grows the reservation; it raises when
+    dropped the body. Release is deferred while its upstream operation remains
+    unsettled. ``reserve_to`` only grows the reservation; it raises when
     the shared budget cannot hold the new total, or after release. Both are
     thread-safe, so a custom upstream may reserve from another thread.
     """
 
-    __slots__ = ("_budget", "_lock", "_released", "_reserved_bytes")
+    __slots__ = (
+        "_budget",
+        "_lock",
+        "_release_requested",
+        "_released",
+        "_reserved_bytes",
+        "_upstream_pending",
+    )
 
     def __init__(self, budget: EgressResponseBufferBudget) -> None:
         if not isinstance(budget, EgressResponseBufferBudget):
@@ -543,6 +552,8 @@ class EgressResponseBuffer:
         self._lock = threading.Lock()
         self._reserved_bytes = 0
         self._released = False
+        self._release_requested = False
+        self._upstream_pending = False
 
     @property
     def reserved_bytes(self) -> int:
@@ -566,17 +577,32 @@ class EgressResponseBuffer:
     def _shrink_to(self, total_bytes: int) -> None:
         # Broker-internal: once the final body is known, hold only its size.
         with self._lock:
-            if self._released or total_bytes >= self._reserved_bytes:
+            if self._released or self._upstream_pending or total_bytes >= self._reserved_bytes:
                 return
             surplus = self._reserved_bytes - total_bytes
             self._reserved_bytes = total_bytes
             self._budget._give(surplus)
 
+    def _hold_for_upstream(self) -> None:
+        # Request/stream cleanup cannot free memory still held by the upstream.
+        with self._lock:
+            self._upstream_pending = True
+
+    def _upstream_settled(self) -> None:
+        with self._lock:
+            self._upstream_pending = False
+            release_requested = self._release_requested
+        if release_requested:
+            self.release()
+
     def release(self) -> None:
-        """Return the reservation to the budget; later calls do nothing."""
+        """Return the reservation once upstream settles; later calls do nothing."""
 
         with self._lock:
             if self._released:
+                return
+            self._release_requested = True
+            if self._upstream_pending:
                 return
             self._released = True
             reserved, self._reserved_bytes = self._reserved_bytes, 0
@@ -2679,8 +2705,11 @@ class TransparentEgressBroker:
             owner = _ActiveUpstreamOperation(
                 operation=operation,
                 result_task=result_task,
+                response_buffer=response_buffer,
             )
             self._active_upstream_operations[token] = owner
+            if response_buffer is not None:
+                response_buffer._hold_for_upstream()
             try:
                 response = await asyncio.shield(result_task)
             except _QuiescentUpstreamProcessControl as outcome:
@@ -2726,7 +2755,9 @@ class TransparentEgressBroker:
         return token
 
     def _release_upstream_operation(self, token: object) -> None:
-        self._active_upstream_operations.pop(token, None)
+        owner = self._active_upstream_operations.pop(token, None)
+        if owner is not None and owner.response_buffer is not None:
+            owner.response_buffer._upstream_settled()
         if not self._active_upstream_operations:
             self._upstream_operations_idle.set()
 
