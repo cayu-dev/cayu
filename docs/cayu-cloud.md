@@ -39,7 +39,7 @@ cayu cloud service status --application my-agent
   for the Agent's [managed settings](#agent-settings);
 - `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
 - `sandboxes list|show` to [read an Agent's brokered sandboxes](#reading-an-agents-sandboxes);
-- `compass agents|show|enroll|disable|verify|pass|job|missions|findings` for
+- `compass agents|show|enroll|disable|verify|pass|passes|job|missions|findings` for
   [Compass](#compass);
 - `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
   read its eval runs;
@@ -2168,16 +2168,19 @@ cayu cloud compass verify my-agent --wait
 cayu cloud compass show my-agent
 cayu cloud compass pass my-agent --wait
 cayu cloud compass findings list my-agent --status proposed --limit 20
+cayu cloud compass findings list my-agent --status proposed --limit 20 --cursor CURSOR
 cayu cloud compass findings list my-agent --summary
 cayu cloud compass findings accept my-agent FINDING --note "Worth trying"
 cayu cloud compass findings dismiss my-agent FINDING --note "Expected behavior"
 cayu cloud compass findings dismiss my-agent --rule repeated_tool --note "Paging, not repeats"
 cayu cloud compass findings sessions my-agent FINDING
+cayu cloud compass passes list my-agent --all
 cayu cloud compass missions my-agent
 cayu cloud compass disable my-agent
 ```
 
-The commands call Cloud's `/v1/compass/agents/...` routes with your `cayu cloud
+The commands call Cloud's `/v1/compass/agents/...` routes, and its paged
+`/v1/compass/findings` and `/v1/compass/passes`, with your `cayu cloud
 login` (or the selected context's API key), and Cloud answers only for your
 Organization's Agents. They need a developer or organization administrator; a
 member is refused with `code` `developer_required`. They mirror Cloud's operator
@@ -2225,6 +2228,29 @@ member is refused with `code` `developer_required`. They mirror Cloud's operator
   proposed, accepted and dismissed. Cloud filters the findings when it can; a
   Cloud release from before that answers every finding, and the CLI filters
   them itself.
+- **Paging findings.** Narrowed by no more than `--status` and `--kind`
+  (`agent_change`, `autonomy_grant` or `platform_issue`), `--limit N` reads
+  Cloud's paged listing: the same N strongest, with `total` and a
+  `next_cursor`. The table ends with "More findings follow: pass --cursor
+  CURSOR"; pass it with the same options for the next N. `--cursor` without
+  `--limit` lists every finding after it. Cloud pages findings by status and
+  kind only, so `--cursor` and `--kind` can't be combined with `--agent`,
+  `--rule`, `--dimension`, `--min-score` or `--tool`, nor `--cursor` with
+  `--summary`; with those filters `--limit N` keeps the N strongest that match,
+  with no cursor. Cloud's paged findings carry no `score`, so the SCORE column
+  shows `-` for them. Without `--limit`, `--cursor` or `--kind` the command
+  reads the Agent's findings as before. A cursor Cloud doesn't recognize is
+  refused with `invalid_cursor`, and a Cloud release from before paging answers
+  `compass_paging_unavailable` to `--cursor` and `--kind` (a plain `--limit`
+  still works there).
+- **Passes.** `compass show` gives an Agent's recent passes; `passes list`
+  lists every one, newest first: when it ran, its window, the sessions it read,
+  the findings it proposed and left waiting, and the mission it made ready or
+  why it made none. `--limit N` lists N (20 by default), `--cursor` goes on
+  from an earlier listing's `next_cursor`, and `--all` follows the cursors to
+  the oldest pass. `--json` prints the JSON envelope. Cloud answers no `total`
+  for passes. A Cloud release from before paging answers
+  `compass_paging_unavailable`.
 - **Dismissing findings in bulk.** `findings dismiss AGENT --rule RULE --note
   TEXT` dismisses every proposed finding of the rule, narrowed by the same
   options as `findings list`. It shows what it will dismiss and asks first;

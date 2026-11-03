@@ -15,6 +15,8 @@ from cayu.cli import cloud as cloud_cli
 from cayu.cli._cloud_api import CloudApiClient
 
 _AGENT = "/v1/compass/agents/cayu-scout"
+# Cloud's paged listings of the Organization's findings and passes.
+_PAGES = "/v1/compass"
 
 
 class _Cloud:
@@ -74,7 +76,17 @@ def test_cloud_help_lists_compass(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert raised.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
-    for command in ("agents", "show", "enroll", "disable", "verify", "pass", "job", "missions"):
+    for command in (
+        "agents",
+        "show",
+        "enroll",
+        "disable",
+        "verify",
+        "pass",
+        "passes",
+        "job",
+        "missions",
+    ):
         assert command in help_text
     assert "findings" in help_text
 
@@ -600,6 +612,10 @@ def test_findings_list_filters_itself_on_a_cloud_that_answers_every_finding(
             ("GET", f"{_AGENT}/findings?rule=repeated_tool&min_score=5"): [
                 httpx.Response(200, json=every)
             ],
+            # A Cloud from before paging ignores `limit` there and answers no total.
+            ("GET", f"{_PAGES}/findings?agent=cayu-scout&limit=3"): [
+                httpx.Response(200, json={"findings": _FINDINGS})
+            ],
             ("GET", f"{_AGENT}/findings?limit=3"): [httpx.Response(200, json=every)],
             ("GET", f"{_AGENT}/findings?dimension=correctness"): [httpx.Response(200, json=every)],
         }
@@ -1075,3 +1091,265 @@ def test_clouds_own_404_codes_for_a_findings_sessions_are_kept(
     code, output = _run(["findings", "sessions", "cayu-scout", "fnd_1"], capsys)
     assert code != 0
     assert output["error"]["category"] != "finding_sessions_unavailable"
+
+
+def _page(items: list[dict[str, Any]], *, next_cursor: str | None, total: int) -> httpx.Response:
+    return httpx.Response(200, json={"findings": items, "next_cursor": next_cursor, "total": total})
+
+
+def test_findings_list_pages_by_status_and_kind_and_prints_the_next_cursor(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--limit keeps the N strongest findings and returns a cursor to continue after them."""
+
+    paged = f"{_PAGES}/findings?agent=cayu-scout&status=proposed&kind=agent_change"
+    first, second = _FINDINGS[:2], _FINDINGS[2:3]
+    fake = cloud(
+        {
+            ("GET", f"{paged}&limit=2"): [_page(first, next_cursor="c-2", total=3)],
+            ("GET", f"{paged}&limit=2&cursor=c-2"): [_page(second, next_cursor=None, total=3)],
+        }
+    )
+    options = ["--status", "proposed", "--kind", "agent_change", "--limit", "2"]
+
+    assert main(["cloud", "compass", "findings", "list", "cayu-scout", *options]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert [line.split()[0] for line in lines[1:3]] == ["f-1", "f-2"]
+    assert lines[-2:] == [
+        "2 of 3 findings.",
+        "More findings follow: pass --cursor c-2 with the same options.",
+    ]
+
+    code, output = _run(
+        ["findings", "list", "cayu-scout", *options, "--cursor", "c-2", "--json"], capsys
+    )
+    assert code == 0
+    assert output["operation"] == "compass.findings.list"
+    result = output["result"]
+    assert [item["finding_id"] for item in result["items"]] == ["f-3"]
+    assert (result["total"], result["next_cursor"]) == (3, None)
+    assert len(fake.requests) == 2
+
+
+def test_findings_list_reads_a_large_limit_or_a_cursor_a_page_at_a_time(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    many = [_finding(f"f-{index:03}") for index in range(260)]
+    paged = f"{_PAGES}/findings?agent=cayu-scout"
+    cloud(
+        {
+            ("GET", f"{paged}&limit=200"): [_page(many[:200], next_cursor="c-200", total=260)],
+            ("GET", f"{paged}&limit=50&cursor=c-200"): [
+                _page(many[200:250], next_cursor="c-250", total=260)
+            ],
+            ("GET", f"{paged}&limit=200&cursor=c-200"): [
+                _page(many[200:], next_cursor=None, total=260)
+            ],
+        }
+    )
+
+    code, output = _run(["findings", "list", "cayu-scout", "--limit", "250", "--json"], capsys)
+    assert code == 0
+    result = output["result"]
+    assert (len(result["items"]), result["total"], result["next_cursor"]) == (250, 260, "c-250")
+
+    # A cursor without --limit lists every finding after it.
+    code, output = _run(["findings", "list", "cayu-scout", "--cursor", "c-200", "--json"], capsys)
+    assert code == 0
+    result = output["result"]
+    assert (len(result["items"]), result["next_cursor"]) == (60, None)
+
+
+def test_findings_list_without_paging_options_reads_the_agents_findings_with_scores(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        {
+            ("GET", f"{_AGENT}/findings?status=proposed"): [
+                httpx.Response(200, json={"items": _FINDINGS[:1], "total": 1})
+            ]
+        }
+    )
+
+    code, output = _run(
+        ["findings", "list", "cayu-scout", "--status", "proposed", "--json"], capsys
+    )
+
+    assert code == 0
+    assert output["result"]["items"][0]["score"] == 9
+    assert "next_cursor" not in output["result"]
+    assert len(fake.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (["--cursor", "c-1", "--rule", "repeated_tool"], "--cursor can't be combined with --rule"),
+        (["--kind", "agent_change", "--tool", "search"], "--kind can't be combined with --tool"),
+        (["--cursor", "c-1", "--agent", "scout"], "Cloud pages findings by --status and --kind"),
+        (["--summary", "--cursor", "c-1"], "leave out --cursor"),
+    ],
+)
+def test_findings_list_refuses_a_cursor_or_kind_with_filters_cloud_cant_page(
+    cloud, options: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud({})
+
+    code, output = _run(["findings", "list", "cayu-scout", *options, "--json"], capsys)
+
+    assert (code, output["error"]["category"]) == (2, "invalid_input")
+    assert message in output["error"]["message"]
+    assert fake.requests == []
+
+
+def test_findings_list_with_a_cursor_on_a_cloud_that_cant_page_says_so(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_PAGES}/findings?agent=cayu-scout&limit=200&cursor=c-1"): [
+                httpx.Response(200, json={"findings": _FINDINGS})
+            ]
+        }
+    )
+
+    code, output = _run(["findings", "list", "cayu-scout", "--cursor", "c-1", "--json"], capsys)
+
+    assert code == 2
+    assert output["error"]["category"] == "compass_paging_unavailable"
+
+
+def test_a_cursor_cloud_refuses_is_reported_with_its_code(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    refusal = {"detail": {"code": "invalid_cursor", "message": "Compass could not accept it."}}
+    cloud(
+        {
+            ("GET", f"{_PAGES}/passes?agent=cayu-scout&limit=20&cursor=bad"): [
+                httpx.Response(422, json=refusal)
+            ]
+        }
+    )
+
+    code, output = _run(["passes", "list", "cayu-scout", "--cursor", "bad", "--json"], capsys)
+
+    assert code == 2
+    assert output["error"]["code"] == "invalid_cursor"
+    assert "without --cursor" in output["error"]["message"]
+
+
+def _passes(count: int, *, start: int = 0) -> list[dict[str, Any]]:
+    return [
+        {
+            "enrollment_id": "cayu-scout",
+            "agent": "scout",
+            "at": f"2026-11-{30 - index % 28:02}T10:00:00Z",
+            "window_start": "2026-10-20T10:00:00Z",
+            "window_end": "2026-11-03T10:00:00Z",
+            "sessions_read": 40,
+            "proposed_findings": 2,
+            "waiting": [{"finding_id": "f-1", "reason": "proposed"}],
+            "no_mission_reason": "nothing accepted",
+            "finding_ids": ["f-1", "f-2"],
+        }
+        for index in range(start, start + count)
+    ]
+
+
+def test_passes_list_pages_through_every_pass(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    paged = f"{_PAGES}/passes?agent=cayu-scout"
+    mission = {**_passes(1)[0], "mission": {"mission_id": "msn_1", "status": "started"}}
+    fake = cloud(
+        {
+            ("GET", f"{paged}&limit=20"): [
+                httpx.Response(200, json={"passes": [mission, *_passes(19)], "next_cursor": "p-20"})
+            ],
+            ("GET", f"{paged}&limit=100&cursor=p-20"): [
+                httpx.Response(200, json={"passes": _passes(100), "next_cursor": "p-120"})
+            ],
+            ("GET", f"{paged}&limit=100&cursor=p-120"): [
+                httpx.Response(200, json={"passes": _passes(5), "next_cursor": None})
+            ],
+        }
+    )
+
+    assert main(["cloud", "compass", "passes", "list", "cayu-scout"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split()[:2] == ["AT", "AGENT"]
+    assert lines[1].split()[-2:] == ["msn_1", "(started)"]
+    assert lines[2].split()[1:6] == ["scout", "2026-10-20T10:00:00Z", "40", "2", "1"]
+    assert lines[-1] == "More passes follow: pass --cursor p-20, or --all."
+
+    code, output = _run(
+        ["passes", "list", "cayu-scout", "--cursor", "p-20", "--all", "--json"], capsys
+    )
+    assert code == 0
+    assert output["operation"] == "compass.passes.list"
+    result = output["result"]
+    assert (len(result["items"]), result["next_cursor"]) == (105, None)
+    assert result["application_id"] == "cayu-scout"
+    assert len(fake.requests) == 3
+
+
+def test_passes_list_takes_a_limit_or_all_but_not_both(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_PAGES}/passes?agent=cayu-scout&limit=3"): [
+                httpx.Response(200, json={"passes": _passes(3), "next_cursor": None})
+            ]
+        }
+    )
+
+    code, output = _run(["passes", "list", "cayu-scout", "--limit", "3", "--json"], capsys)
+    assert code == 0
+    assert len(output["result"]["items"]) == 3
+
+    code, output = _run(["passes", "list", "cayu-scout", "--limit", "3", "--all", "--json"], capsys)
+    assert (code, output["error"]["category"]) == (2, "invalid_input")
+
+
+def test_passes_list_on_a_cloud_that_cant_page_them_says_so(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_PAGES}/passes?agent=cayu-scout&limit=20"): [
+                httpx.Response(200, json={"passes": _passes(2)})
+            ]
+        }
+    )
+
+    code, output = _run(["passes", "list", "cayu-scout", "--json"], capsys)
+
+    assert code == 2
+    assert output["error"]["category"] == "compass_paging_unavailable"
+    assert "compass show" in output["error"]["message"]
+
+
+def test_a_page_that_repeats_a_cursor_is_refused_even_at_the_limit(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paged = f"{_PAGES}/passes?agent=cayu-scout"
+    findings = f"{_PAGES}/findings?agent=cayu-scout"
+    cloud(
+        {
+            ("GET", f"{paged}&limit=100"): [
+                httpx.Response(200, json={"passes": _passes(100), "next_cursor": "p-100"})
+            ],
+            ("GET", f"{paged}&limit=100&cursor=p-100"): [
+                httpx.Response(200, json={"passes": _passes(100), "next_cursor": "p-100"})
+            ],
+            ("GET", f"{findings}&limit=200&cursor=c-1"): [
+                _page(_FINDINGS, next_cursor="c-1", total=7)
+            ],
+        }
+    )
+
+    code, output = _run(["passes", "list", "cayu-scout", "--limit", "200", "--json"], capsys)
+    assert (code, output["error"]["category"]) == (2, "api_response_invalid")
+
+    # The cursor a listing resumes from counts too.
+    code, output = _run(["findings", "list", "cayu-scout", "--cursor", "c-1", "--json"], capsys)
+    assert (code, output["error"]["category"]) == (2, "api_response_invalid")

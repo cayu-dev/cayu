@@ -34,6 +34,9 @@ _SAFE_API_ERROR_DETAILS = {
         "Agent application slugs must be 8-63 lowercase letters, digits, or interior hyphens."
     ),
     (422, "manifest_invalid"): "Cayu Cloud rejected the manifest resources.",
+    (422, "invalid_cursor"): (
+        "The cursor isn't one this listing returned; list again without --cursor."
+    ),
     (403, "organization_admin_required"): (
         "A signed-in organization administrator is required; run `cayu cloud login`."
     ),

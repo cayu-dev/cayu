@@ -3,7 +3,9 @@
 `list` narrows the findings by rule, dimension, score and tool, keeps the strongest
 `--limit`, and `--summary` counts them by rule and tool. Cloud filters them when it can
 (it then answers `total`); on a Cloud from before that, the CLI filters the full listing
-itself, so the answer is the same either way.
+itself, so the answer is the same either way. Narrowed only by `--status` and `--kind`,
+`--limit` and `--cursor` read Cloud's paged listing instead, in the same order, and the
+answer's `next_cursor` goes on after the last finding listed.
 
 `dismiss --rule` dismisses a rule's proposed findings in one go. It lists them first,
 shows what it will dismiss and asks before doing it (`--yes` skips the question), then
@@ -31,6 +33,7 @@ from cayu.cli._cloud_diagnostics import safe_text
 from cayu.cli._cloud_settings import _cell, _table
 
 DIMENSIONS = ("correctness", "cost", "time", "attention")
+KINDS = ("agent_change", "autonomy_grant", "platform_issue")
 # Compass ranks findings by dimension in this order, then by score, highest first.
 _DIMENSION_ORDER = {dimension: index for index, dimension in enumerate(DIMENSIONS)}
 # The ledger steps a finding's tool is read from: a tool call, or the approval gate on one.
@@ -38,11 +41,18 @@ _TOOL_STEPS = frozenset({"tool", "approval_gate"})
 # Filters `list` and `dismiss --rule` share; Cloud reads each from the query parameter of the
 # same name.
 _FILTERS = ("agent", "rule", "dimension", "min_score", "tool")
+# Cloud's paged listing of the Organization's findings, narrowed to one Agent by `agent`. It
+# reads `status` and `kind` but none of `_FILTERS`, and pages in Compass's rank order.
+_PAGED_FINDINGS = "/v1/compass/findings"
+# Findings one request of the paged listing reads, as many as Cloud answers in one.
+_FINDINGS_PAGE = 200
 # Findings per bulk-dismiss request, as many as Cloud takes in one.
 DISMISS_BATCH = 100
 # Findings the confirmation lists one by one before it only counts the rest.
 _PREVIEW_ROWS = 10
 _MESSAGE_LIMIT = 500
+# A cursor is printed whole: Cloud takes one of up to 1,024 characters.
+_CURSOR_LIMIT = 1024
 
 
 def _positive(value: str) -> int:
@@ -91,7 +101,23 @@ def add_output_argument(parser: argparse.ArgumentParser) -> None:
 
 def add_list_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--limit", type=_positive, metavar="N", help="Only the N strongest matching findings."
+        "--kind", choices=KINDS, help="Only findings of this kind (not with the filters above)."
+    )
+    parser.add_argument(
+        "--limit",
+        type=_positive,
+        metavar="N",
+        help=(
+            "Only the N strongest matching findings. Narrowed by no more than --status and "
+            "--kind, the answer's next_cursor goes on after them."
+        ),
+    )
+    parser.add_argument(
+        "--cursor",
+        help=(
+            "Go on after an earlier listing, from its next_cursor; give the same --status and "
+            "--kind. Not with --agent, --rule, --dimension, --min-score or --tool."
+        ),
     )
     parser.add_argument(
         "--summary",
@@ -111,6 +137,99 @@ def finding_tool(finding: Mapping[str, Any]) -> str | None:
             if isinstance(name, str) and name:
                 return name
     return None
+
+
+def list_matching(
+    client: CloudApiClient,
+    application: str,
+    path: str,
+    arguments: argparse.Namespace,
+    *,
+    limit: int | None,
+) -> dict[str, Any]:
+    """`findings list`: from Cloud's paged listing when it can read what was asked, else from
+    the Agent's listing (``list_findings``).
+
+    Both rank the findings the same way, so ``limit`` keeps the strongest either way. The
+    paged one also answers ``next_cursor``, but filters only by status and kind; and its
+    findings carry no ``score``, so with neither ``limit`` nor anything only it reads, the
+    Agent's listing answers, with their scores, as before.
+    """
+
+    narrowed = [
+        f"--{option.replace('_', '-')}"
+        for option in _FILTERS
+        if getattr(arguments, option, None) is not None
+    ]
+    paging = [
+        f"--{option}"
+        for option in ("cursor", "kind")
+        if getattr(arguments, option, None) is not None
+    ]
+    if narrowed and paging:
+        raise ValueError(
+            f"{' and '.join(paging)} can't be combined with {', '.join(narrowed)}: Cloud pages "
+            "findings by --status and --kind only. Leave those out, or use --limit for the "
+            "strongest that match."
+        )
+    if not narrowed and (limit is not None or paging):
+        paged = page_findings(client, application, arguments, limit=limit)
+        if paged is not None:
+            return paged
+    return list_findings(client, path, arguments, limit=limit)
+
+
+def page_findings(
+    client: CloudApiClient, application: str, arguments: argparse.Namespace, *, limit: int | None
+) -> dict[str, Any] | None:
+    """The Agent's findings of ``--status`` and ``--kind`` after ``--cursor``, strongest
+    first, at most ``limit`` of them (every one without it), read a page at a time.
+
+    Answers ``total`` matching and the ``next_cursor`` after the last one listed (None when
+    none follow). None from a Cloud that doesn't page findings, when nothing asked needs it.
+    """
+
+    base = {"agent": application}
+    for option in ("status", "kind"):
+        value = getattr(arguments, option, None)
+        if value is not None:
+            base[option] = str(value)
+    items: list[dict[str, Any]] = []
+    cursor: str | None = arguments.cursor
+    # Every cursor a page started from: a page that answers one of them again would loop.
+    seen: set[str] = set() if cursor is None else {cursor}
+    while True:
+        size = _FINDINGS_PAGE if limit is None else min(_FINDINGS_PAGE, limit - len(items))
+        query = {**base, "limit": str(size), **({} if cursor is None else {"cursor": cursor})}
+        answer = client.request("GET", _PAGED_FINDINGS, query=query)
+        total = answer.get("total")
+        if "total" not in answer and not items:
+            # A Cloud from before paging ignores `limit` and `cursor` and answers no total.
+            if arguments.cursor is not None or arguments.kind is not None:
+                raise CloudApiError(
+                    "compass_paging_unavailable",
+                    "This Cayu Cloud can't page Compass findings or list them by kind yet; "
+                    "leave out --cursor and --kind.",
+                )
+            return None
+        records = answer.get("findings")
+        following = answer.get("next_cursor")
+        if (
+            type(total) is not int
+            or not isinstance(records, list)
+            or not (following is None or isinstance(following, str))
+        ):
+            raise CloudApiError("api_response_invalid", "Compass's page of findings is invalid.")
+        items.extend(item for item in records if isinstance(item, dict))
+        cursor = following or None
+        if cursor is not None and cursor in seen:
+            raise CloudApiError(
+                "api_response_invalid", "Compass's pages of findings repeat a cursor."
+            )
+        if cursor is None or (limit is not None and len(items) >= limit):
+            break
+        seen.add(cursor)
+    return {"items": items, "total": total, "next_cursor": cursor}
 
 
 def list_findings(
@@ -476,6 +595,9 @@ def render_findings(output: Mapping[str, Any]) -> str:
         total = result.get("total", len(items))
         shown = f"{len(items)} of {total}" if total != len(items) else str(total)
         lines.extend(["", f"{shown} findings."])
+        if result.get("next_cursor") is not None:
+            cursor = _cell(result["next_cursor"], limit=_CURSOR_LIMIT)
+            lines.append(f"More findings follow: pass --cursor {cursor} with the same options.")
         return "\n".join(lines)
     key = f"Idempotency key: {_cell(output.get('idempotency_key'), limit=200)}"
     if "matched" not in result:

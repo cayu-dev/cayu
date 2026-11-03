@@ -1,8 +1,8 @@
 """`cayu cloud compass`: enroll an Agent in Compass and review what it finds.
 
 The commands mirror Cayu Cloud's operator `compass` commands and call the same
-customer API routes (`/v1/compass/agents/...`) with the `cayu cloud login` (or a
-selected context's API key). Compass routes need a developer or an organization
+customer API routes (`/v1/compass/agents/...`, and the paged `/v1/compass/findings` and
+`/v1/compass/passes`) with the `cayu cloud login` (or a selected context's API key). Compass routes need a developer or an organization
 administrator. Writes take `--idempotency-key`; without one a fresh key is chosen
 and printed, on an error too, so a write whose answer was lost can be repeated
 with it.
@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import quote
 
 from cayu.cli import _cloud_compass_findings as findings_cli
+from cayu.cli import _cloud_compass_passes as passes_cli
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 
 WAIT_DEFAULT_POLL_SECONDS = 5.0
@@ -191,13 +192,27 @@ def add_compass_parser(
     missions.add_argument("application", type=application)
     missions.add_argument("--status", choices=_MISSION_STATUSES)
 
+    passes = actions.add_parser("passes", description="The passes Compass made over the Agent.")
+    pass_actions = passes.add_subparsers(dest="passes_command", required=True)
+    pass_listing = pass_actions.add_parser(
+        "list",
+        description=(
+            "Every pass Compass made over the Agent, newest first, a page at a time: when it "
+            "ran, the sessions it read, the findings it proposed and left waiting, and the "
+            "mission it made ready, or why it made none."
+        ),
+    )
+    pass_listing.add_argument("application", type=application)
+    passes_cli.add_passes_arguments(pass_listing)
+
     findings = actions.add_parser("findings", description="What Compass found, and its review.")
     finding_actions = findings.add_subparsers(dest="findings_command", required=True)
     listing = finding_actions.add_parser(
         "list",
         description=(
             "Findings, strongest first, narrowed by the options given; --summary counts them "
-            "by rule and tool instead."
+            "by rule and tool instead. Narrowed by no more than --status and --kind, --limit "
+            "and --cursor page them: the answer's next_cursor goes on after the last one."
         ),
     )
     listing.add_argument("application", type=application)
@@ -286,6 +301,8 @@ def compass_command(
         return _answer(action, client.request("DELETE", path))
     if action == "job":
         return _answer(action, client.request("GET", _job_path(path, arguments.job_id)))
+    if action == "passes":
+        return passes_cli.list_passes(client, arguments.application, arguments)
     if action == "missions":
         query = _query(status=arguments.status)
         return _answer(action, client.request("GET", f"{path}/missions", query=query))
@@ -333,9 +350,18 @@ def compass_command(
     finding_action = arguments.findings_command
     operation = f"findings.{finding_action}"
     if finding_action == "list":
-        if arguments.summary and arguments.limit is not None:
-            raise ValueError("--summary counts every matching finding; leave out --limit.")
-        listed = findings_cli.list_findings(client, path, arguments, limit=arguments.limit)
+        paging = [
+            f"--{option}"
+            for option in ("limit", "cursor")
+            if getattr(arguments, option) is not None
+        ]
+        if arguments.summary and paging:
+            raise ValueError(
+                f"--summary counts every matching finding; leave out {' and '.join(paging)}."
+            )
+        listed = findings_cli.list_matching(
+            client, arguments.application, path, arguments, limit=arguments.limit
+        )
         if not arguments.summary:
             return _answer(operation, listed)
         summary = {"groups": findings_cli.summarize(listed["items"]), "total": listed["total"]}
