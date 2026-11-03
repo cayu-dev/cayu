@@ -5,11 +5,12 @@ import errno
 import os
 import stat
 from bisect import insort
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import closing
 from hashlib import sha256
 from os import PathLike
 from pathlib import Path
+from typing import TypeVar
 
 from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
 from cayu.workspaces._local_guard import (
@@ -27,6 +28,7 @@ from cayu.workspaces._local_guard import (
     write_regular,
 )
 from cayu.workspaces._mutations import (
+    acquire_local_source_read_gate,
     content_identity,
     mutation_result,
     mutation_result_from_identities,
@@ -34,9 +36,16 @@ from cayu.workspaces._mutations import (
     workspace_path_locks,
     workspace_source_lock,
 )
+from cayu.workspaces._transfer_processes import (
+    run_in_helper,
+    run_in_thread,
+    transfers_use_helpers,
+)
 from cayu.workspaces.base import (
     Workspace,
     WorkspaceDirectoryPruner,
+    WorkspaceFileIdentity,
+    WorkspaceFileIdentityReader,
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
     WorkspaceGitEntryObservationUnsupportedError,
@@ -70,6 +79,8 @@ from cayu.workspaces.branches import (
     WorkspaceBranchStoreDurability,
     _WorkspaceBranchLifecycleRegistry,
 )
+
+_ResultT = TypeVar("_ResultT")
 
 
 class LocalWorkspace(Workspace, WorkspaceGitModeMutator, WorkspaceDirectoryPruner):
@@ -165,6 +176,63 @@ class LocalWorkspace(Workspace, WorkspaceGitModeMutator, WorkspaceDirectoryPrune
             tuple(sorted(self._excluded_directory_keys)),
             tuple(sorted(self._excluded_path_pattern_keys)),
         )
+
+    def file_identity_reader(self) -> WorkspaceFileIdentityReader | None:
+        """Read many files' identities in one call, outside this process's event loop.
+
+        Offered by ``LocalWorkspace`` itself, not by a subclass or after
+        ``read_bytes`` was replaced, since those may read files differently.
+        """
+
+        return _LocalBulkReader(self) if self._offers_bulk_reads() else None
+
+    def _offers_bulk_reads(self) -> bool:
+        """Whether batched reads may stand in for ``read_bytes`` on this workspace."""
+
+        return (
+            type(self) is LocalWorkspace
+            and LocalWorkspace.read_bytes is _LOCAL_READ_BYTES
+            and "read_bytes" not in vars(self)
+        )
+
+    def _validated_bulk_paths(self, paths: Sequence[str]) -> tuple[str, ...]:
+        """``paths`` checked as ``read_bytes`` checks each, before a batched read."""
+
+        if isinstance(paths, str):
+            raise TypeError("Workspace paths must be a sequence of paths, not one string.")
+        validated = tuple(_validate_workspace_relative_path(path) for path in paths)
+        for path in validated:
+            self._require_path_allowed(path)
+        return validated
+
+    async def _run_bulk(self, function: Callable[..., _ResultT], /, *args: object) -> _ResultT:
+        """Run batched work on this workspace with :func:`run_workspace_transfer`.
+
+        In a helper process the work can't see this process's source gate or
+        fence, so this holds the gate's shared side until the work ends, even
+        when the caller stops waiting first: a branch publication in this
+        process then can't fence the source while the helper reads it. In a
+        thread the work takes the gate itself for each file, as ``read_bytes``
+        does, so holding it here too would deadlock behind a waiting writer.
+        """
+
+        if not transfers_use_helpers():
+            return await run_in_thread(function, *args)
+        acquiring = asyncio.ensure_future(
+            asyncio.to_thread(acquire_local_source_read_gate, self.root)
+        )
+        try:
+            release = await asyncio.shield(acquiring)
+        except asyncio.CancelledError:
+            acquiring.add_done_callback(_release_acquired_gate)
+            raise
+        try:
+            work = asyncio.ensure_future(run_in_helper(function, *args))
+        except BaseException:
+            release()
+            raise
+        work.add_done_callback(lambda done: _settle_gated_work(done, release))
+        return await asyncio.shield(work)
 
     @staticmethod
     def require_path_operations_supported() -> None:
@@ -536,6 +604,76 @@ class LocalWorkspace(Workspace, WorkspaceGitModeMutator, WorkspaceDirectoryPrune
     @property
     def _has_path_exclusions(self) -> bool:
         return bool(self.excluded_directory_names or self.excluded_path_patterns)
+
+
+_LOCAL_READ_BYTES = LocalWorkspace.read_bytes
+
+
+def _release_acquired_gate(acquiring: asyncio.Future[Callable[[], None]]) -> None:
+    if not acquiring.cancelled() and acquiring.exception() is None:
+        acquiring.result()()
+
+
+def _settle_gated_work(work: asyncio.Future[object], release: Callable[[], None]) -> None:
+    release()
+    # A caller that stopped waiting never reads the outcome.
+    if not work.cancelled():
+        work.exception()
+
+
+class _LocalBulkReader(WorkspaceFileIdentityReader):
+    """A local workspace's batched reads, run by :func:`run_workspace_transfer`.
+
+    Each file is read as ``LocalWorkspace.read_bytes`` reads it, under the same
+    locks; only the batch runs in another process.
+    """
+
+    def __init__(self, workspace: LocalWorkspace) -> None:
+        self._workspace = workspace
+
+    async def read_file_identities(
+        self,
+        paths: Sequence[str],
+        *,
+        max_bytes: int,
+    ) -> tuple[WorkspaceFileIdentity, ...]:
+        validated = self._workspace._validated_bulk_paths(paths)
+        requested = tuple(paths)
+        limit = self._workspace.bounded_read_limit(max_bytes)
+        if not validated:
+            return ()
+        identities = await self._workspace._run_bulk(
+            _read_file_identities, self._workspace.root, validated, limit
+        )
+        return tuple(
+            WorkspaceFileIdentity(
+                path=path,
+                total_bytes=total_bytes,
+                truncated=truncated,
+                revision=revision,
+                sha256=digest,
+                git_mode=git_mode,
+            )
+            for path, (total_bytes, truncated, revision, digest, git_mode) in zip(
+                requested, identities, strict=True
+            )
+        )
+
+
+def _read_file_identities(
+    root: Path,
+    paths: tuple[str, ...],
+    max_bytes: int,
+) -> list[tuple[int, bool, str | None, str | None, WorkspaceGitMode | None]]:
+    identities = []
+    for path in paths:
+        result = _read_file_locked(root, path, 0, max_bytes)
+        identities.append(
+            (result.total_bytes, result.truncated, result.revision, result.sha256, result.git_mode)
+        )
+        # Hold at most one file's content at a time, as the caller reserved.
+        del result
+    return identities
 
 
 def _write_file(root: Path, relative_path: str, content: bytes) -> None:

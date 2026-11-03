@@ -188,6 +188,32 @@ def test_named_workers_construct_apps_in_distinct_child_processes(tmp_path):
     _assert_dead([int(p.stem.split("-")[1]) for p in factories])
 
 
+def test_worker_processes_come_from_the_environment_then_pyproject(tmp_path, monkeypatch):
+    _project(tmp_path)
+    pyproject = tmp_path / "pyproject.toml"
+    declared = pyproject.read_text()
+
+    def run(expected: int, source: str) -> None:
+        process = _start(tmp_path, "worker", "once")
+        stdout, stderr = _finished(process)
+        assert process.returncode == 0, (stdout, stderr)
+        assert f"starting {expected} processes (from {source})" in stderr
+        factories = list(tmp_path.glob("factory-*.json"))
+        assert len(factories) == expected
+        _assert_dead([int(p.stem.split("-")[1]) for p in factories])
+        for marker in (*factories, *tmp_path.glob("worker-*.json")):
+            marker.unlink()
+
+    # The environment says how many processes run when --processes doesn't...
+    pyproject.write_text(declared + "[tool.cayu.worker_processes]\nonce = 1\n")
+    monkeypatch.setenv("CAYU_WORKER_PROCESSES", "2")
+    run(2, "CAYU_WORKER_PROCESSES")
+    # ...and without it, [tool.cayu.worker_processes] does.
+    pyproject.write_text(declared + "[tool.cayu.worker_processes]\nonce = 2\n")
+    monkeypatch.delenv("CAYU_WORKER_PROCESSES")
+    run(2, "[tool.cayu.worker_processes]")
+
+
 @pytest.mark.parametrize(
     "name,signum,expected",
     [

@@ -3682,7 +3682,9 @@ never lets more than the run's `max_concurrency` run at once across all of them.
 cayu worker evals --processes 4
 ```
 
-The processes of one `cayu worker NAME --processes N` share each run: with
+`cayu worker evals` starts one process per CPU by default (see [use multiple CPU
+cores](project-workers.md#use-multiple-cpu-cores)); `--processes N` chooses the
+count. The processes of one `cayu worker NAME --processes N` share each run: with
 `max_concurrency` 8, each runs at most two of its trials at once
 (`ceil(8 / 4)`), so the run uses four cores instead of queuing eight sessions on
 one (see [project workers](project-workers.md#one-process-is-one-cpu-core)). A

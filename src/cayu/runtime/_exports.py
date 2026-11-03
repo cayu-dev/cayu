@@ -402,6 +402,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "UsageIdentitySummary": ("cayu.runtime._usage_accounting", "UsageIdentitySummary"),
     "apply_storage_retention": ("cayu.runtime.storage_retention", "apply_storage_retention"),
     "apply_workspace_retention": ("cayu.runtime.storage_retention", "apply_workspace_retention"),
+    "available_cpu_count": ("cayu.runtime._process_workers", "available_cpu_count"),
     "build_execution_profile_identity": (
         "cayu.runtime.execution_profiles",
         "build_execution_profile_identity",
@@ -642,6 +643,7 @@ PUBLIC_NAMES = [
     "UsageIdentitySummary",
     "apply_storage_retention",
     "apply_workspace_retention",
+    "available_cpu_count",
     "build_execution_profile_identity",
     "build_local_execution_attempt_authority",
     "check_manifest",

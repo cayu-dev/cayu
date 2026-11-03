@@ -1215,6 +1215,11 @@ _WORKERS_TOML = """
 # `uv run --no-sync cayu worker timers` runs reminders and deadlines.
 [tool.cayu.workers]
 timers = "operations.timers:run_timer_worker"
+
+# Timers are light work, and the default SQLite store has one writer at a time,
+# so one process is enough. A worker starts one per CPU unless told otherwise.
+[tool.cayu.worker_processes]
+timers = 1
 """
 
 _GUIDANCE = """

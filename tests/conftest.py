@@ -31,6 +31,16 @@ def _no_ambient_release(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _one_worker_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run `cayu worker` in one process unless a test asks for more.
+
+    By default it starts one process per CPU, which on a test host would multiply
+    every worker a test starts.
+    """
+    monkeypatch.setenv("CAYU_WORKER_PROCESSES", "1")
+
+
+@pytest.fixture(autouse=True)
 def _isolated_interpreter_exit_cleanup() -> Iterator[None]:
     """Keep runners a test leaves registered away from the real exit hooks."""
     with isolated_interpreter_exit_cleanup():

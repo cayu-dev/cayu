@@ -762,6 +762,11 @@ class Workspace(ABC):
 
         return None
 
+    def file_identity_reader(self) -> WorkspaceFileIdentityReader | None:
+        """Return a capability that reads many files' identities in one call, if any."""
+
+        return None
+
     def line_locator(self) -> WorkspaceLineLocator | None:
         """Return a capability that finds line ranges where the file lives, if any.
 
@@ -957,6 +962,46 @@ class BoundedTarStreamReader(ABC):
         max_archive_bytes: int | None = None,
     ) -> TarStreamReadResult:
         """Write one uncompressed tar to ``destination`` and report its size."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceFileIdentity:
+    """What a whole-file read reports about one file, without its content.
+
+    The fields mean what they mean on :class:`WorkspaceReadResult` for a read
+    from offset 0: ``revision``, ``sha256`` and ``git_mode`` are ``None`` when
+    the read was ``truncated``.
+    """
+
+    path: str
+    total_bytes: int
+    truncated: bool
+    revision: str | None
+    sha256: str | None
+    git_mode: WorkspaceGitMode | None
+
+
+class WorkspaceFileIdentityReader(ABC):
+    """Nominal capability for reading many files' identities in one call.
+
+    A backend implements this when one batched read costs much less than one
+    ``read_bytes`` per file, as when the work can run outside the caller's
+    event loop. ``SyncBinding`` uses it to check the revisions of every file
+    it copies.
+    """
+
+    @abstractmethod
+    async def read_file_identities(
+        self,
+        paths: Sequence[str],
+        *,
+        max_bytes: int,
+    ) -> tuple[WorkspaceFileIdentity, ...]:
+        """Read each path as ``read_bytes(path, max_bytes=max_bytes)`` would.
+
+        Returns one identity per path, in order, and raises what that
+        ``read_bytes`` raises for the first path it can't read.
+        """
 
 
 class WorkspaceLineLocator(ABC):

@@ -16,6 +16,7 @@ from cayu.runtime._model_completion_contracts import (
 )
 from cayu.runtime._process_workers import ProcessWorkerCommand as ProcessWorkerCommand
 from cayu.runtime._process_workers import ProcessWorkerOutcome as ProcessWorkerOutcome
+from cayu.runtime._process_workers import available_cpu_count as available_cpu_count
 from cayu.runtime._process_workers import process_worker_environment as process_worker_environment
 from cayu.runtime._process_workers import supervise_process_workers as supervise_process_workers
 from cayu.runtime._process_workers import supervisor_watchdog as supervisor_watchdog
@@ -561,6 +562,7 @@ __all__ = [
     "UsageIdentitySummary",
     "apply_storage_retention",
     "apply_workspace_retention",
+    "available_cpu_count",
     "build_execution_profile_identity",
     "build_local_execution_attempt_authority",
     "check_manifest",

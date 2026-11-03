@@ -171,6 +171,28 @@ def workspace_source_lock(
         _release_local_source_gate(source_identity, exclusive=exclusive)
 
 
+def acquire_local_source_read_gate(root: Path) -> Callable[[], None]:
+    """Hold the shared side of ``root``'s in-process source gate; return its release.
+
+    Raises when the source is fenced. Work that reads the source in another
+    process holds it so no branch publication in this process starts, and
+    perhaps fences the source, while that work runs: the other process
+    can't see this process's fence and would wait for its lock forever.
+    """
+
+    source_identity = _local_source_identity(root)
+    _acquire_local_source_gate(source_identity, exclusive=False)
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            _release_local_source_gate(source_identity, exclusive=False)
+
+    return release
+
+
 def fence_local_workspace_source(root: Path) -> None:
     """Permanently fence process-local reuse after uncertain publication rollback."""
 

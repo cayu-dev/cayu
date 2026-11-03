@@ -184,7 +184,9 @@ when this process first saw it fenced),
 with the declaration recorded as the validator; create a new task if the work should run again. The flag sets
 `CAYU_WORKER_RECONCILE_ABANDONED_AFTER_S`, which `run_task_worker` reads when the
 entrypoint doesn't pass `reconcile_abandoned_after_s` itself. It is off by
-default and refused with `--processes`, because with several workers an expired
+default. With it the worker runs in one process, whatever the CPU count, and it
+is refused with more than one (`--processes`, `CAYU_WORKER_PROCESSES` or
+`[tool.cayu.worker_processes]` above 1), because with several workers an expired
 lease can belong to one that is slow rather than gone. Give each process its
 own worker ID (as in the example above), so a restarted worker doesn't share
 the dead one's ID. Otherwise settle fenced tasks yourself once you know the old
@@ -431,8 +433,9 @@ them, and doesn't sweep.
 See [external-event waits](external-event-waits.md#run-them-from-cayu-serve-and-cayu-worker).
 
 An entrypoint that returns anything else fails with exit `1` and a message
-naming the flag. `--until-idle` can't be combined with `--processes`; use
-`concurrency` instead. The long-running preset's `cayu worker timers` supports
+naming the flag. A run with `--until-idle` uses one process, whatever the CPU
+count, `CAYU_WORKER_PROCESSES` or `[tool.cayu.worker_processes]` say, and
+`--processes` above 1 is refused with it; use `concurrency` instead. The long-running preset's `cayu worker timers` supports
 it; it creates timers only for pauses it sees when it starts, so also start it
 after a session pauses.
 
@@ -472,8 +475,8 @@ So the ceiling is a few sessions per process: slowdown starts at about four
 concurrent sessions and is severe at eight. Past that, run the task worker in
 more processes, which the store already coordinates:
 
-- `cayu worker NAME --processes N` in a Cayu project (below). One process per
-  core is a reasonable start.
+- `cayu worker NAME` in a Cayu project, which starts one process per CPU by
+  default (below).
 - [`supervise_process_workers`](#start-worker-processes-from-your-own-code)
   from an application's own code, for example a web service that embeds the
   worker today.
@@ -549,24 +552,66 @@ warning names it. The defaults are the module's `DEFAULT_*` constants.
 
 ## Use multiple CPU cores
 
-```bash
-cayu worker dispatch --processes 16 --shutdown-grace-seconds 45
+`cayu worker NAME` starts one worker process per CPU it may use: the CPUs it can
+be scheduled on, lowered to a container's CPU limit (a cgroup CPU quota, rounded
+down to whole CPUs). On Cayu Cloud that limit is the worker's `cpu_millis`, so a
+2-vCPU worker runs two processes and a 500-millicore one runs one. With one CPU it
+runs in its own process, as before. It prints how many it starts:
+
+```console
+$ cayu worker dispatch
+Worker 'dispatch' is starting 4 processes (one per CPU); --processes 1 runs it in one.
 ```
 
-On POSIX hosts, `--processes` starts independent Python interpreters, each with
+Choose the count with, in this order:
+
+- `--processes N` (1–256) or `--processes auto` on the command line;
+- the `CAYU_WORKER_PROCESSES` environment variable, `N` or `auto`, for example in
+  an Agent's settings on Cayu Cloud, whose `[worker]` command stays
+  `cayu worker NAME`;
+- a per-worker entry in `pyproject.toml`:
+
+```toml
+[tool.cayu.worker_processes]
+dispatch = "auto"
+poller = 1
+```
+
+```bash
+cayu worker dispatch --processes 16 --shutdown-grace-seconds 45
+cayu worker poller --processes 1
+```
+
+`auto` is the default, one per CPU. A worker that runs `--until-idle` or
+declares itself the only worker (`--reconcile-abandoned-after-seconds`) uses one
+process. Off POSIX hosts `auto` is one process, and more are refused.
+`cayu.runtime.available_cpu_count()` returns the count `auto` uses, for an
+application that starts its own processes.
+
+On POSIX hosts, several processes are independent Python interpreters, each with
 its own application factory call and event loop. This allows Python runtime
-work to use multiple cores. The default remains one process; the explicit
-range is 1–256. The supervising process does not construct an application.
-Workers receive zero-based `CAYU_WORKER_INDEX` and total `CAYU_WORKER_COUNT`
+work to use multiple cores. The supervising process does not construct an
+application. Each worker is started as `cayu worker NAME --processes 1` and
+receives zero-based `CAYU_WORKER_INDEX` and total `CAYU_WORKER_COUNT`
 environment variables for process-specific configuration.
 
 Configure all workers to use the same durable stores and unique worker IDs
 (as in the example above). Existing task claims and lease fences coordinate
-ownership. In-memory stores are separate in each process. Starting more
+ownership, so a task, an eval run or a watcher's event is taken by one process.
+In-memory stores are separate in each process, and SQLite allows one writer at
+a time, so a worker with several processes wants PostgreSQL. Starting more
 processes does not automatically partition an arbitrary worker entrypoint:
-an entrypoint that unconditionally launches the same request will do so in
-every process. Use the existing dispatcher or fresh-task loop for claimed work.
-Concurrency limits configured inside an entrypoint apply per process.
+an entrypoint that unconditionally launches the same request, or polls an
+outside service without a claim, will do so in every process. Use the
+existing dispatcher or fresh-task loop for claimed work, and declare an
+entrypoint that must run in one process as `NAME = 1` under
+`[tool.cayu.worker_processes]`.
+Concurrency limits configured inside an entrypoint apply per process, as do
+the runtime's own: the `SyncBinding` staging capacity (16 transfers and 4 GiB
+by default), the helper processes that copy workspaces
+(`CAYU_WORKSPACE_TRANSFER_PROCESSES`), worker metrics and the event-loop lag
+monitor. Each process also builds its own application, so memory use grows with
+the count; choose fewer processes when a worker's memory is tight.
 
 A failed child stops its siblings. Signals request cooperative shutdown;
 children that exceed the grace period are killed and reaped. Child processes
@@ -586,15 +631,19 @@ left and reaps everything before it returns. It never restarts a child.
 ```python
 # run_workers.py
 import asyncio
-import os
 import sys
 from pathlib import Path
 
-from cayu.runtime import ProcessWorkerCommand, process_worker_environment, supervise_process_workers
+from cayu.runtime import (
+    ProcessWorkerCommand,
+    available_cpu_count,
+    process_worker_environment,
+    supervise_process_workers,
+)
 
 
 async def main() -> int:
-    count = os.cpu_count() or 1
+    count = available_cpu_count()
     outcome = await supervise_process_workers(
         [
             ProcessWorkerCommand(

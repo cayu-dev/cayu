@@ -27,6 +27,7 @@ from cayu.cli.project import (
 from cayu.cli.project_control_plane import project_eval_worker
 from cayu.runtime._process_workers import (
     ProcessWorkerCommand,
+    available_cpu_count,
     positive_process_count,
     process_worker_environment,
     supervise_process_workers,
@@ -51,6 +52,10 @@ _MIN_APP_SHUTDOWN_SECONDS = 0.1
 # How long a worker that runs until idle lets its eval runs go on before it serves
 # the tasks they may have created.
 _EVAL_TASK_SERVICE_SECONDS = 5.0
+# How many processes `cayu worker` starts when --processes doesn't say.
+WORKER_PROCESSES_ENV = "CAYU_WORKER_PROCESSES"
+_AUTO = "auto"
+_PROCESSES_TABLE = "worker_processes"
 
 
 class WorkerError(ValueError):
@@ -62,6 +67,20 @@ class _WorkerProject:
     root: Path
     factory_target: str
     worker_target: str
+    # [tool.cayu.worker_processes].<name>: a count, "auto", or None when not declared.
+    processes: int | str | None = None
+
+
+@dataclass(frozen=True)
+class _ProcessRequest:
+    """How many processes were asked for (``None``: one per CPU) and where."""
+
+    count: int | None
+    source: str
+
+    @property
+    def explicit_several(self) -> bool:
+        return self.count is not None and self.count > 1
 
 
 def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -76,9 +95,14 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("name", help="Worker name from [tool.cayu.workers].")
     parser.add_argument(
         "--processes",
-        type=positive_process_count,
-        default=1,
-        help="Independent worker processes; each constructs its own app (default: 1).",
+        type=_process_count,
+        default=None,
+        metavar="N",
+        help=(
+            "Independent worker processes, each with its own app: a number from 1 to 256, "
+            f"or auto for one per CPU this worker may use. Default: {WORKER_PROCESSES_ENV}, "
+            "then [tool.cayu.worker_processes].NAME, then auto."
+        ),
     )
     parser.add_argument(
         "--shutdown-grace-seconds",
@@ -94,7 +118,8 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
         help=(
             "Declare this the only worker for its tasks: run_task_worker settles a task "
             "fenced after another worker's lease expired at least SECONDS ago as cancelled. "
-            "Off by default; can't be combined with --processes."
+            "Off by default. The worker then runs in one process; it can't be combined "
+            "with more than one."
         ),
     )
     parser.add_argument(
@@ -122,7 +147,7 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
             "Run the tasks that are due, then exit and print one JSON line with the "
             "number handled and when work is next due. The entrypoint must return "
             "run_task_worker_until_idle's result when worker_until_idle_requested() "
-            "is true. Can't be combined with --processes."
+            "is true. Runs in one process; can't be combined with --processes above 1."
         ),
     )
 
@@ -135,18 +160,27 @@ def run_worker(args: argparse.Namespace) -> int:
 def _run_worker(args: argparse.Namespace) -> int:
     try:
         project = _resolve_worker_project(args.name)
-        processes = getattr(args, "processes", 1)
+        requested = _requested_processes(getattr(args, "processes", None), project)
         reconcile_after = getattr(args, "reconcile_abandoned_after_seconds", None)
-        if processes > 1 and (
-            reconcile_after is not None or os.environ.get(RECONCILE_ABANDONED_AFTER_ENV, "").strip()
-        ):
+        reconciles = reconcile_after is not None or bool(
+            os.environ.get(RECONCILE_ABANDONED_AFTER_ENV, "").strip()
+        )
+        if reconciles and requested.explicit_several:
             raise WorkerError(
                 f"--reconcile-abandoned-after-seconds and {RECONCILE_ABANDONED_AFTER_ENV} "
-                "declare a single worker and can't be combined with --processes."
+                f"declare a single worker and can't be combined with {requested.source}."
             )
         until_idle = getattr(args, "until_idle", False)
-        if processes > 1 and until_idle:
+        if until_idle and requested.explicit_several and requested.source == "--processes":
             raise WorkerError("--until-idle can't be combined with --processes.")
+        # A declared single worker and a run until idle use one process; otherwise
+        # the request, or one process per CPU where several processes are supported.
+        if reconciles or until_idle:
+            processes = 1
+        elif requested.count is not None:
+            processes = requested.count
+        else:
+            processes = min(available_cpu_count(), 256) if os.name == "posix" else 1
         restart_abandoned = getattr(args, "restart_abandoned", False)
         max_restarts = getattr(args, "max_abandoned_restarts", None)
         if restart_abandoned and (
@@ -167,6 +201,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         if max_restarts is not None:
             os.environ[MAX_ABANDONED_RESTARTS_ENV] = str(max_restarts)
         if processes > 1:
+            print(_processes_notice(args.name, processes, requested), file=sys.stderr, flush=True)
             outcome = asyncio.run(
                 supervise_process_workers(
                     [
@@ -177,6 +212,8 @@ def _run_worker(args: argparse.Namespace) -> int:
                                 "cayu",
                                 "worker",
                                 args.name,
+                                "--processes",
+                                "1",
                                 "--shutdown-grace-seconds",
                                 str(args.shutdown_grace_seconds),
                             ),
@@ -266,6 +303,67 @@ def _resolve_worker_project(name: str) -> _WorkerProject:
         root=discovered.root,
         factory_target=discovered.factory_target,
         worker_target=target.strip(),
+        processes=_declared_processes(discovered.pyproject, discovered.config, workers, name),
+    )
+
+
+def _declared_processes(
+    pyproject: Path,
+    config: dict[str, Any],
+    workers: dict[str, Any],
+    name: str,
+) -> int | str | None:
+    """``[tool.cayu.worker_processes].<name>``: a count, ``"auto"``, or ``None``."""
+
+    table = config.get(_PROCESSES_TABLE)
+    if table is None:
+        return None
+    if not isinstance(table, dict):
+        raise WorkerError(f"{pyproject}: [tool.cayu.{_PROCESSES_TABLE}] must be a table.")
+    entries = cast("dict[str, Any]", table)
+    for worker, value in entries.items():
+        if worker not in workers:
+            raise WorkerError(
+                f"{pyproject}: [tool.cayu.{_PROCESSES_TABLE}] names {worker!r}, which "
+                "[tool.cayu.workers] doesn't declare."
+            )
+        if not (
+            (type(value) is int and 1 <= value <= 256)
+            or (isinstance(value, str) and value.strip().lower() == _AUTO)
+        ):
+            raise WorkerError(
+                f"{pyproject}: [tool.cayu.{_PROCESSES_TABLE}].{worker} must be a number "
+                'from 1 to 256 or "auto".'
+            )
+    value = entries.get(name)
+    return value if value is None or type(value) is int else _AUTO
+
+
+def _requested_processes(flag: int | str | None, project: _WorkerProject) -> _ProcessRequest:
+    """The process count asked for: --processes, the environment, pyproject, or auto."""
+
+    def request(value: int | str, source: str) -> _ProcessRequest:
+        return _ProcessRequest(None if value == _AUTO else cast("int", value), source)
+
+    if flag is not None:
+        return request(flag, "--processes")
+    environment = os.environ.get(WORKER_PROCESSES_ENV, "").strip()
+    if environment:
+        try:
+            value = _process_count(environment)
+        except argparse.ArgumentTypeError as exc:
+            raise WorkerError(f"{WORKER_PROCESSES_ENV}: {exc}") from None
+        return request(value, WORKER_PROCESSES_ENV)
+    if project.processes is not None:
+        return request(project.processes, f"[tool.cayu.{_PROCESSES_TABLE}]")
+    return _ProcessRequest(None, "auto")
+
+
+def _processes_notice(name: str, processes: int, requested: _ProcessRequest) -> str:
+    reason = "one per CPU" if requested.count is None else f"from {requested.source}"
+    return (
+        f"Worker {name!r} is starting {processes} processes ({reason}); "
+        "--processes 1 runs it in one."
     )
 
 
@@ -522,6 +620,19 @@ async def _until_idle_with_evals(
             return outcome.model_copy(
                 update={"handled": handled, "idle": outcome.idle and evals_idle}
             )
+
+
+def _process_count(value: str) -> int | str:
+    """``auto``, or a whole number of processes from 1 to 256."""
+
+    if value.strip().lower() == _AUTO:
+        return _AUTO
+    try:
+        return positive_process_count(value)
+    except argparse.ArgumentTypeError:
+        raise argparse.ArgumentTypeError(
+            "process count must be auto or a whole number from 1 to 256."
+        ) from None
 
 
 def _positive_seconds(value: str) -> float:

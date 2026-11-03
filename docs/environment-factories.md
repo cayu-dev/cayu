@@ -2568,6 +2568,16 @@ staging = SyncBindingStagingCapacity(
 binding = SyncBinding(target_workspace=target, staging_capacity=staging)
 ```
 
+Copying a large tree is mostly Python work: reading and hashing each file and packing the archive.
+In a thread it still takes turns with the event loop, so one big copy would slow model streaming and
+tool calls for every other session in the process. A `LocalWorkspace` source therefore checks its
+files' revisions (`file_identity_reader()`) and packs the archive in helper processes, a batch per
+call. Each process starts at most `CAYU_WORKSPACE_TRANSFER_PROCESSES` helpers (default 2), which is
+also how many such batches it runs at once; `0` runs them in a thread of the process instead. A
+helper starts on first use, is reused, and exits with the process. A custom workspace can offer
+the same batched revision reads by returning a `WorkspaceFileIdentityReader` from
+`file_identity_reader()`.
+
 Admission reserves the peak archive-plus-transient payload before creating its private spool.
 Runner-backed workspaces stream raw tar bytes without whole-archive JSON/base64 copies. Exact
 revision-aware fan-out can share one sealed archive while consumers are active; weak identities,

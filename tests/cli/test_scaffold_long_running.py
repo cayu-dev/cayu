@@ -63,6 +63,7 @@ def test_long_running_project_passes_its_own_tests_eval_and_check(tmp_path: Path
 
     pyproject = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
     assert pyproject["tool"]["cayu"]["workers"] == {"timers": "operations.timers:run_timer_worker"}
+    assert pyproject["tool"]["cayu"]["worker_processes"] == {"timers": 1}
     assert pyproject["tool"]["cayu"]["scaffold"]["preset"] == "long-running"
     agents = (project / "AGENTS.md").read_text(encoding="utf-8")
     assert "## Jobs that wait, approve, or spend" in agents

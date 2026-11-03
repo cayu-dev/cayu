@@ -2081,10 +2081,12 @@ above the environment's configured ceiling and names valid sizes.
 
 A Python process runs the runtime's own work for all of its sessions on one CPU
 core, however many vCPUs its task has, and past a few concurrent sessions each
-of them slows down. A worker sized above one vCPU uses the others only through
-more processes, for example `command = "cayu worker reviews --processes 4"` for
-4 vCPU. The processes share the Agent's PostgreSQL database, whose claims keep
-them from taking the same work. Sessions a web process runs itself are bound
+of them slows down. So `cayu worker NAME` starts one process per vCPU of its
+`cpu_millis`, rounded down: two for `cpu_millis = 2000`, one for 1000 or less.
+Set another count with `--processes N` in the `[worker]` command, or with the
+`CAYU_WORKER_PROCESSES` setting (`N` or `auto`); `--processes 1` runs one. The
+processes share the Agent's PostgreSQL database, whose claims keep them from
+taking the same work. Sessions a web process runs itself are bound
 the same way, so move them to the worker. See [one process is one CPU
 core](project-workers.md#one-process-is-one-cpu-core); a worker logs a warning
 when its process stays saturated.

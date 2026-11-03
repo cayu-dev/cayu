@@ -53,6 +53,9 @@ class ProcessWorkerOutcome:
     forced_shutdown: bool
 
 
+_MAX_PROCESS_COUNT = 256
+
+
 def positive_process_count(value: str) -> int:
     import argparse
 
@@ -60,9 +63,154 @@ def positive_process_count(value: str) -> int:
         count = int(value)
     except ValueError:
         raise argparse.ArgumentTypeError("process count must be an integer.") from None
-    if not 1 <= count <= 256:
+    if not 1 <= count <= _MAX_PROCESS_COUNT:
         raise argparse.ArgumentTypeError("process count must be between 1 and 256.")
     return count
+
+
+# Where Linux says which cgroups this process is in and where they are mounted.
+_PROC_SELF = Path("/proc/self")
+
+
+def available_cpu_count() -> int:
+    """How many CPUs this process may use: at least 1.
+
+    The CPUs it may be scheduled on (``os.process_cpu_count()`` where Python
+    has it, else the scheduler affinity or ``os.cpu_count()``), lowered to a
+    container's CPU limit (a cgroup CPU quota, rounded down), as on Cayu Cloud
+    where it is the process's ``cpu_millis``.
+    """
+
+    count = _schedulable_cpu_count()
+    limit = _cgroup_cpu_limit()
+    if limit is not None:
+        count = min(count, limit)
+    return max(1, count)
+
+
+def _schedulable_cpu_count() -> int:
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    if process_cpu_count is not None:
+        count = process_cpu_count()
+    elif hasattr(os, "sched_getaffinity"):
+        count = len(os.sched_getaffinity(0))
+    else:
+        count = os.cpu_count()
+    return count or 1
+
+
+def _cgroup_cpu_limit() -> int | None:
+    """The whole CPUs this process's cgroups allow, or ``None`` without a quota.
+
+    Reads the CPU quota of the process's own cgroup and of each ancestor up to
+    its mount, cgroup v2 or v1, and keeps the tightest.
+    """
+
+    try:
+        memberships = (_PROC_SELF / "cgroup").read_text(encoding="utf-8").splitlines()
+        mounts = (_PROC_SELF / "mountinfo").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    limits = [
+        limit
+        for directory, mount_point, version in _cpu_cgroup_directories(memberships, mounts)
+        for level in _cgroup_levels(directory, mount_point)
+        if (limit := _cgroup_quota_cpus(level, version)) is not None
+    ]
+    return min(limits, default=None)
+
+
+def _cpu_cgroup_directories(
+    memberships: list[str], mounts: list[str]
+) -> list[tuple[Path, Path, str]]:
+    """Each (cgroup directory, its mount point, "v2" or "v1") that limits CPU."""
+
+    # mountinfo: ID PARENT MAJOR:MINOR ROOT MOUNT_POINT OPTIONS [OPTIONAL...] - TYPE SOURCE SUPER
+    mounted: list[tuple[str, str, Path, set[str]]] = []
+    for line in mounts:
+        before, separator, after = line.partition(" - ")
+        fields, tail = before.split(), after.split()
+        if not separator or len(fields) < 5 or not tail:
+            continue
+        options = set(tail[2].split(",")) if len(tail) > 2 else set()
+        mounted.append(
+            (
+                tail[0],
+                _unescape_mount_path(fields[3]),
+                Path(_unescape_mount_path(fields[4])),
+                options,
+            )
+        )
+    found: list[tuple[Path, Path, str]] = []
+    for line in memberships:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controllers, cgroup_path = parts
+        if controllers == "":
+            version, wanted = "v2", ("cgroup2", None)
+        elif "cpu" in controllers.split(","):
+            version, wanted = "v1", ("cgroup", "cpu")
+        else:
+            continue
+        for fstype, root, mount_point, options in mounted:
+            if fstype != wanted[0] or (wanted[1] is not None and wanted[1] not in options):
+                continue
+            found.append((_cgroup_directory(cgroup_path, root, mount_point), mount_point, version))
+    return found
+
+
+def _unescape_mount_path(value: str) -> str:
+    # mountinfo writes space, tab, newline and backslash as octal escapes.
+    for escaped, plain in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+        value = value.replace(escaped, plain)
+    return value
+
+
+def _cgroup_directory(cgroup_path: str, root: str, mount_point: Path) -> Path:
+    """Where ``cgroup_path`` is under a mount of the hierarchy's ``root``."""
+
+    if root == "/":
+        relative = cgroup_path.lstrip("/")
+    elif cgroup_path == root or cgroup_path.startswith(root.rstrip("/") + "/"):
+        relative = cgroup_path[len(root) :].lstrip("/")
+    else:
+        # Outside what this mount shows, as across cgroup namespaces.
+        return mount_point
+    directory = mount_point / relative
+    return (
+        directory
+        if directory.is_relative_to(mount_point) and ".." not in Path(relative).parts
+        else mount_point
+    )
+
+
+def _cgroup_levels(directory: Path, mount_point: Path) -> list[Path]:
+    """``directory`` and each of its ancestors up to ``mount_point``."""
+
+    levels = [directory]
+    while levels[-1] != mount_point and levels[-1].is_relative_to(mount_point):
+        levels.append(levels[-1].parent)
+    return levels
+
+
+def _cgroup_quota_cpus(directory: Path, version: str) -> int | None:
+    try:
+        if version == "v2":
+            fields = (directory / "cpu.max").read_text(encoding="ascii").split()
+            if not fields or fields[0] == "max":
+                return None
+            quota, period = fields[0], fields[1] if len(fields) > 1 else "100000"
+        else:
+            quota = (directory / "cpu.cfs_quota_us").read_text(encoding="ascii").strip()
+            period = (directory / "cpu.cfs_period_us").read_text(encoding="ascii").strip()
+        quota_us, period_us = int(quota), int(period)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if quota_us <= 0 or period_us <= 0:
+        # cgroup v1 states "no limit" as -1.
+        return None
+    return max(1, quota_us // period_us)
 
 
 # How many worker processes one supervisor runs, in each of them.
