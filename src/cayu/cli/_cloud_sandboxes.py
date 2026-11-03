@@ -13,6 +13,13 @@ now: how many places are held under its limit and when the soonest lease runs ou
 that still holds a place but was created for a Release the Agent no longer selects is marked,
 since that is what a redeploy leaves behind. `show` adds the sandbox's audit events.
 
+`list --session/--task/--label/--since` lists only the sandboxes created for that session or
+task, with those labels, or since then; Cloud filters and pages them (a Cloud before
+cayu-tech/cayu-cloud#766 would ignore the filters, so the command refuses to list
+there). Both commands also show what each sandbox did (`activity`: its commands, failed ones
+and their run time, and its file transfers in and out), and `list` the same summed over every
+sandbox that matches, which Cloud adds up; an older Cloud reports none.
+
 These commands print a table by default; `--json` prints the JSON envelope the other `cayu
 cloud` commands print, with `schema_version` in its result.
 """
@@ -20,12 +27,15 @@ cloud` commands print, with `schema_version` in its result.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_releases import _when, add_output_argument, render_failure
+from cayu.cli._cloud_service_logs import log_time
 from cayu.cli._cloud_settings import _cell, _table
 
 SCHEMA_VERSION = 1
@@ -38,6 +48,13 @@ STATUSES = ("provisioning", "ready", "destroying", "destroyed", "failed")
 # once it is out of the queue.
 _HOLDING = frozenset({"provisioning", "ready", "destroying"})
 _SANDBOX_ID_LIMIT = 128
+# The Cloud change that filters the list and sums the activity.
+_FILTERS_CLOUD = "cayu-tech/cayu-cloud#766"
+# Cloud's bounds on a filter (`SandboxFilter`): a provenance id, and a label as a create sets it.
+_ID_LIMIT = 256
+_LABEL_KEY = re.compile(r"[a-z0-9_.-]{1,63}")
+_LABEL_VALUE_LIMIT = 200
+_LABEL_FILTER_LIMIT = 10
 _PROVENANCE = ("release_id", "session_id", "task_id")
 _SANDBOX_FIELDS = (
     "id",
@@ -74,6 +91,23 @@ def _sandbox_id(value: str) -> str:
     return value
 
 
+def _filter_id(value: str) -> str:
+    if not value or len(value) > _ID_LIMIT or not value.isprintable():
+        raise argparse.ArgumentTypeError(f"must be 1 to {_ID_LIMIT} printable characters")
+    return value
+
+
+def _label(value: str) -> tuple[str, str]:
+    key, separator, label = value.partition("=")
+    if not separator or not _LABEL_KEY.fullmatch(key):
+        raise argparse.ArgumentTypeError("must be KEY=VALUE with a key of 1 to 63 of [a-z0-9_.-]")
+    if len(label) > _LABEL_VALUE_LIMIT or not label.isprintable():
+        raise argparse.ArgumentTypeError(
+            f"its value must be printable and at most {_LABEL_VALUE_LIMIT} long"
+        )
+    return key, label
+
+
 def add_sandboxes_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     sandboxes = commands.add_parser(
         "sandboxes",
@@ -88,7 +122,8 @@ def add_sandboxes_parser(commands: argparse._SubParsersAction[argparse.ArgumentP
         "list",
         description=(
             "List the Agent's sandboxes, newest first, with the places they hold under its "
-            "limit now."
+            "limit now and what each did (commands, file transfers), summed at the end over "
+            "every sandbox that matches."
         ),
     )
     listing.add_argument("--status", choices=STATUSES, help="Only sandboxes with this status.")
@@ -98,8 +133,29 @@ def add_sandboxes_parser(commands: argparse._SubParsersAction[argparse.ArgumentP
         default=DEFAULT_LIMIT,
         help=f"How many to list, newest first (default {DEFAULT_LIMIT}, at most {MAX_LIMIT}).",
     )
+    listing.add_argument(
+        "--session",
+        type=_filter_id,
+        help="Only the sandboxes created for this session (as their provenance names it).",
+    )
+    listing.add_argument(
+        "--task", type=_filter_id, help="Only the sandboxes created for this task."
+    )
+    listing.add_argument(
+        "--label",
+        type=_label,
+        action="append",
+        metavar="KEY=VALUE",
+        help="Only the sandboxes with this label; repeat for several, all of which must match.",
+    )
+    listing.add_argument(
+        "--since",
+        type=log_time,
+        help="Only the sandboxes created at or after this time: 15m, 1h, 2d or ISO 8601.",
+    )
     showing = actions.add_parser(
-        "show", description="Show one sandbox and its audit events, oldest first."
+        "show",
+        description="Show one sandbox, what it did, and its audit events, oldest first.",
     )
     showing.add_argument("sandbox_id", metavar="SANDBOX_ID", type=_sandbox_id)
     for parser, render in ((listing, render_sandboxes), (showing, render_sandbox)):
@@ -114,7 +170,7 @@ def sandboxes_command(
     selected = _selected_release(client, base)
     if arguments.sandboxes_command == "show":
         path = f"{base}/sandboxes/{quote(arguments.sandbox_id, safe='')}"
-        sandbox = _read(client, path)
+        sandbox = _read(client, path, query={"activity": "true"})
         events = _read(client, f"{path}/events").get("items")
         return {
             "operation": "sandboxes.show",
@@ -128,15 +184,32 @@ def sandboxes_command(
                 else [],
             },
         }
+    filters = _filters(arguments)
+    # The sandboxes the list and its totals mean.
+    matching: dict[str, str | Sequence[str]] = dict(filters)
+    if arguments.status is not None:
+        matching["status"] = arguments.status
     items: list[Mapping[str, Any]] = []
     cursor: str | None = None
     while True:
-        query = {"limit": str(min(_PAGE_LIMIT, arguments.limit - len(items)))}
-        if arguments.status is not None:
-            query["status"] = arguments.status
+        query: dict[str, str | Sequence[str]] = {
+            "limit": str(min(_PAGE_LIMIT, arguments.limit - len(items))),
+            "activity": "true",
+            **matching,
+        }
         if cursor is not None:
             query["cursor"] = cursor
         page = _read(client, f"{base}/sandboxes", query=query)
+        # A Cloud that filters says so; an older one ignores the filters and lists every
+        # sandbox, which would pass for the session's.
+        applied = isinstance(page.get("filters"), Mapping)
+        if filters and not applied:
+            raise CloudApiError(
+                "sandbox_filters_unsupported",
+                "This Cayu Cloud doesn't filter sandboxes by session, task, label or time; "
+                f"it needs {_FILTERS_CLOUD}. Update the install, or list without "
+                "--session, --task, --label and --since.",
+            )
         found = page.get("items")
         if not isinstance(found, list):
             raise CloudApiError("api_response_invalid", "The sandbox list is invalid.")
@@ -151,14 +224,74 @@ def sandboxes_command(
             "schema_version": SCHEMA_VERSION,
             "application_id": application_id,
             "selected_release_id": selected,
+            "filters": _filters_dict(arguments),
             "capacity": _capacity(client, base),
             "items": [
                 sandbox_summary(item, selected_release_id=selected)
                 for item in items[: arguments.limit]
             ],
             "next_cursor": cursor,
+            # Only a Cloud that applies the filters adds the activity up.
+            "totals": _totals(client, base, matching) if applied else None,
         },
     }
+
+
+def _filters(arguments: argparse.Namespace) -> dict[str, str | list[str]]:
+    """The list's filters as Cloud's query names them."""
+
+    query: dict[str, str | list[str]] = {}
+    if arguments.session is not None:
+        query["session"] = arguments.session
+    if arguments.task is not None:
+        query["task"] = arguments.task
+    if arguments.label:
+        if len(arguments.label) > _LABEL_FILTER_LIMIT:
+            raise CloudApiError(
+                "invalid_input", f"--label may be given at most {_LABEL_FILTER_LIMIT} times."
+            )
+        values: dict[str, str] = {}
+        for key, value in arguments.label:
+            if values.setdefault(key, value) != value:
+                # No sandbox has two values for one key; Cloud refuses it too.
+                raise CloudApiError(
+                    "invalid_input", f"--label names {key} twice with different values."
+                )
+        query["label"] = [f"{key}={value}" for key, value in arguments.label]
+    if arguments.since is not None:
+        query["since"] = arguments.since.isoformat()
+    return query
+
+
+def _filters_dict(arguments: argparse.Namespace) -> dict[str, Any]:
+    since: datetime | None = arguments.since
+    return {
+        "status": arguments.status,
+        "session": arguments.session,
+        "task": arguments.task,
+        "labels": dict(arguments.label or ()),
+        "since": None if since is None else since.isoformat(),
+    }
+
+
+def _totals(
+    client: CloudApiClient, base: str, matching: Mapping[str, str | Sequence[str]]
+) -> dict[str, Any] | None:
+    """How many sandboxes match and what they did, summed by Cloud over all of them, not only
+    the ones listed; None from a Cloud that doesn't say."""
+
+    try:
+        totals = client.request("GET", f"{base}/sandboxes/activity", query=matching)
+    except CloudApiError as exc:
+        # A Cloud before the route reads "activity" as a sandbox id it doesn't have.
+        if exc.status_code == 404:
+            return None
+        raise _sandbox_error(exc) from None
+    activity = _activity(totals.get("activity"))
+    count = _number(totals.get("sandboxes"))
+    if activity is None or count is None:
+        return None
+    return {"sandboxes": count, "activity": activity}
 
 
 def sandbox_summary(
@@ -169,6 +302,7 @@ def sandbox_summary(
     sandbox holds no place yet, so it is never marked."""
 
     summary = {name: sandbox.get(name) for name in _SANDBOX_FIELDS}
+    summary["activity"] = _activity(sandbox.get("activity"))
     provenance = sandbox.get("provenance")
     summary["provenance"] = (
         {name: _text(provenance.get(name)) for name in _PROVENANCE}
@@ -211,7 +345,7 @@ def _capacity(client: CloudApiClient, base: str) -> dict[str, Any] | None:
 
 
 def _read(
-    client: CloudApiClient, path: str, *, query: dict[str, str] | None = None
+    client: CloudApiClient, path: str, *, query: Mapping[str, str | Sequence[str]] | None = None
 ) -> dict[str, Any]:
     try:
         return client.request("GET", path, query=query)
@@ -258,6 +392,31 @@ def _event(event: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _activity(value: Any) -> dict[str, Any] | None:
+    """What a sandbox did as Cloud sums it (``activity``), or None when it doesn't say."""
+
+    if not isinstance(value, Mapping):
+        return None
+    commands = value.get("commands")
+    transfers = value.get("transfers")
+    if not isinstance(commands, Mapping) or not isinstance(transfers, Mapping):
+        return None
+    inward = transfers.get("in")
+    outward = transfers.get("out")
+    if not isinstance(inward, Mapping) or not isinstance(outward, Mapping):
+        return None
+    return {
+        "commands": {
+            name: _number(commands.get(name))
+            for name in ("count", "running", "failed", "cancelled", "duration_ms")
+        },
+        "transfers": {
+            "in": {name: _number(inward.get(name)) for name in ("count", "bytes", "files")},
+            "out": {name: _number(outward.get(name)) for name in ("count", "bytes")},
+        },
+    }
+
+
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
@@ -286,11 +445,24 @@ def render_sandboxes(result: Mapping[str, Any]) -> str:
             _provenance_cell(item, "release_id"),
             _provenance_cell(item, "session_id"),
             _provenance_cell(item, "task_id"),
+            _commands_cell(item.get("activity")),
+            _transfers_cell(item.get("activity")),
         )
         for item in items
     ]
     lines += _table(
-        ("SANDBOX", "STATUS", "CREATED", "LEASE ENDS", "ENDED", "RELEASE", "SESSION", "TASK"),
+        (
+            "SANDBOX",
+            "STATUS",
+            "CREATED",
+            "LEASE ENDS",
+            "ENDED",
+            "RELEASE",
+            "SESSION",
+            "TASK",
+            "COMMANDS",
+            "TRANSFERS IN / OUT",
+        ),
         rows,
     )
     older = [item for item in items if item.get("older_release")]
@@ -303,6 +475,7 @@ def render_sandboxes(result: Mapping[str, Any]) -> str:
         ]
     if listed.get("next_cursor") is not None:
         lines.append(f"Showing the newest {len(items)}; pass a larger --limit for more.")
+    lines += ["", _totals_line(listed.get("totals"))]
     return "\n".join(lines)
 
 
@@ -330,6 +503,7 @@ def render_sandbox(result: Mapping[str, Any]) -> str:
         ),
         f"  Session: {_cell(provenance.get('session_id'))}",
         f"  Task: {_cell(provenance.get('task_id'))}",
+        *_activity_lines(sandbox.get("activity")),
     ]
     events = shown["events"]
     if not events:
@@ -354,6 +528,100 @@ def _capacity_line(capacity: Mapping[str, Any] | None) -> str:
     if capacity.get("available") == 0 and capacity.get("limited_by") is not None:
         line += f"; a create now waits or is refused ({_cell(capacity['limited_by'])} limit)"
     return line + "."
+
+
+def _activity_lines(activity: Mapping[str, Any] | None) -> list[str]:
+    if activity is None:
+        return [f"  Activity: not reported; this Cayu Cloud needs {_FILTERS_CLOUD}."]
+    commands = activity["commands"]
+    inward = activity["transfers"]["in"]
+    outward = activity["transfers"]["out"]
+    return [
+        f"  Commands: {_commands_text(commands)}",
+        f"  Transfers in: {_transfer_text(inward)}",
+        f"  Transfers out: {_transfer_text(outward)}",
+    ]
+
+
+def _totals_line(totals: Mapping[str, Any] | None) -> str:
+    if totals is None:
+        return f"Activity: not reported; this Cayu Cloud needs {_FILTERS_CLOUD}."
+    activity = totals["activity"]
+    count = totals["sandboxes"]
+    return (
+        f"All {_count(count)} matching {'sandbox' if count == 1 else 'sandboxes'}: "
+        f"{_commands_text(activity['commands'])}; "
+        f"in {_transfer_text(activity['transfers']['in'])}; "
+        f"out {_transfer_text(activity['transfers']['out'])}."
+    )
+
+
+def _commands_text(commands: Mapping[str, Any]) -> str:
+    count = commands["count"]
+    text = f"{_count(count)} {'command' if count == 1 else 'commands'}"
+    outcomes = [
+        f"{_count(commands[name])} {name}"
+        for name in ("failed", "cancelled", "running")
+        if commands[name] != 0
+    ]
+    if outcomes:
+        text += f" ({', '.join(outcomes)})"
+    return f"{text}, {_milliseconds(commands['duration_ms'])} in total"
+
+
+def _transfer_text(transfer: Mapping[str, Any]) -> str:
+    count = transfer["count"]
+    text = (
+        f"{_count(count)} {'transfer' if count == 1 else 'transfers'}, {_bytes(transfer['bytes'])}"
+    )
+    if "files" in transfer:
+        text += f", {_count(transfer['files'])} files"
+    return text
+
+
+def _commands_cell(activity: Mapping[str, Any] | None) -> str:
+    if activity is None:
+        return "-"
+    commands = activity["commands"]
+    text = f"{_count(commands['count'])} {_milliseconds(commands['duration_ms'])}"
+    return f"{text} {_count(commands['failed'])} failed" if commands["failed"] else text
+
+
+def _transfers_cell(activity: Mapping[str, Any] | None) -> str:
+    if activity is None:
+        return "-"
+    inward = activity["transfers"]["in"]
+    outward = activity["transfers"]["out"]
+    return (
+        f"{_count(inward['count'])} {_bytes(inward['bytes'])} / "
+        f"{_count(outward['count'])} {_bytes(outward['bytes'])}"
+    )
+
+
+def _bytes(value: object) -> str:
+    if type(value) is not int:
+        return "? B"
+    size = float(value)
+    for unit in ("B", "kB", "MB", "GB"):
+        if size < 1000 or unit == "GB":
+            return f"{value} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1000
+    raise AssertionError("unreachable")
+
+
+def _milliseconds(value: object) -> str:
+    if type(value) is not int:
+        return "?"
+    if value < 1000:
+        return f"{value} ms"
+    seconds = value / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, second = divmod(round(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{second:02d}s"
+    hours, minute = divmod(minutes, 60)
+    return f"{hours}h{minute:02d}m"
 
 
 def _count(value: object) -> str:

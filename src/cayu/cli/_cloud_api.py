@@ -7,7 +7,7 @@ import ipaddress
 import json
 import re
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -323,7 +323,7 @@ class CloudApiClient:
         *,
         payload: dict[str, object] | None = None,
         idempotency_key: str | None = None,
-        query: dict[str, str] | None = None,
+        query: Mapping[str, str | Sequence[str]] | None = None,
     ) -> dict[str, Any]:
         api_key = self._current_api_key()
         response = self._send(
@@ -436,7 +436,7 @@ class CloudApiClient:
         api_key: str,
         payload: dict[str, object] | None,
         idempotency_key: str | None,
-        query: dict[str, str] | None,
+        query: Mapping[str, str | Sequence[str]] | None,
     ) -> httpx.Response:
         headers = {
             "Accept": "application/json",
@@ -455,7 +455,10 @@ class CloudApiClient:
             ) as client:
                 return client.request(
                     method,
-                    self.api_url.rstrip("/") + path + (f"?{urlencode(query)}" if query else ""),
+                    # A sequence value repeats its name (`label=a=1&label=b=2`).
+                    self.api_url.rstrip("/")
+                    + path
+                    + (f"?{urlencode(query, doseq=True)}" if query else ""),
                     content=body,
                     headers=headers,
                 )

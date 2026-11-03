@@ -1977,6 +1977,9 @@ destroys its sandboxes.
 ```sh
 cayu cloud sandboxes list --application my-agent                 # newest first
 cayu cloud sandboxes list --application my-agent --status ready --limit 200
+cayu cloud sandboxes list --application my-agent --session ses_41  # one session's
+cayu cloud sandboxes list --application my-agent --task task_7 --since 2h
+cayu cloud sandboxes list --application my-agent --label mission=m-17 --label role=builder
 cayu cloud sandboxes show --application my-agent sbx_7f2c...      # with its events
 ```
 
@@ -1989,7 +1992,24 @@ its place until its lease runs out. `show` adds its audit events: who asked,
 each command's program and outcome, renewals, egress hosts and its end. Both
 print a table, or the JSON envelope with `--json`. A sandbox created by an
 older Runtime, or without provenance, shows `-` for its Release, session and
-task. The commands need a Cayu Cloud with cayu-tech/cayu-cloud#679; an older
+task.
+
+`--session`, `--task`, `--label KEY=VALUE` (repeat it; all must match) and
+`--since` (`15m`, `2h`, `2d` or an ISO 8601 time) list only the sandboxes
+created for that session or task, with those labels, or since then. Cloud
+filters and pages them, so finding one session's sandbox doesn't read the
+Agent's whole history. Both commands also say what each sandbox did: how many
+commands it ran, how many failed (a non-zero exit, a timeout or a command
+Cloud couldn't run), how many were cancelled or still run, their run time
+summed, and its file transfers in (archive uploads and staged copies in, with
+their bytes and files) and out (archive downloads and staged copies out).
+`list` ends with the same summed over every sandbox that matches, not only
+the ones it shows. In `--json` that's each sandbox's `activity`, `totals`
+(`{"sandboxes", "activity"}`) and the `filters` asked for. The filters and
+the activity need a Cayu Cloud with cayu-tech/cayu-cloud#766. An older Cloud
+would ignore the filters, so `list` refuses them there
+(`sandbox_filters_unsupported`) instead of listing every sandbox; without
+filters it lists as before and reports no activity. The commands need a Cayu Cloud with cayu-tech/cayu-cloud#679; an older
 one refuses the login on these routes.
 
 Cloud also logs every create it refuses for a full limit, with the limit, how
