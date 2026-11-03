@@ -3823,20 +3823,21 @@ def test_sync_binding_bulk_transfers_runner_workspace_files(tmp_path) -> None:
 
     bind_execs, final_snapshot = asyncio.run(run())
 
-    # Bind costs one exec to list the target for cleaning plus one bulk tar
-    # write, independent of how many files are copied in.
-    assert bind_execs == 2
-    # Two manual writes plus finalize's list, size measurement for the
-    # staging reservation, and bulk tar read.
-    assert runner.exec_calls == 7
+    # Bind costs one exec to list the target for cleaning, one bulk tar write
+    # and one in-target hash of what was copied in, independent of how many
+    # files are copied in.
+    assert bind_execs == 3
+    # Two manual writes plus finalize's list, in-target hash, size measurement
+    # for the staging reservation, and bulk tar read.
+    assert runner.exec_calls == 9
     assert (target_root / "nested" / "c.txt").read_text(encoding="utf-8") == "charlie"
     assert (source_root / "a.txt").read_text(encoding="utf-8") == "changed"
     assert (source_root / "new.txt").read_text(encoding="utf-8") == "created"
     assert final_snapshot is not None
-    assert final_snapshot.metadata["copied_files"] == 4
-    assert final_snapshot.metadata["copied_bytes"] == len("changed") + len("created") + len(
-        "bravo"
-    ) + len("charlie")
+    # Only the changed and created files come back.
+    assert final_snapshot.metadata["copied_files"] == 2
+    assert final_snapshot.metadata["unchanged_files"] == 2
+    assert final_snapshot.metadata["copied_bytes"] == len("changed") + len("created")
     assert binding._states == {}
 
 

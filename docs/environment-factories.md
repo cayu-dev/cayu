@@ -2532,6 +2532,22 @@ framing and path metadata. They are ceilings: a transfer measures the files it i
 (`LocalWorkspace` and `RunnerWorkspace` can) and reserves staging capacity for those sizes. A
 transfer from a workspace that can't measure reserves for its limits, or for what the staging
 capacity holds when the limits are larger, and then copies at most that.
+
+Copy-back sends only what the run changed. Right after copy-in, `SyncBinding` has the target hash
+the files it received (SHA-256, size and Git mode, measured where the files live, so no content
+moves); copy-back hashes the target again and skips every file whose three still match. A session
+that edits two files in a 5,000-file tree copies two files back, plus the files it created, and
+deletes the ones it removed. A file changed and then put back byte for byte counts as unchanged;
+a mode change counts. Files published by an earlier copy-back pass (`copy_back="after_step"`) are
+copied on every later pass rather than compared. The comparison needs a target with
+`capture_content_manifest` (`RunnerWorkspace`, and so the Docker, Lambda MicroVM and brokered
+sandbox targets) and a finite `max_total_bytes`. When the target can't hash its files, a hash fails
+(for example a manifest larger than the listing limit), or the copy-back is a crash recovery, every
+target file is copied back as before. `copy_back_scope="all"` asks for that every time. The final
+snapshot reports `copy_back_scope` (`changed` or `all`, what was done) and `unchanged_files`. With
+`source_conflict_policy="overwrite"`, a skipped file keeps whatever the source holds, so a change
+made to it outside the run is no longer overwritten by the copy taken at bind.
+
 Those per-binding limits are independent of the process-wide staging governor. By default, all
 `SyncBinding` instances share a governor with 16 transfer slots and 4 GiB of byte-weighted
 working-set capacity. Archives spool to temporary files; the capacity also bounds the one file a

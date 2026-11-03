@@ -749,6 +749,34 @@ def test_factory_release_and_binding_destroy_the_sandbox(tmp_path: Path) -> None
     assert broker.live() == []
 
 
+def test_copy_back_reads_only_the_files_the_session_changed(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        result = await _factory(broker, source).create(_request())
+        binding = result.environment.binding
+        bound = await binding.bind(
+            result.environment.workspace,
+            result.environment.runner,
+            session_id="coding",
+            agent_name="coder",
+            environment_name="sandbox",
+        )
+        await bound.workspace.write_bytes("calc.py", b"def add(a, b):\n    return a + b\n")
+        return await binding.finalize(bound, outcome="completed")
+
+    snapshot = asyncio.run(scenario())
+    assert snapshot is not None
+    assert snapshot.metadata["copy_back_scope"] == "changed"
+    assert snapshot.metadata["copied_files"] == 1
+    assert snapshot.metadata["unchanged_files"] >= 1
+    assert (source / "calc.py").read_bytes() == b"def add(a, b):\n    return a + b\n"
+    assert os.access(source / "run.sh", os.X_OK)
+    assert broker.archive_gets == 1
+    assert broker.live() == []
+
+
 def test_the_factory_gives_each_session_its_knowledge_store_and_scope(tmp_path: Path) -> None:
     source = _project(tmp_path)
     broker = FakeBroker(tmp_path / "cloud")

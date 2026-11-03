@@ -66,6 +66,7 @@ from cayu.environments.bindings import (
     MAX_WORKSPACE_TRANSFER_TOTAL_BYTES,
     BoundWorkspace,
     SyncBinding,
+    SyncCopyBackScope,
     WorkspaceSnapshot,
     _should_sync_back,
 )
@@ -439,6 +440,7 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         workspace_repository: str | None = None,
         workspace_setup_commands: Sequence[str] = (),
         setup_command_timeout_s: int = DEFAULT_DOCKER_CODING_SETUP_COMMAND_TIMEOUT_SECONDS,
+        copy_back_scope: SyncCopyBackScope = "changed",
     ) -> None:
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
@@ -502,6 +504,7 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             source_conflict_policy="require_revision",
             preserve_git_modes=True,
             staging_capacity=staging_capacity,
+            copy_back_scope=copy_back_scope,
         )
 
     async def observe_revision(self, bound: BoundWorkspace) -> WorkspaceRevisionObservation:

@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import io
 import json
+import logging
 import ntpath
 import shutil
 import tarfile
@@ -73,6 +74,7 @@ from cayu.workspaces import (
     WorkspaceWriterIsolationEvidence,
 )
 from cayu.workspaces._tar import tar_archive_size_bound
+from cayu.workspaces.base import WorkspaceContentManifest
 from cayu.workspaces.revisions import (
     observe_deterministic_workspace,
     unsupported_workspace_revision,
@@ -194,6 +196,12 @@ class _SyncBindingState:
     phase: Literal["active", "finalizing"] = "active"
     defer_finalize_release: bool = False
     recovered: bool = False
+    # The target's content for source paths it still holds as copied in (or as
+    # last published), measured in the target. A path is skipped at copy-back
+    # only while its entry here matches the target, and an entry is dropped
+    # before the path is published or deleted, so the map never names content
+    # the source might not hold. None copies back every target path.
+    target_digests: dict[str, _SyncTargetDigest] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +292,8 @@ SYNC_FINAL_METADATA_KEYS = frozenset(
         "copied_files",
         "copied_bytes",
         "deleted_files",
+        "unchanged_files",
+        "copy_back_scope",
     }
 )
 
@@ -320,6 +330,9 @@ SyncTargetWorkspacePlanFactory = Callable[
 SyncTargetCleanPolicy = Literal["always", "never"]
 SyncBackPolicy = Literal["always", "on_success", "never"]
 SyncSourceConflictPolicy = Literal["overwrite", "require_revision"]
+SyncCopyBackScope = Literal["changed", "all"]
+# What one target file held when last compared: SHA-256, size and Git mode.
+_SyncTargetDigest = tuple[str, int, str]
 
 
 class SyncBindingSourceConflictError(RuntimeError):
@@ -369,6 +382,8 @@ _GIT_OBSERVATION_ENV_REMOVE = (
 )
 
 SYNC_DISTINCT_WORKSPACES_ERROR = "SyncBinding source and target workspaces must be different."
+
+_LOGGER = logging.getLogger(__name__)
 
 _MutationResultT = TypeVar("_MutationResultT")
 
@@ -1512,6 +1527,20 @@ class SyncBinding(WorkspaceBinding):
     outcomes persist a bounded private copy of the generation state before
     finalization so incomplete-session recovery can reconnect the same target
     and retry revision-aware copy-back without repeating bind or workload work.
+
+    ``copy_back_scope="changed"`` (the default) publishes only what the run changed.
+    Right after copy-in, the binding records each copied file's SHA-256, size
+    and Git mode as the target measures them; copy-back measures the target
+    again and skips a file whose three still match, so moving a large tree in
+    and two edited files out sends two files back. Created files are always
+    copied, and missing files are deleted as before. It needs a target that
+    hashes its own files (``capture_content_manifest``, as ``RunnerWorkspace``
+    does) and finite ``max_total_bytes``; without them, when either
+    measurement fails, or for a copy-back recovered after a crash, every
+    target file is copied back as with ``copy_back_scope="all"``. A skipped file is
+    left as the source holds it, so with ``source_conflict_policy="overwrite"``
+    a change made to it in the source during the run is kept rather than
+    overwritten by the copy made at bind.
     """
 
     def __init__(
@@ -1532,6 +1561,7 @@ class SyncBinding(WorkspaceBinding):
         source_conflict_policy: SyncSourceConflictPolicy = "overwrite",
         preserve_git_modes: bool = False,
         staging_capacity: SyncBindingStagingCapacity | None = None,
+        copy_back_scope: SyncCopyBackScope = "changed",
     ) -> None:
         if target_workspace is not None and not isinstance(target_workspace, Workspace):
             raise TypeError("SyncBinding target_workspace must be a Workspace or None.")
@@ -1577,6 +1607,9 @@ class SyncBinding(WorkspaceBinding):
         if type(preserve_git_modes) is not bool:
             raise TypeError("SyncBinding preserve_git_modes must be a bool.")
         self.preserve_git_modes = preserve_git_modes
+        if copy_back_scope not in ("changed", "all"):
+            raise ValueError("SyncBinding copy_back_scope must be 'changed' or 'all'.")
+        self.copy_back_scope: SyncCopyBackScope = copy_back_scope
         if staging_capacity is not None and not isinstance(
             staging_capacity, SyncBindingStagingCapacity
         ):
@@ -2033,6 +2066,23 @@ class SyncBinding(WorkspaceBinding):
                     )
             finally:
                 staging_transfer.release()
+            # Measure what copy-in left in the target, before any tool or setup
+            # command runs, so copy-back can tell the run's changes apart.
+            target_digests: dict[str, _SyncTargetDigest] | None = None
+            if self.copy_back_scope == "changed" and self.sync_back != "never":
+                target_digests = {}
+                if source_paths:
+                    await _report_sync_lifecycle(
+                        EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+                        EnvironmentLifecycleProgressStatus.STARTED,
+                    )
+                    target_digests = await self._capture_target_digests(target, source_paths)
+                    await _report_sync_lifecycle(
+                        EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+                        EnvironmentLifecycleProgressStatus.COMPLETED,
+                        items_completed=0 if target_digests is None else len(target_digests),
+                        items_total=len(source_paths),
+                    )
             bind_metadata = {
                 **request_metadata,
                 "sync_binding": {
@@ -2051,6 +2101,7 @@ class SyncBinding(WorkspaceBinding):
                     "delete_missing": self.delete_missing,
                     "source_conflict_policy": self.source_conflict_policy,
                     "preserve_git_modes": self.preserve_git_modes,
+                    "copy_back_scope": self.copy_back_scope,
                     "copied_files": len(source_paths),
                     "copied_bytes": copied_bytes,
                     "cleaned_target_files": len(cleaned_paths),
@@ -2087,6 +2138,7 @@ class SyncBinding(WorkspaceBinding):
                     source_resource_key=source_resource_key,
                     target_id=target.id,
                     target_resource_key=target_resource_key,
+                    target_digests=target_digests,
                 ),
             )
             return bound
@@ -2238,20 +2290,28 @@ class SyncBinding(WorkspaceBinding):
                 limit=self.max_files,
                 role="target",
             )
+            copy_back_paths = _sync_back_paths(
+                source_paths=state.source_paths,
+                target_baseline_paths=state.target_baseline_paths,
+                target_paths=target_paths,
+            )
+            copy_back_paths, unchanged_files, changes_only = await self._changed_copy_back_paths(
+                bound.workspace,
+                state,
+                copy_back_paths,
+            )
             await _report_sync_lifecycle(
                 EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
                 EnvironmentLifecycleProgressStatus.COMPLETED,
                 items_completed=len(target_paths),
                 items_total=len(target_paths),
             )
-            copy_back_paths = _sync_back_paths(
-                source_paths=state.source_paths,
-                target_baseline_paths=state.target_baseline_paths,
-                target_paths=target_paths,
-            )
             deleted_paths: tuple[str, ...] = ()
             if self.delete_missing:
                 deleted_paths = tuple(sorted(set(state.source_paths) - set(target_paths)))
+            # Whatever this pass publishes or deletes stops matching what the
+            # target measured, whether or not the pass completes.
+            self._forget_target_digests(state_key, (*copy_back_paths, *deleted_paths))
             if self.source_conflict_policy == "require_revision":
                 copied_bytes, source_revisions = await self._copy_back_with_revisions(
                     state_key=state_key,
@@ -2316,6 +2376,8 @@ class SyncBinding(WorkspaceBinding):
                     "copied_files": len(copy_back_paths),
                     "copied_bytes": copied_bytes,
                     "deleted_files": len(deleted_paths),
+                    "unchanged_files": unchanged_files,
+                    "copy_back_scope": "changed" if changes_only else "all",
                 },
             )
         except BaseException:
@@ -2331,6 +2393,80 @@ class SyncBinding(WorkspaceBinding):
             source_revisions=source_revisions,
         )
         return final_snapshot
+
+    async def _capture_target_digests(
+        self,
+        target: Workspace,
+        paths: tuple[str, ...],
+    ) -> dict[str, _SyncTargetDigest] | None:
+        """Measure ``paths`` in the target, or return None to copy back everything.
+
+        The target hashes its whole guarded tree in place, so no file content
+        leaves it. Any failure only costs the optimization.
+        """
+
+        capture = getattr(target, "capture_content_manifest", None)
+        max_total_bytes = self.max_total_bytes
+        if not callable(capture) or max_total_bytes is None:
+            return None
+        max_file_bytes = (
+            max_total_bytes
+            if self.max_file_bytes is None
+            else min(self.max_file_bytes, max_total_bytes)
+        )
+        try:
+            manifest = await capture(
+                max_paths=self.max_files,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=max_total_bytes,
+            )
+        except Exception as error:
+            _LOGGER.info(
+                "SyncBinding could not measure target workspace %s (%s); copy-back copies "
+                "every file.",
+                target.id,
+                type(error).__name__,
+            )
+            return None
+        if type(manifest) is not WorkspaceContentManifest:
+            return None
+        wanted = frozenset(paths)
+        return {
+            path: (digest, size, mode)
+            for path, digest, size, mode in manifest.entries
+            if path in wanted
+        }
+
+    async def _changed_copy_back_paths(
+        self,
+        target: Workspace,
+        state: _SyncBindingState,
+        copy_back_paths: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], int, bool]:
+        """Drop source paths the target still holds as last measured.
+
+        Returns the paths to copy, how many were skipped, and whether the
+        target was compared at all.
+        """
+
+        baseline = state.target_digests
+        if baseline is None:
+            return copy_back_paths, 0, False
+        source_paths = frozenset(state.source_paths)
+        candidates = tuple(
+            path for path in copy_back_paths if path in source_paths and path in baseline
+        )
+        if not candidates:
+            return copy_back_paths, 0, True
+        current = await self._capture_target_digests(target, candidates)
+        if current is None:
+            return copy_back_paths, 0, False
+        unchanged = frozenset(path for path in candidates if current.get(path) == baseline[path])
+        return (
+            tuple(path for path in copy_back_paths if path not in unchanged),
+            len(unchanged),
+            True,
+        )
 
     async def _copy_back_with_revisions(
         self,
@@ -3011,6 +3147,23 @@ class SyncBinding(WorkspaceBinding):
             state = self._states.get(state_key)
             if state is not None and state.phase == "finalizing":
                 self._states[state_key] = replace(state, phase="active")
+
+    def _forget_target_digests(self, state_key: str, paths: tuple[str, ...]) -> None:
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is None or state.phase != "finalizing":
+                raise RuntimeError("SyncBinding copy-back lost its ownership state.")
+            if state.target_digests is None or not paths:
+                return
+            forgotten = frozenset(paths)
+            self._states[state_key] = replace(
+                state,
+                target_digests={
+                    path: digest
+                    for path, digest in state.target_digests.items()
+                    if path not in forgotten
+                },
+            )
 
     def _update_conflict_state(
         self,
