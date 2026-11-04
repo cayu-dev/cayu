@@ -184,6 +184,7 @@ class CapturedRequest(BaseModel):
 class CapturedResponse(BaseModel):
     """The provider response returned to the sandbox after scrubbing.
 
+    Header strings represent wire octets decoded as Latin-1, not Unicode text.
     Repeated Set-Cookie values belong in ``set_cookie_headers``, in wire order,
     not a comma-joined mapping value. A single Set-Cookie in ``headers`` is also
     supported and precedes the separate values when both are supplied.
@@ -1304,6 +1305,9 @@ class HttpxUpstream:
                         raise _UpstreamResponseTooLargeError(
                             "Upstream response exceeded the configured byte limit."
                         )
+            # Match the proxy's Latin-1 serialization rather than HTTPX's
+            # automatic UTF-8 decoding, preserving the origin's header octets.
+            response.headers.encoding = "latin-1"
             head = CapturedResponse(
                 status_code=response.status_code,
                 headers=_identity_response_headers(
@@ -3002,7 +3006,10 @@ def _scrub_response(
     if not secrets:
         return response.model_copy(update={"headers": headers, "set_cookie_headers": cookies})
 
-    redactor = SecretRedactor(secrets)
+    # Header values preserve wire bytes through Latin-1, including UTF-8 secrets.
+    redactor = SecretRedactor(
+        (*secrets, *(secret.encode("utf-8").decode("latin-1") for secret in secrets))
+    )
     redacted_headers = {key: redactor.redact_text(value) for key, value in headers.items()}
     redacted_cookies = _validated_set_cookie_headers(
         tuple(redactor.redact_text(value) for value in cookies)
