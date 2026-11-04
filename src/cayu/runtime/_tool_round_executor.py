@@ -1889,6 +1889,13 @@ class ToolRoundRun:
                     restore_cancellation_requests=restore_cancellation_requests,
                     minimum_cancellation_requests=minimum_cancellation_requests,
                 )
+            finally:
+                if isinstance(interrupt, BaseExceptionGroup):
+                    # Closure may need private evidence, but it must never leave
+                    # on public group leaves, including when publication fails.
+                    for candidate in iter_exception_tree(interrupt):
+                        if isinstance(candidate, asyncio.CancelledError):
+                            invocation_secrets.sanitize_external_cancellation(candidate)
             for event in interruption_events:
                 yield event
             if isinstance(interrupt, asyncio.CancelledError):
@@ -2432,6 +2439,17 @@ class ToolRoundRun:
                         ),
                         caller_cancelled=True,
                     )
+                # Sanitization replaces cancellation leaves. Retain the round's
+                # authenticated per-call evidence on one final leaf so closure
+                # can recover it without attributing cleanup to siblings.
+                for candidate in iter_exception_tree(current_cancellation_failure):
+                    if isinstance(candidate, asyncio.CancelledError):
+                        _transfer_cancellation_evidence(
+                            candidate,
+                            cancellation_sources,
+                            tool_calls=tool_calls,
+                        )
+                        break
             else:
                 parallel_failure = _parallel_tool_round_exception(exc_group)
                 if child_runner_failures:
