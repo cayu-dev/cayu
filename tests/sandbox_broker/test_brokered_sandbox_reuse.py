@@ -71,7 +71,13 @@ async def _session(
     result = await factory.create(_request(session_id, **request_options))
     bound = await _bind(result, session_id)
     if work is not None:
-        await work(bound)
+        try:
+            await work(bound)
+        except BaseException:
+            # Free the sandbox's workspace for the tests that follow.
+            result.environment.binding.abandon(bound)
+            await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+            raise
     await result.environment.binding.finalize(bound, outcome=outcome)
     return result, bound
 
@@ -503,4 +509,146 @@ def test_detach_refuses_while_a_cancelled_command_is_settling(tmp_path: Path) ->
         await result.release(EnvironmentFactoryReleaseAction.DISCARD)
 
     asyncio.run(scenario())
+    assert broker.live() == []
+
+
+# Delta copy-in ----------------------------------------------------------------
+
+
+def _uploads(broker: FakeBroker) -> int:
+    return len([call for call in broker.calls if call[0] == "PUT"])
+
+
+def test_a_reused_sandbox_receives_only_the_files_that_changed(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    (source / "pkg").mkdir()
+    for index in range(20):
+        (source / "pkg" / f"m{index}.py").write_text(f"VALUE = {index}\n")
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def edit(bound) -> None:
+        await bound.workspace.write_bytes("pkg/m1.py", b"VALUE = 'session'\n")
+
+    async def scenario():
+        factory = _factory(broker, source)
+        _, first = await _session(factory, "one", work=edit)
+        uploads = _uploads(broker)
+        # Copy-back published m1.py, so the sandbox holds it as the source now does.
+        (source / "pkg" / "m2.py").write_text("VALUE = 'outside'\n")
+        second = await factory.create(_request("two"))
+        bound = await _bind(second, "two")
+        content = (await bound.workspace.read_bytes("pkg/m2.py")).content
+        await second.environment.binding.finalize(bound, outcome="completed")
+        await factory.close_idle_resources()
+        return first, bound, uploads, content
+
+    first, bound, uploads, content = asyncio.run(scenario())
+    assert "copy_in_scope" not in first.metadata["sync_binding"]
+    sync = bound.metadata["sync_binding"]
+    assert (sync["copy_in_scope"], sync["transferred_files"]) == ("changed", 1)
+    assert sync["unchanged_files"] == 21
+    assert sync["copied_files"] == 22
+    assert content == b"VALUE = 'outside'\n"
+    assert _uploads(broker) == uploads + 1
+    assert broker.live() == []
+
+
+def test_a_reset_recopies_kept_files_a_session_tampered_with(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    (source / "pkg").mkdir()
+    (source / "pkg" / "a.py").write_text("A = 1\n")
+    (source / "pkg" / "b.py").write_text("B = 1\n")
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def tamper(bound) -> None:
+        await _shell(
+            bound.runner,
+            # A read-only file, a second link to another, and a directory swapped for a
+            # symlink to an identical copy outside the workspace.
+            "chmod 0444 calc.py && ln run.sh ../run-link-$$ && cp -r pkg ../pkg-copy-$$"
+            " && rm -rf pkg && ln -s ../pkg-copy-$$ pkg"
+            # A module that would shadow the reset's own imports.
+            " && : > json.py",
+        )
+
+    async def scenario():
+        factory = _factory(broker, source)
+        await _session(factory, "one", outcome="failed", work=tamper)
+        second = await factory.create(_request("two"))
+        bound = await _bind(second, "two")
+        await _shell(bound.runner, "test ! -e json.py")
+        listing = await _shell(
+            bound.runner,
+            "python3 -c 'import os, stat, sys\n"
+            "for p in sys.argv[1:]:\n"
+            "    i = os.lstat(p)\n"
+            "    d = stat.S_ISDIR(i.st_mode)\n"
+            "    print(p, oct(i.st_mode & 0o777)[2:], 0 if d else i.st_nlink)'"
+            " calc.py run.sh pkg pkg/a.py pkg/b.py",
+        )
+        await bound.workspace.write_bytes("calc.py", b"writable\n")
+        await second.environment.binding.finalize(bound, outcome="failed")
+        await factory.close_idle_resources()
+        return bound, listing
+
+    bound, listing = asyncio.run(scenario())
+    assert listing.splitlines() == [
+        "calc.py 644 1",
+        "run.sh 755 1",
+        "pkg 755 0",
+        "pkg/a.py 644 1",
+        "pkg/b.py 644 1",
+    ]
+    # Whatever the target could still vouch for was kept, and everything else crossed.
+    sync = bound.metadata["sync_binding"]
+    assert sync["unchanged_files"] + sync["transferred_files"] == 4
+    assert sync["transferred_files"] >= 3
+
+
+def test_a_kept_file_gets_back_the_permissions_copy_in_gives_it(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        factory = _factory(broker, source)
+        await _session(
+            factory,
+            "one",
+            outcome="failed",
+            work=lambda bound: _shell(bound.runner, "chmod 0444 calc.py && chmod 0700 run.sh"),
+        )
+        _, bound = await _session(
+            factory,
+            "two",
+            work=lambda bound: bound.workspace.write_bytes("calc.py", b"writable\n"),
+        )
+        await factory.close_idle_resources()
+        return bound
+
+    sync = asyncio.run(scenario()).metadata["sync_binding"]
+    assert (sync["unchanged_files"], sync["transferred_files"]) == (2, 0)
+    assert (source / "calc.py").read_bytes() == b"writable\n"
+    assert broker.live() == []
+
+
+def test_kept_paths_too_many_for_one_command_are_all_copied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cayu.sandbox_broker import coding
+
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    monkeypatch.setattr(
+        coding, "MAX_COMMAND_STDIN_BYTES", coding._WORKSPACE_RESET_STDIN_MARGIN_BYTES
+    )
+
+    async def scenario():
+        factory = _factory(broker, source)
+        await _session(factory, "one")
+        _, bound = await _session(factory, "two")
+        await factory.close_idle_resources()
+        return bound
+
+    sync = asyncio.run(scenario()).metadata["sync_binding"]
+    assert (sync["transferred_files"], sync["unchanged_files"]) == (2, 0)
     assert broker.live() == []

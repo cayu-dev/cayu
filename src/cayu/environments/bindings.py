@@ -223,6 +223,8 @@ class _SyncSourceObservation:
     content_sha256: str
     logical_bytes: int
     largest_file_bytes: int = 0
+    # Each file's SHA-256, size and Git mode, in the order of ``revisions``.
+    contents: tuple[tuple[str, int, WorkspaceGitMode | None], ...] = ()
 
     @property
     def sizes(self) -> _SyncTransferSizes:
@@ -336,6 +338,7 @@ SyncTargetCleanPolicy = Literal["always", "never"]
 SyncBackPolicy = Literal["always", "on_success", "never"]
 SyncSourceConflictPolicy = Literal["overwrite", "require_revision"]
 SyncCopyBackScope = Literal["changed", "all"]
+SyncCopyInScope = Literal["changed", "all"]
 # What one target file held when last compared: SHA-256, size and Git mode.
 _SyncTargetDigest = tuple[str, int, str]
 
@@ -1546,6 +1549,17 @@ class SyncBinding(WorkspaceBinding):
     left as the source holds it, so with ``source_conflict_policy="overwrite"``
     a change made to it in the source during the run is kept rather than
     overwritten by the copy made at bind.
+
+    ``copy_in_scope="changed"`` mirrors that for copy-in, for a target that
+    keeps its files between binds (a reused sandbox). Before copying, the
+    binding measures the target as copy-back does and skips each source file
+    the target already holds with the same SHA-256, size and Git mode; with
+    ``clean_target="always"`` the clean then removes everything else and
+    keeps those. So the target ends up holding exactly the source, but only
+    files that differ cross. It needs ``source_conflict_policy="require_revision"``
+    (whose observation hashes the source) and ``preserve_git_modes=True``.
+    When the target can't measure itself, or the measurement fails, every
+    file is copied as with ``copy_in_scope="all"`` (the default).
     """
 
     def __init__(
@@ -1567,6 +1581,7 @@ class SyncBinding(WorkspaceBinding):
         preserve_git_modes: bool = False,
         staging_capacity: SyncBindingStagingCapacity | None = None,
         copy_back_scope: SyncCopyBackScope = "changed",
+        copy_in_scope: SyncCopyInScope = "all",
     ) -> None:
         if target_workspace is not None and not isinstance(target_workspace, Workspace):
             raise TypeError("SyncBinding target_workspace must be a Workspace or None.")
@@ -1615,6 +1630,16 @@ class SyncBinding(WorkspaceBinding):
         if copy_back_scope not in ("changed", "all"):
             raise ValueError("SyncBinding copy_back_scope must be 'changed' or 'all'.")
         self.copy_back_scope: SyncCopyBackScope = copy_back_scope
+        if copy_in_scope not in ("changed", "all"):
+            raise ValueError("SyncBinding copy_in_scope must be 'changed' or 'all'.")
+        if copy_in_scope == "changed" and (
+            source_conflict_policy != "require_revision" or not preserve_git_modes
+        ):
+            raise ValueError(
+                "SyncBinding copy_in_scope='changed' requires "
+                "source_conflict_policy='require_revision' and preserve_git_modes=True."
+            )
+        self.copy_in_scope: SyncCopyInScope = copy_in_scope
         if staging_capacity is not None and not isinstance(
             staging_capacity, SyncBindingStagingCapacity
         ):
@@ -1984,19 +2009,29 @@ class SyncBinding(WorkspaceBinding):
                     requires_source_observation=source_observation is not None,
                     observed=observed_sizes,
                 )
-                cleaned_paths: tuple[str, ...] = ()
+                # Source files the target already holds as the source does, and
+                # what the target measured them as.
+                unchanged: frozenset[str] = frozenset()
+                held: dict[str, _SyncTargetDigest] | None = None
+                if self.copy_in_scope == "changed" and source_observation is not None:
+                    unchanged, held = await self._unchanged_target_paths(
+                        target, source_paths, source_observation
+                    )
+                cleaned_files = 0
                 if self.clean_target == "always":
                     await _report_sync_lifecycle(
                         EnvironmentLifecyclePhase.TARGET_MATERIALIZATION,
                         EnvironmentLifecycleProgressStatus.STARTED,
                     )
-                    cleaned_paths = await _clear_workspace(target, max_files=self.max_files)
+                    cleaned_files, unchanged = await self._clean_target(
+                        target, runner=runner, keep=unchanged
+                    )
                     target_baseline_paths: tuple[str, ...] = ()
                     await _report_sync_lifecycle(
                         EnvironmentLifecyclePhase.TARGET_MATERIALIZATION,
                         EnvironmentLifecycleProgressStatus.COMPLETED,
-                        items_completed=len(cleaned_paths),
-                        items_total=len(cleaned_paths),
+                        items_completed=cleaned_files,
+                        items_total=cleaned_files,
                     )
                 else:
                     await _report_sync_lifecycle(
@@ -2023,10 +2058,11 @@ class SyncBinding(WorkspaceBinding):
                     bytes_completed=0,
                     bytes_total=self.max_total_bytes,
                 )
-                copied_bytes = await _copy_paths(
+                transfer_paths = tuple(path for path in source_paths if path not in unchanged)
+                transferred_bytes = await _copy_paths(
                     source=workspace,
                     target=target,
-                    paths=source_paths,
+                    paths=transfer_paths,
                     max_file_bytes=self.max_file_bytes,
                     max_total_bytes=self.max_total_bytes,
                     max_archive_bytes=self.max_archive_bytes,
@@ -2034,11 +2070,17 @@ class SyncBinding(WorkspaceBinding):
                     staging_capacity=self.staging_capacity,
                     source_observation=source_observation,
                     archive_policy=self._archive_policy(
-                        source_paths,
+                        transfer_paths,
                         source=workspace,
                         target=target,
                     ),
                     observed=observed_sizes,
+                )
+                # The target holds the whole source either way.
+                copied_bytes = (
+                    transferred_bytes
+                    if not unchanged or source_observation is None
+                    else source_observation.logical_bytes
                 )
                 await _report_sync_lifecycle(
                     EnvironmentLifecyclePhase.TRANSFER,
@@ -2076,7 +2118,10 @@ class SyncBinding(WorkspaceBinding):
             target_digests: dict[str, _SyncTargetDigest] | None = None
             if self.copy_back_scope == "changed" and self.sync_back != "never":
                 target_digests = {}
-                if source_paths:
+                if held is not None and not transfer_paths:
+                    # Nothing crossed, so the target holds what it measured before copy-in.
+                    target_digests = held
+                elif source_paths:
                     await _report_sync_lifecycle(
                         EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
                         EnvironmentLifecycleProgressStatus.STARTED,
@@ -2109,7 +2154,17 @@ class SyncBinding(WorkspaceBinding):
                     "copy_back_scope": self.copy_back_scope,
                     "copied_files": len(source_paths),
                     "copied_bytes": copied_bytes,
-                    "cleaned_target_files": len(cleaned_paths),
+                    "cleaned_target_files": cleaned_files,
+                    **(
+                        {}
+                        if self.copy_in_scope == "all"
+                        else {
+                            "copy_in_scope": self.copy_in_scope,
+                            "unchanged_files": len(unchanged),
+                            "transferred_files": len(transfer_paths),
+                            "transferred_bytes": transferred_bytes,
+                        }
+                    ),
                 },
             }
             if _should_sync_back(self.sync_back, "completed"):
@@ -2399,6 +2454,57 @@ class SyncBinding(WorkspaceBinding):
         )
         return final_snapshot
 
+    async def _unchanged_target_paths(
+        self,
+        target: Workspace,
+        source_paths: tuple[str, ...],
+        observation: _SyncSourceObservation,
+    ) -> tuple[frozenset[str], dict[str, _SyncTargetDigest] | None]:
+        """Source paths the target holds with the source's SHA-256, size and Git mode.
+
+        Also returns what the target measured, or ``None`` when it couldn't.
+        """
+
+        if not source_paths:
+            return frozenset(), None
+        await _report_sync_lifecycle(
+            EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+            EnvironmentLifecycleProgressStatus.STARTED,
+        )
+        held = await self._capture_target_digests(target, source_paths)
+        unchanged = frozenset(
+            ()
+            if held is None
+            else (
+                revision.path
+                for revision, (digest, size, mode) in zip(
+                    observation.revisions, observation.contents, strict=True
+                )
+                if held.get(revision.path) == (digest, size, mode)
+            )
+        )
+        await _report_sync_lifecycle(
+            EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
+            EnvironmentLifecycleProgressStatus.COMPLETED,
+            items_completed=len(unchanged),
+            items_total=len(source_paths),
+        )
+        return unchanged, held
+
+    async def _clean_target(
+        self, target: Workspace, *, runner: Runner | None, keep: frozenset[str]
+    ) -> tuple[int, frozenset[str]]:
+        """Remove every target file but ``keep`` before copy-in (``clean_target="always"``).
+
+        ``runner`` is the bind's. Returns how many files went and which were
+        kept; copy-in skips the kept ones. A subclass with a faster way to
+        clean the target may keep fewer than asked, never more.
+        """
+
+        del runner
+        removed = await _clear_workspace(target, max_files=self.max_files, keep=keep)
+        return len(removed), keep
+
     async def _capture_target_digests(
         self,
         target: Workspace,
@@ -2427,8 +2533,7 @@ class SyncBinding(WorkspaceBinding):
             )
         except Exception as error:
             _LOGGER.info(
-                "SyncBinding could not measure target workspace %s (%s); copy-back copies "
-                "every file.",
+                "SyncBinding could not measure target workspace %s (%s); every file is copied.",
                 target.id,
                 type(error).__name__,
             )
@@ -3485,6 +3590,7 @@ async def _capture_sync_source_revisions(
         content_sha256=hashlib.sha256(encoded).hexdigest(),
         logical_bytes=observed_bytes,
         largest_file_bytes=max((entry[2] for entry in manifest), default=0),
+        contents=tuple((digest, size, mode) for _, digest, size, mode in manifest),
     )
 
 
@@ -3613,8 +3719,11 @@ async def _list_workspace_paths(
     return tuple(result.paths)
 
 
-async def _clear_workspace(workspace: Workspace, *, max_files: int) -> tuple[str, ...]:
-    paths = await _list_workspace_paths(workspace, "**/*", limit=max_files, role="target")
+async def _clear_workspace(
+    workspace: Workspace, *, max_files: int, keep: frozenset[str] = frozenset()
+) -> tuple[str, ...]:
+    listed = await _list_workspace_paths(workspace, "**/*", limit=max_files, role="target")
+    paths = tuple(path for path in listed if path not in keep)
     for path in paths:
         await _await_sync_mutation(
             lambda path=path: workspace.delete(path),

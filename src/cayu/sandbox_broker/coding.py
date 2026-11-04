@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -84,6 +85,7 @@ from cayu.runners.base import Runner
 from cayu.runtime._task_lease_authority import current_task_id
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sandbox_broker.client import (
+    MAX_COMMAND_STDIN_BYTES,
     SandboxBrokerClient,
     SandboxBrokerError,
     SandboxEgressMode,
@@ -167,13 +169,65 @@ _MAX_USER_LABELS = 10 - len(_FACTORY_LABEL_KEYS)
 _TOOLCHAIN_WORKSPACE = "/workspace"
 #: How long clearing a reused sandbox's workspace may take.
 _WORKSPACE_RESET_TIMEOUT_SECONDS = 300
-# Empties the workspace, protected and excluded directories included, even where
-# a session took away permissions.
-_WORKSPACE_RESET_SCRIPT = (
-    "chmod -R u+rwx . 2>/dev/null; "
-    "find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && "
-    '[ -z "$(ls -A)" ]'
-)
+# Room for the JSON around the kept paths in one command's stdin.
+_WORKSPACE_RESET_STDIN_MARGIN_BYTES = 4096
+# Run in the workspace with the kept paths as a JSON list on stdin. It removes
+# everything else, protected and excluded directories included, even where a
+# session took away write permission. A kept file stays only as a regular file
+# with one link, its permissions set as copy-in sets them.
+_WORKSPACE_RESET_PROGRAM = r"""
+import json, os, shutil, stat, sys
+
+keep = set(json.load(sys.stdin))
+parents = set()
+for path in keep:
+    while "/" in path:
+        path = path.rsplit("/", 1)[0]
+        parents.add(path)
+removed = kept = 0
+
+
+def remove_tree(path):
+    count = 0
+    os.chmod(path, 0o700)
+    for root, names, files in os.walk(path):
+        for name in names:
+            child = os.path.join(root, name)
+            if not os.path.islink(child):
+                os.chmod(child, 0o700)
+        count += len(files)
+    shutil.rmtree(path)
+    return count
+
+
+def clear(directory):
+    global removed, kept
+    try:
+        os.chmod(directory or ".", 0o755)
+    except OSError:
+        if directory:
+            raise
+    with os.scandir(directory or ".") as entries:
+        found = list(entries)
+    for entry in found:
+        path = f"{directory}/{entry.name}" if directory else entry.name
+        info = entry.stat(follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            if path in parents:
+                clear(path)
+            else:
+                removed += remove_tree(path)
+        elif stat.S_ISREG(info.st_mode) and path in keep and info.st_nlink == 1:
+            os.chmod(path, 0o755 if info.st_mode & 0o111 else 0o644)
+            kept += 1
+        else:
+            os.unlink(path)
+            removed += 1
+
+
+clear("")
+print(json.dumps({"removed": removed, "kept": kept}))
+"""
 _T = TypeVar("_T")
 
 
@@ -191,9 +245,11 @@ class BrokeredSandboxReuse:
     ``min_lifetime_seconds`` (at least 300, the workspace reset's timeout)
     left before the broker's maximum lifetime isn't reused.
 
-    Before copy-in, a reused sandbox's ``/workspace`` is emptied, protected and
-    excluded directories included, so a session never sees what an earlier
-    one wrote there. Everything outside ``/workspace`` stays: what
+    Before copy-in, a reused sandbox's ``/workspace`` is reset to the source:
+    everything is removed, protected and excluded directories included, but
+    the files it already holds as the source does, and only the rest is
+    copied in. So a session never sees what an earlier one wrote there.
+    Everything outside ``/workspace`` stays: what
     ``setup_commands`` installed (they run once per sandbox), and anything a
     session wrote elsewhere, and a process a session left running in the
     background, which may still write into the workspace. So reuse suits
@@ -250,6 +306,12 @@ class BrokeredSandboxCodingBinding(SyncBinding):
     finalization succeeds, in place of closing it, which destroys the sandbox;
     the factory's ``reuse`` passes one that keeps the sandbox for its next
     session.
+
+    ``reset_sandbox_workspace`` (which the factory sets on a reused sandbox)
+    makes the clean before copy-in empty the sandbox's workspace in one
+    command, protected and excluded directories included, except the files
+    that ``copy_in_scope="changed"`` found it already holds as the source
+    does; copy-in then sends only the rest.
     """
 
     def __init__(
@@ -260,16 +322,20 @@ class BrokeredSandboxCodingBinding(SyncBinding):
         setup_command_timeout_s: int = DEFAULT_BROKERED_SETUP_COMMAND_TIMEOUT_SECONDS,
         workspace_repository: str | None = None,
         release_sandbox: Callable[[BrokeredSandboxRunner], Awaitable[None]] | None = None,
+        reset_sandbox_workspace: bool = False,
         **options: Any,
     ) -> None:
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
+        if type(reset_sandbox_workspace) is not bool:
+            raise TypeError("reset_sandbox_workspace must be a bool.")
         if release_sandbox is not None and not callable(release_sandbox):
             raise TypeError("release_sandbox must be callable or None.")
         self._setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
         super().__init__(**options)
         self._git_baseline = git_baseline
         self._release_sandbox = release_sandbox
+        self._reset_sandbox_workspace = reset_sandbox_workspace
         self._workspace_repository = (
             None if workspace_repository is None else _source_name(workspace_repository)
         )
@@ -351,6 +417,21 @@ class BrokeredSandboxCodingBinding(SyncBinding):
                 "on the bound sandbox runner that excludes .git."
             )
         return target, provision
+
+    async def _clean_target(
+        self, target: Workspace, *, runner: Runner | None, keep: frozenset[str]
+    ) -> tuple[int, frozenset[str]]:
+        if not (
+            self._reset_sandbox_workspace
+            and isinstance(runner, BrokeredSandboxRunner)
+            and isinstance(target, RunnerWorkspace)
+            and target.is_bound_to_runner(runner)
+        ):
+            return await super()._clean_target(target, runner=runner, keep=keep)
+        with environment_phase_step("sandbox_reset"):
+            return await _reset_sandbox_workspace(
+                runner, target.runner_cwd, keep, python=target.python_executable
+            )
 
     async def finalize(
         self,
@@ -485,14 +566,15 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
 
     With ``reuse`` (a ``BrokeredSandboxReuse``; default ``None``) a sandbox
     whose session finalized successfully waits, its lease still renewed, for
-    the factory's next session or turn of the same Agent and environment,
-    which empties its ``/workspace`` and copies the source in again instead of
-    allocating a sandbox and running ``setup_commands``. Untrusted workloads
-    never share one. A sandbox serves one session at a time; concurrent
-    sessions each get their own. A failed setup or finalization still
-    destroys the sandbox, and ``release_idle_resources`` (or
-    ``close_idle_resources`` at shutdown) destroys the waiting ones. With a
-    ``toolchain_profile`` a reused sandbox is admitted again before use.
+    the factory's next session or turn of the same Agent and environment
+    instead of allocating a sandbox and running ``setup_commands``. That
+    session resets ``/workspace`` to the source: it keeps the files the sandbox
+    holds as the source does, removes everything else and copies in only the
+    rest. Untrusted workloads never share one. A sandbox serves one session at
+    a time; concurrent sessions each get their own. A failed setup or
+    finalization still destroys the sandbox, and ``release_idle_resources``
+    (or ``close_idle_resources`` at shutdown) destroys the waiting ones. With
+    a ``toolchain_profile`` a reused sandbox is admitted again before use.
 
     With ``queue_seconds`` (default 0, up to ``MAX_QUEUE_SECONDS``) a create
     over one of Cloud's limits waits in Cloud's queue for up to that long
@@ -1340,20 +1422,15 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             runner = context.runner
             if not isinstance(runner, BrokeredSandboxRunner) or context.session_id is None:
                 raise RuntimeError("A brokered coding target needs the session's sandbox runner.")
-            target = BrokeredSandboxWorkspace(
-                runner,
-                staged_copies=staged_copies,
-                archive_compression=archive_compression,
-                workspace_id=f"brokered-sandbox:{context.session_id}",
-                excluded_directory_names=excluded,
-                excluded_path_patterns=excluded_patterns,
-            )
-
-            async def reset() -> None:
-                await _reset_sandbox_workspace(runner, target.runner_cwd)
-
             return SyncTargetWorkspacePlan(
-                workspace=target, provision=reset if reset_workspace else None
+                workspace=BrokeredSandboxWorkspace(
+                    runner,
+                    staged_copies=staged_copies,
+                    archive_compression=archive_compression,
+                    workspace_id=f"brokered-sandbox:{context.session_id}",
+                    excluded_directory_names=excluded,
+                    excluded_path_patterns=excluded_patterns,
+                )
             )
 
         return BrokeredSandboxCodingBinding(
@@ -1373,21 +1450,53 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             setup_command_timeout_s=self.setup_command_timeout_s,
             workspace_repository=self.workspace_repository,
             release_sandbox=None if reuse_key is None else self._releaser(reuse_key),
+            # A reused sandbox already holds an earlier copy; send only what differs.
+            copy_in_scope="changed" if reset_workspace else "all",
+            reset_sandbox_workspace=reset_workspace,
         )
 
 
-async def _reset_sandbox_workspace(runner: BrokeredSandboxRunner, cwd: str) -> None:
-    """Empty a reused sandbox's workspace before copy-in, so no earlier session's files remain."""
+async def _reset_sandbox_workspace(
+    runner: BrokeredSandboxRunner, cwd: str, keep: frozenset[str], *, python: str
+) -> tuple[int, frozenset[str]]:
+    """Remove everything in a reused sandbox's workspace but ``keep``, in one command.
 
-    with environment_phase_step("sandbox_reset"):
-        result = await runner.exec_system(
-            ExecCommand.bash(_WORKSPACE_RESET_SCRIPT),
-            cwd=cwd,
-            timeout_s=_WORKSPACE_RESET_TIMEOUT_SECONDS,
-            output_limit_bytes=4096,
-        )
-    if result.exit_code != 0 or result.timed_out:
-        raise RuntimeError("The reused brokered sandbox's workspace could not be emptied.")
+    Returns how many files went and the paths kept. When the kept paths don't
+    fit in one command's stdin, or the command found some of them no longer as
+    measured, the workspace is emptied instead and copy-in sends everything.
+    """
+
+    # ASCII, so the guest reads it whatever its locale.
+    payload = json.dumps(sorted(keep))
+    if len(payload.encode()) > MAX_COMMAND_STDIN_BYTES - _WORKSPACE_RESET_STDIN_MARGIN_BYTES:
+        keep, payload = frozenset(), "[]"
+    removed, kept = await _run_workspace_reset(runner, cwd, payload, python=python)
+    if kept != len(keep):
+        more, _ = await _run_workspace_reset(runner, cwd, "[]", python=python)
+        return removed + more, frozenset()
+    return removed, keep
+
+
+async def _run_workspace_reset(
+    runner: BrokeredSandboxRunner, cwd: str, payload: str, *, python: str
+) -> tuple[int, int]:
+    result = await runner.exec_system(
+        # Isolated, so nothing a session left in the workspace shadows its imports.
+        ExecCommand.process(python, "-I", "-c", _WORKSPACE_RESET_PROGRAM),
+        cwd=cwd,
+        stdin=payload,
+        timeout_s=_WORKSPACE_RESET_TIMEOUT_SECONDS,
+        output_limit_bytes=4096,
+    )
+    counts: Any = None
+    if result.exit_code == 0 and not result.timed_out:
+        with contextlib.suppress(ValueError):
+            counts = json.loads(result.stdout)
+    removed = counts.get("removed") if isinstance(counts, dict) else None
+    kept = counts.get("kept") if isinstance(counts, dict) else None
+    if type(removed) is not int or type(kept) is not int or removed < 0 or kept < 0:
+        raise RuntimeError("The reused brokered sandbox's workspace could not be reset.")
+    return removed, kept
 
 
 async def _await_beside(main: Awaitable[_T], side: Awaitable[None]) -> _T:

@@ -91,17 +91,17 @@ BUDGETS: dict[str, dict[str, int]] = {
         "target_cleans": 1,
     },
     "sandbox copy-back": {"sandbox_commands": 3, "broker_requests": 8, "command_kib": 161},
-    # The next session on the same factory with BrokeredSandboxReuse: it takes the
-    # sandbox the first session left and empties its workspace before copy-in (the
-    # reset, then the binding's own clean, which finds nothing).
+    # The next session on the same factory with BrokeredSandboxReuse, after one
+    # source file changed: it takes the sandbox the first session left, resets
+    # its workspace to the source and copies in only the changed file.
     "reused sandbox allocation": {"sandbox_commands": 0, "broker_requests": 1},
     "reused sandbox setup": {
-        "sandbox_commands": 19,
-        "broker_requests": 39,
-        "command_kib": 114,
+        "sandbox_commands": 4,
+        "broker_requests": 9,
+        "command_kib": 116,
         "archive_uploads": 1,
-        "upload_kib": 460,
-        "target_cleans": 2,
+        "upload_kib": 10,
+        "target_cleans": 1,
     },
     # A session of three model steps: two tool calls, then one, then a reply.
     "session start to model request 1": {"store_calls": 40},
@@ -380,11 +380,14 @@ async def _measure_reused_sandbox(
         )
         if measured:
             setup, breakdown["reused sandbox setup"] = meter.take(archives=True)
+            sync = bound.metadata["sync_binding"]
+            assert (sync["transferred_files"], sync["unchanged_files"]) == (1, _SOURCE_FILES - 1)
             setup["target_cleans"] = len(clean_passes)
             observed["reused sandbox setup"] = setup
         await binding.finalize(bound, outcome="completed")
 
     await session("first", measured=False)
+    (source / "notes.txt").write_text("changed outside the sandbox\n")
     await session("second", measured=True)
     await factory.close_idle_resources()
     assert broker.live() == []

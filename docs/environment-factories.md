@@ -872,31 +872,39 @@ By default every session, and every turn of a session, gets a new sandbox.
 keeps a sandbox instead once its session finalizes successfully: it waits with
 its lease still renewed, and the factory's next session or turn of the same
 Agent and environment, with the same execution requirements, takes it rather
-than allocating one and running `setup_commands` again (environments
-report `sandbox_reused` in their factory metadata, and the `sandbox_reuse`
-step in place of `sandbox_allocation`). Before copy-in the next session empties
-`/workspace` in one command, protected and excluded directories included, so it
-sees only the source, never what an earlier session wrote there. Everything
-outside `/workspace` stays, which is the point for what `setup_commands`
-installed, but also keeps anything a session wrote elsewhere, and a process a
-session left running in the background, which can still write into the
-workspace after the reset. Reuse suits trusted sessions of one Agent that may
-see each other's leftovers, and isn't a boundary between them: a session whose
-execution requirements say `code_trust="untrusted"` or `cleanup="confirmed"`
-always gets a fresh sandbox and leaves none behind. A sandbox serves one session at a time, so concurrent
-sessions each get their own. At most `max_idle` (default 1) wait at once, one
-unused for `idle_seconds` (default 600) is destroyed, and one with less than
-`min_lifetime_seconds` (default 1800, at least 300) left before the broker's
-maximum lifetime isn't kept. A failed setup or finalization still destroys the sandbox, a
-waiting one that is no longer `ready` is replaced, and with a toolchain profile
-a reused sandbox is admitted again. `release_idle_resources()` destroys the
-waiting sandboxes, and `close_idle_resources()` (which
-`CayuApp.close_idle_environment_resources` calls at shutdown) also stops
-keeping new ones. `BrokeredCodingBackendOptions` takes `reuse` too. On its own,
+than allocating one and running `setup_commands` again (environments report
+`sandbox_reused` in their factory metadata, and the `sandbox_reuse` step in
+place of `sandbox_allocation`). The next session resets `/workspace` to the
+source: it binds with `copy_in_scope="changed"`, and its clean (`sandbox_reset`)
+is one command that removes everything but the files the sandbox already holds
+as the source does, protected and excluded directories included. A kept file
+stays only as a regular file with one link, with the permissions copy-in gives
+it. Copy-in then sends only the rest, so a session sees only the source, never
+what an earlier session wrote there, and a source whose last session's changes
+were copied back sends almost nothing. When the kept paths don't fit in one
+command's 1 MiB of stdin, the workspace is emptied and everything is copied.
+Everything outside `/workspace` stays, which is the point for what
+`setup_commands` installed, but also keeps anything a session wrote elsewhere,
+and a process a session left running in the background, which can still write
+into the workspace after the reset. Reuse suits trusted sessions of one Agent
+that may see each other's leftovers, and isn't a boundary between them: a
+session whose execution requirements say `code_trust="untrusted"` or
+`cleanup="confirmed"` always gets a fresh sandbox and leaves none behind. A
+sandbox serves one session at a time, so concurrent sessions each get their own.
+At most `max_idle` (default 1) wait at once, one unused for `idle_seconds`
+(default 600) is destroyed, and one with less than `min_lifetime_seconds`
+(default 1800, at least 300) left before the broker's maximum lifetime isn't
+kept. A failed setup or finalization still destroys the sandbox, a waiting one
+that is no longer `ready` is replaced, and with a toolchain profile a reused
+sandbox is admitted again. `release_idle_resources()` destroys the waiting
+sandboxes, and `close_idle_resources()` (which
+`CayuApp.close_idle_environment_resources` calls at shutdown) also stops keeping
+new ones. `BrokeredCodingBackendOptions` takes `reuse` too. On its own,
 `BrokeredSandboxRunner.detach()` closes a runner without destroying its sandbox
 and returns the lease keeper, for a new runner over the same sandbox, and
 `BrokeredSandboxCodingBinding(release_sandbox=...)` takes the runner in place of
-destroying it once finalization succeeds.
+destroying it once finalization succeeds, and its `reset_sandbox_workspace=True`
+is the one-command clean above.
 
 Final admission uses the sandbox record's versioned `guarantees`. A capability
 such as `untrusted_code_isolation`, `real_credential_non_possession`,
@@ -2589,6 +2597,18 @@ target file is copied back as before. `copy_back_scope="all"` asks for that ever
 snapshot reports `copy_back_scope` (`changed` or `all`, what was done) and `unchanged_files`. With
 `source_conflict_policy="overwrite"`, a skipped file keeps whatever the source holds, so a change
 made to it outside the run is no longer overwritten by the copy taken at bind.
+
+Copy-in can work the same way for a target that keeps its files between binds, such as a reused
+brokered sandbox. With `copy_in_scope="changed"` (the default is `"all"`) the binding has the
+target hash what it holds before copying and skips each source file the target already holds with
+the same SHA-256, size and Git mode. With `clean_target="always"` the clean removes everything else
+and keeps those, so the target still ends up holding exactly the source while only files that
+differ cross. When nothing crosses, that measurement also serves as copy-back's baseline, so the
+target isn't hashed twice. It needs `source_conflict_policy="require_revision"` (whose observation
+hashes the source) and `preserve_git_modes=True`; a target that can't hash itself, or a failed
+measurement, gets every file. The bind metadata then reports `copy_in_scope`, `unchanged_files`,
+`transferred_files` and `transferred_bytes`; `copied_files` and `copied_bytes` still describe the
+whole tree the target holds.
 
 Those per-binding limits are independent of the process-wide staging governor. By default, all
 `SyncBinding` instances share a governor with 16 transfer slots and 4 GiB of byte-weighted
