@@ -69,6 +69,7 @@ from cayu.sandbox_broker.coding import (
     BrokeredCodingBackendOptions,
     BrokeredSandboxCodingBinding,
     BrokeredSandboxCodingEnvironmentFactory,
+    BrokeredSandboxReuse,
 )
 from cayu.sandbox_broker.lease import SandboxLeaseKeeper
 from cayu.sandbox_broker.queue import report_sandbox_queue_position
@@ -94,6 +95,7 @@ __all__ = [
     "BrokeredCodingBackendOptions",
     "BrokeredSandboxCodingBinding",
     "BrokeredSandboxCodingEnvironmentFactory",
+    "BrokeredSandboxReuse",
     "BrokeredSandboxRunner",
     "BrokeredSandboxWorkspace",
     "SandboxAllocationFailedError",

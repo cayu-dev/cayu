@@ -867,6 +867,37 @@ phases at least `queue_seconds + ready_timeout_s` plus the setup commands' time
 when sessions may queue longer. Without a lifecycle policy the factory still
 waits but reports nothing and doesn't read the queue.
 
+By default every session, and every turn of a session, gets a new sandbox.
+`BrokeredSandboxCodingEnvironmentFactory(..., reuse=BrokeredSandboxReuse())`
+keeps a sandbox instead once its session finalizes successfully: it waits with
+its lease still renewed, and the factory's next session or turn of the same
+Agent and environment, with the same execution requirements, takes it rather
+than allocating one and running `setup_commands` again (environments
+report `sandbox_reused` in their factory metadata, and the `sandbox_reuse`
+step in place of `sandbox_allocation`). Before copy-in the next session empties
+`/workspace` in one command, protected and excluded directories included, so it
+sees only the source, never what an earlier session wrote there. Everything
+outside `/workspace` stays, which is the point for what `setup_commands`
+installed, but also keeps anything a session wrote elsewhere, and a process a
+session left running in the background, which can still write into the
+workspace after the reset. Reuse suits trusted sessions of one Agent that may
+see each other's leftovers, and isn't a boundary between them: a session whose
+execution requirements say `code_trust="untrusted"` or `cleanup="confirmed"`
+always gets a fresh sandbox and leaves none behind. A sandbox serves one session at a time, so concurrent
+sessions each get their own. At most `max_idle` (default 1) wait at once, one
+unused for `idle_seconds` (default 600) is destroyed, and one with less than
+`min_lifetime_seconds` (default 1800, at least 300) left before the broker's
+maximum lifetime isn't kept. A failed setup or finalization still destroys the sandbox, a
+waiting one that is no longer `ready` is replaced, and with a toolchain profile
+a reused sandbox is admitted again. `release_idle_resources()` destroys the
+waiting sandboxes, and `close_idle_resources()` (which
+`CayuApp.close_idle_environment_resources` calls at shutdown) also stops
+keeping new ones. `BrokeredCodingBackendOptions` takes `reuse` too. On its own,
+`BrokeredSandboxRunner.detach()` closes a runner without destroying its sandbox
+and returns the lease keeper, for a new runner over the same sandbox, and
+`BrokeredSandboxCodingBinding(release_sandbox=...)` takes the runner in place of
+destroying it once finalization succeeds.
+
 Final admission uses the sandbox record's versioned `guarantees`. A capability
 such as `untrusted_code_isolation`, `real_credential_non_possession`,
 `guest_privilege_containment` or `deny_by_default_network` is available only

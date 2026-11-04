@@ -34,7 +34,8 @@ from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.providers.base import ModelStreamEventType
 from cayu.runtime import _session_control
-from cayu.sandbox_broker import BrokeredSandboxCodingEnvironmentFactory
+from cayu.sandbox_broker import BrokeredSandboxCodingEnvironmentFactory, BrokeredSandboxReuse
+from cayu.sandbox_broker import coding as coding_module
 from cayu.sessions import InMemorySessionStore
 from cayu.tools import (
     EditFileTool,
@@ -90,6 +91,18 @@ BUDGETS: dict[str, dict[str, int]] = {
         "target_cleans": 1,
     },
     "sandbox copy-back": {"sandbox_commands": 3, "broker_requests": 8, "command_kib": 161},
+    # The next session on the same factory with BrokeredSandboxReuse: it takes the
+    # sandbox the first session left and empties its workspace before copy-in (the
+    # reset, then the binding's own clean, which finds nothing).
+    "reused sandbox allocation": {"sandbox_commands": 0, "broker_requests": 1},
+    "reused sandbox setup": {
+        "sandbox_commands": 19,
+        "broker_requests": 39,
+        "command_kib": 114,
+        "archive_uploads": 1,
+        "upload_kib": 460,
+        "target_cleans": 2,
+    },
     # A session of three model steps: two tool calls, then one, then a reply.
     "session start to model request 1": {"store_calls": 40},
     "model reply 1 to first tool start": {"store_calls": 22},
@@ -305,6 +318,85 @@ async def _measure_brokered_session(
     observed["sandbox copy-back"], breakdown["sandbox copy-back"] = meter.take()
     assert broker.live() == []
     return observed, breakdown
+
+
+def _count_target_cleans(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record each pass that clears the target: the binding's own, or a reused sandbox's reset."""
+
+    clean_passes: list[int] = []
+    clear_workspace = bindings_module._clear_workspace
+    reset_workspace = coding_module._reset_sandbox_workspace
+
+    async def counted_clear(*args: Any, **kwargs: Any) -> tuple[str, ...]:
+        cleaned = await clear_workspace(*args, **kwargs)
+        clean_passes.append(len(cleaned))
+        return cleaned
+
+    async def counted_reset(*args: Any, **kwargs: Any) -> Any:
+        reset = await reset_workspace(*args, **kwargs)
+        clean_passes.append(-1)
+        return reset
+
+    monkeypatch.setattr(bindings_module, "_clear_workspace", counted_clear)
+    monkeypatch.setattr(coding_module, "_reset_sandbox_workspace", counted_reset)
+    return clean_passes
+
+
+async def _measure_reused_sandbox(
+    root: Path, *, clean_passes: list[int]
+) -> tuple[dict[str, dict[str, int]], dict[str, Any]]:
+    broker = FakeBroker(root / "cloud")
+    source = _source_tree(root)
+    factory = BrokeredSandboxCodingEnvironmentFactory(
+        broker=broker.client(),
+        source_workspace=LocalWorkspace(source, workspace_id="project"),
+        egress="none",
+        reuse=BrokeredSandboxReuse(),
+    )
+    observed: dict[str, dict[str, int]] = {}
+    breakdown: dict[str, Any] = {}
+    meter = _BrokerMeter(broker)
+
+    async def session(session_id: str, *, measured: bool) -> None:
+        meter.mark()
+        created = await factory.create(
+            EnvironmentFactoryRequest(
+                session_id=session_id, agent_name="coder", environment_name="sandbox"
+            )
+        )
+        assert created.metadata["sandbox_reused"] is measured
+        if measured:
+            observed["reused sandbox allocation"], breakdown["reused sandbox allocation"] = (
+                meter.take()
+            )
+            clean_passes.clear()
+        binding = created.environment.binding
+        bound = await binding.bind(
+            created.environment.workspace,
+            created.environment.runner,
+            session_id=session_id,
+            agent_name="coder",
+            environment_name="sandbox",
+        )
+        if measured:
+            setup, breakdown["reused sandbox setup"] = meter.take(archives=True)
+            setup["target_cleans"] = len(clean_passes)
+            observed["reused sandbox setup"] = setup
+        await binding.finalize(bound, outcome="completed")
+
+    await session("first", measured=False)
+    await session("second", measured=True)
+    await factory.close_idle_resources()
+    assert broker.live() == []
+    return observed, breakdown
+
+
+def test_a_reused_sandbox_setup_stays_within_its_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clean_passes = _count_target_cleans(monkeypatch)
+    observed, breakdown = asyncio.run(_measure_reused_sandbox(tmp_path, clean_passes=clean_passes))
+    _check_budgets(observed, breakdown)
 
 
 _HAS_RIPGREP = shutil.which("rg") is not None

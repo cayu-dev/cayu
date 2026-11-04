@@ -326,6 +326,8 @@ class BrokeredSandboxRunner(Runner):
         self._toolchain_evidence: tuple[ExecutionExecutableEvidence, ...] = ()
         self._toolchain_refresh_lock = asyncio.Lock()
         self._destroyed = False
+        # Abandoned commands whose stop the broker hasn't confirmed yet.
+        self._cancellations_settling = 0
 
     @property
     def sandbox_id(self) -> str:
@@ -595,6 +597,35 @@ class BrokeredSandboxRunner(Runner):
             self._destroyed = True
         self._closed = True
 
+    def detach(self) -> SandboxLeaseKeeper | None:
+        """Close this runner without destroying its sandbox, and return its lease keeper.
+
+        The keeper goes on renewing the lease, so a new ``BrokeredSandboxRunner``
+        over the same sandbox and keeper can take the sandbox over. This runner
+        runs nothing more, and closing it later destroys nothing. It refuses,
+        leaving the runner as it was, when the sandbox isn't fit to hand on:
+        the runner is closed, its lease was lost, or a command's cleanup or
+        cancellation is unsettled.
+        """
+
+        if self._closed or self._closing:
+            raise RuntimeError("BrokeredSandboxRunner is closed.")
+        if (
+            self._exec_poisoned
+            or self._command_cleanups_pending
+            or self._cancellations_settling
+            or self._loss_reason is not None
+        ):
+            raise RuntimeError("BrokeredSandboxRunner's sandbox is in an unknown state.")
+        keeper = self.lease_keeper
+        if keeper is not None and keeper.lost is not None:
+            raise RuntimeError("BrokeredSandboxRunner's lease was lost.")
+        self._close_exec("BrokeredSandboxRunner handed its sandbox on")
+        self.lease_keeper = None
+        self.destroy_on_close = False
+        self._closed = True
+        return keeper
+
     async def _await_destroyed(self) -> str:
         """Stop renewing, then return once the sandbox is gone for good, and why.
 
@@ -787,10 +818,13 @@ class BrokeredSandboxRunner(Runner):
             return False
 
         task = asyncio.create_task(settle())
+        self._cancellations_settling += 1
         try:
             settled = await asyncio.shield(task)
         except BaseException:
             settled = False
+        finally:
+            self._cancellations_settling -= 1
         dispatch.cleanup_required = not settled
         if not settled:
             self._poison_exec("the broker could not confirm that an abandoned command stopped")
