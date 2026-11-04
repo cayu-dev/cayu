@@ -42,7 +42,15 @@ from cayu.context.base import (
     estimate_model_request_context_pressure,
 )
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.messages import FilePart, Message, MessageRole, ToolCallPart, ToolResultPart
+from cayu.messages import (
+    FilePart,
+    Message,
+    MessageRole,
+    StructuredOutputPart,
+    ToolCallPart,
+    ToolResultPart,
+    _ValidatedContent,
+)
 from cayu.providers._system_messages import leading_system_count, placed_conversation_messages
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
@@ -904,7 +912,7 @@ def _request_cache_projection(
     *,
     provider: ModelProvider,
 ) -> RequestCacheProjection | None:
-    projection = provider.request_cache_projection(model_request.model_copy(deep=True))
+    projection = provider.request_cache_projection(model_request)
     if projection is not None and type(projection) is not RequestCacheProjection:
         raise TypeError(
             "ModelProvider.request_cache_projection() must return RequestCacheProjection or None."
@@ -939,21 +947,20 @@ def analyze_request_footprint(
     if not isinstance(provider, ModelProvider):
         raise TypeError("provider must be a ModelProvider.")
     resolved_config = copy_request_footprint_config(config)
-    detached_request = model_request.model_copy(deep=True)
-    cache_projection = _request_cache_projection(detached_request, provider=provider)
+    # Provider hooks must be side-effect free. They share one detached copy, so
+    # a hook that mutates its argument still cannot change the analyzed request,
+    # which the analysis below only reads.
+    hook_request = model_request.model_copy(deep=True)
+    cache_projection = _request_cache_projection(hook_request, provider=provider)
     cache_policy = None if cache_projection is None else cache_projection.policy
-    measured_provider_options = provider.request_footprint_options(
-        detached_request.model_copy(deep=True)
-    )
+    measured_provider_options = provider.request_footprint_options(hook_request)
     if type(measured_provider_options) is not dict:
         raise TypeError("ModelProvider.request_footprint_options() must return a dict.")
-    fingerprint_provider_options = provider.request_fingerprint_options(
-        detached_request.model_copy(deep=True)
-    )
+    fingerprint_provider_options = provider.request_fingerprint_options(hook_request)
     if type(fingerprint_provider_options) is not dict:
         raise TypeError("ModelProvider.request_fingerprint_options() must return a dict.")
     return build_request_footprint(
-        detached_request,
+        model_request,
         provider_name=provider_name,
         step=step,
         attempt=attempt,
@@ -992,16 +999,16 @@ def analyze_request_context_pressure(
         raise TypeError("model_request must be a ModelRequest.")
     if not isinstance(provider, ModelProvider):
         raise TypeError("provider must be a ModelProvider.")
-    detached_request = model_request.model_copy(deep=True)
-    cache_projection = _request_cache_projection(detached_request, provider=provider)
+    # As in analyze_request_footprint, hooks share one detached copy and the
+    # measurement only reads the caller's request.
+    hook_request = model_request.model_copy(deep=True)
+    cache_projection = _request_cache_projection(hook_request, provider=provider)
     cache_policy = None if cache_projection is None else cache_projection.policy
-    measured_provider_options = provider.request_footprint_options(
-        detached_request.model_copy(deep=True)
-    )
+    measured_provider_options = provider.request_footprint_options(hook_request)
     if type(measured_provider_options) is not dict:
         raise TypeError("ModelProvider.request_footprint_options() must return a dict.")
     projection = _request_measurement_projection(
-        detached_request,
+        model_request,
         measured_provider_options=measured_provider_options,
     )
     measured_options = _measured_request_options(
@@ -1009,8 +1016,8 @@ def analyze_request_context_pressure(
         cache_markers=_provider_neutral_cache_marker_payload(cache_policy),
     )
     return _estimate_projected_context_pressure(
-        model_request=detached_request,
-        messages=detached_request.messages,
+        model_request=model_request,
+        messages=model_request.messages,
         measured_options=measured_options,
         native_structured_output=projection.native_structured_output,
         profile=copy_model_context_pressure_profile(provider.context_pressure_profile),
@@ -1188,37 +1195,50 @@ def build_request_footprint(
         for message, payload in zip(model_request.messages, message_payloads, strict=True)
         if message.role == MessageRole.SYSTEM
     ]
-    grouped_parts: dict[tuple[MessageRole, str], list[dict[str, Any]]] = defaultdict(list)
+    # Measure each content part once. Group, system, message and whole-request
+    # sizes are composed from these, since a JSON array's canonical encoding is
+    # its items' encodings joined by commas.
+    grouped_parts: dict[tuple[MessageRole, str], list[_SizeTotals]] = defaultdict(list)
+    message_totals: list[_SizeTotals] = []
+    system_totals: list[_SizeTotals] = []
     for message, message_payload in zip(
         model_request.messages,
         message_payloads,
         strict=True,
     ):
-        if message.role == MessageRole.SYSTEM:
-            continue
         content_payloads = message_payload["content"]
-        for part, part_payload in zip(message.content, content_payloads, strict=True):
-            grouped_parts[(message.role, part.type)].append(part_payload)
+        part_totals = [_size_totals(part_payload) for part_payload in content_payloads]
+        totals = _with_array_totals(
+            _size_totals({**message_payload, "content": []}),
+            _array_size_totals(part_totals),
+        )
+        message_totals.append(totals)
+        if message.role == MessageRole.SYSTEM:
+            system_totals.append(totals)
+            continue
+        for part, part_size in zip(message.content, part_totals, strict=True):
+            grouped_parts[(message.role, part.type)].append(part_size)
     message_groups = tuple(
         RequestContentGroupFootprint(
             role=role,
             part_type=part_type,
-            count=len(payloads),
-            size=_request_size(payloads),
+            count=len(part_totals),
+            size=_request_size_from_totals(_array_size_totals(part_totals)),
         )
-        for (role, part_type), payloads in sorted(
+        for (role, part_type), part_totals in sorted(
             grouped_parts.items(),
             key=lambda item: (item[0][0].value, item[0][1]),
         )
     )
+    messages_array_totals = _array_size_totals(message_totals)
     messages = RequestMessagesFootprint(
         count=len(model_request.messages),
         system=RequestComponentFootprint(
             count=len(system_payloads),
-            size=_request_size(system_payloads),
+            size=_request_size_from_totals(_array_size_totals(system_totals)),
         ),
         groups=message_groups,
-        size=_request_size(message_payloads),
+        size=_request_size_from_totals(messages_array_totals),
     )
     tool_manifest, hosted_tool_payloads = _request_tool_manifest(model_request)
     projected_tool_count = (
@@ -1550,7 +1570,15 @@ def build_request_footprint(
         model_attempt_id=model_attempt_id,
         operation_id=operation_id,
         attempt_id=operation_attempt_id,
-        total=RequestComponentFootprint(count=1, size=_request_size(measured_request_shape)),
+        total=RequestComponentFootprint(
+            count=1,
+            size=_request_size_from_totals(
+                _with_array_totals(
+                    _size_totals({**measured_request_shape, "messages": []}),
+                    messages_array_totals,
+                )
+            ),
+        ),
         messages=messages,
         tools=tools,
         attachments=attachments,
@@ -1668,12 +1696,44 @@ def _prompt_contribution_attribution(
 
 
 def _request_size(value: Any) -> RequestSize:
-    encoded = _canonical_json(value)
+    return _request_size_from_totals(_size_totals(value))
+
+
+# Characters, UTF-8 bytes and canonical JSON bytes of one measured value.
+_SizeTotals = tuple[int, int, int]
+
+
+def _size_totals(value: Any) -> _SizeTotals:
     characters, utf8_bytes = _string_value_sizes(value)
+    return characters, utf8_bytes, len(_canonical_json(value))
+
+
+def _array_size_totals(items: list[_SizeTotals]) -> _SizeTotals:
+    """Return the totals of a JSON array whose items were measured separately."""
+
+    characters = sum(item[0] for item in items)
+    utf8_bytes = sum(item[1] for item in items)
+    # Brackets plus one comma between adjacent items.
+    canonical_json_bytes = 2 + sum(item[2] for item in items) + max(len(items) - 1, 0)
+    return characters, utf8_bytes, canonical_json_bytes
+
+
+def _with_array_totals(container: _SizeTotals, array: _SizeTotals) -> _SizeTotals:
+    """Replace one empty array (``[]``) measured in `container` with `array`."""
+
+    return (
+        container[0] + array[0],
+        container[1] + array[1],
+        container[2] - 2 + array[2],
+    )
+
+
+def _request_size_from_totals(totals: _SizeTotals) -> RequestSize:
+    characters, utf8_bytes, canonical_json_bytes = totals
     return RequestSize(
         characters=characters,
         utf8_bytes=utf8_bytes,
-        canonical_json_bytes=len(encoded),
+        canonical_json_bytes=canonical_json_bytes,
     )
 
 
@@ -1996,15 +2056,20 @@ def _estimate_projected_context_pressure(
         and not call_tool_core_callable(model_request.options)
     ):
         projected_tools = [tool for tool in projected_tools if tool.get("name") != CALL_TOOL_NAME]
+    reuse_messages = all(_is_owned_request_message(message) for message in messages)
     measured_request = ModelRequest(
         model=model_request.model,
-        messages=messages,
+        messages=[] if reuse_messages else messages,
         tools=projected_tools,
         hosted_tools=model_request.hosted_tools,
         targeted_tool_projection=model_request.targeted_tool_projection,
         tool_discovery_projection=model_request.tool_discovery_projection,
         options=measured_options,
     )
+    if reuse_messages:
+        # Messages of a validated request are frozen and already detached.
+        # Validating them again would copy the whole transcript only to count it.
+        measured_request = measured_request.model_copy(update={"messages": list(messages)})
     pressure = estimate_model_request_context_pressure(
         model_request=measured_request,
         image_min_tokens=profile.image_min_tokens,
@@ -2037,6 +2102,16 @@ def _estimate_projected_context_pressure(
             ),
         },
         deep=True,
+    )
+
+
+def _is_owned_request_message(message: Message) -> bool:
+    """Return whether `message` already has the form ModelRequest validation gives it."""
+
+    return (
+        type(message) is Message
+        and type(message.content) is _ValidatedContent
+        and not any(type(part) is StructuredOutputPart for part in message.content)
     )
 
 

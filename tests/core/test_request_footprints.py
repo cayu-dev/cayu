@@ -24,6 +24,8 @@ from cayu.context import (
     build_request_footprint,
 )
 from cayu.context.footprints import (
+    _provider_neutral_message_payloads,
+    _request_size,
     analyze_request_context_pressure,
     analyze_request_footprint,
 )
@@ -2655,3 +2657,87 @@ def test_cache_prefix_fingerprint_follows_the_wire_with_a_trailing_note(
         # Anthropic keeps the note as its own user turn and marks the newest
         # user message, which is part of the cached prefix.
         assert prefix(newest="Different question.") != baseline
+
+
+def test_composed_message_sizes_match_direct_measurement() -> None:
+    request = _request()
+    request = request.model_copy(
+        update={"messages": [*request.messages, Message.text("system", "Late note ü 日本")]}
+    )
+    footprint = _build(request)
+    payloads = _provider_neutral_message_payloads(
+        request.messages,
+        resolved_attachments=request.options[RESOLVED_FILE_ATTACHMENTS_OPTION],
+        loaded_discovery_names=frozenset(),
+    )
+
+    assert footprint.messages.size == _request_size(payloads)
+    assert footprint.messages.system.size == _request_size(
+        [payload for payload in payloads if payload["role"] == "system"]
+    )
+    for group in footprint.messages.groups:
+        assert group.size == _request_size(
+            [
+                part
+                for payload in payloads
+                if payload["role"] == group.role
+                for part in payload["content"]
+                if part["type"] == group.part_type
+            ]
+        )
+
+
+def test_mutating_provider_hooks_cannot_change_the_analyzed_request() -> None:
+    class MutatingProjectionProvider(ModelProvider):
+        def request_cache_projection(self, request: ModelRequest) -> None:
+            request.messages.clear()
+            request.tools.clear()
+            return None
+
+        def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+            request.options.clear()
+            return {}
+
+        def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+            request.model = "mutated-model"
+            return {}
+
+        async def stream(
+            self,
+            _request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    class InertProjectionProvider(MutatingProjectionProvider):
+        def request_cache_projection(self, request: ModelRequest) -> None:
+            return None
+
+        def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+            return {}
+
+        def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+            return {}
+
+    request = _request()
+    original = request.model_dump(mode="json")
+
+    def observe(provider: ModelProvider) -> RequestFootprint:
+        return analyze_request_footprint(
+            request,
+            provider=provider,
+            provider_name="custom",
+            step=1,
+            attempt=1,
+            max_attempts=1,
+            request_variant=RequestVariant.INITIAL,
+            observation_id="observation-1",
+            model_step_id="mstep_00000000000000000000000000000001",
+            model_attempt_id="matt_00000000000000000000000000000002",
+        )
+
+    assert observe(MutatingProjectionProvider()) == observe(InertProjectionProvider())
+    assert analyze_request_context_pressure(
+        request,
+        provider=MutatingProjectionProvider(),
+    ) == analyze_request_context_pressure(request, provider=InertProjectionProvider())
+    assert request.model_dump(mode="json") == original
