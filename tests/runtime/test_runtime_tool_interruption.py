@@ -737,6 +737,71 @@ def test_interrupt_session_preserves_tool_result_when_interrupted_after_tool_ret
     assert transcript[-1].content[0].is_error is False
 
 
+@pytest.mark.parametrize("max_parallel_tool_calls", [1, 4])
+def test_interruption_after_one_sequential_tool_call_stops_before_the_next(
+    max_parallel_tool_calls: int,
+):
+    # With one parallel slot the round is one sequential segment; with more, each
+    # call that is not parallel-safe is its own segment. Either way the status
+    # written during the first call must stop the round before the second starts.
+    store = InMemorySessionStore()
+    calls: list[str] = []
+
+    class InterruptingTool(Tool):
+        spec = ToolSpec(
+            name="interrupting_tool",
+            description="Record the call, and interrupt the session during the first.",
+            parallel_safe=False,
+            max_terminal_payload_bytes=1024,
+            input_schema={"type": "object", "properties": {"label": {"type": "string"}}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            calls.append(args["label"])
+            if len(calls) == 1:
+                await store.update_status(ctx.session_id, SessionStatus.INTERRUPTED)
+            return ToolResult(content="done")
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_first", name="interrupting_tool", arguments={"label": "first"}
+            ),
+            ModelStreamEvent.tool_call(
+                id="call_second", name="interrupting_tool", arguments={"label": "second"}
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(max_parallel_tool_calls=max_parallel_tool_calls)
+        ),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[InterruptingTool()])
+    session_id = f"sess_interrupt_between_calls_{max_parallel_tool_calls}"
+
+    async def run():
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "use tools")],
+            ),
+        )
+        return events, await store.load_events(session_id)
+
+    events, stored_events = asyncio.run(run())
+
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    assert calls == ["first"]
+    started = [event for event in stored_events if event.type == EventType.TOOL_CALL_STARTED]
+    assert [event.payload["tool_call_id"] for event in started] == ["call_first"]
+
+
 def test_interrupt_session_closes_tool_round_after_assistant_tool_call_is_quarantined():
     class InterruptingAfterAssistantToolCallQuarantineStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1

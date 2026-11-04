@@ -279,6 +279,7 @@ from cayu.runtime._provider_stream import (
 )
 from cayu.runtime._request_controls import model_request_controls_payload
 from cayu.runtime._run_limits import (
+    _DISPATCH_RESOLVED_BINDING_PROVENANCE,
     _TRUSTED_BINDING_PROVENANCE,
     UNKNOWN_POST_DISPATCH_BUDGET_REASON,
     BudgetDispatchReservationFailed,
@@ -3672,7 +3673,7 @@ class ModelStepRun:
             ),
             reservation_identity_guard=self._reservation_identity_guard,
             binding=resolved_budget_binding,
-            _binding_provenance=_TRUSTED_BINDING_PROVENANCE,
+            _binding_provenance=_DISPATCH_RESOLVED_BINDING_PROVENANCE,
         )
         budget_reservations = list(reservation_setup.reservations)
         try:

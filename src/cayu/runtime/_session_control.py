@@ -141,24 +141,23 @@ class SessionControl(Generic[UsageTrackerT]):
     def stream_interrupt_poll(self, session_id: str) -> StreamInterruptPoll:
         return StreamInterruptPoll(self, session_id=session_id)
 
-    async def raise_if_interrupted(self, session_id: str) -> None:
-        session = await self._session_store.load(session_id)
-        if session is None:
+    async def _durable_status(self, session_id: str) -> SessionStatus:
+        # The runtime checks this several times per model step and tool call,
+        # so it reads the bounded state row rather than the whole session.
+        state = await self._session_store.load_state(session_id)
+        if state is None:
             raise KeyError(f"Session not found: {session_id}")
-        if session.status in INTERRUPT_REQUESTED_SESSION_STATUSES:
+        return state.status
+
+    async def raise_if_interrupted(self, session_id: str) -> None:
+        if await self._durable_status(session_id) in INTERRUPT_REQUESTED_SESSION_STATUSES:
             raise SessionInterruptedByRequest(session_id)
 
     async def interrupt_requested(self, session_id: str) -> bool:
-        session = await self._session_store.load(session_id)
-        if session is None:
-            raise KeyError(f"Session not found: {session_id}")
-        return session.status in INTERRUPT_REQUESTED_SESSION_STATUSES
+        return await self._durable_status(session_id) in INTERRUPT_REQUESTED_SESSION_STATUSES
 
     async def is_interrupting(self, session_id: str) -> bool:
-        session = await self._session_store.load(session_id)
-        if session is None:
-            raise KeyError(f"Session not found: {session_id}")
-        return session.status == SessionStatus.INTERRUPTING
+        return await self._durable_status(session_id) == SessionStatus.INTERRUPTING
 
     def signal_interrupt(self, session_id: str) -> None:
         """Wake throttled polling after the durable interrupt is persisted."""

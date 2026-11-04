@@ -36,11 +36,16 @@ class _CountingSessionStore(InMemorySessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.load_calls = 0
+        self.load_state_calls = 0
         self.load_events_calls = 0
 
     async def load(self, session_id: str):
         self.load_calls += 1
         return await super().load(session_id)
+
+    async def load_state(self, session_id: str):
+        self.load_state_calls += 1
+        return await super().load_state(session_id)
 
     async def load_events(self, session_id: str) -> list[Event]:
         self.load_events_calls += 1
@@ -93,7 +98,7 @@ def test_streaming_does_not_load_session_per_delta(monkeypatch):
                 )
             )
         ]
-        return events, store.load_calls
+        return events, store.load_calls + store.load_state_calls
 
     baseline_events, baseline_load_calls = asyncio.run(run(1, "sess_stream_poll_baseline"))
     delta_count = 200

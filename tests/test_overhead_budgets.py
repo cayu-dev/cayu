@@ -91,12 +91,12 @@ BUDGETS: dict[str, dict[str, int]] = {
     },
     "sandbox copy-back": {"sandbox_commands": 3, "broker_requests": 8, "command_kib": 161},
     # A session of three model steps: two tool calls, then one, then a reply.
-    "session start to model request 1": {"store_calls": 41},
-    "model reply 1 to first tool start": {"store_calls": 23},
-    "between tool calls in round 1": {"store_calls": 15},
-    "round 1 last tool result to model request 2": {"store_calls": 47},
-    "model reply 2 to first tool start": {"store_calls": 23},
-    "round 2 last tool result to model request 3": {"store_calls": 42},
+    "session start to model request 1": {"store_calls": 40},
+    "model reply 1 to first tool start": {"store_calls": 22},
+    "between tool calls in round 1": {"store_calls": 14},
+    "round 1 last tool result to model request 2": {"store_calls": 46},
+    "model reply 2 to first tool start": {"store_calls": 22},
+    "round 2 last tool result to model request 3": {"store_calls": 41},
     "model reply 3 to session end": {"store_calls": 37},
     "during the model calls": {"store_calls": 3},
     # Events stored, split where each model call starts (its model.started event).

@@ -140,6 +140,9 @@ from cayu.sessions.store import SessionStore
 from cayu.tools.inference import InferenceLimits
 
 _TRUSTED_BINDING_PROVENANCE = object()
+# A trusted binding that ``_binding_for_dispatch`` resolved for this same dispatch
+# a moment ago, so its service-budget constraint is not read again.
+_DISPATCH_RESOLVED_BINDING_PROVENANCE = object()
 
 
 def _event_with_budget_authority(
@@ -1615,8 +1618,13 @@ class RunLimitController:
         request: dict[str, object],
         binding: BudgetBinding | None,
         trusted_binding: bool = False,
+        constraint_checked: bool = False,
     ) -> BudgetBinding | None:
-        """Resolve configured authority; never silently downgrade a bound app."""
+        """Resolve configured authority; never silently downgrade a bound app.
+
+        ``constraint_checked`` skips reading the service-budget constraint, for a
+        binding this method resolved for the same dispatch just before.
+        """
         from cayu.runtime._temporary_service_budget import (
             admitted_service_budget_constraint,
             require_service_budget_binding,
@@ -1625,8 +1633,14 @@ class RunLimitController:
         session_id = request.get("session_id")
         if type(session_id) is not str:
             raise ValueError("Budget dispatch requires its receiving session identity.")
-        constraint = await admitted_service_budget_constraint(
-            self._session_store, session_id=session_id
+        if constraint_checked and not trusted_binding:
+            raise ValueError("Only a trusted budget binding can skip its constraint check.")
+        constraint = (
+            None
+            if constraint_checked
+            else await admitted_service_budget_constraint(
+                self._session_store, session_id=session_id
+            )
         )
         if binding is not None:
             if trusted_binding:
@@ -2721,7 +2735,9 @@ class RunLimitController:
         binding = await self._binding_for_dispatch(
             request={"session_id": session.id, "agent_name": agent_name, "kind": "model"},
             binding=binding,
-            trusted_binding=_binding_provenance is _TRUSTED_BINDING_PROVENANCE,
+            trusted_binding=_binding_provenance is _TRUSTED_BINDING_PROVENANCE
+            or _binding_provenance is _DISPATCH_RESOLVED_BINDING_PROVENANCE,
+            constraint_checked=_binding_provenance is _DISPATCH_RESOLVED_BINDING_PROVENANCE,
         )
         if binding is not None and (
             (binding.provider_name is not None and binding.provider_name != provider_name)
@@ -2770,7 +2786,7 @@ class RunLimitController:
                 billing_identity=billing_identity,
                 reservation_identity_guard=reservation_identity_guard,
                 binding=binding,
-                _binding_provenance=_TRUSTED_BINDING_PROVENANCE,
+                _binding_provenance=_DISPATCH_RESOLVED_BINDING_PROVENANCE,
             )
             try:
                 emitted_events = tuple(
@@ -5035,7 +5051,9 @@ class RunLimitController:
         binding = await self._binding_for_dispatch(
             request={"session_id": session_id, "agent_name": agent_name, "kind": "operation"},
             binding=binding,
-            trusted_binding=_binding_provenance is _TRUSTED_BINDING_PROVENANCE,
+            trusted_binding=_binding_provenance is _TRUSTED_BINDING_PROVENANCE
+            or _binding_provenance is _DISPATCH_RESOLVED_BINDING_PROVENANCE,
+            constraint_checked=_binding_provenance is _DISPATCH_RESOLVED_BINDING_PROVENANCE,
         )
         if binding is not None and (
             (binding.provider_name is not None and binding.provider_name != provider_name)

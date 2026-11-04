@@ -1409,6 +1409,18 @@ class ToolRoundRun:
             raise ValueError("Tool-round queued handoff lost frozen invocation authority.")
         self._invocation_context = invocation_context
 
+    async def load_pending_round(self) -> pending_rounds.PendingToolRound | None:
+        """Read the durable pending round with the checks ``run`` admits it under."""
+
+        _source_checkpoint, pending_round = await pending_round_reader.load_pending_tool_round(
+            self._executor._session_store,
+            self._session.id,
+            redactor=self._executor._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=self._session,
+        )
+        return pending_round
+
     @timed_tool_round
     async def run(
         self,
@@ -1417,7 +1429,14 @@ class ToolRoundRun:
         tool_calls: list[runtime_records.ToolCallRequest],
         tool_round_identity: ToolRoundIdentity,
         model_step: int | None = None,
+        pending_round: pending_rounds.PendingToolRound | None = None,
     ) -> AsyncGenerator[Event, None]:
+        """Run one tool round.
+
+        ``pending_round`` is the round the caller just read with
+        ``load_pending_round``; without it the round is read here.
+        """
+
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
         self.stopped_for_limit = False
         self.closed_for_finish = False
@@ -1425,15 +1444,8 @@ class ToolRoundRun:
         executor = self._executor
         session = self._session
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
-        (
-            _source_checkpoint,
-            source_pending_round,
-        ) = await pending_round_reader.load_pending_tool_round(
-            executor._session_store,
-            session.id,
-            redactor=executor._secret_redactor,
-            consume_on_rejection=True,
-            runtime_session=session,
+        source_pending_round = (
+            await self.load_pending_round() if pending_round is None else pending_round
         )
         if source_pending_round is None:
             raise RuntimeError("Tool round has no durable pending exposure authority.")
@@ -1762,6 +1774,11 @@ class ToolRoundRun:
                         messages=messages,
                         tool_calls=segment_calls,
                         round_tool_calls=tool_calls,
+                        # A following sequential segment checks before its first
+                        # call, with nothing in between.
+                        check_after_calls=(
+                            segment_index + 1 == len(segments) or segments[segment_index + 1][0]
+                        ),
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
                         policy_evidence_by_id=policy_evidence_by_id,
@@ -2202,10 +2219,13 @@ class ToolRoundRun:
             | None
         ) = None,
         publish_staged_terminals: Callable[[], AsyncIterator[Event]] | None = None,
+        check_after_calls: bool = True,
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
         if round_tool_calls is None:
             round_tool_calls = tool_calls
         for tool_call in tool_calls:
+            # Nothing runs between one call's end and the next call's start, so
+            # this one check also serves as the previous call's closing check.
             await self._executor._session_control.raise_if_interrupted(self._session.id)
             async for event in self._check_dispatch_limits(
                 pending_tool_calls=1,
@@ -2249,6 +2269,7 @@ class ToolRoundRun:
             async with aclosing(stream) as owned_stream:
                 async for event, outcome in owned_stream:
                     yield event, outcome
+        if tool_calls and check_after_calls:
             await self._executor._session_control.raise_if_interrupted(self._session.id)
 
     async def _run_tool_calls_parallel(

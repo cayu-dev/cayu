@@ -24,11 +24,16 @@ class _CountingSessionStore(InMemorySessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.load_calls = 0
+        self.load_state_calls = 0
         self.event_queries: list[EventQuery] = []
 
     async def load(self, session_id: str):
         self.load_calls += 1
         return await super().load(session_id)
+
+    async def load_state(self, session_id: str):
+        self.load_state_calls += 1
+        return await super().load_state(session_id)
 
     async def query_events(self, query: EventQuery) -> list[EventRecord]:
         self.event_queries.append(query)
@@ -59,17 +64,17 @@ def test_stream_interrupt_poll_throttles_reads_and_signal_bypasses_throttle() ->
 
     async def scenario() -> None:
         await _create_session(store, "sess_poll_signal", status=SessionStatus.INTERRUPTING)
-        store.load_calls = 0
+        store.load_calls = store.load_state_calls = 0
         poll = control.stream_interrupt_poll("sess_poll_signal")
 
         await poll.raise_if_interrupted()
-        assert store.load_calls == 0
+        assert store.load_state_calls == 0
 
         control.signal_interrupt("sess_poll_signal")
         assert control.interrupt_signalled("sess_poll_signal") is True
         with pytest.raises(SessionInterruptedByRequest):
             await poll.raise_if_interrupted()
-        assert store.load_calls == 1
+        assert (store.load_state_calls, store.load_calls) == (1, 0)
 
         control.discard_interrupt_signal("sess_poll_signal")
         assert control.interrupt_signalled("sess_poll_signal") is False
@@ -84,16 +89,53 @@ def test_stream_interrupt_poll_reads_once_per_expired_check(monkeypatch) -> None
 
     async def scenario() -> None:
         await _create_session(store, "sess_poll_expired")
-        store.load_calls = 0
+        store.load_calls = store.load_state_calls = 0
         poll = control.stream_interrupt_poll("sess_poll_expired")
 
         await poll.raise_if_interrupted()
-        assert store.load_calls == 1
+        assert store.load_state_calls == 1
 
         await store.update_status("sess_poll_expired", SessionStatus.INTERRUPTING)
         with pytest.raises(SessionInterruptedByRequest):
             await poll.raise_if_interrupted()
-        assert store.load_calls == 2
+        assert (store.load_state_calls, store.load_calls) == (2, 0)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("status", "requested", "interrupting"),
+    [
+        (SessionStatus.RUNNING, False, False),
+        (SessionStatus.INTERRUPTING, True, True),
+        (SessionStatus.INTERRUPTED, True, False),
+    ],
+)
+def test_interruption_checks_read_only_bounded_session_state(
+    status: SessionStatus, requested: bool, interrupting: bool
+) -> None:
+    store = _CountingSessionStore()
+    control = SessionControl[object](session_store=store)
+
+    async def scenario() -> None:
+        await _create_session(store, "sess_state_check", status=status)
+        store.load_calls = store.load_state_calls = 0
+
+        if requested:
+            with pytest.raises(SessionInterruptedByRequest):
+                await control.raise_if_interrupted("sess_state_check")
+        else:
+            await control.raise_if_interrupted("sess_state_check")
+        assert await control.interrupt_requested("sess_state_check") is requested
+        assert await control.is_interrupting("sess_state_check") is interrupting
+        for check in (
+            control.raise_if_interrupted,
+            control.interrupt_requested,
+            control.is_interrupting,
+        ):
+            with pytest.raises(KeyError):
+                await check("sess_missing")
+        assert (store.load_state_calls, store.load_calls) == (6, 0)
 
     asyncio.run(scenario())
 

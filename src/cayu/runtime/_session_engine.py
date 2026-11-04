@@ -8030,17 +8030,27 @@ class SessionEngine:
                     None if tool_round_identity is None else tool_round_identity.tool_round_id
                 )
                 pending_tool_round = None
+                structured_output_round = (
+                    structured_output is not None
+                    and structured_output.strategy == StructuredOutputStrategy.TOOL
+                    and _has_structured_output_tool_call(tool_calls)
+                )
 
                 if tool_calls:
                     if tool_round_identity is None:
                         raise RuntimeError("Tool calls require a tool-round identity.")
-                    (
-                        _checkpoint,
-                        pending_tool_round,
-                    ) = await pending_round_reader.load_pending_tool_round(
-                        self.session_store,
-                        outcome_state.session.id,
-                    )
+                    if structured_output_round:
+                        (
+                            _checkpoint,
+                            pending_tool_round,
+                        ) = await pending_round_reader.load_pending_tool_round(
+                            self.session_store,
+                            outcome_state.session.id,
+                        )
+                    else:
+                        # Read as the tool round admits it, and handed to the
+                        # round below so it is not read a second time.
+                        pending_tool_round = await tool_round_runner.load_pending_round()
                     if pending_tool_round is None:
                         raise RuntimeError(
                             "Model completion with tool calls lost its durable pending marker."
@@ -8057,11 +8067,7 @@ class SessionEngine:
                         pending_tool_round
                     )
                     expected_durable_tool_calls = tool_calls
-                    if (
-                        structured_output is not None
-                        and structured_output.strategy == StructuredOutputStrategy.TOOL
-                        and _has_structured_output_tool_call(tool_calls)
-                    ):
+                    if structured_output_round:
                         expected_durable_tool_calls = []
                         for call in tool_calls:
                             arguments = self._secret_redactor.redact_json_values(call.arguments)
@@ -8168,11 +8174,7 @@ class SessionEngine:
                 ):
                     continue
 
-                if (
-                    structured_output is not None
-                    and structured_output.strategy == StructuredOutputStrategy.TOOL
-                    and _has_structured_output_tool_call(tool_calls)
-                ):
+                if structured_output_round:
                     if (
                         pending_tool_round is None
                         or tool_round_identity is None
@@ -8680,6 +8682,7 @@ class SessionEngine:
                     tool_calls=tool_calls,
                     tool_round_identity=tool_round_identity,
                     model_step=step,
+                    pending_round=pending_tool_round,
                 )
                 async with contextlib.aclosing(round_stream) as owned_round_stream:
                     async for event in owned_round_stream:
