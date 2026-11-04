@@ -971,6 +971,69 @@ def test_postgres_already_open_codec_less_writer_is_fenced_after_key_initializat
     asyncio.run(runner())
 
 
+def test_postgres_alias_configuration_check_runs_outside_a_transaction(
+    postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import asynccontextmanager
+
+    from cayu.storage import _postgres_public_authority as public_authority_ops
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    original = public_authority_ops.require_current_configuration
+    observed: list[tuple[bool, int]] = []
+
+    async def observing(connect, **kwargs) -> None:
+        @asynccontextmanager
+        async def observed_connect():
+            async with connect() as conn:
+                yield conn
+                observed.append((conn.autocommit, conn.info.transaction_status))
+
+        await original(observed_connect, **kwargs)
+
+    monkeypatch.setattr(public_authority_ops, "require_current_configuration", observing)
+
+    async def runner() -> None:
+        await _truncate(postgres_dsn)
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=1,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=_public_authority_codec(),
+        )
+        try:
+            await store.create(
+                RunRequest(agent_name="assistant", session_id="session", messages=[]),
+                identity=_identity(),
+            )
+            assert await store.load("session") is not None
+            # Each check was one autocommit statement that left no transaction open.
+            assert len(observed) >= 2
+            assert set(observed) == {(True, 0)}
+            async with store._pool.connection() as conn:
+                assert conn.autocommit is False
+
+            async def stalled() -> None:
+                async with store._autocommit_connection() as conn:
+                    await conn.execute("SELECT pg_sleep(30)")
+
+            task = asyncio.create_task(stalled())
+            await asyncio.sleep(0.2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            async with store._pool.connection() as conn:
+                assert conn.autocommit is False
+            assert await store.load("session") is not None
+        finally:
+            await store.close()
+
+    asyncio.run(runner())
+
+
 def test_postgres_store_that_used_a_keyring_names_the_variables_and_opens_read_only_without_it(
     postgres_dsn: str,
 ) -> None:

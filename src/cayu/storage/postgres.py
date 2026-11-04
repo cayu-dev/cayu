@@ -952,8 +952,10 @@ class PostgresSessionStore(
                         acquire_schema_lock=postgres_base._acquire_schema_transaction_lock,
                     )
                     self._public_authority_aliases_reconciled = True
+        # Not cached: another process can rotate the alias keys at any time, and
+        # a stale worker must then fail its next read or write.
         await public_authority_ops.require_current_configuration(
-            self._connection,
+            self._autocommit_connection,
             codec=self.public_authority_alias_codec,
             keyring_optional=self._alias_keyring_optional,
         )

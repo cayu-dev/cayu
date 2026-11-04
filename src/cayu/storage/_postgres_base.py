@@ -28,6 +28,7 @@ from cayu.storage._phase_timing import PostgresTimingScope
 try:
     from psycopg import sql
     from psycopg.errors import DeadlockDetected, DuplicateTable, UniqueViolation
+    from psycopg.pq import TransactionStatus
     from psycopg_pool import AsyncConnectionPool
 except ModuleNotFoundError as exc:
     raise RuntimeError(
@@ -717,6 +718,26 @@ class _PostgresStoreBase:
                 # Session defaults are not stable behind transaction-pooled PgBouncer.
                 await conn.execute("SET TRANSACTION READ ONLY")
             yield conn
+
+    @asynccontextmanager
+    async def _autocommit_connection(self) -> AsyncIterator[Any]:
+        """Acquire a connection that runs each statement as its own transaction.
+
+        For one standalone read this is a single round trip instead of BEGIN,
+        the read and COMMIT. Only use it for statements that need no transaction.
+        """
+        async with PostgresTimingScope(self._pool.connection()) as conn:
+            autocommit = conn.autocommit
+            await conn.set_autocommit(True)
+            try:
+                yield conn
+            finally:
+                if conn.info.transaction_status == TransactionStatus.IDLE:
+                    await conn.set_autocommit(autocommit)
+                else:
+                    # The statement did not finish (a failed cancel, say). Close the
+                    # connection rather than return it to the pool in autocommit mode.
+                    await conn.close()
 
     @asynccontextmanager
     async def _ready_connection(self) -> AsyncIterator[Any]:
