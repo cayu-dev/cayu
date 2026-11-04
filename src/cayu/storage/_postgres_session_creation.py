@@ -30,6 +30,7 @@ from cayu.sessions._run_identity import (
     RUN_LINEAGE_METADATA_KEY,
     run_lineage_for_creation,
     run_marks_for_creation,
+    run_task_for_creation,
 )
 from cayu.sessions._runtime_publication import (
     SessionOperationInitializer,
@@ -535,6 +536,7 @@ async def create_fork(
                 fork.metadata.update(inherited_display_metadata(source_session.metadata))
                 fork.metadata[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(source_session)
                 fork.metadata.update(run_marks_for_creation(source_session))
+                fork.metadata.update(run_task_for_creation(source_session, None))
                 await cur.execute(
                     "SELECT 1 FROM cayu_session_operations "
                     "WHERE session_id = %s AND idempotency_key = %s",

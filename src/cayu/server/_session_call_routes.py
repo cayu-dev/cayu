@@ -221,8 +221,9 @@ def register_session_call_routes(
         description=(
             "Where one session's time went, as `cayu session show` reports it: its elapsed "
             "time split into environment setup, model calls, tool calls, teardown, waits for "
-            "a person, the runtime's own work and idle time between turns, plus each "
-            "environment operation with the steps it timed."
+            "a person, the runtime's own work and idle time between turns, the gaps after "
+            "the first model call when no call ran, how long single model and tool calls "
+            "took, plus each environment operation with the steps it timed."
         ),
     )
     async def get_session_timing(session_id: NonBlankString, response: Response):
@@ -238,6 +239,7 @@ def register_session_call_routes(
                 {**operation, "environment": redact(operation["environment"])}
                 for operation in timing["environment"]
             ],
+            "per_tool": [{**tool, "tool": redact(tool["tool"])} for tool in timing["per_tool"]],
         }
 
 

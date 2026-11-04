@@ -3,7 +3,8 @@
 A worker that runs a session records ``runtime.event_loop.lagged`` events on it while its
 process's event loop stays late (see ``cayu.runtime._event_loop_lag_sessions``).
 `cayu session show` and `cayu task show` read them back as one summary: how many reports,
-how long the loop was late while the session ran, the worst lag, and when.
+how long the loop was late while the session ran, the worst lag, and when. A task's summary
+covers the sessions run under it, and also says how many of them lagged.
 """
 
 from __future__ import annotations
@@ -67,6 +68,34 @@ def event_loop_lag_summary(events: Iterable[Event], *, truncated: bool = False) 
 async def read_event_loop_lag(reader: _EventReader, session_id: str) -> dict[str, Any]:
     """Read one session's lag reports, a page at a time, and summarize them."""
 
+    events, truncated = await _lag_events(reader, session_id)
+    return event_loop_lag_summary(events, truncated=truncated)
+
+
+async def read_sessions_event_loop_lag(
+    reader: _EventReader, session_ids: Iterable[str]
+) -> dict[str, Any]:
+    """Several sessions' lag as one summary, as `event_loop_lag_summary` gives it, plus how
+    many ``sessions`` were read and how many of them lagged (``sessions_lagged``).
+    ``truncated`` says some session had more reports than were read."""
+
+    events: list[Event] = []
+    sessions = lagged = 0
+    truncated = False
+    for session_id in dict.fromkeys(session_ids):
+        read, more = await _lag_events(reader, session_id)
+        sessions += 1
+        lagged += bool(read)
+        truncated = truncated or more
+        events.extend(read)
+    return {
+        **event_loop_lag_summary(events, truncated=truncated),
+        "sessions": sessions,
+        "sessions_lagged": lagged,
+    }
+
+
+async def _lag_events(reader: _EventReader, session_id: str) -> tuple[list[Event], bool]:
     events: list[Event] = []
     after = 0
     truncated = False
@@ -88,7 +117,7 @@ async def read_event_loop_lag(reader: _EventReader, session_id: str) -> dict[str
         if len(page) < _PAGE:
             break
         after = page[-1].sequence
-    return event_loop_lag_summary(events, truncated=truncated)
+    return events, truncated
 
 
 def event_loop_lag_text(summary: object) -> str | None:
@@ -101,9 +130,16 @@ def event_loop_lag_text(summary: object) -> str | None:
     if not reports:
         return None
     worst = _count(data.get("max_lag_ms"))
+    sessions = _count(data.get("sessions"))
+    ran = (
+        "while this session ran"
+        if sessions is None
+        else f"while {_count(data.get('sessions_lagged')) or 0} of this task's {sessions} "
+        f"session{'s' if sessions != 1 else ''} ran"
+    )
     text = (
         "The worker's event loop was late for "
-        f"{_duration(_count(data.get('lagging_ms')) or 0)} while this session ran"
+        f"{_duration(_count(data.get('lagging_ms')) or 0)} {ran}"
         + ("" if worst is None else f", up to {worst / 1000:.2f} s")
         + f" ({reports} report{'s' if reports != 1 else ''}"
         + f", {data.get('first_at')} to {data.get('last_at')})."

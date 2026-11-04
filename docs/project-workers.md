@@ -284,10 +284,45 @@ person or service that reconciled it. `evidence_kind` says what made settling it
 
 `show` reads the same section from a local store, `--server-url` and `--application`.
 
-A task whose session ran while its worker's event loop was late also gets an `Event loop`
-section (`event_loop_lag` in JSON; `null` for a task without a session or from a Cloud Agent
-whose Cayu predates it). It is the session's summary described in
-[Watch for saturation](#watch-for-saturation).
+`show` also adds up the sessions run under the task: its own session (`session_id`) and
+every session marked with the task, such as those its handler started with
+`run_to_completion` and their subagents ([how sessions are linked](session-inspection.md#sessions-run-under-a-task)).
+It reads at most 100 of them, oldest first. `timing` in JSON sums their
+[time breakdowns](session-inspection.md#where-a-sessions-time-went): `sessions`,
+`elapsed_ms`, `first_model_call_ms` (the time before each session's first model call),
+`model_ms`, `tool_ms`, `gap_ms` and the other parts, `model_calls`, `tool_calls`,
+`per_model_call`, `per_tool` and `truncated`, plus `session_ids` (the sessions read),
+`sessions_truncated` (more were left out), `sessions_listed` (false from a Cloud Agent
+whose Cayu predates the link, which then reads only the task's own session) and
+`untimed_session_ids` (sessions whose Agent reports no breakdown). Sessions can run at the
+same time, so the sums can exceed the task's own wall time. The table shows the same
+parts as a session's, added up, then the time before each session's first model call and
+the gaps after it:
+
+```text
+Time over 12 sessions (1h48m elapsed, added up)
+part      time    share  notes
+setup     24m40s  23%    environment setup: allocate, copy in, setup commands
+model     39m02s  36%    164 calls, 14.2s average, longest 1m40s
+tool      22m48s  21%    410 calls
+teardown  6m30s   6%     environment teardown: copy back, release
+waiting   0ms     0%     waiting for a person
+other     9m40s   9%     runtime work inside turns
+idle      5m20s   5%     outside turns
+Before each session's first model call: 31m10s. After it, 15m00s went to neither model nor tool calls (runtime work between steps, setup, teardown, waits and idle time).
+
+Tool calls by tool
+tool         calls  total   average  longest
+read_file    180    9m30s   3.1s     35.0s
+...
+List them with `cayu session list --task TASK_ID`.
+```
+
+A task whose sessions ran while their worker's event loop was late also gets an `Event loop`
+section (`event_loop_lag` in JSON; `null` for a task without any session read, or from a
+Cloud Agent whose Cayu predates it). It is the summary described in
+[Watch for saturation](#watch-for-saturation), over those sessions, with `sessions` and
+`sessions_lagged`.
 
 `wait` reads the task every `--poll-seconds` (default 5) until it ends, then prints it as
 `show` does, with `wait.task_id` (the task you named) and `wait.outcome` added to the JSON.
@@ -531,9 +566,9 @@ that saw a late sample since its last report gets one `runtime.event_loop.lagged
 
 `cayu session show` sums them as `event_loop_lag` (`reports`, `lagging_ms`, `max_lag_ms`,
 `first_at`, `last_at`, `processes`, `truncated`; all zero or `null` for a session with
-none), and `cayu task show` reports the same for the task's session. The tables add a
-sentence such as "The worker's event loop was late for 6m00s while this session ran, up
-to 1.20 s". `cayu session events SESSION_ID --type runtime.event_loop.lagged` lists the
+none), and `cayu task show` reports the same over the sessions run under the task. The
+tables add a sentence such as "The worker's event loop was late for 6m00s while this
+session ran, up to 1.20 s". `cayu session events SESSION_ID --type runtime.event_loop.lagged` lists the
 reports. Every worker of one app shares one recorder, so running several worker loops on
 an app counts each late interval once. A session that ends between two warnings keeps the reports it already got; the
 late samples after its last one aren't recorded. Writing them can fail (it's logged) without

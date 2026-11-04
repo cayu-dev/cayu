@@ -20982,9 +20982,9 @@ export type SessionQueuedMessage = {
  * ``since``/``until`` select sessions by creation time, half-open. ``group_by`` is
  * ``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)
  * or ``label:KEY``. ``causal_budget_id`` keeps the sessions charged to one causal budget (a
- * run and the child sessions it spawned) and ``root_session_id`` the sessions one root
- * invocation started, root included. ``cursor`` continues after the previous page's last
- * session.
+ * run and the child sessions it spawned), ``root_session_id`` the sessions one root
+ * invocation started, root included, and ``task_id`` the sessions run under one task
+ * (``SessionQuery.task_id``). ``cursor`` continues after the previous page's last session.
  */
 export type SessionRollupQuery = {
     /**
@@ -21027,6 +21027,10 @@ export type SessionRollupQuery = {
      */
     since?: string | null;
     status?: SessionStatus | null;
+    /**
+     * Task Id
+     */
+    task_id?: string | null;
     /**
      * Until
      */
@@ -21156,6 +21160,32 @@ export type SessionSummaryResponse = {
 };
 
 /**
+ * SessionTimingCalls
+ *
+ * How long individual calls took: ``calls`` that finished, the ``total_ms`` of their
+ * durations (parallel calls each count in full), and their ``average_ms`` and ``max_ms``.
+ * A tool call's duration leaves out time it waited for an approval.
+ */
+export type SessionTimingCalls = {
+    /**
+     * Average Ms
+     */
+    average_ms?: number | null;
+    /**
+     * Calls
+     */
+    calls?: number;
+    /**
+     * Max Ms
+     */
+    max_ms?: number | null;
+    /**
+     * Total Ms
+     */
+    total_ms?: number;
+};
+
+/**
  * SessionTimingOperation
  *
  * One environment operation: ``factory`` (allocate or reconnect), ``binding`` (copy-in
@@ -21254,6 +21284,10 @@ export type SessionTimingResponse = {
      */
     first_model_call_ms?: number | null;
     /**
+     * Gap Ms
+     */
+    gap_ms?: number;
+    /**
      * Idle Ms
      */
     idle_ms?: number;
@@ -21269,6 +21303,15 @@ export type SessionTimingResponse = {
      * Other Ms
      */
     other_ms?: number;
+    per_model_call?: SessionTimingCalls;
+    /**
+     * Per Tool
+     */
+    per_tool?: Array<SessionTimingTool>;
+    /**
+     * Per Tool Truncated
+     */
+    per_tool_truncated?: boolean;
     /**
      * Session Id
      */
@@ -21294,9 +21337,41 @@ export type SessionTimingResponse = {
      */
     tool_ms?: number;
     /**
+     * Truncated
+     */
+    truncated?: boolean;
+    /**
      * Waiting Ms
      */
     waiting_ms?: number;
+};
+
+/**
+ * SessionTimingTool
+ *
+ * One tool's calls; see `SessionTimingCalls`.
+ */
+export type SessionTimingTool = {
+    /**
+     * Average Ms
+     */
+    average_ms?: number | null;
+    /**
+     * Calls
+     */
+    calls?: number;
+    /**
+     * Max Ms
+     */
+    max_ms?: number | null;
+    /**
+     * Tool
+     */
+    tool: string;
+    /**
+     * Total Ms
+     */
+    total_ms?: number;
 };
 
 /**
@@ -29503,6 +29578,12 @@ export type ListSessionsApiSessionsGetData = {
          * Causal Budget Id
          */
         causal_budget_id?: string | null;
+        /**
+         * Task Id
+         *
+         * Only sessions run under this task: attached to it, created while its handler ran, or children of such a session.
+         */
+        task_id?: string | null;
         order_by?: SessionOrder;
         /**
          * Label

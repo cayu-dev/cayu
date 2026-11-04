@@ -115,6 +115,14 @@ def add_session_parser(subparsers: Any) -> None:
     list_parser.add_argument("--agent", help="Filter by exact agent name.")
     list_parser.add_argument("--environment", help="Filter by exact environment name.")
     list_parser.add_argument(
+        "--task",
+        metavar="TASK_ID",
+        help=(
+            "Only sessions run under this task: attached to it, created while its handler "
+            "ran, or children of such a session."
+        ),
+    )
+    list_parser.add_argument(
         "--label",
         action="append",
         default=[],
@@ -191,6 +199,11 @@ def add_session_parser(subparsers: Any) -> None:
         "--root",
         metavar="SESSION_ID",
         help="Only this root session and the sessions its invocation started.",
+    )
+    rollup_parser.add_argument(
+        "--task",
+        metavar="TASK_ID",
+        help="Only the sessions run under this task (see `cayu session list --task`).",
     )
     rollup_parser.add_argument(
         "--max-sessions",
@@ -931,6 +944,7 @@ async def _list_sessions(args: argparse.Namespace, reader: SessionReader) -> int
             status=None if args.status is None else SessionStatus(args.status),
             agent_name=args.agent,
             environment_name=args.environment,
+            task_id=args.task,
             labels=labels,
             created_since=args.since,
             created_before=args.until,
@@ -1050,6 +1064,7 @@ async def _session_rollup(args: argparse.Namespace, reader: SessionReader) -> in
         labels=_parse_labels(args.label),
         causal_budget_id=args.causal_budget,
         root_session_id=args.root,
+        task_id=args.task,
         cursor=args.cursor,
         max_sessions=min(page_size, args.max_sessions),
         pricing=pricing,
@@ -1252,18 +1267,15 @@ def _print_timing(timing: dict[str, Any] | None) -> None:
     first = timing.get("first_model_call_ms")
     if type(first) is int:
         calls["model"] += f", first after {_duration_text(first)}"
-    _print_table(
-        ("part", "time", "share", "notes"),
-        [
-            {
-                "part": name,
-                "time": _duration_text(timing[f"{name}_ms"]),
-                "share": _share_text(timing[f"{name}_ms"], timing["elapsed_ms"]),
-                "notes": calls.get(name, meaning),
-            }
-            for name, meaning in _TIMING_PARTS
-        ],
-    )
+    single = _call_durations_text(timing.get("per_model_call"))
+    if single is not None:
+        calls["model"] += f", {single}"
+    _print_timing_parts(timing, calls)
+    if type(first) is int and type(timing.get("gap_ms")) is int:
+        print(f"Before the first model call: {_duration_text(first)}. {_gap_text(timing)}")
+    if timing.get("truncated"):
+        print("The session has more events than one breakdown reads; it covers the first.")
+    _print_tool_durations(timing)
     operations = timing.get("environment") or []
     if not operations:
         return
@@ -1291,6 +1303,90 @@ def _print_timing(timing: dict[str, Any] | None) -> None:
     _print_table(("step", "time", "outcome", "work"), rows)
     if timing.get("environment_truncated"):
         print("More environment operations were left out.")
+
+
+def print_timing_totals(totals: dict[str, Any]) -> None:
+    """Print `SessionTimingTotals`: where the time of several sessions went, added up."""
+
+    sessions = totals["sessions"]
+    print(
+        f"Time over {sessions} session{'' if sessions == 1 else 's'} "
+        f"({_duration_text(totals['elapsed_ms'])} elapsed, added up)"
+    )
+    calls = {
+        name: f"{count} call" + ("" if count == 1 else "s")
+        for name, count in (("model", totals["model_calls"]), ("tool", totals["tool_calls"]))
+    }
+    single = _call_durations_text(totals.get("per_model_call"))
+    if single is not None:
+        calls["model"] += f", {single}"
+    _print_timing_parts(totals, calls)
+    print(
+        f"Before each session's first model call: "
+        f"{_duration_text(totals['first_model_call_ms'])}. {_gap_text(totals)}"
+    )
+    if totals.get("truncated"):
+        print("Some sessions have more events than one breakdown reads; they cover the first.")
+    _print_tool_durations(totals)
+
+
+def _print_timing_parts(timing: dict[str, Any], notes: dict[str, str]) -> None:
+    """The parts that add up to the elapsed time, with their shares of it."""
+
+    _print_table(
+        ("part", "time", "share", "notes"),
+        [
+            {
+                "part": name,
+                "time": _duration_text(timing[f"{name}_ms"]),
+                "share": _share_text(timing[f"{name}_ms"], timing["elapsed_ms"]),
+                "notes": notes.get(name, meaning),
+            }
+            for name, meaning in _TIMING_PARTS
+        ],
+    )
+
+
+def _gap_text(timing: dict[str, Any]) -> str:
+    return (
+        f"After it, {_duration_text(timing['gap_ms'])} went to neither model nor tool calls "
+        "(runtime work between steps, setup, teardown, waits and idle time)."
+    )
+
+
+def _call_durations_text(calls: object) -> str | None:
+    """``27.0s average, longest 1m02s``, or nothing for no finished call."""
+
+    if not isinstance(calls, dict):
+        return None
+    data = cast("dict[str, Any]", calls)
+    average, longest = data.get("average_ms"), data.get("max_ms")
+    if type(average) is not int or type(longest) is not int:
+        return None
+    return f"{_duration_text(average)} average, longest {_duration_text(longest)}"
+
+
+def _print_tool_durations(timing: dict[str, Any]) -> None:
+    tools = timing.get("per_tool") or []
+    if not tools:
+        return
+    print()
+    print("Tool calls by tool")
+    _print_table(
+        ("tool", "calls", "total", "average", "longest"),
+        [
+            {
+                "tool": tool["tool"],
+                "calls": tool["calls"],
+                "total": _duration_text(tool["total_ms"]),
+                "average": _optional_duration_text(tool.get("average_ms")),
+                "longest": _optional_duration_text(tool.get("max_ms")),
+            }
+            for tool in tools
+        ],
+    )
+    if timing.get("per_tool_truncated"):
+        print("More tools were left out.")
 
 
 def _share_text(part_ms: int, elapsed_ms: int) -> str:

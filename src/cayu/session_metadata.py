@@ -1,8 +1,10 @@
 """Reserved descriptive metadata shared by SDK authors and read projections.
 
 Title and summary are written through typed session APIs. Description belongs
-in AgentSpec.metadata. Eval-trial and run-lineage marks are runtime authority;
-attention-handoff is a caller-authored opt-out, inherited by descendants.
+in AgentSpec.metadata. Eval-trial, run-lineage and task marks are runtime authority;
+attention-handoff is a caller-authored opt-out, inherited by descendants. The task mark
+names the task a session runs under: the task it is attached to, the task whose handler
+created it, or its parent's.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ DESCRIPTION_METADATA_KEY = "cayu:description"
 EVAL_TRIAL_METADATA_KEY = "cayu:eval_trial"
 ATTENTION_HANDOFF_METADATA_KEY = "cayu:attention_handoff"
 RUN_LINEAGE_METADATA_KEY = "cayu:run_lineage"
+TASK_METADATA_KEY = "cayu:task_id"
 MAX_SESSION_TITLE_LENGTH = 256
 MAX_SESSION_SUMMARY_LENGTH = 4096
 MAX_AGENT_DESCRIPTION_LENGTH = 1024

@@ -28,6 +28,7 @@ from cayu.sessions._run_identity import (
     RUN_LINEAGE_METADATA_KEY,
     run_lineage_for_creation,
     run_marks_for_creation,
+    run_task_for_creation,
 )
 from cayu.sessions._runtime_publication import (
     SessionOperationInitializer,
@@ -726,6 +727,7 @@ async def create_fork(
         fork.metadata.update(inherited_display_metadata(source_session.metadata))
         fork.metadata[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(source_session)
         fork.metadata.update(run_marks_for_creation(source_session))
+        fork.metadata.update(run_task_for_creation(source_session, None))
         if MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY in state.session_operation_records.get(
             source_session_id, {}
         ):

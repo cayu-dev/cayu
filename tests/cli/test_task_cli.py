@@ -667,6 +667,9 @@ def test_wait_never_reports_an_earlier_attempts_end_for_an_unread_successor(
                 raise CayuApiError("unreachable", "Could not connect to the Agent.")
             return second
 
+        async def task_session_ids(self, task: dict[str, Any]) -> None:
+            return None
+
         async def close(self) -> None:
             return None
 
@@ -716,6 +719,9 @@ def test_wait_keeps_the_task_it_read_when_its_series_history_cant_be_read(
             if task_id == "retry-2":
                 return retry
             raise CayuApiError("unreachable", "Could not connect to the Agent.")
+
+        async def task_session_ids(self, task: dict[str, Any]) -> None:
+            return None
 
         async def close(self) -> None:
             return None
@@ -767,6 +773,9 @@ def test_wait_with_no_wait_fails_at_once_on_a_sleeping_agent() -> None:
         async def load_task(self, task_id: str) -> dict[str, Any] | None:
             reads.append(task_id)
             raise CayuApiError("starting", "The Agent a is starting.", status_code=503)
+
+        async def task_session_ids(self, task: dict[str, Any]) -> None:
+            return None
 
         async def close(self) -> None:
             return None

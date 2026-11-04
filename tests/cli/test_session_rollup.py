@@ -565,6 +565,7 @@ def test_rollup_marks_every_call_unpriced_when_the_agent_cant_price(capsys) -> N
             label=[],
             causal_budget=None,
             root=None,
+            task=None,
             cursor=None,
             max_sessions=100,
             price_book=None,

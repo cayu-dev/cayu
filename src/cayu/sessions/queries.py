@@ -22,7 +22,7 @@ from pydantic import (
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes, copy_label_map
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.budgets.aggregates import AggregateCount
-from cayu.session_metadata import TITLE_METADATA_KEY
+from cayu.session_metadata import TASK_METADATA_KEY, TITLE_METADATA_KEY
 from cayu.sessions.records import (
     PendingActionSession,
     Session,
@@ -152,6 +152,9 @@ class SessionQuery(BaseModel):
     # Sessions whose invocation provenance names this root session, root included.
     root_session_id: str | None = None
     causal_budget_id: str | None = None
+    # Sessions run under this task: attached to it, created while its handler ran, or
+    # children of such a session (their `cayu:task_id` metadata).
+    task_id: str | None = None
     # Sessions created strictly after this instant.
     created_after: datetime | None = None
     # Sessions created in the half-open window [created_since, created_before).
@@ -203,6 +206,7 @@ class SessionQuery(BaseModel):
         "parent_session_id",
         "root_session_id",
         "causal_budget_id",
+        "task_id",
     )
     @classmethod
     def validate_optional_nonblank_fields(
@@ -363,6 +367,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         parent_session_id=query.parent_session_id,
         root_session_id=query.root_session_id,
         causal_budget_id=query.causal_budget_id,
+        task_id=query.task_id,
         created_after=query.created_after,
         created_since=query.created_since,
         created_before=query.created_before,
@@ -425,6 +430,8 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
     ):
         return False
     if query.causal_budget_id is not None and session.causal_budget_id != query.causal_budget_id:
+        return False
+    if query.task_id is not None and session.metadata.get(TASK_METADATA_KEY) != query.task_id:
         return False
     if query.created_after is not None and session.created_at <= query.created_after:
         return False

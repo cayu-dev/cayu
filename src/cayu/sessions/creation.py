@@ -37,8 +37,10 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions._run_identity import (
     EVAL_TRIAL_METADATA_KEY,
     RUN_LINEAGE_METADATA_KEY,
+    TASK_METADATA_KEY,
     run_lineage_for_creation,
     run_marks_for_creation,
+    run_task_for_creation,
 )
 from cayu.sessions.fork_overlays import FORK_LINEAGE_METADATA_KEY, fork_lineage_for_child
 from cayu.sessions.forks import FORK_EXECUTION_PROFILE_METADATA_KEY
@@ -174,8 +176,15 @@ def session_metadata_for_creation(
         raise ValueError("Session metadata contains runtime-owned run-lineage authority.")
     if EVAL_TRIAL_METADATA_KEY in copied:
         raise ValueError("Session metadata contains the runtime-owned eval-trial mark.")
+    if TASK_METADATA_KEY in copied:
+        raise ValueError("Session metadata contains the runtime-owned task mark.")
     copied[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(parent_session)
     copied.update(run_marks_for_creation(parent_session))
+    copied.update(
+        run_task_for_creation(
+            parent_session, None if prepared_request is None else prepared_request.task_id
+        )
+    )
     # Preserve both forked and known unforked lineage at the create boundary,
     # so later parent deletion or detachment cannot change the child's status.
     lineage = None if parent_session is None else fork_lineage_for_child(parent_session)

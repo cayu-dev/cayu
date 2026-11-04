@@ -114,6 +114,7 @@ The reserved conventions are defined once in `cayu.session_metadata`:
 | `cayu:eval_trial` | Runtime-owned eval-trial marker, inherited by descendants. |
 | `cayu:attention_handoff` | Caller-set `False` opts out of human-attention handoff, inherited by descendants. |
 | `cayu:run_lineage` | Runtime-owned original run ancestry. |
+| `cayu:task_id` | Runtime-owned: the task the session runs under, inherited by descendants. See [Sessions run under a task](#sessions-run-under-a-task). |
 
 Display text must be an exact string, nonblank, without control characters or
 surrogates. Validation rejects rather than truncates. Titles pass through the
@@ -467,6 +468,9 @@ cayu session list --status completed --agent reviewer --label tenant=acme
 # means UTC midnight.
 cayu session list --since 2026-10-27 --until 2026-10-28T12:00:00-07:00
 
+# The sessions run under one task, such as those its handler started.
+cayu session list --task TASK_ID
+
 # Each session's overview and first user message, as the Sessions page shows them.
 cayu session list --overview
 cayu session list --overview --table --application bug-hunter
@@ -558,7 +562,33 @@ read mid-turn shows its work as it stands rather than as idle time.
 
 `elapsed_ms`, `started_at` and `ended_at` give the whole span, `model_calls` and
 `tool_calls` the counts, and `first_model_call_ms` how long after the start the first
-model call began. `environment` lists each environment operation in the order it
+model call began. `gap_ms` is the time after that not counted in `model_ms` or `tool_ms`:
+the runtime's work between steps, environment setup and teardown, waits for a person and
+idle time, including setup and waits that happen inside a call (a deferred environment
+starting during a tool call, an approval wait, a call still running when the events were
+read); in a session without a model call it is all the time not counted in `tool_ms`. So
+these add up to the elapsed time:
+
+| View | Fields |
+| --- | --- |
+| Total | `elapsed_ms` |
+| Before the first model call | `first_model_call_ms` |
+| Model calls running | `model_ms` |
+| Tool calls running, parallel calls once | `tool_ms` |
+| Neither, after the first model call | `gap_ms` |
+
+The one exception is a tool call that ran before the first model call: its time counts in
+both `first_model_call_ms` and `tool_ms`.
+
+`per_model_call` says how long single model calls took: `calls` (those with a recorded
+start and end), `total_ms`, `average_ms` and `max_ms`. `per_tool` lists the same for each
+tool, the longest total first, with its `tool` name; parallel calls each count in full
+here, and a call's time waiting for an approval is left out. It lists at most 100 tools
+(`per_tool_truncated` says more were left out). One breakdown reads at most 100,000 of
+the session's timed events (model, tool, environment, turn and wait events); `truncated`
+says it stopped there, and the breakdown then covers the time up to the last event read.
+
+`environment` lists each environment operation in the order it
 started (at most 100; `environment_truncated` says more were left out): its `kind`
 (`factory`, `binding`, `materialization` or `finalize`), `environment`, `started_at`,
 `duration_ms`, `outcome` (`completed`, `failed` or `running`) and `phases`, the steps the
@@ -569,16 +599,23 @@ steps it ran inside: `archive_preparation` runs inside `transfer`) and, when the
 reported them, `items` and `bytes`. A session recorded before Cayu timed the steps, or a
 binding that reports none, has empty `phases`; the operation and the parts still show.
 
-The table prints the parts with their share of the elapsed time, then one row per
-operation and step:
+The table prints the parts with their share of the elapsed time, the time before the
+first model call and the gaps, each tool's calls, then one row per operation and step:
 
 ```console
 Time (53m48s elapsed)
 part      time    share  notes
 setup     7m42s   14%    environment setup: allocate, copy in, setup commands
-model     17m02s  32%    22 calls, first after 8m42s
+model     17m02s  32%    22 calls, first after 8m42s, 46.4s average, longest 2m10s
 tool      11m24s  21%    62 calls
 teardown  12m12s  23%    environment teardown: copy back, release
+...
+Before the first model call: 8m42s. After it, 16m40s went to neither model nor tool calls (runtime work between steps, setup, teardown, waits and idle time).
+
+Tool calls by tool
+tool         calls  total  average  longest
+run_tests    9      6m12s  41.3s    1m58s
+read_file    31     3m40s  7.0s     35.0s
 ...
 
 Environment operations
@@ -592,8 +629,26 @@ finalize (sandbox)            12m12s completed  -
   sandbox_release             2.1s   completed  -
 ```
 
-For a Cloud Agent the CLI reads `GET /api/sessions/{id}/timing`. An Agent whose Cayu
-predates it reports `timing` as `null`, and the table says to redeploy.
+For a Cloud Agent the CLI reads `GET /api/sessions/{id}/timing`, which the Agent computes
+with the same code as a local read. An Agent whose Cayu predates it reports `timing` as
+`null`, and the table says to redeploy; one whose Cayu predates `gap_ms`, `per_model_call`
+and `per_tool` reports them as zero or empty.
+
+### Sessions run under a task
+
+Runtime marks each session with the task it runs under, in the runtime-owned session
+metadata `cayu:task_id`: the task a session is attached to as its execution
+(`RunRequest.task_id`), else the task whose handler is running when the session is
+created, else the task of the session it was created under (a subagent or a later child).
+Run, fork and metadata requests that set `cayu:task_id` are refused. A session a handler
+starts some other way, such as through another application's API, is not marked.
+
+`cayu session list --task TASK_ID`, `SessionQuery(task_id=...)` and
+`GET /api/sessions?task_id=...` list them. `cayu task show` adds them up (see
+[Inspect tasks](project-workers.md#inspect-tasks)). Sessions
+created before Cayu recorded the mark have none, so they aren't listed; a task's own
+`session_id` is still read. A Cloud Agent whose Cayu predates the mark ignores the filter;
+the CLI notices and says to redeploy.
 
 ### Structured output
 
@@ -685,7 +740,10 @@ the session ran (`runtime.event_loop.lagged` events; see
 [Watch for saturation](project-workers.md#watch-for-saturation)). `cayu session show`
 sums them as `event_loop_lag`: `reports`, `lagging_ms` (about how long the loop was late),
 `max_lag_ms`, `first_at`, `last_at`, `processes` and `truncated` (more than 1,440 reports,
-of which the first were read). The table adds a sentence when there were any. A session
+of which the first were read). The table adds a sentence when there were any. `cayu task
+show` gives the same over the sessions run under the task, with `sessions` (how many were
+read) and `sessions_lagged` (how many lagged); sessions that ran at the same time each
+count the lag they saw. A session
 slowed by its process shows lag here; one slowed by its own work doesn't. A Cloud Agent
 whose Cayu predates these events reports `event_loop_lag` as `null`.
 
@@ -758,13 +816,17 @@ cayu session rollup --since 2026-10-01 --by label:repository --agent hunter --js
 cayu session rollup --by release --application bug-hunter --table
 cayu session rollup --causal-budget CAUSAL_BUDGET_ID --by agent --table
 cayu session rollup --root RUN_SESSION_ID --json
+cayu session rollup --task TASK_ID --by agent --table
 ```
 
 `--causal-budget ID` keeps the sessions charged to one causal budget, which a run shares
 with the child sessions it spawns (`cayu session show` prints it as `causal_budget_id`; by
 default it is the root session's id, or its task's). `--root SESSION_ID`
 keeps a root session and every session its invocation started. Either one sums a single
-workflow run; combined with `--label` or `--by label:KEY` they compare runs.
+workflow run; combined with `--label` or `--by label:KEY` they compare runs. `--task
+TASK_ID` keeps the sessions run under one task (see
+[Sessions run under a task](#sessions-run-under-a-task)), so `--by agent` shows which of a
+task's agents used its time and tokens.
 
 Each group reports its sessions and their statuses, model calls (with usage evidence and
 errors), tool calls and tool failures, aggregate token usage (auxiliary inference and

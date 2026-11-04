@@ -325,7 +325,11 @@ def test_session_and_task_show_report_the_lag(lagged_store, capsys) -> None:
     assert "late for 2m00s while this session ran, up to 1.20 s (2 reports" in text
 
     assert main(["task", "show", task_id, "--sqlite", str(database), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["event_loop_lag"] == lag
+    assert json.loads(capsys.readouterr().out)["event_loop_lag"] == {
+        **lag,
+        "sessions": 1,
+        "sessions_lagged": 1,
+    }
 
     assert main(["task", "show", task_id, "--sqlite", str(database), "--table"]) == 0
     text = capsys.readouterr().out
@@ -412,7 +416,11 @@ def test_a_cloud_agent_reports_the_same_lag(agent, capsys) -> None:
     assert shown["event_loop_lag"]["reports"] == 2
 
     task = _show(capsys, "task", "show", task_id, *remote)
-    assert task["event_loop_lag"] == local["event_loop_lag"]
+    assert task["event_loop_lag"] == {
+        **local["event_loop_lag"],
+        "sessions": 1,
+        "sessions_lagged": 1,
+    }
 
 
 def test_an_older_agent_reports_no_lag(agent, capsys, monkeypatch) -> None:

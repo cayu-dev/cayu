@@ -144,6 +144,7 @@ from cayu.sessions._run_identity import (
     RUN_LINEAGE_METADATA_KEY,
     run_lineage_for_creation,
     run_marks_for_creation,
+    run_task_for_creation,
 )
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
@@ -1970,6 +1971,7 @@ class SessionFork:
         fork_lineage = fork_lineage_for_fork(source_lineage, controller=fork_owner)
         fork_metadata[RUN_LINEAGE_METADATA_KEY] = run_lineage_for_creation(source_session)
         fork_metadata.update(run_marks_for_creation(source_session))
+        fork_metadata.update(run_task_for_creation(source_session, None))
         if fork_lineage is not None:
             fork_metadata[FORK_LINEAGE_METADATA_KEY] = fork_lineage
         prompt_workflow.attach_receipt(

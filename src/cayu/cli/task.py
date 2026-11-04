@@ -25,13 +25,15 @@ from cayu.cli._read_targets import (
 )
 from cayu.cli._task_readers import (
     MAX_TASK_PAGE,
+    MAX_TASK_SESSIONS,
     ApiTaskReader,
     TaskListRequest,
     TaskReader,
     open_store_task_reader,
 )
-from cayu.cli.session import _redact_sensitive
+from cayu.cli.session import _redact_sensitive, print_timing_totals
 from cayu.sessions._event_loop_lag import event_loop_lag_text
+from cayu.sessions._rollup import SessionTiming, add_session_timings
 from cayu.tasks.cancellation import (
     TaskCancellationReconciliationEventType,
     TaskRetryCancellationReconciliationEventType,
@@ -448,6 +450,13 @@ async def _wait_for_task(args: argparse.Namespace, reader: TaskReader) -> int:
 
 async def _task_payload(reader: TaskReader, task: dict[str, Any]) -> dict[str, Any]:
     session_id = task.get("session_id")
+    linked = await reader.task_session_ids(task)
+    linked_ids, more = linked or ([], False)
+    # The task's own session, then the sessions run under it. Sessions created before Cayu
+    # recorded the link aren't listed.
+    session_ids = list(
+        dict.fromkeys([*([session_id] if isinstance(session_id, str) else []), *linked_ids])
+    )[:MAX_TASK_SESSIONS]
     return _redact_sensitive(
         {
             "schema_version": CLI_SCHEMA_VERSION,
@@ -455,11 +464,40 @@ async def _task_payload(reader: TaskReader, task: dict[str, Any]) -> dict[str, A
             "task": task,
             "cancellation": cancellation_summary(task),
             "retry_series": await _retry_series(reader, task),
-            "event_loop_lag": (
-                await reader.event_loop_lag(session_id) if isinstance(session_id, str) else None
+            "event_loop_lag": (await reader.event_loop_lag(session_ids) if session_ids else None),
+            "timing": await _task_timing(
+                reader, session_ids, listed=linked is not None, truncated=more
             ),
         }
     )
+
+
+async def _task_timing(
+    reader: TaskReader, session_ids: list[str], *, listed: bool, truncated: bool
+) -> dict[str, Any]:
+    """The time breakdown summed over the task's sessions (``SessionTimingTotals``).
+
+    ``session_ids`` names the sessions read, ``sessions_truncated`` says more were left
+    out, ``sessions_listed`` whether the source could list the sessions run under the task
+    (an Agent whose Cayu predates the link can't), and ``untimed_session_ids`` the sessions
+    whose breakdown the source didn't report.
+    """
+
+    timings: list[SessionTiming] = []
+    untimed: list[str] = []
+    for session_id in session_ids:
+        timing = await reader.session_timing(session_id)
+        if timing is None:
+            untimed.append(session_id)
+        else:
+            timings.append(SessionTiming.model_validate(timing))
+    return {
+        **add_session_timings(timings).model_dump(mode="json"),
+        "session_ids": session_ids,
+        "sessions_truncated": truncated,
+        "sessions_listed": listed,
+        "untimed_session_ids": untimed,
+    }
 
 
 def _render_task(args: argparse.Namespace, payload: dict[str, Any]) -> None:
@@ -769,6 +807,7 @@ def _print_task(payload: dict[str, Any]) -> None:
                     if value is not None and key != "summary"
                 ],
             )
+    _print_task_timing(payload.get("timing"), task["id"])
     lag = event_loop_lag_text(payload.get("event_loop_lag"))
     if lag is not None:
         print("\nEvent loop")
@@ -795,6 +834,30 @@ def _print_task(payload: dict[str, Any]) -> None:
                     keep_lines=True,
                 )
             )
+
+
+def _print_task_timing(timing: object, task_id: str) -> None:
+    if not isinstance(timing, dict):
+        return
+    data = cast("dict[str, Any]", timing)
+    print()
+    if not data["session_ids"]:
+        print(
+            "Sessions: none run under this task are recorded."
+            if data["sessions_listed"]
+            else "Sessions: this Agent's Cayu doesn't list the sessions run under a task; "
+            "redeploy it with a newer cayu release to see them."
+        )
+        return
+    print_timing_totals(data)
+    if data["sessions_truncated"]:
+        print(f"Only the first {MAX_TASK_SESSIONS} sessions were read.")
+    if data["untimed_session_ids"]:
+        print(
+            f"{len(data['untimed_session_ids'])} sessions report no timing; their Agent's "
+            "Cayu predates it."
+        )
+    print(terminal_safe(f"List them with `cayu session list --task {task_id}`."))
 
 
 def _page_limit(value: str) -> int:

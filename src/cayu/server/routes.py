@@ -7790,6 +7790,15 @@ def create_router(
         environment_name: str | None = None,
         parent_session_id: str | None = None,
         causal_budget_id: str | None = None,
+        task_id: Annotated[
+            str | None,
+            Query(
+                description=(
+                    "Only sessions run under this task: attached to it, created while its "
+                    "handler ran, or children of such a session."
+                )
+            ),
+        ] = None,
         order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
         label: Annotated[list[str] | None, Query()] = None,
         label_selector: Annotated[list[str] | None, Query()] = None,
@@ -7846,6 +7855,7 @@ def create_router(
             or environment_name is not None
             or parent_session_id is not None
             or causal_budget_id is not None
+            or task_id is not None
             or label
             or label_selector
             or created_since is not None
@@ -7884,6 +7894,7 @@ def create_router(
                     ),
                     parent_session_id=private_parent_session_id,
                     causal_budget_id=private_causal_budget_id,
+                    task_id=_clean_optional_query_value(task_id, "task_id"),
                     labels=labels,
                     label_selectors=label_selectors,
                     created_since=created_since,

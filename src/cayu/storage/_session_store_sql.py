@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 
 from cayu.events import EventType
-from cayu.session_metadata import TITLE_METADATA_KEY
+from cayu.session_metadata import TASK_METADATA_KEY, TITLE_METADATA_KEY
 from cayu.sessions.event_queries import EventOrder, EventQuery, copy_event_query
 from cayu.sessions.queries import (
     LabelSelectorOperator,
@@ -349,6 +349,12 @@ def build_session_query_sql(
         column="causal_budget_id",
         value=query.causal_budget_id,
     )
+    if query.task_id is not None:
+        metadata = _row_metadata(dialect)
+        clauses.append(
+            f"{_json_text(dialect, metadata, TASK_METADATA_KEY)} = {dialect.placeholder}"
+        )
+        params.append(query.task_id)
     if query.created_after is not None:
         clauses.append(f"created_at > {dialect.placeholder}")
         params.append(dialect.datetime_param(query.created_after))

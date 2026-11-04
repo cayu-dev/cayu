@@ -2,21 +2,28 @@
 
 Both readers return tasks in the shape of the Cayu server's task API (``GET
 /api/tasks`` and ``GET /api/tasks/{id}``), so the command renders one shape whichever
-it read. ``StoreTaskReader`` takes any ``TaskStore``; ``open_store_task_reader`` opens a
-SQLite or Postgres one read-only. ``ApiTaskReader`` takes any ``CayuApi``, such as a Cayu
-Cloud Agent's (`open_cloud_agent_api`).
+it read. They also read the sessions run under a task (``SessionQuery.task_id``): their
+time breakdown and the event-loop lag recorded on them. ``StoreTaskReader`` takes any
+``TaskStore``; ``open_store_task_reader`` opens a SQLite or Postgres one read-only.
+``ApiTaskReader`` takes any ``CayuApi``, such as a Cayu Cloud Agent's
+(`open_cloud_agent_api`).
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol, cast
 from urllib.parse import quote
 
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, CayuApiNotFound
 from cayu.cli.store_targets import SessionStoreBackend, SessionStoreTarget
-from cayu.sessions._event_loop_lag import read_event_loop_lag
+from cayu.sessions._event_loop_lag import read_sessions_event_loop_lag
+from cayu.sessions._rollup import session_timing
+from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.queries import SessionOrder, SessionQuery
+from cayu.sessions.records import EventRecord
 from cayu.sessions.store import SessionStore
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task, TaskStatus, task_error_code
@@ -24,6 +31,10 @@ from cayu.tasks.store import TaskStore
 
 # The server's task list takes at most this many rows per page (`TaskQuery.limit`).
 MAX_TASK_PAGE = 1000
+# Sessions run under one task that `cayu task show` reads; the rest are left out.
+MAX_TASK_SESSIONS = 100
+# A session is created after the task it runs under; this allows for clock skew.
+_TASK_SESSION_SKEW = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -53,9 +64,19 @@ class TaskReader(Protocol):
         """The task's detail, with its result, or ``None`` when there is no such task."""
         ...
 
-    async def event_loop_lag(self, session_id: str) -> dict[str, Any] | None:
-        """The worker's event-loop lag recorded on the task's session
-        (``cayu.sessions._event_loop_lag``), or ``None`` when the source can't say."""
+    async def task_session_ids(self, task: dict[str, Any]) -> tuple[list[str], bool] | None:
+        """The sessions run under the task, oldest first: at most ``MAX_TASK_SESSIONS``,
+        and whether more were left out. ``None`` when the source can't list them."""
+        ...
+
+    async def session_timing(self, session_id: str) -> dict[str, Any] | None:
+        """The session's time breakdown (``SessionTiming``), or ``None`` when the source
+        can't say."""
+        ...
+
+    async def event_loop_lag(self, session_ids: Sequence[str]) -> dict[str, Any] | None:
+        """The worker's event-loop lag recorded on these sessions
+        (``read_sessions_event_loop_lag``), or ``None`` when the source can't say."""
         ...
 
     async def close(self) -> None: ...
@@ -91,10 +112,27 @@ class StoreTaskReader:
         task = await self._store.load_task(task_id)
         return None if task is None else task_projection(task, detail=True)
 
-    async def event_loop_lag(self, session_id: str) -> dict[str, Any] | None:
+    async def task_session_ids(self, task: dict[str, Any]) -> tuple[list[str], bool] | None:
         if self._sessions is None:
             return None
-        return await read_event_loop_lag(self._sessions, session_id)
+        ids: list[str] = []
+        query = task_session_query(task)
+        while True:
+            page = await self._sessions.list_sessions(query)
+            ids.extend(session.id for session in page.sessions)
+            if len(ids) > MAX_TASK_SESSIONS or page.next_cursor is None:
+                return ids[:MAX_TASK_SESSIONS], len(ids) > MAX_TASK_SESSIONS
+            query = query.model_copy(update={"cursor": page.next_cursor})
+
+    async def session_timing(self, session_id: str) -> dict[str, Any] | None:
+        if self._sessions is None or await self._sessions.load(session_id) is None:
+            return None
+        return (await session_timing(self._sessions, session_id)).model_dump(mode="json")
+
+    async def event_loop_lag(self, session_ids: Sequence[str]) -> dict[str, Any] | None:
+        if self._sessions is None:
+            return None
+        return await read_sessions_event_loop_lag(self._sessions, session_ids)
 
     async def close(self) -> None:
         for store in (self._store, self._sessions):
@@ -141,11 +179,25 @@ class ApiTaskReader:
             raise CayuApiError("not_cayu", f"{self._api.description} returned an invalid task.")
         return body
 
-    async def event_loop_lag(self, session_id: str) -> dict[str, Any] | None:
+    async def task_session_ids(self, task: dict[str, Any]) -> tuple[list[str], bool] | None:
         from cayu.cli._agent_session_reader import AgentSessionReader
 
         try:
-            return await AgentSessionReader(self._api).event_loop_lag(session_id)
+            page = await AgentSessionReader(self._api).list_sessions(task_session_query(task))
+        except CayuApiError as exc:
+            # A server without session reads, an Agent whose Cayu predates the task filter,
+            # or one that didn't answer just now.
+            if exc.category in {"unsupported", "not_found"} or exc.transient:
+                return None
+            raise
+        ids = [row["id"] for row in page.rows if isinstance(row.get("id"), str)]
+        return ids[:MAX_TASK_SESSIONS], len(ids) > MAX_TASK_SESSIONS
+
+    async def session_timing(self, session_id: str) -> dict[str, Any] | None:
+        from cayu.cli._agent_session_reader import AgentSessionReader
+
+        try:
+            return AgentSessionReader(self._api).timing(session_id)
         except ValueError:
             # The task names a session the server no longer has.
             return None
@@ -155,8 +207,59 @@ class ApiTaskReader:
             # The server didn't answer just now; the task itself was read.
             return None
 
+    async def event_loop_lag(self, session_ids: Sequence[str]) -> dict[str, Any] | None:
+        from cayu.cli._agent_session_reader import AgentSessionReader
+
+        try:
+            return await read_sessions_event_loop_lag(
+                _SkipMissingSessions(AgentSessionReader(self._api)), session_ids
+            )
+        except CayuApiError as exc:
+            # An Agent whose Cayu predates the record refuses its event type; the server
+            # may also not have answered just now. The task itself was read.
+            if exc.category in {"request_rejected", "unsupported"} or exc.transient:
+                return None
+            raise
+
     async def close(self) -> None:
         self._api.close()
+
+
+class _SkipMissingSessions:
+    """Reads events as ``reader`` does, finding none for a session the server no longer
+    has."""
+
+    def __init__(self, reader: Any) -> None:
+        self._reader = reader
+
+    async def query_events(self, query: EventQuery) -> list[EventRecord]:
+        try:
+            return await self._reader.query_events(query)
+        except ValueError:
+            return []
+
+
+def task_session_query(task: dict[str, Any]) -> SessionQuery:
+    """The first page of the sessions run under ``task``, oldest first."""
+
+    created = _instant(task.get("created_at"))
+    return SessionQuery(
+        task_id=task["id"],
+        created_since=None if created is None else created - _TASK_SESSION_SKEW,
+        order_by=SessionOrder.CREATED_AT_ASC,
+        # One more than shown says whether more were left out.
+        limit=MAX_TASK_SESSIONS + 1,
+    )
+
+
+def _instant(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        instant = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return instant if instant.tzinfo is not None else None
 
 
 def open_store_task_reader(target: SessionStoreTarget) -> StoreTaskReader:

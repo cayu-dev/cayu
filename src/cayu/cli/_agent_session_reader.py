@@ -30,6 +30,7 @@ from cayu.cli._session_reader import (
     aggregate_usage_cli_payload,
 )
 from cayu.events import Event
+from cayu.session_metadata import TASK_METADATA_KEY
 from cayu.sessions._call_inspection import InspectionWindow
 from cayu.sessions._event_loop_lag import read_event_loop_lag
 from cayu.sessions._rollup import RollupPage, SessionRollupQuery, SessionTiming
@@ -69,6 +70,7 @@ class AgentSessionReader:
             "environment_name": query.environment_name,
             "parent_session_id": query.parent_session_id,
             "causal_budget_id": query.causal_budget_id,
+            "task_id": query.task_id,
             "label": [f"{key}={value}" for key, value in query.labels.items()],
             "order_by": query.order_by.value,
             "created_since": _instant(query.created_since),
@@ -84,6 +86,7 @@ class AgentSessionReader:
             params["offset"] = None
         rows: list[dict[str, Any]] = []
         filtered_here = False
+        task_checked = False
         while True:
             # Ask only for what the page still needs, so no row is read past the cursor.
             params["limit"] = min(query.limit - len(rows) + skip, 1000)
@@ -105,6 +108,9 @@ class AgentSessionReader:
                 raise CayuApiError(
                     "not_cayu", "The Agent's session list has no overview for every session."
                 )
+            if query.task_id is not None and not task_checked and sessions:
+                self._require_task_filter(sessions[0], query.task_id)
+                task_checked = True
             for index, item in enumerate(cast("list[Any]", sessions)):
                 if not isinstance(item, dict):
                     continue
@@ -134,6 +140,19 @@ class AgentSessionReader:
             # from the Agent is never trusted.
             total_count=None if windowed or type(total_count) is not int else total_count,
         )
+
+    def _require_task_filter(self, item: object, task_id: str) -> None:
+        """Refuse a list an Agent didn't filter by task: its Cayu predates the filter, so it
+        ignores it, and it never marked a session with the task it runs under either."""
+
+        session_id = _mapping(item).get("id")
+        detail = self._session_get(session_id) if isinstance(session_id, str) else {}
+        if _mapping(detail.get("metadata")).get(TASK_METADATA_KEY) != task_id:
+            raise CayuApiError(
+                "unsupported",
+                "This Agent's Cayu doesn't list sessions by task yet; redeploy it with a "
+                "newer cayu release to read them from the CLI.",
+            )
 
     async def require_session(self, session_id: str) -> None:
         self._session_get(session_id)
@@ -209,7 +228,7 @@ class AgentSessionReader:
                 "state": status if status in {"failed", "interrupted"} else "none"
             },
             "budget": None,
-            "timing": self._timing(session_id),
+            "timing": self.timing(session_id),
         }
 
     async def event_loop_lag(self, session_id: str) -> dict[str, Any] | None:
@@ -223,7 +242,7 @@ class AgentSessionReader:
                 return None
             raise
 
-    def _timing(self, session_id: str) -> dict[str, Any] | None:
+    def timing(self, session_id: str) -> dict[str, Any] | None:
         """The session's time breakdown; ``None`` from an Agent whose Cayu predates it."""
 
         try:
@@ -315,13 +334,16 @@ class AgentSessionReader:
                 )
             except CayuApiError as exc:
                 if exc.status_code in {400, 422} and (
-                    query.causal_budget_id is not None or query.root_session_id is not None
+                    query.causal_budget_id is not None
+                    or query.root_session_id is not None
+                    or query.task_id is not None
                 ):
                     raise CayuApiError(
                         "request_rejected",
-                        f"{exc} The Agent's Cayu may predate rollups scoped by --causal-budget "
-                        "or --root; redeploy it with a newer cayu release, or run `cayu session "
-                        "rollup --sqlite PATH` on a copy of its session store.",
+                        f"{exc} The Agent's Cayu may predate rollups scoped by "
+                        "--causal-budget, --root or --task; redeploy it with a newer cayu "
+                        "release, or run `cayu session rollup --sqlite PATH` on a copy of its "
+                        "session store.",
                         status_code=exc.status_code,
                         detail=exc.detail,
                     ) from None
@@ -583,7 +605,7 @@ def _mapping(value: object) -> dict[str, Any]:
 
 
 # Rollup fields a later Cayu added; an older Agent rejects them whatever their value.
-_OPTIONAL_ROLLUP_FIELDS = ("pricing", "causal_budget_id", "root_session_id")
+_OPTIONAL_ROLLUP_FIELDS = ("pricing", "causal_budget_id", "root_session_id", "task_id")
 
 
 def _rollup_body(query: SessionRollupQuery) -> dict[str, Any]:

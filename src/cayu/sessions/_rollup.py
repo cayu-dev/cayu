@@ -147,9 +147,9 @@ class SessionRollupQuery(BaseModel):
     ``since``/``until`` select sessions by creation time, half-open. ``group_by`` is
     ``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)
     or ``label:KEY``. ``causal_budget_id`` keeps the sessions charged to one causal budget (a
-    run and the child sessions it spawned) and ``root_session_id`` the sessions one root
-    invocation started, root included. ``cursor`` continues after the previous page's last
-    session.
+    run and the child sessions it spawned), ``root_session_id`` the sessions one root
+    invocation started, root included, and ``task_id`` the sessions run under one task
+    (``SessionQuery.task_id``). ``cursor`` continues after the previous page's last session.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
@@ -163,6 +163,7 @@ class SessionRollupQuery(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     causal_budget_id: str | None = None
     root_session_id: str | None = None
+    task_id: str | None = None
     cursor: str | None = None
     max_sessions: StrictInt = Field(default=100, ge=1, le=ROLLUP_MAX_SESSIONS_PER_PAGE)
     # Prices every model call on its own date; without it groups report no cost.
@@ -197,6 +198,7 @@ class SessionRollupQuery(BaseModel):
             labels=self.labels,
             causal_budget_id=self.causal_budget_id,
             root_session_id=self.root_session_id,
+            task_id=self.task_id,
             created_since=self.since,
             created_before=self.until,
             cursor=self.cursor,
@@ -397,10 +399,19 @@ class _SessionScan:
     first_at: datetime | None
     last_at: datetime | None
     first_model_at: datetime | None
+    # Each finished model call's span, and each finished tool call's with its tool's name.
+    model_call_spans: list[Span]
+    tool_call_spans: list[tuple[str, Span]]
+    # The read stopped at ``max_events``; everything above covers only the events read.
+    truncated: bool
 
 
 async def _scan_session(
-    store: SessionStore, session_id: str, *, pricing: PriceBook | None
+    store: SessionStore,
+    session_id: str,
+    *,
+    pricing: PriceBook | None,
+    max_events: int | None = None,
 ) -> _SessionScan:
     facts = SessionFacts()
     model_open: dict[str, datetime] = {}
@@ -422,6 +433,9 @@ async def _scan_session(
     pricer = None if pricing is None else CallPricer(pricing)
     wait_open: dict[tuple[str, str], datetime] = {}
     wait_spans: list[Span] = []
+    tool_call_spans: list[tuple[str, Span]] = []
+    truncated = False
+    read = 0
 
     def start_operation(key: tuple[str, str] | None, event: Event) -> None:
         nonlocal operations_truncated
@@ -454,6 +468,10 @@ async def _scan_session(
         operation.phase_timings = event.payload.get("phase_timings")
 
     async for record in _events(store, session_id):
+        if max_events is not None and read >= max_events:
+            truncated = True
+            break
+        read += 1
         event = record.event
         payload = event.payload
         at = event.timestamp
@@ -515,6 +533,7 @@ async def _scan_session(
             started = None if call is None else tool_open.pop(call, None)
             if started is not None:
                 tool_spans.append((started, at))
+                tool_call_spans.append((event.tool_name or _NO_VALUE, (started, at)))
             # An approval can also resolve as a block (ambiguous policy evidence).
             waited = wait_open.pop(("approval", _text(payload.get("approval_id")) or ""), None)
             if waited is not None:
@@ -574,6 +593,7 @@ async def _scan_session(
     # A tool call that waited for approval spans the wait; turn time leaves waits out, so
     # every phase does too. A wait still open runs to the end of what was read.
     wait_spans.extend((started, _NEVER) for started in wait_open.values())
+    model_call_spans = model_spans
     model_spans = _without(model_spans, wait_spans)
     tool_spans = _without(tool_spans, wait_spans)
     setup_spans = _without(setup_spans, wait_spans)
@@ -606,10 +626,17 @@ async def _scan_session(
         first_at=first_at,
         last_at=last_at,
         first_model_at=first_model_at,
+        model_call_spans=model_call_spans,
+        tool_call_spans=tool_call_spans,
+        truncated=truncated,
     )
 
 
 SESSION_TIMING_MAX_OPERATIONS = 100
+# Distinct tools `per_tool` lists; the rest are left out (`per_tool_truncated`).
+SESSION_TIMING_MAX_TOOLS = 100
+# Timed events (model, tool, environment, turn and wait events) one breakdown reads.
+SESSION_TIMING_MAX_EVENTS = 100_000
 
 
 class SessionTimingPhase(BaseModel):
@@ -643,6 +670,25 @@ class SessionTimingOperation(BaseModel):
     phases: list[SessionTimingPhase] = Field(default_factory=list)
 
 
+class SessionTimingCalls(BaseModel):
+    """How long individual calls took: ``calls`` that finished, the ``total_ms`` of their
+    durations (parallel calls each count in full), and their ``average_ms`` and ``max_ms``.
+    A tool call's duration leaves out time it waited for an approval."""
+
+    model_config = _RESPONSE_CONFIG
+
+    calls: StrictInt = Field(default=0, ge=0)
+    total_ms: StrictInt = Field(default=0, ge=0)
+    average_ms: StrictInt | None = Field(default=None, ge=0)
+    max_ms: StrictInt | None = Field(default=None, ge=0)
+
+
+class SessionTimingTool(SessionTimingCalls):
+    """One tool's calls; see `SessionTimingCalls`."""
+
+    tool: str
+
+
 class SessionTiming(BaseModel):
     """Where one session's time went, in milliseconds.
 
@@ -656,6 +702,14 @@ class SessionTiming(BaseModel):
     A call, environment operation or turn still running when the events were read counts
     until the last event. ``first_model_call_ms`` is how long after the start the first
     model call began.
+
+    ``gap_ms`` is the time after the first model call began (the whole session without one)
+    not counted in ``model_ms`` or ``tool_ms``: the runtime's work between steps, setup,
+    teardown, waits (also those inside a call) and idle time. So ``first_model_call_ms``,
+    ``model_ms``, ``tool_ms`` and ``gap_ms`` add up to the elapsed time, unless a tool call
+    ran before the first model call (that time counts in both). ``per_model_call`` and
+    ``per_tool`` say how long single calls took. ``truncated`` says the session had more timed events than
+    one breakdown reads; it then covers the time up to the last event read.
     """
 
     model_config = _RESPONSE_CONFIG
@@ -675,12 +729,20 @@ class SessionTiming(BaseModel):
     first_model_call_ms: StrictInt | None = Field(default=None, ge=0)
     environment: list[SessionTimingOperation] = Field(default_factory=list)
     environment_truncated: bool = False
+    # Agents whose Cayu predates these fields report their defaults.
+    gap_ms: StrictInt = Field(default=0, ge=0)
+    per_model_call: SessionTimingCalls = Field(default_factory=SessionTimingCalls)
+    per_tool: list[SessionTimingTool] = Field(default_factory=list)
+    per_tool_truncated: bool = False
+    truncated: bool = False
 
 
 async def session_timing(store: SessionStore, session_id: str) -> SessionTiming:
     """Split one session's elapsed time into setup, model, tools, teardown and the rest."""
 
-    scan = await _scan_session(store, session_id, pricing=None)
+    scan = await _scan_session(
+        store, session_id, pricing=None, max_events=SESSION_TIMING_MAX_EVENTS
+    )
     # The scan reads only the event types it accounts for; the session's own first and
     # last events (streamed text, progress, ...) bound its elapsed time.
     bounds = [
@@ -694,7 +756,8 @@ async def session_timing(store: SessionStore, session_id: str) -> SessionTiming:
     if not seen:
         return SessionTiming()
     start = min([*seen, *(span[0] for span in scan.turn_spans)])
-    end = max(seen)
+    # A truncated read says nothing about the time after its last event.
+    end = scan.last_at if scan.truncated and scan.last_at is not None else max(seen)
     unfinished = scan.unfinished
     # Each part is what its spans add to everything claimed before it, so rounding to
     # milliseconds keeps the parts adding up to the elapsed time.
@@ -714,6 +777,21 @@ async def session_timing(store: SessionStore, session_id: str) -> SessionTiming:
         parts[name] = total - claimed_ms
         claimed_ms = total
     elapsed = _union_ms([(start, end)])
+    # Calls at work as ``model_ms`` and ``tool_ms`` count them: the waits, setup and
+    # teardown inside a call (unfinished ones too) are cut out and fall in the gaps.
+    calls = _without(
+        [*scan.model_spans, *unfinished["model"], *scan.tool_spans, *unfinished["tool"]],
+        [
+            *scan.wait_spans,
+            *scan.setup_spans,
+            *unfinished["setup"],
+            *scan.teardown_spans,
+            *unfinished["teardown"],
+        ],
+    )
+    first_model_at = scan.first_model_at if scan.first_model_at is not None else start
+    busy = _union_ms(_clip([(start, first_model_at), *calls], start, end))
+    per_tool, per_tool_truncated = _per_tool(scan.tool_call_spans, scan.wait_spans)
     return SessionTiming(
         started_at=start,
         ended_at=end,
@@ -734,6 +812,130 @@ async def session_timing(store: SessionStore, session_id: str) -> SessionTiming:
         ),
         environment=[_timing_operation(item) for item in scan.operations],
         environment_truncated=scan.operations_truncated,
+        gap_ms=max(elapsed - busy, 0),
+        per_model_call=_call_durations([_span_ms(span) for span in scan.model_call_spans]),
+        per_tool=per_tool,
+        per_tool_truncated=per_tool_truncated,
+        truncated=scan.truncated,
+    )
+
+
+def _span_ms(span: Span) -> int:
+    return max(round((span[1] - span[0]).total_seconds() * 1000), 0)
+
+
+def _call_durations(durations: list[int]) -> SessionTimingCalls:
+    return _calls(len(durations), sum(durations), max(durations, default=None))
+
+
+def _calls(calls: int, total_ms: int, max_ms: int | None) -> SessionTimingCalls:
+    return SessionTimingCalls(
+        calls=calls,
+        total_ms=total_ms,
+        average_ms=round(total_ms / calls) if calls else None,
+        max_ms=max_ms,
+    )
+
+
+def _per_tool(
+    calls: list[tuple[str, Span]], waits: list[Span]
+) -> tuple[list[SessionTimingTool], bool]:
+    """Each tool's call durations, waits cut out, longest total first."""
+
+    durations: dict[str, list[int]] = {}
+    for tool, span in calls:
+        durations.setdefault(tool, []).append(_union_ms(_without([span], waits)))
+    return _tool_rows({tool: _call_durations(values) for tool, values in durations.items()})
+
+
+def _tool_rows(tools: dict[str, SessionTimingCalls]) -> tuple[list[SessionTimingTool], bool]:
+    rows = sorted(tools.items(), key=lambda item: (-item[1].total_ms, item[0]))
+    return [
+        SessionTimingTool(tool=tool, **calls.model_dump())
+        for tool, calls in rows[:SESSION_TIMING_MAX_TOOLS]
+    ], len(rows) > SESSION_TIMING_MAX_TOOLS
+
+
+class SessionTimingTotals(BaseModel):
+    """`SessionTiming` added up over several sessions, such as those a task ran.
+
+    ``sessions`` counts the sessions added. Every duration and count is the sum of theirs;
+    sessions can run at the same time, so ``elapsed_ms`` can exceed the wall time they
+    spanned. ``first_model_call_ms`` adds up each session's time before its first model
+    call. ``per_model_call`` and ``per_tool`` merge their calls; ``truncated`` says some
+    session's breakdown was partial.
+    """
+
+    model_config = _RESPONSE_CONFIG
+
+    sessions: StrictInt = Field(default=0, ge=0)
+    elapsed_ms: StrictInt = Field(default=0, ge=0)
+    first_model_call_ms: StrictInt = Field(default=0, ge=0)
+    setup_ms: StrictInt = Field(default=0, ge=0)
+    model_ms: StrictInt = Field(default=0, ge=0)
+    tool_ms: StrictInt = Field(default=0, ge=0)
+    teardown_ms: StrictInt = Field(default=0, ge=0)
+    waiting_ms: StrictInt = Field(default=0, ge=0)
+    other_ms: StrictInt = Field(default=0, ge=0)
+    idle_ms: StrictInt = Field(default=0, ge=0)
+    gap_ms: StrictInt = Field(default=0, ge=0)
+    model_calls: StrictInt = Field(default=0, ge=0)
+    tool_calls: StrictInt = Field(default=0, ge=0)
+    per_model_call: SessionTimingCalls = Field(default_factory=SessionTimingCalls)
+    per_tool: list[SessionTimingTool] = Field(default_factory=list)
+    per_tool_truncated: bool = False
+    truncated: bool = False
+
+
+_SUMMED_TIMING_FIELDS = (
+    "elapsed_ms",
+    "setup_ms",
+    "model_ms",
+    "tool_ms",
+    "teardown_ms",
+    "waiting_ms",
+    "other_ms",
+    "idle_ms",
+    "gap_ms",
+    "model_calls",
+    "tool_calls",
+)
+
+
+def add_session_timings(timings: Iterable[SessionTiming]) -> SessionTimingTotals:
+    """Add several sessions' breakdowns up; see `SessionTimingTotals`."""
+
+    sums = dict.fromkeys(_SUMMED_TIMING_FIELDS, 0)
+    sessions = first_model = 0
+    tools: dict[str, SessionTimingCalls] = {}
+    model = SessionTimingCalls()
+    truncated = per_tool_truncated = False
+    for timing in timings:
+        sessions += 1
+        for name in _SUMMED_TIMING_FIELDS:
+            sums[name] += getattr(timing, name)
+        first_model += timing.first_model_call_ms or 0
+        model = _merge_calls(model, timing.per_model_call)
+        for tool in timing.per_tool:
+            tools[tool.tool] = _merge_calls(tools.get(tool.tool, SessionTimingCalls()), tool)
+        truncated = truncated or timing.truncated
+        per_tool_truncated = per_tool_truncated or timing.per_tool_truncated
+    per_tool, more_tools = _tool_rows(tools)
+    return SessionTimingTotals(
+        sessions=sessions,
+        first_model_call_ms=first_model,
+        **sums,
+        per_model_call=model,
+        per_tool=per_tool,
+        per_tool_truncated=per_tool_truncated or more_tools,
+        truncated=truncated,
+    )
+
+
+def _merge_calls(left: SessionTimingCalls, right: SessionTimingCalls) -> SessionTimingCalls:
+    worst = [value for value in (left.max_ms, right.max_ms) if value is not None]
+    return _calls(
+        left.calls + right.calls, left.total_ms + right.total_ms, max(worst, default=None)
     )
 
 

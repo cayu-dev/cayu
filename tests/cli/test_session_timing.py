@@ -209,6 +209,184 @@ def test_elapsed_time_runs_to_the_last_event_of_any_type(tmp_path: Path) -> None
     assert (timing.elapsed_ms, timing.model_ms, timing.idle_ms) == (60_000, 59_000, 1_000)
 
 
+def test_parallel_tool_calls_count_once_and_each_tool_reports_its_calls(tmp_path: Path) -> None:
+    # Model 2-10 s; three tools 10-20, 11-14 and 12-30 s in one round; model 32-40 s;
+    # an approval wait 50-55 s inside a tool call 48-58 s; the last event at 60 s.
+    call = {"tool_round_id": "r"}
+    timing = _timing_of(
+        tmp_path,
+        [
+            (EventType.SESSION_STARTED, 0, None, {}),
+            (EventType.MODEL_STARTED, 2, None, dict(_ATTEMPT)),
+            (EventType.MODEL_COMPLETED, 10, None, dict(_ATTEMPT)),
+            (EventType.TOOL_CALL_STARTED, 10, "read_file", {**call, "tool_call_id": "a"}),
+            (EventType.TOOL_CALL_STARTED, 11, "read_file", {**call, "tool_call_id": "b"}),
+            (EventType.TOOL_CALL_STARTED, 12, "shell", {**call, "tool_call_id": "c"}),
+            (EventType.TOOL_CALL_COMPLETED, 14, "read_file", {**call, "tool_call_id": "b"}),
+            (EventType.TOOL_CALL_COMPLETED, 20, "read_file", {**call, "tool_call_id": "a"}),
+            (EventType.TOOL_CALL_FAILED, 30, "shell", {**call, "tool_call_id": "c"}),
+            (EventType.MODEL_STARTED, 32, None, dict(_SECOND_ATTEMPT)),
+            (EventType.MODEL_COMPLETED, 40, None, dict(_SECOND_ATTEMPT)),
+            (EventType.TOOL_CALL_STARTED, 48, "shell", {**call, "tool_call_id": "d"}),
+            (EventType.TOOL_CALL_APPROVAL_REQUESTED, 50, "shell", {"approval_id": "ap"}),
+            (EventType.TOOL_CALL_APPROVED, 55, "shell", {"approval_id": "ap"}),
+            (EventType.TOOL_CALL_COMPLETED, 58, "shell", {**call, "tool_call_id": "d"}),
+            (EventType.SESSION_COMPLETED, 60, None, {}),
+        ],
+    )
+
+    assert (timing.elapsed_ms, timing.first_model_call_ms) == (60_000, 2_000)
+    assert (timing.model_ms, timing.tool_ms, timing.waiting_ms) == (16_000, 25_000, 5_000)
+    # 30-32, 40-48, the 5 s wait and 58-60 s.
+    assert timing.gap_ms == 17_000
+    assert timing.first_model_call_ms + 16_000 + 25_000 + timing.gap_ms == timing.elapsed_ms
+    assert timing.per_model_call.model_dump() == {
+        "calls": 2,
+        "total_ms": 16_000,
+        "average_ms": 8_000,
+        "max_ms": 8_000,
+    }
+    # Each call counts in full, the approval wait left out.
+    assert [tool.model_dump() for tool in timing.per_tool] == [
+        {"tool": "shell", "calls": 2, "total_ms": 23_000, "average_ms": 11_500, "max_ms": 18_000},
+        {
+            "tool": "read_file",
+            "calls": 2,
+            "total_ms": 13_000,
+            "average_ms": 6_500,
+            "max_ms": 10_000,
+        },
+    ]
+    assert not timing.truncated and not timing.per_tool_truncated
+
+
+def test_a_session_without_model_calls_or_with_unpaired_events(tmp_path: Path) -> None:
+    call = {"tool_round_id": "r"}
+    timing = _timing_of(
+        tmp_path,
+        [
+            (EventType.SESSION_STARTED, 0, None, {}),
+            # A tool call recorded without its start, and one that never ended.
+            (EventType.TOOL_CALL_COMPLETED, 5, "shell", {**call, "tool_call_id": "a"}),
+            (EventType.TOOL_CALL_STARTED, 10, "shell", {**call, "tool_call_id": "b"}),
+            (EventType.SESSION_COMPLETED, 30, None, {}),
+        ],
+    )
+
+    assert timing.first_model_call_ms is None
+    assert timing.per_model_call.model_dump() == {
+        "calls": 0,
+        "total_ms": 0,
+        "average_ms": None,
+        "max_ms": None,
+    }
+    # The open call runs to the last event; neither unpaired call has a duration.
+    assert (timing.tool_ms, timing.gap_ms) == (20_000, 10_000)
+    assert timing.per_tool == []
+
+    empty = _timing_of(tmp_path / "empty", [])
+    assert (empty.elapsed_ms, empty.gap_ms, empty.first_model_call_ms) == (0, 0, None)
+
+
+def test_waits_and_setup_inside_a_call_fall_in_the_gaps(tmp_path: Path) -> None:
+    call = {"tool_round_id": "r"}
+    # Model 0-5 s; a tool from 5 s still running at the last event (30 s), which waited
+    # for an approval 5-25 s.
+    waiting = _timing_of(
+        tmp_path / "waiting",
+        [
+            (EventType.MODEL_STARTED, 0, None, dict(_ATTEMPT)),
+            (EventType.MODEL_COMPLETED, 5, None, dict(_ATTEMPT)),
+            (EventType.TOOL_CALL_STARTED, 5, "shell", {**call, "tool_call_id": "a"}),
+            (EventType.TOOL_CALL_APPROVAL_REQUESTED, 5, "shell", {"approval_id": "ap"}),
+            (EventType.TOOL_CALL_APPROVED, 25, "shell", {"approval_id": "ap"}),
+            (EventType.MODEL_TEXT_DELTA, 30, None, {**_ATTEMPT, "delta": "x"}),
+        ],
+    )
+    assert (waiting.elapsed_ms, waiting.waiting_ms, waiting.model_ms) == (30_000, 20_000, 5_000)
+    assert (waiting.tool_ms, waiting.gap_ms) == (5_000, 20_000)
+
+    # Model 0-10 s; a tool 10-40 s during which a deferred environment started 10-30 s.
+    deferred = _timing_of(
+        tmp_path / "deferred",
+        [
+            (EventType.MODEL_STARTED, 0, None, dict(_ATTEMPT)),
+            (EventType.MODEL_COMPLETED, 10, None, dict(_ATTEMPT)),
+            (EventType.TOOL_CALL_STARTED, 10, "shell", {**call, "tool_call_id": "a"}),
+            (EventType.ENVIRONMENT_MATERIALIZATION_STARTED, 10, None, dict(_BINDING)),
+            (EventType.ENVIRONMENT_MATERIALIZATION_COMPLETED, 30, None, dict(_BINDING)),
+            (EventType.TOOL_CALL_COMPLETED, 40, "shell", {**call, "tool_call_id": "a"}),
+        ],
+    )
+    assert (deferred.model_ms, deferred.tool_ms, deferred.setup_ms) == (10_000, 10_000, 20_000)
+    assert (deferred.first_model_call_ms, deferred.gap_ms) == (0, 20_000)
+    for timing in (waiting, deferred):
+        assert (
+            timing.first_model_call_ms + timing.model_ms + timing.tool_ms + timing.gap_ms
+            == timing.elapsed_ms
+        )
+
+
+def test_a_breakdown_reads_a_bounded_number_of_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cayu.sessions._rollup as rollup
+
+    monkeypatch.setattr(rollup, "SESSION_TIMING_MAX_EVENTS", 3)
+    timing = _timing_of(
+        tmp_path,
+        [
+            (EventType.SESSION_STARTED, 0, None, {}),
+            (EventType.MODEL_STARTED, 2, None, dict(_ATTEMPT)),
+            (EventType.MODEL_COMPLETED, 10, None, dict(_ATTEMPT)),
+            (EventType.MODEL_STARTED, 20, None, dict(_SECOND_ATTEMPT)),
+            (EventType.MODEL_COMPLETED, 30, None, dict(_SECOND_ATTEMPT)),
+        ],
+    )
+
+    # It covers the time up to the last event read, and says so.
+    assert timing.truncated
+    assert (timing.elapsed_ms, timing.model_ms, timing.model_calls) == (10_000, 8_000, 1)
+
+
+def test_breakdowns_add_up_over_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    import cayu.sessions._rollup as rollup
+    from cayu.sessions._rollup import (
+        SessionTiming,
+        SessionTimingCalls,
+        SessionTimingTool,
+        add_session_timings,
+    )
+
+    def tool(name: str, calls: int, total: int, longest: int) -> SessionTimingTool:
+        return SessionTimingTool(tool=name, calls=calls, total_ms=total, max_ms=longest)
+
+    first = SessionTiming(
+        elapsed_ms=100,
+        model_ms=40,
+        tool_ms=30,
+        gap_ms=10,
+        first_model_call_ms=20,
+        model_calls=2,
+        per_model_call=SessionTimingCalls(calls=2, total_ms=40, average_ms=20, max_ms=30),
+        per_tool=[tool("read_file", 2, 20, 15), tool("shell", 1, 10, 10)],
+    )
+    second = SessionTiming(elapsed_ms=50, tool_ms=50, per_tool=[tool("read_file", 1, 50, 50)])
+    monkeypatch.setattr(rollup, "SESSION_TIMING_MAX_TOOLS", 1)
+
+    totals = add_session_timings([first, second, SessionTiming(truncated=True)])
+
+    assert (totals.sessions, totals.elapsed_ms, totals.tool_ms, totals.gap_ms) == (3, 150, 80, 10)
+    # A session without a model call adds nothing before its first one.
+    assert (totals.first_model_call_ms, totals.model_calls) == (20, 2)
+    assert totals.per_model_call.average_ms == 20
+    assert [item.model_dump() for item in totals.per_tool] == [
+        {"tool": "read_file", "calls": 3, "total_ms": 70, "average_ms": 23, "max_ms": 50}
+    ]
+    assert totals.per_tool_truncated and totals.truncated
+    assert add_session_timings([]).sessions == 0
+
+
 def test_rollup_counts_teardown_apart_from_turn_time(database: Path) -> None:
     facts = asyncio.run(_read(database, lambda store: session_facts(store, "timed")))
 
@@ -285,9 +463,13 @@ def test_session_show_reports_the_breakdown_as_json_and_text(tmp_path: Path, cap
     assert "copy_back_publication" in {phase["phase"] for phase in finalize["phases"]}
     assert all(operation["outcome"] == "completed" for operation in timing["environment"])
 
+    assert timing["per_model_call"]["calls"] == 1
+    assert timing["first_model_call_ms"] + timing["gap_ms"] <= timing["elapsed_ms"]
+
     assert main(["session", "show", "run", "--sqlite", str(database), "--table"]) == 0
     text = capsys.readouterr().out
     assert "elapsed)" in text
+    assert "Before the first model call: " in text and "average, longest" in text
     assert "binding (sandbox)" in text and "finalize (sandbox)" in text
     assert "  transfer" in text
 
@@ -316,6 +498,33 @@ def test_operations_without_step_timings_still_render(capsys) -> None:
 
     _print_timing(None)
     assert "doesn't report session timing" in capsys.readouterr().out
+
+
+def test_session_show_lists_each_tools_calls(capsys) -> None:
+    from cayu.cli.session import _print_timing
+    from cayu.sessions._rollup import SessionTiming, SessionTimingTool
+
+    timing = SessionTiming(
+        elapsed_ms=60_000,
+        tool_ms=30_000,
+        tool_calls=3,
+        first_model_call_ms=5_000,
+        gap_ms=25_000,
+        per_tool=[
+            SessionTimingTool(
+                tool="read_file", calls=3, total_ms=33_000, average_ms=11_000, max_ms=20_000
+            )
+        ],
+        per_tool_truncated=True,
+        truncated=True,
+    )
+    _print_timing(timing.model_dump(mode="json"))
+    text = capsys.readouterr().out
+
+    assert "After it, 25.0s went to neither model nor tool calls (runtime work" in text
+    assert "read_file  3      33.0s  11.0s    20.0s" in text
+    assert "More tools were left out." in text
+    assert "it covers the first" in text
 
 
 def test_session_usage_reports_each_calls_start_duration_and_first_output(

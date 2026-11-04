@@ -10235,6 +10235,16 @@ indexes `root_session_id` with creation order
 (`idx_cayu_sessions_root_session_created`), so tree-scoped, newest-first pages
 read the index without a sort.
 
+`SessionQuery.task_id` selects the sessions run under a task: those whose runtime-owned
+`cayu:task_id` session metadata names it. Runtime sets that mark when it creates a
+session, from the task the session is attached to (`RunRequest.task_id`), else the managed
+task whose handler is running (the handler's context, which asyncio tasks it starts
+inherit), else the session's parent; run, fork and metadata requests that set it are
+refused. Memory, SQLite and PostgreSQL stores apply the filter natively. It is not
+indexed, so a reader of a large store pairs it with `created_since` (a task's sessions are
+created after the task), as `cayu task show` does. `GET /api/sessions?task_id=...` takes
+the same filter, and `cayu session list --task TASK_ID` reads it.
+
 `SessionStore.load_bounded_transcript_window(session_id, start_index=...,
 limit=..., max_record_bytes=..., max_total_bytes=...)` reads an absolute-index
 transcript window without loading a message before its stored size is known.
@@ -21138,9 +21148,10 @@ two fields and every built-in store applies them in its native query.
 `max_sessions` (at most 500) sessions created in the `since`/`until` window, oldest first,
 the per-group sums of sessions, statuses, model and tool calls, tool failures by error kind,
 aggregate usage and time by phase. `group_by` is `agent`, `day`, `release` or `label:KEY`;
-`agent_name`, `environment_name`, `status`, `labels`, `causal_budget_id` and
-`root_session_id` filter sessions (the last two accept public session aliases, resolved as
-`GET /api/sessions` resolves `causal_budget_id`). With a `pricing`
+`agent_name`, `environment_name`, `status`, `labels`, `causal_budget_id`,
+`root_session_id` and `task_id` filter sessions (`causal_budget_id` and `root_session_id`
+accept public session aliases, resolved as `GET /api/sessions` resolves
+`causal_budget_id`). With a `pricing`
 price book each group also sums its model calls' estimated cost per currency (`cost`) and
 counts `unpriced_model_calls`. Groups merge by
 adding, so a client reads `next_cursor` pages and merges groups with the same key. Each

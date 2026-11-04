@@ -13,6 +13,7 @@ from cayu.session_metadata import (
     ATTENTION_HANDOFF_METADATA_KEY,
     EVAL_TRIAL_METADATA_KEY,
     RUN_LINEAGE_METADATA_KEY,
+    TASK_METADATA_KEY,
 )
 
 if TYPE_CHECKING:
@@ -138,6 +139,26 @@ def run_marks_for_creation(parent: Session | None) -> dict[str, bool]:
     if parent is not None and parent.metadata.get(ATTENTION_HANDOFF_METADATA_KEY) is False:
         marks[ATTENTION_HANDOFF_METADATA_KEY] = False
     return marks
+
+
+def run_task_for_creation(parent: Session | None, attached_task_id: str | None) -> dict[str, str]:
+    """The task mark a new session takes: the task it is attached to, else the task whose
+    handler creates it, else its parent's.
+
+    `cayu task show` finds a task's sessions by it (`SessionQuery.task_id`).
+    """
+
+    from cayu.runtime._task_lease_authority import current_task_id
+
+    task_id = attached_task_id or current_task_id() or session_task_id(parent)
+    return {} if task_id is None else {TASK_METADATA_KEY: task_id}
+
+
+def session_task_id(session: Session | None) -> str | None:
+    """The task the session runs under (see `run_task_for_creation`), or ``None``."""
+
+    value = None if session is None else session.metadata.get(TASK_METADATA_KEY)
+    return value if type(value) is str and value else None
 
 
 def run_lineage_for_creation(parent: Session | None) -> dict[str, str | bool | None]:

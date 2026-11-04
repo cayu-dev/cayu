@@ -42292,7 +42292,7 @@
       },
       "SessionRollupQuery": {
         "additionalProperties": false,
-        "description": "Which sessions a rollup reads and how it groups them.\n\n``since``/``until`` select sessions by creation time, half-open. ``group_by`` is\n``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)\nor ``label:KEY``. ``causal_budget_id`` keeps the sessions charged to one causal budget (a\nrun and the child sessions it spawned) and ``root_session_id`` the sessions one root\ninvocation started, root included. ``cursor`` continues after the previous page's last\nsession.",
+        "description": "Which sessions a rollup reads and how it groups them.\n\n``since``/``until`` select sessions by creation time, half-open. ``group_by`` is\n``agent``, ``day`` (UTC creation date), ``release`` (the Release the session started on)\nor ``label:KEY``. ``causal_budget_id`` keeps the sessions charged to one causal budget (a\nrun and the child sessions it spawned), ``root_session_id`` the sessions one root\ninvocation started, root included, and ``task_id`` the sessions run under one task\n(``SessionQuery.task_id``). ``cursor`` continues after the previous page's last session.",
         "properties": {
           "agent_name": {
             "anyOf": [
@@ -42399,6 +42399,17 @@
                 "type": "null"
               }
             ]
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
           },
           "until": {
             "anyOf": [
@@ -42636,6 +42647,49 @@
         "title": "SessionSummaryResponse",
         "type": "object"
       },
+      "SessionTimingCalls": {
+        "description": "How long individual calls took: ``calls`` that finished, the ``total_ms`` of their\ndurations (parallel calls each count in full), and their ``average_ms`` and ``max_ms``.\nA tool call's duration leaves out time it waited for an approval.",
+        "properties": {
+          "average_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Average Ms"
+          },
+          "calls": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Calls",
+            "type": "integer"
+          },
+          "max_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Ms"
+          },
+          "total_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Total Ms",
+            "type": "integer"
+          }
+        },
+        "title": "SessionTimingCalls",
+        "type": "object"
+      },
       "SessionTimingOperation": {
         "description": "One environment operation: ``factory`` (allocate or reconnect), ``binding`` (copy-in\nand setup), ``materialization`` (a deferred environment starting) or ``finalize``\n(copy-back and release). ``phases`` is empty for a session recorded before Cayu timed\nthe steps, or for a binding that reports none.",
         "properties": {
@@ -42808,6 +42862,12 @@
             ],
             "title": "First Model Call Ms"
           },
+          "gap_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Gap Ms",
+            "type": "integer"
+          },
           "idle_ms": {
             "default": 0,
             "minimum": 0.0,
@@ -42831,6 +42891,21 @@
             "minimum": 0.0,
             "title": "Other Ms",
             "type": "integer"
+          },
+          "per_model_call": {
+            "$ref": "#/components/schemas/SessionTimingCalls"
+          },
+          "per_tool": {
+            "items": {
+              "$ref": "#/components/schemas/SessionTimingTool"
+            },
+            "title": "Per Tool",
+            "type": "array"
+          },
+          "per_tool_truncated": {
+            "default": false,
+            "title": "Per Tool Truncated",
+            "type": "boolean"
           },
           "session_id": {
             "title": "Session Id",
@@ -42872,6 +42947,11 @@
             "title": "Tool Ms",
             "type": "integer"
           },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          },
           "waiting_ms": {
             "default": 0,
             "minimum": 0.0,
@@ -42883,6 +42963,56 @@
           "session_id"
         ],
         "title": "SessionTimingResponse",
+        "type": "object"
+      },
+      "SessionTimingTool": {
+        "description": "One tool's calls; see `SessionTimingCalls`.",
+        "properties": {
+          "average_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Average Ms"
+          },
+          "calls": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Calls",
+            "type": "integer"
+          },
+          "max_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Ms"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "total_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Total Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tool"
+        ],
+        "title": "SessionTimingTool",
         "type": "object"
       },
       "SessionToolCallsResponse": {
@@ -56919,6 +57049,24 @@
             }
           },
           {
+            "description": "Only sessions run under this task: attached to it, created while its handler ran, or children of such a session.",
+            "in": "query",
+            "name": "task_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only sessions run under this task: attached to it, created while its handler ran, or children of such a session.",
+              "title": "Task Id"
+            }
+          },
+          {
             "in": "query",
             "name": "order_by",
             "required": false,
@@ -60287,7 +60435,7 @@
     },
     "/api/sessions/{session_id}/timing": {
       "get": {
-        "description": "Where one session's time went, as `cayu session show` reports it: its elapsed time split into environment setup, model calls, tool calls, teardown, waits for a person, the runtime's own work and idle time between turns, plus each environment operation with the steps it timed.",
+        "description": "Where one session's time went, as `cayu session show` reports it: its elapsed time split into environment setup, model calls, tool calls, teardown, waits for a person, the runtime's own work and idle time between turns, the gaps after the first model call when no call ran, how long single model and tool calls took, plus each environment operation with the steps it timed.",
         "operationId": "get_session_timing_api_sessions__session_id__timing_get",
         "parameters": [
           {
