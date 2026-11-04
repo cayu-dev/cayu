@@ -124,6 +124,7 @@ class FakeSandbox:
     copies: dict[str, dict[str, Any]] = field(default_factory=dict)
     staged_copies: dict[str, int] | None = None
     interactive_commands: bool = True
+    archive_encodings: tuple[str, ...] = ()
     image_identity: dict[str, Any] | None = None
     # Set while the sandbox waits in the queue for a place under the Agent's limit.
     queued_until: datetime | None = None
@@ -155,6 +156,7 @@ class FakeSandbox:
             "queued_until": None if self.queued_until is None else self.queued_until.isoformat(),
             "staged_copies": self.staged_copies,
             "interactive_commands": self.interactive_commands,
+            "archive_encodings": list(self.archive_encodings),
             "guarantees": {"version": self.guarantees_version, "items": list(self.guarantees)},
             "git": self.body.get("git"),
             "provenance": None
@@ -208,6 +210,8 @@ class FakeBroker:
         self.fail_copy_ins = 0
         # Whether new sandboxes run interactive commands; Cloud before them refuses the field.
         self.interactive_commands = True
+        # The compressions new sandboxes say they unpack on archive uploads.
+        self.archive_encodings: tuple[str, ...] = ()
         # Whether creates may name their provenance; Cloud before it refuses the field.
         self.provenance = True
         # Staged objects by key, and every request the storage received.
@@ -415,7 +419,10 @@ class FakeBroker:
             if len(request.content) > self.archive_limit:
                 return _error(413, "archive_too_large", {"bytes": len(request.content)})
             target = sandbox.root / request.url.params.get("path", ".")
-            with tarfile.open(fileobj=io.BytesIO(request.content), mode="r:") as archive:
+            # A gzip upload unpacks whether or not the sandbox lists the encoding.
+            gzip = request.headers.get("content-encoding") == "gzip"
+            mode = "r:gz" if gzip else "r:"
+            with tarfile.open(fileobj=io.BytesIO(request.content), mode=mode) as archive:
                 members = archive.getmembers()
                 archive.extractall(target, filter="data")
             return httpx.Response(200, json={"files": len(members), "bytes": len(request.content)})
@@ -563,6 +570,7 @@ class FakeBroker:
             guarantees_version=self.guarantees_version,
             staged_copies=self.staged_copies,
             interactive_commands=self.interactive_commands,
+            archive_encodings=self.archive_encodings,
             image_identity=self.image_identities.get(body["image"]),
             queued_until=queued_until,
         )

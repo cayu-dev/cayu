@@ -22,6 +22,7 @@ from cayu.sandbox_broker.client import (
     BROKER_TOKEN_ENV,
     SandboxAllocationFailedError,
     SandboxArchive,
+    SandboxArchiveEncoding,
     SandboxArchiveTooLargeError,
     SandboxBrokerClient,
     SandboxBrokerError,
@@ -72,6 +73,7 @@ from cayu.sandbox_broker.coding import (
 from cayu.sandbox_broker.lease import SandboxLeaseKeeper
 from cayu.sandbox_broker.queue import report_sandbox_queue_position
 from cayu.sandbox_broker.runner import (
+    ArchiveCompressionMode,
     BrokeredSandboxRunner,
     BrokeredSandboxWorkspace,
     StagedCopiesMode,
@@ -88,6 +90,7 @@ __all__ = [
     "BROKER_APPLICATION_ID_ENV",
     "BROKER_REQUEST_TIMEOUT_ENV",
     "BROKER_TOKEN_ENV",
+    "ArchiveCompressionMode",
     "BrokeredCodingBackendOptions",
     "BrokeredSandboxCodingBinding",
     "BrokeredSandboxCodingEnvironmentFactory",
@@ -95,6 +98,7 @@ __all__ = [
     "BrokeredSandboxWorkspace",
     "SandboxAllocationFailedError",
     "SandboxArchive",
+    "SandboxArchiveEncoding",
     "SandboxArchiveTooLargeError",
     "SandboxBrokerClient",
     "SandboxBrokerError",

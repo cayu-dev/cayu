@@ -61,6 +61,7 @@ __all__ = [
     "MIN_LEASE_SECONDS",
     "SandboxAllocationFailedError",
     "SandboxArchive",
+    "SandboxArchiveEncoding",
     "SandboxArchiveTooLargeError",
     "SandboxBrokerClient",
     "SandboxBrokerError",
@@ -212,6 +213,9 @@ _KNOWN_CODES = frozenset(
 SandboxEgressMode = Literal["none", "public_web", "allowlist"]
 _EGRESS_MODES = ("none", "public_web", "allowlist")
 SandboxStatus = Literal["provisioning", "ready", "destroying", "destroyed", "failed"]
+#: How an archive upload may be compressed beyond plain tar.
+SandboxArchiveEncoding = Literal["gzip"]
+_ARCHIVE_ENCODINGS: frozenset[str] = frozenset({"gzip"})
 CommandStatus = Literal["running", "exited", "timed_out", "cancelled", "failed"]
 CopyStatus = Literal["awaiting_upload", "pending", "running", "done", "failed", "expired"]
 #: The limits a sandbox holds a place under, in the order a create checks them.
@@ -485,6 +489,9 @@ class SandboxRecord(BaseModel):
     #: Whether the broker runs interactive commands in this sandbox. A broker that
     #: doesn't say so refuses them, so its absence means it doesn't.
     interactive_commands: bool = False
+    #: The compressions the broker unpacks on archive uploads, such as ``"gzip"``. A broker
+    #: that doesn't say so takes only plain tar.
+    archive_encodings: tuple[SandboxArchiveEncoding, ...] = ()
     guarantees: SandboxGuarantees | None = None
     image_identity: SandboxImageIdentity | None = None
     #: The repositories the sandbox fetches with brokered git credentials; ``None`` without
@@ -531,6 +538,15 @@ class SandboxRecord(BaseModel):
         # ``true``, or an object describing the offer as ``staged_copies`` does.
         # Any other shape offers nothing rather than invalidating the record.
         return value is True or isinstance(value, Mapping)
+
+    @field_validator("archive_encodings", mode="before")
+    @classmethod
+    def _archive_encodings_known(cls, value: Any) -> Any:
+        # Encodings this client doesn't know, or any other shape, are left out rather
+        # than invalidating the record.
+        if not isinstance(value, list | tuple):
+            return ()
+        return tuple(item for item in value if type(item) is str and item in _ARCHIVE_ENCODINGS)
 
 
 class SandboxImage(BaseModel):
@@ -1537,19 +1553,38 @@ class SandboxBrokerClient:
 
     # Archives -------------------------------------------------------------
 
-    async def put_archive(self, sandbox_id: str, data: bytes, *, path: str | None = None) -> dict:
-        """Extract a tar of at most ``MAX_ARCHIVE_BYTES`` under ``/workspace/<path>``."""
+    async def put_archive(
+        self,
+        sandbox_id: str,
+        data: bytes,
+        *,
+        path: str | None = None,
+        encoding: SandboxArchiveEncoding | None = None,
+    ) -> dict:
+        """Extract a tar of at most ``MAX_ARCHIVE_BYTES`` under ``/workspace/<path>``.
+
+        With ``encoding="gzip"`` the tar is gzip-compressed and ``MAX_ARCHIVE_BYTES``
+        bounds the compressed bytes; send it only to a sandbox whose record lists
+        ``"gzip"`` in ``archive_encodings``, or to a broker known to unpack it.
+        """
 
         if type(data) is not bytes:
             raise TypeError("Sandbox archive must be bytes.")
         if len(data) > MAX_ARCHIVE_BYTES:
             raise ValueError(f"Sandbox archive exceeds {MAX_ARCHIVE_BYTES} bytes.")
+        headers = {"Content-Type": "application/x-tar"}
+        if encoding is not None:
+            if encoding not in _ARCHIVE_ENCODINGS:
+                raise ValueError("Sandbox archive encoding must be 'gzip' or None.")
+            if not data.startswith(b"\x1f\x8b"):
+                raise ValueError("A gzip sandbox archive must start with the gzip magic bytes.")
+            headers["Content-Encoding"] = encoding
         body, _ = await self._json(
             "PUT",
             self._sandbox_url(sandbox_id) + "/archive",
             params={"path": relative_workspace_path(path) or "."},
             content=data,
-            headers={"Content-Type": "application/x-tar"},
+            headers=headers,
             transfer=True,
         )
         if not isinstance(body, dict):

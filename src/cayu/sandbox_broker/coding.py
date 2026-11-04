@@ -105,10 +105,12 @@ from cayu.sandbox_broker.runner import (
     BROKERED_SANDBOX_CANDIDATE,
     MAX_TRANSFER_FILE_BYTES,
     STAGED_FILE_OVERHEAD_BYTES,
+    ArchiveCompressionMode,
     BrokeredSandboxRunner,
     BrokeredSandboxWorkspace,
     StagedCopiesMode,
     sandbox_capability_claims,
+    validate_archive_compression_mode,
     validate_staged_copies_mode,
 )
 from cayu.workspaces import LocalWorkspace, RunnerWorkspace, Workspace
@@ -430,6 +432,11 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     ``transfer_limits`` the largest file follows each sandbox: what its staged
     copies carry where it offers them, otherwise one broker archive.
 
+    ``archive_compression`` chooses whether the split archives copy-in uploads
+    are gzip-compressed (see ``BrokeredSandboxWorkspace``): ``"auto"`` (the
+    default) where the sandbox says it unpacks them, ``"gzip"`` always, or
+    ``"none"``.
+
     ``toolchain_profile`` binds every sandbox to one neutral
     ``CodingToolchainProfile``, so ``run_check`` and ``run_command`` with that
     same profile work here as they do on Docker. It requires ``egress="none"``
@@ -488,6 +495,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         toolchain_profile: CodingToolchainProfile | None = None,
         setup_command_timeout_s: int = DEFAULT_BROKERED_SETUP_COMMAND_TIMEOUT_SECONDS,
         staged_copies: StagedCopiesMode = "auto",
+        archive_compression: ArchiveCompressionMode = "auto",
         knowledge_store: KnowledgeStore | None = None,
         knowledge_access_scope: KnowledgeAccessScope | None = None,
         workspace_repository: str | None = None,
@@ -515,6 +523,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         if type(image) is not str or not image.strip():
             raise ValueError("image must name a sandbox catalog entry.")
         owned_staged_copies = validate_staged_copies_mode(staged_copies)
+        owned_archive_compression = validate_archive_compression_mode(archive_compression)
         # Without explicit limits, the largest file follows what each sandbox
         # can carry: its staged copies where it offers them, else one archive.
         self._max_file_bytes_follow_sandbox = transfer_limits is None
@@ -583,6 +592,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         self.git_baseline = git_baseline
         self.setup_command_timeout_s = validate_setup_command_timeout(setup_command_timeout_s)
         self.staged_copies: StagedCopiesMode = owned_staged_copies
+        self.archive_compression: ArchiveCompressionMode = owned_archive_compression
         owned_sandbox_exclusions = tuple(sandbox_excluded_directory_names)
         names = {
             name.casefold(): name
@@ -631,6 +641,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             "toolchain_profile": self.toolchain_profile,
             "setup_command_timeout_s": self.setup_command_timeout_s,
             "staged_copies": self.staged_copies,
+            "archive_compression": self.archive_compression,
             "knowledge_store": self._knowledge_store,
             "knowledge_access_scope": self._knowledge_access_scope,
         }
@@ -1036,6 +1047,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         excluded = self._excluded
         excluded_patterns = self._excluded_patterns
         staged_copies = self.staged_copies
+        archive_compression = self.archive_compression
 
         def target_plan(context: SyncBindingContext) -> SyncTargetWorkspacePlan:
             runner = context.runner
@@ -1045,6 +1057,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 workspace=BrokeredSandboxWorkspace(
                     runner,
                     staged_copies=staged_copies,
+                    archive_compression=archive_compression,
                     workspace_id=f"brokered-sandbox:{context.session_id}",
                     excluded_directory_names=excluded,
                     excluded_path_patterns=excluded_patterns,
@@ -1234,6 +1247,7 @@ class BrokeredCodingBackendOptions:
     staged_copies: StagedCopiesMode = "auto"
     #: How long a create may wait in Cloud's queue for capacity (see the factory).
     queue_seconds: int = 0
+    archive_compression: ArchiveCompressionMode = "auto"
 
     def __post_init__(self) -> None:
         if type(self.image) is not str or not self.image.strip():
@@ -1244,6 +1258,7 @@ class BrokeredCodingBackendOptions:
         if type(self.git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
         validate_staged_copies_mode(self.staged_copies)
+        validate_archive_compression_mode(self.archive_compression)
         validate_queue_seconds(self.queue_seconds)
 
     @classmethod
@@ -1327,6 +1342,7 @@ def brokered_coding_backend(context: Any) -> Any:
             git_baseline=options.git_baseline,
             toolchain_profile=profile,
             staged_copies=options.staged_copies,
+            archive_compression=options.archive_compression,
             queue_seconds=options.queue_seconds,
             knowledge_store=knowledge_store,
             knowledge_access_scope=knowledge_access_scope,

@@ -248,6 +248,11 @@ def test_cloud_backend_runs_the_neutral_profile_at_the_brokers_bar(tmp_path: Pat
         {**_CLOUD, "CAYU_CLOUD_SANDBOX_IMAGE": "release", "CAYU_CLOUD_SANDBOX_EGRESS": "none"}
     )
     assert defaults.image == "release"
+    # Fields added later go last, so positional callers keep their meaning.
+    positional = BrokeredCodingBackendOptions("release", 60, None, None, None, True, "auto", 120)
+    assert (positional.queue_seconds, positional.archive_compression) == (120, "auto")
+    with pytest.raises(ValueError, match="archive_compression"):
+        BrokeredCodingBackendOptions(archive_compression="zstd")
     with pytest.raises(ValueError, match="prohibits the network"):
         BrokeredCodingBackendOptions.from_env({"CAYU_CLOUD_SANDBOX_EGRESS": "public_web"})
     with pytest.raises(ValueError, match="prohibits the network"):

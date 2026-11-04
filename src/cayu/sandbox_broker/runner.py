@@ -12,11 +12,12 @@ import re
 import secrets
 import tarfile
 import tempfile
-from collections.abc import Awaitable, Callable, Sequence
+import zlib
+from collections.abc import Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, BinaryIO, Literal, TypeVar
+from typing import IO, Any, BinaryIO, Literal, TypeVar
 from urllib.parse import quote
 
 from cayu._validation import canonical_durable_json_bytes
@@ -58,6 +59,7 @@ from cayu.sandbox_broker.client import (
     MAX_STDIO_CHUNK_BYTES,
     MAX_WAIT_SECONDS,
     MIN_COMMAND_OUTPUT_BYTES,
+    SandboxArchiveEncoding,
     SandboxArchiveTooLargeError,
     SandboxBrokerClient,
     SandboxBrokerError,
@@ -83,10 +85,12 @@ from cayu.workspaces.base import TarStreamReadResult
 
 __all__ = [
     "BROKERED_SANDBOX_CANDIDATE",
+    "ArchiveCompressionMode",
     "BrokeredSandboxRunner",
     "BrokeredSandboxWorkspace",
     "StagedCopiesMode",
     "sandbox_capability_claims",
+    "validate_archive_compression_mode",
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -130,6 +134,12 @@ MAX_TRANSFER_FILE_BYTES = MAX_ARCHIVE_BYTES - 64 * 1024
 STAGED_FILE_OVERHEAD_BYTES = 64 * 1024
 #: When a brokered workspace uses the sandbox's staged copies.
 StagedCopiesMode = Literal["auto", "never", "always"]
+#: Whether a brokered workspace compresses the archives it uploads.
+ArchiveCompressionMode = Literal["auto", "gzip", "none"]
+# What one compressed archive may unpack to, well inside what a broker extracts per upload.
+_COMPRESSED_ARCHIVE_MAX_MEMBERS = 20_000
+_COMPRESSED_ARCHIVE_MAX_UNPACKED_BYTES = 256 * 1024 * 1024
+_GZIP_LEVEL = 6
 
 
 def sandbox_capability_claims(
@@ -438,13 +448,22 @@ class BrokeredSandboxRunner(Runner):
             stderr_truncated=finished.stderr_truncated or stderr_cut,
         )
 
-    async def put_archive(self, data: bytes, *, path: str | None = None) -> dict:
-        """Extract an uncompressed tar under ``/workspace/<path>`` through the broker."""
+    async def put_archive(
+        self,
+        data: bytes,
+        *,
+        path: str | None = None,
+        encoding: SandboxArchiveEncoding | None = None,
+    ) -> dict:
+        """Extract a tar (gzip-compressed with ``encoding="gzip"``) under
+        ``/workspace/<path>`` through the broker."""
 
         self._ensure_exec_open()
         self._require_lease()
         try:
-            return await self._client.put_archive(self.sandbox.id, data, path=path)
+            return await self._client.put_archive(
+                self.sandbox.id, data, path=path, encoding=encoding
+            )
         except (SandboxNotReadyError, SandboxNotFoundError) as error:
             raise self._lease_lost(error) from None
 
@@ -1063,6 +1082,15 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
     again as split archives. With ``"never"`` only archives are used, so one
     file must fit in one archive. ``"always"`` sends every copy-in, whatever
     its size, as one staged copy and refuses a sandbox that offers none.
+
+    ``archive_compression`` chooses whether split archives are gzip-compressed,
+    so each carries several times more of the tree. With ``"auto"`` (the
+    default) they are where the sandbox lists ``"gzip"`` in its
+    ``archive_encodings``; ``"gzip"`` always compresses them, for a broker known
+    to unpack them that doesn't say so; ``"none"`` sends plain tar. A file too
+    incompressible to fit one compressed archive goes in a plain one. The next
+    archive is prepared while the current one uploads. Staged copies stay plain
+    tar.
     """
 
     def __init__(
@@ -1070,11 +1098,13 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
         runner: BrokeredSandboxRunner,
         *,
         staged_copies: StagedCopiesMode = "auto",
+        archive_compression: ArchiveCompressionMode = "auto",
         **kwargs: Any,
     ) -> None:
         if not isinstance(runner, BrokeredSandboxRunner):
             raise TypeError("BrokeredSandboxWorkspace requires a BrokeredSandboxRunner.")
         self.staged_copies = validate_staged_copies_mode(staged_copies)
+        self.archive_compression = validate_archive_compression_mode(archive_compression)
         super().__init__(runner, **kwargs)
         self._brokered_runner = runner
 
@@ -1089,6 +1119,15 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
                 "staged_copies='always', but this sandbox broker offers no staged copies."
             )
         return staged
+
+    def _archive_encoding(self) -> SandboxArchiveEncoding | None:
+        """How split archives are compressed for this sandbox, or None for plain tar."""
+
+        if self.archive_compression == "none":
+            return None
+        if self.archive_compression == "gzip":
+            return "gzip"
+        return "gzip" if "gzip" in self._brokered_runner.sandbox.archive_encodings else None
 
     def tar_stream_writer(self):
         return self
@@ -1119,9 +1158,38 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
         await self._write_split(source, archive_bytes)
 
     async def _write_split(self, source: BinaryIO, archive_bytes: int) -> None:
-        chunks = await asyncio.to_thread(self._split_archive, source, archive_bytes)
-        for chunk in chunks:
-            await self._brokered_runner.put_archive(chunk, path=self.cwd)
+        """Check every member, then upload the tree in archives of at most
+        ``MAX_ARCHIVE_BYTES`` each, so a refused tree uploads nothing."""
+
+        if source.seekable():
+            origin = source.tell()
+            await asyncio.to_thread(self._spool_checked, source, archive_bytes, None, True)
+            source.seek(origin)
+            await self._put_archives(source, archive_bytes)
+            return
+        with tempfile.TemporaryFile() as spool:
+            await asyncio.to_thread(self._spool_checked, source, archive_bytes, spool, True)
+            spool.seek(0)
+            await self._put_archives(spool, archive_bytes)
+
+    async def _put_archives(self, source: BinaryIO, archive_bytes: int) -> None:
+        """Upload the archives in order, preparing the next while one uploads."""
+
+        archives = self._split_archive(source, archive_bytes, self._archive_encoding())
+        prepared = asyncio.ensure_future(asyncio.to_thread(_next_archive, archives))
+        try:
+            # Shielded: cancelling the wait can't stop the thread preparing the archive.
+            while (archive := await asyncio.shield(prepared)) is not None:
+                prepared = asyncio.ensure_future(asyncio.to_thread(_next_archive, archives))
+                data, encoding = archive
+                await self._brokered_runner.put_archive(data, path=self.cwd, encoding=encoding)
+        finally:
+            # The generator can't be closed while a thread still advances it.
+            if not prepared.done():
+                await asyncio.wait({prepared})
+            if not prepared.cancelled():
+                prepared.exception()
+            archives.close()
 
     async def read_tar_stream(
         self,
@@ -1329,10 +1397,17 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
             )
             raise
 
-    def _spool_checked(self, source: BinaryIO, archive_bytes: int, spool: BinaryIO | None) -> str:
+    def _spool_checked(
+        self,
+        source: BinaryIO,
+        archive_bytes: int,
+        spool: BinaryIO | None,
+        split: bool = False,
+    ) -> str:
         """Read the archive, checking its members as the split path does, and return its
         SHA-256. With a ``spool`` every byte is written there; without one ``source``
-        must be seekable, and is read again to check what follows its last member."""
+        must be seekable, and is read again to check what follows its last member.
+        With ``split`` every file must also fit one broker archive."""
 
         origin = source.tell() if spool is None else 0
         limited = _LimitedReader(source, archive_bytes)
@@ -1349,6 +1424,8 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
                     raise ValueError("Workspace archive members must be relative files.")
                 if member.isreg():
                     self._require_path_allowed(name)
+                    if split:
+                        _require_one_archive(name, member.size)
             parsed_bytes = incoming.offset
             while tee.read(1 << 16):
                 pass
@@ -1366,11 +1443,14 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
                 raise ValueError("Workspace archive has unvalidated trailing content.")
         return tee.hexdigest()
 
-    def _split_archive(self, source: BinaryIO, archive_bytes: int) -> list[bytes]:
-        chunks: list[bytes] = []
-        pending: list[tuple[tarfile.TarInfo, bytes | None]] = []
-        pending_bytes = 0
+    def _split_archive(
+        self, source: BinaryIO, archive_bytes: int, encoding: SandboxArchiveEncoding | None
+    ) -> Generator[_SplitArchive]:
+        """The tree as archives of at most ``MAX_ARCHIVE_BYTES`` each, gzip-compressed
+        with ``encoding="gzip"``, prepared one at a time."""
+
         limited = _LimitedReader(source, archive_bytes)
+        sink: _ArchiveSink | None = None
         with tarfile.open(fileobj=limited, mode="r|") as incoming:
             for member in incoming:
                 name = posixpath.normpath(member.name)
@@ -1383,33 +1463,125 @@ class BrokeredSandboxWorkspace(RunnerWorkspace):
                     raise ValueError("Workspace archive members must be relative files.")
                 if member.isreg():
                     self._require_path_allowed(name)
+                    _require_one_archive(name, member.size)
                 needed = _ARCHIVE_MEMBER_OVERHEAD + _padded(member.size)
-                if _sealed_size(needed) > MAX_ARCHIVE_BYTES:
-                    raise RuntimeError(
-                        f"Workspace file is larger than one broker archive: {name[:200]}"
-                    )
-                if pending and _sealed_size(pending_bytes + needed) > MAX_ARCHIVE_BYTES:
-                    chunks.append(_seal(pending))
-                    pending, pending_bytes = [], 0
-                extracted = incoming.extractfile(member) if member.isreg() else None
-                pending.append((member, None if extracted is None else extracted.read()))
-                pending_bytes += needed
+                if sink is not None and not sink.fits(needed):
+                    yield sink.sealed()
+                    sink = None
+                if sink is None:
+                    sink = _ArchiveSink(encoding)
+                    if encoding is not None and not sink.fits(needed):
+                        # A file too incompressible for a compressed archive goes in a plain one.
+                        sink = _ArchiveSink(None)
+                sink.add(member, incoming.extractfile(member) if member.isreg() else None)
+                if encoding is not None and sink.encoding is None:
+                    # Only the file that needed it travels plain.
+                    yield sink.sealed()
+                    sink = None
             # Consume the end-of-archive padding so the size check sees every byte.
             while limited.read(1 << 16):
                 pass
-        if pending:
-            chunks.append(_seal(pending))
         if limited.read_bytes != archive_bytes:
             raise RuntimeError("Workspace archive stream did not match its declared size.")
-        return chunks
+        if sink is not None:
+            yield sink.sealed()
 
 
-def _seal(entries: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:", format=tarfile.PAX_FORMAT) as archive:
-        for member, content in entries:
-            archive.addfile(member, None if content is None else io.BytesIO(content))
-    return buffer.getvalue()
+#: One split archive: its bytes and how they're compressed.
+_SplitArchive = tuple[bytes, SandboxArchiveEncoding | None]
+
+
+def _next_archive(archives: Generator[_SplitArchive]) -> _SplitArchive | None:
+    return next(archives, None)
+
+
+def _require_one_archive(name: str, size: int) -> None:
+    if _sealed_size(_ARCHIVE_MEMBER_OVERHEAD + _padded(size)) > MAX_ARCHIVE_BYTES:
+        raise RuntimeError(f"Workspace file is larger than one broker archive: {name[:200]}")
+
+
+def _deflate_bound(size: int) -> int:
+    """Upper bound of the gzip bytes deflating ``size`` more bytes adds, trailer included.
+
+    zlib bounds one deflate at ``size + size/4096 + size/16384 + 13`` plus its
+    wrapper; this leaves more room.
+    """
+
+    return size + (size >> 10) + 1024
+
+
+class _ArchiveSink(io.RawIOBase):
+    """Where one split archive is written: as plain tar, or through a gzip compressor.
+
+    ``fits`` bounds the sealed archive by the bytes already compressed plus what
+    deflating the rest could take, and flushes the compressor to learn the real
+    size only when that bound doesn't fit.
+    """
+
+    def __init__(self, encoding: SandboxArchiveEncoding | None) -> None:
+        self.encoding = encoding
+        self._buffer = io.BytesIO()
+        self._compressor = (
+            None if encoding is None else zlib.compressobj(_GZIP_LEVEL, zlib.DEFLATED, 31)
+        )
+        self._written = 0
+        self._unflushed = 0
+        self._members = 0
+        self._unpacked = 0
+        self._archive = tarfile.TarFile(fileobj=self, mode="w", format=tarfile.PAX_FORMAT)
+
+    def writable(self) -> bool:
+        return True
+
+    # tarfile writes through write and reads its starting offset from tell.
+    def write(self, data) -> int:
+        self._written += len(data)
+        if self._compressor is None:
+            self._buffer.write(data)
+        else:
+            self._buffer.write(self._compressor.compress(data))
+            self._unflushed += len(data)
+        return len(data)
+
+    def tell(self) -> int:
+        return self._written
+
+    def fits(self, needed: int) -> bool:
+        """Whether a member taking ``needed`` tar bytes still fits once the archive is sealed."""
+
+        if self._compressor is None:
+            return _sealed_size(self._written + needed) <= MAX_ARCHIVE_BYTES
+        if (
+            self._members >= _COMPRESSED_ARCHIVE_MAX_MEMBERS
+            or self._unpacked + needed > _COMPRESSED_ARCHIVE_MAX_UNPACKED_BYTES
+        ):
+            return False
+        # Sealing adds the end-of-archive blocks and padding to a whole tar record.
+        more = needed + _ARCHIVE_END_BYTES + tarfile.RECORDSIZE
+        if self._bound(more) <= MAX_ARCHIVE_BYTES:
+            return True
+        if not self._unflushed:
+            return False
+        self._buffer.write(self._compressor.flush(zlib.Z_SYNC_FLUSH))
+        self._unflushed = 0
+        return self._bound(more) <= MAX_ARCHIVE_BYTES
+
+    def _bound(self, more: int) -> int:
+        return self._buffer.tell() + _deflate_bound(self._unflushed + more)
+
+    def add(self, member: tarfile.TarInfo, content: IO[bytes] | None) -> None:
+        self._archive.addfile(member, content)
+        self._members += 1
+        self._unpacked += member.size if member.isreg() else 0
+
+    def sealed(self) -> _SplitArchive:
+        self._archive.close()
+        if self._compressor is not None:
+            self._buffer.write(self._compressor.flush())
+        data = self._buffer.getvalue()
+        if len(data) > MAX_ARCHIVE_BYTES:
+            raise RuntimeError("A workspace archive outgrew its bound while being compressed.")
+        return data, self.encoding
 
 
 @dataclass
@@ -1501,6 +1673,16 @@ class _CountingWriter(io.RawIOBase):
         self._destination.write(bytes(data))
         self.written += size
         return size
+
+
+def validate_archive_compression_mode(value: object) -> ArchiveCompressionMode:
+    if value == "auto" and type(value) is str:
+        return "auto"
+    if value == "gzip" and type(value) is str:
+        return "gzip"
+    if value == "none" and type(value) is str:
+        return "none"
+    raise ValueError("archive_compression must be 'auto', 'gzip' or 'none'.")
 
 
 def validate_staged_copies_mode(value: object) -> StagedCopiesMode:

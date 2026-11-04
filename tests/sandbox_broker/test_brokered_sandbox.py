@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import hashlib
 import io
 import json
@@ -1157,6 +1158,212 @@ def test_large_trees_move_in_several_archives(tmp_path: Path, monkeypatch) -> No
         await runner.close()
 
     asyncio.run(scenario())
+
+
+def _text_tree(count: int, size: int) -> dict[str, bytes]:
+    # Source-like files: compressible, but not one repeated byte.
+    return {
+        f"src/module_{index}.py": b"".join(
+            f"def function_{index}_{line}(value):\n    return value + {line}\n".encode()
+            for line in range(size // 48)
+        )[:size]
+        for index in range(count)
+    }
+
+
+def _puts(broker: FakeBroker) -> list[httpx.Request]:
+    return [request for request in broker.requests if request.method == "PUT"]
+
+
+@pytest.mark.parametrize(
+    ("offered", "mode", "compressed"),
+    [
+        (("gzip",), "auto", True),
+        ((), "auto", False),
+        ((), "gzip", True),
+        (("gzip",), "none", False),
+    ],
+)
+def test_split_archives_are_compressed_where_the_sandbox_unpacks_them(
+    tmp_path: Path, monkeypatch, offered: tuple[str, ...], mode: str, compressed: bool
+) -> None:
+    limit = 64 * 1024
+    monkeypatch.setattr(runner_module, "MAX_ARCHIVE_BYTES", limit)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.archive_limit = limit
+    broker.archive_encodings = offered
+    files = _text_tree(40, 12_000)
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        workspace = BrokeredSandboxWorkspace(runner, archive_compression=mode)
+        data = _tar(files)
+        await workspace.write_tar_stream(io.BytesIO(data), archive_bytes=len(data))
+        await runner.close()
+        return runner.sandbox_id
+
+    sandbox_id = asyncio.run(scenario())
+    puts = _puts(broker)
+    assert all(len(request.content) <= limit for request in puts)
+    encodings = {request.headers.get("content-encoding") for request in puts}
+    if compressed:
+        # 480 KB of source moves in a couple of archives instead of nine.
+        assert encodings == {"gzip"} and len(puts) <= 2
+    else:
+        assert encodings == {None} and len(puts) >= 8
+    for name, content in files.items():
+        assert (broker.sandboxes[sandbox_id].root / name).read_bytes() == content
+
+
+def test_an_incompressible_file_goes_in_a_plain_archive(tmp_path: Path, monkeypatch) -> None:
+    limit = 64 * 1024
+    monkeypatch.setattr(runner_module, "MAX_ARCHIVE_BYTES", limit)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.archive_limit = limit
+    broker.archive_encodings = ("gzip",)
+    # Fits one plain archive, but not the bound a compressed one must allow for.
+    noise = os.urandom(54_000)
+    files = {"a.py": b"print('a')\n" * 100, "noise.bin": noise, "z.py": b"print('z')\n" * 100}
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        workspace = BrokeredSandboxWorkspace(runner)
+        data = _tar(files)
+        await workspace.write_tar_stream(io.BytesIO(data), archive_bytes=len(data))
+        await runner.close()
+        return runner.sandbox_id
+
+    sandbox_id = asyncio.run(scenario())
+    puts = _puts(broker)
+    assert [request.headers.get("content-encoding") for request in puts] == ["gzip", None, "gzip"]
+    assert all(len(request.content) <= limit for request in puts)
+    for name, content in files.items():
+        assert (broker.sandboxes[sandbox_id].root / name).read_bytes() == content
+
+
+@pytest.mark.parametrize("compression", ["gzip", "none"])
+def test_a_tree_with_a_file_too_large_for_an_archive_uploads_nothing(
+    tmp_path: Path, monkeypatch, compression: str
+) -> None:
+    limit = 64 * 1024
+    monkeypatch.setattr(runner_module, "MAX_ARCHIVE_BYTES", limit)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.archive_limit = limit
+    files = {**_text_tree(20, 12_000), "zz/huge.bin": b"x" * limit}
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        workspace = BrokeredSandboxWorkspace(
+            runner, staged_copies="never", archive_compression=compression
+        )
+        data = _tar(files)
+        with pytest.raises(RuntimeError, match="larger than one broker archive: zz/huge.bin"):
+            await workspace.write_tar_stream(io.BytesIO(data), archive_bytes=len(data))
+        # A source that can't seek is checked from a spool, just the same.
+        unseekable = io.BufferedReader(io.BytesIO(data))
+        unseekable.seekable = lambda: False
+        with pytest.raises(RuntimeError, match="larger than one broker archive"):
+            await workspace.write_tar_stream(unseekable, archive_bytes=len(data))
+        await runner.close()
+
+    asyncio.run(scenario())
+    assert _puts(broker) == []
+
+
+@pytest.mark.parametrize("stop", ["failure", "cancel"])
+def test_a_stopped_upload_stops_the_archives_still_being_prepared(
+    tmp_path: Path, monkeypatch, stop: str
+) -> None:
+    limit = 64 * 1024
+    monkeypatch.setattr(runner_module, "MAX_ARCHIVE_BYTES", limit)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.archive_limit = limit
+    files = _text_tree(40, 12_000)
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        sent = []
+        original = runner.put_archive
+        second = asyncio.Event()
+
+        async def put_archive(data, **options):
+            if sent:
+                second.set()
+                if stop == "failure":
+                    raise SandboxBrokerUnavailableError("the broker went away")
+                await asyncio.Event().wait()
+            sent.append(await original(data, **options))
+            return sent[-1]
+
+        runner.put_archive = put_archive
+        workspace = BrokeredSandboxWorkspace(runner, archive_compression="none")
+        data = _tar(files)
+        upload = asyncio.ensure_future(
+            workspace.write_tar_stream(io.BytesIO(data), archive_bytes=len(data))
+        )
+        await second.wait()
+        if stop == "cancel":
+            upload.cancel()
+        expected = SandboxBrokerUnavailableError if stop == "failure" else asyncio.CancelledError
+        with pytest.raises(expected):
+            await upload
+        await runner.close()
+        return sent
+
+    assert len(asyncio.run(scenario())) == 1
+
+
+def test_a_factory_hands_its_archive_compression_to_every_session(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.archive_encodings = ("gzip",)
+    with pytest.raises(ValueError, match="archive_compression"):
+        _factory(broker, source, archive_compression="zstd")
+    factory = _factory(broker, source)
+    assert factory.archive_compression == "auto"
+    plain = factory.with_source_workspace(LocalWorkspace(source, workspace_id="other"))
+    assert plain.archive_compression == "auto"
+
+    async def scenario(chosen):
+        result = await chosen.create(_request())
+        bound = await _bind(result)
+        await result.environment.binding.finalize(bound, outcome="interrupted")
+
+    asyncio.run(scenario(factory))
+    asyncio.run(scenario(_factory(broker, source, archive_compression="none")))
+    first, second = _puts(broker)
+    assert first.headers.get("content-encoding") == "gzip"
+    assert second.headers.get("content-encoding") is None
+
+
+def test_archive_encodings_keep_only_what_the_client_knows() -> None:
+    base = {"id": "s", "image": "coding-python", "egress": {"mode": "none"}, "status": "ready"}
+    record = client_module.SandboxRecord.model_validate
+    assert record(base).archive_encodings == ()
+    assert record({**base, "archive_encodings": ["gzip"]}).archive_encodings == ("gzip",)
+    assert record({**base, "archive_encodings": ["zstd", "gzip", 1]}).archive_encodings == ("gzip",)
+    for value in (None, "gzip", {"gzip": True}):
+        assert record({**base, "archive_encodings": value}).archive_encodings == ()
+
+
+def test_a_gzip_archive_upload_says_so_and_must_be_gzip(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        client = broker.client()
+        with pytest.raises(ValueError, match="gzip magic"):
+            await client.put_archive(runner.sandbox_id, _tar({"a": b"1"}), encoding="gzip")
+        with pytest.raises(ValueError, match="encoding"):
+            await client.put_archive(runner.sandbox_id, b"\x1f\x8b", encoding="zstd")
+        compressed = gzip.compress(_tar({"a.txt": b"1"}))
+        assert (await runner.put_archive(compressed, encoding="gzip"))["files"] == 1
+        await runner.close()
+
+    asyncio.run(scenario())
+    (put,) = _puts(broker)
+    assert put.headers["content-type"] == "application/x-tar"
+    assert put.headers["content-encoding"] == "gzip"
 
 
 def _env_of_exactly(items: int, total: int) -> dict[str, str]:

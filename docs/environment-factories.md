@@ -671,7 +671,15 @@ answered later than that is still read once to confirm it. The factory waits up
 to 330 seconds for the sandbox (`ready_timeout_s`), since Cloud fails one still
 provisioning after five minutes, plus `queue_seconds` when it may queue (see
 below). Copy-in and copy-back use the broker's archive routes. Copy-in
-uploads the tree in archives of at most 8 MiB. Copy-back reads the changed
+checks every member, then uploads the tree in archives of at most 8 MiB,
+preparing the next archive while one uploads. Where the sandbox record lists
+`"gzip"` in `archive_encodings`, the archives are gzip-compressed and the 8 MiB
+bounds the compressed bytes, so a source tree of about 140 MB goes in four
+uploads of about 24 MB in all instead of seventeen of 138 MB.
+`archive_compression` chooses this: `"auto"` (the default) as described,
+`"gzip"` to compress for a broker that unpacks gzip without listing it, or
+`"none"`. A file too incompressible to fit one compressed archive goes in a
+plain one. Copy-back reads the changed
 files by name, in batches, splitting any batch the broker reports as too
 large. So a tree of any size moves, but without staged copies one file must
 fit in one archive (just under 8 MiB).
@@ -700,7 +708,7 @@ runner instead, so the two never race. `"never"` uses only archives, so one
 file must fit in one archive. `"always"` sends every copy-in as one staged
 copy, however small, so a tree larger than one staged copy fails, and it
 refuses a sandbox that doesn't offer staged copies.
-`BrokeredSandboxWorkspace` takes the same option. The tree goes up straight from the
+`BrokeredSandboxWorkspace` takes the same options. The tree goes up straight from the
 binding's staged archive, which `staging_capacity` already accounts for, so no
 second host copy is made; only a caller of
 `BrokeredSandboxWorkspace.write_tar_stream` whose source can't seek gets its
