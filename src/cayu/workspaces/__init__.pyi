@@ -23,6 +23,8 @@ from cayu.workspaces.base import WorkspaceGitMode as WorkspaceGitMode
 from cayu.workspaces.base import WorkspaceGitModeMismatchError as WorkspaceGitModeMismatchError
 from cayu.workspaces.base import WorkspaceGitModeMutator as WorkspaceGitModeMutator
 from cayu.workspaces.base import WorkspaceLineLocator as WorkspaceLineLocator
+from cayu.workspaces.base import WorkspaceLineRead as WorkspaceLineRead
+from cayu.workspaces.base import WorkspaceLineReader as WorkspaceLineReader
 from cayu.workspaces.base import WorkspaceLineSpan as WorkspaceLineSpan
 from cayu.workspaces.base import WorkspaceListResult as WorkspaceListResult
 from cayu.workspaces.base import WorkspaceManifestLimits as WorkspaceManifestLimits
@@ -37,6 +39,9 @@ from cayu.workspaces.base import (
 from cayu.workspaces.base import WorkspaceReadOffsetError as WorkspaceReadOffsetError
 from cayu.workspaces.base import WorkspaceReadResult as WorkspaceReadResult
 from cayu.workspaces.base import WorkspaceRevisionMismatchError as WorkspaceRevisionMismatchError
+from cayu.workspaces.base import WorkspaceTextEditor as WorkspaceTextEditor
+from cayu.workspaces.base import WorkspaceTextEditResult as WorkspaceTextEditResult
+from cayu.workspaces.base import WorkspaceTextReplacement as WorkspaceTextReplacement
 from cayu.workspaces.base import matches_list_pattern as matches_list_pattern
 from cayu.workspaces.base import translate_list_pattern as translate_list_pattern
 from cayu.workspaces.base import validate_list_pattern as validate_list_pattern

@@ -42,11 +42,13 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 from cayu.runners import ExecCommand
 from cayu.workspaces.base import (
     WorkspaceGitMode,
+    WorkspaceLineRead,
     WorkspaceLineSpan,
     WorkspaceMoveAmbiguousError,
     WorkspaceMoveResult,
@@ -54,7 +56,10 @@ from cayu.workspaces.base import (
     WorkspaceMutationResult,
     WorkspacePreconditionUnsupportedError,
     WorkspaceReadOffsetError,
+    WorkspaceReadResult,
     WorkspaceRevisionMismatchError,
+    WorkspaceTextEditResult,
+    WorkspaceTextReplacement,
 )
 
 if TYPE_CHECKING:
@@ -76,6 +81,10 @@ _STATUS_STALE = "stale"
 _STATUS_AMBIGUOUS = "ambiguous"
 
 _READ_OUTPUT_HEADROOM_BYTES = 4096
+# Transports cap command input (a brokered sandbox takes 1 MiB), and the
+# separate replace sends only the result, so a combined edit carries at most
+# this much edit text.
+_COMBINED_EDIT_STDIN_LIMIT_BYTES = 64 * 1024
 
 
 # The program below runs inside the guest. It communicates over a tiny
@@ -86,6 +95,8 @@ _READ_OUTPUT_HEADROOM_BYTES = 4096
 # payloads are base64 on stdout after the status line; write payloads are
 # base64 on stdin. Line lookups answer only
 # "ok <size> <start offset> <end offset> <lines>" and return no file content.
+# A line read ("read-lines") and a text edit ("edit-text") answer "ok", then
+# JSON metadata lines, then each read's bytes as one base64 line.
 GUEST_DESCRIPTOR_GUARD_SOURCE = r"""
 import contextlib
 import errno
@@ -859,6 +870,165 @@ main()
 )
 
 
+# Combined modes, which run in place of main() and are sent only with the
+# commands that use them, so every other guarded command stays as it was.
+# combined_main() applies main()'s containment and locks. "read-lines" locates
+# a line range, then reads a window around it and, when the range starts after
+# offset 0, the file's head, as one observation; revisions, digests and Git
+# modes describe only complete reads. "edit-text" reads the file and, when the
+# edit applies, replaces it under the same path lock.
+GUEST_COMBINED_MODES_SOURCE = r"""
+def read_range(fd, offset, limit):
+    os.lseek(fd, offset, os.SEEK_SET)
+    chunks = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, 1 << 16))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def read_identity(fd, offset, content, size):
+    if offset or len(content) != size:
+        return None, None, None
+    revision, digest = content_identity(content)
+    executable = stat.S_IMODE(os.fstat(fd).st_mode) & 0o111
+    return revision, digest, "100755" if executable else "100644"
+
+
+def apply_text_edits(text, edits, max_bytes):
+    # edit_file's rules; the size is checked before the result is built.
+    replacements = []
+    size = len(text.encode("utf-8"))
+    for old_text, new_text, expected in edits:
+        found = text.find(old_text)
+        starts = []
+        while found >= 0 and len(starts) <= expected:
+            starts.append(found)
+            found = text.find(old_text, found + len(old_text))
+        if len(starts) != expected:
+            return None
+        size += expected * (len(new_text.encode("utf-8")) - len(old_text.encode("utf-8")))
+        replacements.extend((start, start + len(old_text), new_text) for start in starts)
+    if size > max_bytes:
+        return None
+    replacements.sort()
+    parts = []
+    cursor = 0
+    for start, end, new_text in replacements:
+        if start < cursor:
+            return None
+        parts.extend((text[cursor:start], new_text))
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def read_lines_mode(leaf_name, parent_fd):
+    start_line, end_line, before, after, limit, head_limit = (
+        int(value) for value in sys.argv[4:10]
+    )
+    leaf_fd, _ = open_guarded_regular(leaf_name, parent_fd)
+    try:
+        total, start, end, lines = locate_lines(leaf_fd, start_line, end_line)
+        # Reads stop at the size the scan saw, so all three agree.
+        offset = start - min(start, before)
+        window = read_range(leaf_fd, offset, min(limit, min(total, end + after) - offset))
+        reads = [(offset, window)]
+        if head_limit and start:
+            reads.append((0, read_range(leaf_fd, 0, min(head_limit, total))))
+        identities = [read_identity(leaf_fd, at, content, total) for at, content in reads]
+    finally:
+        os.close(leaf_fd)
+    print("ok")
+    print(
+        json.dumps(
+            {
+                "span": [start, end, total, lines],
+                "reads": [[at, identity] for (at, _), identity in zip(reads, identities)],
+            }
+        )
+    )
+    for _, content in reads:
+        print(base64.b64encode(content).decode("ascii"))
+
+
+def edit_text_mode(leaf_name, parent_fd):
+    expected_revision = sys.argv[4]
+    limit = int(sys.argv[5])
+    max_bytes = int(sys.argv[6])
+    edits = json.loads(sys.stdin.read())
+    leaf_fd, info = open_guarded_regular(leaf_name, parent_fd)
+    try:
+        content = read_range(leaf_fd, 0, limit)
+        identity = read_identity(leaf_fd, 0, content, info.st_size)
+    finally:
+        os.close(leaf_fd)
+    edited = None
+    if identity[0] == expected_revision:
+        try:
+            edited = apply_text_edits(content.decode("utf-8"), edits, max_bytes)
+        except UnicodeDecodeError:
+            pass
+    mutation = None
+    if edited is not None:
+        edited = edited.encode("utf-8")
+        before_data, stale_revision = replace_guarded_regular_if_revision(
+            leaf_name, parent_fd, edited, expected_revision
+        )
+        if stale_revision is not None:
+            finish("stale " + stale_revision)
+        mutation = mutation_payload_from_identity("replace", before_data, edited)
+    print("ok")
+    print(json.dumps({"total_bytes": info.st_size, "identity": identity}))
+    print(json.dumps(mutation))
+    print(base64.b64encode(content).decode("ascii"))
+
+
+def combined_main():
+    mode, root, rel_path = sys.argv[1:4]
+    root_fd = None
+    parent_fd = None
+    try:
+        parts = guarded_parts(rel_path)
+        root_fd = open_guard_root(root)
+        with workspace_source_lock(root_fd, False), workspace_path_lock(root_fd, rel_path):
+            parent_fd, leaf_name = open_guarded_parent(root_fd, parts, False)
+            if mode == "read-lines":
+                read_lines_mode(leaf_name, parent_fd)
+            elif mode == "edit-text":
+                edit_text_mode(leaf_name, parent_fd)
+            else:
+                raise SystemExit("unknown guard mode: " + mode)
+    except GuardPathError as exc:
+        finish(exc.status)
+    finally:
+        for fd in (parent_fd, root_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+"""
+
+
+_COMBINED_MODES = frozenset({"read-lines", "edit-text"})
+
+
+def _guard_program(mode: str) -> str:
+    """The guard program, with the combined modes only when ``mode`` is one."""
+
+    if mode not in _COMBINED_MODES:
+        return GUEST_GUARD_PROGRAM
+    program = GUEST_GUARD_PROGRAM.removesuffix("\nmain()\n")
+    if program == GUEST_GUARD_PROGRAM:
+        raise RuntimeError("The guest guard program must end by calling main().")
+    return program + "\n" + GUEST_COMBINED_MODES_SOURCE + "\ncombined_main()\n"
+
+
 def guard_read_limit(runner: Runner) -> int | None:
     """The most file bytes one guarded read can return through ``runner``.
 
@@ -942,10 +1112,7 @@ async def guard_locate_lines(
 ) -> WorkspaceLineSpan:
     """Find a line range's byte offsets inside the guest, returning no file content."""
 
-    if type(start_line) is not int or start_line < 1:
-        raise ValueError("start_line must be a positive integer.")
-    if end_line is not None and (type(end_line) is not int or end_line < start_line):
-        raise ValueError("end_line must be an integer no less than start_line.")
+    _validate_line_range(start_line, end_line)
     result = await _exec_guard(
         runner,
         "lines",
@@ -976,6 +1143,172 @@ async def guard_locate_lines(
     raise RuntimeError(
         f"Failed to read {backend} workspace file: "
         f"{original_path}: unexpected guard status {status!r}"
+    )
+
+
+def _validate_line_range(start_line: int, end_line: int | None) -> None:
+    if type(start_line) is not int or start_line < 1:
+        raise ValueError("start_line must be a positive integer.")
+    if end_line is not None and (type(end_line) is not int or end_line < start_line):
+        raise ValueError("end_line must be an integer no less than start_line.")
+
+
+async def guard_read_lines(
+    runner: Runner,
+    *,
+    root: str,
+    rel_path: str,
+    start_line: int,
+    end_line: int | None,
+    before_bytes: int,
+    after_bytes: int,
+    limit: int,
+    head_limit: int,
+    original_path: str,
+    backend: str,
+    timeout_s: int | None = None,
+    python_executable: str = GUEST_PYTHON,
+) -> WorkspaceLineRead:
+    """Locate a line range, read a window around it and the file's head, in one command.
+
+    Like ``guard_read``, the window and head are lowered to what the runner
+    can return; together they fit one command's output.
+    """
+
+    _validate_line_range(start_line, end_line)
+    runner_limit = guard_read_limit(runner)
+    if runner_limit is not None:
+        # The head comes first; the window gets what output is left.
+        head_limit = min(head_limit, runner_limit)
+        limit = min(limit, max(1, runner_limit - head_limit))
+    output_limit = (
+        4 * ((limit + 2) // 3) + 4 * ((head_limit + 2) // 3) + _READ_OUTPUT_HEADROOM_BYTES
+    )
+    result = await _exec_guard(
+        runner,
+        "read-lines",
+        root,
+        rel_path,
+        str(start_line),
+        str(end_line or 0),
+        str(before_bytes),
+        str(after_bytes),
+        str(limit),
+        str(head_limit),
+        timeout_s=timeout_s,
+        output_limit_bytes=output_limit,
+        python_executable=python_executable,
+    )
+    status, payload = _guard_status(
+        result, mode="read", backend=backend, original_path=original_path
+    )
+    if status in {_STATUS_ENOENT, _STATUS_NOTFILE, _STATUS_NOTDIR}:
+        raise FileNotFoundError(f"Workspace file not found: {original_path}")
+    _raise_common_status(status, mode="read", backend=backend, original_path=original_path)
+    try:
+        metadata_line, *encoded = payload.splitlines()
+        metadata = json.loads(metadata_line)
+        start_offset, end_offset, total_bytes, total_lines = metadata["span"]
+        span = WorkspaceLineSpan(
+            start_offset=start_offset,
+            end_offset=end_offset,
+            total_bytes=total_bytes,
+            total_lines=total_lines,
+        )
+        reads = [
+            _guest_read_result(offset, identity, data, total_bytes)
+            for (offset, identity), data in zip(metadata["reads"], encoded, strict=True)
+        ]
+        return WorkspaceLineRead(span=span, window=reads[0], head=reads[1] if reads[1:] else None)
+    except (TypeError, ValueError, KeyError, binascii.Error) as exc:
+        raise RuntimeError(
+            f"{backend} workspace guard returned an invalid line read: {original_path}"
+        ) from exc
+
+
+async def guard_edit_text(
+    runner: Runner,
+    *,
+    root: str,
+    rel_path: str,
+    replacements: Sequence[WorkspaceTextReplacement],
+    expected_revision: str,
+    max_bytes: int,
+    original_path: str,
+    backend: str,
+    timeout_s: int | None = None,
+    python_executable: str = GUEST_PYTHON,
+) -> WorkspaceTextEditResult | None:
+    """Read a contained file and, when the edit applies, replace it, in one command.
+
+    The read is lowered to what the runner can return, like ``guard_read``.
+    Returns ``None``, running nothing, when the edit text is too large to send
+    with the command; the caller then reads and replaces in separate steps.
+    """
+
+    limit = max_bytes
+    runner_limit = guard_read_limit(runner)
+    if runner_limit is not None:
+        limit = min(limit, runner_limit)
+    edits = json.dumps(
+        [
+            [replacement.old_text, replacement.new_text, replacement.expected_replacements]
+            for replacement in replacements
+        ],
+        ensure_ascii=False,
+    )
+    if len(edits.encode("utf-8")) > _COMBINED_EDIT_STDIN_LIMIT_BYTES:
+        return None
+    result = await _exec_guard(
+        runner,
+        "edit-text",
+        root,
+        rel_path,
+        expected_revision,
+        str(limit),
+        str(max_bytes),
+        stdin=edits,
+        timeout_s=timeout_s,
+        output_limit_bytes=4 * ((limit + 2) // 3) + _READ_OUTPUT_HEADROOM_BYTES,
+        python_executable=python_executable,
+    )
+    status, payload = _guard_status(
+        result, mode="edit", backend=backend, original_path=original_path
+    )
+    if status.startswith(f"{_STATUS_STALE} "):
+        raise WorkspaceRevisionMismatchError(expected_revision, status.partition(" ")[2])
+    if status in {_STATUS_ENOENT, _STATUS_NOTFILE, _STATUS_NOTDIR}:
+        raise FileNotFoundError(f"Workspace file not found: {original_path}")
+    _raise_common_status(status, mode="edit", backend=backend, original_path=original_path)
+    try:
+        read_line, mutation_line, encoded = payload.splitlines()
+        metadata = json.loads(read_line)
+        mutation = json.loads(mutation_line)
+        return WorkspaceTextEditResult(
+            read=_guest_read_result(0, metadata["identity"], encoded, metadata["total_bytes"]),
+            mutation=None if mutation is None else WorkspaceMutationResult(**mutation),
+        )
+    except (TypeError, ValueError, KeyError, binascii.Error) as exc:
+        raise RuntimeError(
+            f"{backend} workspace guard returned an invalid edit result: {original_path}"
+        ) from exc
+
+
+def _guest_read_result(
+    offset: int, identity: Sequence[str | None], encoded: str, total_bytes: int
+) -> WorkspaceReadResult:
+    content = base64.b64decode(encoded.strip(), validate=True)
+    revision, digest, git_mode = identity
+    if git_mode not in {None, "100644", "100755"}:
+        raise ValueError("invalid Git mode")
+    return WorkspaceReadResult(
+        content=content,
+        total_bytes=max(total_bytes, offset + len(content)),
+        truncated=total_bytes > offset + len(content),
+        offset=offset,
+        revision=revision,
+        sha256=digest,
+        git_mode=cast("WorkspaceGitMode | None", git_mode),
     )
 
 
@@ -1283,7 +1616,7 @@ async def _exec_guard(
     python_executable: str = GUEST_PYTHON,
 ) -> ExecResult:
     command = ExecCommand.process(
-        python_executable, "-c", GUEST_GUARD_PROGRAM, mode, root, rel_path, *extra_args
+        python_executable, "-c", _guard_program(mode), mode, root, rel_path, *extra_args
     )
     kwargs: dict[str, object] = {"stdin": stdin, "timeout_s": timeout_s}
     if output_limit_bytes is not None:

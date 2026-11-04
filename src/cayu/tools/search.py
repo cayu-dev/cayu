@@ -4,6 +4,7 @@ import json
 import math
 import ntpath
 import posixpath
+import shlex
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -78,6 +79,8 @@ _MATCH_SEPARATOR_ARG = r"\x1f"
 _CONTEXT_SEPARATOR = "\x1e"
 _CONTEXT_SEPARATOR_ARG = r"\x1e"
 _PREVIEW_TRUNCATION_MARKER = " [match preview truncated]"
+# Room in a scoped search's output for the listing's exit status.
+_LISTING_STATUS_BYTES = 16
 _SEARCH_TEXT_ARGUMENTS = frozenset(
     {
         "pattern",
@@ -393,42 +396,6 @@ class SearchTextTool(Tool):
         scope_globs = _search_scope_globs(path, glob)
         visible_paths: set[str] | None = None
         started_at = time.monotonic()
-        deadline = started_at + self.timeout_s
-        if scope_globs:
-            visible_result = await _run_search_command(
-                ctx,
-                runner,
-                _file_listing_argv(
-                    exclude_directories=self.exclude_directories,
-                    protected_entry_names=self.protected_entry_names,
-                    max_file_size_bytes=self.max_file_size_bytes,
-                ),
-                timeout_s=self.timeout_s,
-                output_limit_bytes=self.capture_limit_bytes,
-                max_result_bytes=self.max_result_bytes,
-                started_at=started_at,
-                deadline=deadline,
-                use_full_timeout=True,
-            )
-            if isinstance(visible_result, ToolResult):
-                return visible_result
-            visible_failure = _preflight_search_failure(
-                visible_result,
-                max_result_bytes=self.max_result_bytes,
-                timeout_s=self.timeout_s,
-                duration_ms=_elapsed_ms(started_at),
-            )
-            if visible_failure is not None:
-                return visible_failure
-            if visible_result.stdout_truncated:
-                return _search_scope_exhausted_result(
-                    phase="visibility",
-                    result=visible_result,
-                    duration_ms=_elapsed_ms(started_at),
-                    max_result_bytes=self.max_result_bytes,
-                )
-            visible_paths = set(_iter_file_paths(visible_result.stdout))
-
         argv = [
             "rg",
             "--no-config",
@@ -483,19 +450,86 @@ class SearchTextTool(Tool):
             for pattern in patterns:
                 argv.extend(["--regexp", pattern])
             argv.extend(["--", "."])
-        raw = await _run_search_command(
-            ctx,
-            runner,
-            argv,
-            timeout_s=self.timeout_s,
-            output_limit_bytes=self.capture_limit_bytes,
-            max_result_bytes=self.max_result_bytes,
-            started_at=started_at,
-            deadline=deadline,
-            use_full_timeout=not scope_globs,
-        )
-        if isinstance(raw, ToolResult):
-            return raw
+        if scope_globs:
+            # A scope glob overrides ignore rules in ripgrep, so the files it may
+            # report are first listed without one. Both run in one command.
+            combined = await _run_search_command(
+                ctx,
+                runner,
+                ExecCommand.bash(
+                    _scoped_search_script(
+                        _file_listing_argv(
+                            exclude_directories=self.exclude_directories,
+                            protected_entry_names=self.protected_entry_names,
+                            max_file_size_bytes=self.max_file_size_bytes,
+                        ),
+                        argv,
+                    )
+                ),
+                timeout_s=self.timeout_s,
+                output_limit_bytes=2 * self.capture_limit_bytes + _LISTING_STATUS_BYTES,
+                max_result_bytes=self.max_result_bytes,
+                started_at=started_at,
+            )
+            if isinstance(combined, ToolResult):
+                return combined
+            visible_result, raw, search_cut_short = _split_scoped_search(
+                _require_exec_result(combined),
+                capture_limit_bytes=self.capture_limit_bytes,
+            )
+            visible_failure = _preflight_search_failure(
+                visible_result,
+                max_result_bytes=self.max_result_bytes,
+                timeout_s=self.timeout_s,
+                duration_ms=_elapsed_ms(started_at),
+            )
+            if visible_failure is not None:
+                return visible_failure
+            if visible_result.stdout_truncated:
+                return _search_scope_exhausted_result(
+                    phase="visibility",
+                    result=visible_result,
+                    duration_ms=_elapsed_ms(started_at),
+                    max_result_bytes=self.max_result_bytes,
+                )
+            visible_paths = set(_iter_file_paths(visible_result.stdout))
+            assert raw is not None
+            if search_cut_short:
+                # The transport's output cap, shared by both parts, cut the
+                # search before its own capture limit: run it again alone.
+                remaining_s = math.floor(started_at + self.timeout_s - time.monotonic())
+                if remaining_s <= 0:
+                    return _search_failure_result(
+                        ExecResult(exit_code=-1, timed_out=True),
+                        max_result_bytes=self.max_result_bytes,
+                        timeout_s=self.timeout_s,
+                        duration_ms=_elapsed_ms(started_at),
+                        artifacts=[],
+                        artifacts_truncated=False,
+                    )
+                raw = await _run_search_command(
+                    ctx,
+                    runner,
+                    ExecCommand.process(*argv),
+                    timeout_s=remaining_s,
+                    output_limit_bytes=self.capture_limit_bytes,
+                    max_result_bytes=self.max_result_bytes,
+                    started_at=started_at,
+                )
+                if isinstance(raw, ToolResult):
+                    return raw
+        else:
+            raw = await _run_search_command(
+                ctx,
+                runner,
+                ExecCommand.process(*argv),
+                timeout_s=self.timeout_s,
+                output_limit_bytes=self.capture_limit_bytes,
+                max_result_bytes=self.max_result_bytes,
+                started_at=started_at,
+            )
+            if isinstance(raw, ToolResult):
+                return raw
         duration_ms = _elapsed_ms(started_at)
         result = _require_exec_result(raw)
         artifacts, artifacts_truncated = _bounded_runner_artifacts(
@@ -689,30 +723,17 @@ def _require_exec_result(value: object) -> ExecResult:
 async def _run_search_command(
     ctx: ToolContext,
     runner: Any,
-    argv: list[str],
+    command: ExecCommand,
     *,
     timeout_s: int,
     output_limit_bytes: int,
     max_result_bytes: int,
     started_at: float,
-    deadline: float,
-    use_full_timeout: bool,
 ) -> ExecResult | ToolResult:
-    remaining_s = deadline - time.monotonic()
-    command_timeout_s = timeout_s if use_full_timeout else math.floor(remaining_s)
-    if command_timeout_s <= 0:
-        return _search_failure_result(
-            ExecResult(exit_code=-1, timed_out=True),
-            max_result_bytes=max_result_bytes,
-            timeout_s=timeout_s,
-            duration_ms=_elapsed_ms(started_at),
-            artifacts=[],
-            artifacts_truncated=False,
-        )
     try:
         raw = await runner.exec(
-            ExecCommand.process(*argv),
-            timeout_s=command_timeout_s,
+            command,
+            timeout_s=timeout_s,
             output_limit_bytes=output_limit_bytes,
         )
     except RunnerUnavailableError as exc:
@@ -759,6 +780,89 @@ def _file_listing_argv(
     )
     argv.extend(["--", "."])
     return argv
+
+
+def _scoped_search_script(listing_argv: list[str], search_argv: list[str]) -> str:
+    """Run the file listing, then the search, reporting the listing's exit status between.
+
+    The listing's NUL-terminated paths are followed by ``NUL <status> NUL``;
+    the search runs only when the listing succeeded.
+    """
+
+    return (
+        f"{shlex.join(listing_argv)}\n"
+        "status=$?\n"
+        "printf '\\000%s\\000' \"$status\"\n"
+        'if [ "$status" -gt 1 ]; then exit "$status"; fi\n'
+        f"exec {shlex.join(search_argv)}\n"
+    )
+
+
+def _split_scoped_search(
+    result: ExecResult, *, capture_limit_bytes: int
+) -> tuple[ExecResult, ExecResult | None, bool]:
+    """Split a scoped search's result into the listing's and the search's.
+
+    Each part's output is held to ``capture_limit_bytes``, as if it had run
+    alone. The search's result is ``None`` when the listing did not succeed.
+    The flag says the runner cut the search's output short of that limit, as
+    a transport whose output cap both parts share can.
+    """
+
+    stdout = result.stdout
+    # Paths are never empty, so the listing ends where an empty entry would be.
+    boundary = 0 if stdout.startswith("\0") else stdout.find("\0\0") + 1
+    status_end = stdout.find("\0", boundary + 1) if stdout[boundary : boundary + 1] == "\0" else -1
+    status = stdout[boundary + 1 : status_end] if status_end > boundary else ""
+    if not status.isdigit():
+        # The listing never finished: it timed out, was cancelled, overflowed
+        # the output, or the script could not run.
+        failed = result.timed_out or result.cancelled or result.stdout_truncated
+        return (
+            result.model_copy(
+                update={
+                    "exit_code": result.exit_code
+                    if failed or result.exit_code not in {0, 1}
+                    else -1,
+                    "stdout_truncated": result.stdout_truncated
+                    or len(stdout.encode("utf-8")) > capture_limit_bytes,
+                }
+            ),
+            None,
+            False,
+        )
+    listing_stdout = stdout[:boundary]
+    listing_bytes = len(listing_stdout.encode("utf-8"))
+    listing = result.model_copy(
+        update={
+            "stdout": listing_stdout,
+            "exit_code": int(status),
+            "timed_out": False,
+            "cancelled": False,
+            "stdout_truncated": listing_bytes > capture_limit_bytes,
+            "stdout_bytes": listing_bytes,
+        }
+    )
+    if int(status) > 1:
+        return listing, None, False
+    search_stdout = stdout[status_end + 1 :].encode("utf-8")
+    search_bytes = len(search_stdout)
+    if result.stdout_bytes is not None:
+        prefix_bytes = len(stdout[: status_end + 1].encode("utf-8"))
+        search_bytes = max(search_bytes, result.stdout_bytes - prefix_bytes)
+    search = result.model_copy(
+        update={
+            "stdout": search_stdout[:capture_limit_bytes].decode("utf-8", errors="replace"),
+            "stdout_truncated": result.stdout_truncated or len(search_stdout) > capture_limit_bytes,
+            "stdout_bytes": search_bytes,
+        }
+    )
+    cut_short = (
+        result.stdout_truncated
+        and not (result.timed_out or result.cancelled)
+        and len(search_stdout) < capture_limit_bytes
+    )
+    return listing, search, cut_short
 
 
 def _append_search_exclusions(

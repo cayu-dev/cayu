@@ -206,6 +206,47 @@ def test_small_file_line_reads_match_across_workspaces(tmp_path, args) -> None:
     assert results[2].model_dump() == results[0].model_dump()
 
 
+class _CountingRunner(LocalRunner):
+    def __init__(self, root: Any) -> None:
+        super().__init__(root, inherit_env=False)
+        self.commands = 0
+
+    async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+        self.commands += 1
+        return await super().exec(command, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("content", "args", "secret"),
+    [
+        (SMALL, {"start_line": 2, "end_line": 3}, None),
+        (SMALL, {"start_line": 9}, None),
+        (_numbered_lines(2_000), {"start_line": 1_500, "end_line": 1_510}, None),
+        (_numbered_lines(2_000), {"start_line": 1_990}, None),
+        (b"\x00head\n" + _numbered_lines(10), {"start_line": 5, "end_line": 6}, None),
+        (b"key=hunter22\nsafe\nkey=hunter22\n", {"start_line": 2}, "hunter22"),
+        (b"a\n" + b"y" * 5_000 + b"\nz\n", {"start_line": 2, "max_bytes": 1_000}, None),
+    ],
+    ids=["small", "past-end", "deep", "to-end", "binary-head", "redacted", "line-cut"],
+)
+def test_runner_line_reads_take_one_command_and_match_paging(
+    tmp_path, content, args, secret
+) -> None:
+    (tmp_path / "f.txt").write_bytes(content)
+    runner = _CountingRunner(tmp_path)
+    guest = RunnerWorkspace(runner, workspace_id="same", python_executable=sys.executable)
+    local = LocalWorkspace(tmp_path, workspace_id="same")
+    request = {"path": "f.txt", **args}
+
+    if secret is None:
+        results = [_read(workspace, request) for workspace in (guest, local)]
+    else:
+        results = [_redacting_read(workspace, secret, request) for workspace in (guest, local)]
+
+    assert results[0].model_dump() == results[1].model_dump()
+    assert runner.commands == 1
+
+
 @pytest.mark.parametrize(
     "content",
     [b"", b"\n", b"one", b"one\n", b"one\ntwo", b"one\ntwo\n", b"\n\n\n", b"a\n" * 70_000],
@@ -323,11 +364,21 @@ class _AppendingRunner(LocalRunner):
         return await super().exec(command, **kwargs)
 
 
+class _SteppedRunnerWorkspace(RunnerWorkspace):
+    """Locates, sniffs and reads in separate commands, like a workspace with no line reader."""
+
+    def line_reader(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("workspace_type", [RunnerWorkspace, _SteppedRunnerWorkspace])
 @pytest.mark.parametrize(("start_line", "end_line"), [(1, 5), (50, 55), (98, None)])
-def test_line_reads_of_a_growing_log_succeed(tmp_path, start_line, end_line) -> None:
+def test_line_reads_of_a_growing_log_succeed(
+    tmp_path, workspace_type, start_line, end_line
+) -> None:
     (tmp_path / "server.log").write_text("".join(f"line {n}\n" for n in range(1, 101)))
     runner = _AppendingRunner(tmp_path)
-    workspace = RunnerWorkspace(runner, workspace_id="log", python_executable=sys.executable)
+    workspace = workspace_type(runner, workspace_id="log", python_executable=sys.executable)
     args: dict[str, Any] = {"path": "server.log", "start_line": start_line}
     if end_line is not None:
         args["end_line"] = end_line
@@ -339,7 +390,8 @@ def test_line_reads_of_a_growing_log_succeed(tmp_path, start_line, end_line) -> 
     assert lines[0] == f"line {start_line}"
     if end_line is not None:
         assert lines == [f"line {n}" for n in range(start_line, end_line + 1)]
-    assert runner.appended >= 2
+    # The line reader takes one command; the log grows between the separate steps.
+    assert runner.appended == 1 if workspace_type is RunnerWorkspace else runner.appended >= 2
 
 
 def test_line_read_of_a_file_that_shrank_below_the_range_fails(tmp_path, monkeypatch) -> None:

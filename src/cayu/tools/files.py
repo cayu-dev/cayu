@@ -67,10 +67,14 @@ from cayu.tools.display import ToolDisplay
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.base import (
     Workspace,
+    WorkspaceLineRead,
+    WorkspaceLineReader,
     WorkspaceLineSpan,
     WorkspaceReadOffsetError,
     WorkspaceReadResult,
     WorkspaceRevisionMismatchError,
+    WorkspaceTextEditResult,
+    WorkspaceTextReplacement,
     validate_list_pattern,
 )
 
@@ -615,13 +619,50 @@ async def _read_workspace_bytes(
     *,
     offset: int = 0,
     max_bytes: int,
+    prefetched: WorkspaceReadResult | None = None,
 ) -> tuple[WorkspaceReadResult, int]:
     read_limit = _bounded_workspace_read_limit(workspace, max_bytes)
+    result = _page_from_prefetched(prefetched, offset=offset, max_bytes=read_limit)
+    if result is not None:
+        return result, read_limit
     try:
         result = await workspace.read_bytes(path, offset=offset, max_bytes=read_limit)
     except FileNotFoundError as exc:
         raise _WorkspaceFileNotFoundError from exc
     return result, read_limit
+
+
+def _page_from_prefetched(
+    prefetched: WorkspaceReadResult | None, *, offset: int, max_bytes: int
+) -> WorkspaceReadResult | None:
+    """The page ``read_bytes(offset, max_bytes)`` returns, cut from an earlier read.
+
+    ``None`` when that read doesn't hold the whole page, so the caller reads it.
+    """
+
+    if (
+        prefetched is None
+        or prefetched.redaction_truncated
+        or prefetched.source_bytes_read not in (None, len(prefetched.content))
+    ):
+        return None
+    start = offset - prefetched.offset
+    if start < 0 or start > len(prefetched.content):
+        return None
+    content = prefetched.content[start : start + max_bytes]
+    end = offset + len(content)
+    if len(content) < max_bytes and end < prefetched.total_bytes:
+        return None
+    complete = offset == 0 and end == prefetched.total_bytes
+    return WorkspaceReadResult(
+        content=content,
+        total_bytes=prefetched.total_bytes,
+        truncated=end < prefetched.total_bytes,
+        offset=offset,
+        revision=prefetched.revision if complete else None,
+        sha256=prefetched.sha256 if complete else None,
+        git_mode=prefetched.git_mode if complete else None,
+    )
 
 
 async def _read_workspace_file(
@@ -702,8 +743,12 @@ async def _read_workspace_text(
     options: ReadFileOptions,
     preserve_line_breaks: bool = False,
     page_bytes: int | None = None,
+    prefetched: WorkspaceReadResult | None = None,
 ) -> _WorkspaceText | ToolResult:
-    """Read one page of text; ``page_bytes`` caps the raw page below ``options.max_bytes``."""
+    """Read one page of text; ``page_bytes`` caps the raw page below ``options.max_bytes``.
+
+    A ``prefetched`` read that holds the page is used instead of reading it.
+    """
 
     if page_bytes is None:
         page_bytes = options.max_bytes
@@ -724,6 +769,7 @@ async def _read_workspace_text(
             path,
             offset=fetch_offset,
             max_bytes=requested_read_limit,
+            prefetched=prefetched,
         )
         return (
             result,
@@ -920,14 +966,24 @@ async def _read_workspace_lines(
     moves only those bytes, in a window no larger than the workspace can
     return. A file that grows between the two steps is read as located; one
     that shrinks below the range fails. Other edits between the steps can
-    shift the window, as they can between byte pages.
+    shift the window, as they can between byte pages. A workspace with a line
+    reader locates the range and reads it, and the file's head, in one call.
     """
 
     start = line_range.start
+    redactor = active_secret_redactor_snapshot(ctx).redactor
+    reader = workspace.line_reader()
+    line_read: WorkspaceLineRead | None = None
     try:
-        span = await locate_workspace_lines(
-            workspace, path, start_line=start, end_line=line_range.end
-        )
+        if reader is None:
+            span = await locate_workspace_lines(
+                workspace, path, start_line=start, end_line=line_range.end
+            )
+        else:
+            line_read = await _read_lines_at_once(
+                workspace, reader, path, line_range, options=options, redactor=redactor
+            )
+            span = line_read.span
     except FileNotFoundError:
         return _missing_workspace_file_result("Read", path)
     if start > 1 and span.start_offset == span.total_bytes:
@@ -940,12 +996,15 @@ async def _read_workspace_lines(
     if span.start_offset > 0:
         # The range alone may miss what marks the file as binary.
         binary = await _binary_workspace_head_result(
-            workspace, path=path, content_type=content_type, total_bytes=span.total_bytes
+            workspace,
+            path=path,
+            content_type=content_type,
+            total_bytes=span.total_bytes,
+            prefetched=None if line_read is None else line_read.head,
         )
         if binary is not None:
             return binary
     span_bytes = span.end_offset - span.start_offset
-    redactor = active_secret_redactor_snapshot(ctx).redactor
     if redactor.has_values:
         # Redacted text can be shorter or longer than its source, so read the
         # whole span, plus enough past it to settle a secret that might start
@@ -968,6 +1027,7 @@ async def _read_workspace_lines(
         options=replace(options, max_bytes=MAX_READ_LIMIT_BYTES),
         preserve_line_breaks=True,
         page_bytes=max(1, requested_bytes),
+        prefetched=None if line_read is None else line_read.window,
     )
     if isinstance(read, ToolResult):
         return read
@@ -1054,6 +1114,41 @@ async def _read_workspace_lines(
     return _WorkspaceText(text=text, structured=structured, capture_snapshot=read.capture_snapshot)
 
 
+async def _read_lines_at_once(
+    workspace: Workspace,
+    reader: WorkspaceLineReader,
+    path: str,
+    line_range: _LineRange,
+    *,
+    options: ReadFileOptions,
+    redactor: SecretRedactor,
+) -> WorkspaceLineRead:
+    """Locate a line range and read the bytes the line read will ask for, in one call.
+
+    The window covers every read ``_read_workspace_lines`` makes after
+    locating the range, with the same redaction margins, so none of them
+    goes back to the workspace.
+    """
+
+    if redactor.has_values:
+        margin = redactor.pagination_overlap_utf8_bytes
+        before_bytes, page_bytes, after_bytes = margin + 3, MAX_READ_LIMIT_BYTES, 2 * (margin + 4)
+    else:
+        before_bytes, page_bytes, after_bytes = 0, options.max_bytes, 0
+    line_read = await reader.read_lines(
+        path,
+        start_line=line_range.start,
+        end_line=line_range.end,
+        before_bytes=before_bytes,
+        after_bytes=after_bytes,
+        max_bytes=_bounded_workspace_read_limit(workspace, before_bytes + page_bytes + after_bytes),
+        head_bytes=_bounded_workspace_read_limit(workspace, _BINARY_SNIFF_BYTES),
+    )
+    if type(line_read) is not WorkspaceLineRead:
+        raise TypeError(f"{type(workspace).__name__} line reader must return a WorkspaceLineRead.")
+    return line_read
+
+
 def _workspace_file_changed_result(path: str) -> ToolResult:
     return ToolResult(
         content=f"{path} shrank while it was being read. Retry the read.",
@@ -1072,9 +1167,12 @@ async def _binary_workspace_head_result(
     path: str,
     content_type: str,
     total_bytes: int,
+    prefetched: WorkspaceReadResult | None = None,
 ) -> ToolResult | None:
     try:
-        head, _ = await _read_workspace_bytes(workspace, path, max_bytes=_BINARY_SNIFF_BYTES)
+        head, _ = await _read_workspace_bytes(
+            workspace, path, max_bytes=_BINARY_SNIFF_BYTES, prefetched=prefetched
+        )
     except _WorkspaceFileNotFoundError:
         return _missing_workspace_file_result("Read", path)
     content = head.content
@@ -2565,123 +2663,51 @@ class EditFileTool(Tool):
             if max_diff_bytes < 256:
                 raise ValueError("Tool argument `max_diff_bytes` must be at least 256.")
 
+        editor = workspace.text_editor()
+        edited: WorkspaceTextEditResult | None = None
         try:
-            read = await workspace.read_bytes(path, max_bytes=max_bytes)
+            if editor is None:
+                read = await workspace.read_bytes(path, max_bytes=max_bytes)
+            else:
+                # One call reads the file and, when the edit applies, replaces it.
+                edited = await editor.edit_text(
+                    path,
+                    [
+                        WorkspaceTextReplacement(
+                            old_text=edit.old_text,
+                            new_text=edit.new_text,
+                            expected_replacements=edit.expected_replacements,
+                        )
+                        for edit in edits
+                    ],
+                    expected_revision=expected_revision,
+                    max_bytes=max_bytes,
+                )
+                if type(edited) is not WorkspaceTextEditResult:
+                    raise TypeError(
+                        f"{type(workspace).__name__} text editor must return a "
+                        "WorkspaceTextEditResult."
+                    )
+                read = edited.read
         except FileNotFoundError:
             return ToolResult(
                 content=f"Edit refused: workspace file not found: {path}.",
                 structured={"path": path, "reason": "not_found"},
                 is_error=True,
             )
-        if read.truncated:
-            return ToolResult(
-                content=(
-                    f"Edit refused: {path} is {read.total_bytes} bytes and exceeds "
-                    f"max_bytes={max_bytes}."
-                ),
-                structured={
-                    "path": path,
-                    "total_bytes": read.total_bytes,
-                    "max_bytes": max_bytes,
-                    "reason": "file_truncated",
-                },
-                is_error=True,
-            )
-        before_sha256 = _content_hash(read.content)
-        if read.revision != expected_revision:
-            return ToolResult(
-                content=(
-                    f"Edit refused: {path} changed since it was read; expected revision "
-                    f"{expected_revision}, found {read.revision}."
-                ),
-                structured={
-                    "path": path,
-                    "expected_revision": expected_revision,
-                    "actual_revision": read.revision,
-                    "reason": "stale_content",
-                },
-                is_error=True,
-            )
-        try:
-            original = read.content.decode("utf-8")
-        except UnicodeDecodeError:
-            return ToolResult(
-                content=f"Edit refused: {path} is not valid UTF-8 text.",
-                structured={"path": path, "encoding": "utf-8", "reason": "invalid_encoding"},
-                is_error=True,
-            )
-
-        replacements: list[tuple[int, int, str, int]] = []
-        replacement_count = 0
-        for index, edit in enumerate(edits):
-            starts = _exact_match_offsets(original, edit.old_text)
-            actual_replacements = len(starts)
-            if actual_replacements != edit.expected_replacements:
-                return ToolResult(
-                    content=(
-                        f"Edit refused: edit {index} expected "
-                        f"{edit.expected_replacements} exact occurrence(s), "
-                        f"found {actual_replacements}. No changes were written."
-                    ),
-                    structured={
-                        "path": path,
-                        "edit_index": index,
-                        "expected_replacements": edit.expected_replacements,
-                        "actual_replacements": actual_replacements,
-                    },
-                    is_error=True,
-                )
-            replacements.extend(
-                (start, start + len(edit.old_text), edit.new_text, index) for start in starts
-            )
-            replacement_count += actual_replacements
-        replacements.sort()
-        for previous, current in pairwise(replacements):
-            if current[0] < previous[1]:
-                return ToolResult(
-                    content=(
-                        f"Edit refused: edits {previous[3]} and {current[3]} overlap in "
-                        f"{path}. No changes were written."
-                    ),
-                    structured={
-                        "path": path,
-                        "first_edit_index": previous[3],
-                        "second_edit_index": current[3],
-                        "reason": "overlapping_edits",
-                    },
-                    is_error=True,
-                )
-        edit_byte_deltas = [
-            _utf8_text_size(edit.new_text) - _utf8_text_size(edit.old_text) for edit in edits
-        ]
-        projected_bytes = len(read.content) + sum(
-            edit_byte_deltas[edit_index] for _start, _end, _replacement, edit_index in replacements
+        except WorkspaceRevisionMismatchError as exc:
+            return _stale_mutation_result("Edit", path, exc)
+        planned = _plan_text_edit(
+            path, read, edits, expected_revision=expected_revision, max_bytes=max_bytes
         )
-        if projected_bytes > max_bytes:
-            return ToolResult(
-                content=(
-                    f"Edit refused: result is {projected_bytes} bytes, "
-                    f"which exceeds max_bytes={max_bytes}."
-                ),
-                structured={
-                    "path": path,
-                    "after_bytes": projected_bytes,
-                    "max_bytes": max_bytes,
-                    "reason": "result_too_large",
-                },
-                is_error=True,
-            )
-        updated_parts: list[str] = []
-        cursor = 0
-        for start, end, replacement, _ in replacements:
-            updated_parts.extend((original[cursor:start], replacement))
-            cursor = end
-        updated_parts.append(original[cursor:])
-        updated = "".join(updated_parts)
-
-        encoded = updated.encode("utf-8")
-        if len(encoded) != projected_bytes:
-            raise AssertionError("Edit result byte-size projection drifted.")
+        if isinstance(planned, ToolResult):
+            if edited is not None and edited.mutation is not None:
+                raise RuntimeError(
+                    f"{type(workspace).__name__} applied an edit that edit_file refuses."
+                )
+            return planned
+        original, updated, encoded, replacement_count = planned
+        before_sha256 = _content_hash(read.content)
         diff = "".join(
             difflib.unified_diff(
                 original.splitlines(keepends=True),
@@ -2698,16 +2724,23 @@ class EditFileTool(Tool):
         )
         if diff_truncated:
             record_ambiguous_secret_output(ctx, diff_snapshot)
-        try:
-            mutation = await workspace.replace_bytes(
-                path,
-                encoded,
-                expected_revision=expected_revision,
-            )
-        except WorkspaceRevisionMismatchError as exc:
-            return _stale_mutation_result("Edit", path, exc)
-        except FileNotFoundError:
-            return _missing_workspace_file_result("Edit", path)
+        if edited is not None and edited.mutation is not None:
+            mutation = edited.mutation
+            if mutation.after_sha256 != _content_hash(encoded):
+                raise RuntimeError(
+                    f"{type(workspace).__name__} wrote different content than edit_file planned."
+                )
+        else:
+            try:
+                mutation = await workspace.replace_bytes(
+                    path,
+                    encoded,
+                    expected_revision=expected_revision,
+                )
+            except WorkspaceRevisionMismatchError as exc:
+                return _stale_mutation_result("Edit", path, exc)
+            except FileNotFoundError:
+                return _missing_workspace_file_result("Edit", path)
         after_sha256 = mutation.after_sha256
         summary = (
             f"Edited {path}: {len(edits)} edit(s), {replacement_count} replacement(s), "
@@ -2736,6 +2769,127 @@ class EditFileTool(Tool):
                 "max_diff_bytes": max_diff_bytes,
             },
         )
+
+
+def _plan_text_edit(
+    path: str,
+    read: WorkspaceReadResult,
+    edits: tuple[_TextEdit, ...],
+    *,
+    expected_revision: str,
+    max_bytes: int,
+) -> tuple[str, str, bytes, int] | ToolResult:
+    """Apply exact text edits to a read, or say why edit_file refuses them."""
+
+    if read.truncated:
+        return ToolResult(
+            content=(
+                f"Edit refused: {path} is {read.total_bytes} bytes and exceeds "
+                f"max_bytes={max_bytes}."
+            ),
+            structured={
+                "path": path,
+                "total_bytes": read.total_bytes,
+                "max_bytes": max_bytes,
+                "reason": "file_truncated",
+            },
+            is_error=True,
+        )
+    if read.revision != expected_revision:
+        return ToolResult(
+            content=(
+                f"Edit refused: {path} changed since it was read; expected revision "
+                f"{expected_revision}, found {read.revision}."
+            ),
+            structured={
+                "path": path,
+                "expected_revision": expected_revision,
+                "actual_revision": read.revision,
+                "reason": "stale_content",
+            },
+            is_error=True,
+        )
+    try:
+        original = read.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return ToolResult(
+            content=f"Edit refused: {path} is not valid UTF-8 text.",
+            structured={"path": path, "encoding": "utf-8", "reason": "invalid_encoding"},
+            is_error=True,
+        )
+
+    replacements: list[tuple[int, int, str, int]] = []
+    replacement_count = 0
+    for index, edit in enumerate(edits):
+        starts = _exact_match_offsets(original, edit.old_text)
+        actual_replacements = len(starts)
+        if actual_replacements != edit.expected_replacements:
+            return ToolResult(
+                content=(
+                    f"Edit refused: edit {index} expected "
+                    f"{edit.expected_replacements} exact occurrence(s), "
+                    f"found {actual_replacements}. No changes were written."
+                ),
+                structured={
+                    "path": path,
+                    "edit_index": index,
+                    "expected_replacements": edit.expected_replacements,
+                    "actual_replacements": actual_replacements,
+                },
+                is_error=True,
+            )
+        replacements.extend(
+            (start, start + len(edit.old_text), edit.new_text, index) for start in starts
+        )
+        replacement_count += actual_replacements
+    replacements.sort()
+    for previous, current in pairwise(replacements):
+        if current[0] < previous[1]:
+            return ToolResult(
+                content=(
+                    f"Edit refused: edits {previous[3]} and {current[3]} overlap in "
+                    f"{path}. No changes were written."
+                ),
+                structured={
+                    "path": path,
+                    "first_edit_index": previous[3],
+                    "second_edit_index": current[3],
+                    "reason": "overlapping_edits",
+                },
+                is_error=True,
+            )
+    edit_byte_deltas = [
+        _utf8_text_size(edit.new_text) - _utf8_text_size(edit.old_text) for edit in edits
+    ]
+    projected_bytes = len(read.content) + sum(
+        edit_byte_deltas[edit_index] for _start, _end, _replacement, edit_index in replacements
+    )
+    if projected_bytes > max_bytes:
+        return ToolResult(
+            content=(
+                f"Edit refused: result is {projected_bytes} bytes, "
+                f"which exceeds max_bytes={max_bytes}."
+            ),
+            structured={
+                "path": path,
+                "after_bytes": projected_bytes,
+                "max_bytes": max_bytes,
+                "reason": "result_too_large",
+            },
+            is_error=True,
+        )
+    updated_parts: list[str] = []
+    cursor = 0
+    for start, end, replacement, _ in replacements:
+        updated_parts.extend((original[cursor:start], replacement))
+        cursor = end
+    updated_parts.append(original[cursor:])
+    updated = "".join(updated_parts)
+
+    encoded = updated.encode("utf-8")
+    if len(encoded) != projected_bytes:
+        raise AssertionError("Edit result byte-size projection drifted.")
+    return original, updated, encoded, replacement_count
 
 
 class DeleteFileTool(Tool):

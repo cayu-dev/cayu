@@ -775,6 +775,20 @@ class Workspace(ABC):
 
         return None
 
+    def line_reader(self) -> WorkspaceLineReader | None:
+        """Return a capability that locates and reads a line range in one call, if any."""
+
+        return None
+
+    def text_editor(self) -> WorkspaceTextEditor | None:
+        """Return a capability that reads and conditionally edits text in one call, if any.
+
+        Without one, ``edit_file`` reads with ``read_bytes`` and writes with
+        ``replace_bytes``.
+        """
+
+        return None
+
     def tar_stream_writer(self) -> TarStreamWriter | None:
         """Return an explicit streaming-tar writer capability, if any."""
 
@@ -1024,6 +1038,142 @@ class WorkspaceLineLocator(ABC):
         ``end_line=None`` runs to the end of the file. Raises
         ``FileNotFoundError`` when ``path`` is not a regular file, under the
         same path policy as ``read_bytes``.
+        """
+
+
+@dataclass(frozen=True)
+class WorkspaceLineRead:
+    """A located line range with the bytes around it, from one observation.
+
+    ``window`` holds the bytes from ``before_bytes`` ahead of the range's
+    first line through ``after_bytes`` past its last, as ``read_bytes`` would
+    return them from that offset. ``head`` holds the file's first bytes when
+    the range starts after offset 0 and a head was requested, else ``None``.
+    """
+
+    span: WorkspaceLineSpan
+    window: WorkspaceReadResult
+    head: WorkspaceReadResult | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.span) is not WorkspaceLineSpan:
+            raise TypeError("WorkspaceLineRead span must be a WorkspaceLineSpan.")
+        for name in ("window", "head"):
+            value = getattr(self, name)
+            if value is None and name == "head":
+                continue
+            if type(value) is not WorkspaceReadResult:
+                raise TypeError(f"WorkspaceLineRead {name} must be a WorkspaceReadResult.")
+            if value.total_bytes != self.span.total_bytes:
+                raise ValueError(f"WorkspaceLineRead {name} must describe the located file.")
+        if self.head is not None and self.head.offset != 0:
+            raise ValueError("WorkspaceLineRead head must start at offset 0.")
+
+
+class WorkspaceLineReader(ABC):
+    """Nominal capability for locating a line range and reading it in one call.
+
+    A backend whose every call is a round trip, such as a remote sandbox,
+    implements this so a line read costs one call instead of a locate, a
+    binary sniff and a read.
+    """
+
+    @abstractmethod
+    async def read_lines(
+        self,
+        path: str,
+        *,
+        start_line: int,
+        end_line: int | None = None,
+        before_bytes: int = 0,
+        after_bytes: int = 0,
+        max_bytes: int,
+        head_bytes: int = 0,
+    ) -> WorkspaceLineRead:
+        """Locate lines as ``WorkspaceLineLocator.locate_lines`` does, then read them.
+
+        The window starts ``before_bytes`` ahead of the range (not before
+        offset 0) and ends ``after_bytes`` past it (not past the end of the
+        file), and is read as ``read_bytes(path, offset=..., max_bytes=max_bytes)``
+        would. With ``head_bytes`` and a range that starts after offset 0, the
+        result also carries ``read_bytes(path, max_bytes=head_bytes)``. Like
+        any bounded read, the window or head may come back shorter when the
+        transport can't return all of them at once. The span, window and head
+        describe one observation of the file. Raises ``FileNotFoundError``
+        when ``path`` is not a regular file.
+        """
+
+
+@dataclass(frozen=True)
+class WorkspaceTextReplacement:
+    """Replace every exact occurrence of ``old_text``, expected ``expected_replacements`` times."""
+
+    old_text: str
+    new_text: str
+    expected_replacements: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.old_text) is not str or not self.old_text:
+            raise ValueError("WorkspaceTextReplacement old_text must be a non-empty string.")
+        if type(self.new_text) is not str:
+            raise TypeError("WorkspaceTextReplacement new_text must be a string.")
+        if type(self.expected_replacements) is not int or self.expected_replacements < 1:
+            raise ValueError(
+                "WorkspaceTextReplacement expected_replacements must be a positive integer."
+            )
+
+
+@dataclass(frozen=True)
+class WorkspaceTextEditResult:
+    """The read an edit was planned from and, when it was applied, its mutation."""
+
+    read: WorkspaceReadResult
+    mutation: WorkspaceMutationResult | None
+
+    def __post_init__(self) -> None:
+        if type(self.read) is not WorkspaceReadResult:
+            raise TypeError("WorkspaceTextEditResult read must be a WorkspaceReadResult.")
+        if self.mutation is not None:
+            if type(self.mutation) is not WorkspaceMutationResult:
+                raise TypeError(
+                    "WorkspaceTextEditResult mutation must be a WorkspaceMutationResult or None."
+                )
+            if self.mutation.operation != "replace" or (
+                self.mutation.before_revision != self.read.revision
+            ):
+                raise ValueError("WorkspaceTextEditResult mutation must replace the read file.")
+
+
+class WorkspaceTextEditor(ABC):
+    """Nominal capability for reading and conditionally editing a text file in one call.
+
+    A backend whose every call is a round trip implements this so an edit
+    costs one call instead of a read and a conditional replace.
+    """
+
+    @abstractmethod
+    async def edit_text(
+        self,
+        path: str,
+        replacements: Sequence[WorkspaceTextReplacement],
+        *,
+        expected_revision: str,
+        max_bytes: int,
+    ) -> WorkspaceTextEditResult:
+        """Read ``path`` and replace it with the edited text when the edit applies.
+
+        The file is read as ``read_bytes(path, max_bytes=max_bytes)`` would.
+        The edit applies only when that read is complete, its revision is
+        ``expected_revision``, it decodes as UTF-8, each ``old_text`` occurs
+        exactly ``expected_replacements`` times, no two occurrences overlap,
+        and the edited text fits ``max_bytes``. Then the file is replaced as
+        ``replace_bytes(..., expected_revision=expected_revision)`` would,
+        with nothing changing the file between the read and the replacement.
+        Otherwise nothing is written and ``mutation`` is ``None``; the caller
+        finds the reason in ``read``. A backend may also leave an edit it
+        can't send in one call unapplied, with ``mutation`` ``None``; the
+        caller then replaces the file itself. Raises ``FileNotFoundError``
+        when ``path`` is not a regular file.
         """
 
 

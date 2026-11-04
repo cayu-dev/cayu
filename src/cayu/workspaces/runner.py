@@ -25,10 +25,12 @@ from cayu.workspaces._guest_guard import (
     GUEST_DESCRIPTOR_GUARD_SOURCE,
     guard_create,
     guard_delete_if_revision,
+    guard_edit_text,
     guard_locate_lines,
     guard_move_if_revision,
     guard_read,
     guard_read_limit,
+    guard_read_lines,
     guard_replace,
     guard_require_absent,
 )
@@ -45,12 +47,17 @@ from cayu.workspaces.base import (
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
     WorkspaceLineLocator,
+    WorkspaceLineRead,
+    WorkspaceLineReader,
     WorkspaceLineSpan,
     WorkspaceListResult,
     WorkspaceManifestLimits,
     WorkspaceMoveResult,
     WorkspaceMutationResult,
     WorkspaceReadResult,
+    WorkspaceTextEditor,
+    WorkspaceTextEditResult,
+    WorkspaceTextReplacement,
     _local_resource_key,
     _runner_resource_key,
     _validate_workspace_offset,
@@ -1050,6 +1057,8 @@ main()
 class RunnerWorkspace(
     WorkspaceDirectoryPruner,
     WorkspaceLineLocator,
+    WorkspaceLineReader,
+    WorkspaceTextEditor,
     RunnerBoundWorkspace,
     BoundedTarReader,
     TarWriter,
@@ -1223,6 +1232,94 @@ class RunnerWorkspace(
             backend="Runner",
             python_executable=self.python_executable,
         )
+
+    def line_reader(self) -> WorkspaceLineReader | None:
+        # A subclass that changes how files are read keeps the separate steps.
+        if not _inherits_runner_methods(self, "read_bytes", "locate_lines"):
+            return None
+        return self
+
+    async def read_lines(
+        self,
+        path: str,
+        *,
+        start_line: int,
+        end_line: int | None = None,
+        before_bytes: int = 0,
+        after_bytes: int = 0,
+        max_bytes: int,
+        head_bytes: int = 0,
+    ) -> WorkspaceLineRead:
+        path = _validate_relative_path(path)
+        self._require_path_allowed(path)
+        for value, name in (
+            (before_bytes, "before_bytes"),
+            (after_bytes, "after_bytes"),
+            (head_bytes, "head_bytes"),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"RunnerWorkspace {name} must be a non-negative integer.")
+        return await guard_read_lines(
+            self._runner,
+            root=self._runner.resolve_cwd(self.cwd),
+            rel_path=path,
+            start_line=start_line,
+            end_line=end_line,
+            before_bytes=before_bytes,
+            after_bytes=after_bytes,
+            limit=_validate_required_limit(max_bytes, "max_bytes"),
+            head_limit=head_bytes,
+            original_path=path,
+            backend="Runner",
+            python_executable=self.python_executable,
+        )
+
+    def text_editor(self) -> WorkspaceTextEditor | None:
+        # A subclass that changes how files are read or replaced keeps the
+        # separate steps.
+        if not _inherits_runner_methods(self, "read_bytes", "replace_bytes"):
+            return None
+        return self
+
+    async def edit_text(
+        self,
+        path: str,
+        replacements: Sequence[WorkspaceTextReplacement],
+        *,
+        expected_revision: str,
+        max_bytes: int,
+    ) -> WorkspaceTextEditResult:
+        path = _validate_relative_path(path)
+        self._require_path_allowed(path)
+        replacements = tuple(replacements)
+        if not replacements or any(
+            type(replacement) is not WorkspaceTextReplacement for replacement in replacements
+        ):
+            raise TypeError(
+                "RunnerWorkspace replacements must be a non-empty sequence of "
+                "WorkspaceTextReplacement values."
+            )
+        max_bytes = _validate_required_limit(max_bytes, "max_bytes")
+        edited = await guard_edit_text(
+            self._runner,
+            root=self._runner.resolve_cwd(self.cwd),
+            rel_path=path,
+            replacements=replacements,
+            expected_revision=_validate_workspace_revision(
+                expected_revision, owner="RunnerWorkspace"
+            ),
+            max_bytes=max_bytes,
+            original_path=path,
+            backend="Runner",
+            python_executable=self.python_executable,
+        )
+        if edited is None:
+            # Edit text too large for one command: read here, and the caller
+            # replaces the file itself.
+            return WorkspaceTextEditResult(
+                read=await self.read_bytes(path, max_bytes=max_bytes), mutation=None
+            )
+        return edited
 
     def branch_capabilities(self) -> WorkspaceBranchCapabilities:
         if type(self) is not RunnerWorkspace or self._branch_capability is None:
@@ -1914,6 +2011,10 @@ class RunnerWorkspace(
                 f"{exec_result.stderr.strip() or exec_result.stdout.strip()}"
             )
         return payload
+
+
+def _inherits_runner_methods(workspace: RunnerWorkspace, *names: str) -> bool:
+    return all(getattr(type(workspace), name) is getattr(RunnerWorkspace, name) for name in names)
 
 
 def _validate_optional_cwd(cwd: str | None) -> str | None:

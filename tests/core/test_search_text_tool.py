@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 import shutil
 import tracemalloc
 from datetime import UTC, datetime, timedelta
@@ -72,6 +73,24 @@ class _ResultRunner(Runner):
         return self.results[0] if self.repeat_result else self.results.pop(0)
 
 
+def _search_argvs(command: ExecCommand) -> tuple[list[str] | None, list[str]]:
+    """The listing (for a scoped search) and search argv one search command runs."""
+
+    if command.kind == "process":
+        assert command.argv is not None
+        return None, list(command.argv)
+    assert command.shell is not None
+    lines = command.shell.splitlines()
+    assert lines[-1].startswith("exec ")
+    return shlex.split(lines[0]), shlex.split(lines[-1].removeprefix("exec "))
+
+
+def _scoped_stdout(listing: str, search: str = "", *, status: int = 0) -> str:
+    """What a scoped search prints: the listing, its exit status, then the search."""
+
+    return f"{listing}\0{status}\0{search}"
+
+
 def test_search_preview_bound_never_splits_redaction_marker() -> None:
     value = "prefix-" + REDACTED_SECRET + "-suffix"
 
@@ -109,7 +128,7 @@ class _SwapToOutsideSymlinkRunner(LocalRunner):
         stdin: str | None = None,
         output_limit_bytes: int | None = None,
     ) -> ExecResult:
-        argv = command.argv or []
+        argv = command.argv or shlex.split(command.shell or "")
         reads_file_contents = any(
             option in argv
             for option in ("--files-with-matches", "--line-number", "--count-matches")
@@ -456,13 +475,15 @@ _RECORDED_SEARCH_CALL = {
 def test_search_text_accepts_a_pattern_repeated_or_left_empty_next_to_patterns(
     args: dict, regexes: list[str]
 ) -> None:
-    runner = _ResultRunner(ExecResult(exit_code=1))
+    runner = _ResultRunner(
+        ExecResult(stdout=_scoped_stdout("") if "glob" in args else "", exit_code=1)
+    )
 
     result = asyncio.run(SearchTextTool().run(ToolContext(session_id="s", runner=runner), args))
 
     assert result.is_error is False
     assert runner.command is not None
-    argv = list(runner.command.argv)
+    _, argv = _search_argvs(runner.command)
     if len(regexes) == 1:
         assert argv[-3:] == ["--", regexes[0], "."]
     else:
@@ -863,12 +884,7 @@ def test_search_text_real_runner_bounds_a_one_megabyte_matching_line(tmp_path) -
 
 
 def test_search_text_registration_controls_the_bounded_runner_request() -> None:
-    runner = _ResultRunner(
-        [
-            ExecResult(stdout="src/a.py\0"),
-            ExecResult(stdout="src/a.py\0"),
-        ]
-    )
+    runner = _ResultRunner(ExecResult(stdout=_scoped_stdout("src/a.py\0", "src/a.py\0")))
 
     result = asyncio.run(
         SearchTextTool(
@@ -889,52 +905,43 @@ def test_search_text_registration_controls_the_bounded_runner_request() -> None:
     )
 
     assert result.is_error is False
-    assert runner.timeout_values[0] == 7
-    assert all(timeout is not None and timeout <= 7 for timeout in runner.timeout_values)
-    assert runner.output_limit_bytes == 12_345
+    assert result.structured["matches"] == [{"path": "src/a.py"}]
+    # The listing and the search run in one command, so they share its timeout.
+    assert runner.timeout_values == [7]
+    # Each part of the output gets the configured capture limit.
+    assert runner.output_limit_bytes == 2 * 12_345 + 16
     assert runner.command is not None
-    assert runner.command.kind == "process"
-    assert runner.command.argv is not None
-    assert "--no-config" in runner.command.argv
-    assert "--no-require-git" in runner.command.argv
-    assert "--ignore-case" in runner.command.argv
-    assert runner.command.argv[-2:] == ["-needle", "."]
-    option_end = runner.command.argv.index("--")
-    assert runner.command.argv[option_end + 1 :] == ["-needle", "."]
-    assert runner.command.argv[
-        runner.command.argv.index("--max-filesize") : runner.command.argv.index("--max-filesize")
-        + 2
-    ] == ["--max-filesize", "54321"]
-    assert "!generated/**" in runner.command.argv
-    assert "!generated" not in runner.command.argv
-    assert "!dist/**" not in runner.command.argv
-    assert "--iglob" in runner.command.argv
-    assert "!.git" in runner.command.argv
-    assert "!**/.git/**" in runner.command.argv
-    for command in runner.commands:
-        assert command.argv is not None
-        assert "!generated" not in command.argv
-        assert "!.git" in command.argv
-    assert runner.command.argv[-1] == "."
-    assert "src/**/*.py" in runner.command.argv
-    assert "src/a.py" not in runner.command.argv
+    assert runner.command.kind == "shell"
+    listing, argv = _search_argvs(runner.command)
+    assert listing is not None
+    assert "--files" in listing
+    assert "--no-config" in argv
+    assert "--no-require-git" in argv
+    assert "--ignore-case" in argv
+    assert argv[-2:] == ["-needle", "."]
+    option_end = argv.index("--")
+    assert argv[option_end + 1 :] == ["-needle", "."]
+    assert argv[argv.index("--max-filesize") : argv.index("--max-filesize") + 2] == [
+        "--max-filesize",
+        "54321",
+    ]
+    assert "!generated/**" in argv
+    assert "!generated" not in argv
+    assert "!dist/**" not in argv
+    assert "--iglob" in argv
+    assert "!.git" in argv
+    assert "!**/.git/**" in argv
+    for command_argv in (listing, argv):
+        assert "!generated" not in command_argv
+        assert "!.git" in command_argv
+    assert argv[-1] == "."
+    assert "src/**/*.py" in argv
+    assert "src/a.py" not in argv
 
 
-def test_search_text_scope_resolution_shares_one_timeout_budget(monkeypatch) -> None:
-    clock = [100.0]
-
-    class _AdvancingRunner(_ResultRunner):
-        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
-            result = await super().exec(command, **kwargs)
-            clock[0] += 2.0
-            return result
-
-    monkeypatch.setattr(search_module.time, "monotonic", lambda: clock[0])
-    runner = _AdvancingRunner(
-        [
-            ExecResult(stdout="src/a.py\0"),
-            ExecResult(stdout="src/a.py\0"),
-        ]
+def test_search_text_scoped_search_filters_matches_to_listed_files() -> None:
+    runner = _ResultRunner(
+        ExecResult(stdout=_scoped_stdout("src/a.py\0", "src/a.py\0src/ignored.py\0"))
     )
 
     result = asyncio.run(
@@ -945,20 +952,20 @@ def test_search_text_scope_resolution_shares_one_timeout_budget(monkeypatch) -> 
     )
 
     assert result.is_error is False
-    assert runner.timeout_values == [7, 5]
+    assert result.structured["matches"] == [{"path": "src/a.py"}]
+    assert len(runner.commands) == 1
+    assert runner.timeout_values == [7]
 
 
-def test_search_text_scope_resolution_does_not_round_up_subsecond_budget(monkeypatch) -> None:
-    clock = [100.0]
-
-    class _NearlyExpiredRunner(_ResultRunner):
-        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
-            result = await super().exec(command, **kwargs)
-            clock[0] += 6.5
-            return result
-
-    monkeypatch.setattr(search_module.time, "monotonic", lambda: clock[0])
-    runner = _NearlyExpiredRunner(ExecResult(stdout="src/a.py\0"))
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        pytest.param("src/a.py\0", id="during-listing"),
+        pytest.param(_scoped_stdout("src/a.py\0", "src/a.py\0"), id="during-search"),
+    ],
+)
+def test_search_text_scoped_search_reports_a_timeout_in_either_part(stdout: str) -> None:
+    runner = _ResultRunner(ExecResult(stdout=stdout, exit_code=-1, timed_out=True))
 
     result = asyncio.run(
         SearchTextTool(timeout_s=7).run(
@@ -968,9 +975,61 @@ def test_search_text_scope_resolution_does_not_round_up_subsecond_budget(monkeyp
     )
 
     assert result.is_error is True
-    assert result.structured is not None
     assert result.structured["error"] == "search_timed_out"
-    assert runner.timeout_values == [7]
+    assert result.content == "Search timed out after 7 seconds."
+
+
+def test_search_text_scoped_search_reports_a_failed_listing() -> None:
+    stderr = "rg: ./src: Permission denied (os error 13)\n"
+    runner = _ResultRunner(
+        ExecResult(stdout=_scoped_stdout("src/a.py\0", status=2), stderr=stderr, exit_code=2)
+    )
+
+    result = asyncio.run(
+        SearchTextTool().run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"pattern": "needle", "path": "src"},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured["error"] == "search_failed"
+    assert result.structured["exit_code"] == 2
+    assert result.structured["stderr_bytes"] == len(stderr)
+
+
+def test_search_text_scoped_search_holds_each_part_to_the_capture_limit() -> None:
+    listing = "".join(f"src/{index:04}.py\0" for index in range(200))
+    overflowing = _ResultRunner(ExecResult(stdout=_scoped_stdout(listing)))
+
+    exhausted = asyncio.run(
+        SearchTextTool(capture_limit_bytes=1024).run(
+            ToolContext(session_id="sess_1", runner=overflowing),
+            {"pattern": "needle", "path": "src"},
+        )
+    )
+
+    assert exhausted.is_error is True
+    assert exhausted.structured["error"] == "search_scope_exhausted"
+    assert exhausted.structured["phase"] == "visibility"
+
+    matches = "".join(f"src/{index:04}.py\0" for index in range(10))
+    search = "".join(f"src/{index:04}.py\0" for index in range(100))
+    truncating = _ResultRunner(ExecResult(stdout=_scoped_stdout(matches, search)))
+
+    truncated = asyncio.run(
+        SearchTextTool(capture_limit_bytes=1024).run(
+            ToolContext(session_id="sess_1", runner=truncating),
+            {"pattern": "needle", "path": "src", "limit": 20},
+        )
+    )
+
+    assert truncated.is_error is False
+    assert truncated.structured["matches"] == [
+        {"path": f"src/{index:04}.py"} for index in range(10)
+    ]
+    assert truncated.structured["stdout_bytes"] == len(search)
+    assert truncated.structured["truncated"] is True
 
 
 @pytest.mark.parametrize(
@@ -1514,12 +1573,36 @@ def test_search_text_rejects_invalid_globs_before_runner_execution(glob: str) ->
     assert runner.command is None
 
 
-def test_search_text_normalizes_contained_relative_paths() -> None:
+def test_search_text_runs_a_search_again_when_the_transport_cut_it_short() -> None:
+    listing = "".join(f"src/{index:04}.py\0" for index in range(50))
     runner = _ResultRunner(
         [
-            ExecResult(stdout="tests/unit/test_app.py\0"),
-            ExecResult(stdout="tests/unit/test_app.py\0"),
+            # The shared output cap cut the search after a few entries.
+            ExecResult(
+                stdout=_scoped_stdout(listing, "src/0000.py\0src/00"), stdout_truncated=True
+            ),
+            ExecResult(stdout=listing),
         ]
+    )
+
+    result = asyncio.run(
+        SearchTextTool(timeout_s=7).run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"pattern": "needle", "path": "src"},
+        )
+    )
+
+    assert result.is_error is False
+    assert result.structured["returned"] == 50
+    assert result.structured["truncated"] is False
+    assert [command.kind for command in runner.commands] == ["shell", "process"]
+    assert runner.timeout_values[0] == 7
+    assert runner.timeout_values[1] is not None and runner.timeout_values[1] <= 7
+
+
+def test_search_text_normalizes_contained_relative_paths() -> None:
+    runner = _ResultRunner(
+        ExecResult(stdout=_scoped_stdout("tests/unit/test_app.py\0", "tests/unit/test_app.py\0"))
     )
 
     result = asyncio.run(
@@ -1531,11 +1614,11 @@ def test_search_text_normalizes_contained_relative_paths() -> None:
 
     assert result.is_error is False
     assert runner.command is not None
-    assert runner.command.argv is not None
-    assert runner.command.argv[-1] == "."
-    assert "tests/unit" in runner.command.argv
-    assert "tests/unit/**" in runner.command.argv
-    assert "tests/unit/test_app.py" not in runner.command.argv
+    _, argv = _search_argvs(runner.command)
+    assert argv[-1] == "."
+    assert "tests/unit" in argv
+    assert "tests/unit/**" in argv
+    assert "tests/unit/test_app.py" not in argv
     assert result.structured is not None
     assert result.structured["path"] == "tests/unit"
 
