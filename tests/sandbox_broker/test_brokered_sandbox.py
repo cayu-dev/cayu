@@ -12,7 +12,7 @@ import os
 import subprocess
 import sys
 import tarfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -1021,7 +1021,7 @@ def test_without_a_git_baseline_the_sandbox_runs_no_git(tmp_path: Path) -> None:
     asyncio.run(scenario())
     (sandbox,) = broker.sandboxes.values()
     assert not (sandbox.root / ".git").exists()
-    assert not any(argv[0] == "git" for argv in broker.started)
+    assert not any(argv[0] == "git" or "cayu-git-baseline" in argv for argv in broker.started)
     assert broker.live() == []
 
 
@@ -1034,6 +1034,10 @@ def test_a_baseline_that_fails_fails_the_bind(tmp_path: Path, monkeypatch) -> No
         # An image without git: every git command exits nonzero.
         if body["argv"][0] == "git":
             body = {**body, "argv": ["false"]}
+        elif "cayu-git-baseline" in body["argv"]:
+            argv = list(body["argv"])
+            argv[2] = "git() { return 127; }\n" + argv[2]
+            body = {**body, "argv": argv}
         return await start(sandbox, body)
 
     monkeypatch.setattr(broker, "_start", without_git)
@@ -3424,42 +3428,122 @@ def test_a_staged_copy_in_spools_only_a_source_that_cannot_seek(tmp_path, monkey
 
 
 class _RecordingRunner:
-    """Answers every baseline step, recording each one's timeout."""
+    """Answers the baseline command, recording each command and its timeout."""
 
     def __init__(self) -> None:
-        self.timeouts: dict[str, int] = {}
+        self.commands: list[tuple[list[str], int]] = []
 
     async def exec_system(self, command, *, timeout_s, **_options):
-        argv = command.argv
-        step = "commit" if "commit" in argv else argv[1]
-        self.timeouts.setdefault(step, timeout_s)
-        # The filter check finds nothing configured.
-        exit_code = 1 if "--get-regexp" in argv else 0
-        return runner_module.ExecResult(stdout="", stderr="", exit_code=exit_code)
+        self.commands.append((command.argv, timeout_s))
+        return runner_module.ExecResult(stdout="", stderr="", exit_code=0)
 
 
 def test_the_git_baseline_gives_a_large_tree_time_to_commit() -> None:
     from cayu.environments import _ephemeral_git as ephemeral_git
 
-    def timeouts(**options) -> dict[str, int]:
+    def timeout(**options) -> int:
         runner = _RecordingRunner()
         asyncio.run(initialize_ephemeral_git_baseline(runner, **options))
-        return runner.timeouts
+        # Every step runs in one command.
+        ((argv, timeout_s),) = runner.commands
+        assert argv[:2] == ["/bin/sh", "-c"]
+        return timeout_s
 
-    small = timeouts()
-    assert small["add"] == small["commit"] == small["init"] == 60
+    # The most any one step got when each ran as its own command.
+    assert timeout() == 60
     # A 1 GiB tree of 10,000 files gets minutes, not one.
     copied = {"sync_binding": {"copied_bytes": 1024**3, "copied_files": 10_000}}
     tree_bytes, tree_files = ephemeral_git.sync_bound_tree_size(copied)
-    large = timeouts(tree_bytes=tree_bytes, tree_files=tree_files)
-    assert large["add"] == large["commit"] == 60 + 256 + 100
-    assert large["init"] == large["config"] == 60
-    huge = timeouts(tree_bytes=64 * 1024**3, tree_files=10_000_000)
-    assert huge["add"] == ephemeral_git.MAX_BASELINE_STEP_TIMEOUT_SECONDS
-    assert timeouts(tree_bytes=1024**3, timeout_s=90)["commit"] == 90
+    assert timeout(tree_bytes=tree_bytes, tree_files=tree_files) == 60 + 256 + 100
+    huge = timeout(tree_bytes=64 * 1024**3, tree_files=10_000_000)
+    assert huge == ephemeral_git.MAX_BASELINE_STEP_TIMEOUT_SECONDS
+    assert timeout(tree_bytes=1024**3, timeout_s=90) == 90
     with pytest.raises(ValueError):
-        timeouts(timeout_s=0)
+        timeout(timeout_s=0)
     assert ephemeral_git.sync_bound_tree_size({}) == (None, None)
+
+
+def test_the_git_baseline_is_one_sandbox_command(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        (sandbox,) = broker.sandboxes.values()
+        (sandbox.root / "a.txt").write_bytes(b"a\n")
+        started = len(broker.started)
+        await initialize_ephemeral_git_baseline(runner)
+        commands = broker.started[started:]
+        tracked = await runner.exec(ExecCommand.process("git", "ls-files", "-z"))
+        configuration = await runner.exec(
+            ExecCommand.process("git", "config", "--local", "--list"),
+            env={"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+        )
+        log = await runner.exec(ExecCommand.process("git", "log", "--format=%an <%ae> %s"))
+        await runner.close()
+        return commands, tracked, configuration, log
+
+    commands, tracked, configuration, log = asyncio.run(scenario())
+    assert len(commands) == 1 and commands[0][:2] == ["/bin/sh", "-c"]
+    assert tracked.stdout == "a.txt\0"
+    for setting in (
+        "core.hookspath=/dev/null",
+        "core.fsmonitor=false",
+        "credential.helper=/bin/false",
+        "commit.gpgsign=false",
+        "protocol.allow=never",
+    ):
+        assert setting in configuration.stdout.splitlines()
+    assert log.stdout == "Cayu Runtime <runtime@cayu.invalid> Cayu workspace baseline\n"
+
+
+def test_the_git_baseline_fits_a_sandbox_with_little_lifetime_left(tmp_path: Path) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        sandbox = broker.sandboxes[runner.sandbox_id]
+        # Two and a half minutes left: enough for each former step's minute.
+        sandbox.max_expires_at = datetime.now(UTC) + timedelta(seconds=150)
+        runner.sandbox = runner.sandbox.model_copy(
+            update={"max_expires_at": sandbox.max_expires_at}
+        )
+        (sandbox.root / "a.txt").write_bytes(b"a\n")
+        await initialize_ephemeral_git_baseline(runner)
+        tracked = await runner.exec(ExecCommand.process("git", "ls-files", "-z"))
+        await runner.close()
+        return tracked
+
+    assert asyncio.run(scenario()).stdout == "a.txt\0"
+    assert broker.lifetime_refusals == 0
+
+
+def test_a_baseline_with_a_filter_configured_is_unsafe(tmp_path: Path, monkeypatch) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    start = broker._start
+
+    async def with_filter(sandbox, body):
+        # Something in the image configures a clean filter as the repository is made.
+        if "cayu-git-baseline" in body["argv"]:
+            script = (
+                'git() { command git "$@" || return; '
+                'if [ "$1" = init ]; then command git config --local filter.x.clean cat; fi; }\n'
+            )
+            argv = list(body["argv"])
+            argv[2] = script + argv[2]
+            body = {**body, "argv": argv}
+        return await start(sandbox, body)
+
+    monkeypatch.setattr(broker, "_start", with_filter)
+
+    async def scenario():
+        runner = await _ready_runner(broker)
+        try:
+            with pytest.raises(RuntimeError, match="ephemeral Git configuration is unsafe"):
+                await initialize_ephemeral_git_baseline(runner)
+        finally:
+            await runner.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("interactive", [False, True])

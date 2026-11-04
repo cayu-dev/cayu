@@ -10,6 +10,7 @@ signing and every transport, and is checked before the baseline is trusted.
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -44,19 +45,78 @@ GIT_ENV_REMOVE = (
     "GIT_WORK_TREE",
 )
 _FILTER_OUTPUT_BYTES = 64 * 1024
-#: Setup steps, and staging and committing a tree of unknown size, get a minute each.
+#: The baseline of a tree of unknown size gets a minute.
 BASELINE_STEP_TIMEOUT_SECONDS = 60
-#: Staging and committing a known tree get the minute plus this long per MiB and per
+#: The baseline of a known tree gets the minute plus this long per MiB and per
 #: thousand files, which ``git add`` hashes and compresses one by one, up to the cap.
 _BASELINE_SECONDS_PER_MIB = 0.25
 _BASELINE_SECONDS_PER_THOUSAND_FILES = 10.0
 MAX_BASELINE_STEP_TIMEOUT_SECONDS = 1_800
+# Configuration that would run commands or read another file: includes and filters.
+_UNSAFE_CONFIGURATION_PATTERN = r"^(include([iI][fF])?\..*|filter\..*\.(clean|smudge|process))$"
+_UNSAFE_CONFIGURATION_QUERY = (
+    "git",
+    "config",
+    "--includes",
+    "--null",
+    "--name-only",
+    "--get-regexp",
+)
+_QUERY_ENVIRONMENT = {"GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
+_BASELINE_STEPS = (
+    ("rm", "-rf", "--", ".git"),
+    ("git", "init", "-q"),
+    ("git", "config", "--local", "core.hooksPath", "/dev/null"),
+    ("git", "config", "--local", "core.fsmonitor", "false"),
+    ("git", "config", "--local", "core.pager", "cat"),
+    ("git", "config", "--local", "pager.branch", "false"),
+    ("git", "config", "--local", "pager.diff", "false"),
+    ("git", "config", "--local", "pager.status", "false"),
+    ("git", "config", "--local", "credential.helper", "/bin/false"),
+    ("git", "config", "--local", "credential.interactive", "never"),
+    ("git", "config", "--local", "commit.gpgSign", "false"),
+    ("git", "config", "--local", "tag.gpgSign", "false"),
+    ("git", "config", "--local", "protocol.allow", "never"),
+    ("git", "add", "-A", "--", "."),
+    (
+        "git",
+        "-c",
+        "user.name=Cayu Runtime",
+        "-c",
+        "user.email=runtime@cayu.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "--no-gpg-sign",
+        "--no-verify",
+        "-m",
+        "Cayu workspace baseline",
+    ),
+)
+_UNSAFE_CONFIGURATION_EXIT_CODE = 3
+# The steps stop at the first failure. The last line exits 3 unless ``git config``
+# finds nothing matching $1, so a configuration that names an include or a filter
+# fails the baseline apart from a step that fails.
+_BASELINE_SCRIPT = (
+    " &&\n".join(shlex.join(step) for step in _BASELINE_STEPS)
+    + " || exit 1\n"
+    + shlex.join(
+        [
+            *(f"{name}={value}" for name, value in _QUERY_ENVIRONMENT.items()),
+            *_UNSAFE_CONFIGURATION_QUERY,
+        ]
+    )
+    + ' "$1" >/dev/null\n'
+    + f'[ "$?" -eq 1 ] || exit {_UNSAFE_CONFIGURATION_EXIT_CODE}\n'
+)
 
 
 def baseline_step_timeout_seconds(
     *, tree_bytes: int | None = None, tree_files: int | None = None
 ) -> int:
-    """How long ``git add`` and ``git commit`` may take for a tree of this size.
+    """How long the baseline of a tree of this size may take, all its steps included.
 
     A 1 GiB tree of 10,000 files gets 60 + 256 + 100 seconds; nothing gets more
     than ``MAX_BASELINE_STEP_TIMEOUT_SECONDS``.
@@ -103,11 +163,17 @@ async def initialize_ephemeral_git_baseline(
 ) -> None:
     """Commit the workspace at ``cwd`` (the runner's root by default) to a fresh, inert repository.
 
-    No step reads back output that grows with the workspace, so a runner whose
+    Every step, from ``git init`` through the commit and the check of its
+    configuration, runs in one ``/bin/sh`` command, because each command costs
+    a round trip that on a brokered sandbox outweighs the steps themselves. No
+    step reads back output that grows with the workspace, so a runner whose
     command output is capped, as a brokered sandbox's is, can baseline any tree
-    it holds. Each setup step gets a minute. ``git add`` and ``git commit`` get
-    ``timeout_s`` each, or by default a time that grows with the copied tree's
-    ``tree_bytes`` and ``tree_files`` (see ``baseline_step_timeout_seconds``).
+    it holds. The command gets ``timeout_s``, or by default a time that grows
+    with the copied tree's ``tree_bytes`` and ``tree_files`` (see
+    ``baseline_step_timeout_seconds``). That is the most any one step got when
+    the steps ran as separate commands, so the baseline needs no more of a
+    sandbox's remaining lifetime than its ``git add`` did; the other steps take
+    a fraction of a second.
     """
 
     if timeout_s is None:
@@ -128,53 +194,22 @@ async def initialize_ephemeral_git_baseline(
         "GIT_TERMINAL_PROMPT": "0",
         "PAGER": "cat",
     }
-    commands = (
-        ExecCommand.process("rm", "-rf", "--", ".git"),
-        ExecCommand.process("git", "init", "-q"),
-        ExecCommand.process("git", "config", "--local", "core.hooksPath", "/dev/null"),
-        ExecCommand.process("git", "config", "--local", "core.fsmonitor", "false"),
-        ExecCommand.process("git", "config", "--local", "core.pager", "cat"),
-        ExecCommand.process("git", "config", "--local", "pager.branch", "false"),
-        ExecCommand.process("git", "config", "--local", "pager.diff", "false"),
-        ExecCommand.process("git", "config", "--local", "pager.status", "false"),
-        ExecCommand.process("git", "config", "--local", "credential.helper", "/bin/false"),
-        ExecCommand.process("git", "config", "--local", "credential.interactive", "never"),
-        ExecCommand.process("git", "config", "--local", "commit.gpgSign", "false"),
-        ExecCommand.process("git", "config", "--local", "tag.gpgSign", "false"),
-        ExecCommand.process("git", "config", "--local", "protocol.allow", "never"),
-        ExecCommand.process("git", "add", "-A", "--", "."),
+    result = await runner.exec_system(
         ExecCommand.process(
-            "git",
-            "-c",
-            "user.name=Cayu Runtime",
-            "-c",
-            "user.email=runtime@cayu.invalid",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "--no-gpg-sign",
-            "--no-verify",
-            "-m",
-            "Cayu workspace baseline",
+            "/bin/sh", "-c", _BASELINE_SCRIPT, "cayu-git-baseline", _UNSAFE_CONFIGURATION_PATTERN
         ),
+        cwd=cwd,
+        env=environment,
+        env_remove=GIT_ENV_REMOVE,
+        timeout_s=tree_timeout,
+        output_limit_bytes=64 * 1024,
     )
-    for index, command in enumerate(commands):
-        # The last two steps, ``git add`` and ``git commit``, walk the whole tree.
-        walks_tree = index >= len(commands) - 2
-        result = await runner.exec_system(
-            command,
-            cwd=cwd,
-            env=environment,
-            env_remove=GIT_ENV_REMOVE,
-            timeout_s=tree_timeout if walks_tree else BASELINE_STEP_TIMEOUT_SECONDS,
-            output_limit_bytes=64 * 1024,
-        )
-        if result.exit_code != 0 or result.timed_out:
-            raise RuntimeError("The coding sandbox could not establish its ephemeral Git baseline.")
-    if not await git_filter_configuration_is_safe(runner, cwd=cwd):
+    if result.exit_code == _UNSAFE_CONFIGURATION_EXIT_CODE and not (
+        result.timed_out or result.cancelled
+    ):
         raise RuntimeError("The coding sandbox's ephemeral Git configuration is unsafe.")
+    if result.exit_code != 0 or result.timed_out or result.cancelled:
+        raise RuntimeError("The coding sandbox could not establish its ephemeral Git baseline.")
 
 
 async def ephemeral_git_baseline(runner: Runner) -> EphemeralGitBaseline:
@@ -227,23 +262,14 @@ async def git_filter_configuration_is_safe(runner: Runner, *, cwd: str | None = 
     """True when the repository at ``cwd`` has no include and no clean, smudge or process filter."""
 
     configured_filters = await runner.exec_system(
-        ExecCommand.process(
-            "git",
-            "config",
-            "--includes",
-            "--null",
-            "--name-only",
-            "--get-regexp",
-            r"^(include([iI][fF])?\..*|filter\..*\.(clean|smudge|process))$",
-        ),
+        ExecCommand.process(*_UNSAFE_CONFIGURATION_QUERY, _UNSAFE_CONFIGURATION_PATTERN),
         cwd=cwd,
         env={
             "GIT_ATTR_NOSYSTEM": "1",
             "GIT_CONFIG_COUNT": "0",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "LC_ALL": "C",
+            **_QUERY_ENVIRONMENT,
         },
         env_remove=GIT_ENV_REMOVE,
         timeout_s=60,

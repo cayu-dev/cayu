@@ -82,9 +82,9 @@ BUDGETS: dict[str, dict[str, int]] = {
     # then copy-back of the two files the tool calls changed.
     "sandbox allocation": {"sandbox_commands": 0, "broker_requests": 2},
     "sandbox setup": {
-        "sandbox_commands": 18,
-        "broker_requests": 37,
-        "command_kib": 114,
+        "sandbox_commands": 3,
+        "broker_requests": 7,
+        "command_kib": 109,
         "archive_uploads": 1,
         "upload_kib": 460,
         "target_cleans": 1,

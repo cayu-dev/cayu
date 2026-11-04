@@ -3412,14 +3412,19 @@ class _NoGitLocalDockerRunner(_LocalDockerRunner):
     """Fail any guest Git command, proving a binding never needs Git."""
 
     async def exec(self, command, **kwargs: Any):
-        if command.argv and command.argv[0] == "git":
+        if _runs_git(command):
             raise AssertionError("git must not run without a guest Git baseline")
         return await super().exec(command, **kwargs)
 
     async def exec_system(self, command, **kwargs: Any):
-        if command.argv and command.argv[0] == "git":
+        if _runs_git(command):
             raise AssertionError("git must not run without a guest Git baseline")
         return await super().exec_system(command, **kwargs)
+
+
+def _runs_git(command) -> bool:
+    # The baseline's steps run in one shell command.
+    return bool(command.argv) and (command.argv[0] == "git" or "cayu-git-baseline" in command.argv)
 
 
 def _no_git_binding(runner: DockerRunner) -> DockerCodingWorkspaceBinding:
