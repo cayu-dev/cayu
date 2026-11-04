@@ -5301,7 +5301,7 @@ class SQLiteSessionStore(
         )
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
-        return await event_publication_ops.append_events(
+        await event_publication_ops.append_events(
             self._run_write,
             session_id,
             events,
@@ -5309,6 +5309,26 @@ class SQLiteSessionStore(
             closure_owners=self._closure_lineage_owners_unlocked,
             append_events=_append_events_in_transaction,
             first_existing_event_id=_first_existing_event_id,
+        )
+
+    async def append_event_and_claim_side_effect(
+        self,
+        session_id: str,
+        event: Event,
+        *,
+        lease_seconds: float = 300.0,
+        claim_id: str | None = None,
+    ) -> PersistedEventSideEffectClaim | None:
+        return await event_publication_ops.append_events(
+            self._run_write,
+            session_id,
+            [event],
+            store_now=self._ownership_clock,
+            closure_owners=self._closure_lineage_owners_unlocked,
+            append_events=_append_events_in_transaction,
+            first_existing_event_id=_first_existing_event_id,
+            claim_lease_seconds=lease_seconds,
+            claim_id=claim_id,
         )
 
     async def append_tool_effect_conflict(self, request: object) -> Event:

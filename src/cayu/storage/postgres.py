@@ -4861,7 +4861,7 @@ class PostgresSessionStore(
         return event
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
-        return await event_publication_ops.append_events(
+        await event_publication_ops.append_events(
             self._connection,
             session_id,
             events,
@@ -4871,6 +4871,28 @@ class PostgresSessionStore(
             append_events=self._append_events_with_cursor,
             first_existing_event_id=self._first_existing_event_id,
             unique_violation=UniqueViolation,
+        )
+
+    async def append_event_and_claim_side_effect(
+        self,
+        session_id: str,
+        event: Event,
+        *,
+        lease_seconds: float = 300.0,
+        claim_id: str | None = None,
+    ) -> PersistedEventSideEffectClaim | None:
+        return await event_publication_ops.append_events(
+            self._connection,
+            session_id,
+            [event],
+            ensure_ready=self._ensure_ready,
+            load_session=self._load_for_update,
+            closure_owners=self._closure_lineage_owners,
+            append_events=self._append_events_with_cursor,
+            first_existing_event_id=self._first_existing_event_id,
+            unique_violation=UniqueViolation,
+            claim_lease_seconds=lease_seconds,
+            claim_id=claim_id,
         )
 
     async def append_tool_effect_conflict(self, request: object) -> Event:

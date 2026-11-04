@@ -21,6 +21,7 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectQuery,
     PersistedEventSideEffectStatus,
     validate_persisted_event_side_effect_error,
+    validate_persisted_event_side_effect_lease_seconds,
 )
 from cayu.sessions.records import EventRecord
 
@@ -77,10 +78,10 @@ async def _claim_persisted_event_side_effect(
         event_id = require_clean_nonblank(event_id, "event_id")
     if (session_id is None) != (event_id is None):
         raise ValueError("session_id and event_id must be supplied together.")
-    if type(lease_seconds) not in {int, float} or lease_seconds <= 0:
-        raise ValueError("lease_seconds must be greater than 0.")
+    lease_seconds = validate_persisted_event_side_effect_lease_seconds(lease_seconds)
     async with locked() as state:
         now = state.ownership_clock()
+        lease_expires_at = now + timedelta(seconds=lease_seconds)
         deliveries = sorted(
             state.persisted_event_side_effect_deliveries.values(),
             key=lambda delivery: delivery.event_sequence,
@@ -88,56 +89,97 @@ async def _claim_persisted_event_side_effect(
         for delivery in deliveries:
             if expected is not None and delivery != expected:
                 continue
-            if state.session_closure_progress.owns(delivery.session_id):
-                continue
             if session_id is not None and (
                 delivery.session_id != session_id or delivery.event_id != event_id
             ):
                 continue
-            if delivery.status in {
-                PersistedEventSideEffectStatus.DELIVERED,
-                PersistedEventSideEffectStatus.DEAD_LETTERED,
-            }:
+            if not _claimable_unlocked(state, delivery, now):
                 continue
-            if (
-                delivery.status is PersistedEventSideEffectStatus.LEASED
-                and delivery.lease_expires_at is not None
-                and delivery.lease_expires_at > now
-            ):
-                continue
-            if (
-                delivery.status is PersistedEventSideEffectStatus.FAILED
-                and delivery.next_attempt_at is not None
-                and delivery.next_attempt_at > now
-            ):
-                continue
-            record = state.event_records_by_id.get((delivery.session_id, delivery.event_id))
-            if record is None:
-                raise RuntimeError("Persisted side-effect delivery lost its source event.")
-            claim = PersistedEventSideEffectClaim(
-                session_id=delivery.session_id,
-                event_id=delivery.event_id,
-                event_sequence=delivery.event_sequence,
-                event=record.event,
-                attempt=delivery.attempts + 1,
-                lease_expires_at=now + timedelta(seconds=float(lease_seconds)),
-            )
-            state.persisted_event_side_effect_deliveries[
-                (delivery.session_id, delivery.event_id)
-            ] = delivery.model_copy(
-                update={
-                    "status": PersistedEventSideEffectStatus.LEASED,
-                    "attempts": claim.attempt,
-                    "claim_id": claim.claim_id,
-                    "lease_expires_at": claim.lease_expires_at,
-                    "next_attempt_at": None,
-                    "last_error": None,
-                    "updated_at": now,
-                },
-                deep=True,
-            )
-            return claim
+            return _lease_unlocked(state, delivery, now, lease_expires_at)
         return None
+
+
+def claim_appended_event_side_effect_unlocked(
+    state: MemoryEventDeliveryState,
+    *,
+    session_id: str,
+    event_id: str,
+    now: datetime,
+    lease_expires_at: datetime,
+    claim_id: str,
+) -> PersistedEventSideEffectClaim | None:
+    """Claim one event's handoff under the lock that appended the event.
+
+    The caller computes the lease before appending, so nothing here can fail
+    after the append has been applied.
+    """
+
+    delivery = state.persisted_event_side_effect_deliveries.get((session_id, event_id))
+    if delivery is None or not _claimable_unlocked(state, delivery, now):
+        return None
+    return _lease_unlocked(state, delivery, now, lease_expires_at, claim_id=claim_id)
+
+
+def _claimable_unlocked(
+    state: MemoryEventDeliveryState,
+    delivery: PersistedEventSideEffectDelivery,
+    now: datetime,
+) -> bool:
+    if state.session_closure_progress.owns(delivery.session_id):
+        return False
+    if delivery.status in {
+        PersistedEventSideEffectStatus.DELIVERED,
+        PersistedEventSideEffectStatus.DEAD_LETTERED,
+    }:
+        return False
+    if (
+        delivery.status is PersistedEventSideEffectStatus.LEASED
+        and delivery.lease_expires_at is not None
+        and delivery.lease_expires_at > now
+    ):
+        return False
+    return not (
+        delivery.status is PersistedEventSideEffectStatus.FAILED
+        and delivery.next_attempt_at is not None
+        and delivery.next_attempt_at > now
+    )
+
+
+def _lease_unlocked(
+    state: MemoryEventDeliveryState,
+    delivery: PersistedEventSideEffectDelivery,
+    now: datetime,
+    lease_expires_at: datetime,
+    *,
+    claim_id: str | None = None,
+) -> PersistedEventSideEffectClaim:
+    record = state.event_records_by_id.get((delivery.session_id, delivery.event_id))
+    if record is None:
+        raise RuntimeError("Persisted side-effect delivery lost its source event.")
+    claim = PersistedEventSideEffectClaim(
+        session_id=delivery.session_id,
+        event_id=delivery.event_id,
+        event_sequence=delivery.event_sequence,
+        event=record.event,
+        attempt=delivery.attempts + 1,
+        lease_expires_at=lease_expires_at,
+        **({} if claim_id is None else {"claim_id": claim_id}),
+    )
+    state.persisted_event_side_effect_deliveries[(delivery.session_id, delivery.event_id)] = (
+        delivery.model_copy(
+            update={
+                "status": PersistedEventSideEffectStatus.LEASED,
+                "attempts": claim.attempt,
+                "claim_id": claim.claim_id,
+                "lease_expires_at": claim.lease_expires_at,
+                "next_attempt_at": None,
+                "last_error": None,
+                "updated_at": now,
+            },
+            deep=True,
+        )
+    )
+    return claim
 
 
 async def get_persisted_event_side_effect_delivery(

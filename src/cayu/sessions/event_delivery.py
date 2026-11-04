@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -576,6 +577,18 @@ def restore_persisted_event_authority(
         )
     )
     return event_with_runtime_payload_authority(copied, *fields) if fields else copied
+
+
+def validate_persisted_event_side_effect_lease_seconds(lease_seconds: float) -> float:
+    """Return one finite, positive claim lease in seconds."""
+
+    if (
+        type(lease_seconds) not in {int, float}
+        or not math.isfinite(lease_seconds)
+        or lease_seconds <= 0
+    ):
+        raise ValueError("lease_seconds must be a finite number greater than 0.")
+    return float(lease_seconds)
 
 
 def _copy_session_event_batch(session_id: str, events: list[Event]) -> tuple[str, list[Event]]:

@@ -15,7 +15,12 @@ from cayu.budgets.base import BudgetReservationIdentityConflict
 from cayu.events import Event
 from cayu.sessions._closure_records import _check_closure_lineage_owner
 from cayu.sessions._invocation_scope import _assert_session_run_epoch, _current_session_run_epoch
-from cayu.sessions.event_delivery import _copy_session_event_batch, _copy_workflow_step_reservation
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectClaim,
+    _copy_session_event_batch,
+    _copy_workflow_step_reservation,
+    validate_persisted_event_side_effect_lease_seconds,
+)
 from cayu.sessions.mcp_manifest_history import (
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
@@ -143,11 +148,30 @@ async def append_events(
     append_events: EventWriter,
     first_existing_event_id: Callable[[Any, str, list[str]], Awaitable[str | None]],
     unique_violation: type[UniqueViolation],
-) -> None:
+    claim_lease_seconds: float | None = None,
+    claim_id: str | None = None,
+) -> PersistedEventSideEffectClaim | None:
+    """Append one durable batch; optionally claim a single event's new handoff.
+
+    With ``claim_lease_seconds`` the batch must hold one event, and its claim
+    commits with the append or not at all.
+    """
+
     session_id, copied_events = _copy_session_event_batch(session_id, events)
+    if claim_lease_seconds is not None:
+        if len(copied_events) != 1:
+            raise ValueError("Append and claim takes exactly one event.")
+        claim_lease_seconds = validate_persisted_event_side_effect_lease_seconds(
+            claim_lease_seconds
+        )
+    elif claim_id is not None:
+        raise ValueError("claim_id requires claim_lease_seconds.")
+    if claim_id is not None:
+        claim_id = require_clean_nonblank(claim_id, "claim_id")
 
     await ensure_ready()
     expected_run_epoch = _current_session_run_epoch(session_id)
+    claim = None
     async with connect() as conn:
         try:
             async with conn.cursor() as cur:
@@ -156,7 +180,7 @@ async def append_events(
                     raise KeyError(f"Session not found: {session_id}")
                 if not copied_events:
                     _assert_session_run_epoch(session_id, loaded)
-                    return
+                    return None
                 for owner in await closure_owners(cur, (session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
                 await append_events(
@@ -165,7 +189,16 @@ async def append_events(
                     copied_events,
                     expected_run_epoch=expected_run_epoch,
                 )
+                if claim_lease_seconds is not None:
+                    claim = await event_delivery_ops.claim_appended_event_side_effect(
+                        cur,
+                        session_id=session_id,
+                        event_id=copied_events[0].id,
+                        lease_seconds=claim_lease_seconds,
+                        claim_id=claim_id,
+                    )
             await conn.commit()
+            return claim
         except unique_violation as exc:
             await conn.rollback()
             existing = await first_existing_event_id(

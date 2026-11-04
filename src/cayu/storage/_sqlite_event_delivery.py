@@ -28,6 +28,7 @@ from cayu.sessions.event_delivery import (
     _event_file_attachment_attestations_are_runtime_owned,
     _event_input_contract_is_runtime_owned,
     validate_persisted_event_side_effect_error,
+    validate_persisted_event_side_effect_lease_seconds,
 )
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
@@ -164,81 +165,124 @@ async def _claim_persisted_event_side_effect(
         event_id = require_clean_nonblank(event_id, "event_id")
     if (session_id is None) != (event_id is None):
         raise ValueError("session_id and event_id must be supplied together.")
-    if type(lease_seconds) not in {int, float} or lease_seconds <= 0:
-        raise ValueError("lease_seconds must be greater than 0.")
+    lease_seconds = validate_persisted_event_side_effect_lease_seconds(lease_seconds)
 
     def statement(connection: sqlite3.Connection) -> PersistedEventSideEffectClaim | None:
         try:
             connection.execute("BEGIN IMMEDIATE")
             now = ownership_clock()
-            lease_expires_at = now + timedelta(seconds=float(lease_seconds))
-            formatted_now = sqlite_records.format_datetime(now)
-            filters = [
-                "(status = 'pending' "
-                "OR (status = 'failed' AND "
-                "(next_attempt_at IS NULL OR next_attempt_at <= ?)) "
-                "OR (status = 'leased' AND lease_expires_at <= ?))",
-                "NOT EXISTS (SELECT 1 FROM cayu_session_closure_progress AS p "
-                "WHERE p.root_session_id = cayu_persisted_event_side_effects.session_id "
-                "OR EXISTS (SELECT 1 FROM json_each(p.progress_json, '$.descendants') AS child "
-                "WHERE json_extract(child.value, '$.session_id') = "
-                "cayu_persisted_event_side_effects.session_id))",
-            ]
-            params: list[object] = [formatted_now, formatted_now]
-            if session_id is not None and event_id is not None:
-                filters.extend(["session_id = ?", "event_id = ?"])
-                params.extend([session_id, event_id])
-            delivery_row = connection.execute(
-                "SELECT * FROM cayu_persisted_event_side_effects WHERE "
-                + " AND ".join(filters)
-                + " ORDER BY event_sequence ASC LIMIT 1",
-                params,
-            ).fetchone()
+            delivery_row = _claimable_delivery_row(
+                connection, now, session_id=session_id, event_id=event_id
+            )
             if delivery_row is None:
                 connection.commit()
                 return None
             if expected is not None and delivery_from_row(delivery_row) != expected:
                 connection.rollback()
                 return None
-            claim_id = str(uuid4())
-            attempt = int(delivery_row["attempts"]) + 1
-            connection.execute(
-                "UPDATE cayu_persisted_event_side_effects "
-                "SET status = 'leased', attempts = ?, claim_id = ?, "
-                "lease_expires_at = ?, next_attempt_at = NULL, "
-                "last_error = NULL, updated_at = ? "
-                "WHERE session_id = ? AND event_id = ?",
-                (
-                    attempt,
-                    claim_id,
-                    sqlite_records.format_datetime(lease_expires_at),
-                    sqlite_records.format_datetime(now),
-                    delivery_row["session_id"],
-                    delivery_row["event_id"],
-                ),
-            )
-            event_row = connection.execute(
-                f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
-                "WHERE session_id = ? AND event_id = ?",
-                (delivery_row["session_id"], delivery_row["event_id"]),
-            ).fetchone()
-            if event_row is None:
-                raise RuntimeError("Persisted side-effect delivery lost its source event.")
+            claim = _lease_delivery_row(connection, delivery_row, now, lease_seconds)
             connection.commit()
-            return PersistedEventSideEffectClaim(
-                session_id=delivery_row["session_id"],
-                event_id=delivery_row["event_id"],
-                event_sequence=delivery_row["event_sequence"],
-                event=sqlite_records.event_from_row(event_row),
-                attempt=attempt,
-                claim_id=claim_id,
-                lease_expires_at=lease_expires_at,
-            )
+            return claim
         except Exception:
             connection.rollback()
             raise
 
     return await run_write(statement)
+
+
+def claim_appended_event_side_effect(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    event_id: str,
+    lease_seconds: float,
+    claim_id: str | None,
+    ownership_clock: Callable[[], datetime],
+) -> PersistedEventSideEffectClaim | None:
+    """Claim one event's handoff in the transaction that appended the event."""
+
+    now = ownership_clock()
+    delivery_row = _claimable_delivery_row(
+        connection, now, session_id=session_id, event_id=event_id
+    )
+    if delivery_row is None:
+        return None
+    return _lease_delivery_row(connection, delivery_row, now, lease_seconds, claim_id=claim_id)
+
+
+def _claimable_delivery_row(
+    connection: sqlite3.Connection,
+    now: datetime,
+    *,
+    session_id: str | None,
+    event_id: str | None,
+) -> sqlite3.Row | None:
+    formatted_now = sqlite_records.format_datetime(now)
+    filters = [
+        "(status = 'pending' "
+        "OR (status = 'failed' AND "
+        "(next_attempt_at IS NULL OR next_attempt_at <= ?)) "
+        "OR (status = 'leased' AND lease_expires_at <= ?))",
+        "NOT EXISTS (SELECT 1 FROM cayu_session_closure_progress AS p "
+        "WHERE p.root_session_id = cayu_persisted_event_side_effects.session_id "
+        "OR EXISTS (SELECT 1 FROM json_each(p.progress_json, '$.descendants') AS child "
+        "WHERE json_extract(child.value, '$.session_id') = "
+        "cayu_persisted_event_side_effects.session_id))",
+    ]
+    params: list[object] = [formatted_now, formatted_now]
+    if session_id is not None and event_id is not None:
+        filters.extend(["session_id = ?", "event_id = ?"])
+        params.extend([session_id, event_id])
+    return connection.execute(
+        "SELECT * FROM cayu_persisted_event_side_effects WHERE "
+        + " AND ".join(filters)
+        + " ORDER BY event_sequence ASC LIMIT 1",
+        params,
+    ).fetchone()
+
+
+def _lease_delivery_row(
+    connection: sqlite3.Connection,
+    delivery_row: sqlite3.Row,
+    now: datetime,
+    lease_seconds: float,
+    *,
+    claim_id: str | None = None,
+) -> PersistedEventSideEffectClaim:
+    lease_expires_at = now + timedelta(seconds=float(lease_seconds))
+    claim_id = str(uuid4()) if claim_id is None else claim_id
+    attempt = int(delivery_row["attempts"]) + 1
+    connection.execute(
+        "UPDATE cayu_persisted_event_side_effects "
+        "SET status = 'leased', attempts = ?, claim_id = ?, "
+        "lease_expires_at = ?, next_attempt_at = NULL, "
+        "last_error = NULL, updated_at = ? "
+        "WHERE session_id = ? AND event_id = ?",
+        (
+            attempt,
+            claim_id,
+            sqlite_records.format_datetime(lease_expires_at),
+            sqlite_records.format_datetime(now),
+            delivery_row["session_id"],
+            delivery_row["event_id"],
+        ),
+    )
+    event_row = connection.execute(
+        f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
+        "WHERE session_id = ? AND event_id = ?",
+        (delivery_row["session_id"], delivery_row["event_id"]),
+    ).fetchone()
+    if event_row is None:
+        raise RuntimeError("Persisted side-effect delivery lost its source event.")
+    return PersistedEventSideEffectClaim(
+        session_id=delivery_row["session_id"],
+        event_id=delivery_row["event_id"],
+        event_sequence=delivery_row["event_sequence"],
+        event=sqlite_records.event_from_row(event_row),
+        attempt=attempt,
+        claim_id=claim_id,
+        lease_expires_at=lease_expires_at,
+    )
 
 
 async def get_persisted_event_side_effect_delivery(

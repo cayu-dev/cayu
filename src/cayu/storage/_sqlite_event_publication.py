@@ -17,7 +17,12 @@ from cayu.budgets.base import BudgetReservationIdentityConflict
 from cayu.events import Event
 from cayu.sessions._closure_records import _check_closure_lineage_owner
 from cayu.sessions._invocation_scope import _assert_session_run_epoch, _current_session_run_epoch
-from cayu.sessions.event_delivery import _copy_session_event_batch, _copy_workflow_step_reservation
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectClaim,
+    _copy_session_event_batch,
+    _copy_workflow_step_reservation,
+    validate_persisted_event_side_effect_lease_seconds,
+)
 from cayu.sessions.mcp_manifest_history import (
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
@@ -124,14 +129,32 @@ async def append_events(
     closure_owners: ClosureOwners,
     append_events: EventWriter,
     first_existing_event_id: Callable[[sqlite3.Connection, str, list[str]], str | None],
-) -> None:
-    session_id, copied_events = _copy_session_event_batch(session_id, events)
+    claim_lease_seconds: float | None = None,
+    claim_id: str | None = None,
+) -> PersistedEventSideEffectClaim | None:
+    """Append one durable batch; optionally claim a single event's new handoff.
 
-    def statement(connection: sqlite3.Connection) -> None:
+    With ``claim_lease_seconds`` the batch must hold one event, and its claim
+    commits with the append or not at all.
+    """
+
+    session_id, copied_events = _copy_session_event_batch(session_id, events)
+    if claim_lease_seconds is not None:
+        if len(copied_events) != 1:
+            raise ValueError("Append and claim takes exactly one event.")
+        claim_lease_seconds = validate_persisted_event_side_effect_lease_seconds(
+            claim_lease_seconds
+        )
+    elif claim_id is not None:
+        raise ValueError("claim_id requires claim_lease_seconds.")
+    if claim_id is not None:
+        claim_id = require_clean_nonblank(claim_id, "claim_id")
+
+    def statement(connection: sqlite3.Connection) -> PersistedEventSideEffectClaim | None:
         if not copied_events:
             if not sqlite_records.session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
-            return
+            return None
 
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -146,7 +169,20 @@ async def append_events(
                 copied_events,
                 activity_at=activity_at,
             )
+            claim = (
+                None
+                if claim_lease_seconds is None
+                else event_delivery_ops.claim_appended_event_side_effect(
+                    connection,
+                    session_id=session_id,
+                    event_id=copied_events[0].id,
+                    lease_seconds=claim_lease_seconds,
+                    claim_id=claim_id,
+                    ownership_clock=store_now,
+                )
+            )
             connection.commit()
+            return claim
         except sqlite3.IntegrityError as exc:
             connection.rollback()
             existing_event_id = first_existing_event_id(
@@ -167,7 +203,7 @@ async def append_events(
             connection.rollback()
             raise
 
-    await run_write(statement)
+    return await run_write(statement)
 
 
 async def append_tool_effect_conflict(

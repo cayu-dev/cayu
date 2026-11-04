@@ -308,6 +308,7 @@ _SESSION_EXPORT_OWNER_METHODS = (
     "append_transcript_messages_and_transform_checkpoint",
     "append_event",
     "append_events",
+    "append_event_and_claim_side_effect",
     "publish_checkpoint_and_events",
     "publish_checkpoint_and_events_with_store_time",
     "_publish_checkpoint_and_events",
@@ -322,6 +323,7 @@ _SESSION_EXPORT_OWNER_METHODS = (
     "_store_checkpoint_unlocked",
     "_upsert_checkpoint",
     "_prepare_event_append_unlocked",
+    "_append_session_events_unlocked",
     "_append_events_unlocked",
     "_append_events_with_cursor",
     "_load_checkpoint_unlocked",
@@ -1923,6 +1925,72 @@ class SessionStore(ABC):
         lease_seconds: float = 300.0,
     ) -> PersistedEventSideEffectClaim | None:
         """Claim the oldest eligible persisted event side-effect handoff."""
+
+    async def append_event_and_claim_side_effect(
+        self,
+        session_id: str,
+        event: Event,
+        *,
+        lease_seconds: float = 300.0,
+        claim_id: str | None = None,
+    ) -> PersistedEventSideEffectClaim | None:
+        """Append one event, then claim the side-effect handoff it created.
+
+        The default appends and then claims, in two store calls. Stores that
+        can do both in the append transaction override this; the claim is then
+        never visible to another worker before the event is, and a failure
+        commits neither. ``None`` means the event has no claimable handoff.
+
+        ``claim_id`` names the new claim, so a caller that loses the result
+        (cancellation or a lost commit acknowledgement) can still recognize
+        and release its lease. Only native implementations accept it; the
+        default's separate claim chooses its own identity.
+        """
+
+        if claim_id is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot choose the identity of a separate claim."
+            )
+        await self.append_event(session_id, event)
+        return await self.claim_persisted_event_side_effect(
+            session_id=session_id,
+            event_id=event.id,
+            lease_seconds=lease_seconds,
+        )
+
+    def _supports_atomic_event_side_effect_claim_protocol(self) -> bool:
+        """Return whether one native override owns append and claim together.
+
+        A subclass or instance that replaces the append or claim methods keeps
+        them in force: the combined override is used only when its class is at
+        least as derived as every class that declares one of them.
+        """
+
+        mro = type(self).__mro__
+        combined_owner = next(
+            index
+            for index, owner in enumerate(mro)
+            if "append_event_and_claim_side_effect" in owner.__dict__
+        )
+        if mro[combined_owner] is SessionStore:
+            return False
+        names = ("append_event", "append_events", "claim_persisted_event_side_effect")
+        try:
+            instance_state = object.__getattribute__(self, "__dict__")
+        except AttributeError:
+            instance_state = None
+        if isinstance(instance_state, dict) and any(
+            name in instance_state for name in (*names, "append_event_and_claim_side_effect")
+        ):
+            return False
+        return all(
+            combined_owner
+            <= next(
+                (index for index, owner in enumerate(mro) if name in owner.__dict__),
+                len(mro),
+            )
+            for name in names
+        )
 
     @abstractmethod
     async def get_persisted_event_side_effect_delivery(

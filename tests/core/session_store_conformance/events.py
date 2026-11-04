@@ -27,10 +27,12 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import (
     RunRequest,
 )
+from cayu.sessions.store import SessionStore
 
 pytestmark = pytest.mark.postgres
 
@@ -420,6 +422,152 @@ def test_session_store_conformance_persisted_event_side_effect_claim_fencing(
             assert await store.claim_persisted_event_side_effect() is None
         finally:
             await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_append_event_and_claim_side_effect(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            assert store._supports_atomic_event_side_effect_claim_protocol()
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_append_and_claim",
+                    messages=[Message.text("user", "persist")],
+                ),
+                identity=_identity(),
+            )
+            event = Event(type="custom.claimed", session_id=session.id)
+            claim = await store.append_event_and_claim_side_effect(
+                session.id, event, lease_seconds=30, claim_id="caller-named-claim"
+            )
+            assert claim is not None
+            assert (claim.session_id, claim.event_id, claim.attempt, claim.claim_id) == (
+                session.id,
+                event.id,
+                1,
+                "caller-named-claim",
+            )
+            [record] = await store.query_events(
+                EventQuery(session_id=session.id, event_id=event.id, limit=2)
+            )
+            assert claim.event == record.event
+            delivery = await store.get_persisted_event_side_effect_delivery(
+                session_id=session.id, event_id=event.id
+            )
+            assert delivery is not None
+            assert delivery.status is PersistedEventSideEffectStatus.LEASED
+            assert (delivery.claim_id, delivery.event_sequence, delivery.attempts) == (
+                claim.claim_id,
+                claim.event_sequence,
+                1,
+            )
+            # The live claim keeps the handoff from every other claimer.
+            assert await store.claim_persisted_event_side_effect() is None
+
+            # A failed append commits neither the event nor a claim.
+            event_ids = [item.id for item in await store.load_events(session.id)]
+            with pytest.raises(ValueError, match="already exists"):
+                await store.append_event_and_claim_side_effect(session.id, event)
+            assert (
+                await store.get_persisted_event_side_effect_delivery(
+                    session_id=session.id, event_id=event.id
+                )
+                == delivery
+            )
+            rejected = Event(type="custom.rejected", session_id=session.id)
+            for lease_seconds in (0, float("nan"), float("inf")):
+                with pytest.raises(ValueError, match="lease_seconds"):
+                    await store.append_event_and_claim_side_effect(
+                        session.id, rejected, lease_seconds=lease_seconds
+                    )
+            with pytest.raises(ValueError, match="claim_id"):
+                await store.append_event_and_claim_side_effect(session.id, rejected, claim_id=" ")
+            with pytest.raises(KeyError):
+                await store.append_event_and_claim_side_effect(
+                    "sess_append_and_claim_missing",
+                    Event(type="custom.missing", session_id="sess_append_and_claim_missing"),
+                )
+            assert [item.id for item in await store.load_events(session.id)] == event_ids
+
+            delivered = await store.mark_persisted_event_side_effect_delivered(claim)
+            assert delivered.status is PersistedEventSideEffectStatus.DELIVERED
+            assert await store.claim_persisted_event_side_effect() is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_atomic_append_and_claim_yields_to_overridden_append_or_claim() -> None:
+    class CustomClaimStore(InMemorySessionStore):
+        async def claim_persisted_event_side_effect(self, **kwargs):
+            return await super().claim_persisted_event_side_effect(**kwargs)
+
+    class CustomAppendStore(InMemorySessionStore):
+        async def append_events(self, session_id, events):
+            await super().append_events(session_id, events)
+
+    class OwnCombinedStore(CustomAppendStore):
+        async def append_event_and_claim_side_effect(
+            self, session_id, event, *, lease_seconds=300.0, claim_id=None
+        ):
+            return await super().append_event_and_claim_side_effect(
+                session_id, event, lease_seconds=lease_seconds, claim_id=claim_id
+            )
+
+    assert InMemorySessionStore()._supports_atomic_event_side_effect_claim_protocol()
+    assert not CustomClaimStore()._supports_atomic_event_side_effect_claim_protocol()
+    assert not CustomAppendStore()._supports_atomic_event_side_effect_claim_protocol()
+    assert OwnCombinedStore()._supports_atomic_event_side_effect_claim_protocol()
+    patched = InMemorySessionStore()
+    patched.append_event = patched.append_event  # type: ignore[method-assign]
+    assert not patched._supports_atomic_event_side_effect_claim_protocol()
+
+
+def test_default_append_event_and_claim_side_effect_composes_append_and_claim() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(agent_name="assistant", session_id="sess_default_claim", messages=[]),
+            identity=_identity(),
+        )
+        event = Event(type="custom.claimed", session_id=session.id)
+        claim = await SessionStore.append_event_and_claim_side_effect(store, session.id, event)
+        assert claim is not None
+        assert (claim.event_id, claim.attempt) == (event.id, 1)
+        assert [item.id for item in await store.load_events(session.id)] == [event.id]
+        # A separate claim chooses its own identity, so the default refuses one.
+        with pytest.raises(NotImplementedError):
+            await SessionStore.append_event_and_claim_side_effect(
+                store,
+                session.id,
+                Event(type="custom.named", session_id=session.id),
+                claim_id="caller-named-claim",
+            )
+        assert [item.id for item in await store.load_events(session.id)] == [event.id]
+
+    asyncio.run(run())
+
+
+def test_in_memory_append_and_claim_rejects_an_unrepresentable_lease_before_appending() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(agent_name="assistant", session_id="sess_lease_overflow", messages=[]),
+            identity=_identity(),
+        )
+        event = Event(type="custom.overflow", session_id=session.id)
+        with pytest.raises(OverflowError):
+            await store.append_event_and_claim_side_effect(session.id, event, lease_seconds=1e20)
+        assert await store.load_events(session.id) == []
+        assert await store.list_persisted_event_side_effect_deliveries() == []
+        claim = await store.append_event_and_claim_side_effect(session.id, event)
+        assert claim is not None and claim.event_id == event.id
 
     asyncio.run(run())
 

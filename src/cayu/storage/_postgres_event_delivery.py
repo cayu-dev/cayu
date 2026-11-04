@@ -29,6 +29,7 @@ from cayu.sessions.event_delivery import (
     _event_file_attachment_attestations_are_runtime_owned,
     _event_input_contract_is_runtime_owned,
     validate_persisted_event_side_effect_error,
+    validate_persisted_event_side_effect_lease_seconds,
 )
 from cayu.storage import _postgres_support as pg_support
 
@@ -143,14 +144,10 @@ async def _claim_persisted_event_side_effect(
         event_id = require_clean_nonblank(event_id, "event_id")
     if (session_id is None) != (event_id is None):
         raise ValueError("session_id and event_id must be supplied together.")
-    if type(lease_seconds) not in {int, float} or lease_seconds <= 0:
-        raise ValueError("lease_seconds must be greater than 0.")
-    claim_id = str(uuid4())
+    lease_seconds = validate_persisted_event_side_effect_lease_seconds(lease_seconds)
     async with connect() as conn:
         try:
             async with conn.cursor() as cur:
-                exact_filter = ""
-                params: list[Any] = []
                 # The same transaction-level lock protects closure admission.
                 # Exclude closed targets in selection, so one retained target
                 # cannot starve unrelated event deliveries.
@@ -167,76 +164,108 @@ async def _claim_persisted_event_side_effect(
                     if expected_row is None or delivery_from_row(expected_row) != expected:
                         await conn.rollback()
                         return None
-                if session_id is not None and event_id is not None:
-                    exact_filter = (
-                        "AND candidate_delivery.session_id = %s "
-                        "AND candidate_delivery.event_id = %s"
-                    )
-                    params.extend([session_id, event_id])
-                params.extend([claim_id, float(lease_seconds)])
-                await cur.execute(
-                    f"""
-                        WITH timing AS MATERIALIZED (
-                            SELECT clock_timestamp() AS now
-                        ), candidate AS (
-                            SELECT candidate_delivery.session_id,
-                                   candidate_delivery.event_id
-                            FROM cayu_persisted_event_side_effects AS candidate_delivery,
-                                 timing
-                            WHERE (
-                                candidate_delivery.status = 'pending'
-                                OR (candidate_delivery.status = 'failed' AND (
-                                    candidate_delivery.next_attempt_at IS NULL
-                                    OR candidate_delivery.next_attempt_at <= timing.now
-                                ))
-                                OR (candidate_delivery.status = 'leased'
-                                    AND candidate_delivery.lease_expires_at <= timing.now)
-                            )
-                            {exact_filter}
-                            AND NOT EXISTS (
-                                SELECT 1 FROM cayu_session_closure_progress AS p
-                                WHERE p.root_session_id = candidate_delivery.session_id
-                                   OR EXISTS (
-                                       SELECT 1 FROM jsonb_array_elements(
-                                           p.progress_json->'descendants'
-                                       ) AS child
-                                       WHERE child->>'session_id' = candidate_delivery.session_id
-                                   )
-                            )
-                            ORDER BY candidate_delivery.event_sequence ASC
-                            FOR UPDATE OF candidate_delivery SKIP LOCKED
-                            LIMIT 1
-                        )
-                        UPDATE cayu_persisted_event_side_effects AS delivery
-                        SET status = 'leased', attempts = delivery.attempts + 1,
-                            claim_id = %s,
-                            lease_expires_at = timing.now + (%s * INTERVAL '1 second'),
-                            next_attempt_at = NULL, last_error = NULL,
-                            updated_at = timing.now
-                        FROM candidate, timing
-                        WHERE delivery.session_id = candidate.session_id
-                          AND delivery.event_id = candidate.event_id
-                        RETURNING delivery.session_id, delivery.event_id,
-                                  delivery.event_sequence, delivery.attempts,
-                                  delivery.lease_expires_at
-                        """,
-                    params,
+                claim = await _lease_claimable_delivery(
+                    cur, session_id=session_id, event_id=event_id, lease_seconds=lease_seconds
                 )
-                row = await cur.fetchone()
-                if row is None:
-                    await conn.commit()
-                    return None
-                await cur.execute(
-                    "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
-                    (row[0], row[1]),
-                )
-                event_row = await cur.fetchone()
-                if event_row is None:
-                    raise RuntimeError("Persisted side-effect delivery lost its source event.")
             await conn.commit()
         except Exception:
             await conn.rollback()
             raise
+    return claim
+
+
+async def claim_appended_event_side_effect(
+    cur: Any, *, session_id: str, event_id: str, lease_seconds: float, claim_id: str | None
+) -> PersistedEventSideEffectClaim | None:
+    """Claim one event's handoff in the transaction that appended the event.
+
+    No other transaction can see the new handoff before this one commits, and
+    the append holds the session row lock that closure admission also takes,
+    so the claim needs no closure-lineage lock of its own.
+    """
+
+    return await _lease_claimable_delivery(
+        cur,
+        session_id=session_id,
+        event_id=event_id,
+        lease_seconds=lease_seconds,
+        claim_id=claim_id,
+    )
+
+
+async def _lease_claimable_delivery(
+    cur: Any,
+    *,
+    session_id: str | None,
+    event_id: str | None,
+    lease_seconds: float,
+    claim_id: str | None = None,
+) -> PersistedEventSideEffectClaim | None:
+    claim_id = str(uuid4()) if claim_id is None else claim_id
+    exact_filter = ""
+    params: list[Any] = []
+    if session_id is not None and event_id is not None:
+        exact_filter = "AND candidate_delivery.session_id = %s AND candidate_delivery.event_id = %s"
+        params.extend([session_id, event_id])
+    params.extend([claim_id, float(lease_seconds)])
+    await cur.execute(
+        f"""
+            WITH timing AS MATERIALIZED (
+                SELECT clock_timestamp() AS now
+            ), candidate AS (
+                SELECT candidate_delivery.session_id,
+                       candidate_delivery.event_id
+                FROM cayu_persisted_event_side_effects AS candidate_delivery,
+                     timing
+                WHERE (
+                    candidate_delivery.status = 'pending'
+                    OR (candidate_delivery.status = 'failed' AND (
+                        candidate_delivery.next_attempt_at IS NULL
+                        OR candidate_delivery.next_attempt_at <= timing.now
+                    ))
+                    OR (candidate_delivery.status = 'leased'
+                        AND candidate_delivery.lease_expires_at <= timing.now)
+                )
+                {exact_filter}
+                AND NOT EXISTS (
+                    SELECT 1 FROM cayu_session_closure_progress AS p
+                    WHERE p.root_session_id = candidate_delivery.session_id
+                       OR EXISTS (
+                           SELECT 1 FROM jsonb_array_elements(
+                               p.progress_json->'descendants'
+                           ) AS child
+                           WHERE child->>'session_id' = candidate_delivery.session_id
+                       )
+                )
+                ORDER BY candidate_delivery.event_sequence ASC
+                FOR UPDATE OF candidate_delivery SKIP LOCKED
+                LIMIT 1
+            )
+            UPDATE cayu_persisted_event_side_effects AS delivery
+            SET status = 'leased', attempts = delivery.attempts + 1,
+                claim_id = %s,
+                lease_expires_at = timing.now + (%s * INTERVAL '1 second'),
+                next_attempt_at = NULL, last_error = NULL,
+                updated_at = timing.now
+            FROM candidate, timing
+            WHERE delivery.session_id = candidate.session_id
+              AND delivery.event_id = candidate.event_id
+            RETURNING delivery.session_id, delivery.event_id,
+                      delivery.event_sequence, delivery.attempts,
+                      delivery.lease_expires_at
+            """,
+        params,
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    await cur.execute(
+        "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
+        (row[0], row[1]),
+    )
+    event_row = await cur.fetchone()
+    if event_row is None:
+        raise RuntimeError("Persisted side-effect delivery lost its source event.")
     return PersistedEventSideEffectClaim(
         session_id=row[0],
         event_id=row[1],

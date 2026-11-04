@@ -12,8 +12,9 @@ from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from uuid import uuid4
 
 from pydantic import SecretStr
 
@@ -4680,14 +4681,53 @@ class InMemorySessionStore(
         )
 
         async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-            invocation_scope._assert_session_run_epoch(session_id, session)
-            if copied_events:
-                for owner in self._session_closure_progress.owners((session_id,)):
-                    closure_records._check_closure_lineage_owner(owner, (session_id,))
-            self._sessions[session_id] = self._append_events_unlocked(session, copied_events)
+            self._append_session_events_unlocked(session_id, copied_events)
+
+    def _append_session_events_unlocked(self, session_id: str, events: list[Event]) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        invocation_scope._assert_session_run_epoch(session_id, session)
+        if events:
+            for owner in self._session_closure_progress.owners((session_id,)):
+                closure_records._check_closure_lineage_owner(owner, (session_id,))
+        self._sessions[session_id] = self._append_events_unlocked(session, events)
+
+    async def append_event_and_claim_side_effect(
+        self,
+        session_id: str,
+        event: Event,
+        *,
+        lease_seconds: float = 300.0,
+        claim_id: str | None = None,
+    ) -> PersistedEventSideEffectClaim | None:
+        session_id, copied_events = session_event_rules._copy_session_event_batch(
+            session_id, [event]
+        )
+        lease_seconds = session_event_rules.validate_persisted_event_side_effect_lease_seconds(
+            lease_seconds
+        )
+        claim_id = (
+            str(uuid4()) if claim_id is None else require_clean_nonblank(claim_id, "claim_id")
+        )
+        async with self._lock:
+            # Everything that can fail runs before the append mutates state.
+            now = self._ownership_clock()
+            lease_expires_at = now + timedelta(seconds=lease_seconds)
+            self._append_session_events_unlocked(session_id, copied_events)
+            return memory_event_delivery.claim_appended_event_side_effect_unlocked(
+                memory_event_delivery.MemoryEventDeliveryState(
+                    persisted_event_side_effect_deliveries=self._persisted_event_side_effect_deliveries,
+                    event_records_by_id=self._event_records_by_id,
+                    session_closure_progress=self._session_closure_progress,
+                    ownership_clock=self._ownership_clock,
+                ),
+                session_id=session_id,
+                event_id=copied_events[0].id,
+                now=now,
+                lease_expires_at=lease_expires_at,
+                claim_id=claim_id,
+            )
 
     async def append_tool_effect_conflict(self, request: object) -> Event:
         from cayu.runtime._tool_effect_conflicts import (

@@ -277,6 +277,10 @@ from tests.core.session_store_conformance.events import (
     test_session_store_conformance_rejects_nonportable_side_effect_errors_atomically,
     test_legacy_unbounded_side_effect_error_remains_readable,
     test_session_store_conformance_persisted_event_side_effect_claim_fencing,
+    test_session_store_conformance_append_event_and_claim_side_effect,
+    test_atomic_append_and_claim_yields_to_overridden_append_or_claim,
+    test_default_append_event_and_claim_side_effect_composes_append_and_claim,
+    test_in_memory_append_and_claim_rejects_an_unrepresentable_lease_before_appending,
     test_session_store_conformance_persisted_event_side_effect_retry_spacing_and_paging,
 )
 

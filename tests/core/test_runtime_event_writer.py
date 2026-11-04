@@ -769,6 +769,190 @@ def test_emit_closes_its_durable_side_effect_handoff() -> None:
     assert [event.id for event in sink_events] == [public_event_id(1)]
 
 
+class _AppendAndClaimCountingStore(InMemorySessionStore):
+    def __init__(
+        self,
+        *,
+        fail_append: bool = False,
+        lose_result: type[BaseException] | None = None,
+    ) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+        self.fail_append = fail_append
+        self.lose_result = lose_result
+
+    async def append_event_and_claim_side_effect(
+        self, session_id, event, *, lease_seconds=300.0, claim_id=None
+    ):
+        self.calls.append("append_event_and_claim_side_effect")
+        if self.fail_append:
+            raise ConnectionError("store unavailable")
+        claim = await super().append_event_and_claim_side_effect(
+            session_id, event, lease_seconds=lease_seconds, claim_id=claim_id
+        )
+        if self.lose_result is not None:
+            # The transaction committed, but its result never reaches the writer.
+            raise self.lose_result()
+        return claim
+
+    async def mark_persisted_event_side_effect_delivered(self, claim):
+        self.calls.append("mark_persisted_event_side_effect_delivered")
+        return await super().mark_persisted_event_side_effect_delivered(claim)
+
+
+def test_emit_appends_and_claims_in_one_store_call() -> None:
+    async def scenario():
+        store = _AppendAndClaimCountingStore()
+        await store.create(
+            RunRequest(agent_name="assistant", session_id="writer_one_call", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        budget_store = InMemoryBudgetStore()
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=budget_store, event_sinks=[sink]
+        )
+        emitted = await writer.emit(
+            Event(type=EventType.MODEL_COMPLETED, session_id="writer_one_call")
+        )
+        delivery = await store.get_persisted_event_side_effect_delivery(
+            session_id="writer_one_call", event_id=emitted.id
+        )
+        budget_events = await budget_store.load_events_for_budget(
+            scope="app", key=None, window=BudgetWindow.all_time()
+        )
+        return store.calls, delivery, budget_events, sink.events, emitted
+
+    calls, delivery, budget_events, sink_events, emitted = asyncio.run(scenario())
+
+    assert calls == [
+        "append_event_and_claim_side_effect",
+        "mark_persisted_event_side_effect_delivered",
+    ]
+    assert delivery is not None
+    assert (delivery.status, delivery.attempts) == (PersistedEventSideEffectStatus.DELIVERED, 1)
+    assert [event.id for event in budget_events] == [emitted.id]
+    assert len(sink_events) == 1
+
+
+def test_emit_failed_append_and_claim_persists_and_delivers_nothing() -> None:
+    async def scenario():
+        store = _AppendAndClaimCountingStore(fail_append=True)
+        await store.create(
+            RunRequest(agent_name="assistant", session_id="writer_failed_append", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=InMemoryBudgetStore(), event_sinks=[sink]
+        )
+        with pytest.raises(ConnectionError, match="store unavailable"):
+            await writer.emit(Event(type="custom.failed", session_id="writer_failed_append"))
+        return (
+            await store.load_events("writer_failed_append"),
+            await store.list_persisted_event_side_effect_deliveries(),
+            sink.events,
+        )
+
+    events, deliveries, sink_events = asyncio.run(scenario())
+
+    assert (events, deliveries, sink_events) == ([], [], [])
+
+
+@pytest.mark.parametrize("lost_result", [ConnectionError, asyncio.CancelledError])
+def test_emit_releases_a_committed_claim_whose_result_was_lost(lost_result) -> None:
+    async def scenario():
+        store = _AppendAndClaimCountingStore(lose_result=lost_result)
+        await store.create(
+            RunRequest(agent_name="assistant", session_id="writer_lost_claim", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=InMemoryBudgetStore(), event_sinks=[sink]
+        )
+        with pytest.raises(lost_result):
+            await writer.emit(Event(type="custom.lost", session_id="writer_lost_claim"))
+        [delivery] = await store.list_persisted_event_side_effect_deliveries()
+        recovered = await writer.recover_persisted_side_effects()
+        return delivery, recovered, sink.events
+
+    delivery, recovered, sink_events = asyncio.run(scenario())
+
+    # The lease went back to recovery at once, without spending an attempt.
+    assert (delivery.status, delivery.attempts, delivery.claim_id) == (
+        PersistedEventSideEffectStatus.PENDING,
+        0,
+        None,
+    )
+    assert [event.type for event in recovered] == ["custom.lost"]
+    assert len(sink_events) == 1
+
+
+def test_emit_releases_its_claim_when_a_persisted_observer_fails() -> None:
+    async def scenario():
+        store = _AppendAndClaimCountingStore()
+        await store.create(
+            RunRequest(agent_name="assistant", session_id="writer_observer", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=InMemoryBudgetStore(), event_sinks=[sink]
+        )
+
+        async def scheduler(_estimated_bytes, prepare):
+            return prepare()
+
+        def fail(_event):
+            raise RuntimeError("observer failed")
+
+        with pytest.raises(RuntimeError, match="observer failed"):
+            await writer.emit_cooperatively(
+                Event(type="custom.observed", session_id="writer_observer"),
+                estimated_bytes=1,
+                scheduler=scheduler,
+                persisted_observer=fail,
+            )
+        [delivery] = await store.list_persisted_event_side_effect_deliveries()
+        recovered = await writer.recover_persisted_side_effects()
+        return delivery, recovered, sink.events
+
+    delivery, recovered, sink_events = asyncio.run(scenario())
+
+    assert (delivery.status, delivery.attempts) == (PersistedEventSideEffectStatus.PENDING, 0)
+    assert [event.type for event in recovered] == ["custom.observed"]
+    assert len(sink_events) == 1
+
+
+def test_emit_does_not_release_another_writers_claim_on_a_duplicate_event() -> None:
+    async def scenario():
+        store = _AppendAndClaimCountingStore()
+        await store.create(
+            RunRequest(agent_name="assistant", session_id="writer_duplicate", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        event = Event(type="custom.duplicate", session_id="writer_duplicate")
+        live = await store.append_event_and_claim_side_effect("writer_duplicate", event)
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=InMemoryBudgetStore(), event_sinks=[]
+        )
+        with pytest.raises(ValueError, match="already exists"):
+            await writer.emit(event)
+        delivery = await store.get_persisted_event_side_effect_delivery(
+            session_id="writer_duplicate", event_id=event.id
+        )
+        return live, delivery
+
+    live, delivery = asyncio.run(scenario())
+
+    assert live is not None and delivery is not None
+    assert (delivery.status, delivery.claim_id) == (
+        PersistedEventSideEffectStatus.LEASED,
+        live.claim_id,
+    )
+
+
 def test_emit_does_not_fail_when_recovery_worker_wins_the_claim_race() -> None:
     async def scenario():
         store = _ConcurrentClaimSessionStore()

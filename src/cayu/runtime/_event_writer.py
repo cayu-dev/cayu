@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from itertools import islice
+from uuid import uuid4
 
 from cayu.budgets.base import BudgetStore
 from cayu.events import (
@@ -228,21 +229,88 @@ class RuntimeEventWriter:
             if phase is None
             else phase_scope(phase, call_id=event.payload.get("tool_call_id"))
         ):
-            await self._session_store.append_event(event.session_id, event)
-            note_execution_progress(event)
-            observe_timing_event(event)
-            if persisted_observer is not None:
-                persisted_observer(event)
-            self._retain_terminal_event_authority(event)
-            claim = await self._session_store.claim_persisted_event_side_effect(
-                session_id=event.session_id,
-                event_id=event.id,
-            )
+            if self._appends_and_claims_atomically():
+                # One transaction appends the event and claims its new handoff.
+                # The writer names the claim, so a commit whose result never
+                # arrives, or an observer that fails before delivery starts,
+                # does not leave the handoff leased to nobody.
+                claim_id = str(uuid4())
+                try:
+                    claim = await self._session_store.append_event_and_claim_side_effect(
+                        event.session_id,
+                        event,
+                        claim_id=claim_id,
+                    )
+                    self._observe_persisted_event(event, persisted_observer)
+                except BaseException:
+                    await self._release_unreturned_claim(event, claim_id)
+                    raise
+            else:
+                await self._session_store.append_event(event.session_id, event)
+                self._observe_persisted_event(event, persisted_observer)
+                claim = await self._session_store.claim_persisted_event_side_effect(
+                    session_id=event.session_id,
+                    event_id=event.id,
+                )
             if claim is None:
                 sequence = await self._handle_unclaimed_persisted_side_effect(event)
                 return event_with_durable_sequence(event, sequence)
             delivered_event, _ = await self._deliver_persisted_side_effect_claim(claim)
             return delivered_event
+
+    async def _release_unreturned_claim(self, event: Event, claim_id: str) -> None:
+        """Return a committed but unreturned claim to recovery without spending an attempt.
+
+        Best effort: if the release fails too, recovery takes the handoff when
+        its lease expires, as after a crash.
+        """
+
+        try:
+            delivery = await self._session_store.get_persisted_event_side_effect_delivery(
+                session_id=event.session_id,
+                event_id=event.id,
+            )
+            if (
+                delivery is None
+                or delivery.status is not PersistedEventSideEffectStatus.LEASED
+                or delivery.claim_id != claim_id
+                or delivery.lease_expires_at is None
+            ):
+                return
+            await self._session_store.defer_persisted_event_side_effect(
+                PersistedEventSideEffectClaim(
+                    session_id=delivery.session_id,
+                    event_id=delivery.event_id,
+                    event_sequence=delivery.event_sequence,
+                    event=event,
+                    attempt=delivery.attempts,
+                    claim_id=claim_id,
+                    lease_expires_at=delivery.lease_expires_at,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not release an unreturned event side-effect claim; recovery "
+                "takes it when its lease expires: error_type=%s",
+                _object_type_name(exc),
+            )
+
+    def _appends_and_claims_atomically(self) -> bool:
+        checker = getattr(
+            self._session_store, "_supports_atomic_event_side_effect_claim_protocol", None
+        )
+        return callable(checker) and checker() is True
+
+    def _observe_persisted_event(
+        self,
+        event: Event,
+        persisted_observer: Callable[[Event], None] | None,
+    ) -> None:
+        note_execution_progress(event)
+        observe_timing_event(event)
+        if persisted_observer is not None:
+            persisted_observer(event)
+        self._retain_terminal_event_authority(event)
 
     async def persist(self, event: Event) -> Event:
         """Commit an event to the durable side-effect handoff without delivering it.
