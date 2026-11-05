@@ -4913,6 +4913,7 @@ class _SessionHoldWatch:
         self.waiting: str | None = None
         self._seen: tuple[object, ...] | None = None
         self._reported: tuple[object, ...] | None = None
+        self._overdue_reported: tuple[object, ...] | None = None
 
     def observe(self, deployment: dict[str, Any], deadline: float) -> float:
         preflight = _waiting_session_preflight(deployment)
@@ -4929,6 +4930,25 @@ class _SessionHoldWatch:
                 else ""
             )
             print(f"cayu cloud: {preflight['message']}{until}", file=sys.stderr)
+        # Cloud checked at or after its own decision time and still holds the Release: say
+        # so, since nothing else is reported while the hold lasts.
+        status = deployment.get("status")
+        if not isinstance(status, str) or status not in _DEPLOYMENT_STATUSES:
+            status = "unknown"
+        overdue = (preflight["deadline_at"], status)
+        if (
+            preflight["remaining_seconds"] == 0.0
+            and preflight["checked_at"] is not None
+            and overdue != self._overdue_reported
+        ):
+            self._overdue_reported = overdue
+            print(
+                f"cayu cloud: Cayu Cloud's decision time {preflight['deadline_at']} has passed, "
+                f"but at {preflight['checked_at']} it still held the Release "
+                f"(`{status}`, waiting for "
+                f"{preflight['waiting_for'] or 'its sessions'}); still waiting.",
+                file=sys.stderr,
+            )
         # Only a new check extends the wait, so a preflight that stops changing can't
         # hold the command forever.
         seen = (preflight["checked_at"], *report)

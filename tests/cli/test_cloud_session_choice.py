@@ -1504,6 +1504,51 @@ def test_wait_keeps_waiting_while_cloud_holds_the_release_for_sessions(capsys):
     assert "Cayu Cloud decides by 2026-10-09T12:15:00+00:00." in stderr
 
 
+def test_a_hold_still_reported_after_clouds_decision_time_is_said_once(capsys):
+    clock = _Clock()
+    # Cloud's checks after its own deadline (12:15) still say it is waiting.
+    late = [
+        _held(_waiting_preflight(checked_at=f"2026-10-09T12:{minute:02d}:30+00:00"))
+        for minute in (14, 15, 16, 17)
+    ]
+    published = {"id": _DEPLOYMENT, "status": "promoted", "session_preflight": {"state": "clear"}}
+    client = _SequenceClient([*late, published])
+
+    result = _wait_for_deployment(client, clock)
+
+    assert result["status"] == "promoted"
+    stderr = capsys.readouterr().err
+    assert stderr.count("decision time 2026-10-09T12:15:00+00:00 has passed") == 1
+    assert "at 2026-10-09T12:15:30+00:00 it still held the Release (`smoke_tested`" in stderr
+
+
+@pytest.mark.parametrize("status", ["\x1b]0;owned\x07", "x" * 10_000, None, {"unexpected": True}])
+def test_overdue_hold_does_not_print_unrecognized_status(status, capsys):
+    clock = _Clock()
+    watch = cloud._SessionHoldWatch(wait_seconds=30, monotonic=clock.monotonic)
+    deployment = _held(_waiting_preflight(checked_at="2026-10-09T12:16:00+00:00"))
+    deployment["status"] = status
+
+    watch.observe(deployment, 30)
+    watch.observe(deployment, 30)
+
+    stderr = capsys.readouterr().err
+    assert "\x1b" not in stderr and "\x07" not in stderr
+    assert stderr.count("(`unknown`, waiting for") == 1
+    assert len(stderr) < 1000
+
+
+def test_a_hold_before_clouds_decision_time_says_nothing_more(capsys):
+    clock = _Clock()
+    checks = [
+        _held(_waiting_preflight(checked_at=f"2026-10-09T12:{minute:02d}:30+00:00"))
+        for minute in range(0, 3)
+    ]
+    published = {"id": _DEPLOYMENT, "status": "promoted", "session_preflight": {"state": "clear"}}
+    _wait_for_deployment(_SequenceClient([*checks, published]), clock)
+    assert "has passed" not in capsys.readouterr().err
+
+
 def test_wait_stops_at_the_preflight_deadline_plus_its_own_wait(capsys):
     clock = _Clock()
     # Fourteen and a half minutes remain on Cloud's clock; Cloud then stops answering.
