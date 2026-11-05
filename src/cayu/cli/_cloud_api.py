@@ -143,6 +143,11 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "export_not_ready"),
         (409, "target_not_stopped"),
         (503, "agent_data_transfers_unavailable"),
+        # `cayu cloud admin runtime-record`: why Cloud refused to read or change the record.
+        (404, "runtime_record_not_found"),
+        (409, "database_migration_running"),
+        (409, "runtime_record_changed"),
+        (503, "application_runtime_unavailable"),
         (409, "settings_revision_conflict"),
         (409, "source_not_uploaded"),
         (410, "source_bundle_expired"),

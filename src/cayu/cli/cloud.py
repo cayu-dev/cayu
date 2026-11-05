@@ -1435,7 +1435,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_api_keys_parser(commands)
 
-    add_admin_parser(commands)
+    add_admin_parser(commands, application=_application_slug)
 
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
 
@@ -2419,7 +2419,9 @@ def _client_command(
     if arguments.command == "api-keys":
         return api_keys_command(arguments, client=client)
     if arguments.command == "admin":
-        return admin_command(arguments, client=client)
+        return admin_command(
+            arguments, client=client, recovery_arguments=_cloud_recovery_arguments(arguments)
+        )
     if arguments.command == "settings":
         return settings_command(
             arguments,

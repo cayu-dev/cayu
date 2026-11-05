@@ -45,7 +45,9 @@ cayu cloud service status --application my-agent
   read its eval runs;
 - `api-keys create|list|revoke` for the Organization's
   [API keys](#organization-api-keys), as a signed-in admin;
-- `admin system-agents` to list [the install's system Agents](#the-installs-system-agents), as a
+- `admin system-agents` to list [the install's system Agents](#the-installs-system-agents), and
+  `admin runtime-record show|forget-migration` to read
+  [an Agent's runtime record](#an-agents-runtime-record) and forget a migration note in it, as a
   signed-in Cayu platform administrator; and
 - `evidence list|show|verify` for local content-free command records.
 
@@ -1924,6 +1926,41 @@ differ, the output adds a `warnings` entry saying so and naming the `service res
 that applies the current setting. `admin system-agents` says `not system until restarted` for
 such an Agent. A Cloud from before `recorded_system` leaves it out and reports the recorded
 value as `system`, and no warning is given.
+
+## An Agent's runtime record
+
+Cayu Cloud keeps a runtime record for each deployed Agent. Among other things it notes which
+Release last ran the Agent's own `[database] migrate` (`app_database_migration`) and which
+release image last ran `cayu storage migrate` on its database (`migrated_image_digest`), so a
+later publication doesn't run them again and a rollback never runs an older migration against
+newer tables. When the Agent's database is restored from a backup, those notes describe tables
+that are gone. A Cayu platform administrator reads the record and forgets a note, so the Agent's
+next deploy runs that migration again, without AWS, Kubernetes or database access:
+
+```console
+cayu cloud admin runtime-record show my-agent --organization org_123
+cayu cloud admin runtime-record show my-agent --organization org_123 --json
+cayu cloud admin runtime-record forget-migration my-agent --organization org_123 --revision 17
+cayu cloud admin runtime-record forget-migration my-agent --organization org_123 --revision 17 \
+  --note migrated_image_digest
+```
+
+`show` prints the record's `revision`, where Cloud keeps it (`location`), the Release it runs and
+its migration notes, then the `forget-migration` command for that revision, with the same
+`--context` and `--api-key-file` (`result.commands.forget_migration`); `--json` prints the whole
+record in `result.record`. The record names secrets by reference and holds no secret
+values. `--organization` names the Organization that owns the Agent and is required.
+
+`forget-migration` drops each `--note` (`app_database_migration` by default; repeat it for both)
+and prints the record's new revision and the notes it held (`result.forgotten`); a note the
+record doesn't hold changes nothing. Cloud changes the record only while it is still at
+`--revision`, no publication or other service change of the Agent runs and no migration of it may
+still be running, and only for an active Agent. Otherwise the command exits `2` with the code
+Cloud gave, having changed nothing: `runtime_record_changed` (read the record again and decide
+again), `service_busy`, `database_migration_running` or `application_archived`. An Agent never
+published has no record (`runtime_record_not_found`). Deploy the Agent afterwards to run the
+migration. Cloud refuses anyone but a platform administrator (`platform_admin_required`), and a
+Cloud without these commands gives `runtime_records_unsupported`.
 
 ## Agent settings
 

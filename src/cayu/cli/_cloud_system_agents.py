@@ -25,22 +25,31 @@ from __future__ import annotations
 
 import argparse
 import shlex
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_releases import add_output_argument
+from cayu.cli._cloud_runtime_record import add_runtime_record_parser, runtime_record_command
 from cayu.cli._cloud_settings import _cell, _table
 
 _PATH = "/v1/admin/system-agents"
 
 
-def add_admin_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+def add_admin_parser(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+    *,
+    application: Callable[[str], str],
+) -> None:
+    """``application`` checks an Agent slug argument."""
+
     admin = commands.add_parser(
         "admin",
-        help="Read the install's own configuration (Cayu platform administrators).",
+        help="Read the install's own configuration and any Agent's runtime record (Cayu "
+        "platform administrators).",
         description=(
-            "Read how this Cayu Cloud install is configured. Needs a signed-in Cayu platform "
+            "Read how this Cayu Cloud install is configured, and read or correct any "
+            "Organization's Agent's runtime record. Needs a signed-in Cayu platform "
             "administrator (`cayu cloud login`); an Organization admin or an API key can't."
         ),
     )
@@ -57,11 +66,23 @@ def add_admin_parser(commands: argparse._SubParsersAction[argparse.ArgumentParse
         ),
     )
     add_output_argument(system_agents, render_system_agents)
+    add_runtime_record_parser(actions, application=application)
 
 
-def admin_command(arguments: argparse.Namespace, *, client: CloudApiClient) -> dict[str, Any]:
+def admin_command(
+    arguments: argparse.Namespace,
+    *,
+    client: CloudApiClient,
+    recovery_arguments: Sequence[str] = (),
+) -> dict[str, Any]:
+    """``recovery_arguments`` are the command's own ``--context`` and ``--api-key-file``."""
+
     if arguments.admin_command == "system-agents":
         return {"operation": "admin.system-agents", "result": _system_agents(client)}
+    if arguments.admin_command == "runtime-record":
+        return runtime_record_command(
+            arguments, client=client, recovery_arguments=recovery_arguments
+        )
     raise ValueError(f"Unknown admin command {arguments.admin_command!r}.")
 
 
