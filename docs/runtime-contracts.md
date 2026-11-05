@@ -21044,6 +21044,14 @@ take up to 1000 session IDs: `load_sessions`, `load_checkpoints`,
 `query_transcript` returns for that role with `limit=1`, tool results that live
 in their tool event included). Each answers exactly what
 the matching single-session read answers; IDs with nothing to report are absent.
+Two narrower reads skip what a caller does not use: `load_session_instance_ids`
+returns the incarnation `load_sessions` would, without the row, and
+`load_checkpoint_fields(session_ids, keys)` returns `load_checkpoints` cut down to
+those root fields. Through the runtime checkpoint boundary, only fields that
+decode independently of the rest of the checkpoint (today `browser_controls`)
+can be selected; others raise `ValueError`. The session list's overview summarizes the rows it listed
+without loading them again, and checks their incarnations, not whole rows, after
+each group of reads.
 `ArtifactStore.count_session_artifacts` returns the `list(scope=SESSION, ...)`
 total for each requested session, zero included. The base classes implement every
 page read by looping over the single-session methods, so custom stores keep

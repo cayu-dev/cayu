@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast, overload
 
 from cayu.sessions import _checkpoint_publication as checkpoint_publication
 from cayu.sessions import _checkpoint_transforms as checkpoint_transforms
+from cayu.sessions import _page_reads as page_reads
 
 if TYPE_CHECKING:
     from cayu.execution_profiles import (
@@ -49,6 +50,8 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     _DecodedRuntimeCheckpoint,
     decode_runtime_checkpoint,
+    decode_runtime_checkpoint_fields,
+    require_self_contained_checkpoint_fields,
     validate_runtime_checkpoint_root_projection,
 )
 from cayu.sessions.forks import ProfiledSessionForkResult
@@ -340,6 +343,19 @@ class _RuntimeCheckpointSessionStore:
             return decoded
         finally:
             checkpoints = {}
+
+    async def load_checkpoint_fields(
+        self, session_ids: Sequence[str], keys: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        selected = page_reads.checkpoint_field_keys(keys)
+        require_self_contained_checkpoint_fields(selected)
+        fields = await self._store.load_checkpoint_fields(
+            session_ids, (*selected, CHECKPOINT_SCHEMA_VERSION_KEY)
+        )
+        return {
+            session_id: decode_runtime_checkpoint_fields(value, selected, session_id=session_id)
+            for session_id, value in fields.items()
+        }
 
     async def _load_decoded_runtime_checkpoint(self, session_id: str) -> _DecodedRuntimeCheckpoint:
         load_checkpoint = self.load_checkpoint

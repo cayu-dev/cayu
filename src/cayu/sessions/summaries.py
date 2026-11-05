@@ -172,14 +172,31 @@ def session_outcome(
     latest_retry_event: EventRecord | None,
 ) -> SessionOutcome:
     session = copy_session(session)
+    return session_status_outcome(
+        session.id,
+        session.status,
+        terminal_event=terminal_event,
+        latest_retry_event=latest_retry_event,
+    )
+
+
+def session_status_outcome(
+    session_id: str,
+    status: SessionStatus,
+    *,
+    terminal_event: EventRecord | None,
+    latest_retry_event: EventRecord | None,
+) -> SessionOutcome:
+    """``session_outcome`` from the only session fields an outcome depends on."""
+
     terminal_event = _copy_event_record(terminal_event)
     latest_retry_event = _copy_event_record(latest_retry_event)
-    if not _terminal_event_matches_status(session, terminal_event):
+    if not _terminal_event_matches_status(status, terminal_event):
         terminal_event = None
-    reason, details = _outcome_reason_and_details(session, terminal_event)
+    reason, details = _outcome_reason_and_details(status, terminal_event)
     return SessionOutcome(
-        session_id=session.id,
-        status=session.status,
+        session_id=session_id,
+        status=status,
         reason=reason,
         details=details,
         retry=_retry_details(latest_retry_event),
@@ -204,17 +221,17 @@ def _is_outcome_lifecycle_event(event: Event) -> bool:
 
 
 def _outcome_reason_and_details(
-    session: Session,
+    status: SessionStatus,
     terminal_event: EventRecord | None,
 ) -> tuple[str, dict[str, Any]]:
-    if session.status not in _OUTCOME_TERMINAL_STATUSES:
-        return session.status.value, {}
+    if status not in _OUTCOME_TERMINAL_STATUSES:
+        return status.value, {}
     if terminal_event is None:
-        return session.status.value, {}
+        return status.value, {}
 
     event = terminal_event.event
-    if event.type != _OUTCOME_EVENT_TYPE_BY_STATUS[session.status]:
-        return session.status.value, {}
+    if event.type != _OUTCOME_EVENT_TYPE_BY_STATUS[status]:
+        return status.value, {}
 
     payload = event.payload
     if event.type == EventType.SESSION_COMPLETED:
@@ -242,16 +259,16 @@ def _outcome_reason_and_details(
             ),
         )
         return reason, details
-    return session.status.value, {}
+    return status.value, {}
 
 
 def _terminal_event_matches_status(
-    session: Session,
+    status: SessionStatus,
     terminal_event: EventRecord | None,
 ) -> bool:
     if terminal_event is None:
         return False
-    expected_event_type = _OUTCOME_EVENT_TYPE_BY_STATUS.get(session.status)
+    expected_event_type = _OUTCOME_EVENT_TYPE_BY_STATUS.get(status)
     if expected_event_type is None:
         return False
     return terminal_event.event.type == expected_event_type

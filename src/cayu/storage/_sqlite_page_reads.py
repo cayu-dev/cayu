@@ -11,11 +11,12 @@ import sqlite3
 from collections.abc import Sequence
 from typing import Any
 
+from cayu._validation import DurableValueError
 from cayu.events import EventType
 from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
-from cayu.sessions.records import EventRecord, Session, TranscriptRecord
-from cayu.sessions.summaries import SessionOutcome, session_outcome
+from cayu.sessions.records import EventRecord, Session, SessionStatus, TranscriptRecord
+from cayu.sessions.summaries import SessionOutcome, session_status_outcome
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_transcript_content as transcript_content
 
@@ -85,13 +86,74 @@ def _latest_after_lifecycle(type_filter: str) -> str:
     """
 
 
+def load_session_instance_ids(
+    connection: sqlite3.Connection, session_ids: Sequence[str]
+) -> dict[str, str]:
+    if not session_ids:
+        return {}
+    rows = connection.execute(
+        f"SELECT id, instance_id FROM cayu_sessions WHERE id IN ({_PAGE_IDS})",
+        (_ids(session_ids),),
+    ).fetchall()
+    found = {row["id"]: row["instance_id"] for row in rows}
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
+def load_checkpoint_fields(
+    connection: sqlite3.Connection, session_ids: Sequence[str], keys: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    if not session_ids:
+        return {}
+    rows = connection.execute(
+        f"""
+        SELECT
+            cayu_checkpoints.session_id,
+            json_type(cayu_checkpoints.state_json) AS root_type,
+            field.key,
+            field.type,
+            field.value
+        FROM cayu_checkpoints
+        LEFT JOIN json_each(cayu_checkpoints.state_json) AS field
+            ON field.key IN ({_PAGE_IDS})
+        WHERE cayu_checkpoints.session_id IN ({_PAGE_IDS})
+        """,
+        (_ids(keys), _ids(session_ids)),
+    ).fetchall()
+    found: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        # A checkpoint is an object, as the whole-checkpoint read requires.
+        if row["root_type"] != "object":
+            raise DurableValueError("invalid_json_object", "checkpoint")
+        fields = found.setdefault(row["session_id"], {})
+        if row["key"] is not None:
+            fields[row["key"]] = _json_field(row["type"], row["value"])
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
+def _json_field(json_type: str, value: Any) -> Any:
+    # json_each yields containers as JSON text and JSON booleans as integers.
+    if json_type in ("object", "array"):
+        return json.loads(value)
+    if json_type in ("true", "false"):
+        return json_type == "true"
+    return value
+
+
 def summarize_outcomes(
     connection: sqlite3.Connection, session_ids: Sequence[str]
 ) -> dict[str, SessionOutcome]:
-    sessions = load_sessions(connection, session_ids)
-    if not sessions:
+    if not session_ids:
         return {}
-    page = _ids(list(sessions))
+    # An outcome depends only on each session's status, so whole rows are not read.
+    rows = connection.execute(
+        f"SELECT id, status FROM cayu_sessions WHERE id IN ({_PAGE_IDS})",
+        (_ids(session_ids),),
+    ).fetchall()
+    found = {row["id"]: SessionStatus(row["status"]) for row in rows}
+    statuses = {session_id: found[session_id] for session_id in session_ids if session_id in found}
+    if not statuses:
+        return {}
+    page = _ids(list(statuses))
     terminal = {
         row["page_session_id"]: sqlite_records.event_record_from_row(row)
         for row in connection.execute(
@@ -108,12 +170,13 @@ def summarize_outcomes(
         ).fetchall()
     }
     return {
-        session_id: session_outcome(
-            session,
+        session_id: session_status_outcome(
+            session_id,
+            status,
             terminal_event=terminal.get(session_id),
             latest_retry_event=retry.get(session_id),
         )
-        for session_id, session in sessions.items()
+        for session_id, status in statuses.items()
     }
 
 

@@ -45,6 +45,17 @@ def page_session_ids(session_ids: Sequence[str]) -> tuple[str, ...]:
     return page
 
 
+def checkpoint_field_keys(keys: Sequence[str]) -> tuple[str, ...]:
+    """Validate the root checkpoint fields a page read selects, keeping first-seen order."""
+
+    if isinstance(keys, str | bytes) or not isinstance(keys, Iterable):
+        raise TypeError("keys must be a sequence of checkpoint field names.")
+    selected = tuple(dict.fromkeys(require_clean_nonblank(key, "checkpoint field") for key in keys))
+    if not selected:
+        raise ValueError("keys must name at least one checkpoint field.")
+    return selected
+
+
 def page_sessions(parents: Sequence[Session]) -> tuple[Session, ...]:
     """Validate a page of sessions by ID, keeping the first of any repeated ID."""
 

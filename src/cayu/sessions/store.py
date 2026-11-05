@@ -5240,10 +5240,36 @@ class SessionStore(ABC):
 
         return await page_reads.load_sessions_one_by_one(self, session_ids)
 
+    async def load_session_instance_ids(self, session_ids: Sequence[str]) -> dict[str, str]:
+        """The incarnation ``load_sessions`` would return for each session, without its row.
+
+        IDs with no session are absent. A caller compares an incarnation it read
+        before with this one to learn whether the session was replaced meanwhile.
+        """
+
+        sessions = await self.load_sessions(session_ids)
+        return {session_id: session.instance_id for session_id, session in sessions.items()}
+
     async def load_checkpoints(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Load the latest checkpoint of several sessions; sessions without one are absent."""
 
         return await page_reads.load_checkpoints_one_by_one(self, session_ids)
+
+    async def load_checkpoint_fields(
+        self, session_ids: Sequence[str], keys: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """``load_checkpoints`` with each checkpoint cut down to the given root fields.
+
+        Sessions without a checkpoint are absent; a checkpoint without any of the
+        fields maps to an empty object. Native stores read only those fields.
+        """
+
+        page = page_reads.checkpoint_field_keys(keys)
+        checkpoints = await self.load_checkpoints(session_ids)
+        return {
+            session_id: {key: checkpoint[key] for key in page if key in checkpoint}
+            for session_id, checkpoint in checkpoints.items()
+        }
 
     async def summarize_outcomes(self, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
         """``summarize_outcome`` for several sessions; sessions not found are absent."""

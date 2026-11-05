@@ -9,12 +9,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, LiteralString, cast
 
+from cayu._validation import DurableValueError
 from cayu.events import Event, EventType
 from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
 from cayu.sessions.event_delivery import restore_persisted_event_authority
-from cayu.sessions.records import EventRecord, Session, TranscriptRecord
-from cayu.sessions.summaries import SessionOutcome, session_outcome
+from cayu.sessions.records import EventRecord, Session, SessionStatus, TranscriptRecord
+from cayu.sessions.summaries import SessionOutcome, session_status_outcome
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._postgres_session_queries import load_session_labels_batch
@@ -58,6 +59,47 @@ async def load_checkpoints(cur: Any, session_ids: Sequence[str]) -> dict[str, An
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 
+async def load_session_instance_ids(cur: Any, session_ids: Sequence[str]) -> dict[str, str]:
+    if not session_ids:
+        return {}
+    await cur.execute(
+        "SELECT id, instance_id FROM cayu_sessions WHERE id = ANY(%s::text[])",
+        (list(session_ids),),
+    )
+    found = {row[0]: row[1] for row in await cur.fetchall()}
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
+async def load_checkpoint_fields(
+    cur: Any, session_ids: Sequence[str], keys: Sequence[str]
+) -> dict[str, Any]:
+    """Raw stored values of the given root fields; the store copies them."""
+
+    if not session_ids:
+        return {}
+    await cur.execute(
+        """
+        SELECT session_id,
+               jsonb_typeof(state),
+               CASE WHEN jsonb_typeof(state) = 'object' THEN
+                   (SELECT jsonb_object_agg(field.key, field.value)
+                    FROM jsonb_each(state) AS field
+                    WHERE field.key = ANY(%s::text[]))
+               END
+        FROM cayu_checkpoints
+        WHERE session_id = ANY(%s::text[])
+        """,
+        (list(keys), list(session_ids)),
+    )
+    found: dict[str, Any] = {}
+    for session_id, root_type, fields in await cur.fetchall():
+        # A checkpoint is an object, as the whole-checkpoint read requires.
+        if root_type != "object":
+            raise DurableValueError("invalid_json_object", "checkpoint")
+        found[session_id] = {} if fields is None else fields
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
 def _latest_after_lifecycle(type_filter: LiteralString) -> LiteralString:
     # The single read scopes terminal and retry events to the latest invocation:
     # only events after the most recent start or resume count.
@@ -92,8 +134,15 @@ def _event_record(sequence: Any, event: Any) -> EventRecord | None:
 
 
 async def summarize_outcomes(cur: Any, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
-    sessions = await load_sessions(cur, session_ids)
-    if not sessions:
+    if not session_ids:
+        return {}
+    # An outcome depends only on each session's status, so whole rows are not read.
+    await cur.execute(
+        "SELECT id, status FROM cayu_sessions WHERE id = ANY(%s::text[])", (list(session_ids),)
+    )
+    found = {row[0]: SessionStatus(row[1]) for row in await cur.fetchall()}
+    statuses = {session_id: found[session_id] for session_id in session_ids if session_id in found}
+    if not statuses:
         return {}
     await cur.execute(
         "SELECT page.session_id, terminal.sequence, terminal.event, retry.sequence, retry.event "
@@ -103,7 +152,7 @@ async def summarize_outcomes(cur: Any, session_ids: Sequence[str]) -> dict[str, 
         + _latest_after_lifecycle("event_type = %(retry)s")
         + " AS retry ON TRUE",
         {
-            "ids": list(sessions),
+            "ids": list(statuses),
             "terminal": _TERMINAL_EVENT_TYPES,
             "retry": str(EventType.MODEL_RETRY),
             "lifecycle": _LIFECYCLE_EVENT_TYPES,
@@ -111,12 +160,13 @@ async def summarize_outcomes(cur: Any, session_ids: Sequence[str]) -> dict[str, 
     )
     events = {row[0]: row[1:] for row in await cur.fetchall()}
     outcomes: dict[str, SessionOutcome] = {}
-    for session_id, session in sessions.items():
+    for session_id, status in statuses.items():
         terminal_sequence, terminal, retry_sequence, retry = events.get(
             session_id, (None, None, None, None)
         )
-        outcomes[session_id] = session_outcome(
-            session,
+        outcomes[session_id] = session_status_outcome(
+            session_id,
+            status,
             terminal_event=_event_record(terminal_sequence, terminal),
             latest_retry_event=_event_record(retry_sequence, retry),
         )

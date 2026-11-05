@@ -2127,6 +2127,14 @@ class SQLiteSessionStore(
             lambda connection: page_read_ops.load_sessions(connection, page)
         )
 
+    async def load_session_instance_ids(self, session_ids: Sequence[str]) -> dict[str, str]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_session_instance_ids(page)
+        return await self._run_read(
+            lambda connection: page_read_ops.load_session_instance_ids(connection, page)
+        )
+
     async def load_checkpoints(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         page = page_reads.page_session_ids(session_ids)
         if await page_reads.page_reads_are_bounded():
@@ -2139,6 +2147,21 @@ class SQLiteSessionStore(
                 session_id: _checkpoint_from_json(value) for session_id, value in values.items()
             }
         )
+
+    async def load_checkpoint_fields(
+        self, session_ids: Sequence[str], keys: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        page = page_reads.page_session_ids(session_ids)
+        fields = page_reads.checkpoint_field_keys(keys)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_checkpoint_fields(page, fields)
+        values = await self._run_read(
+            lambda connection: page_read_ops.load_checkpoint_fields(connection, page, fields)
+        )
+        return {
+            session_id: copy_durable_json_object(value, "checkpoint")
+            for session_id, value in values.items()
+        }
 
     async def summarize_outcomes(self, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
         page = page_reads.page_session_ids(session_ids)

@@ -79,13 +79,10 @@ class SessionOverviewService:
         selection: SessionOverviewSelection | None = None,
     ) -> tuple[list[Session], list[SessionOverviewResponse]]:
         selection = SessionOverviewSelection() if selection is None else selection
-        expected = {session.id: session.instance_id for session in sessions}
-        facts = await SessionOverviewReader(self.store, pricing=self.pricing).read(tuple(expected))
+        facts = await SessionOverviewReader(self.store, pricing=self.pricing).read_listed(sessions)
         selected: list[SessionOverviewFacts] = []
         for fact in facts:
             session = fact.session
-            if session.instance_id != expected.get(session.id):
-                continue
             if (not selection.include_eval and is_eval_trial(session)) or (
                 not selection.include_forks and fact.forked
             ):
@@ -122,12 +119,11 @@ class SessionOverviewService:
     async def _current(self, sessions: list[Session]) -> set[str]:
         """The sessions whose selected incarnation is still current, from one read."""
 
-        current = await self.store.load_sessions(tuple(session.id for session in sessions))
+        current = await self.store.load_session_instance_ids(
+            tuple(session.id for session in sessions)
+        )
         return {
-            session.id
-            for session in sessions
-            if (row := current.get(session.id)) is not None
-            and row.instance_id == session.instance_id
+            session.id for session in sessions if current.get(session.id) == session.instance_id
         }
 
     async def _uses(self, sessions: list[Session]) -> dict[str, SessionOverviewUses]:
@@ -147,7 +143,9 @@ class SessionOverviewService:
     async def _uses_browser(self, sessions: list[Session]) -> dict[str, bool]:
         session_ids = tuple(session.id for session in sessions)
         with browser_control_checkpoint_read_scope(*session_ids):
-            checkpoints = await self.store.load_checkpoints(session_ids)
+            checkpoints = await self.store.load_checkpoint_fields(
+                session_ids, (BROWSER_CONTROLS_CHECKPOINT_KEY,)
+            )
         uses: dict[str, bool] = {}
         for session in sessions:
             checkpoint = checkpoints.get(session.id)

@@ -7,8 +7,10 @@ loops over the single-session methods, and with those methods themselves.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from typing import Any, cast
 
+import psycopg
 import pytest
 from tests.core.session_store_conformance.support import (
     _close_store,
@@ -18,16 +20,35 @@ from tests.core.session_store_conformance.support import (
 )
 from tests.core.test_cloud_reporting import _app, _drain, _pending, _start
 
+from cayu._validation import DurableValueError
 from cayu.approvals import UserInputResponse
 from cayu.artifacts import ArtifactScope, LocalArtifactStore
 from cayu.artifacts.base import ArtifactListResult, ArtifactStore, ArtifactStoreUnavailableError
 from cayu.messages import Message, MessageRole
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.sessions import ForkSessionRequest
 from cayu.sessions._browser_usage import BROWSER_USAGE_KEY
+from cayu.sessions._model_failover import MODEL_FAILOVER_CHECKPOINT_KEY
 from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions._page_reads import MAX_PAGE_READ_SESSIONS
 from cayu.sessions._supervision_projection import RELEASE_MARKER_EVENT_TYPES
+from cayu.sessions.checkpoints import (
+    _SELF_CONTAINED_ROOT_FIELDS,
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
+    BROWSER_CONTROLS_CHECKPOINT_KEY,
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
+    CheckpointCompatibilityError,
+    decode_runtime_checkpoint,
+    decode_runtime_checkpoint_fields,
+)
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
@@ -84,10 +105,23 @@ def test_page_reads_match_single_session_reads(session_store_case):
             assert sessions == {sid: await store.load(sid) for sid in SESSIONS}
             assert sessions == await SessionStore.load_sessions(store, PAGE)
 
+            instances = await store.load_session_instance_ids(PAGE)
+            assert instances == {sid: session.instance_id for sid, session in sessions.items()}
+            assert list(instances) == list(SESSIONS)
+            assert instances == await SessionStore.load_session_instance_ids(store, PAGE)
+
             checkpoints = await store.load_checkpoints(PAGE)
             single = {sid: await store.load_checkpoint(sid) for sid in SESSIONS}
             assert checkpoints == {sid: value for sid, value in single.items() if value}
             assert checkpoints == await SessionStore.load_checkpoints(store, PAGE)
+            keys = (*sorted(checkpoints["written"])[:2], "absent")
+            fields = await store.load_checkpoint_fields(PAGE, keys)
+            assert fields == {
+                sid: {key: value[key] for key in keys if key in value}
+                for sid, value in checkpoints.items()
+            }
+            assert all(fields.values())
+            assert fields == await SessionStore.load_checkpoint_fields(store, PAGE, keys)
 
             outcomes = await store.summarize_outcomes(PAGE)
             assert outcomes == {sid: await store.summarize_outcome(sid) for sid in SESSIONS}
@@ -188,6 +222,174 @@ def test_first_transcript_records_match_single_transcript_reads(session_store_ca
                 await store.query_first_transcript_records(
                     [f"s{index}" for index in range(MAX_PAGE_READ_SESSIONS + 1)], MessageRole.USER
                 )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.store_semantics
+def test_checkpoint_field_reads_keep_each_json_type(session_store_case):
+    async def scenario():
+        store = await _open_store(session_store_case)
+        try:
+            for sid in ("typed", "empty", "unwritten"):
+                await store.create(
+                    RunRequest(agent_name="writer", session_id=sid, messages=[]),
+                    identity=SessionIdentity(provider_name="test", model="test"),
+                )
+            typed = {
+                "object": {"nested": [1, {"deep": None}]},
+                "array": ["a", 2, False],
+                "true": True,
+                "false": False,
+                "null": None,
+                "integer": 7,
+                "real": 1.5,
+                "text": "null",
+                "unselected": "x" * 1000,
+            }
+            await store.checkpoint("typed", typed)
+            await store.checkpoint("empty", {"unselected": 1})
+            page = ("typed", "empty", "unwritten", "missing")
+            keys = ("object", "array", "true", "false", "null", "integer", "real", "text")
+            fields = await store.load_checkpoint_fields(page, keys)
+            assert fields == {"typed": {key: typed[key] for key in keys}, "empty": {}}
+            assert {key: type(value) for key, value in fields["typed"].items()} == {
+                key: type(typed[key]) for key in keys
+            }
+            assert fields == await SessionStore.load_checkpoint_fields(store, page, keys)
+            assert await store.load_checkpoint_fields((), keys) == {}
+            with pytest.raises(TypeError):
+                await store.load_checkpoint_fields(page, "object")
+            with pytest.raises(ValueError):
+                await store.load_checkpoint_fields(page, ())
+        finally:
+            await _close_store(store)
+
+    asyncio.run(scenario())
+
+
+class _StoredCheckpoints(InMemorySessionStore):
+    """Stored checkpoints as given, which the runtime boundary must decode."""
+
+    def __init__(self, checkpoints: dict[str, dict[str, Any]]) -> None:
+        super().__init__()
+        self.stored = checkpoints
+
+    async def load_checkpoints(self, session_ids):
+        return {sid: dict(self.stored[sid]) for sid in session_ids if sid in self.stored}
+
+
+def _whole_checkpoint(version: int | None) -> dict[str, Any]:
+    """Every root field of every schema version a migration reads or writes."""
+
+    checkpoint: dict[str, Any] = {
+        root: {"schema_version": 1, "value": root}
+        for root in (
+            BROWSER_CONTROLS_CHECKPOINT_KEY,
+            ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+            SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+            AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
+            WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
+            MODEL_FAILOVER_CHECKPOINT_KEY,
+            "last_model_step_publication",
+            "pending_tool_round",
+            "pending_user_input",
+            "pending_session_interrupt",
+            "user_input_resolution_intent",
+            "workspace_checkpoints",
+            "execution_snapshots",
+            "pending_wake",
+            "unselected",
+        )
+    }
+    if version is not None:
+        checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = version
+    return checkpoint
+
+
+def test_runtime_checkpoint_fields_decode_as_their_whole_checkpoint():
+    async def scenario():
+        versions = {
+            "versionless": None,
+            **{
+                f"v{version}": version
+                for version in range(1, CURRENT_CHECKPOINT_SCHEMA_VERSION + 1)
+            },
+        }
+        stored = _StoredCheckpoints({sid: _whole_checkpoint(v) for sid, v in versions.items()})
+        keys = tuple(sorted(_SELF_CONTAINED_ROOT_FIELDS))
+        # Each selectable field decodes from itself and the version alone exactly as
+        # inside its whole checkpoint, at every schema version. A migration that
+        # derives one from another field fails here.
+        for sid, checkpoint in stored.stored.items():
+            whole = decode_runtime_checkpoint(checkpoint, session_id=sid)
+            assert whole is not None
+            projection = {
+                key: checkpoint[key]
+                for key in (*keys, CHECKPOINT_SCHEMA_VERSION_KEY)
+                if key in checkpoint
+            }
+            assert decode_runtime_checkpoint_fields(projection, keys, session_id=sid) == {
+                key: whole[key] for key in keys if key in whole
+            }, sid
+        runtime = runtime_checkpoint_session_store(stored)
+        page = (*versions, "missing")
+        whole = await runtime.load_checkpoints(page)
+        fields = await runtime.load_checkpoint_fields(page, keys)
+        assert fields == {
+            sid: {key: value[key] for key in keys if key in value} for sid, value in whole.items()
+        }
+        # Version 9 began owning browser controls; an older value is application data.
+        assert {sid for sid, value in fields.items() if value} == {
+            f"v{version}" for version in range(9, CURRENT_CHECKPOINT_SCHEMA_VERSION + 1)
+        }
+        # A field another field's migration can write needs its whole checkpoint.
+        # The refusal holds whatever is stored, including no checkpoint at all.
+        for refused_page in (page, (), ("missing",)):
+            with pytest.raises(ValueError, match="self-contained"):
+                await runtime.load_checkpoint_fields(refused_page, ("unselected",))
+        stored.stored["v1"][CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
+        with pytest.raises(CheckpointCompatibilityError):
+            await runtime.load_checkpoint_fields(page, keys)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.store_semantics
+def test_checkpoint_field_reads_refuse_a_checkpoint_that_is_not_an_object(session_store_case):
+    kind, path, dsn = session_store_case
+    if kind == "memory":
+        pytest.skip("The in-memory store holds checkpoints only as objects.")
+
+    async def scenario():
+        store = await _open_store(session_store_case)
+        try:
+            await store.create(
+                RunRequest(agent_name="writer", session_id="listed", messages=[]),
+                identity=SessionIdentity(provider_name="test", model="test"),
+            )
+            await store.checkpoint("listed", {"unselected": 1})
+            if kind == "sqlite":
+                with sqlite3.connect(path / "sessions.sqlite") as connection:
+                    connection.execute(
+                        "UPDATE cayu_checkpoints SET state_json = '[1]' WHERE session_id = ?",
+                        ("listed",),
+                    )
+            else:
+                with psycopg.connect(dsn) as connection:
+                    connection.execute(
+                        "UPDATE cayu_checkpoints SET state = '[1]'::jsonb WHERE session_id = %s",
+                        ("listed",),
+                    )
+            # The whole-checkpoint read refuses it, and so does the field read.
+            with pytest.raises(DurableValueError, match="JSON object"):
+                await store.load_checkpoints(("listed",))
+            with pytest.raises(DurableValueError, match="JSON object"):
+                await store.load_checkpoint_fields(("listed",), ("unselected",))
         finally:
             await _close_store(store)
 

@@ -83,6 +83,78 @@ def test_browser_enrichment_reconciles_only_confirmed_identity_loss(
     asyncio.run(scenario())
 
 
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("mode", ["delete", "replace"])
+@pytest.mark.parametrize(
+    # One read before each fence: the reader's, the projection's and the route's.
+    "method",
+    ["query_latest_events", "count_child_runs", "query_first_transcript_records"],
+)
+def test_overview_drops_a_session_replaced_after_it_was_listed(
+    session_store_case, monkeypatch, mode, method
+):
+    async def scenario():
+        store = await _open_store(session_store_case)
+        try:
+            app = _app(store)
+            await _start(app, "gone", "writer")
+            await _start(app, "kept", "writer")
+            original = getattr(store, method)
+            reached = asyncio.Event()
+            release = asyncio.Event()
+
+            async def paused_read(sessions, *args, **kwargs):
+                reached.set()
+                await release.wait()
+                return await original(sessions, *args, **kwargs)
+
+            monkeypatch.setattr(store, method, paused_read)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(
+                    app=create_server(app, config=ServerConfig.local_development())
+                ),
+                base_url="http://test",
+            ) as client:
+                request = asyncio.create_task(
+                    client.get("/api/sessions", params={"include": ["overview", "first_message"]})
+                )
+                await asyncio.wait_for(reached.wait(), 3)
+                await store.delete_session("gone")
+                if mode == "replace":
+                    await _start(app, "gone", "writer")
+                release.set()
+                response = await request
+            assert response.status_code == 200, response.text
+            assert [row["id"] for row in response.json()["sessions"]] == ["kept"]
+            assert [row["session_id"] for row in response.json()["overviews"]] == ["kept"]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(scenario())
+
+
+def test_listed_sessions_are_summarized_only_while_still_current():
+    from cayu.sessions.overview import SessionOverviewReader
+
+    async def scenario():
+        app = _app()
+        store = app.session_store
+        await _start(app, "replaced", "writer")
+        await _start(app, "kept", "writer")
+        listed = (await store.list_sessions()).sessions
+        replaced = next(session for session in listed if session.id == "replaced")
+        await store.delete_session("replaced")
+        await _start(app, "replaced", "writer")
+        rows = await SessionOverviewReader(store).read_listed(listed)
+        assert [row.session.id for row in rows] == ["kept"]
+        assert rows[0].session is next(session for session in listed if session.id == "kept")
+        # Read by ID, the session's new incarnation is summarized instead.
+        (current,) = await SessionOverviewReader(store).read(("replaced",))
+        assert current.session.instance_id != replaced.instance_id
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("delegated", [False, True])
 def test_cloud_advances_past_pending_issues_while_control_plane_refuses_partial_state(
     monkeypatch, delegated

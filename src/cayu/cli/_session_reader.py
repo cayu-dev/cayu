@@ -223,11 +223,10 @@ class StoreSessionReader:
         )
         kept, overviews = await service.read(sessions)
         overviews = await service.with_first_messages(kept, overviews)
-        current = await self.store.load_sessions(tuple(session.id for session in kept))
+        current = await self.store.load_session_instance_ids(tuple(session.id for session in kept))
         rows = []
         for session, projected in zip(kept, overviews, strict=True):
-            row = current.get(session.id)
-            if row is None or row.instance_id != session.instance_id:
+            if current.get(session.id) != session.instance_id:
                 continue
             payload = projected.model_dump(mode="json")
             payload["uses"]["artifacts"] = None

@@ -547,6 +547,33 @@ def decode_runtime_checkpoint(
         raise error from None
 
 
+# Root fields no migration derives from another field: each is kept, or dropped
+# for an older schema, on its own. So they decode from a read of just themselves
+# and the schema version exactly as they do inside the whole checkpoint.
+_SELF_CONTAINED_ROOT_FIELDS = frozenset({BROWSER_CONTROLS_CHECKPOINT_KEY})
+
+
+def require_self_contained_checkpoint_fields(keys: tuple[str, ...]) -> None:
+    """Refuse root fields that can't decode apart from their whole checkpoint."""
+
+    if not set(keys) <= _SELF_CONTAINED_ROOT_FIELDS:
+        raise ValueError("Only self-contained checkpoint fields decode apart from the checkpoint.")
+
+
+def decode_runtime_checkpoint_fields(
+    fields: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    session_id: str,
+) -> dict[str, Any]:
+    """Decode root fields read together with the schema version, as their checkpoint would."""
+
+    require_self_contained_checkpoint_fields(keys)
+    decoded = decode_runtime_checkpoint(fields, session_id=session_id)
+    assert decoded is not None
+    return {key: decoded[key] for key in keys if key in decoded}
+
+
 class _DecodedRuntimeCheckpoint:
     """Transfer one privately owned, decoded snapshot to a reader exactly once.
 

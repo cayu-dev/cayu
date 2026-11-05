@@ -158,18 +158,24 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
         assert large_totals["counts_by_state"]["waiting_approval"] == "6"
         # Each read the overview needs is made once for the whole page.
         for name in (
-            "sessions.load_sessions",
             "sessions.summarize_outcomes",
             "sessions.query_pending_actions_for_sessions",
             "sessions.query_latest_events",
-            "sessions.load_checkpoints",
+            "sessions.load_checkpoint_fields",
             "sessions.load_session_operations",
             "sessions.count_child_runs",
             "sessions.query_first_transcript_records",
             "artifacts.count_session_artifacts",
         ):
             assert large[name] >= 1, (name, large)
+        # The listed rows are summarized as listed. Each fence after a group of
+        # reads (the reader's, the projection's and the route's) reads only the
+        # incarnations, and only browser controls are read from checkpoints.
+        assert large["sessions.list_sessions"] == 1, large
+        assert large["sessions.load_session_instance_ids"] == 3, large
         for name in (
+            "sessions.load_sessions",
+            "sessions.load_checkpoints",
             "sessions.load",
             "sessions.summarize_outcome",
             "sessions.query_pending_actions",

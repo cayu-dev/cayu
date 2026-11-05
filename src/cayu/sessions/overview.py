@@ -280,9 +280,24 @@ class SessionOverviewReader:
 
         self._loaded.clear()
         await self._load_many(session_ids)
-        sessions = [
-            session for session_id in session_ids if (session := self._loaded.get(session_id))
-        ]
+        return await self._read(
+            [session for session_id in session_ids if (session := self._loaded.get(session_id))]
+        )
+
+    async def read_listed(self, sessions: Sequence[Session]) -> tuple[SessionOverviewFacts, ...]:
+        """Summarize sessions exactly as the caller's listing just read them.
+
+        A listed row is as new as the listing's cursor, and every read below is
+        made after it, so the rows are not loaded again. A session replaced since
+        it was listed is left out, as ``read`` leaves it out.
+        """
+
+        listed = {session.id: session for session in sessions}
+        self._loaded.clear()
+        self._loaded.update(listed)
+        return await self._read(list(listed.values()))
+
+    async def _read(self, sessions: list[Session]) -> tuple[SessionOverviewFacts, ...]:
         if not sessions:
             return ()
         query = EventQuery(session_ids=tuple(session.id for session in sessions))
@@ -375,13 +390,22 @@ class SessionOverviewReader:
 
         if not sessions:
             return set()
-        current = await self._store.load_sessions(tuple(session.id for session in sessions))
+        session_ids = tuple(session.id for session in sessions)
+        if query is None:
+            # Only the incarnation decides; the rows themselves are not needed.
+            instances = await self._store.load_session_instance_ids(session_ids)
+            return {
+                session.id
+                for session in sessions
+                if instances.get(session.id) == session.instance_id
+            }
+        current = await self._store.load_sessions(session_ids)
         return {
             session.id
             for session in sessions
             if (row := current.get(session.id)) is not None
             and row.instance_id == session.instance_id
-            and (query is None or _session_matches(row, query))
+            and _session_matches(row, query)
         }
 
     async def _states(

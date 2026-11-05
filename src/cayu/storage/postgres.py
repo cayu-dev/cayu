@@ -1546,6 +1546,14 @@ class PostgresSessionStore(
         async with self._connection() as conn, conn.cursor() as cur:
             return await page_read_ops.load_sessions(cur, page)
 
+    async def load_session_instance_ids(self, session_ids: Sequence[str]) -> dict[str, str]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_session_instance_ids(page)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await page_read_ops.load_session_instance_ids(cur, page)
+
     async def load_checkpoints(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         page = page_reads.page_session_ids(session_ids)
         if await page_reads.page_reads_are_bounded():
@@ -1553,6 +1561,21 @@ class PostgresSessionStore(
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             values = await page_read_ops.load_checkpoints(cur, page)
+        return {
+            session_id: copy_durable_json_object(pg_support._json_obj(value), "checkpoint")
+            for session_id, value in values.items()
+        }
+
+    async def load_checkpoint_fields(
+        self, session_ids: Sequence[str], keys: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        page = page_reads.page_session_ids(session_ids)
+        fields = page_reads.checkpoint_field_keys(keys)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_checkpoint_fields(page, fields)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            values = await page_read_ops.load_checkpoint_fields(cur, page, fields)
         return {
             session_id: copy_durable_json_object(pg_support._json_obj(value), "checkpoint")
             for session_id, value in values.items()

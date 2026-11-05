@@ -7964,11 +7964,11 @@ def create_router(
         if overviews is not None:
             # Optional sibling reads can await after overview enrichment. Keep
             # every parallel representation aligned to the same incarnation.
-            current = await session_store.load_sessions([s.id for s in result.sessions])
+            current = await session_store.load_session_instance_ids([s.id for s in result.sessions])
             retained = [
                 index
                 for index, session in enumerate(result.sessions)
-                if (row := current.get(session.id)) and row.instance_id == session.instance_id
+                if current.get(session.id) == session.instance_id
             ]
             result = result.model_copy(
                 update={"sessions": [result.sessions[index] for index in retained]}

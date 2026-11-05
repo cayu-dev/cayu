@@ -207,14 +207,23 @@ def test_overview_metadata_is_bounded_redacted_and_never_sent_to_cloud(monkeypat
         }
         # Model stored runtime-owned metadata; public update_metadata refuses these keys.
         load = app.session_store.load
+        list_sessions = app.session_store.list_sessions
 
-        async def named_record(session_id):
-            session = await load(session_id)
-            if session is not None and session_id == "named":
+        def named(session):
+            if session is not None and session.id == "named":
                 return session.model_copy(update={"metadata": {**session.metadata, **metadata}})
             return session
 
+        async def named_record(session_id):
+            return named(await load(session_id))
+
+        # The overview summarizes the rows the list read, and Cloud loads them.
+        async def named_page(query=None):
+            page = await list_sessions(query)
+            return page.model_copy(update={"sessions": [named(row) for row in page.sessions]})
+
         monkeypatch.setattr(app.session_store, "load", named_record)
+        monkeypatch.setattr(app.session_store, "list_sessions", named_page)
         response = client.get("/api/sessions", params={"include": "overview"})
         assert response.status_code == 200
         assert "private-canary" not in response.text
