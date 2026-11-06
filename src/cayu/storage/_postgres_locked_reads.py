@@ -80,6 +80,16 @@ def transcript_cursor(session_id: str) -> FollowRead:
     )
 
 
+def operation_row(session_id: str, idempotency_key: str) -> FollowRead:
+    """An operation record's raw row, or None."""
+
+    return FollowRead(
+        "SELECT record FROM cayu_session_operations WHERE session_id = %s AND idempotency_key = %s",
+        (session_id, idempotency_key),
+        lambda rows: rows[0] if rows else None,
+    )
+
+
 def operation_record(session_id: str, idempotency_key: str) -> FollowRead:
     return FollowRead(
         "SELECT record FROM cayu_session_operations WHERE session_id = %s AND idempotency_key = %s",

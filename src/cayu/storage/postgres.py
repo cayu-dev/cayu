@@ -5775,7 +5775,6 @@ class PostgresSessionStore(
             ensure_ready=self._ensure_aliases_reconciled,
             load_checkpoint=self._load_checkpoint,
             store_now=self._session_store_now,
-            closure_owners=self._closure_lineage_owners,
             public_authority_alias_codec=self.public_authority_alias_codec,
             first_existing_event_id=self._first_existing_event_id,
             publish_budget_identities=self._publish_budget_reservation_identities,

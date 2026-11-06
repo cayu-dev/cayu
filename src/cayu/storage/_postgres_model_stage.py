@@ -440,11 +440,8 @@ async def prepare(
                                 *_model_failover_predecessor_storage_keys(prepared),
                             ],
                         ),
-                        locked_reads.FollowRead(
-                            "SELECT record FROM cayu_session_operations "
-                            "WHERE session_id = %s AND idempotency_key = %s",
-                            (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
-                            lambda rows: rows[0] if rows else None,
+                        locked_reads.operation_row(
+                            session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
                         ),
                         locked_reads.FollowRead(
                             "SELECT idempotency_key FROM cayu_session_operations "
@@ -731,11 +728,8 @@ async def complete(
                                 prepared.settlement_storage_key,
                             ],
                         ),
-                        locked_reads.FollowRead(
-                            "SELECT record FROM cayu_session_operations "
-                            "WHERE session_id = %s AND idempotency_key = %s",
-                            (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
-                            lambda rows: rows[0] if rows else None,
+                        locked_reads.operation_row(
+                            session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
                         ),
                     ),
                 )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -261,31 +261,17 @@ async def publish_runtime(
                 follow_reads = []
                 if _model_completion_stage is not None:
                     follow_reads.append(
-                        locked_reads.FollowRead(
-                            "SELECT idempotency_key, record FROM cayu_session_operations "
-                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
-                            (
-                                session_id,
-                                [
-                                    _model_completion_stage.preparation_storage_key,
-                                    _model_completion_stage.terminal_storage_key,
-                                    _model_completion_stage.active_storage_key,
-                                    _model_completion_stage.winner_storage_key,
-                                ],
-                            ),
-                            lambda rows: {
-                                row[0]: model_stage_ops.decode_stage_record(row[1]) for row in rows
-                            },
+                        model_stage_ops._stage_records_read(
+                            session_id,
+                            [
+                                _model_completion_stage.preparation_storage_key,
+                                _model_completion_stage.terminal_storage_key,
+                                _model_completion_stage.active_storage_key,
+                                _model_completion_stage.winner_storage_key,
+                            ],
                         )
                     )
-                follow_reads.append(
-                    locked_reads.FollowRead(
-                        "SELECT record FROM cayu_session_operations "
-                        "WHERE session_id = %s AND idempotency_key = %s",
-                        (session_id, prepared.storage_key),
-                        lambda rows: rows[0] if rows else None,
-                    )
-                )
+                follow_reads.append(locked_reads.operation_row(session_id, prepared.storage_key))
                 follow_reads.append(locked_reads.closure_owners((session_id,)))
                 loaded_result, followed = await locked_reads.load_session_then_read(
                     cur, session_id, " FOR UPDATE", follow_reads
@@ -917,7 +903,6 @@ async def publish_checkpoint_events(
     ensure_ready: Callable[[], Awaitable[None]],
     load_checkpoint: Callable[[Any, str], Awaitable[dict[str, Any] | None]],
     store_now: Callable[[Any], Awaitable[datetime]],
-    closure_owners: Callable[[Any, Iterable[str]], Awaitable[tuple[dict[str, Any], ...]]],
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
     first_existing_event_id: Callable[[Any, str, list[str]], Awaitable[str | None]],
     publish_budget_identities: Callable[[Any, list[Event]], Awaitable[None]],
