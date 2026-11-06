@@ -2752,6 +2752,36 @@ def _recent_conversation(
     return tuple(reversed(selected)), latest_clipped
 
 
+def _remap_recall_checkpoint_anchors(
+    checkpoint: dict[str, Any],
+    *,
+    index_map: Mapping[int, int],
+) -> dict[str, Any]:
+    """Keep recall anchors on the same user rows after a history projection."""
+
+    updated = copy_durable_record(checkpoint, "checkpoint")
+
+    def remap(anchor: Any) -> None:
+        if type(anchor) is dict and type(anchor.get("anchor_transcript_index")) is int:
+            # Unmapped anchors were not user rows in the source history. Keep
+            # them invalid rather than accidentally accepting a different row.
+            anchor["anchor_transcript_index"] = index_map.get(anchor["anchor_transcript_index"], -1)
+
+    state = updated.get(AUTOMATIC_RECALL_CHECKPOINT_KEY)
+    remap(state)
+    if type(state) is dict and type(state.get("runtime_authored_anchors")) is list:
+        for anchor in state["runtime_authored_anchors"]:
+            remap(anchor)
+    remap(updated.get(RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY))
+    history = updated.get(AUTOMATIC_RECALL_HISTORY_CHECKPOINT_KEY)
+    if type(history) is dict:
+        for name in ("current_placements", "retained_placements"):
+            if type(history.get(name)) is list:
+                for placement in history[name]:
+                    remap(placement)
+    return updated
+
+
 def _load_runtime_authored_user_message(
     checkpoint: dict[str, Any] | None,
     *,

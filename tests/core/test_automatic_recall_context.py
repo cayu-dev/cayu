@@ -71,6 +71,7 @@ from cayu.memory.context import (
     _bounded_gather,
     _message_digest,
     _redacted_locator_json,
+    _remap_recall_checkpoint_anchors,
     _render_projection,
 )
 from cayu.memory.evidence import (
@@ -6774,3 +6775,41 @@ def test_bounded_recall_reads_do_not_create_later_batches_after_termination(canc
                 coroutine.close()
 
     asyncio.run(run())
+
+
+def test_history_projection_remaps_all_recall_checkpoint_anchors() -> None:
+    def checkpoint_at(first: int, current: int, runtime: int) -> dict[str, Any]:
+        def anchor(index: int) -> dict[str, Any]:
+            return {"anchor_transcript_index": index, "user_message_sha256": "a" * 64}
+
+        return {
+            "automatic_recall": {
+                **anchor(current),
+                "runtime_authored_anchors": [anchor(runtime)],
+                "receipt_id": "unchanged-receipt",
+            },
+            "runtime_authored_user_message": {**anchor(runtime), "version": 1},
+            "automatic_recall_history": {
+                "current_placements": [anchor(current)],
+                "retained_placements": [anchor(first)],
+            },
+            "other_state": {"anchor_transcript_index": 99},
+        }
+
+    original = checkpoint_at(0, 2, 4)
+    projected = _remap_recall_checkpoint_anchors(original, index_map={0: 0, 2: 1, 4: 3})
+    assert projected == checkpoint_at(0, 1, 3)
+    assert original == checkpoint_at(0, 2, 4)
+    # A later switch remaps positions from the already projected history.
+    assert _remap_recall_checkpoint_anchors(
+        projected, index_map={0: 0, 1: 1, 3: 2}
+    ) == checkpoint_at(0, 1, 2)
+
+
+@pytest.mark.parametrize("index", [1, -1, True, "2", None])
+def test_history_projection_does_not_repair_invalid_recall_anchors(index: Any) -> None:
+    checkpoint = {"automatic_recall": {"anchor_transcript_index": index}}
+    projected = _remap_recall_checkpoint_anchors(checkpoint, index_map={0: 0, 2: 1})
+    assert projected["automatic_recall"]["anchor_transcript_index"] == (
+        -1 if type(index) is int else index
+    )

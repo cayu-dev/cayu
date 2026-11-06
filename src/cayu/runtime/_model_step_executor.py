@@ -78,12 +78,14 @@ from cayu.context.base import (
     ContextRequest,
     ContextUsageState,
     RuntimeManagedContextPolicy,
+    _attach_context_build_termination_diagnostics,
     _automatic_compaction_runner_scope,
     _AutomaticCompactionRunner,
     _context_recall_telemetry_publisher_scope,
     _context_secret_redactor_scope,
     _ContextCountAuthorityError,
     _defer_billing_identity_cancellation_scope,
+    context_build_termination_checkpoint_error,
     context_input_coverage,
     copy_context_messages,
     estimate_context_pressure,
@@ -2690,6 +2692,7 @@ class ModelStepRun:
                 raise ValueError("Targeted tool grants require an active interaction identity.")
             interaction_id = require_durable_clean_nonblank(interaction_id, "interaction_id")
         self._interaction_id = interaction_id
+        self._recall_anchor_index_map: dict[int, int] | None = None
         self._refresh_request_configuration()
 
     def _refresh_request_configuration(self) -> None:
@@ -3050,7 +3053,19 @@ class ModelStepRun:
             # No output was accepted anywhere in this logical step. All supplied
             # history therefore precedes this switch. Keep semantic turns/files;
             # never forward another provider's response IDs or signed thinking.
-            messages = list(project_portable_transcript(messages).messages)
+            portable = project_portable_transcript(messages)
+            self._recall_anchor_index_map = dict(
+                zip(
+                    (i for i, message in enumerate(messages) if message.role is MessageRole.USER),
+                    (
+                        i
+                        for i, message in enumerate(portable.messages)
+                        if message.role is MessageRole.USER
+                    ),
+                    strict=True,
+                )
+            )
+            messages = list(portable.messages)
             portable_history_cursor = source_transcript_cursor
 
     async def _candidate_disposition(
@@ -3340,6 +3355,7 @@ class ModelStepRun:
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=compaction.run,
                 publish_recall_telemetry=compaction.publish_recall,
+                recall_anchor_index_map=self._recall_anchor_index_map,
             )
         except ContextBuildError as exc:
             (
@@ -3904,6 +3920,15 @@ class ModelStepRun:
                             else None
                         ),
                     )
+                    if route_admission.transition == "fallback":
+                        route_admission = replace(
+                            route_admission,
+                            recall_anchor_index_map=(
+                                None
+                                if self._recall_anchor_index_map is None
+                                else tuple(self._recall_anchor_index_map.items())
+                            ),
+                        )
                     dispatch_ordinal = route_admission.successor.dispatch_ordinal
                     stage_id = route_admission.successor.stage_id
                 recovery_context = self._model_completion_recovery_context_factory(
@@ -4100,6 +4125,9 @@ class ModelStepRun:
                         unsettled_failure=lambda: classified_preparation_failure,
                         supervisor=self._executor._recovery_cleanup_supervisor,
                     )
+                # Preparation commits the recall remap with the route's projection
+                # boundary. Any overflow rebuild now uses those durable positions.
+                self._recall_anchor_index_map = None
                 if not prepared.dispatch_authorized:
                     authorization_failure = ModelCompletionDispatchNotAuthorized(
                         stage=prepared.stage,
@@ -4689,6 +4717,7 @@ class ModelStepRun:
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=compaction.run,
                 publish_recall_telemetry=compaction.publish_recall,
+                recall_anchor_index_map=self._recall_anchor_index_map,
                 force_bounded_compaction=True,
             )
         except ContextBuildError as exc:
@@ -5841,6 +5870,7 @@ async def _build_context(
     run_compaction: _AutomaticCompactionRunner | None = None,
     publish_recall_telemetry: Callable[[ContextRecallTelemetry], Awaitable[None]] | None = None,
     force_bounded_compaction: bool = False,
+    recall_anchor_index_map: Mapping[int, int] | None = None,
 ) -> tuple[
     list[Message],
     dict[str, Any] | None,
@@ -5890,6 +5920,20 @@ async def _build_context(
         checkpoint = project_runtime_managed_context_checkpoint(
             await session_store.load_checkpoint(session.id)
         )
+        from cayu.memory.context import _remap_recall_checkpoint_anchors
+
+        # Until fallback preparation commits, the durable checkpoint still
+        # addresses the predecessor's history. Build against the candidate's
+        # projection, but publish context progress in the old coordinates.
+        reverse_index_map = (
+            None
+            if recall_anchor_index_map is None
+            else {new: old for old, new in recall_anchor_index_map.items()}
+        )
+        if checkpoint is not None and recall_anchor_index_map is not None:
+            checkpoint = _remap_recall_checkpoint_anchors(
+                checkpoint, index_map=recall_anchor_index_map
+            )
         try:
             with (
                 _context_secret_redactor_scope(secret_redactor),
@@ -5903,24 +5947,48 @@ async def _build_context(
                     checkpoint=checkpoint,
                 )
         except ContextBuildError as error:
+            if error.checkpoint is not None and reverse_index_map is not None:
+                error.checkpoint = _remap_recall_checkpoint_anchors(
+                    error.checkpoint, index_map=reverse_index_map
+                )
             sanitize_context_build_error_checkpoint(
                 error,
                 redactor=secret_redactor,
             )
             raise
+        except BaseException as error:
+            if reverse_index_map is not None:
+                progress = context_build_termination_checkpoint_error(error)
+                if progress is not None and progress.checkpoint is not None:
+                    # Cancellation can carry completed compaction prefixes too.
+                    # Restore their anchors before termination cleanup publishes them.
+                    _attach_context_build_termination_diagnostics(
+                        error,
+                        compaction_telemetry=[],
+                        checkpoint=_remap_recall_checkpoint_anchors(
+                            progress.checkpoint, index_map=reverse_index_map
+                        ),
+                        checkpoint_event_payload=progress.checkpoint_event_payload,
+                    )
+            raise
         safe_checkpoint, safe_checkpoint_event_payload = sanitize_context_build_result_checkpoint(
             result,
             redactor=secret_redactor,
         )
+        reference = memory_evidence_reference_from_checkpoint(
+            safe_checkpoint if safe_checkpoint is not None else checkpoint
+        )
+        if safe_checkpoint is not None and reverse_index_map is not None:
+            safe_checkpoint = _remap_recall_checkpoint_anchors(
+                safe_checkpoint, index_map=reverse_index_map
+            )
         return (
             copy_context_messages(result.messages),
             safe_checkpoint,
             safe_checkpoint_event_payload,
             [telemetry.model_copy(deep=True) for telemetry in result.compaction_telemetry],
             [telemetry.model_copy(deep=True) for telemetry in result.recall_telemetry],
-            memory_evidence_reference_from_checkpoint(
-                safe_checkpoint if safe_checkpoint is not None else checkpoint
-            ),
+            reference,
         )
 
     with _context_secret_redactor_scope(secret_redactor):

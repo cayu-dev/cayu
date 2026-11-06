@@ -59,6 +59,7 @@ class ModelFailoverStageAdmission:
     failure: BaseException | None = field(default=None, repr=False)
     retry: RetryDecision | None = None
     observation: FailoverObservation | None = None
+    recall_anchor_index_map: tuple[tuple[int, int], ...] | None = None
 
     def __post_init__(self) -> None:
         from cayu.runtime._execution_profile_admission import bind_model_failover_execution_profile
@@ -119,6 +120,8 @@ class ModelFailoverStageAdmission:
             ):
                 raise ValueError("Model failover requires the exact predecessor preparation.")
             validate_model_failover_successor(expected, successor, transition=self.transition)
+        if self.recall_anchor_index_map is not None and self.transition != "fallback":
+            raise ValueError("Only a fallback transition remaps recall anchors.")
         if self.transition == "fallback":
             assert isinstance(expected, ModelFailoverProgress)
             if self.failure is None or self.retry is None or self.observation is None:
@@ -233,6 +236,12 @@ def model_failover_checkpoint_after_preparation(
     if observed != expected:
         raise SessionModelCompletionStageConflict("Model failover predecessor changed.")
     updated = {} if current is None else current
+    if not replayed and admission.recall_anchor_index_map is not None:
+        from cayu.memory.context import _remap_recall_checkpoint_anchors
+
+        updated = _remap_recall_checkpoint_anchors(
+            updated, index_map=dict(admission.recall_anchor_index_map)
+        )
     updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
     updated[MODEL_FAILOVER_CHECKPOINT_KEY] = successor.payload()
     return updated

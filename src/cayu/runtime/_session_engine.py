@@ -4910,6 +4910,7 @@ class SessionEngine:
         source_transcript_cursor: int | None = None
         provider_state_parts_dropped = 0
         thinking_parts_dropped = 0
+        recall_anchor_index_map: dict[int, int] = {}
         if target_changed:
             if requested_target is None:
                 raise AssertionError("Changed model target lost its requested identity.")
@@ -4917,12 +4918,34 @@ class SessionEngine:
             try:
                 source_transcript = _transcript._transcript_snapshot_messages(source_snapshot)
                 source_transcript_cursor = source_snapshot.cursor
+                # Checkpoints address the previous model-facing history, which
+                # may already be shorter than the durable source after a switch.
+                previous_user_indexes = [
+                    index
+                    for index, message in enumerate(
+                        _transcript._project_model_target_snapshot(
+                            source_snapshot, loaded_projection_cursor
+                        ).messages
+                    )
+                    if message.role is MessageRole.USER
+                ]
             finally:
                 del source_snapshot
             portable_projection = None
             try:
                 source_transcript_digest = session_input_messages_sha256(source_transcript)
                 portable_projection = model_target.project_portable_transcript(source_transcript)
+                recall_anchor_index_map = dict(
+                    zip(
+                        previous_user_indexes,
+                        (
+                            index
+                            for index, message in enumerate(portable_projection.messages)
+                            if message.role is MessageRole.USER
+                        ),
+                        strict=True,
+                    )
+                )
                 provider_state_parts_dropped = portable_projection.provider_state_parts_dropped
                 thinking_parts_dropped = portable_projection.thinking_parts_dropped
                 if request_projection is None:
@@ -5181,6 +5204,13 @@ class SessionEngine:
                 execution_snapshot_registry(checkpoint), registered_environment
             )
         claimed_checkpoint = claim_resumable_checkpoint(loaded_session, checkpoint)
+        if target_changed:
+            from cayu.memory.context import _remap_recall_checkpoint_anchors
+
+            # Publish new anchor positions atomically with the target change.
+            claimed_checkpoint = _remap_recall_checkpoint_anchors(
+                claimed_checkpoint, index_map=recall_anchor_index_map
+            )
         if required_foreground_terminal is not None and required_foreground_continuation is None:
             existing_terminal = claimed_checkpoint.get(FOREGROUND_CHILD_TERMINAL_KEY)
             selected_terminal = required_foreground_terminal.model_dump(mode="json")
