@@ -6564,14 +6564,17 @@ class EnvironmentLifecycle:
         owns_cleanup = setup_owner is not None and not setup_owner.cleanup_started
         owns_prebind_tombstone = setup_owner is not None and setup_owner.prebind_release_tombstone
         try:
-            finalized = await self._finalize_terminal_event_once(
-                event=event,
-                session=session,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile,
-            )
-            await self._end_shared_allocation_owner(session, event)
-            return finalized
+            try:
+                return await self._finalize_terminal_event_once(
+                    event=event,
+                    session=session,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                )
+            finally:
+                # Diagnostics can be interrupted after the session detached.
+                # End its scope even then; remaining attachments defer release.
+                await self._end_shared_allocation_owner(session, event)
         except BaseException as exc:
             if owns_cleanup and setup_owner is not None and setup_owner.cleanup_started:
                 setup_owner.cleanup_error = exc
