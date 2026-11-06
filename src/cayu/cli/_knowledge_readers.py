@@ -56,7 +56,8 @@ class KnowledgeListRequest:
 class KnowledgePage:
     entries: list[dict[str, Any]]
     next_cursor: str | None
-    # More entries exist that no cursor reaches (Cayu's pending list has no cursor).
+    # More entries exist that no cursor reaches (an older Cayu's pending list has no
+    # cursor, or the next entry alone exceeds the page's byte bound).
     truncated: bool = False
 
 
@@ -172,25 +173,35 @@ class ApiKnowledgeReader:
             query["kind"] = list(request.kinds)
         if request.labels:
             query["label"] = [f"{key}={value}" for key, value in request.labels.items()]
+        if request.cursor is not None:
+            query["cursor"] = request.cursor
         pending = request.status is KnowledgeStatus.PENDING
         if pending:
-            if request.cursor is not None:
-                raise ValueError("Cayu's pending knowledge list has no next page to continue.")
             body = self._get("/knowledge/pending", query, "pending knowledge")
         else:
-            if request.cursor is not None:
-                query["cursor"] = request.cursor
             body = self._get("/knowledge", query, "knowledge")
         rows = body.get("entries") if isinstance(body, dict) else None
         if not isinstance(rows, list) or not all(_is_entry(row) for row in rows):
             raise CayuApiError(
                 "not_cayu", f"{self._api.description} returned an invalid knowledge list."
             )
-        cursor = None if pending else body.get("next_cursor")
+        # A Cayu older than the pending list's cursor ignores one and returns no
+        # `next_cursor`; it can only say that more proposals exist.
+        unpaged = pending and "next_cursor" not in body
+        if unpaged and request.cursor is not None:
+            raise CayuApiError(
+                "unsupported",
+                f"{self._api.description} runs a Cayu whose pending knowledge list has no "
+                "next page; deploy it with a newer Cayu, or narrow the filters.",
+            )
+        cursor = body.get("next_cursor")
+        cursor = cursor if isinstance(cursor, str) and cursor else None
         return KnowledgePage(
             entries=[row for row in rows if _matches(row, request)],
-            next_cursor=cursor if isinstance(cursor, str) and cursor else None,
-            truncated=pending and body.get("truncated") is True,
+            next_cursor=cursor,
+            truncated=pending
+            and body.get("truncated") is True
+            and (unpaged or (cursor is None and not rows)),
         )
 
     async def load_entry(self, entry_id: str) -> dict[str, Any] | None:

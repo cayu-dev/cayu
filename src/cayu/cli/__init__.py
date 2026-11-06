@@ -119,8 +119,10 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_cloud_cli(arguments[1:])
 
+    from cayu.cli._cursor_arguments import attach_cursor_values
+
     parser = _build_parser()
-    args = parser.parse_args(arguments)
+    args = parser.parse_args(attach_cursor_values(parser, arguments))
     runner = getattr(args, "_runner", None)
     if runner is not None:
         return runner(args)

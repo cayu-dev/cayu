@@ -803,8 +803,11 @@ def run_cloud(arguments: argparse.Namespace) -> int:
 
 
 def run_cloud_cli(arguments: Sequence[str]) -> int:
+    from cayu.cli._cursor_arguments import attach_cursor_values
+
     try:
-        parsed = _build_parser().parse_args(arguments)
+        parser = _build_parser()
+        parsed = parser.parse_args(attach_cursor_values(parser, arguments))
     except (
         CloudApiError,
         CloudAuthError,

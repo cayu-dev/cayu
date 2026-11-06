@@ -34,7 +34,9 @@ from cayu.knowledge.search import decode_knowledge_list_cursor
 from cayu.sessions.queries import decode_session_cursor
 from cayu.tasks.index import decode_task_index_cursor
 
-SealedPurpose = Literal["knowledge", "actions", "pending-actions", "tasks", "kept-knowledge"]
+SealedPurpose = Literal[
+    "knowledge", "actions", "pending-actions", "tasks", "kept-knowledge", "pending-knowledge"
+]
 
 _LIFETIME_SECONDS = 900
 _CLOCK_SKEW_SECONDS = 60
@@ -49,6 +51,7 @@ _NO_STORE = {"Cache-Control": "private, no-store"}
 _PURPOSES: dict[SealedPurpose, tuple[str, Callable[[str], object]]] = {
     "tasks": ("cayu.tasks.index.v1", decode_task_index_cursor),
     "kept-knowledge": ("cayu.knowledge.kept.v1", decode_knowledge_list_cursor),
+    "pending-knowledge": ("cayu.knowledge.pending.v1", decode_knowledge_list_cursor),
     "knowledge": ("cayu.inbox.knowledge.v1", decode_knowledge_list_cursor),
     "actions": ("cayu.inbox.actions.v1", decode_session_cursor),
     "pending-actions": ("cayu.pending-actions.v1", decode_session_cursor),
@@ -106,6 +109,6 @@ class InboxCursorSeal:
             detail = _INVALID if self.configured else _INVALID_GENERATED
             if purpose == "tasks":
                 detail = "Invalid or expired task cursor. Restart the task listing."
-            elif purpose == "kept-knowledge":
+            elif purpose in {"kept-knowledge", "pending-knowledge"}:
                 detail = "Invalid or expired knowledge cursor. Restart the knowledge listing."
             raise HTTPException(status_code=422, detail=detail, headers=_NO_STORE) from None

@@ -134,7 +134,7 @@ from cayu.knowledge.records import (
     KnowledgeRevisionConflict,
     KnowledgeVisibility,
 )
-from cayu.knowledge.search import KnowledgeListItem
+from cayu.knowledge.search import KnowledgeListItem, encode_knowledge_list_cursor
 from cayu.messages import Message, MessageRole
 from cayu.project_control_plane import ResolvedProjectControlPlaneContext
 from cayu.providers.retry_policy import RetryPolicy
@@ -9669,25 +9669,58 @@ def create_router(
         visibility: Annotated[list[KnowledgeVisibility] | None, Query()] = None,
         source_type: str | None = None,
         source_id: str | None = None,
+        cursor: str | None = Query(default=None, max_length=6144),
         limit: int = 50,
         max_bytes: int = 20_000,
         auth_context: AuthContext | None = optional_auth_context,
     ):
         workflow = _knowledge_review_workflow()
         try:
+            filters: dict[str, Any] = {
+                "namespace": _clean_optional_query_value(namespace, "namespace"),
+                "labels": _parse_knowledge_label_filters(label),
+                "kinds": (
+                    _parse_knowledge_string_filters(kind, "kind") if kind is not None else None
+                ),
+                "visibilities": visibility,
+                "aspects": _parse_knowledge_string_filters(aspect, "aspect"),
+                "source_type": _clean_optional_query_value(source_type, "source_type"),
+                "source_id": _clean_optional_query_value(source_id, "source_id"),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # A cursor continues only the listing that returned it: the same caller, filters
+        # and review scope. It is sealed because it names the page's last entry, which
+        # the inbox access rule may hide from this caller.
+        binding = {
+            "subject": None if auth_context is None else auth_context.subject,
+            "tenant": None if auth_context is None else auth_context.tenant,
+            "filters": filters,
+            "namespace": workflow.namespace,
+            "labels": workflow.labels,
+            "scope": workflow.access_scope.model_dump(mode="json"),
+        }
+        position = (
+            None if cursor is None else inbox_cursor.open("pending-knowledge", cursor, binding)
+        )
+        try:
             result = await workflow.list_pending(
-                namespace=_clean_optional_query_value(namespace, "namespace"),
-                labels=_parse_knowledge_label_filters(label),
-                kinds=_parse_knowledge_string_filters(kind, "kind") if kind is not None else None,
-                visibilities=visibility,
-                aspects=_parse_knowledge_string_filters(aspect, "aspect"),
-                source_type=_clean_optional_query_value(source_type, "source_type"),
-                source_id=_clean_optional_query_value(source_id, "source_id"),
-                limit=limit,
-                max_bytes=max_bytes,
+                **filters, cursor=position, limit=limit, max_bytes=max_bytes
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        after = None
+        if (
+            result.truncated
+            and result.entries
+            and (
+                result.total_entries_known is None
+                or result.total_entries_known > len(result.entries)
+            )
+        ):
+            after = encode_knowledge_list_cursor(result.entries[-1].entry)
+            if after == position:
+                raise HTTPException(status_code=409, detail="Knowledge listing could not advance.")
         entries = []
         remaining = result.max_bytes
         truncated = result.truncated
@@ -9709,6 +9742,9 @@ def create_router(
                 entries.append(row)
         return {
             "entries": entries,
+            "next_cursor": (
+                None if after is None else inbox_cursor.seal("pending-knowledge", after, binding)
+            ),
             "truncated": truncated,
             "limit": result.limit,
             "max_bytes": result.max_bytes,

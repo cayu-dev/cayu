@@ -936,7 +936,9 @@ support; falling back to ordinary `create_task` would lose these guarantees.
 `GET /api/knowledge` lists active, unexpired entries within the application's
 configured knowledge namespace, labels and access scope. Members can read this
 route. Pending proposals still use `/api/knowledge/pending` and the existing
-Keep/Drop decisions.
+Keep/Drop decisions. The pending list pages the same way: follow its opaque
+`next_cursor` with `cursor` until it is null. A pending cursor is bound to the
+caller, the list's filters and the review scope, and expires after 15 minutes.
 
 `namespace`, `kind` and `label` (`key=value`) narrow the list; `kind` and `label`
 repeat, and every label must match. They stay inside the configured scope: a
@@ -1022,7 +1024,9 @@ remain read-only; mutations always go through the running server.
 `--status` is `active` (kept, the default) or `pending`, and `archived` from a
 local store. `--kind` repeats for any of several kinds and `--label KEY=VALUE`
 repeats to require several labels. A page with more after it prints the
-`--cursor` to continue with. `show` prints an entry of any status with its text,
+`--cursor` to continue with, for every status. An Agent on a Cayu whose pending list
+has no cursor says only that more proposals exist; deploy it with a newer Cayu to
+page past them. `show` prints an entry of any status with its text,
 and `--json` adds its chunks. The CLI applies the filters to what an Agent
 returns too, so an Agent on a Cayu without these filters still answers
 correctly.

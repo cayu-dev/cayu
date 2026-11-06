@@ -20147,6 +20147,17 @@
           "title": "Max Bytes",
           "type": "integer"
         },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
         "total_entries_known": {
           "minimum": 0.0,
           "title": "Total Entries Known",
@@ -20159,6 +20170,7 @@
       },
       "required": [
         "entries",
+        "next_cursor",
         "truncated",
         "limit",
         "max_bytes",
@@ -36099,6 +36111,23 @@
                 }
               ],
               "title": "Aspect"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 6144,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
             }
           },
           {

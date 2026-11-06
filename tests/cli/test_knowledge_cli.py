@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -216,6 +217,122 @@ def test_store_and_server_readers_return_the_same_entries(database: Path) -> Non
     assert absent is None
 
 
+_PAGED_STATUSES = (KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING, KnowledgeStatus.ARCHIVED)
+
+
+def _paged_entries() -> list[KnowledgeEntry]:
+    """Five entries per status, sharing a timestamp so pages split on importance and id."""
+
+    updated = datetime(2026, 11, 1, tzinfo=UTC)
+    return [
+        KnowledgeEntry(
+            id=f"{status.value}-{index}",
+            namespace="reviews",
+            kind="fact",
+            text=f"Entry {index}.",
+            status=status,
+            importance=0.5 if index == 3 else None,
+            created_at=updated,
+            updated_at=updated,
+        )
+        for status in _PAGED_STATUSES
+        for index in range(5)
+    ]
+
+
+def _page_through(
+    capsys: pytest.CaptureFixture[str], status: KnowledgeStatus, *target: str
+) -> list[str]:
+    ids: list[str] = []
+    cursor: tuple[str, ...] = ()
+    for _ in range(10):
+        code, page = _run(
+            capsys, "list", "--status", status.value, "--limit", "2", *cursor, *target, "--json"
+        )
+        assert code == 0, page
+        ids.extend(entry["entry_id"] for entry in page["entries"])
+        assert page["has_more"] is (page["next_cursor"] is not None)
+        if page["next_cursor"] is None:
+            return ids
+        cursor = ("--cursor", page["next_cursor"])
+    raise AssertionError("The listing didn't end.")
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_store_listing_pages_through_every_status(
+    backend: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if backend == "postgres":
+        pytest.importorskip("psycopg_pool")
+        from cayu.storage import PostgresKnowledgeStore
+
+        dsn = request.getfixturevalue("postgres_dsn")
+        store: Any = PostgresKnowledgeStore(
+            dsn, schema_mode=schema.SchemaMode.CREATE, access_scope=SCOPE
+        )
+        target: tuple[str, ...] = ("--postgres", request.getfixturevalue("postgres_url"))
+    else:
+        path = tmp_path / "cayu.db"
+        store = SQLiteKnowledgeStore(path, access_scope=SCOPE)
+        target = ("--sqlite", str(path))
+
+    async def seed() -> None:
+        try:
+            for entry in _paged_entries():
+                await store.create_entry(entry, access_scope=SCOPE)
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    for status in _PAGED_STATUSES:
+        ids = _page_through(capsys, status, *target)
+        assert len(ids) == len(set(ids))
+        assert sorted(ids) == [f"{status.value}-{index}" for index in range(5)]
+
+
+def test_server_listing_pages_through_kept_and_pending_knowledge() -> None:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from cayu.applications import CayuApp
+    from cayu.cli._cloud_agent_api import CayuApi
+    from cayu.cli._knowledge_readers import ApiKnowledgeReader, KnowledgeListRequest
+    from cayu.server import ServerConfig, create_server
+    from cayu.storage.memory import InMemoryKnowledgeStore
+
+    store = InMemoryKnowledgeStore(_paged_entries(), access_scope=SCOPE)
+    app = CayuApp(knowledge_store=store, knowledge_access_scope=SCOPE, enable_logging=False)
+
+    async def page_through(reader: ApiKnowledgeReader, status: KnowledgeStatus) -> list[str]:
+        ids: list[str] = []
+        cursor = None
+        for _ in range(10):
+            page = await reader.list_entries(
+                KnowledgeListRequest(status=status, limit=2, cursor=cursor)
+            )
+            assert page.truncated is False
+            ids.extend(entry["entry_id"] for entry in page.entries)
+            if page.next_cursor is None:
+                return ids
+            cursor = page.next_cursor
+        raise AssertionError("The listing didn't end.")
+
+    async def read() -> dict[KnowledgeStatus, list[str]]:
+        with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+            reader = ApiKnowledgeReader(CayuApi("http://testserver/", http=client), source={})
+            return {
+                status: await page_through(reader, status)
+                for status in (KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING)
+            }
+
+    for status, ids in asyncio.run(read()).items():
+        assert len(ids) == len(set(ids))
+        assert sorted(ids) == [f"{status.value}-{index}" for index in range(5)]
+
+
 @pytest.fixture
 def agent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[dict[str, Any]]:
     """A fake Cayu Cloud and Agent; ``routes`` maps Agent API paths to (status, body)."""
@@ -302,6 +419,49 @@ def test_application_sends_filters_and_still_filters_an_older_servers_rows(
     assert _ids(listed) == ["denial"]
     path, query = agent["requests"][-1]
     assert path == "/cayu/api/knowledge" and query["kind"] == ["denial"]
+
+
+def test_application_pending_listing_forwards_the_cursor(
+    agent: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    agent["routes"]["/cayu/api/knowledge/pending"] = (
+        200,
+        {
+            "entries": [_api_entry("proposal", status="pending")],
+            "next_cursor": "sealed-next",
+            "truncated": True,
+        },
+    )
+    target = ("--application", "bug-hunter", "--status", "pending", "--json")
+
+    # A sealed cursor is base64url text, so it can start with a dash.
+    for cursor in ("sealed-first", "-Jx4_sealed"):
+        code, listed = _run(capsys, "list", "--cursor", cursor, *target)
+
+        assert code == 0
+        assert listed["next_cursor"] == "sealed-next" and listed["has_more"] is True
+        path, query = agent["requests"][-1]
+        assert path == "/cayu/api/knowledge/pending" and query["cursor"] == [cursor]
+
+
+def test_application_pending_listing_on_an_older_server_without_a_cursor(
+    agent: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An older Cayu's pending list has no `next_cursor` and ignores a `cursor`.
+    agent["routes"]["/cayu/api/knowledge/pending"] = (
+        200,
+        {"entries": [_api_entry("proposal", status="pending")], "truncated": True},
+    )
+    target = ("--application", "bug-hunter", "--status", "pending", "--json")
+
+    code, listed = _run(capsys, "list", *target)
+    assert code == 0
+    assert listed["next_cursor"] is None and listed["has_more"] is True
+
+    code, out = _run(capsys, "list", "--cursor", "from-a-newer-cayu", *target)
+    assert code == 1
+    assert out["error"]["category"] == "unsupported"
+    assert "deploy it with a newer Cayu" in out["error"]["message"]
 
 
 def test_application_show_falls_back_to_pending_on_an_older_server(

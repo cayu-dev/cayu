@@ -3550,6 +3550,7 @@ class RetireKnowledgeRequest(ApiBaseModel):
 
 class PendingKnowledgeListResponse(ApiBaseModel):
     entries: list[ApiKnowledgeListItem]
+    next_cursor: str | None
     truncated: StrictBool
     limit: StrictInt = Field(ge=1)
     max_bytes: StrictInt = Field(ge=1)

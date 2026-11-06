@@ -233,3 +233,54 @@ def test_server_pending_knowledge_detail_validates_chunk_limits() -> None:
     too_many_bytes = client.get("/api/knowledge/pending/pending_git?max_bytes=128001")
     assert too_many_bytes.status_code == 422
     assert "max_bytes" in str(too_many_bytes.json()["detail"])
+
+
+def test_server_pending_knowledge_pages_with_a_cursor_bound_to_its_listing() -> None:
+    store = _TestKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id=f"pending_{index}",
+                text=f"Proposal {index}.",
+                kind="fact" if index % 2 else "procedure",
+                status=KnowledgeStatus.PENDING,
+            )
+            for index in range(5)
+        ]
+        + [KnowledgeEntry(id="kept", text="Kept.", status=KnowledgeStatus.ACTIVE)]
+    )
+    client = TestClient(create_server(CayuApp(knowledge_store=store), config=_LOCAL_SERVER_CONFIG))
+
+    seen: list[str] = []
+    params: dict[str, object] = {"limit": 2}
+    for _ in range(5):
+        response = client.get("/api/knowledge/pending", params=params)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        seen.extend(entry["entry_id"] for entry in body["entries"])
+        assert body["truncated"] is (body["next_cursor"] is not None)
+        if body["next_cursor"] is None:
+            break
+        params["cursor"] = body["next_cursor"]
+    assert sorted(seen) == [f"pending_{index}" for index in range(5)]
+    assert len(seen) == len(set(seen))
+
+    first = client.get("/api/knowledge/pending", params={"kind": "fact", "limit": 1}).json()
+    assert first["next_cursor"] is not None
+    following = client.get(
+        "/api/knowledge/pending",
+        params={"kind": "fact", "limit": 1, "cursor": first["next_cursor"]},
+    )
+    assert following.status_code == 200
+    assert [entry["entry_id"] for entry in following.json()["entries"]] != [
+        entry["entry_id"] for entry in first["entries"]
+    ]
+    for reused in (
+        {"kind": "procedure", "cursor": first["next_cursor"]},
+        {"cursor": first["next_cursor"]},
+        {"cursor": "not-a-cursor"},
+    ):
+        refused = client.get("/api/knowledge/pending", params=reused)
+        assert refused.status_code == 422
+        assert refused.json()["detail"] == (
+            "Invalid or expired knowledge cursor. Restart the knowledge listing."
+        )

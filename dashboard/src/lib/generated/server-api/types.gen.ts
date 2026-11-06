@@ -16673,6 +16673,10 @@ export type PendingKnowledgeListResponse = {
      */
     max_bytes: number;
     /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
+    /**
      * Total Entries Known
      */
     total_entries_known: number;
@@ -29077,6 +29081,10 @@ export type ListPendingKnowledgeApiKnowledgePendingGetData = {
          * Source Id
          */
         source_id?: string | null;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
         /**
          * Limit
          */
