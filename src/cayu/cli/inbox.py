@@ -16,7 +16,7 @@ import json
 import secrets
 import sys
 import unicodedata
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -92,7 +92,7 @@ def add_inbox_parser(subparsers: Any) -> None:
     listing.add_argument("--session", help="Only this session's items (public session id).")
     listing.add_argument(
         "--limit",
-        type=_page_limit,
+        type=_limit(_MAX_PAGE_LIMIT),
         help=f"List one page of at most this many items (1 to {_MAX_PAGE_LIMIT}).",
     )
     listing.add_argument(
@@ -230,7 +230,7 @@ def add_inbox_parser(subparsers: Any) -> None:
     )
     decisions.add_argument(
         "--limit",
-        type=_decisions_limit,
+        type=_limit(_MAX_DECISIONS),
         default=_DEFAULT_DECISIONS,
         help=f"List at most this many (1 to {_MAX_DECISIONS}, default {_DEFAULT_DECISIONS}).",
     )
@@ -335,14 +335,14 @@ async def _run(args: argparse.Namespace) -> int:
     from cayu.cli.cloud import CloudCommandError
 
     try:
-        reason = getattr(args, "reason", None)
-        if reason is not None:
-            _check_reason(reason)
-        if args.application is not None and getattr(args, "reviewer", None) is not None:
-            raise ValueError("--reviewer applies to the local inbox; a Cloud Agent records you.")
         if args.inbox_command == "decisions":
             async with _inbox(args) as inbox:
                 return await _decisions(args, inbox)
+        reason = getattr(args, "reason", None)
+        if reason is not None:
+            _check_reason(reason)
+        if args.application is not None and args.reviewer is not None:
+            raise ValueError("--reviewer applies to the local inbox; a Cloud Agent records you.")
         if args.inbox_command != "list" and (args.item_id is None) == (args.session is None):
             raise ValueError("Name the item with ITEM_ID or its session with --session.")
         if getattr(args, "adopt_profile", False) and reason is None:
@@ -974,23 +974,18 @@ def _record_time(value: str) -> datetime:
     return log_time(value)
 
 
-def _decisions_limit(value: str) -> int:
-    try:
-        limit = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError("the limit must be a whole number.") from None
-    if not 1 <= limit <= _MAX_DECISIONS:
-        raise argparse.ArgumentTypeError(f"the limit must be 1 to {_MAX_DECISIONS}.")
-    return limit
+def _limit(maximum: int) -> Callable[[str], int]:
+    """An option's limit: a whole number from 1 to ``maximum``."""
 
+    def limit(value: str) -> int:
+        try:
+            number = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError("the limit must be a whole number.") from None
+        if not 1 <= number <= maximum:
+            raise argparse.ArgumentTypeError(f"the limit must be 1 to {maximum}.")
+        return number
 
-def _page_limit(value: str) -> int:
-    try:
-        limit = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError("the limit must be a whole number.") from None
-    if not 1 <= limit <= _MAX_PAGE_LIMIT:
-        raise argparse.ArgumentTypeError(f"the limit must be 1 to {_MAX_PAGE_LIMIT}.")
     return limit
 
 

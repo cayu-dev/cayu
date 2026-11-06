@@ -1292,3 +1292,15 @@ def test_decisions_needs_a_cloud_agent(capsys) -> None:
         main(["inbox", "decisions"])
     assert exited.value.code == 2
     assert "--application" in capsys.readouterr().err
+
+
+def test_decisions_refuse_pages_that_repeat_a_cursor() -> None:
+    cloud = _DecisionsCloud(
+        {"items": [_record("decision_2", "settled")], "next_cursor": "c1", "filters": {}},
+    )
+
+    with pytest.raises(InboxClientError) as refused:
+        _run(CloudInbox(cloud, "a").decisions(filters={}, limit=50, cursor="c1"))
+
+    assert refused.value.code == "api_response_invalid"
+    assert len(cloud.calls) == 1

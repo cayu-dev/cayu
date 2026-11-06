@@ -405,7 +405,7 @@ class CloudInbox:
 
         items: list[dict[str, Any]] = []
         applied: dict[str, Any] | None = None
-        followed: set[str] = set()
+        followed: set[str] = set() if cursor is None else {cursor}
         while True:
             query: dict[str, str | list[str]] = {
                 **filters,
@@ -426,9 +426,15 @@ class CloudInbox:
             applied = said if isinstance(said, dict) else applied
             items.extend(row for row in answer.get("items", []) if isinstance(row, dict))
             cursor = answer.get("next_cursor")
-            if not isinstance(cursor, str) or not cursor or cursor in followed:
-                # A Cloud that keeps answering with the same cursor would never end.
+            if not isinstance(cursor, str) or not cursor:
                 cursor = None
+            if cursor is not None and cursor in followed:
+                # Following it would list the same records again and never end; neither stopping
+                # silently nor handing it on would say so.
+                raise InboxClientError(
+                    "api_response_invalid",
+                    "Cayu Cloud's pages of decision records repeat a cursor.",
+                )
             if cursor is None or len(items) >= limit:
                 return DecisionRecords(items[:limit], cursor, applied)
             followed.add(cursor)
