@@ -3421,7 +3421,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                             f"""
                             UPDATE cayu_tasks AS task
                             SET worker_id = %s,
-                                lease_expires_at = transaction_timestamp()
+                                lease_expires_at = clock_timestamp()
                                     + (%s * INTERVAL '1 second'),
                                 interrupted_handoff_id = %s,
                                 updated_at = transaction_timestamp()
