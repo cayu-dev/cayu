@@ -4136,6 +4136,139 @@ def test_dispatch_cancellation_fence_rejects_reused_worker_lease_generation() ->
     asyncio.run(scenario())
 
 
+def test_dispatch_late_renewal_cannot_authorize_successor_lease() -> None:
+    async def scenario() -> None:
+        ownership_now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        tasks = InMemoryTaskStore(ownership_clock=lambda: ownership_now[0])
+        await tasks.create_task(TaskCreate(task_id="late-renewal-successor", type="dispatch"))
+        stale = await tasks.claim_task("shared-worker", lease_seconds=1)
+        assert stale is not None
+        assert stale.lease_expires_at is not None
+        authority = _DispatchLeaseAuthority(stale.lease_expires_at)
+        release_acknowledgement = asyncio.Event()
+
+        async def renew() -> Task:
+            renewed = await tasks.heartbeat(
+                stale.id,
+                "shared-worker",
+                lease_expires_at=stale.lease_expires_at,
+                extend_seconds=2,
+            )
+            await release_acknowledgement.wait()
+            return renewed
+
+        authority.pending_renewal = asyncio.create_task(renew())
+        await asyncio.sleep(0)
+        ownership_now[0] += timedelta(seconds=3)
+        assert [task.id for task in await tasks.reclaim_expired()] == [stale.id]
+        successor = await tasks.claim_task("shared-worker", lease_seconds=30)
+        assert successor is not None
+        release_acknowledgement.set()
+
+        dispatcher = TaskStoreDispatcher(tasks)
+        with pytest.raises(TaskClaimLost, match="expected lease generation"):
+            await dispatcher._request_dispatch_cancellation_fence(
+                stale,
+                "shared-worker",
+                {"code": "stale-dispatch-cancelled"},
+                lease_authority=authority,
+            )
+
+        assert authority.pending_renewal is None
+        assert authority.lease_expires_at != successor.lease_expires_at
+        assert await tasks.load_task(successor.id) == successor
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("request_race", [False, True])
+@pytest.mark.parametrize("publish_cancellation", [False, True])
+def test_dispatch_stalled_renewal_does_not_block_cancellation_fence(
+    request_race: bool,
+    publish_cancellation: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        ownership_now = [datetime(2026, 1, 1, tzinfo=UTC)]
+
+        class RacingStore(InMemoryTaskStore):
+            return_stale = False
+
+            async def load_task(self, task_id: str) -> Task | None:
+                if self.return_stale:
+                    self.return_stale = False
+                    return stale
+                return await super().load_task(task_id)
+
+        tasks = RacingStore(ownership_clock=lambda: ownership_now[0])
+        await tasks.create_task(TaskCreate(task_id="stalled-renewal", type="dispatch"))
+        stale = await tasks.claim_task("shared-worker", lease_seconds=1)
+        assert stale is not None and stale.lease_expires_at is not None
+        authority = _DispatchLeaseAuthority(stale.lease_expires_at)
+        renewed = await tasks.heartbeat(
+            stale.id,
+            "shared-worker",
+            lease_expires_at=stale.lease_expires_at,
+            extend_seconds=2,
+        )
+        release_acknowledgement = asyncio.Event()
+        observation_started = asyncio.Event()
+
+        async def acknowledge() -> Task:
+            await release_acknowledgement.wait()
+            return renewed
+
+        reconcile = authority.reconcile_renewal
+
+        async def observe() -> bool:
+            observation_started.set()
+            return await reconcile()
+
+        monkeypatch.setattr(authority, "reconcile_renewal", observe)
+        pending = asyncio.create_task(acknowledge())
+        authority.pending_renewal = pending
+        if not publish_cancellation:
+            ownership_now[0] += timedelta(seconds=3)
+            await tasks.reclaim_expired()
+            successor = await tasks.claim_task("shared-worker", lease_seconds=30)
+            assert successor is not None
+        tasks.return_stale = request_race
+        dispatcher = TaskStoreDispatcher(tasks)
+        fence = asyncio.create_task(
+            dispatcher._request_dispatch_cancellation_fence(
+                stale,
+                "shared-worker",
+                {"code": "stalled-renewal"},
+                lease_authority=authority,
+            )
+        )
+        try:
+            await asyncio.wait_for(observation_started.wait(), 3)
+            if publish_cancellation:
+                assert renewed.lease_expires_at is not None
+                requested = await tasks.request_claimed_task_cancellation(
+                    stale.id,
+                    "shared-worker",
+                    renewed.lease_expires_at,
+                    {"code": "independent-cancellation"},
+                )
+                assert await asyncio.wait_for(fence, 3) == requested
+            else:
+                with pytest.raises(TaskClaimLost, match="lease generation"):
+                    await asyncio.wait_for(fence, 3)
+                assert await tasks.load_task(stale.id) == successor
+            assert authority.pending_renewal is pending
+            assert not pending.done()
+            assert authority.lease_expires_at == stale.lease_expires_at
+            assert not authority.lock.locked()
+        finally:
+            fence.cancel()
+            release_acknowledgement.set()
+            await asyncio.gather(fence, pending, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_dispatch_lease_loss_drains_cancellation_opaque_thread() -> None:
     async def scenario() -> None:
         thread_started = threading.Event()

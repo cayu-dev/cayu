@@ -174,6 +174,22 @@ class _DispatchLeaseAuthority:
     def __init__(self, lease_expires_at: datetime) -> None:
         self.lease_expires_at = lease_expires_at
         self.lock = asyncio.Lock()
+        self.pending_renewal: asyncio.Task[Task] | None = None
+
+    async def reconcile_renewal(self) -> bool:
+        """Observe a late renewal for bounded cleanup, with the authority lock held."""
+
+        if self.pending_renewal is None:
+            return False
+        completed, _pending = await asyncio.wait({self.pending_renewal}, timeout=1.0)
+        if self.pending_renewal not in completed:
+            return False
+        renewed = self.pending_renewal.result()
+        if renewed.lease_expires_at is None:  # pragma: no cover - store contract
+            raise TaskClaimLost("Dispatch heartbeat returned no worker lease.")
+        self.lease_expires_at = renewed.lease_expires_at
+        self.pending_renewal = None
+        return True
 
 
 def _conservative_dispatch_lease_deadline(started: float, lease_seconds: int) -> float:
@@ -2109,9 +2125,11 @@ class TaskStoreDispatcher(Dispatcher):
                         timeout=max(0.0, claim_deadline_monotonic - loop.time()),
                     )
                 except asyncio.CancelledError:
+                    lease_authority.pending_renewal = renewal_task
                     renewal_task.add_done_callback(_consume_dispatch_heartbeat_outcome)
                     raise
                 if renewal_task not in completed:
+                    lease_authority.pending_renewal = renewal_task
                     renewal_task.add_done_callback(_consume_dispatch_heartbeat_outcome)
                     raise TaskClaimLost(
                         "Dispatch task heartbeat acknowledgement did not arrive before "
@@ -2191,6 +2209,7 @@ class TaskStoreDispatcher(Dispatcher):
         """Persist a reclaim-blocking marker before draining an opaque dispatch."""
 
         async with lease_authority.lock:
+            renewal_observed = False
             while True:
                 expected_lease_expires_at = lease_authority.lease_expires_at
                 current = await self._tasks.load_task(task.id)
@@ -2206,6 +2225,19 @@ class TaskStoreDispatcher(Dispatcher):
                     current.worker_id != worker_id
                     or current.lease_expires_at != expected_lease_expires_at
                 ):
+                    # A timed-out heartbeat may have committed this worker's
+                    # renewal. Only its exact acknowledgement can authorize
+                    # cleanup; a readback with the same worker ID cannot.
+                    if (
+                        current.worker_id == worker_id
+                        and not renewal_observed
+                        and lease_authority.pending_renewal is not None
+                    ):
+                        renewal_observed = True
+                        await lease_authority.reconcile_renewal()
+                        # Reload durable cancellation/terminal state even when
+                        # the acknowledgement remains stalled after observation.
+                        continue
                     raise TaskClaimLost(
                         "Dispatch cancellation fence no longer owns the expected lease generation."
                     )
@@ -2242,6 +2274,14 @@ class TaskStoreDispatcher(Dispatcher):
                         current.worker_id != worker_id
                         or current.lease_expires_at != expected_lease_expires_at
                     ):
+                        if (
+                            current.worker_id == worker_id
+                            and not renewal_observed
+                            and lease_authority.pending_renewal is not None
+                        ):
+                            renewal_observed = True
+                            await lease_authority.reconcile_renewal()
+                            continue
                         raise TaskClaimLost(
                             "Dispatch cancellation fence lost its exact worker lease."
                         ) from request_failure
