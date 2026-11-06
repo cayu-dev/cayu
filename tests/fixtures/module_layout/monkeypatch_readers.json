@@ -1,0 +1,4198 @@
+{
+  "cayu._application_registration:validate_process_isolated_tool_registration": [
+    "_validate_registered_tool"
+  ],
+  "cayu._task_wait:consume_pending_task_cancellation": [
+    "await_shielded_task_outcome",
+    "await_shielded_task_outcome.<locals>.capture_pending_cancellation"
+  ],
+  "cayu._validation:_JSON_ESCAPED_OR_NONPORTABLE_RE": [
+    "_walk_bounded_durable_json.<locals>.consume_string"
+  ],
+  "cayu._validation:_NONPORTABLE_STRING_RE": [
+    "_walk_bounded_durable_json.<locals>.consume_string"
+  ],
+  "cayu._validation:_bounded_ascii_label": [
+    "DurableValueError.__init__"
+  ],
+  "cayu._validation:_require_durable_text": [
+    "require_durable_text"
+  ],
+  "cayu._validation:_walk_bounded_durable_json": [
+    "_canonical_walked_durable_json_bytes",
+    "copy_bounded_durable_json_value",
+    "inspect_bounded_durable_json",
+    "scripts/benchmark_tool_round.py:observe_store"
+  ],
+  "cayu._validation:canonical_durable_json_bytes": [
+    "cayu._application_task_types:ApplicationTaskTypes.prepare_operation",
+    "cayu.collaboration.base:CollaborationStore._owned_wait",
+    "cayu.egress.adapter:SandboxEgressAdapter._execution_admission_executable_declaration",
+    "cayu.evals.browser_acceptance:_validated_operator_observation_revision",
+    "cayu.evals.runner:_workflow_root_sha256",
+    "cayu.evals.runner:_workflow_structured_sha256",
+    "cayu.external_agents.recording:ExternalAgentRecorder.record",
+    "cayu.runtime._external_execution_to_wait:_ExternalExecutionToWait.publish_structured_event",
+    "cayu.runtime._session_message_queue:SourceTranscriptHasher.__init__",
+    "cayu.runtime._session_message_queue:SourceTranscriptHasher.add"
+  ],
+  "cayu._validation:ord": [
+    "JsonUtf8SizeCounter._string",
+    "_bounded_ascii_label",
+    "_walk_bounded_durable_json.<locals>.consume_special_string"
+  ],
+  "cayu._version:version": [
+    "package_version"
+  ],
+  "cayu.applications:ClarificationCoordinator": [
+    "CayuApp.__init__"
+  ],
+  "cayu.applications:current_runtime_build_provenance": [
+    "CayuApp.__init__"
+  ],
+  "cayu.applications:validate_file_attachment_bytes": [
+    "CayuApp.attach_file"
+  ],
+  "cayu.artifacts._images:MAX_IMAGE_DECODED_BYTES": [
+    "effective_image_decode_policy"
+  ],
+  "cayu.artifacts._images:MAX_IMAGE_FRAMES": [
+    "effective_image_decode_policy"
+  ],
+  "cayu.artifacts._images:MAX_IMAGE_TOTAL_DECODED_BYTES": [
+    "effective_image_decode_policy"
+  ],
+  "cayu.artifacts._s3_pins:MAX_PIN_OWNERS": [
+    "S3ArtifactPinState._validate",
+    "S3ArtifactPinState.pin.<locals>.plan"
+  ],
+  "cayu.artifacts.local:_ARTIFACT_LOCK_DIRECTORY_NAME": [
+    "_artifact_ownership_lock"
+  ],
+  "cayu.artifacts.local:_DARWIN_FULL_SYNC_COMMAND": [
+    "_supports_durable_publication",
+    "_sync_descriptor"
+  ],
+  "cayu.artifacts.local:_FCNTL_MODULE": [
+    "_sync_descriptor"
+  ],
+  "cayu.artifacts.local:_SUPPORTS_DIRECTORY_FD": [
+    "_open_artifact_directory",
+    "_open_store_root"
+  ],
+  "cayu.artifacts.local:_SUPPORTS_DURABLE_DIRECTORY_SYNC": [
+    "_supports_durable_publication"
+  ],
+  "cayu.artifacts.local:_change_resource_pin": [
+    "LocalArtifactStore._pin_resource.<locals>.start",
+    "LocalArtifactStore._release_resource_pin"
+  ],
+  "cayu.artifacts.local:_create_durable_directory_ancestry": [
+    "_initialize_durable_store_root"
+  ],
+  "cayu.artifacts.local:_create_pending_root_marker": [
+    "_initialize_durable_store_root"
+  ],
+  "cayu.artifacts.local:_initialize_durable_store_root": [
+    "LocalArtifactStore.__init__"
+  ],
+  "cayu.artifacts.local:_iter_artifacts": [
+    "LocalArtifactStore.scan_metadata",
+    "_count_session_artifacts",
+    "_list_artifacts"
+  ],
+  "cayu.artifacts.local:_load_metadata": [
+    "LocalArtifactStore._resource_metadata",
+    "_iter_artifacts"
+  ],
+  "cayu.artifacts.local:_new_artifact_id": [
+    "LocalArtifactStore.put_bytes"
+  ],
+  "cayu.artifacts.local:_put_deterministic_artifact": [
+    "LocalArtifactStore.put_bytes"
+  ],
+  "cayu.artifacts.local:_read_artifact": [
+    "LocalArtifactStore.read_bytes",
+    "LocalArtifactStore.read_range",
+    "_put_deterministic_artifact"
+  ],
+  "cayu.artifacts.local:_remove_artifact_directory_if_unchanged": [
+    "_delete_artifact",
+    "_remove_matching_incomplete_artifact",
+    "_write_artifact",
+    "cayu.artifacts._local_closure:delete_claimed_artifact"
+  ],
+  "cayu.artifacts.local:_remove_matching_incomplete_artifact": [
+    "_put_deterministic_artifact"
+  ],
+  "cayu.artifacts.local:_rename_directory_no_replace": [
+    "_write_artifact",
+    "cayu.artifacts._local_closure:claim_session",
+    "cayu.artifacts._local_closure:delete_claimed_artifact"
+  ],
+  "cayu.artifacts.local:_run_local_artifact_write": [
+    "LocalArtifactStore.put_bytes.<locals>.<lambda>"
+  ],
+  "cayu.artifacts.local:_settle_artifact_write": [
+    "LocalArtifactStore.put_bytes"
+  ],
+  "cayu.artifacts.local:_stat_directory_entry": [
+    "_initialize_durable_store_root",
+    "_iter_artifacts",
+    "_open_artifact_directory",
+    "_remove_artifact_directory_if_unchanged",
+    "_remove_matching_incomplete_artifact",
+    "_require_unchanged_directory",
+    "_write_artifact",
+    "cayu.artifacts._local_closure:_retire_pending_claims",
+    "cayu.artifacts._local_closure:claim_session",
+    "cayu.artifacts._local_closure:delete_claimed_artifact",
+    "cayu.artifacts._local_closure:require_publication_open"
+  ],
+  "cayu.artifacts.local:_sync_descriptor": [
+    "_change_pin",
+    "_create_pending_root_marker",
+    "_sync_directory_path",
+    "_sync_existing_artifact",
+    "_sync_open_directory",
+    "_validate_pending_root_marker",
+    "_write_artifact_file"
+  ],
+  "cayu.artifacts.local:_sync_directory_path": [
+    "_create_durable_directory_ancestry",
+    "_sync_open_directory"
+  ],
+  "cayu.artifacts.local:_sync_existing_artifact": [
+    "_put_deterministic_artifact"
+  ],
+  "cayu.artifacts.local:_sync_open_directory": [
+    "_initialize_durable_store_root",
+    "_sync_existing_artifact",
+    "_write_artifact",
+    "cayu.artifacts._local_closure:_retire_pending_claims",
+    "cayu.artifacts._local_closure:claim_session",
+    "cayu.artifacts._local_closure:delete_claimed_artifact"
+  ],
+  "cayu.artifacts.local:_write_artifact": [
+    "_put_deterministic_artifact",
+    "_write_generated_artifact"
+  ],
+  "cayu.artifacts.local:_write_artifact_file": [
+    "_write_artifact",
+    "cayu.artifacts._local_closure:claim_session"
+  ],
+  "cayu.artifacts.local:_write_generated_artifact": [
+    "LocalArtifactStore.put_bytes"
+  ],
+  "cayu.artifacts.local:cooperative_path_lock": [
+    "_artifact_ownership_lock",
+    "_initialize_durable_store_root"
+  ],
+  "cayu.artifacts.resources:RESOURCE_FOREGROUND_TIMEOUT_S": [
+    "LocalArtifactResourceOwner._observe"
+  ],
+  "cayu.artifacts.resources:RESOURCE_MAX_EVENTS": [
+    "_ResourceJournal._write",
+    "_reserve_events"
+  ],
+  "cayu.artifacts.resources:RESOURCE_MAX_RESERVED_BYTES": [
+    "LocalArtifactResourceOwner._accept_transfer_impl",
+    "LocalArtifactResourceOwner._record",
+    "_journal_capacity_envelope"
+  ],
+  "cayu.artifacts.resources:cooperative_path_lock": [
+    "LocalArtifactResourceOwner._sync_mutation_guard",
+    "_ResourceJournal.locked"
+  ],
+  "cayu.artifacts.settlement:exception_group_children": [
+    "artifact_write_settlements"
+  ],
+  "cayu.browser_profiles:BROWSER_PROFILE_MAX_RECEIPTS": [
+    "_StoredBrowserProfile.validate_record_authority",
+    "_bounded_operations",
+    "_bounded_restore_history"
+  ],
+  "cayu.budgets.base:revalidate_model_input": [
+    "BudgetCheck.copy_cost_summary",
+    "BudgetReconciliation.copy_nested_contracts",
+    "BudgetReconciliationPricing.copy_nested_contracts",
+    "BudgetSettlementRecord.copy_reconciliation",
+    "_detached_price_book"
+  ],
+  "cayu.budgets.base:uuid4": [
+    "BudgetReservationRecord.<lambda>",
+    "new_budget_reservation_id"
+  ],
+  "cayu.budgets.pricing:estimate_model_step_cost": [
+    "cayu.budgets.aggregates:_estimate_usage_cost",
+    "cayu.sessions.supervision_events:price_supervision_events"
+  ],
+  "cayu.build_provenance:_distribution_is_editable": [
+    "current_runtime_build_provenance"
+  ],
+  "cayu.build_provenance:_distribution_owns_runtime_module": [
+    "current_runtime_build_provenance"
+  ],
+  "cayu.cli._benchmark_campaigns:run_benchmark": [
+    "cayu.cli.evals:_run"
+  ],
+  "cayu.cli._cloud_agent_api:CayuApi": [
+    "cayu.cli.artifact:_run_artifact",
+    "cayu.cli.diagnostics:_run_system",
+    "cayu.cli.environment:_open_api",
+    "cayu.cli.knowledge:open_knowledge_reader",
+    "cayu.cli.task:open_task_reader",
+    "cayu.cli.usage:_run_usage",
+    "cloud_agent_api"
+  ],
+  "cayu.cli._cloud_agent_api:MAX_RESPONSE_BYTES": [
+    "CayuApi._bounded_request"
+  ],
+  "cayu.cli._cloud_agent_api:open_cloud_agent_api": [
+    "cayu.cli.artifact:_run_artifact",
+    "cayu.cli.diagnostics:_run_system",
+    "cayu.cli.environment:_open_api",
+    "cayu.cli.session:_close_cloud_session",
+    "cayu.cli.session:_open_cloud_reader",
+    "cayu.cli.usage:_run_usage"
+  ],
+  "cayu.cli._cloud_auth:prepare_private_json": [
+    "CloudAuthStore.prepare_refresh"
+  ],
+  "cayu.cli._cloud_compass_findings:DISMISS_BATCH": [
+    "_send_bulk"
+  ],
+  "cayu.cli._cloud_data:MAX_CAT_BYTES": [
+    "_cat",
+    "add_data_parser"
+  ],
+  "cayu.cli._cloud_deploy_tasks:read_running_tasks": [
+    "cayu.cli.cloud:_running_tasks_before_deploy"
+  ],
+  "cayu.cli._cloud_evals:cloud_agent_api": [
+    "_agent_api"
+  ],
+  "cayu.cli._cloud_private_state:_move_file_ex_windows": [
+    "_replace_private_json",
+    "cayu.support_bundles:_write_support_bundle_windows"
+  ],
+  "cayu.cli._cloud_private_state:_overwrite_payload": [
+    "_overwrite_reserved_payload",
+    "prepare_private_json"
+  ],
+  "cayu.cli._cloud_private_state:_overwrite_reserved_payload": [
+    "PreparedPrivateJsonWrite._prepare_replacement"
+  ],
+  "cayu.cli._cloud_private_state:_replace_private_json": [
+    "PreparedPrivateJsonWrite._publish_replacement",
+    "write_private_json"
+  ],
+  "cayu.cli._cloud_private_state:_sync_private_json_directory": [
+    "PreparedPrivateJsonWrite.synchronize_publication",
+    "remove_private_json_staging",
+    "write_private_json"
+  ],
+  "cayu.cli._cloud_project:SOURCE_BUNDLE_MAX_BYTES": [
+    "_archive_project"
+  ],
+  "cayu.cli._cloud_project:_archive_project": [
+    "resolve_project"
+  ],
+  "cayu.cli._cloud_project:_github_file": [
+    "resolve_project"
+  ],
+  "cayu.cli._cloud_project:_listed_project_files": [
+    "_archive_project",
+    "deploy_upload_includes.<locals>.uploaded"
+  ],
+  "cayu.cli._cloud_project:_optional_github_file": [
+    "_github_file",
+    "resolve_project"
+  ],
+  "cayu.cli._cloud_project:httpx": [
+    "_anonymous_github_file"
+  ],
+  "cayu.cli._cloud_release_source:SOURCE_BUNDLE_MAX_BYTES": [
+    "_download",
+    "_refusal"
+  ],
+  "cayu.cli._cloud_release_source:_DIRECTORY_RELATIVE": [
+    "download_release_source"
+  ],
+  "cayu.cli._cloud_release_source:_publish_file": [
+    "_publish_tree"
+  ],
+  "cayu.cli._cloud_service_logs:print": [
+    "_follow"
+  ],
+  "cayu.cli._constant_branches:_next_edit": [
+    "has_constant_branches",
+    "simplify_constant_branches"
+  ],
+  "cayu.cli._constant_branches:_without_newly_unused_imports": [
+    "simplify_constant_branches"
+  ],
+  "cayu.cli._control_plane_actions:_offered_replay": [
+    "_replay_request"
+  ],
+  "cayu.cli._control_plane_actions:open_action_api": [
+    "cayu.cli._eval_curation:_target_api",
+    "run_action"
+  ],
+  "cayu.cli._eval_processes:_read_json": [
+    "_worker",
+    "run_process_eval",
+    "run_process_eval.<locals>.admit"
+  ],
+  "cayu.cli._eval_processes:run_eval_suite": [
+    "_dynamic_worker.<locals>.run_case",
+    "_worker"
+  ],
+  "cayu.cli._eval_reporting:report_token": [
+    "_prepare_report_request",
+    "publish_saved"
+  ],
+  "cayu.cli._generator_transaction:_MAX_CREATED_TREE_ENTRIES": [
+    "_TreeSnapshot.parse",
+    "_snapshot_tree",
+    "_sync_tree"
+  ],
+  "cayu.cli._generator_transaction:_MAX_EDITS": [
+    "_load_receipt",
+    "_parse_manifest",
+    "_parse_receipt_created_roots",
+    "validate_generator_transaction_collection_bounds"
+  ],
+  "cayu.cli._generator_transaction:_MAX_PATH_BYTES": [
+    "_parse_cleanup_entry",
+    "_validate_relative_path"
+  ],
+  "cayu.cli._generator_transaction:_MAX_PATH_DEPTH": [
+    "_parse_cleanup_entry",
+    "_validate_durable_representation_bounds",
+    "_validate_relative_path"
+  ],
+  "cayu.cli._generator_transaction:_MAX_PRECONDITIONS": [
+    "_load_receipt",
+    "_parse_manifest",
+    "validate_generator_transaction_collection_bounds"
+  ],
+  "cayu.cli._generator_transaction:_MAX_PRIVATE_TREE_ENTRIES": [
+    "_bounded_cleanup_entries",
+    "_capture_transaction_cleanup_authority",
+    "_load_cleanup_claim",
+    "_publish_preparation_cleanup_claim"
+  ],
+  "cayu.cli._generator_transaction:_MAX_STAGED_BYTES": [
+    "_FileSnapshot.parse",
+    "_capture_request_authority",
+    "_cleanup_entry_bound",
+    "_parse_cleanup_entry",
+    "_prepare_transaction",
+    "_snapshot_regular",
+    "_snapshot_tree",
+    "_validate_request",
+    "encode_generator_transaction_content",
+    "generator_transaction_staged_byte_limit"
+  ],
+  "cayu.cli._generator_transaction:_capture_stable_identity": [
+    "_append_event",
+    "_capture_directory_identity",
+    "_finalize_windows_published_path",
+    "_read_regular_bytes",
+    "_remove_owned_directory",
+    "_rename_no_replace",
+    "_snapshot_regular",
+    "_snapshot_tree",
+    "_sync_directory",
+    "_sync_file",
+    "_write_private_file"
+  ],
+  "cayu.cli._generator_transaction:_close_descriptor": [
+    "_append_event",
+    "_read_regular_bytes",
+    "_remove_owned_directory",
+    "_rename_no_replace",
+    "_sync_directory",
+    "_sync_file",
+    "_write_private_file"
+  ],
+  "cayu.cli._generator_transaction:_create_owned_directory": [
+    "_prepare_transaction",
+    "_state_directory"
+  ],
+  "cayu.cli._generator_transaction:_fault": [
+    "_append_event",
+    "_append_phase",
+    "_cleanup_transaction",
+    "_commit_transaction",
+    "_prepare_transaction",
+    "_promote_preparation",
+    "_publish_cleanup_claim",
+    "_publish_receipt",
+    "_remove_owned_directory",
+    "_rollback_transaction"
+  ],
+  "cayu.cli._generator_transaction:_remove_owned_directory": [
+    "_cleanup_preparation",
+    "_cleanup_transaction",
+    "_settle_cleanups"
+  ],
+  "cayu.cli._generator_transaction:_rename_names_no_replace": [
+    "_rename_no_replace",
+    "_restore_unexpected_rename"
+  ],
+  "cayu.cli._generator_transaction:_rename_no_replace": [
+    "_cleanup_preparation",
+    "_cleanup_transaction",
+    "_commit_transaction",
+    "_promote_preparation",
+    "_publish_cleanup_claim",
+    "_publish_cleanup_owner",
+    "_publish_preparation_cleanup_claim",
+    "_publish_receipt",
+    "_rollback_transaction"
+  ],
+  "cayu.cli._generator_transaction:_sync_directory": [
+    "_cleanup_preparation",
+    "_cleanup_transaction",
+    "_commit_transaction",
+    "_prepare_transaction",
+    "_promote_preparation",
+    "_publish_cleanup_claim",
+    "_publish_cleanup_owner",
+    "_publish_preparation_cleanup_claim",
+    "_publish_receipt",
+    "_rollback_transaction",
+    "_settle_cleanups",
+    "_state_directory",
+    "_sync_tree"
+  ],
+  "cayu.cli._generator_transaction:_sync_file": [
+    "_commit_transaction",
+    "_prepare_transaction",
+    "_rollback_transaction",
+    "_sync_tree"
+  ],
+  "cayu.cli._generator_transaction:_write_all": [
+    "_append_event",
+    "_write_private_file"
+  ],
+  "cayu.cli._generator_transaction:_write_stage_files": [
+    "_prepare_transaction"
+  ],
+  "cayu.cli._guarded_tree_publication:_CLEANUP_MANIFEST_LIMIT_BYTES": [
+    "_cleanup_manifest_content",
+    "_prepare_cleanup_manifest",
+    "_read_cleanup_manifest",
+    "_require_population_cleanup_capacity"
+  ],
+  "cayu.cli._guarded_tree_publication:_PARENT_DIRECTORY_CENSUS_LIMIT": [
+    "_bounded_parent_directory_entries"
+  ],
+  "cayu.cli._guarded_tree_publication:_PUBLICATION_METADATA_CENSUS_LIMIT": [
+    "_publication_metadata_candidates"
+  ],
+  "cayu.cli._guarded_tree_publication:_TREE_DEPTH_LIMIT": [
+    "_append_cleanup_entry",
+    "_prepare_stage_relative_path",
+    "_read_cleanup_manifest"
+  ],
+  "cayu.cli._guarded_tree_publication:_TREE_ENTRY_LIMIT": [
+    "_append_cleanup_entry",
+    "_bounded_cleanup_entry_names",
+    "_capture_tree_authority",
+    "_prepare_stage_files",
+    "_read_cleanup_manifest"
+  ],
+  "cayu.cli._guarded_tree_publication:_assert_windows_directory_dacl_is_protected": [
+    "_create_private_stage",
+    "_finalize_published_tree",
+    "_owned_prepared_stage_identity",
+    "_require_windows_destination_dacl"
+  ],
+  "cayu.cli._guarded_tree_publication:_bounded_cleanup_entry_names": [
+    "_delete_windows_entry_by_handle",
+    "_remove_directory_contents_from_fd"
+  ],
+  "cayu.cli._guarded_tree_publication:_capture_posix_cleanup_entry": [
+    "_remove_directory_contents_from_fd"
+  ],
+  "cayu.cli._guarded_tree_publication:_capture_stable_identity": [
+    "GuardedTreeStage.capture_owned_identity",
+    "_Parent.assert_unchanged",
+    "_Parent.entry_identity",
+    "_append_journal",
+    "_capture_parent",
+    "_capture_posix_cleanup_entry",
+    "_capture_stage_default_directory_mode",
+    "_capture_tree_authority",
+    "_capture_windows_cleanup_entry",
+    "_create_private_stage",
+    "_create_stage_directory_from_fd",
+    "_delete_windows_entry_by_handle",
+    "_directory_is_empty",
+    "_load_journal",
+    "_owned_prepared_stage_identity",
+    "_pinned_parent",
+    "_publish_new_regular_file",
+    "_read_cleanup_manifest",
+    "_read_pending_metadata",
+    "_remove_directory_contents_from_fd",
+    "_remove_exact_tree",
+    "_remove_owner_marker",
+    "_rename_exact_regular_file_no_replace",
+    "_rename_no_replace",
+    "_require_parent_namespace_mutable",
+    "_require_windows_cleanup_access",
+    "_seal_directory_from_fd",
+    "_seal_tree_on_windows",
+    "_seal_windows_directory",
+    "_sync_exact_pending_metadata",
+    "_write_stage_file_from_fd",
+    "_write_stage_files_from_fd",
+    "_write_stage_files_on_windows",
+    "cayu.cli.dashboard:_StagingGuard.assert_unchanged"
+  ],
+  "cayu.cli._guarded_tree_publication:_capture_tree_authority": [
+    "_execute_publication",
+    "_prepare_cleanup_manifest",
+    "_publish_guarded_tree_owned",
+    "_require_current_tree_within_cleanup_manifest",
+    "_seal_tree"
+  ],
+  "cayu.cli._guarded_tree_publication:_create_private_stage": [
+    "_execute_publication"
+  ],
+  "cayu.cli._guarded_tree_publication:_create_private_windows_directory": [
+    "_create_private_stage"
+  ],
+  "cayu.cli._guarded_tree_publication:_directory_lookup_semantics": [
+    "_resolve_destination_metadata_stem"
+  ],
+  "cayu.cli._guarded_tree_publication:_finalize_published_tree": [
+    "_execute_publication",
+    "_reconcile_missing_journal",
+    "_recover"
+  ],
+  "cayu.cli._guarded_tree_publication:_linux_birth_time_ns": [
+    "_linux_incarnation"
+  ],
+  "cayu.cli._guarded_tree_publication:_linux_cleanup_blocking_flags": [
+    "_require_posix_cleanup_flags"
+  ],
+  "cayu.cli._guarded_tree_publication:_linux_file_flags": [
+    "_directory_lookup_semantics",
+    "_linux_cleanup_blocking_flags"
+  ],
+  "cayu.cli._guarded_tree_publication:_linux_incarnation": [
+    "_capture_stable_identity"
+  ],
+  "cayu.cli._guarded_tree_publication:_linux_inode_generation": [
+    "_linux_incarnation"
+  ],
+  "cayu.cli._guarded_tree_publication:_mark_cleanup_sealed": [
+    "_remove_exact_tree"
+  ],
+  "cayu.cli._guarded_tree_publication:_owned_prepared_stage_identity": [
+    "_recover",
+    "_rollback_before_publication"
+  ],
+  "cayu.cli._guarded_tree_publication:_path_is_mount_boundary": [
+    "_capture_tree_authority",
+    "_remove_directory_contents_from_fd",
+    "_seal_directory_from_fd"
+  ],
+  "cayu.cli._guarded_tree_publication:_posix_cleanup_blocking_flags": [
+    "_require_posix_cleanup_flags"
+  ],
+  "cayu.cli._guarded_tree_publication:_publication_fault": [
+    "_create_private_stage",
+    "_execute_publication",
+    "_mark_cleanup_sealed",
+    "_publish_new_regular_file",
+    "_remove_directory_contents_from_fd"
+  ],
+  "cayu.cli._guarded_tree_publication:_reject_case_alias": [
+    "_publish_guarded_tree_owned",
+    "recover_guarded_tree"
+  ],
+  "cayu.cli._guarded_tree_publication:_remove_directory_contents_from_fd": [
+    "_remove_directory_contents_from_fd",
+    "_remove_exact_tree"
+  ],
+  "cayu.cli._guarded_tree_publication:_rename_name_no_replace": [
+    "_publish_new_regular_file",
+    "_rename_exact_regular_file_no_replace",
+    "_rename_no_replace",
+    "_restore_unexpected_rename"
+  ],
+  "cayu.cli._guarded_tree_publication:_rename_no_replace": [
+    "_execute_publication",
+    "_recover",
+    "_remove_exact_tree",
+    "_rollback_before_publication"
+  ],
+  "cayu.cli._guarded_tree_publication:_restore_windows_directory_inheritance": [
+    "_finalize_published_tree"
+  ],
+  "cayu.cli._guarded_tree_publication:_rollback_before_publication": [
+    "_settle_after_failure"
+  ],
+  "cayu.cli._guarded_tree_publication:_seal_windows_directory": [
+    "_seal_tree_on_windows",
+    "_seal_windows_directory"
+  ],
+  "cayu.cli._guarded_tree_publication:_sync_exact_pending_metadata": [
+    "_prepare_cleanup_manifest"
+  ],
+  "cayu.cli._guarded_tree_publication:_sync_windows_path": [
+    "_Parent.sync",
+    "_create_private_stage",
+    "_remove_owner_marker",
+    "_seal_tree_on_windows",
+    "_seal_windows_directory",
+    "cayu.cli._eval_reporting:_save_exact"
+  ],
+  "cayu.cli._guarded_tree_publication:_windows_deletion_handle": [
+    "_delete_windows_entry_by_handle",
+    "_require_windows_cleanup_access"
+  ],
+  "cayu.cli._guarded_tree_publication:_windows_directory_namespace_fence": [
+    "_capture_stage_default_directory_mode",
+    "_create_private_stage",
+    "_directory_is_empty",
+    "_finalize_published_tree",
+    "_owned_prepared_stage_identity",
+    "_pinned_parent",
+    "_remove_owner_marker",
+    "_seal_tree_on_windows",
+    "_seal_windows_directory",
+    "_write_stage_files_on_windows"
+  ],
+  "cayu.cli._guarded_tree_publication:_windows_file_id_bindings": [
+    "_windows_file_change_time",
+    "_windows_incarnation"
+  ],
+  "cayu.cli._guarded_tree_publication:_windows_last_error": [
+    "_windows_file_change_time",
+    "_windows_incarnation",
+    "_windows_object_id"
+  ],
+  "cayu.cli._guarded_tree_publication:_windows_object_id_binding": [
+    "_windows_object_id"
+  ],
+  "cayu.cli._guarded_tree_publication:cooperative_path_lock": [
+    "_publish_guarded_tree",
+    "recover_guarded_tree"
+  ],
+  "cayu.cli._inbox_client:_CLOUD_PAGE_LIMIT": [
+    "CloudInbox.list_items"
+  ],
+  "cayu.cli._release_check:_FETCH_TIMEOUT_S": [
+    "fetch_latest_release",
+    "fetch_latest_release.<locals>.fetch"
+  ],
+  "cayu.cli._release_check:_PYPI_PROJECT_URL": [
+    "fetch_latest_release.<locals>.fetch"
+  ],
+  "cayu.cli._release_check:fetch_latest_release": [
+    "latest_release"
+  ],
+  "cayu.cli._release_check:release_cache_path": [
+    "latest_release"
+  ],
+  "cayu.cli._serve_reload:WatchFilesReload": [
+    "run_reload"
+  ],
+  "cayu.cli._serve_reload:_ReloadServer": [
+    "run_reload"
+  ],
+  "cayu.cli._serve_reload:_build_serve_app": [
+    "_ReloadApp.__init__"
+  ],
+  "cayu.cli._serve_reload:serve_project_control_plane": [
+    "_ReloadApp.__init__"
+  ],
+  "cayu.cli.auth:_browser_login": [
+    "run_auth"
+  ],
+  "cayu.cli.auth:_device_login": [
+    "run_auth"
+  ],
+  "cayu.cli.cloud:_PRODUCTION_API_URL": [
+    "_cloud_client",
+    "_login",
+    "_login_api_url",
+    "_login_command",
+    "_require_login_for",
+    "_selected_login",
+    "_use_organization"
+  ],
+  "cayu.cli.cloud:_acting_organization": [
+    "_require_acting_organization"
+  ],
+  "cayu.cli.cloud:_agent_homes_directory": [
+    "_changed_agent",
+    "_execute"
+  ],
+  "cayu.cli.cloud:_clear_active_context": [
+    "_execute",
+    "_login",
+    "_use_organization"
+  ],
+  "cayu.cli.cloud:_cloud_client": [
+    "_execute",
+    "cloud_client"
+  ],
+  "cayu.cli.cloud:_deploy": [
+    "_client_command"
+  ],
+  "cayu.cli.cloud:_execute": [
+    "_run_cloud"
+  ],
+  "cayu.cli.cloud:_read_context": [
+    "_activate_context",
+    "_configured_cloud_api_url.<locals>.context_url",
+    "_execute",
+    "_login_api_url",
+    "_selected_context",
+    "_selected_login",
+    "cayu.cli._eval_curation:_cloud_files",
+    "cloud_client"
+  ],
+  "cayu.cli.cloud:_requested_candidate": [
+    "_deploy",
+    "_preflight_deploy_wait",
+    "_running_tasks_before_deploy"
+  ],
+  "cayu.cli.cloud:_write_private_json": [
+    "_activate_context",
+    "_login"
+  ],
+  "cayu.cli.cloud:cloud_client": [
+    "cayu.cli._cloud_agent_api:open_cloud_agent_api",
+    "cayu.cli._eval_curation:_target_api",
+    "cayu.cli.inbox:_inbox"
+  ],
+  "cayu.cli.cloud:fresh_cloud_credentials": [
+    "_login_client",
+    "_login_client.<locals>.current_access_token"
+  ],
+  "cayu.cli.cloud:resolve_application_id": [
+    "cayu.cli._cloud_agent_api:open_cloud_agent_api",
+    "cayu.cli._cloud_evals:_application_id",
+    "cayu.cli._eval_curation:_target_api",
+    "cayu.cli.inbox:_inbox"
+  ],
+  "cayu.cli.cloud:resolve_project": [
+    "_execute"
+  ],
+  "cayu.cli.dashboard:_validate_destination": [
+    "eject_dashboard_source"
+  ],
+  "cayu.cli.dashboard:_write_staging_tree": [
+    "eject_dashboard_source.<locals>.populate"
+  ],
+  "cayu.cli.doctor:DEFAULT_SUPPORT_BUNDLE_LIMITS": [
+    "_doctor_worker_entry",
+    "_run_bounded_publisher",
+    "_run_bounded_worker.<locals>.receive",
+    "_run_doctor_before_deadline",
+    "_validate_session_selectors"
+  ],
+  "cayu.cli.doctor:_PROCESS_KILL_SECONDS": [
+    "_terminate_owned_process"
+  ],
+  "cayu.cli.doctor:_PROCESS_TEARDOWN_RESERVE_SECONDS": [
+    "_run_doctor_before_deadline"
+  ],
+  "cayu.cli.doctor:_PROCESS_TERMINATE_SECONDS": [
+    "_terminate_owned_process"
+  ],
+  "cayu.cli.doctor:_doctor_publisher_entry": [
+    "_run_bounded_publisher"
+  ],
+  "cayu.cli.doctor:_doctor_staging_reconciliation_entry": [
+    "_run_bounded_staging_reconciliation"
+  ],
+  "cayu.cli.doctor:_run_bounded_publisher": [
+    "_run_doctor_before_deadline"
+  ],
+  "cayu.cli.doctor:_run_bounded_worker": [
+    "_run_doctor_before_deadline"
+  ],
+  "cayu.cli.doctor:close_project_control_plane_context": [
+    "_collect_project_report_under_inspection"
+  ],
+  "cayu.cli.doctor:collect_support_bundle": [
+    "_collect_project_report_under_inspection"
+  ],
+  "cayu.cli.doctor:encode_support_bundle": [
+    "_run_doctor_before_deadline"
+  ],
+  "cayu.cli.evals:_load_eval_plan": [
+    "_run_with_admission",
+    "_validate_corpus_for_target",
+    "cayu.cli._benchmark_campaigns:maintain_benchmark",
+    "cayu.cli._benchmark_campaigns:run_benchmark",
+    "cayu.cli._eval_processes:_worker"
+  ],
+  "cayu.cli.evals:resolve_eval_project": [
+    "_run_with_admission",
+    "_validate_corpus_for_target"
+  ],
+  "cayu.cli.execution_profile:close_project_app": [
+    "_resolve_candidates",
+    "_resolve_comparison"
+  ],
+  "cayu.cli.generate:apply_generator_transaction": [
+    "apply_slice_plan"
+  ],
+  "cayu.cli.generate:encode_generator_transaction_content": [
+    "_transaction_request"
+  ],
+  "cayu.cli.generate_preset:apply_slice_plan": [
+    "apply_preset_conversion"
+  ],
+  "cayu.cli.inbox:build_project_app": [
+    "_inbox"
+  ],
+  "cayu.cli.inbox:build_project_service": [
+    "_inbox"
+  ],
+  "cayu.cli.inbox:close_project_app": [
+    "_inbox"
+  ],
+  "cayu.cli.inbox:project_context": [
+    "_inbox"
+  ],
+  "cayu.cli.inbox:resolve_project": [
+    "_inbox"
+  ],
+  "cayu.cli.knowledge:open_knowledge_reader": [
+    "_run_knowledge_command"
+  ],
+  "cayu.cli.lambda_microvm:files": [
+    "_sidecar_resource"
+  ],
+  "cayu.cli.project_control_plane:_create_eval_store": [
+    "build_project_control_plane_context"
+  ],
+  "cayu.cli.recovery:build_project_app": [
+    "_run_recovery"
+  ],
+  "cayu.cli.recovery:project_context": [
+    "_run_recovery"
+  ],
+  "cayu.cli.recovery:resolve_project": [
+    "_run_recovery"
+  ],
+  "cayu.cli.scaffold:_cayu_source_checkout": [
+    "_newer_release_notice",
+    "_render_new_receipt",
+    "_rendered_preset_files"
+  ],
+  "cayu.cli.scaffold:_installed_cayu_version": [
+    "_newer_release_notice",
+    "_rendered_preset_files"
+  ],
+  "cayu.cli.scaffold:_owned_private_group": [
+    "_require_safe_scaffold_parent"
+  ],
+  "cayu.cli.scaffold:_preflight_coding_commands": [
+    "_populate_scaffold_stage",
+    "cayu.cli.generate_preset:_preflight_coding"
+  ],
+  "cayu.cli.scaffold:_rendered_project_files": [
+    "project_file_paths",
+    "project_files"
+  ],
+  "cayu.cli.scaffold:_run_scaffold_command": [
+    "_preflight_coding_commands",
+    "_run_scaffold_git_command"
+  ],
+  "cayu.cli.scaffold:_sanitized_scaffold_git_environment": [
+    "_initialize_coding_git",
+    "_preflight_coding_commands"
+  ],
+  "cayu.cli.scaffold:publish_guarded_tree": [
+    "_publish_new_project"
+  ],
+  "cayu.cli.scaffold:run_bounded_command": [
+    "_run_scaffold_command"
+  ],
+  "cayu.cli.scaffold_check:_MAX_DECLARATION_MODULES": [
+    "_check_import_inertness",
+    "_project_declaration_proofs",
+    "_referenced_modules"
+  ],
+  "cayu.cli.serve:_build_serve_app": [
+    "run_serve"
+  ],
+  "cayu.cli.serve:build_project_service": [
+    "_build_serve_app"
+  ],
+  "cayu.cli.session:_MAX_TRANSCRIPT_CONTENT_BYTES": [
+    "_session_transcript"
+  ],
+  "cayu.cli.session:_MAX_TRANSCRIPT_SUMMARY_PARTS": [
+    "_message_preview",
+    "_transcript_row"
+  ],
+  "cayu.cli.session:_open_read_only_store": [
+    "_run_session.<locals>.<lambda>"
+  ],
+  "cayu.cli.storage:_migrate": [
+    "run_storage"
+  ],
+  "cayu.cli.storage:_render_migration": [
+    "_migrate_postgres",
+    "_migrate_sqlite_locked",
+    "_recover_sqlite_migration_receipt"
+  ],
+  "cayu.cli.storage:_session_store": [
+    "_export.<locals>.run",
+    "_prune.<locals>.run_with_store"
+  ],
+  "cayu.cli.storage:_write_durable_sqlite_receipt": [
+    "_migrate_sqlite_locked"
+  ],
+  "cayu.cli.storage:cooperative_path_lock": [
+    "_migrate_sqlite"
+  ],
+  "cayu.cli.task:_retry_series": [
+    "_task_payload"
+  ],
+  "cayu.cli.task:open_task_reader": [
+    "_run_task_command"
+  ],
+  "cayu.cli.worker:_EVAL_TASK_SERVICE_SECONDS": [
+    "_until_idle_with_evals"
+  ],
+  "cayu.cli.worker:available_cpu_count": [
+    "_run_worker"
+  ],
+  "cayu.cli.worker:supervise_process_workers": [
+    "_run_worker"
+  ],
+  "cayu.cli.worker:watch_cloud_drain": [
+    "_invoke_worker"
+  ],
+  "cayu.cloud_inventory:MAX_BODY_BYTES": [
+    "CloudInventoryPublisher._send",
+    "_fit_registration",
+    "_registered_knowledge"
+  ],
+  "cayu.cloud_reporting:_SCAN_BATCH": [
+    "read_cloud_activity"
+  ],
+  "cayu.cloud_reporting:_SCAN_BUDGET": [
+    "read_cloud_activity"
+  ],
+  "cayu.cloud_reporting:classify_supervision_anchors": [
+    "read_cloud_activity"
+  ],
+  "cayu.coding_products:CODING_PRODUCT_MAX_EVENT_BYTES": [
+    "collect_coding_product_events"
+  ],
+  "cayu.coding_products:observe_deterministic_workspace": [
+    "CodingProductRunner._compile_and_publish",
+    "CodingProductRunner._require_exact_source_revision",
+    "CodingProductRunner.run",
+    "admit_coding_product_request"
+  ],
+  "cayu.collaboration._clarification_question_recovery:expire_question": [
+    "cayu.collaboration._clarification_coordinator:ClarificationCoordinator._inspect_maintenance_owned",
+    "cayu.collaboration._clarification_coordinator:ClarificationCoordinator.expire_question"
+  ],
+  "cayu.collaboration._clarification_reply_api:accept_reply": [
+    "cayu.collaboration._clarification_coordinator:ClarificationCoordinator.reply"
+  ],
+  "cayu.collaboration._contracts:inspect_bounded_durable_json": [
+    "snapshot_input"
+  ],
+  "cayu.collaboration._export_validation_failure:retain_validation_failure": [
+    "cayu.collaboration._session_export_coordinator:SessionExportCoordinator.export.<locals>.operation"
+  ],
+  "cayu.collaboration._host:continuation_delivery_ready": [
+    "CollaborationHost._service_continuations.<locals>.<lambda>"
+  ],
+  "cayu.collaboration._host:lookup_host_plan": [
+    "CollaborationHost._service_plans.<locals>.<lambda>"
+  ],
+  "cayu.collaboration._host:start_clarification": [
+    "CollaborationHost._service_clarifications"
+  ],
+  "cayu.collaboration._host:start_planned_producer": [
+    "CollaborationHost._service_planned_producers"
+  ],
+  "cayu.collaboration._host_continuation_recovery:read_continuation_release": [
+    "cayu.collaboration._host_continuations:HostContinuationOwner.start.<locals>.reconcile",
+    "recover_interrupted_continuation"
+  ],
+  "cayu.collaboration._host_continuations:acknowledge_continuation": [
+    "HostContinuationOwner.acknowledge"
+  ],
+  "cayu.collaboration._host_continuations:continuation_delivery_ready": [
+    "HostContinuationOwner.start.<locals>.action"
+  ],
+  "cayu.collaboration._host_continuations:recover_session_continuation": [
+    "HostContinuationOwner.start.<locals>.action",
+    "HostContinuationOwner.start.<locals>.reconcile"
+  ],
+  "cayu.collaboration._host_discovery:pending_producer_outputs": [
+    "discover_host_source"
+  ],
+  "cayu.collaboration._host_planned_producer:attach_host_producer": [
+    "start_planned_producer.<locals>.action"
+  ],
+  "cayu.collaboration._host_planned_producer:lookup_host_plan": [
+    "start_planned_producer.<locals>.action"
+  ],
+  "cayu.collaboration._host_planning:lookup_host_plan": [
+    "start_planning.<locals>.action",
+    "start_planning.<locals>.reconcile"
+  ],
+  "cayu.collaboration._host_planning:service_application_plan": [
+    "start_planning.<locals>.action"
+  ],
+  "cayu.collaboration._host_producer_execution:_release_proof": [
+    "start_producer_execution.<locals>.action",
+    "start_producer_execution.<locals>.reconcile"
+  ],
+  "cayu.collaboration._host_producer_execution:inspect_producer_output": [
+    "start_producer_execution.<locals>.action",
+    "start_producer_execution.<locals>.reconcile"
+  ],
+  "cayu.collaboration._host_producer_execution:recover_registered_execution": [
+    "start_producer_execution.<locals>.action"
+  ],
+  "cayu.collaboration._host_producer_maintenance:deliver_producer_output": [
+    "service_producer_maintenance.<locals>.dispatch"
+  ],
+  "cayu.collaboration._host_producer_maintenance:export_producer_output": [
+    "service_producer_maintenance.<locals>.dispatch"
+  ],
+  "cayu.collaboration._host_producer_maintenance:lookup_producer_registration": [
+    "service_producer_maintenance"
+  ],
+  "cayu.collaboration._host_producer_maintenance:publish_producer_outcome": [
+    "service_producer_maintenance.<locals>.dispatch"
+  ],
+  "cayu.collaboration._host_producer_maintenance:reconcile_producer_delivery": [
+    "service_producer_maintenance.<locals>.dispatch"
+  ],
+  "cayu.collaboration._host_producer_reconciliation:inspect_producer_output": [
+    "reconcile_maintenance"
+  ],
+  "cayu.collaboration._host_producer_registration:producer_registration_ready": [
+    "attach_host_producer",
+    "start_producer_registration.<locals>.action",
+    "start_producer_registration.<locals>.reconcile"
+  ],
+  "cayu.collaboration._host_waits:resolve_wait": [
+    "HostWaitOwner.start.<locals>.action",
+    "HostWaitOwner.start.<locals>.reconcile"
+  ],
+  "cayu.collaboration._namespace_store:apply_lifecycle": [
+    "cayu.collaboration.base:CollaborationStore.apply_lifecycle"
+  ],
+  "cayu.collaboration._permit_store:register_permit_in_transaction": [
+    "cayu.collaboration._planning_stages:retain_stage",
+    "cayu.collaboration._planning_view_reservation:register_reserved_view",
+    "register_permit"
+  ],
+  "cayu.collaboration._planning_coordinator:_held": [
+    "cayu.collaboration._planning_creation:progress_creation",
+    "cayu.collaboration._planning_fork:prepare_view_stage",
+    "cayu.collaboration._planning_fork:progress_fork",
+    "cayu.collaboration._planning_resources:progress_resources",
+    "plan_request.<locals>.owned.<locals>.progress"
+  ],
+  "cayu.collaboration._planning_coordinator:read_plan_in_transaction": [
+    "_held"
+  ],
+  "cayu.collaboration._planning_preflight:preflight_plan_control": [
+    "cayu.collaboration._planning_store:_write_transition",
+    "cayu.collaboration._planning_store:retain_plan_in_transaction"
+  ],
+  "cayu.collaboration._planning_preflight:preflight_stage_terminal": [
+    "cayu.collaboration._planning_stages:retain_stage",
+    "preflight_stage_terminal"
+  ],
+  "cayu.collaboration._planning_stages:_write_transition": [
+    "retain_preparation_stage"
+  ],
+  "cayu.collaboration._producer_delivery:acquire_clarification_source": [
+    "deliver_producer_output.<locals>.deliver"
+  ],
+  "cayu.collaboration._producer_export_absence:publish_export_mutation": [
+    "exclude_absent_export"
+  ],
+  "cayu.collaboration._producer_preparation:_native_execution_commitment": [
+    "prepare_producer_output.<locals>.prepare"
+  ],
+  "cayu.collaboration._producer_public_control:retain_producer_completion": [
+    "observe_public_producer_completion",
+    "retain_public_producer_completion"
+  ],
+  "cayu.collaboration._request_coordinator:retained_request": [
+    "RequestCoordinator._due",
+    "RequestCoordinator._held",
+    "RequestCoordinator._prepared_read_admission",
+    "RequestCoordinator._receive_held"
+  ],
+  "cayu.collaboration._validation_snapshot:_MAX_CONTAINERS": [
+    "ValidationSnapshots.remember"
+  ],
+  "cayu.context.base:_bounded_default_compaction_prompt": [
+    "ModelCompactor._compact_with_invocation_identity"
+  ],
+  "cayu.context.base:_default_compaction_prompt_parts": [
+    "_bounded_default_compaction_prompt",
+    "default_compaction_prompt"
+  ],
+  "cayu.context.base:_message_digest": [
+    "TranscriptDigestCompactor.compact",
+    "_messages_digest"
+  ],
+  "cayu.deadlines:datetime": [
+    "ExecutionDeadline.after",
+    "ExecutionDeadline.model_post_init",
+    "ExecutionDeadline.remaining_seconds",
+    "ExecutionDeadlineReport.passed"
+  ],
+  "cayu.deadlines:execution_deadline_scope": [
+    "deadline_stream",
+    "task_event_deadline_scope"
+  ],
+  "cayu.deadlines:time": [
+    "ExecutionDeadline.model_post_init",
+    "ExecutionDeadline.remaining_seconds"
+  ],
+  "cayu.egress._content_decoding:_append": [
+    "_BrotliDecoder.feed",
+    "_ZlibDecoder.feed",
+    "_ZstdDecoder.feed"
+  ],
+  "cayu.egress._content_decoding:_brotli": [
+    "content_decoder",
+    "supported_content_codings"
+  ],
+  "cayu.egress._docker_reconnect:run_enforcement_preflight": [
+    "DockerReconnect.create_runner"
+  ],
+  "cayu.egress._remote_adapter:DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS": [
+    "prepare_exposed_proxy_binding"
+  ],
+  "cayu.egress._resolution:_OWNED_RESOLVER_HELPER": [
+    "resolve_destination_owned"
+  ],
+  "cayu.egress.aws_lambda_microvm_adapter:LambdaMicroVMRunner": [
+    "LambdaMicroVMEgressAdapter.capability_evidence",
+    "LambdaMicroVMEgressAdapter.create_or_recover_runner",
+    "LambdaMicroVMEgressAdapter.create_runner",
+    "LambdaMicroVMEgressAdapter.egress_environment_fingerprint",
+    "LambdaMicroVMEgressAdapter.execution_capability_evidence",
+    "LambdaMicroVMEgressAdapter.finalize_runner",
+    "LambdaMicroVMEgressAdapter.observe_writer_isolation",
+    "LambdaMicroVMEgressAdapter.reconnect_metadata"
+  ],
+  "cayu.egress.aws_lambda_microvm_adapter:_install_ca": [
+    "LambdaMicroVMEgressAdapter._admit_runner"
+  ],
+  "cayu.egress.aws_lambda_microvm_adapter:_verify_agent_privilege_boundary": [
+    "LambdaMicroVMEgressAdapter._admit_runner"
+  ],
+  "cayu.egress.aws_lambda_microvm_adapter:_wall_clock": [
+    "LambdaMicroVMEgressAdapter._require_replay_window_open",
+    "LambdaMicroVMEgressAdapter.prepare_allocation_metadata",
+    "LambdaMicroVMEgressAdapter.reap_allocation"
+  ],
+  "cayu.egress.aws_lambda_microvm_adapter:run_enforcement_preflight": [
+    "LambdaMicroVMEgressAdapter._admit_runner"
+  ],
+  "cayu.egress.aws_lambda_microvm_adapter:run_setup_commands": [
+    "LambdaMicroVMEgressAdapter._admit_runner"
+  ],
+  "cayu.egress.broker:DEFAULT_EGRESS_BROWSER_MAX_RESPONSE_BYTES": [
+    "TransparentEgressBroker.__init__"
+  ],
+  "cayu.egress.broker:_MAX_ACTIVE_CREDENTIAL_RESOLUTIONS": [
+    "TransparentEgressBroker._reserve_credential_resolution"
+  ],
+  "cayu.egress.docker_adapter:DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS": [
+    "DockerEgressAdapter._settle_preparation_cleanup"
+  ],
+  "cayu.egress.docker_adapter:DockerRunner": [
+    "DockerEgressAdapter.create_runner",
+    "DockerEgressAdapter.cutover_authority",
+    "DockerEgressAdapter.egress_environment_fingerprint",
+    "DockerEgressAdapter.execution_capability_evidence",
+    "DockerEgressAdapter.finalize_runner",
+    "DockerEgressAdapter.park_runner_for_authority_adoption",
+    "DockerEgressAdapter.reconcile_authority_cutover",
+    "DockerEgressAdapter.reconnect_metadata",
+    "DockerEgressAdapter.renew_authority"
+  ],
+  "cayu.egress.docker_adapter:TransparentEgressProxyServer": [
+    "DockerEgressAdapter._prepare"
+  ],
+  "cayu.egress.docker_adapter:_HOST_ISOLATION_PROBE_TIMEOUT_S": [
+    "DockerEgressAdapter._run_host_isolation_probe"
+  ],
+  "cayu.egress.docker_adapter:_SIDECAR_PROBE_TIMEOUT_S": [
+    "DockerEgressAdapter._probe_sidecar_broker"
+  ],
+  "cayu.egress.docker_adapter:_create_sidecar_transport_authorization": [
+    "DockerEgressAdapter._prepare"
+  ],
+  "cayu.egress.docker_adapter:docker_setup_failure": [
+    "DockerEgressAdapter._probe_sidecar_broker",
+    "DockerEgressAdapter._run"
+  ],
+  "cayu.egress.docker_adapter:run_enforcement_preflight": [
+    "DockerEgressAdapter.cutover_authority",
+    "DockerEgressAdapter.reconcile_authority_cutover",
+    "DockerEgressAdapter.renew_authority"
+  ],
+  "cayu.egress.e2b_adapter:DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS": [
+    "E2BEgressAdapter._materialize_runner"
+  ],
+  "cayu.egress.e2b_adapter:E2BRunner": [
+    "E2BEgressAdapter._materialize_runner",
+    "E2BEgressAdapter.cutover_authority",
+    "E2BEgressAdapter.egress_environment_fingerprint",
+    "E2BEgressAdapter.execution_capability_evidence",
+    "E2BEgressAdapter.finalize_runner",
+    "E2BEgressAdapter.park_runner_for_authority_adoption",
+    "E2BEgressAdapter.reconcile_authority_cutover",
+    "E2BEgressAdapter.renew_authority"
+  ],
+  "cayu.egress.e2b_adapter:run_enforcement_preflight": [
+    "E2BEgressAdapter._materialize_runner.<locals>.guest_setup",
+    "E2BEgressAdapter.cutover_authority",
+    "E2BEgressAdapter.reconcile_authority_cutover",
+    "E2BEgressAdapter.renew_authority"
+  ],
+  "cayu.egress.proxy_server:_BROKER_RESPONSE_MARGIN_S": [
+    "TransparentEgressProxyServer._call_broker"
+  ],
+  "cayu.egress.proxy_server:_BROKER_TIMEOUT_S": [
+    "TransparentEgressProxyServer._begin_connect_destination_admission",
+    "TransparentEgressProxyServer._call_broker",
+    "TransparentEgressProxyServer._connect_destination_admission_is_active",
+    "TransparentEgressProxyServer._end_connect_destination_admission",
+    "TransparentEgressProxyServer._settle_aborted_connect_admission"
+  ],
+  "cayu.egress.proxy_server:_CERTIFICATE_CACHE_TTL_S": [
+    "SessionCertificateAuthority.server_ssl_context"
+  ],
+  "cayu.egress.proxy_server:_MAX_CERTIFICATE_CACHE_ENTRIES": [
+    "SessionCertificateAuthority.server_ssl_context"
+  ],
+  "cayu.egress.proxy_server:_MAX_HEADER_COUNT": [
+    "_read_chunked",
+    "_read_head"
+  ],
+  "cayu.egress.proxy_server:_MAX_REQUEST_HEAD_BYTES": [
+    "_read_head"
+  ],
+  "cayu.egress.proxy_server:_ResponseStreamChannel": [
+    "TransparentEgressProxyServer._handle_connect"
+  ],
+  "cayu.egress.proxy_server:_read_head": [
+    "TransparentEgressProxyServer._handle_connect",
+    "TransparentEgressProxyServer._handle_connection"
+  ],
+  "cayu.egress.proxy_server:_send_all": [
+    "TransparentEgressProxyServer._accept_loop",
+    "TransparentEgressProxyServer._handle_connect",
+    "TransparentEgressProxyServer._handle_connection",
+    "TransparentEgressProxyServer._relay_response_stream",
+    "_send_protocol_rejection"
+  ],
+  "cayu.egress.transitions:DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS": [
+    "EgressAuthorityTransitionCoordinator.install"
+  ],
+  "cayu.environments.admission:datetime": [
+    "evaluate_execution_admission"
+  ],
+  "cayu.environments.bindings:_COMPLETION_MARKER_STATE_MAX_NODES": [
+    "_require_completion_marker_capacity"
+  ],
+  "cayu.environments.bindings:_clear_workspace": [
+    "SyncBinding._clean_target"
+  ],
+  "cayu.environments.bindings:_promote_sync_factory_resources": [
+    "SyncBinding._bind"
+  ],
+  "cayu.environments.bindings:_read_sync_tar_member": [
+    "SyncBinding._copy_back_with_revisions.<locals>.mutate_and_record.<locals>.<lambda>",
+    "_extract_tar_to_workspace.<locals>.<lambda>"
+  ],
+  "cayu.environments.bindings:_report_sync_lifecycle": [
+    "SyncBinding._bind",
+    "SyncBinding._copy_back_with_revisions",
+    "SyncBinding._unchanged_target_paths",
+    "SyncBinding.finalize",
+    "_copy_paths",
+    "_copy_paths_per_file",
+    "_extract_tar_to_workspace"
+  ],
+  "cayu.environments.bindings:_reserve_sync_factory_source": [
+    "SyncBinding._bind"
+  ],
+  "cayu.environments.docker_coding:_WARM_SPARE_DOCKER_TIMEOUT_S": [
+    "_DockerWarmSpareBackend._docker"
+  ],
+  "cayu.environments.docker_coding:_capture_final_git_evidence": [
+    "DockerCodingWorkspaceBinding.finalize"
+  ],
+  "cayu.environments.docker_coding:_require_docker": [
+    "_DockerWarmSpareBackend._docker",
+    "_DockerWarmSpareBackend.remove_spares_at_exit",
+    "reap_orphaned_docker_coding_containers",
+    "verify_local_docker_image"
+  ],
+  "cayu.environments.docker_coding:_run_docker": [
+    "reap_orphaned_docker_coding_containers"
+  ],
+  "cayu.environments.docker_coding:_run_toolchain_admission_probes": [
+    "DockerCodingEnvironmentFactory._create",
+    "DockerCodingEnvironmentFactory._materialize_deferred",
+    "_DockerWarmSpareBackend.create_spare"
+  ],
+  "cayu.environments.process_ownership:_boot_and_namespace": [
+    "current_process_local_owner",
+    "process_local_owner_exited"
+  ],
+  "cayu.environments.process_ownership:_process_start": [
+    "current_process_local_owner",
+    "process_local_owner_exited"
+  ],
+  "cayu.environments.snapshot_lifecycle:ensure_execution_snapshot_binding": [
+    "cayu.runtime._session_engine:SessionEngine.resume",
+    "cayu.workspaces.checkpoint_lifecycle:ensure_workspace_checkpoint"
+  ],
+  "cayu.environments.warm_spares:_pid_is_alive": [
+    "stale_spare_names"
+  ],
+  "cayu.evals._admission:monotonic": [
+    "LaunchAdmission._try_admit"
+  ],
+  "cayu.evals._admission:sleep": [
+    "LaunchAdmission.admit"
+  ],
+  "cayu.evals._exception_diagnostics:exception_evidence": [
+    "workflow_exception_diagnostic"
+  ],
+  "cayu.evals._inspection_documents:PROCESS_DOCUMENT_MAX_BYTES": [
+    "ProcessDocuments.read",
+    "write_process_document"
+  ],
+  "cayu.evals.benchmark_campaign:_rename_directory_no_replace": [
+    "admit_benchmark_campaign"
+  ],
+  "cayu.evals.benchmark_campaign:_write_benchmark_campaign": [
+    "admit_benchmark_campaign"
+  ],
+  "cayu.evals.benchmark_campaign:write_process_document": [
+    "_write_benchmark_campaign"
+  ],
+  "cayu.evals.browser_acceptance:_persist_trial_receipt": [
+    "_reconcile_trial_intents",
+    "_run_browser_acceptance_locked"
+  ],
+  "cayu.evals.browser_acceptance:_publish_browser_acceptance_report_file": [
+    "write_browser_acceptance_report"
+  ],
+  "cayu.evals.browser_acceptance:project_assertion_evidence_view": [
+    "_run_browser_acceptance_locked"
+  ],
+  "cayu.evals.browser_acceptance:run_eval_suite": [
+    "_run_browser_acceptance_locked"
+  ],
+  "cayu.evals.browser_acceptance_fixture:_fixture_address": [
+    "BrowserAcceptanceFixtureV1.__enter__"
+  ],
+  "cayu.evals.corpus:EVAL_CORPUS_MAX_BYTES": [
+    "EvalCorpusDocument.create",
+    "EvalCorpusDocument.validate_contract",
+    "_merge_eval_corpus_documents.<locals>.merge_item",
+    "_pricing_profile_identity_from_validated_price_book",
+    "eval_corpus_from_json",
+    "eval_corpus_to_json",
+    "load_eval_corpus"
+  ],
+  "cayu.evals.corpus:EVAL_CORPUS_MAX_CASES": [
+    "_merge_eval_corpus_documents"
+  ],
+  "cayu.evals.corpus:EVAL_CORPUS_MAX_DESCRIPTION_CHARS": [
+    "EvalCaseSpec.validate_description",
+    "EvalSuiteSpec.validate_description"
+  ],
+  "cayu.evals.corpus:EVAL_CORPUS_MAX_NAME_CHARS": [
+    "EvalCaseSpec.validate_name",
+    "EvalCorpusSuiteInspectionV1.validate_name",
+    "EvalSuiteSpec.validate_name"
+  ],
+  "cayu.evals.corpus:require_durable_text": [
+    "_bounded_durable_text"
+  ],
+  "cayu.evals.evidence:_estimate_session_cost": [
+    "_build_assertion_evidence_view"
+  ],
+  "cayu.evals.execution:_publish_eval_run_with_trial_public_data": [
+    "_finalize_compiled_corpus_result"
+  ],
+  "cayu.evals.execution:pricing_profile_identity": [
+    "CorpusTarget.validate_authority_boundary",
+    "ModelJudgeTarget.validate_authority_boundary",
+    "_validate_corpus_target_compatibility",
+    "model_judge_profile"
+  ],
+  "cayu.evals.execution:run_corpus_suite": [
+    "cayu.evals.runner:run_eval_plan"
+  ],
+  "cayu.evals.external_private_memory_ablation:EXTERNAL_PRIVATE_MEMORY_ABLATION_MAX_ARTIFACT_BYTES": [
+    "_prepare_external_private_memory_ablation_validated",
+    "_write_external_private_memory_ablation_artifacts_validated"
+  ],
+  "cayu.evals.external_private_memory_ablation:MEMORY_EXPERIMENT_REPORT_MAX_BYTES": [
+    "ExternalPrivateMemoryAblationMethodology.validate_methodology",
+    "_prepare_external_private_memory_ablation_validated",
+    "external_private_memory_ablation_methodology_to_json"
+  ],
+  "cayu.evals.external_private_memory_ablation:_assert_windows_directory_dacl_is_protected": [
+    "_publish_windows_private_artifact_tree.<locals>.populate"
+  ],
+  "cayu.evals.external_private_memory_ablation:_methodology": [
+    "_content_free_redaction_failure_result",
+    "_prepare_external_private_memory_ablation_validated",
+    "run_external_private_memory_ablation"
+  ],
+  "cayu.evals.external_private_memory_ablation:_private_artifact_publication_fault": [
+    "_publish_posix_private_artifact_tree",
+    "_publish_windows_private_artifact_tree.<locals>.populate"
+  ],
+  "cayu.evals.external_private_memory_ablation:_publish_variant": [
+    "_report_from_outcomes"
+  ],
+  "cayu.evals.external_private_memory_ablation:_remove_incomplete_posix_private_stage": [
+    "_publish_posix_private_artifact_tree"
+  ],
+  "cayu.evals.external_private_memory_ablation:_report_from_outcomes": [
+    "_content_free_redaction_failure_result",
+    "run_external_private_memory_ablation"
+  ],
+  "cayu.evals.external_private_memory_ablation:_sync_windows_path": [
+    "_publish_windows_private_artifact_tree.<locals>.populate"
+  ],
+  "cayu.evals.external_private_memory_ablation:_target_matches_authorization": [
+    "run_external_private_memory_ablation"
+  ],
+  "cayu.evals.external_private_memory_ablation:_validate_report_evidence_size": [
+    "run_external_private_memory_ablation"
+  ],
+  "cayu.evals.external_private_memory_ablation:_windows_directory_namespace_fence": [
+    "_publish_windows_private_artifact_tree.<locals>.populate"
+  ],
+  "cayu.evals.external_private_memory_ablation:_write_all_private_artifact_bytes": [
+    "_write_posix_private_artifact"
+  ],
+  "cayu.evals.external_private_memory_ablation:publish_guarded_tree": [
+    "_publish_windows_private_artifact_tree"
+  ],
+  "cayu.evals.internal.browser_acceptance:DockerEgressAdapter": [
+    "_build_runtime"
+  ],
+  "cayu.evals.internal.browser_acceptance:TemporaryDirectory": [
+    "build"
+  ],
+  "cayu.evals.internal.browser_acceptance:_PROCESS_KILL_GRACE_SECONDS": [
+    "_settle_spawned_process"
+  ],
+  "cayu.evals.internal.browser_acceptance:_PROCESS_TERMINATE_GRACE_SECONDS": [
+    "_settle_spawned_process"
+  ],
+  "cayu.evals.internal.browser_acceptance:_build_runtime": [
+    "_DeterministicScenarioExecutor.__call__",
+    "_process_scenario_worker.<locals>.execute",
+    "build"
+  ],
+  "cayu.evals.internal.browser_acceptance:_signal_browser_daemon": [
+    "_install_browser_crash_fault.<locals>.execute_with_browser_fault"
+  ],
+  "cayu.evals.internal.browser_acceptance:build": [
+    "scripts/run_browser_acceptance.py:_run_with_operator_setup"
+  ],
+  "cayu.evals.internal.browser_acceptance:deterministic_browser_acceptance_manifest": [
+    "_case_request",
+    "build"
+  ],
+  "cayu.evals.internal.runtime_acceptance:TemporaryDirectory": [
+    "_IsolatedLocalEnvironmentFactory.__init__"
+  ],
+  "cayu.evals.judges:asyncio": [
+    "LLMJudge._evaluate_material",
+    "StructuredLLMJudge._evaluate_material"
+  ],
+  "cayu.evals.memory_reporting:MEMORY_EXPERIMENT_REPORT_MAX_BYTES": [
+    "MemoryExperimentReport.validate_report",
+    "MemoryExperimentReportRequest.validate_request",
+    "MemoryPublishedResultEvidence.copy_result",
+    "_memory_experiment_json_document",
+    "memory_experiment_report_to_json"
+  ],
+  "cayu.evals.objectives:load_project_objectives": [
+    "_declaration"
+  ],
+  "cayu.evals.portable_assertions:_build_assertion_evidence_view": [
+    "_CompiledModelJudgeAssertion.evaluate",
+    "_CompiledPortableAssertion.evaluate",
+    "_CompiledStructuredModelJudgeAssertion.evaluate",
+    "_prepare_portable_assertion_evidence"
+  ],
+  "cayu.evals.portable_assertions:_validated_pricing": [
+    "_pricing_snapshot_for_bindings"
+  ],
+  "cayu.evals.portable_assertions:assertion_spec_revision": [
+    "_CompiledModelJudgeAssertion.__init__",
+    "_CompiledPortableAssertion.__init__",
+    "_CompiledStructuredModelJudgeAssertion.__init__"
+  ],
+  "cayu.evals.portable_assertions:pricing_profile_identity": [
+    "_compile_corpus_assertion_specs",
+    "_compiled_pricing_binding",
+    "_trusted_model_judge_binding"
+  ],
+  "cayu.evals.portable_evaluation:assertion_spec_revision": [
+    "_evaluate_validated_assertion_spec"
+  ],
+  "cayu.evals.promotion:EVAL_CORPUS_MAX_NAME_CHARS": [
+    "build_captured_evaluation_candidate",
+    "build_promotion_candidate",
+    "score_promotion_candidate"
+  ],
+  "cayu.evals.published:EVAL_MEMORY_ATTRIBUTION_RESULT_BUDGET_BYTES": [
+    "PublishedEvalRun.validate_contract"
+  ],
+  "cayu.evals.result_presentation:EVAL_RESULT_REPORT_MAX_BYTES": [
+    "EvalResultReportV1.validate_report",
+    "EvalResultReportV2.validate_report",
+    "_validate_report_text_utf8_size",
+    "eval_result_report_from_json"
+  ],
+  "cayu.evals.runner:EventLoopLagMonitor": [
+    "_schedule_suite_trials"
+  ],
+  "cayu.evals.runner:WORKSPACE_PROBE_MAX_BYTES": [
+    "_capture_probes"
+  ],
+  "cayu.evals.runner:_build_child_trajectories": [
+    "_run_session_case_once",
+    "_run_workflow_case_once_with_public_projection"
+  ],
+  "cayu.evals.runner:_capture_probes": [
+    "_capture_workflow_child_probes",
+    "_run_session_case_once"
+  ],
+  "cayu.evals.runner:_capture_workflow_child_probes": [
+    "_capture_workflow_child_probes",
+    "_run_workflow_case_once_with_public_projection"
+  ],
+  "cayu.evals.runner:_evaluate_assertions_with_prepared_evidence": [
+    "_evaluate_assertions",
+    "_run_session_case_once",
+    "_run_workflow_case_once_with_public_projection"
+  ],
+  "cayu.evals.runner:_load_terminal_evidence": [
+    "_run_session_case_once"
+  ],
+  "cayu.evals.runner:_prepare_portable_evidence": [
+    "_evaluate_assertions",
+    "_run_session_case_once",
+    "_run_workflow_case_once_with_public_projection"
+  ],
+  "cayu.evals.runner:_promote_memory_attribution": [
+    "_owned_fresh_memory_attribution_projection.<locals>.<lambda>"
+  ],
+  "cayu.evals.runner:_run_suite_cases": [
+    "_execute_eval_suite"
+  ],
+  "cayu.evals.runner:capture_failed_workflow": [
+    "_run_workflow_case_once_with_public_projection.<locals>.observe_failure"
+  ],
+  "cayu.evals.runner:observe_eval_trial_result": [
+    "_schedule_suite_trials.<locals>._execute"
+  ],
+  "cayu.evals.runner:run_eval_suite": [
+    "run_eval_plan"
+  ],
+  "cayu.evals.trajectory:_CHILD_TRAJECTORY_MAX_PAGES": [
+    "_best_effort_child_sessions"
+  ],
+  "cayu.evals.trajectory:_CHILD_TRAJECTORY_PAGE_SIZE": [
+    "_best_effort_child_sessions"
+  ],
+  "cayu.evals.trajectory:_SESSION_TRAJECTORY_HARD_MAX_LINEAGE_CANDIDATES": [
+    "_CaptureState.observe_lineage_candidate"
+  ],
+  "cayu.evals.trajectory:_validate_trajectory_record_contract": [
+    "_trajectory_from_terminal_evidence",
+    "_workflow_trajectory_from_session"
+  ],
+  "cayu.events:_copy_prevalidated_payload": [
+    "Event.__deepcopy__",
+    "_copy_prevalidated_payload",
+    "copy_event"
+  ],
+  "cayu.events:_validate_event_candidate": [
+    "Event.validate_durable_envelope",
+    "copy_event"
+  ],
+  "cayu.events:uuid4": [
+    "Event.<lambda>"
+  ],
+  "cayu.execution_units:uuid4": [
+    "ModelAttemptIdentity.new_tool_round",
+    "ModelStepIdentity.new_attempt",
+    "new_model_step_identity"
+  ],
+  "cayu.external_agents._codex_transport:_MAX_FRAME_BYTES": [
+    "BoundedCodexTransport._read_message"
+  ],
+  "cayu.external_agents._codex_transport:_MAX_TRANSPORT_BYTES": [
+    "BoundedCodexTransport._read_message"
+  ],
+  "cayu.external_agents._codex_transport:_MAX_TRANSPORT_MESSAGES": [
+    "BoundedCodexTransport._read_message"
+  ],
+  "cayu.external_agents.claude:import_module": [
+    "ClaudeAgentAdapter.stream"
+  ],
+  "cayu.external_agents.codex:import_module": [
+    "CodexAgentAdapter.stream"
+  ],
+  "cayu.external_agents.environment:_require_internal_network": [
+    "docker_agent_launch"
+  ],
+  "cayu.external_agents.local:_request_group_stop": [
+    "local_agent_launch.<locals>.close"
+  ],
+  "cayu.external_wait_tasks:recover_before_handoff": [
+    "cayu.tasks.worker:_recover_expired_interrupted_task_handoffs"
+  ],
+  "cayu.external_wait_tasks:stop_wait_left_arming": [
+    "cayu.tasks.worker:_recover_expired_interrupted_task_handoffs"
+  ],
+  "cayu.external_wait_tasks:stop_wait_of_ended_task": [
+    "cayu.external_wait_hosting:ExternalWaitHosting._sweep_row"
+  ],
+  "cayu.external_wait_tasks:turn_held_by_task_wait": [
+    "cayu.runtime._incomplete_session_recovery:IncompleteSessionRecovery.recover_incomplete_session_scoped"
+  ],
+  "cayu.guides.coding_host_owner:_inspect": [
+    "_observe"
+  ],
+  "cayu.guides.coding_host_owner:_observe": [
+    "inspect_stopped_worker",
+    "maintenance_worker_id"
+  ],
+  "cayu.knowledge._access_rules:datetime": [
+    "_knowledge_scope_allows_activation_receipt",
+    "_knowledge_scope_allows_lineage_endpoint",
+    "_knowledge_scope_allows_maintenance_access_snapshot",
+    "_knowledge_scope_allows_relation_access_snapshot",
+    "_knowledge_scope_allows_snapshot"
+  ],
+  "cayu.knowledge._query_rules:datetime": [
+    "_entry_is_expired"
+  ],
+  "cayu.knowledge.changes:datetime": [
+    "_knowledge_change_now"
+  ],
+  "cayu.knowledge.maintenance_persistence:_fingerprint": [
+    "KnowledgeMaintenanceAcceptedPlan.fingerprint",
+    "KnowledgeMaintenanceProposalPublisherConfig.fingerprint",
+    "_build_proposal",
+    "_build_source_evidence",
+    "_proposal_publication_request_sha256",
+    "_publication_key"
+  ],
+  "cayu.knowledge.records:MAX_KNOWLEDGE_REVISION": [
+    "_next_knowledge_revision",
+    "_validate_knowledge_revision"
+  ],
+  "cayu.mcp._stdio_containment:_establish_linux_child_reaping_semantics": [
+    "_anchor",
+    "_supervisor",
+    "_verify_linux_containment_primitives"
+  ],
+  "cayu.mcp._stdio_containment:_install_linux_process_tree_filter": [
+    "_anchor",
+    "_verify_linux_containment_primitives"
+  ],
+  "cayu.mcp._stdio_containment:_linux_pidfd_open": [
+    "_linux_pidfd_signaling_supported",
+    "_signal_owned_group_members",
+    "_verify_linux_waitid_without_reaping"
+  ],
+  "cayu.mcp._stdio_containment:_linux_pidfd_send_signal": [
+    "_linux_pidfd_signaling_supported",
+    "_signal_owned_group_members",
+    "_verify_linux_waitid_without_reaping"
+  ],
+  "cayu.mcp._stdio_containment:_linux_process_group_pids": [
+    "_settle_anchor_tree",
+    "_signal_owned_group_members"
+  ],
+  "cayu.mcp._stdio_containment:_linux_process_group_stats": [
+    "_settle_supervisor_tree",
+    "_verify_linux_containment_primitives"
+  ],
+  "cayu.mcp._stdio_containment:_linux_process_identity": [
+    "_linux_pidfd_signaling_supported",
+    "_linux_process_group_pids",
+    "_signal_owned_group_members"
+  ],
+  "cayu.mcp._stdio_containment:_linux_process_stat": [
+    "_linux_process_group_stats",
+    "_linux_process_identity",
+    "_validated_anchor_ready"
+  ],
+  "cayu.mcp._stdio_containment:_set_linux_child_subreaper": [
+    "_anchor",
+    "_supervisor",
+    "_verify_linux_containment_primitives"
+  ],
+  "cayu.mcp._stdio_containment:_set_linux_process_nondumpable": [
+    "_anchor",
+    "_supervisor",
+    "_verify_linux_containment_primitives"
+  ],
+  "cayu.mcp._stdio_containment:_verify_linux_abstract_rendezvous": [
+    "_verify_linux_containment_primitives"
+  ],
+  "cayu.mcp._stdio_containment:_verify_linux_environment_transfer": [
+    "_verify_linux_containment_primitives"
+  ],
+  "cayu.mcp._stdio_containment:_verify_linux_waitid_without_reaping": [
+    "_verify_linux_containment_primitives"
+  ],
+  "cayu.mcp._stdio_process:ContainedStdioMcpProcess": [
+    "create_contained_stdio_mcp_process",
+    "stdio_mcp_process_capability_evidence_for_process"
+  ],
+  "cayu.mcp._stdio_process:_PARENT_DEATH_CONTAINMENT_PREFLIGHT_PROCESS_ID": [
+    "_current_parent_death_containment_preflight_result"
+  ],
+  "cayu.mcp._stdio_process:_PARENT_DEATH_CONTAINMENT_PREFLIGHT_SUCCEEDED": [
+    "_current_parent_death_containment_preflight_result"
+  ],
+  "cayu.mcp._stdio_process:_create_sealed_server_environment_fd": [
+    "create_contained_stdio_mcp_process"
+  ],
+  "cayu.mcp._stdio_process:_linux_pidfd_signaling_supported": [
+    "stdio_mcp_parent_death_containment_platform_candidate"
+  ],
+  "cayu.mcp._stdio_process:_prepare_stdio_mcp_containment_rendezvous": [
+    "create_contained_stdio_mcp_process"
+  ],
+  "cayu.mcp._stdio_process:preflight_stdio_mcp_parent_death_containment": [
+    "cayu.runtime._local_execution_attempt_owner:run_owned_local_execution_attempt",
+    "create_contained_stdio_mcp_process"
+  ],
+  "cayu.mcp._stdio_process:stdio_mcp_parent_death_containment_platform_candidate": [
+    "cayu.runtime.local_execution_attempts:local_execution_parent_death_containment_platform_candidate",
+    "preflight_stdio_mcp_parent_death_containment",
+    "stdio_mcp_parent_death_containment_supported",
+    "stdio_mcp_process_capability_evidence",
+    "validate_containment_platform"
+  ],
+  "cayu.mcp._stdio_process:stdio_mcp_parent_death_containment_supported": [
+    "cayu.runtime.local_execution_attempts:local_execution_attempt_capability_evidence",
+    "stdio_mcp_process_capability_evidence"
+  ],
+  "cayu.mcp.http:HttpMcpSession": [
+    "HttpMcpClient.connect",
+    "HttpMcpSession._call_tool_with_dispatch_signal",
+    "HttpMcpSession._discover_tools_for_toolset",
+    "HttpMcpSession._fence_before_retained_close"
+  ],
+  "cayu.mcp.http:_MCP_SERVER_LISTENER_INITIAL_RECONNECT_DELAY_S": [
+    "HttpMcpSession._run_server_listener"
+  ],
+  "cayu.mcp.http:_MCP_SERVER_LISTENER_MAX_RECONNECT_DELAY_S": [
+    "HttpMcpSession._run_server_listener"
+  ],
+  "cayu.mcp.http:_decode_jsonrpc_bytes": [
+    "_read_json_response"
+  ],
+  "cayu.mcp.http:_sleep_before_mcp_server_listener_reconnect": [
+    "HttpMcpSession._run_server_listener"
+  ],
+  "cayu.mcp.http:copy_json_value": [
+    "HttpMcpSession._call_tool_request",
+    "HttpMcpSession._request"
+  ],
+  "cayu.mcp.http:json": [
+    "HttpMcpSession._listen_for_server_messages_once",
+    "HttpMcpSession._send",
+    "_decode_jsonrpc"
+  ],
+  "cayu.mcp.http:jsonrpc_request_payload": [
+    "HttpMcpSession._listen_for_server_messages_once",
+    "HttpMcpSession._request"
+  ],
+  "cayu.mcp.http:safely_redact_jsonrpc_response": [
+    "HttpMcpSession._request"
+  ],
+  "cayu.mcp.http:tool_result_from_payload": [
+    "HttpMcpSession._call_tool_request",
+    "_modern_http_tool_result_from_payload"
+  ],
+  "cayu.mcp.stdio:_prepare_stdio_mcp_containment_rendezvous": [
+    "StdioMcpClient.connect"
+  ],
+  "cayu.mcp.stdio:copy_json_value": [
+    "StdioMcpSession._call_tool_request",
+    "StdioMcpSession._handle_message",
+    "StdioMcpSession._request"
+  ],
+  "cayu.mcp.stdio:create_contained_stdio_mcp_process": [
+    "StdioMcpClient.connect"
+  ],
+  "cayu.mcp.stdio:create_direct_stdio_mcp_process": [
+    "StdioMcpClient.connect"
+  ],
+  "cayu.mcp.stdio:jsonrpc_request_payload": [
+    "StdioMcpSession._request"
+  ],
+  "cayu.mcp.stdio:mcp_jsonrpc_request_preflight": [
+    "StdioMcpSession._request"
+  ],
+  "cayu.mcp.stdio:preflight_stdio_mcp_parent_death_containment": [
+    "StdioMcpClient.connect"
+  ],
+  "cayu.mcp.stdio:safely_redact_jsonrpc_response": [
+    "StdioMcpSession._request"
+  ],
+  "cayu.mcp.stdio:tool_result_from_payload": [
+    "StdioMcpSession._call_tool_request",
+    "_modern_stdio_tool_result_from_payload"
+  ],
+  "cayu.mcp.stdio:validate_containment_platform": [
+    "StdioMcpClient.connect"
+  ],
+  "cayu.mcp.tools:_default_client_for": [
+    "McpToolset.connect"
+  ],
+  "cayu.mcp.tools:copy_json_value": [
+    "McpToolset.call_tool"
+  ],
+  "cayu.mcp.tools:mcp_json_value_nesting_too_deep": [
+    "McpToolset.call_tool"
+  ],
+  "cayu.memory.context:_MAX_RETAINED_RECALL_PLACEMENTS": [
+    "_bounded_retained_placements"
+  ],
+  "cayu.memory.execution:asyncio": [
+    "CayuMemoryInterventionRuntimeRunner._continue_compacted_trial",
+    "CayuMemoryInterventionRuntimeRunner._execute",
+    "CayuMemoryInterventionRuntimeRunner._execute.<locals>.<lambda>",
+    "CayuMemoryInterventionRuntimeRunner._with_application_cleanup",
+    "InMemoryMemoryInterventionExecutionStore.__init__",
+    "MemoryInterventionExecutor._claim_runtime_dispatch",
+    "MemoryInterventionExecutor._execute_trial",
+    "MemoryInterventionExecutor._heartbeat_runtime_dispatch",
+    "MemoryInterventionExecutor._record_runtime_cancellation",
+    "MemoryInterventionExecutor._record_runtime_timeout",
+    "MemoryInterventionExecutor._run_runtime",
+    "SQLiteMemoryInterventionExecutionStore.begin",
+    "SQLiteMemoryInterventionExecutionStore.compare_and_set",
+    "SQLiteMemoryInterventionExecutionStore.load",
+    "SQLiteMemoryInterventionExecutionStore.transition_runtime_dispatch_ownership",
+    "_acquire_execution_gate"
+  ],
+  "cayu.messages:inspect_bounded_durable_json": [
+    "Message.validate_role_content"
+  ],
+  "cayu.observability.event_loop_lag:_last_warning_at": [
+    "_claim_warning"
+  ],
+  "cayu.observability.event_loop_lag:monotonic": [
+    "_claim_warning"
+  ],
+  "cayu.observability.otel:_MAX_OPEN_SESSIONS": [
+    "OpenTelemetryEventSink._start_session_span"
+  ],
+  "cayu.observability.otel:_MAX_RECENT_EVENT_IDENTITIES": [
+    "OpenTelemetryEventSink._emit_correlated"
+  ],
+  "cayu.observability.otel:_emit_opentelemetry_delivery": [
+    "cayu.runtime._event_writer:_emit_event_sink"
+  ],
+  "cayu.observability.otel:project_runtime_event": [
+    "OpenTelemetryEventSink.emit"
+  ],
+  "cayu.providers._cleanup_diagnostics:Path": [
+    "_local_exception_evidence"
+  ],
+  "cayu.providers._cleanup_diagnostics:_PROVIDER_ROOT": [
+    "_local_exception_evidence"
+  ],
+  "cayu.providers._credential_boundary:_MAX_OWNED_PROVIDER_STREAM_DEADLINE_CLEANUPS": [
+    "_reserve_provider_stream_deadline_cleanup"
+  ],
+  "cayu.providers._http:DEFAULT_SSE_MAX_EVENT_BYTES": [
+    "stream_sse_json_events"
+  ],
+  "cayu.providers._http:MAX_PROVIDER_ERROR_BODY_BYTES": [
+    "_provider_error_body_text",
+    "_public_provider_message",
+    "_read_bounded_identity_error_response",
+    "_response_error_request_id"
+  ],
+  "cayu.providers._http:aiter_sse_json_events": [
+    "stream_sse_json_events"
+  ],
+  "cayu.providers._http:new_async_client": [
+    "SharedAsyncClient.get"
+  ],
+  "cayu.providers.bedrock:_boto3_module": [
+    "BedrockProvider._create_client"
+  ],
+  "cayu.providers.bedrock:observe_provider_semantic_progress": [
+    "bedrock_converse_stream_events",
+    "bedrock_converse_stream_events.<locals>.hold"
+  ],
+  "cayu.providers.chat_completions:observe_provider_semantic_progress": [
+    "chat_completions_stream_events"
+  ],
+  "cayu.providers.openai:_accept_sse_terminal": [
+    "_openai_background_stream_events",
+    "_openai_stream_events_impl"
+  ],
+  "cayu.providers.openai:build_openai_payload": [
+    "OpenAIProvider.stream",
+    "_OpenAIBackgroundOperationAdapter.start",
+    "build_openai_token_count_payload"
+  ],
+  "cayu.providers.openai_subscription:_open_auth_store_temporary": [
+    "_prepare_auth_store_write"
+  ],
+  "cayu.providers.openai_subscription:_reserve_auth_store_capacity": [
+    "_prepare_auth_store_write"
+  ],
+  "cayu.providers.openai_subscription:_supports_durable_auth_store": [
+    "OpenAISubscriptionAuthStore._exclusive_lock",
+    "OpenAISubscriptionAuthStore._prepare_parent",
+    "OpenAISubscriptionAuthStore.delete",
+    "_create_private_auth_store_directory_chain",
+    "_open_auth_store_directory"
+  ],
+  "cayu.providers.openai_subscription:_sync_auth_store_descriptor": [
+    "OpenAISubscriptionAuthStore._publish_prepared_document",
+    "_prepare_auth_store_write",
+    "_sync_auth_store_directory"
+  ],
+  "cayu.providers.openai_subscription:_sync_auth_store_directory": [
+    "OpenAISubscriptionAuthStore._publish_prepared_document",
+    "_sync_auth_store_directory_path"
+  ],
+  "cayu.providers.openai_subscription:_sync_auth_store_directory_path": [
+    "_sync_auth_store_directory_chain"
+  ],
+  "cayu.providers.openai_subscription:_write_auth_store_payload": [
+    "OpenAISubscriptionAuthStore._publish_prepared_document"
+  ],
+  "cayu.providers.vertex:_auth_request": [
+    "VertexProvider._access_token.<locals>.<lambda>"
+  ],
+  "cayu.providers.vertex:_import_google": [
+    "_auth_request",
+    "_resolve_credentials"
+  ],
+  "cayu.resource_access:execution_access": [
+    "ScopedCayuAccess.recover",
+    "cayu.tasks.access:ScopedTaskAccess._create_collection",
+    "cayu.tasks.access:ScopedTaskAccess.create",
+    "cayu.tasks.worker:_await_task_handler.<locals>.invoke_handler",
+    "guard_stream"
+  ],
+  "cayu.runners._exit_cleanup:_holders": [
+    "_forget_in_child",
+    "_release_held_at_exit",
+    "release_held_runners_at_exit",
+    "release_held_runners_at_exit.<locals>.owner_collected"
+  ],
+  "cayu.runners._exit_cleanup:_inherited": [
+    "_forget_in_child",
+    "_release_held_at_exit"
+  ],
+  "cayu.runners._exit_cleanup:_owner_pid": [
+    "_finish_unsettled_at_exit",
+    "_release_held_at_exit"
+  ],
+  "cayu.runners._exit_cleanup:_unsettled": [
+    "_finish_unsettled_at_exit",
+    "_forget_in_child",
+    "forget_unsettled_terminal_lifecycle",
+    "track_unsettled_terminal_lifecycle"
+  ],
+  "cayu.runners._lambda_microvm_allocation:REAP_TERMINATION_TIMEOUT_SECONDS": [
+    "reap_token_owned_microvm"
+  ],
+  "cayu.runners._subprocess:_DRAIN_AFTER_KILL_S": [
+    "_await_process_exit",
+    "_bounded_drain",
+    "_local_cleanup_artifact"
+  ],
+  "cayu.runners._subprocess:_TASKKILL_TIMEOUT_S": [
+    "_taskkill_tree"
+  ],
+  "cayu.runners._subprocess:_await_process_exit": [
+    "_kill_process_and_wait"
+  ],
+  "cayu.runners._subprocess:_cleanup_io_tasks": [
+    "_bounded_drain",
+    "_cleanup_io_tasks_resisting_cancellation",
+    "run_subprocess"
+  ],
+  "cayu.runners._subprocess:_detach_process": [
+    "_bounded_drain",
+    "_cleanup_cancelled_process"
+  ],
+  "cayu.runners._subprocess:_kill_process": [
+    "_kill_process_and_wait"
+  ],
+  "cayu.runners._subprocess:_kill_process_and_wait": [
+    "_cleanup_cancelled_process",
+    "_kill_timed_out_process"
+  ],
+  "cayu.runners._subprocess:_read_limited": [
+    "run_subprocess"
+  ],
+  "cayu.runners._subprocess:_taskkill_tree": [
+    "_kill_process"
+  ],
+  "cayu.runners.aws_lambda_microvm:DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS": [
+    "LambdaMicroVMRunner._await_command"
+  ],
+  "cayu.runners.aws_lambda_microvm:HttpxLambdaMicroVMEndpointTransport": [
+    "LambdaMicroVMRunner.__init__"
+  ],
+  "cayu.runners.aws_lambda_microvm:LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES": [
+    "_decode_output"
+  ],
+  "cayu.runners.aws_lambda_microvm:LAMBDA_MICROVM_MAX_OUTPUT_BYTES": [
+    "LambdaMicroVMRunner._prepare_exec_request",
+    "LambdaMicroVMRunner.resume_exec",
+    "_decode_output"
+  ],
+  "cayu.runners.aws_lambda_microvm:LAMBDA_MICROVM_MAX_RESPONSE_BYTES": [
+    "HttpxLambdaMicroVMEndpointTransport._request"
+  ],
+  "cayu.runners.aws_lambda_microvm:_LAMBDA_CLIENT_TOKEN_RETRY_DELAYS_SECONDS": [
+    "run_microvm_with_client_token"
+  ],
+  "cayu.runners.aws_lambda_microvm:_LAMBDA_LIFECYCLE_DISPATCH_WINDOW_SECONDS": [
+    "LambdaMicroVMRunner._owned_provider_mutation"
+  ],
+  "cayu.runners.aws_lambda_microvm:_control_client": [
+    "LambdaMicroVMRunner.create",
+    "LambdaMicroVMRunner.from_existing"
+  ],
+  "cayu.runners.aws_lambda_microvm:_submission_clock": [
+    "_submit_run_microvm"
+  ],
+  "cayu.runners.aws_lambda_microvm:datetime": [
+    "_LambdaAdmissionObserver.collect"
+  ],
+  "cayu.runners.docker:DOCKER_COMMAND_STATE_DIR": [
+    "DockerRunner._exec",
+    "DockerRunner.observe_command_receipt"
+  ],
+  "cayu.runners.docker:_inspect_strict_container": [
+    "DockerRunner.collect_execution_admission_candidate",
+    "DockerRunner.create",
+    "DockerRunner.reconnect_strict",
+    "DockerRunner.refresh_execution_admission",
+    "DockerRunner.require_allocation_identity",
+    "_DockerToolAdmissionObserver.collect.<locals>.inspect_identity"
+  ],
+  "cayu.runners.docker:_probe_container_executables": [
+    "_DockerToolAdmissionObserver.collect",
+    "_probe_strict_container"
+  ],
+  "cayu.runners.docker:_probe_immutable_input_mounts": [
+    "DockerRunner.collect_execution_admission_candidate",
+    "DockerRunner.create",
+    "DockerRunner.reconnect_strict",
+    "DockerRunner.refresh_execution_admission"
+  ],
+  "cayu.runners.docker:_probe_strict_container": [
+    "DockerRunner.collect_execution_admission_candidate",
+    "DockerRunner.create",
+    "DockerRunner.reconnect_strict",
+    "DockerRunner.refresh_execution_admission"
+  ],
+  "cayu.runners.docker:_require_docker": [
+    "DockerRunner.__init__",
+    "DockerRunner.container_exists",
+    "DockerRunner.create",
+    "DockerRunner.reconnect_strict",
+    "DockerRunner.require_allocation_identity",
+    "DockerRunner.resolve_container_id"
+  ],
+  "cayu.runners.docker:_run_docker": [
+    "DockerRunner._finalize_browser_recordings",
+    "DockerRunner._observe_container_loss",
+    "DockerRunner._remove_container",
+    "DockerRunner._stop_container",
+    "DockerRunner.create",
+    "DockerRunner.create.<locals>.rollback",
+    "DockerRunner.fence_guest_processes_for_egress_cutover",
+    "_DockerCommandHandle._kill_verified_tree",
+    "_DockerCommandHandle.has_started",
+    "_DockerCommandHandle.kill",
+    "_inspect_strict_container",
+    "_lookup_docker_container_ids",
+    "_run_docker_admission_probe.<locals>.dispatch"
+  ],
+  "cayu.runners.docker:_verify_strict_container_inspection": [
+    "DockerRunner.collect_execution_admission_candidate",
+    "DockerRunner.create",
+    "DockerRunner.reconnect_strict",
+    "DockerRunner.refresh_execution_admission"
+  ],
+  "cayu.runners.docker:datetime": [
+    "DockerRunner.collect_execution_admission_candidate",
+    "DockerRunner.create",
+    "DockerRunner.reconnect_strict",
+    "DockerRunner.refresh_execution_admission",
+    "_DockerToolAdmissionObserver.collect"
+  ],
+  "cayu.runners.docker:run_subprocess": [
+    "DockerRunner._exec",
+    "DockerRunner.observe_command_receipt",
+    "_run_docker"
+  ],
+  "cayu.runners.docker:settle_creation_cleanup": [
+    "DockerRunner.create"
+  ],
+  "cayu.runners.docker:uuid4": [
+    "DockerRunner._exec",
+    "_probe_immutable_input_mounts",
+    "_run_docker_admission_probe"
+  ],
+  "cayu.runners.local:_local_environment_names_case_sensitive": [
+    "LocalRunner.__init__",
+    "LocalRunner._prepare_exec_request"
+  ],
+  "cayu.runners.local:run_subprocess": [
+    "LocalRunner._exec"
+  ],
+  "cayu.runners.local:shutil": [
+    "LocalRunner.execution_admission_candidate_for"
+  ],
+  "cayu.runtime._auxiliary_inference:reserve_provider_stream_cleanup": [
+    "AuxiliaryInferenceOwner.execute_attempt"
+  ],
+  "cayu.runtime._auxiliary_invocation:await_shielded_task_outcome": [
+    "AuxiliaryInferenceScope.invoke",
+    "AuxiliaryInferenceScope.lifetime"
+  ],
+  "cayu.runtime._child_session_identity:uuid4": [
+    "generate_child_session_id"
+  ],
+  "cayu.runtime._compaction.automatic:_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S": [
+    "AutomaticCompactionRun._persist_automatic_compaction_predispatch_event",
+    "AutomaticCompactionRun._persist_automatic_compaction_started"
+  ],
+  "cayu.runtime._compaction.automatic:_AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS": [
+    "AutomaticCompactionRun._persist_automatic_compaction_predispatch_event",
+    "AutomaticCompactionRun._persist_automatic_compaction_start_with_retry"
+  ],
+  "cayu.runtime._compaction.automatic:_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S": [
+    "AutomaticCompactionRun._fan_out_reconciled_automatic_compaction_events",
+    "AutomaticCompactionRun._persist_automatic_compaction_completions",
+    "AutomaticCompactionRun._persist_automatic_compaction_predispatch_event",
+    "AutomaticCompactionRun._persist_automatic_compaction_started",
+    "AutomaticCompactionRun._reconcile_automatic_compaction_events"
+  ],
+  "cayu.runtime._compaction.automatic:_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S": [
+    "AutomaticCompactionRun._fan_out_reconciled_automatic_compaction_events",
+    "AutomaticCompactionRun._persist_automatic_compaction_completions",
+    "AutomaticCompactionRun._publish_owned_automatic_compaction_completion",
+    "AutomaticCompactionRun._reconcile_automatic_compaction_events"
+  ],
+  "cayu.runtime._compaction.automatic:_CONTEXT_TERMINATION_PERSIST_TIMEOUT_S": [
+    "AutomaticCompactionRun.context_terminated"
+  ],
+  "cayu.runtime._compaction.automatic:await_shielded_task_outcome": [
+    "AutomaticCompactionRun._fan_out_reconciled_automatic_compaction_events",
+    "AutomaticCompactionRun._persist_automatic_compaction_completions",
+    "AutomaticCompactionRun._persist_automatic_compaction_predispatch_event",
+    "AutomaticCompactionRun._persist_automatic_compaction_started",
+    "AutomaticCompactionRun._persist_context_events",
+    "AutomaticCompactionRun._publish_owned_automatic_compaction_completion",
+    "AutomaticCompactionRun._reconcile_automatic_compaction_events",
+    "AutomaticCompactionRun.context_terminated"
+  ],
+  "cayu.runtime._compaction.explicit:_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS": [
+    "SessionCompaction._heartbeat_compaction_operation_claim"
+  ],
+  "cayu.runtime._compaction.explicit:_SESSION_OPERATION_CLAIM_HEARTBEAT_RETRY_SECONDS": [
+    "SessionCompaction._heartbeat_compaction_operation_claim"
+  ],
+  "cayu.runtime._compaction.explicit:_SESSION_OPERATION_CLAIM_LEASE": [
+    "SessionCompaction._heartbeat_compaction_operation_claim",
+    "SessionCompaction._persist_compaction_attempt_events.<locals>.confirm_current_claim",
+    "SessionCompaction.run",
+    "SessionCompaction.run.<locals>.claim_operation",
+    "_renew_session_operation_claim_publication"
+  ],
+  "cayu.runtime._compaction.explicit:_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS": [
+    "SessionCompaction._await_session_operation_store_task",
+    "SessionCompaction._fan_out_reconciled_session_operation_events"
+  ],
+  "cayu.runtime._continuation_wait_settlement:acknowledge_retirement": [
+    "cayu.collaboration._wait_coordinator:WaitCoordinator._exclude_owned",
+    "cayu.runtime._external_wait_receiver:ExternalWaitLatchReceiver.retire_released"
+  ],
+  "cayu.runtime._durable_worker_loop:EventLoopLagMonitor": [
+    "worker_event_loop_lag_monitor"
+  ],
+  "cayu.runtime._environment_exposure:_EXPOSURE_ADMISSION_SETTLEMENT_TIMEOUT_SECONDS": [
+    "_await_exposure_admission_settlement",
+    "await_environment_exposure_settlement"
+  ],
+  "cayu.runtime._environment_exposure:_await_exposure_admission_settlement": [
+    "_settle_dispatch_owners",
+    "await_environment_exposure_settlement.<locals>.settle",
+    "refresh_and_require_environment_exposed"
+  ],
+  "cayu.runtime._environment_lifecycle:_FINAL_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS": [
+    "_observe_final_workspace_revision"
+  ],
+  "cayu.runtime._environment_lifecycle:_LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS": [
+    "EnvironmentLifecycle._settle_retained_environment_cleanups"
+  ],
+  "cayu.runtime._environment_lifecycle:_PRE_EXPOSURE_ADMISSION_SETTLEMENT_TIMEOUT_SECONDS": [
+    "EnvironmentLifecycle._await_pre_exposure_admission_settlement"
+  ],
+  "cayu.runtime._environment_lifecycle:await_environment_exposure_settlement": [
+    "EnvironmentLifecycle._await_exposure_cleanup"
+  ],
+  "cayu.runtime._environment_lifecycle:require_materialized_workspace_observation_keyring": [
+    "EnvironmentLifecycle.resolve_factory"
+  ],
+  "cayu.runtime._environment_lifecycle:transfer_queued_environment_exposure": [
+    "EnvironmentLifecycle.accept_queued_interaction"
+  ],
+  "cayu.runtime._event_projection:restore_attested_event_result": [
+    "_prepare_runtime_event",
+    "_project_runtime_event"
+  ],
+  "cayu.runtime._event_watcher_delivery:EVENT_WATCHER_QUERY_PAGE_LIMIT": [
+    "dispatch_event_watchers"
+  ],
+  "cayu.runtime._event_writer:_PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS": [
+    "RuntimeEventWriter._mark_claim_failed"
+  ],
+  "cayu.runtime._execution_profile_admission:resolve_execution_profile_identity": [
+    "cayu.runtime._session_execution_profile:_execution_profile_identity",
+    "prepare_execution_profile_continuation.<locals>.candidate_profile"
+  ],
+  "cayu.runtime._execution_profile_continuation:_runtime_version": [
+    "ExecutionProfileContinuation._prepare_plan",
+    "cayu.runtime._pending_profile_adoption:decide_pending_profile_adoption",
+    "cayu.runtime._runtime_upgrade:invocation_runtime_changed",
+    "cayu.runtime._session_engine:SessionEngine.resume",
+    "cayu.runtime._session_execution_profile:_execution_profile_identity",
+    "cayu.runtime._session_fork:SessionFork.fork_session",
+    "cayu.runtime._session_preparation:_session_identity",
+    "cayu.runtime.manifest:describe_app"
+  ],
+  "cayu.runtime._foreground_child_wait:foreground_child_finished": [
+    "cayu.tasks.session_wakes:in_subagent_chain"
+  ],
+  "cayu.runtime._foreground_child_wait:observe_foreground_child_wait": [
+    "cayu.runtime._pending_tool_round_recovery:PendingToolRoundRecovery.reattached_subagent_result",
+    "cayu.runtime._tool_invocation.dispatch:ToolInvocationDispatch.run.<locals>.reconcile_child_result"
+  ],
+  "cayu.runtime._foreground_child_wait:retain_foreground_child_wait": [
+    "cayu.runtime._pending_tool_round_recovery:PendingToolRoundRecovery.reattached_subagent_result",
+    "cayu.runtime._tool_invocation.dispatch:ToolInvocationDispatch.run.<locals>.reconcile_child_result"
+  ],
+  "cayu.runtime._incomplete_session_recovery:reconstruct_invocation_context": [
+    "IncompleteSessionRecovery._recover_incomplete_session_owned"
+  ],
+  "cayu.runtime._interruption_coordinator:_BACKGROUND_INTERRUPTION_CONCURRENCY": [
+    "BackgroundInterruptionCoordinator._ensure_background_interruption_workers",
+    "BackgroundInterruptionCoordinator._run_deferred_background_interruption_cascades",
+    "BackgroundInterruptionCoordinator.schedule"
+  ],
+  "cayu.runtime._interruption_coordinator:_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS": [
+    "BackgroundInterruptionCoordinator._heartbeat_background_interruption_claim",
+    "BackgroundInterruptionCoordinator.run_cascade"
+  ],
+  "cayu.runtime._interruption_coordinator:_BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS": [
+    "BackgroundInterruptionCoordinator._heartbeat_background_interruption_claim"
+  ],
+  "cayu.runtime._interruption_coordinator:_BACKGROUND_INTERRUPTION_LEASE_SECONDS": [
+    "BackgroundInterruptionCoordinator._heartbeat_background_interruption_claim",
+    "BackgroundInterruptionCoordinator.run_cascade",
+    "interruption_cascade_lease_seconds"
+  ],
+  "cayu.runtime._invocation_lifecycle:apply_invocation_lifecycle_command": [
+    "cayu.runtime._checkpoint_store:_RuntimeCheckpointSessionStore.apply_invocation_lifecycle_command",
+    "cayu.sessions.store:SessionStore.apply_invocation_lifecycle_command"
+  ],
+  "cayu.runtime._isolated_tool_process:_CLEANUP_SETTLEMENT_HEADROOM_SECONDS": [
+    "_IsolatedToolProcessOwner._settle"
+  ],
+  "cayu.runtime._isolated_tool_process:_RETAINED_ISOLATED_TOOL_APPLICATIONS": [
+    "_application_cleanups",
+    "_discard_retained_task",
+    "_retain_task",
+    "retry_retained_isolated_tool_cleanups.<locals>.<lambda>"
+  ],
+  "cayu.runtime._isolated_tool_process:_RETAINED_ISOLATED_TOOL_OWNERS": [
+    "_application_cleanups",
+    "_discard_retained_task",
+    "_retain_task",
+    "_retained_isolated_tool_cleanup_pending",
+    "_retire_late_spawn_retained_tasks",
+    "_retry_failed_retained_cleanups",
+    "retained_isolated_tool_cleanups_unresolved"
+  ],
+  "cayu.runtime._isolated_tool_process:_TEMPORARY_DIRECTORY_SETTLEMENT_SECONDS": [
+    "_IsolatedToolProcessOwner._cleanup_impl"
+  ],
+  "cayu.runtime._isolated_tool_process:_WORKER_MODULE": [
+    "_IsolatedToolProcessOwner._spawn"
+  ],
+  "cayu.runtime._isolated_tool_process:_child_subreaper_probe_succeeds": [
+    "_complete_process_tree_supervision_available"
+  ],
+  "cayu.runtime._isolated_tool_process:_complete_process_tree_supervision_available": [
+    "execute_process_isolated_tool",
+    "validate_process_isolated_tool_registration"
+  ],
+  "cayu.runtime._isolated_tool_process:_completed_process_wait_settlement": [
+    "_settle_owned_supervisor",
+    "_wait_for_supervisor"
+  ],
+  "cayu.runtime._isolated_tool_process:_remove_temporary_directory": [
+    "_IsolatedToolProcessOwner._cleanup_impl",
+    "_IsolatedToolProcessOwner._cleanup_impl.<locals>.<lambda>"
+  ],
+  "cayu.runtime._isolated_tool_process:_retain_task": [
+    "_IsolatedToolProcessOwner._cleanup_impl",
+    "_IsolatedToolProcessOwner._retain_cleanup_task",
+    "_IsolatedToolProcessOwner._spawn",
+    "_retry_failed_retained_cleanups"
+  ],
+  "cayu.runtime._isolated_tool_process:_retained_isolated_tool_cleanup_pending": [
+    "_IsolatedToolProcessOwner._spawn",
+    "execute_process_isolated_tool"
+  ],
+  "cayu.runtime._isolated_tool_process:_settle_late_spawn": [
+    "_LateSpawnSettlementOwner.settle"
+  ],
+  "cayu.runtime._isolated_tool_process:_settle_owned_supervisor": [
+    "_IsolatedToolProcessOwner._cleanup_impl",
+    "_settle_late_spawn"
+  ],
+  "cayu.runtime._isolated_tool_process:_wait_for_supervisor": [
+    "_settle_owned_supervisor"
+  ],
+  "cayu.runtime._isolated_tool_process:await_shielded_task_outcome": [
+    "_IsolatedToolProcessOwner._adopt_pending_spawn_for_cleanup",
+    "_IsolatedToolProcessOwner._cleanup_impl",
+    "_IsolatedToolProcessOwner._settle",
+    "_IsolatedToolProcessOwner._spawn",
+    "_settle_late_spawn",
+    "execute_process_isolated_tool.<locals>.restore_cancellation_after_zero_dispatch"
+  ],
+  "cayu.runtime._isolated_tool_supervisor:_direct_children": [
+    "_settle_owned_children",
+    "main"
+  ],
+  "cayu.runtime._isolated_tool_supervisor:_enable_child_subreaper": [
+    "main"
+  ],
+  "cayu.runtime._isolated_tool_supervisor:_reap_exited": [
+    "_settle_owned_children",
+    "main"
+  ],
+  "cayu.runtime._isolated_tool_supervisor:_settle_owned_children": [
+    "_settle_before_worker_dispatch",
+    "main"
+  ],
+  "cayu.runtime._isolated_tool_supervisor:_shutdown_requested": [
+    "_await_worker_admission",
+    "main"
+  ],
+  "cayu.runtime._isolated_tool_supervisor:_signal_group": [
+    "_settle_owned_children"
+  ],
+  "cayu.runtime._isolated_tool_supervisor:_signal_pid": [
+    "_settle_owned_children"
+  ],
+  "cayu.runtime._live_model_attempt:_admitted_model_provider_events": [
+    "LiveModelAttempt.execute.<locals>.<lambda>"
+  ],
+  "cayu.runtime._live_model_attempt:analyze_request_context_pressure": [
+    "LiveModelAttempt.execute"
+  ],
+  "cayu.runtime._local_execution_attempt_owner:_RETAINED_LOCAL_EXECUTION_TASKS": [
+    "_retain_local_execution_task",
+    "_retain_local_execution_task.<locals>.settled",
+    "retained_local_execution_tasks"
+  ],
+  "cayu.runtime._local_execution_attempt_owner:_create_local_execution_task": [
+    "run_owned_local_execution_attempt"
+  ],
+  "cayu.runtime._local_execution_attempt_owner:_exact_process_is_live": [
+    "_recover_owned_local_execution_attempt"
+  ],
+  "cayu.runtime._local_execution_attempt_owner:_load_receipt_or_exact_durable_settlement": [
+    "run_owned_local_execution_attempt"
+  ],
+  "cayu.runtime._local_execution_attempt_owner:_probe_rendezvous": [
+    "_recover_owned_local_execution_attempt"
+  ],
+  "cayu.runtime._local_execution_attempt_owner:local_execution_boot_id": [
+    "_recover_owned_local_execution_attempt",
+    "_recovery_receipt",
+    "_start_from_message",
+    "run_owned_local_execution_attempt"
+  ],
+  "cayu.runtime._local_execution_supervisor:_descendants": [
+    "_freeze_to_closure",
+    "_settle_tree"
+  ],
+  "cayu.runtime._local_execution_supervisor:_exit": [
+    "_settle_after_internal_failure",
+    "_supervise",
+    "_supervise_started_attempt"
+  ],
+  "cayu.runtime._local_execution_supervisor:_freeze_to_closure": [
+    "_settle_tree"
+  ],
+  "cayu.runtime._local_execution_supervisor:_publish_receipt": [
+    "_settle_after_internal_failure",
+    "_supervise",
+    "_supervise_started_attempt"
+  ],
+  "cayu.runtime._local_execution_supervisor:_reap_children": [
+    "_settle_tree",
+    "_supervise_started_attempt"
+  ],
+  "cayu.runtime._local_execution_supervisor:_send": [
+    "_supervise",
+    "_supervise_started_attempt"
+  ],
+  "cayu.runtime._local_execution_supervisor:_settle_tree": [
+    "_retain_tree_cleanup_authority",
+    "_supervise",
+    "_supervise_started_attempt"
+  ],
+  "cayu.runtime._local_execution_supervisor:_signal_exact": [
+    "_freeze_to_closure",
+    "_settle_tree"
+  ],
+  "cayu.runtime._memory_attribution:memory_evidence_document_bytes": [
+    "_bounded_page_bytes",
+    "project_memory_attribution"
+  ],
+  "cayu.runtime._model_completion_delivery:_validate_model_completion_publication_result": [
+    "_publish_model_completion"
+  ],
+  "cayu.runtime._model_step_executor:_combine_authoritative_model_failure": [
+    "ModelStepExecutor.run_with_retries",
+    "ModelStepRun._execute_request",
+    "ModelStepRun.execute",
+    "_combine_context_build_failure_with_secondary"
+  ],
+  "cayu.runtime._model_step_executor:_model_preparation_lost_to_interrupt": [
+    "ModelStepRun._execute_request.<locals>.prepare_model_completion_dispatch.<locals>.settle_preparation_failure"
+  ],
+  "cayu.runtime._model_step_executor:_raise_after_model_pre_dispatch_cleanup": [
+    "ModelStepRun._execute_request.<locals>.prepare_model_completion_dispatch"
+  ],
+  "cayu.runtime._model_step_executor:analyze_request_context_pressure": [
+    "ModelStepExecutor._observe_context_pressure",
+    "ModelStepExecutor.run_with_retries"
+  ],
+  "cayu.runtime._model_step_executor:asyncio": [
+    "ModelStepExecutor._sleep_before_retry",
+    "ModelStepExecutor.run_with_retries",
+    "ModelStepExecutor.run_with_retries.<locals>.retry_elapsed_s",
+    "ModelStepRun._execute_candidate",
+    "ModelStepRun._execute_request",
+    "ModelStepRun._run_with_context_overflow_recovery",
+    "ModelStepRun.execute",
+    "_raise_after_model_pre_dispatch_cleanup",
+    "_terminate_pre_dispatch_context_exposure"
+  ],
+  "cayu.runtime._pending_profile_adoption:prepare_adopting_continuation_command": [
+    "cayu.runtime._recovery_ownership:RecoveryOwnership.fence_or_rebind_active_invocation"
+  ],
+  "cayu.runtime._phase_timing:datetime": [
+    "_Builder.__init__",
+    "_Builder.mark_committed",
+    "_Builder.observe_event"
+  ],
+  "cayu.runtime._policy_installation:time": [
+    "PolicyInstallationOwner._execute",
+    "PolicyInstallationOwner._state",
+    "PolicyInstallationOwner.install"
+  ],
+  "cayu.runtime._policy_journal:RETAINED_REPORTS": [
+    "append_decision",
+    "load_journal"
+  ],
+  "cayu.runtime._process_workers:_PROC_SELF": [
+    "_cgroup_cpu_limit"
+  ],
+  "cayu.runtime._process_workers:_schedulable_cpu_count": [
+    "available_cpu_count"
+  ],
+  "cayu.runtime._producer_output_store:admit_native_producer": [
+    "cayu.runtime._checkpoint_store:_RuntimeCheckpointSessionStore._admit_native_producer",
+    "cayu.sessions.store:SessionStore._admit_native_producer"
+  ],
+  "cayu.runtime._producer_output_store:attach_native_producer": [
+    "cayu.sessions.store:SessionStore._attach_native_producer"
+  ],
+  "cayu.runtime._producer_output_store:require_native_admission": [
+    "cayu.runtime._invocation_lifecycle:apply_invocation_lifecycle_command.<locals>.admit_checkpoint"
+  ],
+  "cayu.runtime._producer_output_store:retain_native_output": [
+    "cayu.sessions.store:SessionStore._retain_native_producer_output"
+  ],
+  "cayu.runtime._provider_disposition_recovery:clear_pending_provider_operation_disposition": [
+    "ProviderDispositionRecovery.retire_completed_provider_operation_disposition"
+  ],
+  "cayu.runtime._provider_operation_cancellation_owner:_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS": [
+    "ProviderOperationCancellationOwner._heartbeat_provider_operation_cancellation_claim"
+  ],
+  "cayu.runtime._provider_operation_cancellation_owner:_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE": [
+    "ProviderOperationCancellationOwner._acquire_provider_operation_cancellation_claim.<locals>.acquire_claim",
+    "ProviderOperationCancellationOwner._heartbeat_provider_operation_cancellation_claim",
+    "ProviderOperationCancellationOwner._heartbeat_provider_operation_cancellation_claim.<locals>.renew_claim",
+    "ProviderOperationCancellationOwner._persist_provider_operation_cancellation_event.<locals>.checkpoint_transform",
+    "ProviderOperationCancellationOwner.cancel_started_operation"
+  ],
+  "cayu.runtime._provider_operation_cancellation_owner:_PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS": [
+    "_cancel_provider_operation_after_definite_absence"
+  ],
+  "cayu.runtime._provider_operation_start_owner:_PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS": [
+    "ProviderOperationStartOwner.start"
+  ],
+  "cayu.runtime._recovery_claims:time": [
+    "_require_live_incomplete_recovery_claim_acknowledgement"
+  ],
+  "cayu.runtime._recovery_coordinator:reconstruct_invocation_context": [
+    "RecoveryCoordinator._claim_manual_tool_round_recovery.<locals>.reconstruct_claim_invocation_context",
+    "RecoveryCoordinator._continue_closed_tool_round",
+    "RecoveryCoordinator._prepare_gate_invocation",
+    "RecoveryCoordinator._recover_tool_round_claimed",
+    "RecoveryCoordinator._resolve_tool_approval_owned"
+  ],
+  "cayu.runtime._recovery_coordinator:time": [
+    "RecoveryCoordinator._claim_manual_tool_round_recovery",
+    "RecoveryCoordinator.continue_tool_approval_resolution"
+  ],
+  "cayu.runtime._recovery_ownership:_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS": [
+    "RecoveryOwnership.heartbeat"
+  ],
+  "cayu.runtime._recovery_ownership:_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS": [
+    "RecoveryOwnership.heartbeat"
+  ],
+  "cayu.runtime._recovery_ownership:_INCOMPLETE_RECOVERY_CLAIM_LEASE": [
+    "RecoveryOwnership.claim",
+    "RecoveryOwnership.claim.<locals>.claim_checkpoint",
+    "RecoveryOwnership.claim_lease_duration",
+    "RecoveryOwnership.heartbeat",
+    "RecoveryOwnership.renew_claim.<locals>.renew_claim"
+  ],
+  "cayu.runtime._recovery_ownership:_MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS": [
+    "RecoveryOwnership.watch_manual_recovery_interruption"
+  ],
+  "cayu.runtime._recovery_plan_coordinator:_RECOVERY_PLAN_EXECUTION_HEARTBEAT_SECONDS": [
+    "RecoveryPlanCoordinator._heartbeat_execution"
+  ],
+  "cayu.runtime._run_limits:_event_with_budget_authority": [
+    "RunLimitController._emit_budget_limit_reached",
+    "RunLimitController.evaluate_policy_budgets",
+    "RunLimitController.reserve_for_model_step",
+    "RunLimitController.reserve_operation_budgets",
+    "RunLimitController.run_automatic_compaction_dispatch"
+  ],
+  "cayu.runtime._run_limits:time": [
+    "RunLimitController.elapsed_seconds"
+  ],
+  "cayu.runtime._session_abandonment:pending_tool_round_from_checkpoint": [
+    "_abandonable_tool_round"
+  ],
+  "cayu.runtime._session_continuation_owner:admit_continuation": [
+    "SessionContinuationOwner._admit.<locals>.dispatch"
+  ],
+  "cayu.runtime._session_control:ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS": [
+    "SessionControl.wait_for_active_interrupted_event"
+  ],
+  "cayu.runtime._session_control:ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S": [
+    "SessionControl.wait_for_active_interrupted_event"
+  ],
+  "cayu.runtime._session_control:STREAM_INTERRUPT_POLL_INTERVAL_S": [
+    "StreamInterruptPoll.raise_if_interrupted"
+  ],
+  "cayu.runtime._session_engine:require_active_egress_transition_environment": [
+    "SessionEngine._require_active_egress_profile_cutover",
+    "SessionEngine._run_session_with_deadline"
+  ],
+  "cayu.runtime._session_engine:time": [
+    "SessionEngine._run_session_with_deadline"
+  ],
+  "cayu.runtime._session_execution_presence:_RELEASE_WAIT_SECONDS": [
+    "SessionExecutionPresence.stop_and_wait"
+  ],
+  "cayu.runtime._session_execution_profile:_execution_profile_identity": [
+    "cayu.runtime._compaction.explicit:SessionCompaction.run.<locals>.current_compaction_profile_candidate",
+    "cayu.runtime._execution_profile_comparison:_resume_candidate.<locals>.build",
+    "cayu.runtime._session_engine:SessionEngine._queued_dispatch_required_profile.<locals>.ordinary_queued_profile",
+    "cayu.runtime._session_engine:SessionEngine._run_session_with_deadline.<locals>.live_candidate_profile",
+    "cayu.runtime._session_engine:SessionEngine.resume",
+    "cayu.runtime._session_engine:SessionEngine.resume.<locals>.current_resume_profile",
+    "cayu.runtime._session_fork:SessionFork.fork_session.<locals>.ordinary_child_execution_profile",
+    "cayu.runtime._session_preparation:SessionPreparation.prepare_initial_run"
+  ],
+  "cayu.runtime._session_finalization:_INTERACTION_TRANSITION_REPLAY_WINDOW_SECONDS": [
+    "SessionFinalization.publish_interaction_transition"
+  ],
+  "cayu.runtime._session_finalization:_interaction_transition_replay_failure": [
+    "SessionFinalization.publish_interaction_transition"
+  ],
+  "cayu.runtime._session_fork:await_shielded_task_outcome": [
+    "SessionFork.fork_session.<locals>.await_owned_fork_task"
+  ],
+  "cayu.runtime._session_fork:require_ordinary_session_execution": [
+    "SessionFork.fork_session",
+    "SessionFork.preflight_source"
+  ],
+  "cayu.runtime._session_outcome_publication:load_recoverable_provider_operation": [
+    "SessionOutcomePublication._stream_deadline_settles_as_failure"
+  ],
+  "cayu.runtime._session_steering:prepare_interaction_completion_steering_record": [
+    "cayu.sessions.memory:InMemorySessionStore.publish_interaction_transition",
+    "cayu.storage.postgres:PostgresSessionStore.publish_interaction_transition",
+    "cayu.storage.sqlite:SQLiteSessionStore.publish_interaction_transition.<locals>.statement"
+  ],
+  "cayu.runtime._session_task_lifecycle:_terminalize_claimed_task": [
+    "SessionTaskLifecycle.complete_task"
+  ],
+  "cayu.runtime._shared_allocation_records:DISPOSAL_RENEW_SECONDS": [
+    "keeping_disposal_lease.<locals>.renew"
+  ],
+  "cayu.runtime._shared_environment_allocations:_dispose_recorded": [
+    "SharedEnvironmentAllocations._dispose_what_finalize_kept",
+    "SharedEnvironmentAllocations.reap_recorded"
+  ],
+  "cayu.runtime._stream_delta_buffer:monotonic": [
+    "coalesce_model_stream_deltas",
+    "coalesce_model_stream_deltas.<locals>.flush"
+  ],
+  "cayu.runtime._tool_effect_reconciliation:asyncio": [
+    "ToolEffectReconciliationOwner.reconcile"
+  ],
+  "cayu.runtime._tool_invocation.admission:uuid4": [
+    "ToolInvocationAdmission.pause_for_approval"
+  ],
+  "cayu.runtime._tool_invocation.invocation:_registered_tool_argument_error": [
+    "ToolInvocation.execute"
+  ],
+  "cayu.runtime._tool_invocation.invocation:await_invocation_operation": [
+    "ToolInvocation.execute.<locals>.close_workspace_mutation_window_after_interrupt"
+  ],
+  "cayu.runtime._tool_invocation.invocation:begin_workspace_mutation_window": [
+    "ToolInvocation.execute"
+  ],
+  "cayu.runtime._tool_invocation.invocation:publish_workspace_observation_transition": [
+    "ToolInvocation.execute",
+    "ToolInvocation.execute.<locals>.stage_workspace_terminal"
+  ],
+  "cayu.runtime._tool_invocation.terminal:_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS": [
+    "ToolTerminalPublisher.project_result"
+  ],
+  "cayu.runtime._tool_invocation.terminal:await_shielded_task_outcome": [
+    "ToolTerminalPublisher.project_result"
+  ],
+  "cayu.runtime._tool_invocation.workspace_capture:_WORKSPACE_ARTIFACT_WRITE_TIMEOUT_SECONDS": [
+    "_workspace_evidence_projection"
+  ],
+  "cayu.runtime._tool_invocation.workspace_capture:_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS": [
+    "_observe_workspace_revision"
+  ],
+  "cayu.runtime._tool_invocation.workspace_capture:_WORKSPACE_RECEIPT_INLINE_PATH_LIMIT": [
+    "_workspace_evidence_projection"
+  ],
+  "cayu.runtime._tool_invocation.workspace_capture:await_shielded_task_outcome": [
+    "_observe_workspace_revision"
+  ],
+  "cayu.runtime._tool_invocation.workspace_capture:compare_workspace_revisions": [
+    "_record_workspace_mutation_after"
+  ],
+  "cayu.runtime._tool_round_executor:uuid4": [
+    "ToolRoundExecutor.checkpoint_pending_user_input"
+  ],
+  "cayu.runtime._workspace_observation_recovery:_WORKSPACE_ARTIFACT_RECOVERY_READ_TIMEOUT_SECONDS": [
+    "WorkspaceObservationRecovery._reconcile_workspace_observation_artifacts"
+  ],
+  "cayu.runtime.provider_operations:inspect_provider_operation": [
+    "resolve_provider_operation_stage"
+  ],
+  "cayu.runtime.session_closure:_COMPLETED_PLAN_ID_LIMIT": [
+    "SessionClosureCoordinator._erase"
+  ],
+  "cayu.sandbox_broker.client:_COPY_TIMEOUT_FLOOR_SECONDS": [
+    "_copy_deadline"
+  ],
+  "cayu.sandbox_broker.client:_OUTAGE_RETRY_SECONDS": [
+    "_CopyDeadline.pause"
+  ],
+  "cayu.sandbox_broker.client:_RETRY_DELAYS_SECONDS": [
+    "SandboxBrokerClient._request",
+    "SandboxBrokerClient.upload_staged",
+    "_CopyDeadline.pause"
+  ],
+  "cayu.sandbox_broker.client:asyncio": [
+    "SandboxBrokerClient._commit_uploaded_copy",
+    "SandboxBrokerClient._finished_copy",
+    "SandboxBrokerClient._request",
+    "SandboxBrokerClient.upload_staged",
+    "SandboxBrokerClient.wait_until_ready",
+    "_CopyDeadline.passed",
+    "_CopyDeadline.pause",
+    "_copy_deadline",
+    "_read_chunks"
+  ],
+  "cayu.sandbox_broker.coding:MAX_COMMAND_STDIN_BYTES": [
+    "_reset_sandbox_workspace"
+  ],
+  "cayu.sandbox_broker.coding:_QUEUE_HEARTBEAT_SECONDS": [
+    "BrokeredSandboxCodingEnvironmentFactory._await_ready"
+  ],
+  "cayu.sandbox_broker.coding:_QUEUE_POLL_INTERVAL_SECONDS": [
+    "BrokeredSandboxCodingEnvironmentFactory._await_ready"
+  ],
+  "cayu.sandbox_broker.coding:_reset_sandbox_workspace": [
+    "BrokeredSandboxCodingBinding._clean_target"
+  ],
+  "cayu.sandbox_broker.runner:MAX_ARCHIVE_BYTES": [
+    "BrokeredSandboxWorkspace.write_tar_stream",
+    "_ArchiveSink.fits",
+    "_ArchiveSink.sealed",
+    "_require_one_archive"
+  ],
+  "cayu.sandbox_broker.runner:_CANCEL_SETTLE_SECONDS": [
+    "BrokeredSandboxRunner._settle_cancelled.<locals>.settle",
+    "_BrokeredInteractiveProcess.close",
+    "_kill_receipt"
+  ],
+  "cayu.sandbox_broker.runner:_DESTROYED_POLL_SECONDS": [
+    "BrokeredSandboxRunner._await_destroyed"
+  ],
+  "cayu.sandbox_broker.runner:_LAPSE_CLOCK_GRACE_SECONDS": [
+    "BrokeredSandboxRunner._await_destroyed"
+  ],
+  "cayu.server:_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE": [
+    "_compose_interruption_drain_lifespan",
+    "_recover_persisted_event_side_effects_until_idle",
+    "create_server"
+  ],
+  "cayu.server:_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS": [
+    "_compose_interruption_drain_lifespan",
+    "_recover_persisted_event_side_effects_forever",
+    "create_server"
+  ],
+  "cayu.server:_STARTUP_EXECUTION_OWNER_RETRY_MARGIN_SECONDS": [
+    "_startup_execution_owner_retry_delay"
+  ],
+  "cayu.server:_startup_execution_owner_retry_delay": [
+    "_retry_execution_owner_deferred_startup_recovery"
+  ],
+  "cayu.server._artifact_query:ARTIFACT_QUERY_SCAN_MAX": [
+    "query_artifacts.<locals>.scan_store",
+    "query_artifacts.<locals>.scan_store.<locals>.consume"
+  ],
+  "cayu.server._data_volume_reader:MAX_ARCHIVE_BYTES": [
+    "DataVolume.archive"
+  ],
+  "cayu.server._data_volume_reader:MAX_DIRECTORY_SCAN": [
+    "_scan"
+  ],
+  "cayu.server._data_volume_reader:MAX_READ_BYTES": [
+    "DataVolume.content"
+  ],
+  "cayu.server._data_volume_reader:_names": [
+    "_ArchiveWriter.add_directory",
+    "_scan"
+  ],
+  "cayu.server._inbox_access:_SCAN_PAGES": [
+    "InboxAccessGate.scan_pending"
+  ],
+  "cayu.server._inbox_cursor:time": [
+    "InboxCursorSeal.open",
+    "InboxCursorSeal.seal"
+  ],
+  "cayu.server._inbox_routes:_KNOWLEDGE_SCAN_PAGES": [
+    "register_inbox_routes.<locals>.knowledge_items"
+  ],
+  "cayu.server._inbox_routes:_PENDING_SCAN_LIMIT": [
+    "register_inbox_routes.<locals>.inbox_counts.<locals>.read_page",
+    "register_inbox_routes.<locals>.knowledge_items",
+    "register_inbox_routes.<locals>.resolve_session_item",
+    "register_inbox_routes.<locals>.round_call_reference"
+  ],
+  "cayu.server._judge_calibration_routes:_candidate_judge_route_relation": [
+    "register_judge_calibration_routes.<locals>._preview_judge_calibration_definition"
+  ],
+  "cayu.server._kept_knowledge:_CHUNK_READ_BYTES": [
+    "register_kept_knowledge.<locals>.knowledge_detail"
+  ],
+  "cayu.server.evals_registry:derive_eval_target_key": [
+    "generated_eval_target_registry"
+  ],
+  "cayu.server.evals_registry:prepare_eval_execution_profile": [
+    "EvalTargetRegistry.prepare_execution_profile"
+  ],
+  "cayu.server.evals_worker:_run_compiled_corpus_suite": [
+    "EvalRunCoordinator._execute_compiled_lease",
+    "EvalRunCoordinator._run_distributed_lease"
+  ],
+  "cayu.server.evals_worker:compile_corpus_suite": [
+    "EvalRunCoordinator._compile_loaded_corpus",
+    "EvalRunCoordinator._compile_loaded_scenario"
+  ],
+  "cayu.server.evals_worker:target_for_eval_invocation": [
+    "EvalRunCoordinator._preflight_run"
+  ],
+  "cayu.server.routes:EvalRunCoordinator": [
+    "create_router.<locals>.evals_lifespan"
+  ],
+  "cayu.server.routes:_CAUSAL_BUDGET_SUMMARY_MAX_RESULT_BYTES": [
+    "create_router.<locals>.get_causal_budget_summary"
+  ],
+  "cayu.server.routes:_CAUSAL_BUDGET_SUMMARY_MAX_SESSIONS": [
+    "create_router.<locals>.get_causal_budget_summary"
+  ],
+  "cayu.server.service:PRODUCT_EXECUTION_HEARTBEAT_SECONDS": [
+    "_run_product_operation_with_heartbeat.<locals>.heartbeat"
+  ],
+  "cayu.server.service:PRODUCT_EXECUTION_HEARTBEAT_TIMEOUT_SECONDS": [
+    "_retain_product_execution_claim"
+  ],
+  "cayu.server.service:_PUBLIC_RESULT_CAPTURE_BYTES": [
+    "_BoundedProductResultCapture.__init__",
+    "_BoundedProductResultCapture._capture"
+  ],
+  "cayu.sessions._call_inspection:_EVENT_QUERY_PAGE_SIZE": [
+    "collect_inspection_records"
+  ],
+  "cayu.sessions._call_inspection:_MAX_COLLECTED_EVENT_BYTES": [
+    "collect_inspection_records"
+  ],
+  "cayu.sessions._call_inspection:_MAX_COLLECTED_EVENT_RECORDS": [
+    "collect_inspection_records"
+  ],
+  "cayu.sessions._context_selection_fence:CONTEXT_SELECTION_MAX_CONTROLS_PER_OWNER": [
+    "cayu.sessions._memory_context_views:control_selection"
+  ],
+  "cayu.sessions._interaction_receipts:_checkpoint_after_queued_interaction_profile_handoff": [
+    "cayu.sessions._memory_queued_messages:deliver_queued_session_messages",
+    "cayu.sessions._memory_queued_messages:repair_queued_interaction_profile_handoff"
+  ],
+  "cayu.sessions._invocation_lifecycle:INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_BYTES": [
+    "_InvocationLifecycleCommandReceipt.validate_record",
+    "_InvocationLifecycleReceiptLedger.validate_ledger",
+    "_compact_invocation_lifecycle_receipts.<locals>.fits",
+    "_require_projected_invocation_release_capacity",
+    "_validated_receipt_ledger"
+  ],
+  "cayu.sessions._invocation_lifecycle:INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS": [
+    "_InvocationLifecycleReceiptLedger.copy_receipts",
+    "_InvocationLifecycleReceiptLedger.validate_ledger",
+    "_compact_invocation_lifecycle_receipts",
+    "_shared_receipt_ledger_from_checkpoint"
+  ],
+  "cayu.sessions._invocation_lifecycle:_validate_receipt_ledger": [
+    "_validated_receipt_ledger"
+  ],
+  "cayu.sessions._invocation_lifecycle:_validated_ledger_by_session": [
+    "_evict_validated_ledger",
+    "_validated_receipt_ledger"
+  ],
+  "cayu.sessions._invocation_lifecycle:_validated_ledger_source_bytes": [
+    "_evict_validated_ledger",
+    "_validated_receipt_ledger"
+  ],
+  "cayu.sessions._invocation_lifecycle:_validated_ledgers": [
+    "_evict_validated_ledger",
+    "_validated_receipt_ledger"
+  ],
+  "cayu.sessions._invocation_lifecycle:require_invocation_rebind_lineage": [
+    "cayu.runtime._producer_completion_replay:prepare_producer_completion_replay",
+    "cayu.runtime._producer_failure:read_native_failure",
+    "cayu.runtime._producer_lineage:require_producer_epoch",
+    "cayu.runtime._producer_output_store:read_retained_native_output",
+    "cayu.runtime._producer_output_store:retain_native_output",
+    "cayu.runtime._producer_release:release_from_snapshot"
+  ],
+  "cayu.sessions._memory_event_reads:_query_candidate_records": [
+    "_query_events_unlocked"
+  ],
+  "cayu.sessions._memory_event_reads:_query_events_unlocked": [
+    "fold_event_snapshot.<locals>.<lambda>",
+    "query_events",
+    "query_events_bounded"
+  ],
+  "cayu.sessions._pending_tool_round_reader:_pending_tool_round_from_owned_checkpoint": [
+    "cayu.runtime._tool_round_recovery:checkpoint_with_assistant_publication_redactor",
+    "cayu.runtime._tool_round_recovery:checkpoint_with_assistant_publication_snapshot",
+    "cayu.sessions._staged_tool_terminal_reader:_staged_terminal_owner_from_owned_checkpoint",
+    "cayu.sessions.pending_actions:_pending_action_checkpoint_index_state",
+    "cayu.sessions.pending_actions:_pending_checkpoint_candidates",
+    "load_pending_tool_round",
+    "pending_tool_round_from_checkpoint"
+  ],
+  "cayu.sessions._process_liveness:_host_boot_id": [
+    "current_process_identity",
+    "process_liveness"
+  ],
+  "cayu.sessions._process_liveness:_linux_process": [
+    "current_process_identity",
+    "process_liveness"
+  ],
+  "cayu.sessions._rollup:SESSION_TIMING_MAX_EVENTS": [
+    "session_timing"
+  ],
+  "cayu.sessions._rollup:SESSION_TIMING_MAX_TOOLS": [
+    "_tool_rows"
+  ],
+  "cayu.sessions._session_continuation_store:require_history": [
+    "cayu.sessions.store:SessionStore.load_continuation_ticket",
+    "index_publication",
+    "require_erasure_quiescence"
+  ],
+  "cayu.sessions._session_continuation_store:require_released_wait_invocation": [
+    "cayu.runtime._execution_to_wait:_ExecutionToWait.parked_replay",
+    "cayu.runtime._external_execution_to_wait:_ExternalExecutionToWait.recovery_is_settled",
+    "cayu.sessions.store:SessionStore.retire_continuation.<locals>.transform"
+  ],
+  "cayu.sessions._temporary_continuation_store:compose_same_session_admission": [
+    "compose_temporary_service_admission"
+  ],
+  "cayu.sessions._temporary_service_target:publish_target_record": [
+    "cayu.sessions._side_service_preparation:plan_preparation",
+    "cayu.sessions._temporary_continuation_store:compose_temporary_service_admission",
+    "cayu.sessions.store:SessionStore._publish_temporary_service_target"
+  ],
+  "cayu.sessions._terminal_evidence:_queued_dispatch_terminal_receipts_for_session": [
+    "cayu.sessions.memory:InMemorySessionStore._refresh_queued_dispatch_terminal_receipts_unlocked"
+  ],
+  "cayu.sessions.context_views:CONTEXT_VIEW_EXPIRY_BATCH_SIZE": [
+    "cayu.sessions._memory_context_views:select_context_view",
+    "cayu.storage._postgres_context_views:select_context_view",
+    "cayu.storage._sqlite_context_views:select_context_view"
+  ],
+  "cayu.sessions.context_views:CONTEXT_VIEW_MAX_LIFECYCLE_EVENTS_PER_VIEW": [
+    "validate_context_view_lifecycle_capacity"
+  ],
+  "cayu.sessions.context_views:CONTEXT_VIEW_MAX_SELECTIONS_PER_OWNER": [
+    "cayu.sessions._memory_context_views:select_context_view",
+    "cayu.storage._postgres_context_views:select_context_view",
+    "cayu.storage._sqlite_context_views:select_context_view"
+  ],
+  "cayu.sessions.context_views:validate_context_view_manifest_storage": [
+    "cayu.storage._postgres_context_views:lookup_context_view_publication",
+    "cayu.storage._postgres_context_views:publish_context_view",
+    "cayu.storage._postgres_context_views:read_context_view",
+    "cayu.storage._postgres_context_views:select_context_view",
+    "cayu.storage._sqlite_context_views:lookup_context_view_publication",
+    "cayu.storage._sqlite_context_views:publish_context_view",
+    "cayu.storage._sqlite_context_views:read_context_view",
+    "cayu.storage._sqlite_context_views:select_context_view",
+    "cayu.storage.postgres:PostgresSessionStore._validate_context_view_compaction",
+    "cayu.storage.sqlite:SQLiteSessionStore._validate_context_view_compaction_unlocked"
+  ],
+  "cayu.sessions.creation_claims:_runtime_session_create_reference_claim_id": [
+    "authenticate_runtime_session_create_claim_reference",
+    "run_request_with_runtime_session_create_claim_reference",
+    "runtime_session_create_claim_reference"
+  ],
+  "cayu.sessions.creation_claims:_runtime_session_create_reference_request_hmac_sha256": [
+    "authenticate_runtime_session_create_claim_reference",
+    "run_request_with_runtime_session_create_claim_reference",
+    "runtime_session_create_claim_reference"
+  ],
+  "cayu.sessions.inspection:_SESSION_INSPECTION_MAX_RECORDS": [
+    "cayu.sessions.store:SessionStore.inspect_summary"
+  ],
+  "cayu.sessions.inspection:_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES": [
+    "_retain_session_inspection_event"
+  ],
+  "cayu.sessions.requests:uuid4": [
+    "session_instance_id_for_run_request"
+  ],
+  "cayu.sessions.terminal_evidence:_terminal_session_evidence_record_bytes": [
+    "_measure_terminal_session_evidence.<locals>.measure_record",
+    "_terminal_session_evidence_boundary_with_exact_total",
+    "_terminal_session_evidence_checked_record_bytes"
+  ],
+  "cayu.snapshots.bundles:_cas_descriptor_guards_available": [
+    "FileSystemAgentSnapshotObjectStore.__init__",
+    "_require_cas_descriptor_guards",
+    "_require_materialization_publication_guards"
+  ],
+  "cayu.snapshots.bundles:_open_materialization_parent": [
+    "PortableAgentSnapshotComponentProvider._materialize_sync",
+    "PortableAgentSnapshotComponentProvider._recover_sync"
+  ],
+  "cayu.snapshots.containers:_publish_file": [
+    "pack_agent_bundle"
+  ],
+  "cayu.snapshots.containers:pack_agent_bundle": [
+    "cayu.snapshots.bundles:_pack_container_without_abandoning_mutation"
+  ],
+  "cayu.storage._context_selection_fence:CONTEXT_SELECTION_MAX_CONTROLS_PER_OWNER": [
+    "PostgresContextSelectionFenceMixin._context_selection_control",
+    "SQLiteContextSelectionFenceMixin._context_selection_control"
+  ],
+  "cayu.storage._disk_space:file_system_id": [
+    "find_space_shortfalls"
+  ],
+  "cayu.storage._eval_report_publication:publish_postgres_report": [
+    "cayu.storage.evals_postgres:PostgresEvalStore.publish_report"
+  ],
+  "cayu.storage._peer_attempts:permits_parked_delivery_append": [
+    "cayu.sessions._memory_peer_content:append_peer_content",
+    "cayu.storage._postgres_peer_content:append_peer_content",
+    "cayu.storage._sqlite_peer_content:append_peer_content.<locals>.statement"
+  ],
+  "cayu.storage._postgres_aggregates:MAX_USAGE_PRICING_RAW_CANDIDATES": [
+    "_add_pricing_input_from_row",
+    "pricing_input_statement",
+    "session_pricing_input_statement"
+  ],
+  "cayu.storage._postgres_base:_INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE": [
+    "_PostgresStoreBase._backfill_interrupted_handoff_generations"
+  ],
+  "cayu.storage._postgres_context_views:lock_admission": [
+    "cayu.storage._context_selection_fence:PostgresContextSelectionFenceMixin._context_selection_control",
+    "publish_context_view",
+    "select_context_view"
+  ],
+  "cayu.storage._postgres_context_views:require_lifecycle_capacity": [
+    "select_context_view",
+    "transition_context_view_ownership"
+  ],
+  "cayu.storage._postgres_event_delivery:enqueue_persisted_event_side_effects": [
+    "cayu.storage._postgres_event_publication:append_workflow_step_started",
+    "cayu.storage._postgres_event_publication:compare_and_publish_mcp_manifest_checks",
+    "cayu.storage._postgres_publication:publish_checkpoint_events",
+    "cayu.storage._postgres_publication:publish_runtime",
+    "cayu.storage._postgres_session_creation:create",
+    "cayu.storage._postgres_session_creation:create_fork",
+    "cayu.storage._postgres_session_messages:deliver_queued_session_messages",
+    "cayu.storage._postgres_session_messages:enqueue_session_message",
+    "cayu.storage.postgres:PostgresSessionStore._insert_event_rows_with_cursor",
+    "cayu.storage.postgres:PostgresSessionStore.publish_interaction_transition",
+    "cayu.storage.postgres:PostgresSessionStore.reject_execution_profile_resume",
+    "cayu.storage.postgres:PostgresSessionStore.transition_status_and_checkpoint"
+  ],
+  "cayu.storage._postgres_memory_evidence:_lock_evidence_id": [
+    "create_context_exposure",
+    "create_recall_receipt"
+  ],
+  "cayu.storage._postgres_public_authority:register_event_authorities": [
+    "cayu.storage._postgres_publication:publish_checkpoint_events",
+    "cayu.storage._postgres_publication:publish_runtime",
+    "cayu.storage.postgres:PostgresSessionStore._create_fork",
+    "cayu.storage.postgres:PostgresSessionStore._insert_event_rows_with_cursor",
+    "cayu.storage.postgres:PostgresSessionStore.append_workflow_step_started",
+    "cayu.storage.postgres:PostgresSessionStore.compare_and_publish_mcp_manifest_checks",
+    "cayu.storage.postgres:PostgresSessionStore.create",
+    "cayu.storage.postgres:PostgresSessionStore.deliver_queued_session_messages",
+    "cayu.storage.postgres:PostgresSessionStore.enqueue_session_message",
+    "cayu.storage.postgres:PostgresSessionStore.publish_interaction_transition",
+    "cayu.storage.postgres:PostgresSessionStore.reject_execution_profile_resume"
+  ],
+  "cayu.storage._postgres_public_authority:require_current_configuration": [
+    "cayu.storage.postgres:PostgresSessionStore._ensure_ready"
+  ],
+  "cayu.storage._postgres_session_queries:_EVENT_QUERY_SESSION_IDS_BATCH_SIZE": [
+    "_event_query_session_id_batches",
+    "_query_events_bounded_snapshot",
+    "query_events"
+  ],
+  "cayu.storage._postgres_session_queries:_query_events_bounded_snapshot": [
+    "fold_event_snapshot.<locals>.read",
+    "query_events_bounded"
+  ],
+  "cayu.storage._postgres_support:_json_obj": [
+    "cayu.storage._postgres_base:_PostgresStoreBase._backfill_interrupted_handoff_generations",
+    "cayu.storage._postgres_event_delivery:_lease_claimable_delivery",
+    "cayu.storage._postgres_event_publication:append_tool_effect_conflict",
+    "cayu.storage._postgres_model_stage:mark_dispatched",
+    "cayu.storage._postgres_model_stage:prepare",
+    "cayu.storage._postgres_page_reads:_event_record",
+    "cayu.storage._postgres_page_reads:query_latest_events",
+    "cayu.storage._postgres_publication:load_attestation",
+    "cayu.storage._postgres_publication:load_material",
+    "cayu.storage._postgres_publication:publish_checkpoint_events",
+    "cayu.storage._postgres_publication:publish_runtime",
+    "cayu.storage._postgres_session_messages:_acceptance_events",
+    "cayu.storage._postgres_session_messages:deliver_queued_session_messages",
+    "cayu.storage._postgres_session_messages:enqueue_session_message",
+    "cayu.storage._postgres_session_messages:message_from_row",
+    "cayu.storage._postgres_session_messages:repair_queued_interaction_profile_handoff",
+    "cayu.storage._postgres_session_queries:_query_events",
+    "cayu.storage._postgres_session_queries:event_record_from_row",
+    "cayu.storage._postgres_session_queries:load_events",
+    "cayu.storage._postgres_session_queries:load_tool_round_lifecycle_events",
+    "cayu.storage._postgres_session_queries:load_tool_round_lifecycle_events_for_round",
+    "cayu.storage._postgres_session_queries:load_user_input_supersession_events",
+    "cayu.storage._postgres_session_queries:query_child_session_lifecycle",
+    "cayu.storage._postgres_session_queries:query_latest_interaction_events",
+    "cayu.storage._postgres_session_queries:read_cost_accounting",
+    "cayu.storage._postgres_session_queries:read_cost_accounting.<locals>.add_group",
+    "cayu.storage._postgres_session_queries:read_usage_accounting",
+    "cayu.storage._postgres_terminal_evidence:_load_evidence",
+    "cayu.storage._postgres_tool_grants:bind_targeted_tool_grant_use",
+    "cayu.storage._postgres_tool_grants:issue_targeted_tool_grants",
+    "cayu.storage._postgres_tool_grants:reconstruct_targeted_tool_grants",
+    "cayu.storage._postgres_tool_grants:revoke_targeted_tool_grant",
+    "cayu.storage._postgres_transcript:load_deferred_interaction_input",
+    "cayu.storage._postgres_transcript:materialize_deferred_interaction_input",
+    "cayu.storage._postgres_transcript:replace_initial_transcript_messages",
+    "cayu.storage._postgres_transcript:search_transcript",
+    "cayu.storage._producer_cleanup:postgres_cleanup",
+    "cayu.storage._producer_observation:postgres_observation",
+    "cayu.storage._producer_retirement:postgres_retirement",
+    "cayu.storage._zero_work_interruption:postgres_terminalize",
+    "cayu.storage.budget_postgres:PostgresBudgetLedger._load_record",
+    "cayu.storage.budget_postgres:PostgresBudgetLedger._settlement_from_row",
+    "cayu.storage.knowledge_postgres:_knowledge_chunk_from_row",
+    "cayu.storage.knowledge_postgres:_knowledge_entry_from_row",
+    "cayu.storage.knowledge_postgres:_knowledge_evidence_from_row",
+    "cayu.storage.knowledge_postgres:_knowledge_relation_from_row",
+    "cayu.storage.postgres:PostgresSessionStore._append_event_once_with_cursor",
+    "cayu.storage.postgres:PostgresSessionStore._capture_completed_turn_snapshot",
+    "cayu.storage.postgres:PostgresSessionStore._load_checkpoint",
+    "cayu.storage.postgres:PostgresSessionStore._load_historical_interaction_settlement_record",
+    "cayu.storage.postgres:PostgresSessionStore._load_interaction_transition_receipt_by_event_id",
+    "cayu.storage.postgres:PostgresSessionStore._load_session_closure_records.<locals>.<lambda>",
+    "cayu.storage.postgres:PostgresSessionStore._prepare_temporary_side_service",
+    "cayu.storage.postgres:PostgresSessionStore._query_pending_actions",
+    "cayu.storage.postgres:PostgresSessionStore._require_session_erasure_quiescence",
+    "cayu.storage.postgres:PostgresSessionStore._update_display_or_user_metadata",
+    "cayu.storage.postgres:PostgresSessionStore.load_checkpoint_fields",
+    "cayu.storage.postgres:PostgresSessionStore.load_checkpoints",
+    "cayu.storage.postgres:PostgresSessionStore.load_interaction_transition_receipt",
+    "cayu.storage.postgres:PostgresSessionStore.load_session_export_snapshot",
+    "cayu.storage.postgres:PostgresSessionStore.load_session_operation",
+    "cayu.storage.postgres:PostgresSessionStore.load_session_operations",
+    "cayu.storage.postgres:PostgresSessionStore.publish_interaction_transition",
+    "cayu.storage.postgres:PostgresSessionStore.release_session_invocation",
+    "cayu.storage.postgres:PostgresSessionStore.replace_execution_deadline",
+    "cayu.storage.tasks_postgres:PostgresTaskStore._load_local_execution_attempt_row",
+    "cayu.storage.tasks_postgres:PostgresTaskStore.load_task_retry_settlement",
+    "cayu.storage.tasks_postgres:PostgresTaskStore.reconcile_task_cancellation",
+    "cayu.storage.tasks_postgres:PostgresTaskStore.reconcile_task_retry_cancellation",
+    "cayu.storage.tasks_postgres:PostgresTaskStore.settle_task_retry_attempt",
+    "cayu.storage.tasks_postgres:_postgres_interrupted_task_handoff_receipt",
+    "cayu.storage.tasks_postgres:_postgres_task_terminalization_receipt"
+  ],
+  "cayu.storage._postgres_task_graphs:insert_events": [
+    "create_graph.<locals>.operation",
+    "record_transition"
+  ],
+  "cayu.storage._postgres_task_graphs:lock_graph": [
+    "cayu.storage._postgres_task_groups:reconcile",
+    "create_graph.<locals>.operation",
+    "lock_task_graphs"
+  ],
+  "cayu.storage._postgres_task_groups:publish": [
+    "cayu.storage._postgres_task_graphs:create_graph.<locals>.operation",
+    "cayu.storage._postgres_task_graphs:record_transition"
+  ],
+  "cayu.storage._postgres_verified_work:_POSTGRES_MUTATION_CANCELLATION_GRACE_SECONDS": [
+    "PostgresMutationMixin._await_owned_store_mutation"
+  ],
+  "cayu.storage._postgres_verified_work:_require_quiescent_postgres_mutation_connection": [
+    "_PostgresMutationConnectionOwner.acquire"
+  ],
+  "cayu.storage._postgres_verified_work:_require_quiescent_postgres_mutation_pool": [
+    "_PostgresMutationConnectionOwner.__init__"
+  ],
+  "cayu.storage._producer_observation:_project": [
+    "memory_observation",
+    "postgres_observation",
+    "sqlite_observation.<locals>.query"
+  ],
+  "cayu.storage._producer_retirement:validate_retiring_receipt": [
+    "memory_retirement",
+    "postgres_retirement",
+    "sqlite_retirement.<locals>.transaction"
+  ],
+  "cayu.storage._sqlite_aggregates:MAX_USAGE_PRICING_RAW_CANDIDATES": [
+    "_add_pricing_input_from_row",
+    "pricing_input_statement",
+    "session_pricing_input_statement"
+  ],
+  "cayu.storage._sqlite_aggregates:usage_series_statement": [
+    "aggregate_session_usage"
+  ],
+  "cayu.storage._sqlite_connection:connect": [
+    "cayu.cli.storage:_migrate_sqlite_locked",
+    "cayu.cli.storage:_preflight_sqlite_migration",
+    "cayu.cli.storage:_read_sqlite_schema_state",
+    "cayu.cli.storage:_sqlite_alias_backfill_pending",
+    "cayu.cli.storage:_sqlite_input_empty",
+    "cayu.cli.storage:_validate_sqlite_migration_result",
+    "cayu.cli.storage:_write_sqlite_snapshot",
+    "cayu.storage.authorization_grants_sqlite:SQLiteToolAuthorizationGrantStore.__init__",
+    "cayu.storage.budget_ledger:SQLiteBudgetLedger.__init__",
+    "cayu.storage.collaboration_sqlite:SQLiteCollaborationStore.__init__",
+    "cayu.storage.evals_sqlite:SQLiteEvalStore.__init__",
+    "cayu.storage.event_watchers:SQLiteEventWatcherStore.__init__",
+    "cayu.storage.knowledge_sqlite:SQLiteKnowledgeStore.__init__",
+    "cayu.storage.model_policy_sqlite:SQLiteModelPolicyStore.__init__",
+    "cayu.storage.product_operations_sqlite:SQLiteProductOperationStore.__init__",
+    "cayu.storage.sqlite:SQLiteSessionStore._connect",
+    "cayu.storage.sqlite:SQLiteSessionStore._connect_read_only",
+    "cayu.storage.task_steps_sqlite:SQLiteTaskStepStore.__init__",
+    "cayu.storage.tasks_sqlite:SQLiteTaskStore._connect",
+    "cayu.storage.tasks_sqlite:SQLiteTaskStore._connect_read_only",
+    "cayu.storage.work_context_sqlite:SQLiteAgentWorkContextStore.__init__",
+    "connect_read_only_inspection"
+  ],
+  "cayu.storage._sqlite_context_views:transaction": [
+    "cayu.storage._context_selection_fence:SQLiteContextSelectionFenceMixin._context_selection_control",
+    "publish_context_view",
+    "select_context_view",
+    "transition_context_view_ownership"
+  ],
+  "cayu.storage._sqlite_event_delivery:enqueue_persisted_event_side_effects": [
+    "cayu.storage._sqlite_event_publication:append_workflow_step_started.<locals>.statement",
+    "cayu.storage._sqlite_event_publication:compare_and_publish_mcp_manifest_checks.<locals>.statement",
+    "cayu.storage._sqlite_publication:publish_checkpoint_events.<locals>.statement",
+    "cayu.storage._sqlite_publication:publish_runtime.<locals>.statement",
+    "cayu.storage._sqlite_session_creation:create",
+    "cayu.storage._sqlite_session_creation:create_fork",
+    "cayu.storage._sqlite_session_messages:deliver_queued_session_messages.<locals>.statement",
+    "cayu.storage._sqlite_session_messages:enqueue_session_message.<locals>.statement",
+    "cayu.storage.sqlite:SQLiteSessionStore.publish_interaction_transition.<locals>.statement",
+    "cayu.storage.sqlite:SQLiteSessionStore.reject_execution_profile_resume",
+    "cayu.storage.sqlite:SQLiteSessionStore.transition_status_and_checkpoint",
+    "cayu.storage.sqlite:_insert_event_rows_in_transaction"
+  ],
+  "cayu.storage._sqlite_public_authority:require_current_configuration": [
+    "cayu.storage.sqlite:SQLiteSessionStore._create_fork",
+    "cayu.storage.sqlite:SQLiteSessionStore._run_read.<locals>.guarded",
+    "cayu.storage.sqlite:SQLiteSessionStore._run_write.<locals>.guarded",
+    "cayu.storage.sqlite:SQLiteSessionStore.create"
+  ],
+  "cayu.storage._sqlite_records:event_from_row": [
+    "cayu.storage._session_access_records:sqlite_read.<locals>.read",
+    "cayu.storage._sqlite_event_delivery:_lease_delivery_row",
+    "cayu.storage._sqlite_event_publication:append_tool_effect_conflict.<locals>.statement",
+    "cayu.storage._sqlite_model_stage:prepare.<locals>.statement",
+    "cayu.storage._sqlite_publication:load_material",
+    "cayu.storage._sqlite_publication:publish_runtime.<locals>.statement",
+    "cayu.storage._sqlite_session_messages:enqueue_session_message.<locals>.statement",
+    "cayu.storage._sqlite_session_queries:_query_events_bounded_snapshot",
+    "cayu.storage._sqlite_session_queries:load_events.<locals>.<lambda>",
+    "cayu.storage._sqlite_session_queries:load_tool_round_lifecycle_events.<locals>.query",
+    "cayu.storage._sqlite_session_queries:load_tool_round_lifecycle_events_for_round.<locals>.query",
+    "cayu.storage._sqlite_session_queries:load_user_input_supersession_events.<locals>.query",
+    "cayu.storage._sqlite_session_queries:query_events.<locals>.run_query",
+    "cayu.storage._sqlite_session_queries:query_latest_interaction_events.<locals>.run_query",
+    "cayu.storage._sqlite_session_queries:read_cost_accounting.<locals>.read",
+    "cayu.storage._sqlite_session_queries:read_cost_accounting.<locals>.read.<locals>.add_group",
+    "cayu.storage._sqlite_session_queries:read_usage_accounting.<locals>.read",
+    "cayu.storage._sqlite_terminal_evidence:_load_evidence.<locals>.run_query",
+    "cayu.storage._sqlite_tool_grants:bind_targeted_tool_grant_use.<locals>.statement",
+    "cayu.storage._sqlite_tool_grants:issue_targeted_tool_grants.<locals>.statement",
+    "cayu.storage._sqlite_tool_grants:reconstruct_targeted_tool_grants.<locals>.statement",
+    "cayu.storage._sqlite_tool_grants:revoke_targeted_tool_grant.<locals>.statement",
+    "cayu.storage._zero_work_interruption:sqlite_terminalize.<locals>.statement",
+    "cayu.storage.sqlite:SQLiteSessionStore._capture_completed_turn_snapshot.<locals>.query",
+    "cayu.storage.sqlite:SQLiteSessionStore._load_interaction_transition_receipt_by_event_id.<locals>.statement",
+    "cayu.storage.sqlite:SQLiteSessionStore._load_session_closure_records_unlocked",
+    "cayu.storage.sqlite:SQLiteSessionStore._require_session_erasure_quiescence_unlocked",
+    "cayu.storage.sqlite:SQLiteSessionStore.load_interaction_transition_receipt.<locals>.statement",
+    "cayu.storage.sqlite:SQLiteSessionStore.load_session_export_snapshot.<locals>.query",
+    "cayu.storage.sqlite:SQLiteSessionStore.publish_interaction_transition.<locals>.statement",
+    "cayu.storage.sqlite:SQLiteSessionStore.reject_execution_profile_resume",
+    "cayu.storage.sqlite:SQLiteSessionStore.release_session_invocation.<locals>.statement",
+    "cayu.storage.sqlite:_append_event_once_in_transaction",
+    "event_record_from_row"
+  ],
+  "cayu.storage._sqlite_records:load_session": [
+    "cayu.storage._external_wait_sqlite:SQLiteExternalWaitMixin._mutate_external_wait",
+    "cayu.storage._producer_observation:sqlite_observation.<locals>.query",
+    "cayu.storage._session_access_records:sqlite_owner_read",
+    "cayu.storage._session_access_records:sqlite_read.<locals>.read",
+    "cayu.storage._sqlite_context_views:publish_context_view",
+    "cayu.storage._sqlite_context_views:select_context_view",
+    "cayu.storage._sqlite_event_publication:compare_and_publish_mcp_manifest_checks.<locals>.statement",
+    "cayu.storage._sqlite_model_stage:mark_dispatched.<locals>.statement",
+    "cayu.storage._sqlite_session_creation:create",
+    "cayu.storage._sqlite_session_messages:inspect_session_messages.<locals>.read",
+    "cayu.storage._sqlite_session_messages:snapshot_session_message_source.<locals>.query",
+    "cayu.storage._sqlite_session_queries:query_child_session_lifecycle.<locals>.read_snapshot",
+    "cayu.storage._sqlite_terminal_evidence:_load_evidence.<locals>.run_query",
+    "cayu.storage._sqlite_transcript:load_bounded_transcript_window.<locals>.snapshot",
+    "cayu.storage.sqlite:SQLiteSessionStore._capture_completed_turn_snapshot.<locals>.query",
+    "cayu.storage.sqlite:SQLiteSessionStore._load_interaction_transition_receipt_by_event_id.<locals>.statement",
+    "cayu.storage.sqlite:SQLiteSessionStore._load_session_closure_records_unlocked",
+    "cayu.storage.sqlite:SQLiteSessionStore._load_unlocked",
+    "cayu.storage.sqlite:SQLiteSessionStore._lookup_participant_session_creation_unserialized",
+    "cayu.storage.sqlite:SQLiteSessionStore._scan_participant_session_bindings.<locals>.read",
+    "cayu.storage.sqlite:SQLiteSessionStore.load.<locals>.<lambda>",
+    "cayu.storage.sqlite:SQLiteSessionStore.load_bounded.<locals>.read",
+    "cayu.storage.sqlite:SQLiteSessionStore.load_participant_session_creation_receipt",
+    "cayu.storage.sqlite:SQLiteSessionStore.load_session_export_snapshot.<locals>.query",
+    "cayu.storage.sqlite:SQLiteSessionStore.publish_interaction_transition.<locals>.statement",
+    "cayu.storage.sqlite:SQLiteSessionStore.release_session_invocation.<locals>.statement",
+    "cayu.storage.sqlite:SQLiteSessionStore.summarize_outcome.<locals>.query",
+    "cayu.storage.sqlite:_record_invocation_terminal_event_receipts"
+  ],
+  "cayu.storage._sqlite_schema_history:_MIGRATION_STEPS": [
+    "cayu.storage._sqlite_support:_apply_revision",
+    "cayu.storage._sqlite_support:_apply_revision_seventeen",
+    "cayu.storage._sqlite_support:_apply_revision_seventy_two",
+    "cayu.storage._sqlite_support:_repair_missing_pending_action_scope_indexes",
+    "cayu.storage._sqlite_support:_repair_missing_reservation_event_index",
+    "cayu.storage._sqlite_support:_repair_missing_revision_17_indexes",
+    "cayu.storage._sqlite_support:_repair_missing_workflow_replay_indexes",
+    "cayu.storage._sqlite_support:reconcile_schema",
+    "cayu.storage._sqlite_support:reset_empty_recall_state"
+  ],
+  "cayu.storage._sqlite_session_queries:_EVENT_QUERY_SESSION_IDS_BATCH_SIZE": [
+    "_event_query_session_id_batches",
+    "_query_events_bounded_snapshot",
+    "query_events"
+  ],
+  "cayu.storage._sqlite_session_queries:aggregate_environment_activity": [
+    "cayu.storage.sqlite:SQLiteSessionStore.aggregate_environment_activity"
+  ],
+  "cayu.storage._sqlite_support:_INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE": [
+    "_backfill_interrupted_handoff_generations"
+  ],
+  "cayu.storage._sqlite_support:_validate_revision_37_knowledge_fts_data": [
+    "_migrate_revision_thirty_seven_knowledge_fts"
+  ],
+  "cayu.storage._sqlite_task_graphs:insert_events": [
+    "create_graph",
+    "record_transition"
+  ],
+  "cayu.storage._sqlite_task_groups:publish": [
+    "cayu.storage._sqlite_task_graphs:create_graph",
+    "cayu.storage._sqlite_task_graphs:record_transition"
+  ],
+  "cayu.storage._sqlite_transcript_content:event_contents": [
+    "document_decoder"
+  ],
+  "cayu.storage._validated_cache:_MAX_ENTRIES": [
+    "validated_row_cache.<locals>.wrapped"
+  ],
+  "cayu.storage._validated_cache:_MAX_SOURCE_BYTES": [
+    "validated_row_cache.<locals>.wrapped"
+  ],
+  "cayu.storage.evals_postgres:_database_now": [
+    "PostgresEvalStore._save_prepared_authored_suite_in_transaction",
+    "PostgresEvalStore._terminalize_without_result",
+    "PostgresEvalStore.admit_run",
+    "PostgresEvalStore.claim_run",
+    "PostgresEvalStore.claim_run_for_targets",
+    "PostgresEvalStore.claim_run_trial",
+    "PostgresEvalStore.heartbeat_run",
+    "PostgresEvalStore.heartbeat_run_observation",
+    "PostgresEvalStore.heartbeat_run_trial",
+    "PostgresEvalStore.initialize_scenario_progress",
+    "PostgresEvalStore.load_trial_checkpoints",
+    "PostgresEvalStore.open_run_trials",
+    "PostgresEvalStore.publish_result",
+    "PostgresEvalStore.release_run",
+    "PostgresEvalStore.request_cancel",
+    "PostgresEvalStore.save_captured_result",
+    "PostgresEvalStore.save_claimed_trial_checkpoint",
+    "PostgresEvalStore.save_corpus",
+    "PostgresEvalStore.save_judge_calibration",
+    "PostgresEvalStore.save_scenario",
+    "PostgresEvalStore.save_trial_checkpoint",
+    "PostgresEvalStore.set_baseline",
+    "PostgresEvalStore.submit_scenario_approval",
+    "PostgresEvalStore.unfinished_run_trials",
+    "PostgresEvalStore.update_scenario_trial"
+  ],
+  "cayu.storage.evals_postgres:validate_result_for_run": [
+    "PostgresEvalStore.publish_result"
+  ],
+  "cayu.storage.evals_sqlite:_SQLITE_EVAL_MIN_REQUIRED_REVISION": [
+    "SQLiteEvalStore.__init__"
+  ],
+  "cayu.storage.evals_sqlite:_prepare_corpus_catalog_for_store": [
+    "SQLiteEvalStore.save_captured_result",
+    "SQLiteEvalStore.save_corpus"
+  ],
+  "cayu.storage.evals_sqlite:_prepare_result_for_store": [
+    "SQLiteEvalStore.publish_result"
+  ],
+  "cayu.storage.evals_sqlite:datetime": [
+    "SQLiteEvalStore._save_prepared_authored_suite_in_transaction",
+    "SQLiteEvalStore._terminalize_without_result.<locals>.operation",
+    "SQLiteEvalStore.admit_run.<locals>.operation",
+    "SQLiteEvalStore.claim_run.<locals>.operation",
+    "SQLiteEvalStore.claim_run_for_targets.<locals>.operation",
+    "SQLiteEvalStore.claim_run_trial.<locals>.operation",
+    "SQLiteEvalStore.heartbeat_run.<locals>.operation",
+    "SQLiteEvalStore.heartbeat_run_observation.<locals>.operation",
+    "SQLiteEvalStore.heartbeat_run_trial.<locals>.operation",
+    "SQLiteEvalStore.initialize_scenario_progress.<locals>.operation",
+    "SQLiteEvalStore.load_trial_checkpoints.<locals>.operation",
+    "SQLiteEvalStore.open_run_trials.<locals>.operation",
+    "SQLiteEvalStore.publish_result.<locals>.operation",
+    "SQLiteEvalStore.release_run.<locals>.operation",
+    "SQLiteEvalStore.request_cancel.<locals>.operation",
+    "SQLiteEvalStore.save_captured_result.<locals>.operation",
+    "SQLiteEvalStore.save_claimed_trial_checkpoint.<locals>.operation",
+    "SQLiteEvalStore.save_corpus.<locals>.operation",
+    "SQLiteEvalStore.save_judge_calibration.<locals>.operation",
+    "SQLiteEvalStore.save_scenario.<locals>.operation",
+    "SQLiteEvalStore.save_trial_checkpoint.<locals>.operation",
+    "SQLiteEvalStore.set_baseline.<locals>.operation",
+    "SQLiteEvalStore.submit_scenario_approval.<locals>.operation",
+    "SQLiteEvalStore.unfinished_run_trials.<locals>.operation",
+    "SQLiteEvalStore.update_scenario_trial.<locals>.operation"
+  ],
+  "cayu.storage.evals_sqlite:eval_run_invocation_from_json": [
+    "_delete_trial_checkpoints",
+    "_request_from_row",
+    "_run_record_from_row"
+  ],
+  "cayu.storage.evals_sqlite:validate_result_for_run": [
+    "SQLiteEvalStore.publish_result"
+  ],
+  "cayu.storage.evals_sqlite:view_index_sql": [
+    "SQLiteEvalStore.list_view_index"
+  ],
+  "cayu.storage.event_watchers_postgres:datetime": [
+    "PostgresEventWatcherStore.resolve_dead_letter"
+  ],
+  "cayu.storage.knowledge_memory:copy_knowledge_entry": [
+    "InMemoryKnowledgeStore.__init__",
+    "InMemoryKnowledgeStore._append_revision",
+    "InMemoryKnowledgeStore.append_entry_revision",
+    "InMemoryKnowledgeStore.approve_pending_entry",
+    "InMemoryKnowledgeStore.create_entry",
+    "InMemoryKnowledgeStore.delete_entry",
+    "InMemoryKnowledgeStore.get_entry"
+  ],
+  "cayu.storage.knowledge_postgres:datetime": [
+    "PostgresKnowledgeStore._insert_change",
+    "PostgresKnowledgeStore._inspect_lineage",
+    "PostgresKnowledgeStore._load_activation_receipt",
+    "PostgresKnowledgeStore._load_entry_activation_receipts",
+    "PostgresKnowledgeStore._load_entry_in_scope",
+    "PostgresKnowledgeStore.approve_pending_entry",
+    "PostgresKnowledgeStore.delete_entry",
+    "PostgresKnowledgeStore.get_entry",
+    "PostgresKnowledgeStore.prune_expired",
+    "PostgresKnowledgeStore.publish_entry_revision",
+    "PostgresKnowledgeStore.transition_entry_status",
+    "_postgres_knowledge_metadata_filter_sql",
+    "_postgres_relation_access_scope_filter_sql"
+  ],
+  "cayu.storage.migrations:REVISIONS": [
+    "pending",
+    "revision",
+    "validate_migration_input"
+  ],
+  "cayu.storage.postgres:PostgresSessionStore": [
+    "cayu.cli.storage:_eval_store_for",
+    "cayu.runtime._host_continuation_discovery:_require_session",
+    "cayu.sessions._participant_discovery:discover_participant_sessions",
+    "cayu.storage.application:_open_postgres_stores"
+  ],
+  "cayu.storage.postgres:datetime": [
+    "PostgresSessionStore._session_store_now"
+  ],
+  "cayu.storage.sqlite:_SQLITE_SESSION_MIN_REQUIRED_REVISION": [
+    "SQLiteSessionStore._initialize_schema"
+  ],
+  "cayu.storage.sqlite:_append_events_in_transaction": [
+    "SQLiteSessionStore._prepare_model_completion_stage_atomic",
+    "SQLiteSessionStore.append_event_and_claim_side_effect",
+    "SQLiteSessionStore.append_events",
+    "SQLiteSessionStore.apply_session_message_action",
+    "SQLiteSessionStore.bind_targeted_tool_grant_use",
+    "SQLiteSessionStore.issue_targeted_tool_grants",
+    "SQLiteSessionStore.revoke_targeted_tool_grant",
+    "_append_event_once_in_transaction",
+    "cayu.storage._zero_work_interruption:sqlite_terminalize"
+  ],
+  "cayu.tasks._execution_settlement:_OBSERVATION_TIMEOUT_SECONDS": [
+    "TaskExecutionSettlement.attempt"
+  ],
+  "cayu.tasks._graphs:TaskGraphEvent": [
+    "plan_graph_transition.<locals>.event"
+  ],
+  "cayu.tasks._schedule_wakeup:monotonic": [
+    "next_schedule_wake_at"
+  ],
+  "cayu.tasks.abandoned:_SCAN_MAX": [
+    "FencedTaskMonitor.scan"
+  ],
+  "cayu.tasks.abandoned:_SCAN_PAGE": [
+    "fenced_task_scan_query"
+  ],
+  "cayu.tasks.abandoned:_WHOLE_PASS_SCAN_MAX": [
+    "FencedTaskMonitor.scan"
+  ],
+  "cayu.tasks.abandoned:_settle_abandoned": [
+    "FencedTaskMonitor.scan",
+    "reconcile_abandoned_tasks"
+  ],
+  "cayu.tasks.abandoned:restart_observed_abandoned_task": [
+    "_settle_abandoned"
+  ],
+  "cayu.tasks.contracts:copy_durable_json_object": [
+    "CompletionDecisionApplicationRequest.copy_result",
+    "completion_result_sha256"
+  ],
+  "cayu.tasks.creation:datetime": [
+    "_task_from_create"
+  ],
+  "cayu.tasks.memory:schedule_receipt": [
+    "InMemoryTaskStore.cancel_scheduled_task",
+    "InMemoryTaskStore.reschedule_task"
+  ],
+  "cayu.tasks.parked_continuation:OWNER_HANDOFF_WAIT": [
+    "handed_off_owner"
+  ],
+  "cayu.tasks.session_wakes:SESSION_WAKE_RETRY_WINDOW": [
+    "_successor"
+  ],
+  "cayu.tasks.session_wakes:_CONTINUATION_LEASE_SECONDS": [
+    "_deliver_to_owning_task",
+    "reconcile_parked_handoffs"
+  ],
+  "cayu.tasks.session_wakes:_cancel_session_wake": [
+    "cayu.applications:CayuApp._stop_parked_waits"
+  ],
+  "cayu.tasks.session_wakes:_deliver": [
+    "_deliver_to_owning_task.<locals>.continue_owned",
+    "_deliver_when_due",
+    "deliver_session_wake"
+  ],
+  "cayu.tasks.session_wakes:_ensure_wake_attempt": [
+    "reconcile_session_wakes"
+  ],
+  "cayu.tasks.session_wakes:_leaves_parent_to_its_wake": [
+    "cayu.runtime._foreground_child_continuation:continue_foreground_parent"
+  ],
+  "cayu.tasks.session_wakes:_publish_session_wake": [
+    "cayu.applications:CayuApp.__init__.<locals>.<lambda>"
+  ],
+  "cayu.tasks.session_wakes:_sleeping_wait": [
+    "_leaves_parent_to_its_wake",
+    "_stop_chain_if_its_task_ended",
+    "cayu.tasks.worker:_session_parked_wait"
+  ],
+  "cayu.tasks.session_wakes:reconcile_parked_handoffs": [
+    "cayu.tasks.worker:_reconcile_session_wakes"
+  ],
+  "cayu.tasks.session_wakes:reconcile_session_wakes": [
+    "cayu.tasks.worker:_reconcile_session_wakes"
+  ],
+  "cayu.tasks.worker:_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE": [
+    "_run_recovered_interrupted_task_handler.<locals>.claim_once",
+    "run_task_worker.<locals>.run_slot.<locals>.run_step"
+  ],
+  "cayu.tasks.worker:_RECLAIM_BATCH_SIZE": [
+    "run_task_worker.<locals>.run_slot",
+    "run_task_worker.<locals>.run_slot.<locals>.maintain_expired_claims"
+  ],
+  "cayu.tasks.worker:_UNPRODUCTIVE_CONTINUATION_INITIAL_BACKOFF_SECONDS": [
+    "_unproductive_continuation_backoff"
+  ],
+  "cayu.tasks.worker:_UNPRODUCTIVE_HANDOFF_HISTORY_PAGE_SIZE": [
+    "_count_unproductive_interrupted_handoffs"
+  ],
+  "cayu.tasks.worker:_handle_with_heartbeat": [
+    "_run_recovered_interrupted_task_handler",
+    "run_task_worker.<locals>.run_slot.<locals>.run_step"
+  ],
+  "cayu.tasks.worker:_quiesce_task_retry_handler_before_terminalization": [
+    "_await_task_handler",
+    "_raise_task_retry_owner_cancellation.<locals>.cleanup"
+  ],
+  "cayu.tasks.worker:_reconcile_observed_abandoned_task_cancellation": [
+    "cayu.tasks.abandoned:_settle_abandoned",
+    "cayu.tasks.session_wakes:settle_wake_attempts_of_ended_tasks",
+    "reconcile_abandoned_task_cancellation"
+  ],
+  "cayu.tasks.worker:_recover_expired_interrupted_task_handoffs": [
+    "run_task_worker.<locals>.run_slot.<locals>.run_step"
+  ],
+  "cayu.tasks.worker:_run_recovered_interrupted_task_handler": [
+    "cayu.tasks.parked_continuation:run_under_parked_claim",
+    "run_task_worker.<locals>.run_slot.<locals>.run_step"
+  ],
+  "cayu.tasks.worker:_session_has_pending_action": [
+    "_run_bounded_interrupted_task_handler"
+  ],
+  "cayu.tasks.worker:_session_parked_wait": [
+    "_handoff_interrupted_session",
+    "_recover_expired_interrupted_task_handoffs",
+    "cayu.tasks.session_wakes:reconcile_parked_handoffs"
+  ],
+  "cayu.tasks.worker:_stop_busy_slot_maintenance": [
+    "_stop_busy_slot_maintenance",
+    "run_task_worker.<locals>.run_slot.<locals>.maintained_while_busy"
+  ],
+  "cayu.tasks.worker:_unproductive_continuation_backoff": [
+    "_run_bounded_interrupted_task_handler"
+  ],
+  "cayu.tasks.worker:_wait_or_stop": [
+    "_heartbeat_until",
+    "_run_bounded_interrupted_task_handler",
+    "run_task_worker.<locals>.run_slot"
+  ],
+  "cayu.tasks.worker:monotonic": [
+    "_await_task_handler.<locals>.invoke_handler",
+    "_handle_with_heartbeat",
+    "_handle_with_heartbeat_owned",
+    "_heartbeat_until",
+    "_heartbeat_until.<locals>.inspect_heartbeat",
+    "_heartbeat_until.<locals>.reconcile_heartbeat_failure",
+    "_renew_task_claim_before_dispatch",
+    "_renew_task_lease_before_deadline",
+    "run_task_worker.<locals>.run_slot"
+  ],
+  "cayu.tasks.worker:run_durable_worker_loop": [
+    "run_task_worker.<locals>.run_slot"
+  ],
+  "cayu.testing.base:_capture_workspace": [
+    "verify_tool_effect"
+  ],
+  "cayu.testing.base:_seed_workspace": [
+    "verify_tool_effect"
+  ],
+  "cayu.tools._browser_guest:_INTERACTIVE_CONNECT_SECONDS": [
+    "_await_interactive_retirement",
+    "_interactive_send"
+  ],
+  "cayu.tools._browser_guest:_INTERACTIVE_IDLE_POLL_SECONDS": [
+    "_wait_for_interactive_shutdown"
+  ],
+  "cayu.tools._browser_guest:_INTERACTIVE_RESPONSE_DRAIN_SECONDS": [
+    "_interactive_daemon_main.<locals>.handle"
+  ],
+  "cayu.tools._browser_guest:_INTERACTIVE_ROOT": [
+    "_finalize_recordings",
+    "_interactive_retired_path",
+    "_interactive_socket_path",
+    "_run_interactive_request"
+  ],
+  "cayu.tools._browser_guest:_INTERACTIVE_STARTUP_SETTLEMENT_SECONDS": [
+    "_run_interactive_request"
+  ],
+  "cayu.tools._browser_guest:_InteractiveDaemon": [
+    "_interactive_daemon_main"
+  ],
+  "cayu.tools._browser_guest:_OBSERVATION_GUARD_SETTLEMENT_SECONDS": [
+    "_interactive_observation.<locals>.settle_restoration"
+  ],
+  "cayu.tools._browser_guest:_PLAIN_SCAN_BUDGET": [
+    "_ProtectedValueMatcher.found_in"
+  ],
+  "cayu.tools._browser_guest:_TEMPORARY_PROFILE_ROOT": [
+    "_start_temporary_profile_owner",
+    "_temporary_profile_cleanup_main",
+    "_validate_temporary_profile_home"
+  ],
+  "cayu.tools._browser_guest:_admit_interactive_snapshot_materialization": [
+    "_interactive_observation"
+  ],
+  "cayu.tools._browser_guest:_cleanup_browser_resources": [
+    "_fetch_with_browser"
+  ],
+  "cayu.tools._browser_guest:_cleanup_temporary_profile_owner": [
+    "_InteractiveDaemon.close.<locals>.settle_all",
+    "_raise_temporary_profile_start_failure",
+    "_run"
+  ],
+  "cayu.tools._browser_guest:_fetch_with_browser": [
+    "_run"
+  ],
+  "cayu.tools._browser_guest:_install_browser_ca": [
+    "_InteractiveDaemon._refresh_egress_trust",
+    "_InteractiveDaemon.start",
+    "_run"
+  ],
+  "cayu.tools._browser_guest:_interactive_observation": [
+    "_InteractiveDaemon._observe_page"
+  ],
+  "cayu.tools._browser_guest:_interactive_rendered_text": [
+    "_interactive_observation"
+  ],
+  "cayu.tools._browser_guest:_interactive_send": [
+    "_finalize_recordings.<locals>.settle",
+    "_run_interactive_request",
+    "_run_private_control_bootstrap"
+  ],
+  "cayu.tools._browser_guest:_interactive_socket_path": [
+    "_interactive_daemon_main",
+    "_run_interactive_request",
+    "_run_private_control_bootstrap"
+  ],
+  "cayu.tools._browser_guest:_proxy_and_ca": [
+    "_InteractiveDaemon._refresh_egress_trust",
+    "_InteractiveDaemon.bootstrap_operator_channel",
+    "_InteractiveDaemon.start",
+    "_run",
+    "_run_interactive_request"
+  ],
+  "cayu.tools._browser_guest:_record_interactive_retirement": [
+    "_interactive_daemon_main"
+  ],
+  "cayu.tools._browser_guest:_sanitize_environment": [
+    "_InteractiveDaemon.start",
+    "_run"
+  ],
+  "cayu.tools._browser_guest:_start_interactive_daemon": [
+    "_run_interactive_request"
+  ],
+  "cayu.tools._browser_guest:_start_temporary_profile_owner": [
+    "_InteractiveDaemon._start_profile_home",
+    "_InteractiveDaemon.close.<locals>.settle_all",
+    "_run"
+  ],
+  "cayu.tools._browser_guest:_temporary_profile_cleanup_command": [
+    "_start_temporary_profile_owner"
+  ],
+  "cayu.tools._browser_guest:open_guest_control_channel": [
+    "_InteractiveDaemon.bootstrap_operator_channel.<locals>.connect_and_own"
+  ],
+  "cayu.tools._runner:_RUNNER_MUTATION_SETTLEMENT_FOREGROUND_TIMEOUT_SECONDS": [
+    "_settle_invocation_runner_mutation"
+  ],
+  "cayu.tools._runner:await_shielded_task_outcome": [
+    "_settle_invocation_runner_mutation"
+  ],
+  "cayu.tools._runner:runner_workspace_mutation_settlement": [
+    "_invocation_runner_mutation_settlement"
+  ],
+  "cayu.tools._runner:sanitize_runner_failure_group": [
+    "InvocationRunnerHandle.__exec",
+    "sanitize_runner_failure"
+  ],
+  "cayu.tools.browser:_PngRasterValidator": [
+    "_verified_png_dimensions"
+  ],
+  "cayu.tools.browser:_verified_png_dimensions": [
+    "_browser_screenshot_result"
+  ],
+  "cayu.tools.browser_session:_browser_page_set_transition_is_valid": [
+    "BrowserSessionTool._project_response"
+  ],
+  "cayu.tools.browser_session:_runtime_tool_invocation_authority": [
+    "BrowserSessionTool._checkpoint_browser_profile",
+    "BrowserSessionTool._seal_visual_publication",
+    "_RunnerBrowserSessionBackend._prepare_dispatch",
+    "_durable_browser_authority"
+  ],
+  "cayu.tools.exposure:TOOL_EXPOSURE_MAX_CATALOG_BYTES": [
+    "_copy_capability_sequence"
+  ],
+  "cayu.tools.exposure:_sha256_durable_json": [
+    "RegisteredToolCapability.validate_and_bind_fingerprints",
+    "ResolvedToolExposure.validate_and_bind_fingerprint",
+    "ToolCapabilityCeiling.validate_and_bind_fingerprint"
+  ],
+  "cayu.tools.files:MAX_PDF_PAGES_PER_READ": [
+    "PdfArtifactReader.read",
+    "_extract_pdf_pages",
+    "_parse_pdf_page_range"
+  ],
+  "cayu.tools.files:_detect_image_content_type": [
+    "ImageArtifactReader.read",
+    "cayu.tools._image_regions:read_image_region"
+  ],
+  "cayu.tools.files:_extract_pdf_pages": [
+    "PdfArtifactReader.read"
+  ],
+  "cayu.tools.files:_resize_image_bytes": [
+    "ImageArtifactReader.read"
+  ],
+  "cayu.tools.files:locate_workspace_lines": [
+    "_read_workspace_lines"
+  ],
+  "cayu.tools.knowledge:MAX_RETAINED_REMEMBER_KNOWLEDGE_PUBLICATIONS": [
+    "RememberKnowledgeTool.__init__"
+  ],
+  "cayu.tools.named_checks:ensure_coding_toolchain_runner_admission": [
+    "RunCheckTool.run"
+  ],
+  "cayu.tools.outcomes:copy_durable_json_object": [
+    "ToolCallSummary.detach_arguments"
+  ],
+  "cayu.tools.shared_artifacts:_finalize_materialization": [
+    "MaterializeSharedArtifactTool._run.<locals>.settle"
+  ],
+  "cayu.tools.structured_commands:_COMMAND_MANIFEST_MAX_FILE_BYTES": [
+    "_command_manifest_limits"
+  ],
+  "cayu.tools.structured_commands:ensure_coding_toolchain_runner_admission": [
+    "RunCommandTool.run"
+  ],
+  "cayu.tools.subagents:SUBAGENT_CANCEL_CLEANUP_TIMEOUT_S": [
+    "SubagentTool.run"
+  ],
+  "cayu.tools.web_access:_utc_now_seconds": [
+    "WebAccessRoutingTool.run"
+  ],
+  "cayu.verification._completion_result_resolver_coordinator:_MAX_ACTIVE_RESULT_RESOLVERS": [
+    "CompletionResultResolverCoordinator._reserve_resolution_capacity",
+    "CompletionResultResolverCoordinator._resolve_with_group_ownership"
+  ],
+  "cayu.verification._completion_result_resolver_coordinator:_PUBLICATION_OWNER_HEARTBEAT_SECONDS": [
+    "_PublicationLeaseHeartbeat.interval_seconds"
+  ],
+  "cayu.verification._completion_result_resolver_coordinator:_PUBLICATION_OWNER_LEASE_SECONDS": [
+    "CompletionResultResolverCoordinator._acknowledge_publication_renewal_deadline",
+    "CompletionResultResolverCoordinator._renew_resolved_event_publication.<locals>.<lambda>",
+    "CompletionResultResolverCoordinator._reserve_resolved_event_publication",
+    "CompletionResultResolverCoordinator._reserve_resolved_event_publication_checkpoint",
+    "_PublicationLeaseHeartbeat.renew.<locals>.<lambda>"
+  ],
+  "cayu.verification._completion_result_resolver_coordinator:monotonic": [
+    "CompletionResultResolverCoordinator._acknowledge_publication_renewal_deadline",
+    "CompletionResultResolverCoordinator._heartbeat_publication_owner",
+    "CompletionResultResolverCoordinator._renew_resolved_event_publication",
+    "CompletionResultResolverCoordinator._reserve_resolved_event_publication",
+    "CompletionResultResolverCoordinator._resolve_locked"
+  ],
+  "cayu.verification._completion_verifier_coordinator:_MAX_ACTIVE_COMPLETION_VERIFIERS": [
+    "CompletionVerifierCoordinator._reserve_adapter_capacity"
+  ],
+  "cayu.verification._completion_verifier_coordinator:capture_task_store_operation": [
+    "CompletionVerifierCoordinator._load_optional_decision",
+    "CompletionVerifierCoordinator._load_optional_decision_for_proposal",
+    "CompletionVerifierCoordinator._load_optional_profile",
+    "CompletionVerifierCoordinator._load_prior_profile",
+    "CompletionVerifierCoordinator._load_required",
+    "CompletionVerifierCoordinator._prepare_profile",
+    "CompletionVerifierCoordinator._publish_adapter_outcome",
+    "CompletionVerifierCoordinator._renew_claim",
+    "CompletionVerifierCoordinator._verify_locked"
+  ],
+  "cayu.verification._completion_verifier_coordinator:monotonic": [
+    "CompletionVerifierCoordinator._heartbeat_claim",
+    "CompletionVerifierCoordinator._renew_claim"
+  ],
+  "cayu.verification._leased_adapter_heartbeat:await_shielded_task_outcome": [
+    "run_leased_adapter_heartbeat"
+  ],
+  "cayu.verification.verified_task_worker:datetime": [
+    "VerifiedTaskWorker._recover_discovered_execution",
+    "VerifiedTaskWorker._verification_request"
+  ],
+  "cayu.workflows.workflow:_append_step_completed": [
+    "_run_step"
+  ],
+  "cayu.workflows.workflow:_child_failure_state": [
+    "_run_step",
+    "_run_step.<locals>.collect_child_failure_evidence"
+  ],
+  "cayu.workflows.workflow:generate_child_session_id": [
+    "_run_step"
+  ],
+  "cayu.workflows.workflow:uuid4": [
+    "WorkflowContext.__init__"
+  ],
+  "cayu.workspaces._guest_guard:GUEST_GUARD_PROGRAM": [
+    "_guard_program"
+  ],
+  "cayu.workspaces._local_branch:WorkspaceBranchConflict": [
+    "LocalWorkspaceBranch._converge_durable_publication",
+    "LocalWorkspaceBranch._publication_conflicts",
+    "LocalWorkspaceBranch._published_identity_conflicts",
+    "_baseline_conflicts",
+    "_capture_baseline",
+    "_copy_one_regular",
+    "_filesystem_publication_alias_conflicts",
+    "_validate_conflict_evidence_limit"
+  ],
+  "cayu.workspaces._local_branch:WorkspaceBranchPublicationResult": [
+    "LocalWorkspaceBranch._publication_result_from_receipt",
+    "LocalWorkspaceBranch._publish",
+    "LocalWorkspaceBranch._publish_change_set",
+    "LocalWorkspaceBranch._publish_durable_claimed",
+    "_durable_failed_publication_result",
+    "_durable_publication_result"
+  ],
+  "cayu.workspaces._local_branch:_ACTIVE_BRANCHES": [
+    "_admit_branch",
+    "_mark_matching_branch_owner_terminal",
+    "_release_branch_attachment"
+  ],
+  "cayu.workspaces._local_branch:_BINDING_CLAIM_RELEASES": [
+    "_retain_failed_binding_claim_release",
+    "_retry_pending_binding_claim_releases"
+  ],
+  "cayu.workspaces._local_branch:_DURABLE_RECOVERY_CLEANUPS": [
+    "_release_durable_recovery_cleanup",
+    "_retain_durable_recovery_cleanup",
+    "_retry_pending_durable_recovery_cleanups"
+  ],
+  "cayu.workspaces._local_branch:_DURABLE_TERMINAL_SETTLEMENTS": [
+    "LocalWorkspaceBranch._retain_durable_terminal_settlement",
+    "_release_durable_terminal_settlement",
+    "_retry_pending_durable_terminal_settlements"
+  ],
+  "cayu.workspaces._local_branch:_PRIVATE_TREE_CLEANUPS": [
+    "_forget_private_tree_cleanup",
+    "_retain_private_tree_cleanup",
+    "_retry_pending_private_tree_cleanups",
+    "_retry_private_tree_cleanup",
+    "_retry_retained_private_tree_cleanup",
+    "_schedule_private_tree_cleanup"
+  ],
+  "cayu.workspaces._local_branch:_PublicationReceipt": [
+    "LocalWorkspaceBranch._publish_change_set",
+    "LocalWorkspaceBranch._record_durable_terminal_handle_unlocked"
+  ],
+  "cayu.workspaces._local_branch:_SOURCE_STAGING_CLEANUPS": [
+    "_retain_source_staging_cleanup",
+    "_retry_pending_source_staging_cleanups",
+    "_retry_source_staging_cleanup",
+    "_schedule_source_staging_cleanup"
+  ],
+  "cayu.workspaces._local_branch:_capture_baseline": [
+    "_capture_baseline_at_private_root",
+    "create_local_workspace_branch"
+  ],
+  "cayu.workspaces._local_branch:_capture_baseline_at_private_root": [
+    "_complete_durable_creating_record.<locals>.capture_before_open"
+  ],
+  "cayu.workspaces._local_branch:_copy_one_regular": [
+    "_copy_regular_tree"
+  ],
+  "cayu.workspaces._local_branch:_copy_regular_tree": [
+    "_capture_baseline"
+  ],
+  "cayu.workspaces._local_branch:_directory_lookup_semantics": [
+    "LocalWorkspaceBranch._publication_conflicts.<locals>.semantics_changed",
+    "_capture_baseline",
+    "_captured_from_private_root",
+    "_copy_regular_tree"
+  ],
+  "cayu.workspaces._local_branch:_filesystem_paths_alias": [
+    "LocalWorkspaceBranch._validate_filesystem_request_path",
+    "_filesystem_publication_alias_conflicts"
+  ],
+  "cayu.workspaces._local_branch:_inspect_source_path": [
+    "LocalWorkspaceBranch._converge_durable_publication",
+    "LocalWorkspaceBranch._preflight_durable_publication",
+    "LocalWorkspaceBranch._publication_conflicts",
+    "LocalWorkspaceBranch._published_identity_conflicts",
+    "LocalWorkspaceBranch._reconcile_overlay_mutation_failure_unlocked",
+    "LocalWorkspaceBranch._restore_applied"
+  ],
+  "cayu.workspaces._local_branch:_load_durable_branch_record": [
+    "LocalWorkspaceBranch._converge_and_settle_observed_durable_operation",
+    "LocalWorkspaceBranch._converge_exact_publication_conflict",
+    "LocalWorkspaceBranch._durable_private_mutation_claimed",
+    "LocalWorkspaceBranch._publish_durable_claimed",
+    "LocalWorkspaceBranch._rollback_durable_claimed",
+    "_complete_durable_creating_record",
+    "_create_durable_local_workspace_branch",
+    "_publish_or_reconcile_exact_record",
+    "_record_durable_branch_ambiguity",
+    "_recover_local_workspace_branch_claimed",
+    "_retry_durable_terminal_settlement",
+    "recover_local_workspace_branch"
+  ],
+  "cayu.workspaces._local_branch:_lock_cleanup_claim_staging": [
+    "_write_or_require_cleanup_quarantine_claim"
+  ],
+  "cayu.workspaces._local_branch:_publish_or_reconcile_exact_record": [
+    "LocalWorkspaceBranch._publish_durable_claimed",
+    "LocalWorkspaceBranch._rollback_durable_claimed",
+    "_complete_durable_creating_record",
+    "_create_durable_local_workspace_branch",
+    "_record_durable_branch_ambiguity",
+    "_record_durable_creation_failure",
+    "_recover_local_workspace_branch_claimed",
+    "_retry_durable_terminal_settlement"
+  ],
+  "cayu.workspaces._local_branch:_read_cleanup_quarantine_claim": [
+    "_read_matching_cleanup_quarantine_claim",
+    "_remove_owned_private_tree",
+    "_settle_owned_cleanup_quarantine"
+  ],
+  "cayu.workspaces._local_branch:_release_branch_attachment": [
+    "_BranchCapacityLease.release_after_cleanup",
+    "_BranchCapacityLease.release_owner",
+    "_settle_durable_recovery_private_tree"
+  ],
+  "cayu.workspaces._local_branch:_release_durable_terminal_settlement": [
+    "LocalWorkspaceBranch._complete_durable_terminal_settlement",
+    "_retry_pending_durable_terminal_settlements"
+  ],
+  "cayu.workspaces._local_branch:_remove_cleanup_quarantine_claim": [
+    "_restore_unowned_cleanup_quarantine",
+    "_settle_owned_cleanup_quarantine"
+  ],
+  "cayu.workspaces._local_branch:_remove_durable_private_tree": [
+    "_settle_durable_private_tree_removal",
+    "_settle_durable_recovery_private_tree"
+  ],
+  "cayu.workspaces._local_branch:_remove_owned_private_tree": [
+    "_remove_private_tree"
+  ],
+  "cayu.workspaces._local_branch:_remove_private_tree": [
+    "_discard_owned_capture_staging",
+    "_remove_durable_private_tree",
+    "_settle_private_tree_cleanup"
+  ],
+  "cayu.workspaces._local_branch:_rename_private_root_no_replace": [
+    "_capture_baseline_at_private_root",
+    "_remove_owned_private_tree",
+    "_restore_unowned_cleanup_quarantine"
+  ],
+  "cayu.workspaces._local_branch:_retry_durable_terminal_settlement": [
+    "_retry_pending_durable_terminal_settlements"
+  ],
+  "cayu.workspaces._local_branch:_retry_pending_branch_cleanups": [
+    "_create_durable_local_workspace_branch",
+    "_recover_local_workspace_branch_claimed",
+    "create_local_workspace_branch"
+  ],
+  "cayu.workspaces._local_branch:_scan_private_tree": [
+    "_captured_from_private_root"
+  ],
+  "cayu.workspaces._local_branch:_schedule_private_tree_cleanup": [
+    "_retain_private_tree_cleanup",
+    "_retry_private_tree_cleanup"
+  ],
+  "cayu.workspaces._local_branch:_schedule_source_staging_cleanup": [
+    "_retain_source_staging_cleanup",
+    "_retry_source_staging_cleanup"
+  ],
+  "cayu.workspaces._local_branch:create_regular": [
+    "LocalWorkspaceBranch._converge_durable_publication",
+    "LocalWorkspaceBranch._publish_change_set"
+  ],
+  "cayu.workspaces._local_branch:delete_regular": [
+    "LocalWorkspaceBranch._delete",
+    "LocalWorkspaceBranch._restore_applied",
+    "LocalWorkspaceBranch._write"
+  ],
+  "cayu.workspaces._local_branch:delete_regular_if_revision": [
+    "LocalWorkspaceBranch._converge_durable_publication",
+    "LocalWorkspaceBranch._publish_change_set"
+  ],
+  "cayu.workspaces._local_branch:open_regular_for_read": [
+    "_read_regular_bytes",
+    "_restore_baseline_git_modes"
+  ],
+  "cayu.workspaces._local_branch:replace_regular_if_revision": [
+    "LocalWorkspaceBranch._converge_durable_publication",
+    "LocalWorkspaceBranch._publish_change_set"
+  ],
+  "cayu.workspaces._local_branch:restore_regular": [
+    "LocalWorkspaceBranch._restore_applied",
+    "write_regular"
+  ],
+  "cayu.workspaces._local_branch:write_regular": [
+    "LocalWorkspaceBranch._write",
+    "_capture_baseline"
+  ],
+  "cayu.workspaces._local_guard:_SUPPORTS_DIR_FD": [
+    "_require_descriptor_guard_support"
+  ],
+  "cayu.workspaces._local_guard:_unlink_staging_and_inspect": [
+    "_LocalGuardStagingCleanupError.retry_cleanup",
+    "_create_at",
+    "_replace_at",
+    "_write_temp",
+    "settle_regular_staging"
+  ],
+  "cayu.workspaces._mutations:cooperative_path_lock": [
+    "workspace_path_lock",
+    "workspace_source_lock"
+  ],
+  "cayu.workspaces._runner_branch:RUNNER_WORKSPACE_BRANCH_PROGRAM": [
+    "_run"
+  ],
+  "cayu.workspaces._runner_branch:_run": [
+    "RunnerWorkspaceBranch._operation",
+    "create_runner_workspace_branch",
+    "recover_runner_workspace_branch"
+  ],
+  "cayu.workspaces._runner_branch:runner_workspace_mutation_settlement": [
+    "_run"
+  ],
+  "cayu.workspaces.branches:copy_bounded_workspace_revision_observation": [
+    "copy_workspace_branch_request"
+  ],
+  "cayu.workspaces.branches:workspace_branch_evidence": [
+    "_bounded_workspace_branch_evidence"
+  ],
+  "cayu.workspaces.checkpoint_lifecycle:capture_workspace_checkpoint": [
+    "_complete_workspace_checkpoint_mutation",
+    "_ensure_workspace_checkpoint"
+  ],
+  "cayu.workspaces.local:_LIST_OPEN_DIRECTORY_LIMIT": [
+    "_iter_listable_files"
+  ],
+  "cayu.workspaces.local:_read_file_locked": [
+    "LocalWorkspace.read_bytes",
+    "_read_file_identities",
+    "cayu.environments.bindings:_pack_local_files"
+  ],
+  "cayu.workspaces.local:_write_file": [
+    "LocalWorkspace.write_bytes"
+  ],
+  "cayu.workspaces.local:run_in_helper": [
+    "LocalWorkspace._run_bulk"
+  ],
+  "cayu.workspaces.runner:RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES": [
+    "RunnerWorkspace.__init__"
+  ],
+  "cayu.workspaces.runner:_RUNNER_WORKSPACE_MEASURE_BATCH_BYTES": [
+    "RunnerWorkspace._observe_transfer_sizes"
+  ],
+  "cayu.workspaces.runner:_RUNNER_WORKSPACE_PROGRAM": [
+    "RunnerWorkspace._run_json_operation",
+    "RunnerWorkspace.read_tar_stream",
+    "RunnerWorkspace.write_tar_stream"
+  ],
+  "cayu.workspaces.runner:guard_read": [
+    "RunnerWorkspace.read_bytes"
+  ]
+}
