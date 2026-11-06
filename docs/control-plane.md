@@ -603,7 +603,12 @@ refresh failures retain the last authorized snapshot with a stale-data warning.
 The same data is available through `cayu usage rollup --server-url URL` or
 `--application NAME`. Add `--price-book prices.json --top-sessions 20
 --session-order cost`; JSON preserves the HTTP result and table output labels
-cost versus token order and explains fallback. Price books remain optional.
+cost versus token order and explains fallback. Without `--price-book`, the CLI
+sends Cayu's bundled price book, so costs appear as estimates at public list
+rates. The dashboard does the same unless `dashboard_config` sets `priceBook`;
+set it to `None` to show tokens only. A request to the API that names no price
+book still returns a null `cost`. Use your own price book for negotiated or
+gateway rates.
 
 ### Usage windows and series
 

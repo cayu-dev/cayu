@@ -410,8 +410,8 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
         "pricing": {
-            "configured": False,
-            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "configured": True,
+            "read": {"enabled": True, "unavailable_reason": None},
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
         "evaluation_promotion": {
@@ -779,7 +779,9 @@ def test_contract_keeps_optional_capability_combinations_independent(
         )
     dashboard = DashboardConfig(
         runtime_config=(
-            {"priceBook": default_price_book()} if configured_feature == "pricing" else {}
+            {"priceBook": default_price_book()}
+            if configured_feature == "pricing"
+            else {"priceBook": None}
         )
     )
 

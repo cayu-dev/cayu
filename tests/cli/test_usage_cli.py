@@ -147,7 +147,10 @@ def test_usage_cli_live_loopback_and_table_output(capsys):
                 "--table",
             ]
             assert main(["usage", "rollup", *arguments]) == 0
-            assert "Event-activity buckets" in capsys.readouterr().out
+            rollup = capsys.readouterr().out
+            assert "Event-activity buckets" in rollup
+            # Without --price-book, costs still use the bundled book.
+            assert "Estimated cost (priced work)" in rollup
             assert main(["usage", "counts", *arguments]) == 0
             assert "Session-start buckets" in capsys.readouterr().out
         finally:

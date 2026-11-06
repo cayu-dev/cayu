@@ -74,7 +74,9 @@ def test_cost_cli_http_json_and_table(monkeypatch, tmp_path, capsys, target, pri
         if priced:
             assert "Cost by model" in text and "Cost by provider" in text
         else:
-            assert "pricing not configured" in text
+            # The bundled book does not price these fixture-only models.
+            assert "Unavailable" in text
+            assert "pricing not configured" not in text
 
 
 @pytest.mark.parametrize("enabled", [None, False, 1, "true"])

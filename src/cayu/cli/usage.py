@@ -87,7 +87,7 @@ def add_usage_parser(subparsers: Any) -> None:
             command.add_argument(
                 "--price-book",
                 type=Path,
-                help="Optional price-book JSON for headline, provider, model and session costs. Series contain counters only.",
+                help="Price-book JSON for headline, provider, model and session costs, instead of Cayu's bundled one. Series contain counters only.",
             )
             command.add_argument(
                 "--top-sessions",
@@ -241,6 +241,10 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
                 if len(raw) > 2 * 1024 * 1024:
                     raise ValueError("Price book exceeds the 2 MiB request limit.")
                 body["pricing"] = json.loads(raw)
+            else:
+                from cayu.budgets.pricing import default_price_book
+
+                body["pricing"] = default_price_book().model_dump(mode="json")
             result = api.post("/usage/rollup", body, resource="usage rollup")
         else:
             query: dict[str, str | list[str]] = {

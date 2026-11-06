@@ -38,7 +38,7 @@ from typing import Any
 
 from cayu._validation import require_clean_nonblank, thaw_json_value
 from cayu.applications import CayuApp
-from cayu.budgets.pricing import PriceBook
+from cayu.budgets.pricing import PriceBook, default_price_book
 from cayu.cloud_inventory import cloud_inventory_lifespan
 from cayu.project_control_plane import (
     ProjectControlPlaneContext,
@@ -229,6 +229,19 @@ _ALLOWED_FASTAPI_OPTIONS = frozenset(
         "version",
     }
 )
+
+
+def _dashboard_browser_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Give the browser the bundled book unless a deployment chose one or set ``None``.
+
+    This is display pricing only. Evaluation promotion keeps using the book a
+    deployment configured explicitly.
+    """
+
+    resolved = dict(config)
+    if "priceBook" not in resolved:
+        resolved["priceBook"] = default_price_book().model_dump(mode="json")
+    return resolved
 
 
 def _configured_dashboard_price_book(config: Mapping[str, Any]) -> PriceBook | None:
@@ -504,7 +517,7 @@ def create_server(
             thaw_json_value(resolved_config.dashboard.runtime_config)
         )
         pricing_metadata = (
-            dashboard_pricing_metadata(resolved_dashboard_runtime_config)
+            dashboard_pricing_metadata(_dashboard_browser_config(resolved_dashboard_runtime_config))
             if resolved_config.dashboard.enabled
             else None
         )
@@ -585,7 +598,10 @@ def create_server(
             auth=dashboard_auth,
             api_base_url=control_plane_path,
             dashboard_config=_with_human_review_purpose(
-                dict(thaw_json_value(resolved_config.dashboard.runtime_config)), app
+                _dashboard_browser_config(
+                    thaw_json_value(resolved_config.dashboard.runtime_config)
+                ),
+                app,
             ),
         )
         if not dashboard_mounted:
@@ -1026,7 +1042,12 @@ def _prepare_dashboard_mount(
         auth=auth,
         base_path=mount_path,
         api_base_url=api_url,
-        dashboard_config=dashboard_config,
+        dashboard_config=_dashboard_browser_config(
+            normalize_dashboard_runtime_config(
+                {} if dashboard_config is None else dashboard_config,
+                field_name="dashboard_config",
+            )
+        ),
     )
     return mount_path, dashboard_app
 

@@ -92,7 +92,9 @@ durable identity labels this as a ChatGPT-subscription request using an
 
 That value is only an API-equivalent estimate. It is not the subscription's
 actual spend, quota consumption, invoice, or evidence that the flat plan bills
-per token. Unknown models remain unpriced. Applications should choose a price
+per token. `cayu session`, `cayu usage rollup` and the dashboard use Cayu's
+bundled price book when none is configured, so subscription usage shows this
+estimate by default. Unknown models remain unpriced. Applications should choose a price
 book and budget threshold appropriate for the conservative control they want;
 see the official [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing).
 

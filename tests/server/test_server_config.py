@@ -899,3 +899,54 @@ def test_dashboard_rejects_invalid_human_review_purpose(purpose):
 def test_dashboard_accepts_explicit_human_review_purpose():
     config = DashboardConfig(runtime_config={"humanReviewPurpose": "delivery"})
     assert config.runtime_config["humanReviewPurpose"] == "delivery"
+
+
+def test_dashboard_browser_config_prices_with_the_bundled_book_by_default():
+    from cayu.budgets.pricing import default_price_book
+    from cayu.server import _configured_dashboard_price_book, _dashboard_browser_config
+
+    bundled = default_price_book()
+    resolved = _dashboard_browser_config({"title": "Ops"})
+
+    assert resolved["title"] == "Ops"
+    assert resolved["priceBook"]["price_book_version"] == bundled.price_book_version
+    # An explicit choice wins, including choosing no price book at all.
+    assert _dashboard_browser_config({"priceBook": None}) == {"priceBook": None}
+    chosen = {"priceBook": {"price_book_version": "custom"}}
+    assert _dashboard_browser_config(chosen) == chosen
+    # The display default isn't a configured book, so promotion stays unpriced.
+    assert _configured_dashboard_price_book({"title": "Ops"}) is None
+
+
+@pytest.mark.parametrize("adapter", ["mount_cayu", "mount_dashboard"])
+@pytest.mark.parametrize("pricing", ["default", "custom", "disabled"])
+def test_dashboard_mounts_share_display_pricing_defaults(adapter, pricing):
+    from fastapi import FastAPI
+
+    bundled = default_price_book().model_dump(mode="json")
+    custom = {**bundled, "price_book_version": "deployment-prices"}
+    runtime_config = (
+        {} if pricing == "default" else {"priceBook": None if pricing == "disabled" else custom}
+    )
+    server = FastAPI()
+    if adapter == "mount_cayu":
+        mount_cayu(server, CayuApp(), access=OpenAccess(), dashboard_config=runtime_config)
+    else:
+        assert mount_dashboard(server, dashboard_config=runtime_config)
+    client = TestClient(server)
+    response = client.get("/cayu/")
+    assert response.status_code == 200
+    marker = "window.__CAYU_DASHBOARD_CONFIG__="
+    injected = json.loads(response.text.split(marker, 1)[1].split(";</script>", 1)[0])
+    expected = bundled if pricing == "default" else runtime_config["priceBook"]
+    assert injected["priceBook"] == expected
+    if adapter == "mount_cayu":
+        contract = client.get("/cayu/api/contract").json()
+        assert contract["capabilities"]["surfaces"]["pricing"]["configured"] is (
+            pricing != "disabled"
+        )
+    # Display defaults must not mutate the deployment's explicit eval pricing.
+    from cayu.server import _configured_dashboard_price_book
+
+    configured = _configured_dashboard_price_book(runtime_config)
+    assert (configured is not None) is (pricing == "custom")
