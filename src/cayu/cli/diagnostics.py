@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -26,7 +27,7 @@ DEFAULT_SERVER_URL = "http://127.0.0.1:8000"
 DEFAULT_AUTHORIZATION_ENV = "CAYU_API_AUTHORIZATION"
 EXIT_BUDGET_EXCEEDED = 1
 EXIT_UNAVAILABLE = 2
-_REQUEST_TIMEOUT_SECONDS = 10.0
+_REQUEST_TIMEOUT_SECONDS = 30.0
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _DURATION_PATTERN = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$")
 _DURATION_UNITS = {"": 1.0, "s": 1.0, "m": 60.0, "h": 3600.0}
@@ -43,7 +44,7 @@ def add_diagnostics_parser(subparsers: Any) -> None:
         description="Read live diagnostics from a running Cayu server.",
     )
     commands = parser.add_subparsers(dest="diagnostics_command", required=True)
-    from cayu.cli._read_targets import add_read_target_options
+    from cayu.cli._read_targets import _positive_seconds, add_read_target_options
 
     system_parser = commands.add_parser(
         "system",
@@ -60,18 +61,35 @@ def add_diagnostics_parser(subparsers: Any) -> None:
             "minute, wall time, and CPU seconds per minute by route template, the "
             "top routes by CPU, and the estimated share of --vcpu CPUs. With "
             "--budget-idle-cpu the command exits 1 when that share exceeds the "
-            "budget; it exits 2 when the summary cannot be read. Authorization is "
-            f"read from {DEFAULT_AUTHORIZATION_ENV} by default and is never printed."
+            "budget; it exits 2 when the summary cannot be read. With --server-url the "
+            f"Authorization header is read from {DEFAULT_AUTHORIZATION_ENV} by default; "
+            "with --application NAME the CLI reads the Cayu Cloud Agent with your "
+            "`cayu cloud login` and the Agent's Developer dashboard login, as `cayu "
+            "session --application` does. Credentials are never printed."
         ),
     )
-    requests_parser.add_argument(
+    target = requests_parser.add_mutually_exclusive_group()
+    target.add_argument(
         "--server-url",
-        default=DEFAULT_SERVER_URL,
         help=(
             "Cayu server root URL, including any mount prefix but excluding /api "
             f"(default: {DEFAULT_SERVER_URL}; use http://127.0.0.1:8000/cayu for "
             "an app that calls mount_cayu at /cayu)."
         ),
+    )
+    target.add_argument(
+        "--application",
+        metavar="NAME",
+        help=(
+            "Read the Cayu Cloud Agent with this slug or name through its own Cayu API, "
+            "signed in as `cayu cloud` is. Needs a developer or admin role for the Agent."
+        ),
+    )
+    requests_parser.add_argument(
+        "--context",
+        type=Path,
+        metavar="PATH",
+        help="With --application: the private Cayu Cloud context JSON (`cayu cloud --context`).",
     )
     requests_parser.add_argument(
         "--since",
@@ -102,8 +120,24 @@ def add_diagnostics_parser(subparsers: Any) -> None:
         "--authorization-env",
         default=DEFAULT_AUTHORIZATION_ENV,
         metavar="NAME",
-        help="Environment variable containing the complete Authorization header value.",
+        help=(
+            "With --server-url: environment variable containing the complete "
+            "Authorization header value."
+        ),
     )
+    requests_parser.add_argument(
+        "--timeout-seconds",
+        type=_positive_seconds,
+        default=_REQUEST_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "How long the read may take, not counting waiting for a sleeping Agent "
+            f"(default: {_REQUEST_TIMEOUT_SECONDS:g})."
+        ),
+    )
+    from cayu.cli._cloud_agent_api import add_wake_options
+
+    add_wake_options(requests_parser)
     add_output_options(requests_parser, formats=("json", "table"), default="table")
 
 
@@ -117,6 +151,18 @@ def run_diagnostics(args: argparse.Namespace) -> int:
             error_code="SYSTEM_DIAGNOSTICS_FAILED",
             schema_version=CLI_SCHEMA_VERSION,
         )
+    # Both checked before the output is opened, which truncates it.
+    if args.application is None and args.context is not None:
+        print("error: --context applies only with --application.", file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    if args.output is not None and args.application is not None:
+        from cayu.cli._read_targets import cloud_login_output_conflict
+
+        # The output must never overwrite the Cloud login.
+        conflict = cloud_login_output_conflict(args.output, args.context)
+        if conflict is not None:
+            print(f"error: {conflict}", file=sys.stderr)
+            return EXIT_UNAVAILABLE
     try:
         with output_destination(args.output):
             return _run_requests(args)
@@ -126,17 +172,31 @@ def run_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _run_requests(args: argparse.Namespace) -> int:
+    from cayu.cli._cloud_agent_api import CayuApiError
+    from cayu.cli._output import terminal_safe
+
     try:
-        endpoint = request_cost_endpoint(args.server_url)
-        authorization = read_authorization(args.authorization_env)
-        summary = fetch_request_cost_summary(
-            endpoint,
-            authorization=authorization,
-            since_seconds=args.since,
-            vcpu=args.vcpu,
-        )
-    except (DiagnosticsError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        if args.application is not None:
+            summary = fetch_cloud_request_cost_summary(
+                args.application,
+                context=args.context,
+                since_seconds=args.since,
+                vcpu=args.vcpu,
+                timeout_seconds=args.timeout_seconds,
+                wake_timeout_seconds=args.wake_timeout_seconds,
+            )
+        else:
+            endpoint = request_cost_endpoint(args.server_url or DEFAULT_SERVER_URL)
+            authorization = read_authorization(args.authorization_env)
+            summary = fetch_request_cost_summary(
+                endpoint,
+                authorization=authorization,
+                since_seconds=args.since,
+                vcpu=args.vcpu,
+                timeout_seconds=args.timeout_seconds,
+            )
+    except (DiagnosticsError, CayuApiError, ValueError) as exc:
+        print(f"error: {terminal_safe(str(exc))}", file=sys.stderr)
         return EXIT_UNAVAILABLE
     if not summary.enabled:
         print(
@@ -257,6 +317,50 @@ def fetch_request_cost_summary(
         return RequestCostSummary.model_validate_json(bytes(body))
     except ValueError:
         raise DiagnosticsError("Cayu server returned an invalid request summary.") from None
+
+
+def fetch_cloud_request_cost_summary(
+    application: str,
+    *,
+    context: Path | None,
+    since_seconds: float,
+    vcpu: float,
+    timeout_seconds: float = _REQUEST_TIMEOUT_SECONDS,
+    wake_timeout_seconds: float | None = None,
+) -> RequestCostSummary:
+    """Read a Cayu Cloud Agent's request summary through its own Cayu API.
+
+    The CLI signs in to Cayu Cloud as `cayu cloud` does and reads the Agent at its Cayu
+    address with its Developer dashboard login (`open_cloud_agent_api`), like the other
+    ``--application`` reads; Cloud gives that login to the Agent's developers and admins.
+    """
+
+    from cayu.cli._cloud_agent_api import DEFAULT_WAKE_TIMEOUT_SECONDS, open_cloud_agent_api
+
+    name = application.strip()
+    if not name:
+        raise ValueError("--application must name an Agent.")
+    api = open_cloud_agent_api(
+        name,
+        context=context,
+        timeout_seconds=timeout_seconds,
+        wake_timeout_seconds=(
+            DEFAULT_WAKE_TIMEOUT_SECONDS if wake_timeout_seconds is None else wake_timeout_seconds
+        ),
+        offers_wake_option=True,
+    )
+    try:
+        raw = api.get(
+            "/diagnostics/requests",
+            query={"since_seconds": str(since_seconds), "vcpu": str(vcpu)},
+            resource="request timing",
+        )
+    finally:
+        api.close()
+    try:
+        return RequestCostSummary.model_validate(raw)
+    except ValueError:
+        raise DiagnosticsError(f"{api.description} returned an invalid request summary.") from None
 
 
 def render_request_cost_table(

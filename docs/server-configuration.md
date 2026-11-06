@@ -345,7 +345,8 @@ The protected `GET /api/diagnostics/requests?since_seconds=300&vcpu=0.5`
 route summarizes the buffer: requests per minute, p50/p95 wall time, CPU seconds
 per minute, and the estimated share of `vcpu` CPUs for each route, ordered by
 CPU. It returns `enabled: false` when timing is off, and its own requests are
-not recorded. `cayu diagnostics requests` reads it from the command line; see
+not recorded. `cayu diagnostics requests` reads it from the command line, from
+a server URL or, with `--application NAME`, from a Cayu Cloud Agent; see
 `cayu guide diagnostics#request-cost` for the idle-cost check.
 
 Measured overhead is about 15 microseconds of CPU per request on an Apple M1
