@@ -3236,21 +3236,15 @@ class EnvironmentLifecycle:
         if registered_environment is None:
             if started_event is not None:
                 raise AssertionError("Factory start event exists without a registered factory.")
-            requirements = effective_execution_requirements(session, registered_agent)
-            if requirements.tool_requirements:
-                decision = evaluate_execution_admission(
-                    candidate="no_environment",
-                    requirements=requirements,
-                    evidence=None,
-                )
-                return EnvironmentFactoryResolutionResult(
-                    registered_environment=None,
-                    events=[],
-                    error=ExecutionAdmissionError(decision),
-                )
+            decision = evaluate_execution_admission(
+                candidate="no_environment",
+                requirements=effective_execution_requirements(session, registered_agent),
+                evidence=None,
+            )
             return EnvironmentFactoryResolutionResult(
                 registered_environment=None,
                 events=[],
+                error=ExecutionAdmissionError(decision) if decision.status == "refused" else None,
             )
         if registered_environment.factory is None:
             if started_event is not None:
